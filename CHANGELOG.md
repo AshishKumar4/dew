@@ -5,6 +5,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Liquid's LFM3 (`lfm3`, LiquidAI/LFM3-1.7B and the text backbone of LFM3-VL and d1) loads, trains, decodes
+  and saves: its gated short convolution layers are a mixer of their own (`short_conv`, its last inputs
+  through the decode cache), and attention gates each head by its own sigmoid (`gate_projection='head'`).
 - `NodePerturbation`, mixed into an objective, trains its model without backpropagation, by node
   perturbation of every Dense, DenseGeneral and Embed output as Dust does, the rest by weight-space
   evolution strategies, pooled over a split or accumulated update as its gradient is;

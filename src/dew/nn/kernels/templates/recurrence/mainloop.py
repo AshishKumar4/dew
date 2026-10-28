@@ -96,12 +96,15 @@ PARTS = 3
 class Tiles:
     """A forward's tiles, the recurrence template's config, derived from the call's shape and the device's
     and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states
-    launch splits the values into (`block_v`), the chunks it has in flight (`stages`), and the output
-    launch's value block (`block_o`), the states launch's where None."""
+    launch splits the values into (`block_v`), the chunks it has in flight (`stages`), the output
+    launch's value block (`block_o`), the states launch's where None, and the value blocks of one sequence
+    and head a walk program takes, one a consumer role beside one producer (`walkers`: the states and
+    reverse launches'; their chains overlap on one multiprocessor and their keys stream once)."""
 
     block_v: int
     stages: int
     block_o: int | None = None
+    walkers: int = 1
 
     @property
     def output_block(self) -> int:
@@ -208,6 +211,24 @@ class _Issuer:
         values = _split(x, len(buffers)) if len(buffers) > 1 else (x,)
         family = self.call.family
         return tuple(family.staged(value, buffer) for value, buffer in zip(values, buffers, strict=True))
+
+    def summed(self, products: list) -> jax.Array:
+        """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
+        accumulator in place (`Family.summed`): one accumulator held where each its own held two (Kimi delta
+        attention's output, `algebra.key_decayed_output`)."""
+        operands = [(self._operand(lhs, name, rhs), self._operand(rhs, name, lhs))
+                    for name, lhs, rhs in products]
+        shape = (products[0][1].shape[0], products[0][2].shape[1])
+        family, interpret = self.call.family, self.call.interpret
+
+        def issued(acc):
+            for left, right in operands:
+                count = max(len(left), len(right))
+                for i, j in ((i, j) for i in range(len(left)) for j in range(len(right)) if i + j < count):
+                    acc = family.products(acc, left[i], right[j], interpret)
+            return acc
+
+        return family.summed(shape, issued, interpret)
 
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
         left = self._operand(lhs, name, rhs)
@@ -507,6 +528,25 @@ def _masks(rows: int, columns: int) -> list:
     return [(rows, columns, jnp.int32)]
 
 
+def _product(call: _Call, lhs: tuple, rhs: tuple) -> list:
+    """The operand fragments one product `[rows, depth] @ [depth, columns]` holds at once where the family's
+    products read registers (`Family.operands_in_registers`), its left operand `lhs` `(operand, rows,
+    depth)` a step deep and its right one `rhs` `(operand, depth, columns)` a sub-step
+    (`Family.fragment_depth`), each in the warps replicating it (`lhs_copies`, `rhs_copies`): the GEMM's own
+    rule (`resources.tile_registers`); none where they read shared memory (wgmma's)."""
+    family = call.family
+    if not family.operands_in_registers:
+        return []
+    (left, rows, depth), (right, _, columns) = lhs, rhs
+    return (_held(left, rows * family.lhs_copies, depth)
+            + _held(right, family.fragment_depth(depth), columns * family.rhs_copies))
+
+
+def _widest(*tiles: list) -> list:
+    """The largest of `tiles`' live sets by their words: of products issued in turn, one's fragments."""
+    return max(tiles, key=lambda held: sum(r * c * jnp.dtype(d).itemsize for r, c, d in held))
+
+
 def _fragments(call: _Call, *tiles) -> list:
     """The operand tiles `(operand, rows, columns)` a product reads from registers where the family's
     products read them there (`Family.operands_in_registers`, mma.sync's), none where they read shared
@@ -538,6 +578,7 @@ class Launch:
     exponentials: float
     device_bytes: int
     resident: int = 1
+    consumers: int = 1
 
 
 _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned", default=None)
@@ -605,19 +646,19 @@ def _landed(landing: dict, family: mosaic.Family) -> dict:
 
 
 def _planned_launch(call: _Call, scope: Callable[[int], resources.Scope], registers: int, *, floor: int,
-                    most: int) -> resources.LaunchPlan:
+                    most: int, consumers: int = 1) -> resources.LaunchPlan:
     """A launch's ring depth and the programs a multiprocessor holds of it (`resources.plan`, at its stated
     `registers` and its streams `scope`d at each depth from `floor` to `most`), or where it holds at none (a
     config past the device, which `template.Mosaic.legal` refuses) one stage and one program."""
-    found = resources.plan([resources.Launch(scope, 1, registers, floor=floor, most=most)], call.family,
-                           call.target)
+    found = resources.plan([resources.Launch(scope, consumers, registers, floor=floor, most=most)],
+                           call.family, call.target)
     if found:
         return found[0]
     return resources.LaunchPlan(floor, 1, resources.shared_bytes(call.family, scope(floor)))
 
 
 def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
-          stages: int | None) -> tuple[resources.LaunchPlan, int]:
+          stages: int | None, consumers: int = 1) -> tuple[resources.LaunchPlan, int]:
     """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
     holds at once, at most its `tiles`, its rings two deep where they run on (`mosaic.RingFamily`'s) and two
     deep hold as many programs as one, so a tile's loads go out under the last tile's work: a launch of
@@ -629,7 +670,7 @@ def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, 
         most = 2 if isinstance(call.family, mosaic.RingFamily) else 1
         found = _planned_launch(call, scope, registers, floor=1, most=most)
         return found, min(tiles, (call.target.multiprocessors or 1) * found.programs)
-    return _planned_launch(call, scope, registers, floor=stages, most=stages), tiles
+    return _planned_launch(call, scope, registers, floor=stages, most=stages, consumers=consumers), tiles
 
 
 def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
@@ -644,7 +685,7 @@ def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
             landing: dict | None = None, persistent: bool = False, reduces: bool = True,
-            after: tuple = ()):
+            after: tuple = (), consumers: int = 1):
     """`program(*refs, streams, staging, landing)` as a kernel over `grid`, run where `live(refs)` holds (a
     laid call's chunks and sequences are as many as its worst case, most of them empty): its streams'
     allocations (of `blocks`, `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened`
@@ -657,25 +698,28 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     (`_walk`) for the grid's indices `_axis` reads. A program that `reduces` none takes no reduction scratch
     (`_scope`; the compile gate holds its plan's shared memory to at least the compiled kernel's).
     `after` are the `(shape, dtype)` tiles its program scopes after its walks (`_final_landing`), which its
-    plan counts beside them as its family scopes them."""
+    plan counts beside them as its family scopes them. A program of `consumers` consumer roles (a walk's,
+    `Tiles.walkers`) holds each staging and landing tile once a role, along a leading axis a role indexes
+    (`_roled`): one role's products' tiles are no other's to write while its products read them."""
     family = call.family
-    landed = _landed(landing or {}, family)
-    staging = (*staging, landed)
+    staging, landing = _roles_staged(staging, landing or {}, consumers)
+    staging = (*staging, _landed(landing, family))
     tiles = math.prod(grid)
-    threads = 128 * family.warpgroups(1)
+    threads = 128 * family.warpgroups(consumers)
 
     def allocations(depth: int) -> dict:
         # The walked streams and those loaded once, each its own allocation (a pipelined family's stages are
         # its allocation's), which a program opens with their views by name ('walked', 'once').
-        opened = {"walked": family.streams(blocks, depth, 1)}
+        opened = {"walked": family.streams(blocks, depth, consumers)}
         if once:
-            opened["once"] = family.streams(once, 1, 1)
+            opened["once"] = family.streams(once, 1, consumers)
         return opened
 
     def scope(depth: int) -> resources.Scope:
         return _scope(allocations(depth), staging, reduces=reduces, after=after)
 
-    found, programs = _laid(call, scope, held.registers(family), tiles, stages=None if persistent else stages)
+    found, programs = _laid(call, scope, held.registers(family), tiles, stages=None if persistent else stages,
+                            consumers=consumers)
     stages = found.stages
     streams = allocations(stages)
     name = f"recurrence{program.__qualname__.split('.')[0]}"
@@ -690,7 +734,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             flops = work.flops * _products(call.held.parts) * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
                                     held.registers(family), work.steps * each, stages, stepped, flops,
-                                    work.exponentials * each, moved, found.programs))
+                                    work.exponentials * each, moved, found.programs, consumers))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
         return recorded
@@ -698,8 +742,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     def entry(*arrays):
         def scoped(staged, *, streams):
             *staged, lands = staged
-            keys = _landing_keys(landing or {}, family)
-            lands = {name: lands[keys[name]] for name in landing or {}}
+            keys = _landing_keys(landing, family)
+            lands = {name: lands[keys[name]] for name in landing}
             if not persistent:
                 program(*arrays, streams=streams, staging=tuple(staged), landing=lands)
                 return
@@ -754,7 +798,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     def launched(*arrays):
         laid = ({"grid": (programs,), "grid_names": ("programs",)} if persistent
                 else {"grid": grid, "grid_names": grid_names})
-        return family.kernel(entry, out_type=out_type, **laid, consumers=1, interpret=call.interpret,
+        return family.kernel(entry, out_type=out_type, **laid, consumers=consumers, interpret=call.interpret,
                              name=name, cost=_stated(work, tiles, arrays, out_type))(*arrays)
 
     return launched
@@ -1084,36 +1128,46 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
 
 
 def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, walked: tuple, step, start,
-                   count, kept, written, out, bv: int, *, landing, prefetch: Callable | None = None) -> None:
-    """A sequence's memory over a value block `bv` wide, carried in one role pair: the memory it takes, each
-    key slice's tile `{name}{i}` of `memory` (`entering`, the opened streams and their views), zero where
-    `kept` is 0; `step` over its chunks `[start, start + count)` of `walked` (the same); and the memory it
-    gives written to each slice's view `out(i)` where `written` is nonzero, through `landing` (a slice's
-    shared tile, `_landed`, or where None one scoped after the walk, `_final_landing`) (`_states`', and
-    `_reverse`'s from its last chunk). Where
-    `prefetch(n)` is given, it loads chunk `n`'s own values from global memory (its prefix), a step ahead:
-    each step issues the next chunk's loads before its own work and takes the ones the step before issued
-    (`step(n, slots, state, accumulators, loaded)`), so their latency is the step's, not on its path."""
+                   count, kept, written, out, bv: int, *, landing, prefetch: Callable | None = None,
+                   walkers: int = 1) -> None:
+    """A sequence's memory over `walkers` value blocks `bv` wide, one a consumer role beside one producer
+    (`Tiles.walkers`): the memory each role takes, its columns of each key slice's tile `{name}{i}` of
+    `memory` (`entering`, the opened streams and their views), zero where `kept` is 0; the role's
+    `step(role)` over its chunks `[start, start + count)` of `walked` (the same, its value streams the roles'
+    columns side by side); and the memory it gives written to each slice's view `out(role, i)` where
+    `written` is nonzero, through `landing(role)` (a slice's shared tile, `_landed`, or where None one scoped
+    after the walk, `_final_landing`) (`_states`', and `_reverse`'s from its last chunk). Where `prefetch(n)`
+    is given, it loads chunk `n`'s own values from global memory (its prefix), a step ahead: each step issues
+    the next chunk's loads before its own work and takes the ones the step before issued (`step(role)(n,
+    slots, state, accumulators, loaded)`), so their latency is the step's, not on its path."""
     family, slices = call.family, call.width // call.block
-    walked_step = step
-    if prefetch is not None:
-        last = start + count - 1
-
-        def walked_step(n, slots, carry, accumulators):
-            state, loaded = carry
-            ahead = prefetch(jnp.minimum(n + 1, last))
-            state, accumulators = step(n, slots, state, accumulators, loaded)
-            return (state, ahead), accumulators
     (entered, entered_views), (chunks, views) = entering, walked
 
-    def taken(index, slots, carry, accumulators):
-        del index, carry
-        # A finite memory times zero where the sequence takes none (a select takes no scalar condition over a
-        # tile in Mosaic GPU's warpgroup lowering).
-        scale = jnp.where(kept > 0, 1.0, 0.0)
-        return [_tile(slots, f"{name}{i}", memory).value() * scale for i in range(slices)], accumulators
+    def consumer(wg):
+        # Each role's columns and tiles at static offsets: Mosaic GPU slices a swizzled tile at static
+        # columns.
+        for role in range(walkers):
+            pl.when(wg == role)(functools.partial(walk, role))
 
-    def consumer(_):
+    def walk(role):
+        walked_step = role_step = step(role)
+        if (fetch := prefetch) is not None:
+            last = start + count - 1
+
+            def walked_step(n, slots, carry, accumulators):
+                state, loaded = carry
+                ahead = fetch(jnp.minimum(n + 1, last))
+                state, accumulators = role_step(n, slots, state, accumulators, loaded)
+                return (state, ahead), accumulators
+
+        def taken(index, slots, carry, accumulators):
+            del index, carry
+            # A finite memory times zero where the sequence takes none (a select takes no scalar condition
+            # over a tile in Mosaic GPU's warpgroup lowering).
+            scale = jnp.where(kept > 0, 1.0, 0.0)
+            return [_tile(slots, f"{name}{i}", memory, columns=pl.ds(role * bv, bv)).value() * scale
+                    for i in range(slices)], accumulators
+
         state = family.walk(entered, ((taken, 0, 1),), [family.zeros((call.block, bv))] * slices, (),
                             call.interpret)[0]
         carry = state if prefetch is None else (state, prefetch(start))
@@ -1126,18 +1180,39 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
         @pl.when(written > 0)
         def _():
             def store(smem):
-                family.stored(list(state), [out(i) for i in range(slices)], smem=smem)
+                family.stored(list(state), [out(role, i) for i in range(slices)], smem=smem)
 
-            if landing is None:
+            if landing(role) is None:
                 pl.run_scoped(store, plgpu.SMEM((call.block, bv), jnp.float32))
             else:
-                store(landing)
+                store(landing(role))
 
     def producer():
         family.stream(entered, entered_views, 0, 1)
         family.stream(chunks, views, start, start + count)
 
-    family.roles(1, consumer, producer)
+    family.roles(walkers, consumer, producer)
+
+
+def _roles_staged(staging: tuple, landing: dict, consumers: int) -> tuple[tuple, dict]:
+    """`_kernel`'s staging and landing tiles for `consumers` roles: each once a role along a leading axis a
+    role indexes (`_roled`) where more than one role shares the program."""
+    if consumers == 1:
+        return staging, landing
+    return (jax.tree.map(lambda tile: plgpu.SMEM((consumers, *tile.shape), tile.dtype), staging),
+            {name: ((consumers, *shape), dtype) for name, (shape, dtype) in landing.items()})
+
+
+def _roled(staging, landing: dict, walkers: int):
+    """A walk program's role's staging and landing tiles: `_kernel`'s, each along a leading axis of one tile a
+    role where `walkers` roles share the program, the role's own (`ref.at[role]`)."""
+    def of(role):
+        if walkers == 1:
+            return staging, landing
+        return (jax.tree.map(lambda ref: ref.at[role], staging),
+                {name: None if ref is None else ref.at[role] for name, ref in landing.items()})
+
+    return of
 
 
 def _final_landing(call: _Call, bv: int) -> tuple[dict, tuple]:
@@ -1166,6 +1241,24 @@ def _gated_write(call: _Call, corrected, loaded, prefix: tuple, last, head) -> t
     return gated, [decayed[:, None]] * slices
 
 
+def _last_write(call: _Call, keys: _Operand, k_ref, row, final_token, key_columns, columns, gated) -> tuple:
+    """`algebra.carried`'s `last` for a chunk at `row` whose last real token is its `final_token`-th: that
+    token's key slices as rows' vectors (its parts' rows summed, exactly, from `key_columns` on), its gated
+    write's row as a column's (`columns`, `_columns`), and its row, held to the fp32 recurrence outside the
+    write product, as the portable math peels it (`_peeled_chunk_inputs`). A chunk past its document's end
+    holds zeros after its tokens: its last slot's write left the last real one in the product, 2.0 times the
+    portable math's final memory from float64 under a steep decay (VisualOrca, interpreted and on an
+    H100)."""
+    family = call.family
+
+    def key_rows(i):
+        views = keys.vectors(k_ref, row + final_token, key_columns + i * call.block, call.block)
+        return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32) for view in views))
+
+    ends = family.iota(gated.shape, 0) == final_token
+    return key_rows, columns(jnp.where(ends, gated, 0.0)), final_token
+
+
 def _states_held(call: _Call, values: _Operand, keys: _Operand, bv: int) -> _Held:
     """What `_states`' consumer thread holds: the memory carried, its key slices in fp32, and the next
     chunk's prefix vectors (`prefetch`); a step's corrected and written values beside the values' block and
@@ -1177,7 +1270,7 @@ def _states_held(call: _Call, values: _Operand, keys: _Operand, bv: int) -> _Hel
         + _fragments(call, (held, CHUNK, call.block), (keys, CHUNK, call.block)),))
 
 
-def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
+def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Tiles):
     """`(h [chunks * HV * Dk, Dv], corrected [R, HV * Dv], final [B * HV * Dk, Dv])`: the memory each chunk
     enters and the corrected values as `call.held`, and each row's final memory, fp32, each sequence's chunks
     in order over a value block (`algebra.corrected`, `carried`). Under the delta rule `u` is the weighted
@@ -1186,9 +1279,11 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
     each chunk's write to its end (`algebra.scalar_write`); under one a key dimension `k` is the keys decayed
     so (`_weighted`'s third) and the memory's rows take their own decays. `sequences` `[N, 5]` is each
     sequence's first chunk, its chunks, its row and whether it begins and ends its row; `h0` `[B * HV * Dk,
-    Dv]` fp32 each row's initial memory."""
+    Dv]` fp32 each row's initial memory. A program walks `tiles.walkers` value blocks of its sequence and
+    head, one a consumer role, its keys and weighted keys streamed once for all of them."""
     width, value_width, bv, family = call.width, call.value_width, tiles.block_v, call.family
-    slices = width // call.block
+    slices, walkers = width // call.block, tiles.walkers
+    walked_width = bv * walkers
     held, memories = dataclasses.replace(call.held, rows=call.rows), call.memories
     batch = h0.shape[0] // (call.heads * width)
     initial = _Operand(h0.shape[0], 1, jnp.dtype(jnp.float32))
@@ -1197,22 +1292,23 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
     # The keys the memory takes: a key head's, or a value head's decayed to their chunk's end.
     keys, keyed = (held, 1) if call.per_key else (call.given, call.group)
 
-    def program(k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, h_ref, corrected_ref,
-                final_ref, *, streams, staging, landing):
+    def program(k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, h_ref,
+                corrected_ref, final_ref, *, streams, staging, landing):
         j, s, h = lax.axis_index("blocks"), lax.axis_index("sequences"), lax.axis_index("heads")
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
-        staged, scratch = staging
-        issue = _Issuer(call, {"corrected": staged, "write": staged})
+        roled = _roled(staging, landing, walkers)
 
         def memory(base, i):
             return (base * call.heads + h) * width + i * call.block
 
-        # Each step a chunk of every row's operands, by its index among the call's chunks.
+        # Each step a chunk of every row's operands, by its index among the call's chunks: the program's value
+        # blocks side by side, a role's its own columns.
+        walked = j * walked_width
         views = _views(**({"w": held.views(w_ref, 0, call.rows, h * width, width)} if delta else {}),
                        keys=keys.views(k_ref, 0, call.rows, h // keyed * width, width),
-                       values=values.views(u_ref, 0, call.rows, h * value_width + j * bv, bv))
-        initial_views = _views(**{f"initial{i}": initial.views(h0_ref, memory(row, i), call.block, j * bv, bv)
-                                  for i in range(slices)})
+                       values=values.views(u_ref, 0, call.rows, h * value_width + walked, walked_width))
+        initial_views = _views(**{f"initial{i}": initial.views(h0_ref, memory(row, i), call.block, walked,
+                                                               walked_width) for i in range(slices)})
         chunks = family.opened(streams["walked"], views)
         entering = family.opened(streams["once"], initial_views)
 
@@ -1228,13 +1324,19 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
         # Each key slice of the memory and the corrected values, a store each in flight.
         before_store = _walk_stores(family, width // call.block + 1)
 
-        def step(n, slots, state, accumulators, loaded=None):
+        def step(role):
+            (staged, scratch), lands = roled(role)
+            issue = _Issuer(call, {"corrected": staged, "write": staged})
+            column = walked + role * bv
+            return functools.partial(_states_step, lands, issue, scratch, column, role)
+
+        def _states_step(lands, issue, scratch, column, role, n, slots, state, accumulators, loaded=None):
             span, last = pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
             for i, part in enumerate(state):
                 before_store()
-                memories.store(h_ref, part, memory(n, i), call.block, j * bv, bv, family=family,
-                               smem=landing[f"memory{i}"], wait=False)
-            tile = _tile(slots, "values", values).value()
+                memories.store(h_ref, part, memory(n, i), call.block, column, bv, family=family,
+                               smem=lands[f"memory{i}"], wait=False)
+            tile = _tile(slots, "values", values, columns=pl.ds(role * bv, bv)).value()
             if delta:
                 def weights(i):
                     return _tile(slots, "w", held, columns=pl.ds(i * call.block, call.block))
@@ -1245,21 +1347,12 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
                 written = algebra.weighted("apply_u", None, tile, betas, issue)
                 corrected = algebra.corrected(written, None, state, held.dtype, issue)
             before_store()
-            held.store(corrected_ref, corrected, n * CHUNK, CHUNK, h * value_width + j * bv, bv,
-                       family=family, smem=landing["corrected"], wait=False)
+            held.store(corrected_ref, corrected, n * CHUNK, CHUNK, h * value_width + column, bv,
+                       family=family, smem=lands["corrected"], wait=False)
             gated, decay = _gated_write(call, corrected, loaded, (hi_ref, lo_ref), last, h)
-            separate = None
-            if held.parts > 1:
-                # An fp32 call's last write outside the product (`algebra.carried`), held to the fp32
-                # recurrence; a 16-bit call's is fla's product.
-                def key_rows(i):
-                    """The chunk's last key's slice `i`, a row's vector: its parts' rows summed, exactly."""
-                    views = keys.vectors(k_ref, last, h // keyed * width + i * call.block, call.block)
-                    return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32)
-                                                      for view in views))
-
-                ends = family.iota((CHUNK, bv), 0) == CHUNK - 1
-                separate = key_rows, _columns(call, scratch)(jnp.where(ends, gated, 0.0))
+            # An fp32 call's last real token's write outside the product; a 16-bit call's is fla's product.
+            separate = (_last_write(call, keys, k_ref, n * CHUNK, taken_ref[n] - 1, h // keyed * width,
+                                    _columns(call, scratch), gated) if held.parts > 1 else None)
             state = algebra.carried(
                 state, lambda i: _tile(slots, "keys", keys, columns=pl.ds(i * call.block, call.block)), gated,
                 decay, held.dtype, issue, last=separate)
@@ -1267,21 +1360,25 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
 
         _sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, first,
                        count, begins, ends,
-                       lambda i: final_ref.at[pl.ds(memory(row, i), call.block), pl.ds(j * bv, bv)], bv,
-                       prefetch=None if call.per_key else prefetch, landing=landing.get("final"))
+                       lambda role, i: final_ref.at[pl.ds(memory(row, i), call.block),
+                                                    pl.ds(walked + role * bv, bv)], bv,
+                       prefetch=None if call.per_key else prefetch,
+                       landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 
     out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
     blocks = _streamed(**({"w": ((CHUNK, width), held)} if delta else {}), keys=((CHUNK, width), keys),
-                       values=((CHUNK, bv), values))
-    initials = _streamed(**{f"initial{i}": ((call.block, bv), initial) for i in range(slices)})
+                       values=((CHUNK, walked_width), values))
+    initials = _streamed(**{f"initial{i}": ((call.block, walked_width), initial) for i in range(slices)})
     # A sequence's chunks, the mean over the laid sequences; two products a chunk.
     steps = call.chunks / sequences.shape[0]
-    work = Work(4 * CHUNK * width * bv * steps, steps)
+    work = Work(4 * CHUNK * width * walked_width * steps, steps)
     final_landing, after = _final_landing(call, bv)
-    return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
+    return _kernel(program, call, out_type=out_type,
+                   grid=(value_width // walked_width, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
                    live=lambda refs: refs[7][lax.axis_index("sequences"), 1] > 0, work=work,
+                   consumers=walkers,
                    held=_states_held(call, values, keys, bv),
                    staging=(*_staging(held, (call.block, bv)), _column_scratch(call)), once=initials,
                    landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
@@ -1289,7 +1386,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
                    after=after,
                    # Its last write's column sums an fp32 call's alone (`_columns`).
                    reduces=held.parts > 1)(
-        k, k if w is None else w, u, hi, lo, beta, h0, sequences)
+        k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken)
 
 
 def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
@@ -1301,7 +1398,9 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
     if call.per_key:
         given = {"gates": ((CHUNK, width), gates), "lows": ((CHUNK, width), gates),
                  "scores": ((CHUNK, CHUNK), held)}
-        staging = _staging(held, (CHUNK, call.block))
+        # The local product's staged scores, then each key block's gated queries.
+        staging = (_staging(held, (CHUNK, CHUNK)) + _staging(call.given, *[(CHUNK, call.block)]
+                                                             * (width // call.block)),)
     else:
         given = {"keys": ((CHUNK, width), call.given)}
         staging = _staging(held, (CHUNK, CHUNK))
@@ -1311,19 +1410,35 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
 
 
 def _output_held(call: _Call, bv: int) -> _Held:
-    """What `_output`'s consumer thread holds: a value block's memory and local products' fp32 sums beside
-    its values (and, where products read registers, a key block's queries and memory slice and the scores);
-    under a decay a head the first step's scores too, their sum, their pairs' decays and their masks (an
-    fp32 call's split into parts), held with the value block's tiles, the step's whole set (as its phases
-    alone, a 64-wide value block's output spilled 16 bytes a thread on an A100's at 200 stated registers);
-    under one a key dimension a key block's prefix halves and the scores in fp32."""
-    held, memories = call.held, call.memories
-    values = [_f32(CHUNK, bv)] * 2 + _held(held, CHUNK, bv) + _fragments(
-        call, (call.given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
+    """What `_output`'s consumer thread holds. Under a decay a head: a value block's phase, its output's
+    fp32 sum (the memory's and the local product's, each its own accumulator where products overlap,
+    `Family.products_overlap`), its values and one product's fragments (`_product`); and the first step's
+    scores' phase, their sum, their pairs' decays and their masks (an fp32 call's split into parts) and their
+    product's fragments. The two phases hold at once where the walk steps over value blocks (the scores'
+    branch inside its loop), or where its products overlap; apart where it takes one value block on a family
+    whose products complete in turn. So an A100's need was 232, 240, None and 216 registers at value blocks
+    16, 32, 64 and 128 wide of 128 values, and None at 128 of 256; an H100's 224, 224, 232/240 and None
+    (the 1971 gate's dump: where both phases were stated at once, 456 refused 216). Under a decay a key
+    dimension the value block's phase, and apart from it the first step's: a key block's prefix halves, its
+    decay raised from them and its queries widened, staged for every step (`algebra.key_gated`)."""
+    held, memories, given, family = call.held, call.memories, call.given, call.family
+    products = _widest(_product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
+                       _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv)))
     if call.per_key:
-        return _Held(phases=(values + [_f32(CHUNK, call.block)] * 2 + [_f32(CHUNK, CHUNK)],))
-    return _Held(phases=(values + [_f32(CHUNK, bv)] + [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
-                         + (_held(held, CHUNK, CHUNK) if held.parts > 1 else []),))
+        # One accumulator for every product (`_Issuer.summed`) beside the values, the intra launch's scores
+        # in fp32 and their masked narrow form; apart from it, at the first step, the key blocks' gated
+        # queries, staged before any product (an A100's held 64- and 128-wide value blocks at 247 registers,
+        # an H100's 128-wide at 248).
+        values = [_f32(CHUNK, bv), *_held(held, CHUNK, bv), _f32(CHUNK, CHUNK), *_held(held, CHUNK, CHUNK),
+                  *products]
+        return _Held(phases=(values, [_f32(CHUNK, call.block)] * 4))
+    values = [_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv) + products
+    scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
+              + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
+              + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
+    if call.value_width // bv == 1 and not family.products_overlap:
+        return _Held(phases=(values, scores))
+    return _Held(phases=(values + scores,))
 
 
 def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, scale: float, out_dtype,
@@ -1369,13 +1484,24 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
             entered = functools.partial(block, "entered", memories, along_rows=True)
             value = _tile(slots, "values", held)
             if call.per_key:
-                def decays(c):
-                    return tuple(block(name, gates, c).value() for name in ("gates", "lows"))
+                local, *gated = staged
+                # The tiles taken before the first step's branch: a slot is the stream's, every step's.
+                queries, halves = ([block(name, operand, c) for c in range(width // call.block)]
+                                   for name, operand in (("queries", call.given), ("gates", gates)))
+                lows = [block("lows", gates, c) for c in range(width // call.block)]
+
+                # Each key block's gated queries staged once, at the first step, for every value block's
+                # product: computed each step, they were live across the walk's steps beside each one's sum.
+                @pl.when(index == 0)
+                def _():
+                    for c, tile in enumerate(gated):
+                        decays = (halves[c].value(), lows[c].value())
+                        family.staged(algebra.key_gated(queries[c].value(), decays, scale), tile[0])
 
                 out = algebra.key_decayed_output(
-                    lambda c: block("queries", call.given, c).value(), decays, entered, width // call.block,
-                    _tile(slots, "scores", held).value().astype(jnp.float32), value, scale,
-                    _Issuer(call, {"memory": staged, "local": staged}))
+                    lambda c: _Parts(gated[c], call.given.dtype), entered, width // call.block,
+                    _tile(slots, "scores", held).value().astype(jnp.float32), value,
+                    _Issuer(call, {"local": local}).summed)
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
                 (gate, low), laid = loaded
@@ -1575,7 +1701,9 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     q, k = (_padded(x.astype(dtype), 3, width) for x in (q, k))
     v = _padded(v.astype(dtype), 3, columns)
     g = _padded(g.astype(jnp.float32), 3, width) if per_key else g.astype(jnp.float32)
-    beta = beta.astype(dtype).astype(jnp.float32)
+    # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
+    # reference's own fp32 (Mamba-2's `dt`).
+    beta = (beta.astype(dtype) if delta else beta).astype(jnp.float32)
     h0 = (jnp.zeros((batch, heads, width, columns), jnp.float32) if h0 is None
           else _padded(_padded(h0.astype(jnp.float32), 2, width), 3, columns))
     if starts is not None:
@@ -1583,7 +1711,13 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
     rows = chunks * CHUNK
-    given = held = _Operand(rows, _parts(dtype), dtype)
+    given = _Operand(rows, _parts(dtype), dtype)
+    # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it
+    # (the port is its reference); without the delta rule fp32, its three parts, as the portable math and
+    # mamba_ssm hold their scores, written values and memories (a 16-bit call's rounded to bf16 put the
+    # template's output 1.7 times and its final memory up to 540 times the portable math's distance from
+    # float64, on an H100 and interpreted).
+    held = given if delta else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                  interpret, generation.gpu_target())
     hi, lo = prefix(laid(g).reshape(chunks, CHUNK, -1))
@@ -1609,8 +1743,8 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     if kept is not None and delta and not per_key:
         (w, h, corrected), final = kept, None
     else:
-        h, corrected, final = _states(keys, w, u, hi, lo, beta, h0.reshape(-1, columns), sequences, call,
-                                      tiles)
+        h, corrected, final = _states(keys, w, u, hi, lo, beta, h0.reshape(-1, columns), sequences, taken,
+                                      call, tiles)
         final = final.reshape(batch, heads, width, columns)[:, :, :key_width, :value_width]
     return _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta,
                 None if per_key else a, w, scores, h, corrected, final, taken, sequences, laid,
@@ -1645,8 +1779,10 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
 
 def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> bool:
     """Whether each of `launches` fits a block of `shared` bytes and its consumer threads hold their registers
-    (`Launch.registers` within `Family.registers`): a generated launch spills nothing."""
-    return all(launch.shared <= shared and launch.registers <= family.registers(1) for launch in launches)
+    (`Launch.registers` within `Family.registers` at its consumer roles): a generated launch spills
+    nothing."""
+    return all(launch.shared <= shared and launch.registers <= family.registers(launch.consumers)
+               for launch in launches)
 
 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, shared: int,
@@ -1800,10 +1936,14 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     tiles |= _vector_blocks(call, "gate", "low", "column_gate", "column_low")
     # The local scores, then their product with the output's gradient.
     work = Work(2 * CHUNK * CHUNK * (width + value_width), exponentials=CHUNK * CHUNK)
-    # The local scores, their decays and masks and their narrow form, and their product and its cast.
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK) + _held(held, CHUNK, CHUNK)
-                               + [_f32(CHUNK, value_width)] + _held(held, CHUNK, value_width)
-                               + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
+    # The local scores, their decays and masks; then their narrow form's product with the output's gradient
+    # and its cast (`algebra.local_gradient`: the scores are narrowed before the product): as one phase, an
+    # H100's model stated 248 registers where ptxas needed 136, an A100's 280 against 160.
+    held_tiles = _Held(phases=(
+        [_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK)
+        + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),
+        [*_held(held, CHUNK, CHUNK), _f32(CHUNK, value_width), *_held(held, CHUNK, value_width),
+         *_fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, value_width))]))
     return _kernel(program, call, out_type=held.shape(call.heads * value_width),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
                    live=_taken(7), work=work, held=held_tiles, staging=_staging(held, (CHUNK, CHUNK)),
@@ -1817,9 +1957,11 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
     `local`, `_local_back`'s, and the memory's, `algebra.reverse_carried`) and each row's initial memory's
     gradient, fp32, each sequence's chunks from its last over a value block, the states launch's
     (`tiles.block_v`; fla's dhu). `q`, `k`, `w`, `do` and `local` are laid as the forward's; `dht`
-    `[B * HV * Dk, Dv]` fp32 each row's final memory's gradient."""
+    `[B * HV * Dk, Dv]` fp32 each row's final memory's gradient. A program walks `tiles.walkers` value blocks
+    of its sequence and head, one a consumer role, as the states launch does."""
     width, value_width, family = call.width, call.value_width, call.family
-    bv, slices = tiles.block_v, width // call.block
+    bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
+    walked_width = bv * walkers
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     batch = dht.shape[0] // (call.heads * width)
     final = _Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
@@ -1829,13 +1971,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                 dh0_ref, *, streams, staging, landing):
         j, s, h = lax.axis_index("blocks"), lax.axis_index("sequences"), lax.axis_index("heads")
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
-        staged, (second,) = staging
-        # The decayed output gradient fp32 as two parts against the queries (fla's split product, 16 of its
-        # significand's bits): one part put the initial memory's gradient 5 to 7 times the port's distance
-        # from float64. Its first part reuses the memory products' tile, each consumed before the next
-        # stages.
-        issue = _Issuer(call, {**dict.fromkeys(("values_dv", "weights_dv"), staged),
-                               "reads": (*staged, second)})
+        roled = _roled(staging, landing, walkers)
+        walked = j * walked_width
 
         def memory(base, i):
             return (base * call.heads + h) * width + i * call.block
@@ -1846,53 +1983,65 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                        queries=given.views(q_ref, 0, call.rows, key_columns, width),
                        keys=given.views(k_ref, 0, call.rows, key_columns, width),
                        w=held.views(w_ref, 0, call.rows, h * width, width),
-                       out=given.views(do_ref, 0, call.rows, h * value_width + j * bv, bv),
-                       local=held.views(local_ref, 0, call.rows, h * value_width + j * bv, bv))
-        final_views = _views(**{f"final{i}": final.views(dht_ref, memory(row, i), call.block, j * bv, bv)
-                                for i in range(slices)})
-        walked = family.opened(streams["walked"], views)
+                       out=given.views(do_ref, 0, call.rows, h * value_width + walked, walked_width),
+                       local=held.views(local_ref, 0, call.rows, h * value_width + walked, walked_width))
+        final_views = _views(**{f"final{i}": final.views(dht_ref, memory(row, i), call.block, walked,
+                                                         walked_width) for i in range(slices)})
+        walked_streams = family.opened(streams["walked"], views)
         leaving = family.opened(streams["once"], final_views)
 
         # Each key slice of the memory's gradient and the corrected values', a store each in flight.
         before_store = _walk_stores(family, width // call.block + 1)
 
-        def step(f, slots, grad, accumulators):
+        def step(role):
+            (staged, (second,)), lands = roled(role)
+            # The decayed output gradient fp32 as two parts against the queries (fla's split product, 16 of
+            # its significand's bits): one part put the initial memory's gradient 5 to 7 times the port's
+            # distance from float64. Its first part reuses the memory products' tile, each consumed before
+            # the next stages.
+            issue = _Issuer(call, {**dict.fromkeys(("values_dv", "weights_dv"), staged),
+                                   "reads": (*staged, second)})
+            return functools.partial(_reverse_step, lands, issue, walked + role * bv, pl.ds(role * bv, bv))
+
+        def _reverse_step(lands, issue, column, columns, f, slots, grad, accumulators):
             n = chunks - 1 - f
             span, last = pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
             for i, part in enumerate(grad):
                 before_store()
-                memories.store(dh_ref, part, memory(n, i), call.block, j * bv, bv, family=family,
-                               smem=landing[f"memory{i}"], wait=False)
+                memories.store(dh_ref, part, memory(n, i), call.block, column, bv, family=family,
+                               smem=lands[f"memory{i}"], wait=False)
 
             def block(name, operand, i):
                 return _tile(slots, name, operand, columns=pl.ds(i * call.block, call.block))
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
-            out = _tile(slots, "out", given)
-            local = _tile(slots, "local", held).value().astype(jnp.float32)
+            out = _tile(slots, "out", given, columns=columns)
+            local = _tile(slots, "local", held, columns=columns).value().astype(jnp.float32)
             ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
             grad, dv = algebra.reverse_carried(
                 grad, functools.partial(block, "keys", given), functools.partial(block, "w", held),
                 functools.partial(block, "queries", given), out.value(), local, gate, low, ending,
                 ending_low, scale, held.dtype, issue)
             before_store()
-            held.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + j * bv, bv, family=family,
-                       smem=landing["corrected"], wait=False)
+            held.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + column, bv, family=family,
+                       smem=lands["corrected"], wait=False)
             return grad, accumulators
 
-        _sequence_walk(call, final, "final", (leaving, final_views), (walked, views), step,
+        _sequence_walk(call, final, "final", (leaving, final_views), (walked_streams, views), step,
                        chunks - first - count, count, ends, begins,
-                       lambda i: dh0_ref.at[pl.ds(memory(row, i), call.block), pl.ds(j * bv, bv)], bv,
-                       landing=landing.get("final"))
+                       lambda role, i: dh0_ref.at[pl.ds(memory(row, i), call.block),
+                                                  pl.ds(walked + role * bv, bv)], bv,
+                       landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 
     out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
     blocks = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
-                       w=((CHUNK, width), held), out=((CHUNK, bv), given), local=((CHUNK, bv), held))
-    finals = _streamed(**{f"final{i}": ((call.block, bv), final) for i in range(slices)})
+                       w=((CHUNK, width), held), out=((CHUNK, walked_width), given),
+                       local=((CHUNK, walked_width), held))
+    finals = _streamed(**{f"final{i}": ((call.block, walked_width), final) for i in range(slices)})
     # The memory's carried gradient: three memory products a chunk.
     steps = chunks / sequences.shape[0]
-    work = Work(2 * 3 * CHUNK * width * bv * steps, steps)
+    work = Work(2 * 3 * CHUNK * width * walked_width * steps, steps)
     # The memory's gradient carried, its key slices in fp32, and the one it gives the chunk before as it is
     # summed; a step's corrected values' two gradients and its local one beside the output's gradient, a
     # memory slice as an operand, and the stored tiles' casts.
@@ -1901,9 +2050,10 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
         + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(held, CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
     final_landing, after = _final_landing(call, bv)
-    return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
+    return _kernel(program, call, out_type=out_type,
+                   grid=(value_width // walked_width, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=2, work=work,
-                   held=held_tiles,
+                   held=held_tiles, consumers=walkers,
                    live=lambda refs: refs[8][lax.axis_index("sequences"), 1] > 0,
                    staging=(*_staging(held, (call.block, bv)), (plgpu.SMEM((CHUNK, bv), held.stored),)),
                    once=finals,
@@ -2112,8 +2262,9 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
     # The scores' gradient, the scores and the pairs' sums.
     work = Work(2 * CHUNK * CHUNK * (value_width + width + CHUNK), exponentials=CHUNK * CHUNK)
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
-    # the pairs' sum's product.
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 5 + _held(held, CHUNK, CHUNK) + _masks(CHUNK, CHUNK)
+    # the pairs' sum's product: four fp32 tiles at once, the decays taken before the scores' product
+    # (`algebra.scores_gradient`); five stated an A100's 280 registers where ptxas needed 240.
+    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 4 + _held(held, CHUNK, CHUNK) + _masks(CHUNK, CHUNK)
                                + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(8), work=work,

@@ -30,9 +30,10 @@ from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 
 from ..activations import silu
+from ..blocks import Upsample
 from .api import LatentNormalization, ModuleAutoEncoder, published_source
 from .kl import posterior_latent
-from .vae import FlaxDownsample2D, FlaxUpsample2D
+from .vae import FlaxDownsample2D
 from .wan import WanMidBlock, WanResidualBlock, WanRMSNorm, causal_conv
 
 if TYPE_CHECKING:
@@ -82,7 +83,7 @@ class _Upsampler(nn.Module):
     def __call__(self, x):
         if self.temporal:
             _TimeConv(self.features, 2 * self.features, name="time_conv")()
-        return FlaxUpsample2D(self.features, dtype=jnp.dtype(self.dtype), name="resample")(x)
+        return Upsample(self.features, 2, dtype=jnp.dtype(self.dtype), conv="conv", name="resample")(x)
 
 
 def _average_down(x, features: int, temporal: bool, spatial: int):

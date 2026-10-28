@@ -59,19 +59,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from architecture_cases import CASES as ARCHITECTURES, LM, SEQ_LEN, TEXT_FEATURES, TEXT_TOKENS, VOCAB, Case
 from flax.traverse_util import flatten_dict, unflatten_dict
+from jepa_cases import MASK
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, widened
-from test_architectures import (
-    CASES as ARCHITECTURES,
-    LM,
-    MASK,
-    SEQ_LEN,
-    TEXT_FEATURES,
-    TEXT_TOKENS,
-    VOCAB,
-    Case,
-)
 from tiny_models import build_model, tiny_inputs
 from tool_support import load
 

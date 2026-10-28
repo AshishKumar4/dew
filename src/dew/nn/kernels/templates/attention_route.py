@@ -61,7 +61,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     if hooks.output_mod is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
-    form = generation.measured_kernel('attention_form', 'fast')
+    form = generation.chosen_kernel('attention_form', 'fast')
     if form not in FORMS:
         raise ValueError(f"attention_form {form!r}: the template's forms are {', '.join(FORMS)}")
     wide = form == 'accurate'

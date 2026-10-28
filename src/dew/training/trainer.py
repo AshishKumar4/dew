@@ -84,7 +84,7 @@ from dew.inputs import Field, InputSpec
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
+from dew.nn.kernels.generation import assumed, backend, chosen_kernel, gpu_mesh, gpu_target
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     Link,
@@ -1030,6 +1030,7 @@ class Trainer(Generic[Loss, Effects]):
                                      mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
+        cheaper = self._cheaper(search, planned, recorded, resumed)
         self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
@@ -1037,11 +1038,29 @@ class Trainer(Generic[Loss, Effects]):
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
-        self.plan = settled(planned, plans, seconds, probes)
+            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches,
+                                         'cheaper': cheaper})
+        self.plan = settled(planned, plans, seconds, probes, cheaper)
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned.released(), flops
+
+    @staticmethod
+    def _cheaper(search: FitSearch, planned: Planned, recorded: JSON,
+                 resumed: JSON) -> dict[str, JSON] | None:
+        """The cheaper remat rung the run is told of (`FitSearch.cheaper`): none for a resumed run, which
+        continues its checkpoint's rung; the one a recorded plan's run measured, where the run took that
+        plan, its split and rung, and none where the search moved off it; else measured now."""
+        if resumed is not None:
+            return None
+        if recorded is not None:
+            kept = record(recorded, 'recorded plan')
+            told = json_value(kept.get('cheaper'), 'recorded cheaper rung')
+            plan = {**planned.rung, 'split': planned.split}
+            taken = all(kept.get(field) == value for field, value in plan.items())
+            return told if taken and isinstance(told, dict) else None
+        probe = search.cheaper(planned)
+        return None if probe is None else probe.record()
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int, narrow: bool, launches: str | None) -> Candidate:
@@ -1148,10 +1167,10 @@ class Trainer(Generic[Loss, Effects]):
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
-        (`dew.training.narrow`), by path under `params`: on every GPU but
-        one whose row measured them off, for a step this trainer composes,
-        without a loss scale."""
-        if (measured_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
+        (`dew.training.narrow`), by path under `params`: on every GPU unless
+        `chosen` turns them off, for a step this trainer composes, without a
+        loss scale."""
+        if (chosen_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
                 or self.step is not None or self.dynamic_scale or FROZEN in state.variables):
             return {}
         variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)

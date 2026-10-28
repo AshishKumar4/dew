@@ -9,6 +9,7 @@ form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2).
 Each solver's order of accuracy is measured against that closed form.
 """
 
+import functools
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,15 @@ import numpy as np
 import pytest
 from diffusion_support import SourceOracle, relative_gap, walk
 from flax import linen as nn
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+    recording,
+)
+from tool_support import run_from
 
 from dew.diffusion import (
     ConsistencyBoundary,
@@ -674,7 +683,15 @@ def test_empty_guidance_interval_generates_the_unguided_samples():
 # EDM's own stochastic sampler
 ############################################################################################################
 
-EDM = np.load(Path(__file__).resolve().parent / "fixtures" / "edm" / "heun.npz")
+EDM = Path(__file__).resolve().parent / "fixtures" / "edm" / "heun.npz"
+
+
+@functools.cache
+def edm_generator():
+    """tools/edm_reference.py, whose seeded draw the recorded inputs are drawn again by, loaded as a
+    script from its directory."""
+    with run_from("edm_reference", "tools") as module:
+        return module
 
 
 class EDMOracle(nn.Module):
@@ -697,20 +714,39 @@ def edm_grid(steps: int) -> Process:
     return Process(SigmaGrid(sigmas, sigmas, 80.0), DirectPredictionTransform())
 
 
+def assert_walks_as_edm(name: str, *, final_denoise: bool) -> None:
+    """Heun with the recorded case's S_churn, S_tmin, S_tmax and S_noise from each seed's latent under
+    its key, on par with the published sampler's own float32 walk of its rho-7 grid and the same
+    per-step draws over the case's declared seeds (check 1). With `final_denoise`, the walk stops at the
+    last sigma and closes with the model's clean prediction there; without, it steps onto the zero NVlabs
+    appends."""
+    stored = recording(EDM)
+    arguments = json.loads(str(stored[f"{name}.arguments"]))
+    steps = arguments["num_steps"]
+    solver = Heun(s_churn=arguments.get("S_churn", 0.0), s_tmin=arguments.get("S_min", 0.0),
+                  s_tmax=arguments.get("S_max", float("inf")), s_noise=arguments.get("S_noise", 1.0))
+    denoiser = edm_grid(steps).denoiser(EDMOracle(), {}, {})
+    times = np.arange(steps, 0 if final_denoise else -1, -1, dtype=np.float32)
+
+    # The closing walk takes `sample`'s default, which is the closing denoise.
+    closing = {} if final_denoise else {"final_denoise": False}
+
+    @jax.jit
+    def walked(index, inputs):
+        x_T = jnp.asarray(inputs["latents"]) * np.float32(80.0)
+        return {"result": sample(denoiser, x_T, solver=solver, key=inputs["key"], times=times, **closing)}
+
+    seeds = declared_seeds(EDM)[name]
+    draw, recorded, truth = indexed_recording(stored, name, seeds, inputs_of=edm_generator().draw)
+    assert_as_exact(walked, recorded, draw, name, seeds=seeds, truth_fn=truth)
+
+
 @pytest.mark.parametrize("name", ["deterministic", "churn", "churn_to_the_end"])
 def test_heun_walks_edms_algorithm_2_with_its_churn(name):
     """Heun with S_churn, S_tmin, S_tmax and S_noise against the published
     sampler on its own rho-7 grid and the same per-step draws, as exact as
-    the published sampler's own float32 walk."""
-    arguments = json.loads(str(EDM[f"{name}.arguments"]))
-    steps = arguments["num_steps"]
-    solver = Heun(s_churn=arguments.get("S_churn", 0.0), s_tmin=arguments.get("S_min", 0.0),
-                  s_tmax=arguments.get("S_max", float("inf")), s_noise=arguments.get("S_noise", 1.0))
-    x_T = jnp.asarray(EDM["latents"] * np.float32(80.0))
-    walked = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
-                    key=jax.random.PRNGKey(7), times=np.arange(steps, -1, -1, dtype=np.float32),
-                    final_denoise=False)
-    assert_as_exact_as_the_reference(walked, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
+    the published sampler's own float32 walk over the recorded seeds."""
+    assert_walks_as_edm(name, final_denoise=False)
 
 
 @pytest.mark.parametrize("name", ["deterministic", "churn"])
@@ -721,14 +757,7 @@ def test_the_closing_denoise_is_edms_last_euler_step_onto_sigma_zero(name):
     (`final_denoise`, its default) and matches the published sampler as
     exactly as its own float32 walk; the churn case's last sigma, 0.002, is
     below its S_min, so nothing is churned there."""
-    arguments = json.loads(str(EDM[f"{name}.arguments"]))
-    steps = arguments["num_steps"]
-    solver = Heun(s_churn=arguments.get("S_churn", 0.0), s_tmin=arguments.get("S_min", 0.0),
-                  s_tmax=arguments.get("S_max", float("inf")), s_noise=arguments.get("S_noise", 1.0))
-    x_T = jnp.asarray(EDM["latents"] * np.float32(80.0))
-    closed = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
-                    key=jax.random.PRNGKey(7), times=np.arange(steps, 0, -1, dtype=np.float32))
-    assert_as_exact_as_the_reference(closed, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
+    assert_walks_as_edm(name, final_denoise=True)
 
 
 class UnitEpsilon(nn.Module):

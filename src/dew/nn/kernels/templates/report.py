@@ -58,12 +58,14 @@ class Report:
 
 
 @contextlib.contextmanager
-def reported(directory: str):
-    """Mosaic GPU's reports on, into `directory`, for the compiles in the block, under `DUMPING` from before
-    the settings are read to after they are restored."""
+def reported(directory: str, *, ptx: bool = False):
+    """Mosaic GPU's reports on, into `directory`, for the compiles in the block, each kernel's PTX too where
+    `ptx` asks (the compile gate's register need), under `DUMPING` from before the settings are read to
+    after they are restored."""
     with DUMPING:
-        before = {name: os.environ.get(name) for name in (*DUMPS, "MOSAIC_GPU_DUMP_TO")}
-        os.environ.update(DUMPS, MOSAIC_GPU_DUMP_TO=directory)
+        dumps = {**DUMPS, **({"MOSAIC_GPU_DUMP_PTX": "1"} if ptx else {})}
+        before = {name: os.environ.get(name) for name in (*dumps, "MOSAIC_GPU_DUMP_TO")}
+        os.environ.update(dumps, MOSAIC_GPU_DUMP_TO=directory)
         try:
             yield
         finally:

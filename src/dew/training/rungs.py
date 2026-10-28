@@ -129,6 +129,8 @@ def recorded_launches(recorded: JSON, plan: Mapping[str, JSON]) -> str | None:
     record beside its FLOPs (`plan_flops`)."""
     kept = dict(record(recorded, 'recorded plan')) if recorded is not None else {}
     kept.pop('flops', None)
+    # What a cheaper rung measured is advice beside the plan (`FitSearch.cheaper`), no part of it.
+    kept.pop('cheaper', None)
     launches = kept.pop('launches', None)
     return launches if kept == plan and isinstance(launches, str) else None
 
