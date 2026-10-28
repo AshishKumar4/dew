@@ -643,6 +643,43 @@ def test_a_packed_recurrence_runs_on_each_devices_own_rows():
     assert reduced <= parameters, (reduced, parameters)
 
 
+def _split_delta_forward(length: int, devices: int) -> jax.stages.Lowered:
+    """A bf16 gated delta net's forward over one row of `length` tokens, lowered for an assumed H100 over an
+    abstract mesh whose sequence axis splits it `devices` ways."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.linear import GatedDeltaNet
+
+    layer = GatedDeltaNet(256, 1, 2, 128, 128, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((1, length, 256), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+    device = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90").abstract_device
+    mesh = AbstractMesh((devices,), ("sequence",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        return jax.jit(layer.apply).trace(variables, x).lower(lowering_platforms=("cuda",))
+
+
+def test_a_gated_delta_net_split_over_the_sequence_runs_each_devices_own_slice():
+    """A gated delta net on a mesh splitting its sequence runs the recurrence on each device's slice, as its
+    lowered H100 program states it: over two devices and 384 tokens, every kernel call of the layer over one
+    device's 192 tokens is among its calls, operand for operand, but the conv's, which reads its three-token
+    halo too, beside its slice's summary (the rule from `[0 | I]`), where the rule ran the whole sequence on
+    every device before (row 1437); and its collectives are the halo's and the summaries' gathers alone, no
+    activation reduced (`recurrence_chunk.entering_memory`, `linear.sequence_conv`)."""
+    def kernels(operations: list[Operation]) -> list[tuple]:
+        return [(target, operands) for name, target, operands, _ in operations
+                if name == "stablehlo.custom_call"]
+
+    operations = _operations(_split_delta_forward(384, 2))
+    calls, local = kernels(operations), kernels(_operations(_split_delta_forward(192, 1)))
+    convolved = [(target, (((1, 195, 512), dtype), *rest)) for target, ((shape, dtype), *rest) in local
+                 if shape == (1, 192, 512)]
+    assert convolved and all(call in calls for call in convolved), (calls, local)
+    assert all(call in calls for call in local if call[1][0][0] != (1, 192, 512)), (calls, local)
+    collectives = {_collective(name) for name, *_ in operations if _collective(name)}
+    assert collectives <= {"all-gather", "collective-permute"}, collectives
+
+
 def _ssd_forward(generation: str, rows: int, devices: int) -> jax.stages.Lowered:
     """A bf16 Mamba-2 layer's forward over `rows` rows of 128 tokens, its scan on the recurrence template
     (`SCAN`'s 'mosaic_gpu', named: a declared cell may give the port the generation's forward), lowered for

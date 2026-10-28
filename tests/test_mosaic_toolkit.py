@@ -3,6 +3,7 @@ operand across persistent tiles of their own trip counts, one consumer or two sh
 interpreter is coverage, not proof (it treats wgmma_wait as a no-op); each kernel also lowers for an H100
 here, and runs on one in the GPU gate."""
 
+import dataclasses
 import functools
 
 import jax
@@ -144,6 +145,9 @@ def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     # 400 bytes -> 1 KiB; walks 4 KiB and 8 KiB -> 8 KiB; 3 barriers; the after tile's 2 KiB.
     assert resources.shared_bytes(mosaic_sm90.WGMMA, scope) == 1024 + 2048 + 8192 + 3 * 8
     assert resources.shared_bytes(mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)), scope) == 1024 + 8192 + 3 * 8
+    # Three warpgroups reducing implicitly each take their share of Mosaic GPU's scratch on warpgroup MMA.
+    reducing = dataclasses.replace(scope, reducing_warpgroups=3)
+    assert resources.shared_bytes(mosaic_sm90.WGMMA, reducing) == 1024 + 3 * 2048 + 2048 + 8192 + 3 * 8
 
 
 def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():

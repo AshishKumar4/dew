@@ -122,11 +122,6 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
 
 
-_tril_inverse = algebra.tril_inverse
-"""`(I + D)^-1` of a strictly lower square block, row by row: fla's forward substitution (chunk_fwd.py's
-solve, chunk_intra.py's for Kimi's delta attention), the algebra's (`recurrence_algebra.tril_inverse`)."""
-
-
 def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, beta_ref, a_ref, *, chunk: int, aligned: bool,
                       sub: int, bk: int, exact: bool):
     """fla's `chunk_gated_delta_rule_fwd_kkt_solve_kernel` (fla/ops/gated_delta_rule/chunk_fwd.py:40-
@@ -154,29 +149,17 @@ def _kkt_solve_chunk(k_ref, g_ref, beta_ref, a_ref, start, taken, *, chunk: int,
 
     gates = [_gates(g_ref, start, taken, sub, i * sub) for i in range(count)]
     betas = [part(beta_ref, i).astype(jnp.float32) for i in range(count)]
-    index = jnp.arange(sub)
-    strict = index[:, None] > index[None, :]
 
     def keys(i, c):
         return part(k_ref, i, pl.ds(c * bk, bk))
 
-    def block(i, j):
-        """`A`'s block (i, j), i >= j: the keys' products, gated and scaled by beta."""
-        product = sum(_dot(keys(i, c), keys(j, c).T, exact=exact) for c in range(width // bk))
-        decay = jnp.exp2(_pairs(gates[i], gates[j]))
-        product = product * (jnp.where(strict, decay, 0.0) if i == j else decay)
-        return product * betas[i][:, None]
+    def issue(name, a, b):
+        # The keys' products at the call's precision, the merges at its solve precision (`_dot`).
+        return _dot(a, b, exact=exact, solve=k_ref.dtype if name == "merge" else None)
 
-    blocks = {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
-
-    inverse = {(i, i): _tril_inverse(blocks[i, i], index) for i in range(count)}
-    for distance in range(1, count):
-        for i in range(distance, count):
-            j = i - distance
-            # X_ij = -X_ii (sum over j <= m < i of A_im X_mj), fla's merge order.
-            inner = sum(_dot(blocks[i, m], inverse[m, j], exact=exact, solve=k_ref.dtype)
-                        for m in range(j, i))
-            inverse[i, j] = -_dot(inverse[i, i], inner, exact=exact, solve=k_ref.dtype)
+    blocks = algebra.system(keys, lambda i, j: jnp.exp2(_pairs(gates[i], gates[j])), betas, count,
+                            width // bk, issue)
+    inverse = algebra.inverted(blocks, issue)
     # fla zero-fills A before its kernel stores the lower blocks; here the blocks above are stored as zeros.
     for i in range(count):
         for j in range(count):

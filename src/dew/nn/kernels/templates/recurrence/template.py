@@ -13,6 +13,7 @@ launches' seconds.
 """
 
 import dataclasses
+import functools
 from typing import ClassVar
 
 import jax
@@ -148,20 +149,21 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
-        (docs/design/kernel-templates.md §7), each rule naming the fact it reads:
-        - value block: of those dividing the padded values in steps of the narrowest a staged operand block
-          takes (`Family.narrowest_columns`) and legal (`legal`: every launch's shared memory within a
-          block of the device and its registers within a thread's, `registers`), and of those at which the
-          call's fast backward holds where it holds at any (`_backward_holds`: its launches take the states
-          launch's block, an H100's reverse launch 328 registers 64 wide), the narrowest whose states
-          launch, a program a value block, sequence and value head walking its sequence's chunks in turn,
-          runs in one wave of the programs the device's multiprocessors hold at once (`states_held`), else
-          the widest: a wave's time is its walk's, whose steps wait on their loads, about as long a program
-          16 wide as 32 (an H100's 114 us a wave 16 wide against 95 32 wide, the 27B's and Qwen3-Next's,
-          SE-family-h100-b0980aaff), so one wave of the most programs (fla's chunk_fwd_h runs the 27B
-          gated delta net's 192 programs a 32-wide block on an A100's 108, where 64 wide its 96 left
-          twelve idle the whole walk, SE-rx-ncu-b106b18d8), and past one wave the fewest programs; the
-          widest where the device's multiprocessors are unknown;
+        (docs/design/kernel-templates.md §7; no candidate space, no ranking: each rule gives way from the
+        widest value block to the next narrower where it does not hold), each rule naming the fact it reads:
+        - value block, in steps of the narrowest a staged operand block takes (`Family.narrowest_columns`)
+          dividing the padded values: the widest legal (`legal`: every launch's shared memory within a block
+          of the device and its registers within a thread's, `registers`), then the widest at which the
+          call's fast backward holds where it holds at any narrower (`_backward_holds`: its launches take the
+          states launch's block, an H100's reverse launch 328 registers 64 wide), then the narrowest whose
+          states launch, a program a value block, sequence and value head walking its sequence's chunks in
+          turn, still runs in one wave of the programs the device's multiprocessors hold at once
+          (`states_held`), else that widest one with walk roles (`_walked`): a wave's time is its walk's,
+          whose steps wait on their loads, about as long a program 16 wide as 32 (an H100's 114 us a wave 16
+          wide against 95 32 wide, the 27B's and Qwen3-Next's, SE-family-h100-b0980aaff), so one wave of the
+          most programs (fla's chunk_fwd_h runs the 27B gated delta net's 192 programs a 32-wide block on an
+          A100's 108, where 64 wide its 96 left twelve idle the whole walk, SE-rx-ncu-b106b18d8), and past one
+          wave the fewest programs; the widest where the device's multiprocessors are unknown;
         - output block: the widest legal beside it (`_staged`), the output launch's registers apart from the
           states launch's: on an A100 the output launch holds 264 registers 32 wide, where the states
           launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
@@ -172,30 +174,46 @@ class Mosaic(base.Template[mainloop.Tiles]):
         if family is None:
             return None
         _, columns, _ = _widths(ba, family)
-        legal = [tiles for tiles in (self._staged(ba, block, target) for block in self._blocks(ba, family))
-                 if tiles is not None]
-        if not legal:
+        blocks = self._blocks(ba, family)
+        # Each rule gives way from the widest block to the next narrower where it does not hold, a block's
+        # tiles staged as a rule first reads them: the widest legal, then the widest at which the fast
+        # backward holds where it holds at any narrower, then the narrowest still running the states
+        # launch in one wave.
+        staged = functools.cache(lambda index: self._staged(ba, blocks[index], target))
+        start = next((index for index in range(len(blocks)) if staged(index) is not None), None)
+        if start is None:
             return None
-        legal = [tiles for tiles in legal if self._backward_holds(ba, tiles, target)] or legal
+        def trains(index: int) -> bool:
+            tiles = staged(index)
+            return tiles is not None and self._backward_holds(ba, tiles, target)
+
+        trained = next((index for index in range(start, len(blocks)) if trains(index)), start)
+        chosen = staged(trained)
+        assert chosen is not None
+        if target.multiprocessors is None:
+            return chosen
         arguments = ba.arguments
         batch, length, heads, _ = arguments["value"].shape
         sequences = batch * (1 if arguments.get("starts") is None
                              else arguments.get("max_segments") or length)
-        if target.multiprocessors is None:
-            return legal[0]
         multiprocessors = target.multiprocessors
 
         def one_wave(tiles: mainloop.Tiles) -> bool:
             programs = columns // tiles.block_v * sequences * heads
             return programs <= multiprocessors * self.states_held(ba, tiles, target)
 
-        # `legal` runs widest first: the last of those in one wave is the narrowest.
-        chosen = next((tiles for tiles in reversed(legal) if one_wave(tiles)), legal[0])
-        if one_wave(chosen):
-            return chosen
-        programs = columns // chosen.block_v * sequences * heads
-        return self._walked(ba, chosen, target, programs // (multiprocessors * self.states_held(ba, chosen,
-                                                                                                  target)))
+        if not one_wave(chosen):
+            programs = columns // chosen.block_v * sequences * heads
+            return self._walked(ba, chosen, target,
+                                programs // (multiprocessors * self.states_held(ba, chosen, target)))
+        # Narrower only while the fast backward holds where it held at the block given way from.
+        held = trains(trained)
+        for index in range(trained + 1, len(blocks)):
+            tiles = staged(index)
+            if tiles is None or not one_wave(tiles) or (held and not trains(index)):
+                break
+            chosen = tiles
+        return chosen
 
     def _walked(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
                 waves: int) -> mainloop.Tiles:

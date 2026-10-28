@@ -45,7 +45,8 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
         "--trainer.name", "tickets", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.steps", "2", "--trainer.eval-every", "2",
         "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
-        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
+        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32",
+        "--trainer.scored-to", str(tmp_path / "scored")],
         default=DecisionRunConfig(data=asked(train), validation=asked(held)))
     assert config.data.facts()["batch"] == 8
     assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
@@ -56,6 +57,9 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     answer = decide("I was billed twice", {"team": Choice("Which team?", ["billing", "technical", "sales"])})
     assert answer["team"].choice in ("billing", "technical", "sales")
     assert decide.name == "tickets" and set(decide.calibration.temperatures.types) == {"choice"}
+    # The run kept every validation batch's decisions of its evaluation, as `--trainer.scored-to` asked.
+    kept = sorted(path.name for path in (tmp_path / "scored" / "step-2").iterdir())
+    assert kept and kept == [f"val-{batch:05d}.npz" for batch in range(len(kept))]
 
 
 def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_their_summary(tmp_path):

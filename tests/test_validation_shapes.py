@@ -59,6 +59,40 @@ def test_every_validation_split_reads_in_its_trainings_shapes():
     assert shapes["two"]["options"][-1] >= 7
 
 
+def test_a_run_measures_its_widths_over_examples_it_reads_once_each():
+    """A decision run over examples its read holds in memory, with no step that states their widths, has
+    its objective measure them as it lays the examples out, over training and validation alike: the run
+    binds the widest question either asks (7 options), and lays out each example once, the widths'
+    measure and the run's read being one pass."""
+    import collections
+
+    encoded: collections.Counter = collections.Counter()
+
+    class Counting(ByteTokenizer):
+        def encode(self, text, *, add_special_tokens=True):
+            encoded[text] += 1
+            return super().encode(text, add_special_tokens=add_special_tokens)
+
+    backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
+                                 max_seq_len=128, attention_impl="xla")
+    objective = DecisionObjective(backbone, tokenizer=Counting(), specials=SPECIALS, layout=LAYOUT,
+                                  shuffle_options=False)
+
+    def chain(split: str, options: int, count: int):
+        question = Choice("Which?", [f"o{index}" for index in range(options)])
+        return Memory([{"example": Example(f"{split} state {index}", {"q": question}, {"q": "o0"})}
+                       for index in range(count)]).batch(4)
+
+    _, readers = fitted(chain("train", 3, 8), {"val": chain("val", 7, 4)}, objective=objective.data())
+    states = [text for text in encoded if "state" in text]
+    assert len(states) == 12 and all(encoded[text] == 1 for text in states)
+    opened = readers["val"](DataPartition())
+    try:
+        assert np.shape(next(iter(opened))["options"])[-1] >= 7
+    finally:
+        opened.close()
+
+
 def test_a_scoring_rules_total_reads_its_answered_rows_alone():
     """A rule's total over a batch is the same whatever its unanswered rows hold, NaN among them: they
     are masked at the batch's shape, never read; and two batches of one shape with different counts of

@@ -583,6 +583,28 @@ def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
 
 
 @runs("sm90")
+@pytest.mark.parametrize("rows", [1, 65, 256, 257])
+@pytest.mark.parametrize("transpose_rhs", [False, True], ids=["forward", "input gradient"])
+def test_a_dense_projection_keeps_the_rows_at_a_pair_boundary(rows, transpose_rhs):
+    """A dense projection at one row, within a tile, at a pair and one row past it keeps every real row
+    through both matrix orientations. The interpreter takes the same dense fact as the native launch."""
+    def dew(x, w):
+        return mosaic_gpu.gmm(
+            x, w[None], jnp.asarray([rows], jnp.int32), tiles=PAIRED, transpose_rhs=transpose_rhs,
+            out_dtype=jnp.bfloat16, multiprocessors=2, interpret=True, dense=True)
+
+    def plain(x, w):
+        matrix = w.T if transpose_rhs else w
+        return jnp.dot(x, matrix, preferred_element_type=jnp.promote_types(x.dtype, jnp.float32)).astype(
+            x.dtype)
+
+    with generation.assumed("sm90"):
+        assert_as_exact(jax.jit(dew), jax.jit(plain), _dense_draw(rows, 128, 128),
+                        f"dense pair boundary {rows}, transpose_rhs={transpose_rhs}",
+                        seeds=SEEDS, truth_fn=plain)
+
+
+@runs("sm90")
 def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
     """A dense kernel gradient at depth 96 on Hopper through Triton's launches (`generation.chosen`): the
     tiles dividing 96 have 32 output rows, which Hopper's warpgroup MMA refuses, so a 64-row tile runs

@@ -55,6 +55,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle,
     bundle_of,
     extents,
+    reducing,
     refused,
     whole_tiles,
 )
@@ -249,7 +250,9 @@ class MosaicForward(_Mainloop[Tiles]):
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            bool(ba.arguments.get("residuals")), min(config.stages, steps))
-        return resources.shared_bytes(family, resources.Scope(program=allocations))
+        reduces = reducing(family, config.consumers, self.score_mod, self.output_mod)
+        return resources.shared_bytes(family, resources.Scope(program=allocations,
+                                                              reducing_warpgroups=reduces))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
@@ -446,7 +449,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         if not config.fused:
             launches.append(_dq_allocations(family, config, width, value_width, dtype,
                                             min(config.stages, padded_k // config.block_k)))
-        return max(resources.shared_bytes(family, resources.Scope(program=allocations))
+        reduces = reducing(family, config.consumers, self.score_mod)
+        return max(resources.shared_bytes(family, resources.Scope(program=allocations,
+                                                                  reducing_warpgroups=reduces))
                    for allocations in launches)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:

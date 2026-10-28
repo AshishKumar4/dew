@@ -533,13 +533,10 @@ def _product(call: _Call, lhs: tuple, rhs: tuple) -> list:
     products read registers (`Family.operands_in_registers`), its left operand `lhs` `(operand, rows,
     depth)` a step deep and its right one `rhs` `(operand, depth, columns)` a sub-step
     (`Family.fragment_depth`), each in the warps replicating it (`lhs_copies`, `rhs_copies`): the GEMM's own
-    rule (`resources.tile_registers`); none where they read shared memory (wgmma's)."""
-    family = call.family
-    if not family.operands_in_registers:
-        return []
+    rule (`resources.operand_fragments`, each operand's parts); none where they read shared memory."""
     (left, rows, depth), (right, _, columns) = lhs, rhs
-    return (_held(left, rows * family.lhs_copies, depth)
-            + _held(right, family.fragment_depth(depth), columns * family.rhs_copies))
+    return resources.operand_fragments(call.family, rows, depth, columns, left.stored, right.stored,
+                                       lhs_parts=left.parts, rhs_parts=right.parts)
 
 
 def _widest(*tiles: list) -> list:
@@ -1247,7 +1244,7 @@ def _last_write(call: _Call, keys: _Operand, k_ref, row, final_token, key_column
     write's row as a column's (`columns`, `_columns`), and its row, held to the fp32 recurrence outside the
     write product, as the portable math peels it (`_peeled_chunk_inputs`). A chunk past its document's end
     holds zeros after its tokens: its last slot's write left the last real one in the product, 2.0 times the
-    portable math's final memory from float64 under a steep decay (VisualOrca, interpreted and on an
+    portable math's final memory from float64 under a steep decay (interpreted and on an
     H100)."""
     family = call.family
 
