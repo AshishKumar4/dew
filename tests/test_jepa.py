@@ -645,7 +645,7 @@ def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_bl
 
 def test_an_explicit_momentum_count_keeps_its_law_and_none_reads_the_runs_progress(mask):
     """A momentum ramp over `momentum_steps` updates reads the update count, an explicit 0 holding the first
-    momentum at every update (optax's empty ramp); with none it ramps over the run's progress, 0 to 1,
+    momentum at every update (optax's empty ramp); with None it ramps over the run's progress, 0 to 1,
     to the last momentum at the run's end."""
     held = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=0).ema
     assert not held.progressed
@@ -653,6 +653,6 @@ def test_an_explicit_momentum_count_keeps_its_law_and_none_reads_the_runs_progre
     counted = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=10).ema
     assert not counted.progressed and float(counted.decay(10)) == pytest.approx(0.99)
     assert float(counted.decay(5)) == pytest.approx(0.945)
-    progressed = make_objective(mask, momentum=(0.9, 0.99)).ema
+    progressed = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=None).ema
     assert progressed.progressed
     assert [float(progressed.decay(at)) for at in (0.0, 0.5, 1.0)] == pytest.approx([0.9, 0.945, 0.99])
