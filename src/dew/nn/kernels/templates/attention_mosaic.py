@@ -55,6 +55,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle,
     bundle_of,
     extents,
+    layouts,
     reducing,
     refused,
     whole_tiles,
@@ -139,9 +140,9 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle (`bundle`),
         tiles its program takes (`whole_tiles`), a call the launch takes (`refusal`), and the block and
         registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
-        family = bundle(target.generation, ba.arguments["query"].dtype)
-        return (family is not None and config.family == generation.family(target.generation)
-                and whole_tiles(family, config) and self.refusal(ba, family) is None
+        found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
+        family = found.get(config.family)
+        return (family is not None and whole_tiles(family, config) and self.refusal(ba, family) is None
                 and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:

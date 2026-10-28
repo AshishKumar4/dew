@@ -30,8 +30,9 @@ from dew.nn.kernels.templates.attention import (
     whole,
 )
 
-QUALIFIED = frozenset({mosaic_sm90.WGMMA.name})
-"""The instruction families the attention mainloop is qualified on: wgmma's. mma.sync's bundle
+QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
+"""The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
+feed their own rings (`mosaic_sm90.FED`). mma.sync's bundle
 (`bundles.of`) does not yet pass Mosaic GPU's layout inference in the attention programs (its MMA layouts'
 stores and transposed views), so its calls take the frozen Triton mainloop by legality."""
 
@@ -44,12 +45,22 @@ def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
     return family if family is not None and family.name in QUALIFIED else None
 
 
+def layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family, ...]:
+    """The bundles a launch of the attention mainloop takes on a device of `generation_name` for operands of
+    `dtype`, in preference order (`bundles.layouts`: a producer's layout, then on warpgroup MMA the layout
+    whose consumers feed their own rings, `mosaic_sm90.FED`), where its family is qualified (`bundle`)."""
+    if generation_name is None or bundle(generation_name, dtype) is None:
+        return ()
+    return tuple(family for family in bundles.layouts(generation_name, dtype) if family.name in QUALIFIED)
+
+
 def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
-    """The bundle `tiles` run on: the current device's (`generation.gpu_target`), whose family their legality
-    matched (`MosaicForward.legal`)."""
-    family = bundle(generation.gpu_target().generation, dtype)
-    if family is None or family.name != tiles.family:
-        raise ValueError(f"{tiles}: this device's attention bundle is {family.name if family else None}")
+    """The bundle `tiles` run on: the current device's (`generation.gpu_target`) layout their family names,
+    which their legality matched (`MosaicForward.legal`)."""
+    found = {family.name: family for family in layouts(generation.gpu_target().generation, dtype)}
+    family = found.get(tiles.family)
+    if family is None:
+        raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
     return family
 """The instruction families this mainloop runs on (`generation.family`), each by its bundle: wgmma's. A
 family without one (mma.sync's, until its thin mainloop) takes another mainloop (`MosaicForward.eligible`,
