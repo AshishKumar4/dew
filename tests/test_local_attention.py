@@ -150,7 +150,7 @@ def test_packed_documents_restart_their_windows_and_chunks(span, implementation)
 
 
 @pytest.mark.parametrize("implementation", ["xla", "template"])
-@pytest.mark.parametrize("given", ["origin", "repeated", "wide"])
+@pytest.mark.parametrize("given", ["origin", "repeated", "wide", "narrow"])
 @pytest.mark.parametrize("length", [12, 8], ids=["banded", "dense"])
 def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, length, implementation):
     """A chunk is cut at each token's place counted from the place its
@@ -162,13 +162,17 @@ def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, le
     band once read the given places within its two blocks and missed a
     chunk's earlier keys. Places given from 2^32 + 1 (64-bit), chunks of 3,
     cut where their own integers say: narrowed to 32 bits first, they would
-    move every boundary (the template's runs, `chunk_runs`)."""
-    chunk, origin = (3, 2 ** 32 + 1) if given == "wide" else (4, 2)
+    move every boundary; int8 places in chunks of 128, past their largest,
+    are all one chunk (the template's runs, `chunk_runs`)."""
+    chunk, origin = {"wide": (3, 2 ** 32 + 1), "narrow": (128, 0)}.get(given, (4, 2))
     rows = np.arange(length)
     places = rows + origin if given in ("origin", "wide") else rows
     keep = (rows[None, :] <= rows[:, None]) & (places[:, None] // chunk == places[None, :] // chunk)
 
     def band(q, k, v):
+        if given == "narrow":
+            return local_attention(q, k, v, chunk=chunk, places=jnp.arange(length, dtype=jnp.int8),
+                                   implementation=implementation)
         positions = (jnp.arange(length) + origin if given in ("origin", "wide")
                      else jnp.zeros((length,), jnp.int32))
         places = counted_places(positions=positions)
