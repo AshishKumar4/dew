@@ -277,9 +277,12 @@ class Trainer(Generic[Loss, Effects]):
         built = isinstance(optimizer, optax.GradientTransformation)
         self._config = None if built else optimizer
         self._optimizer = objective.optimizer(optimizer) if built else None
-        from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
-        self.key = request_key(key)
+        if self.seed is None and not isinstance(key, jax.Array):
+            raise ValueError("key must be an integer seed or a single JAX PRNG key")
+        # A seed's key is made when first read, after `fit` readies the process (`key`): making it here
+        # would open JAX's backend before the process's flags and cache are set.
+        self._given_key, self._key = key, None
         self.mesh = mesh
         self.layout = layout
         self._microbatches = microbatches
@@ -414,6 +417,16 @@ class Trainer(Generic[Loss, Effects]):
             ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
             key=run_key,
         )
+
+    @property
+    def key(self) -> jax.Array:
+        """The run's PRNG key: the one it was given, or its seed's, made when first read, which `fit`
+        does after it readies the process (`ready_process`), so constructing a trainer opens no
+        backend before the process's flags and compilation cache are set."""
+        if self._key is None:
+            from dew.nn.inputs import request_key
+            self._key = request_key(self._given_key)
+        return self._key
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
