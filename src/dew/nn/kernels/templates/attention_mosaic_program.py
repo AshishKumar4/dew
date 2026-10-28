@@ -166,20 +166,6 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     if family.copy_extent is not None and widest > family.copy_extent:
         return (f"the Mosaic mainloop loads a head {widest} wide in one copy, past the "
                 f"{family.copy_extent} one moves (`Family.copy_extent`)")
-    # The hooks as a launch runs them: on its family's least tile, its values in whole swizzled rows.
-    unit = math.lcm(family.role_rows, family.column_unit(dtype))
-    return unlowered(hooks, (unit, unit), _width(value_width, family, dtype))
-
-
-def unlowered(hooks: Hooks, tile: tuple[int, int], value_width: int) -> str | None:
-    """Why Mosaic GPU cannot lower `hooks` on this mainloop's tiles (`tile`, its outputs `value_width` wide),
-    or None: a hook that forms an array of a unit axis beside a longer one (`q_pos[:, :1]`, a reshape), whose
-    every operation jax 0.11.2's Mosaic GPU layout inference finds no layout for. A legality rule, which
-    the route's chooser reads to send such a call to another route, until the fork's layout inference
-    takes unit axes (ledger row 1428)."""
-    if any(_unit_axis(jaxpr) for jaxpr in _hook_jaxprs(hooks, tile, value_width)):
-        return ("the Mosaic mainloop takes no hook that forms a unit axis beside a longer one (Mosaic GPU's "
-                "layout inference finds no layout for it)")
     return None
 
 
@@ -241,18 +227,6 @@ def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:
         for inner in jax_core.jaxprs_in_params(eqn.params):
             names |= _primitives(inner)
     return names
-
-
-def _unit_axis(jaxpr: jax_core.Jaxpr) -> bool:
-    """Whether any operation of `jaxpr`, or of a jaxpr inside it, gives a two-dimensional array of a unit
-    axis beside a longer one."""
-    for eqn in jaxpr.eqns:
-        shapes = [getattr(var.aval, "shape", ()) for var in eqn.outvars]
-        if any(len(shape) == 2 and 1 in shape and max(shape) > 1 for shape in shapes):
-            return True
-        if any(_unit_axis(inner) for inner in jax_core.jaxprs_in_params(eqn.params)):
-            return True
-    return False
 
 
 def _columns(array: jax.Array, unit: int) -> jax.Array:
