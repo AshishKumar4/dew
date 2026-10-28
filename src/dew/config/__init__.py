@@ -1100,6 +1100,24 @@ class RunConfig:
         keeps the source as it is). Every run kind that starts from a source loads it with these."""
         return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen)}
 
+    def built_fresh(self) -> None:
+        """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
+        `Pretrained.load` builds of a source (`source_keywords`) reaches nothing such a run builds."""
+        if self.source != SourceOptions():
+            raise ValueError(f"--source says what a run builds of the source it loads, and this "
+                             f"{type(self).__name__} loads none: its model is built from --model, whose "
+                             "own fields say it; or start the run from a source")
+
+    def sourced_model(self) -> None:
+        """Refuse a `model` name in a run whose source decides its architecture: such a run reads its
+        model's fields' few choices alone, and a name other than its kind's own would be dropped."""
+        (declared,) = (field for field in dataclasses.fields(self) if field.name == "model")
+        default = (declared.default if declared.default_factory is dataclasses.MISSING
+                   else declared.default_factory())
+        if self.model.name != default.name:
+            raise ValueError(f"--model names {self.model.name}, and the source this {type(self).__name__} "
+                             "starts from decides its architecture; name none")
+
     def check_resume(self, saved: Mapping[str, object]) -> None:
         """Refuse to resume the run whose record is `saved` as this one where they train different
         things: another class, or a field outside `RESUMABLE` that differs. A changed `rope_theta`
@@ -1232,6 +1250,7 @@ class RunConfig:
         if self.objective is None or self.lora is not None:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
+        self.built_fresh()
         objective = self.objective.build(model=self.model.build())
         scored = self.validation_metrics(validates=self.validation is not None)
         return Prepared(self, lambda name: self.train(objective, self.chain(), name=name, metrics=scored,
@@ -1366,6 +1385,21 @@ class RunConfig:
         return dataclasses.replace(self, objective=dataclasses.replace(
             stated, defaults={**stated.defaults, **resolved}))
 
+    def check_process(self) -> None:
+        """Refuse to train in a process that does not carry the run's process options
+        (`dew.training.runtime.unprepared`): `run()` and `dew train` set them up before JAX opens a
+        backend (`prepare_process`), and a run trained after `prepare()` in a process nothing set up
+        with them would drop them."""
+        from dew.training.runtime import unprepared
+
+        process = self.trainer
+        missed = unprepared(process.multi_host, process.xla_flags, process.compilation_cache_dir)
+        if missed:
+            raise ValueError(f"trainer.{', trainer.'.join(missed)} set the process up before JAX opens a "
+                             "backend, as `run()` and `dew train` do (`prepare_process`), and this process "
+                             "carries none of it: train the run through `run()`, or call prepare_process "
+                             "with them before anything calls JAX")
+
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None,
@@ -1401,6 +1435,7 @@ class RunConfig:
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
+        self.check_process()
         dataset, validation = self.compiled(objective.data(), dataset, validation)
         # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
         suites = self.suites(dataset, validation)
