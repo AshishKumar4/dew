@@ -214,8 +214,9 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
         # leading axis where it has a row axis.
         rowed = [None if segment_ids is None else document_ids(segment_ids)[0], block_groups, image_groups,
                  key_valid, key_runs, pair[0], query_slots]
-        rows = max([jnp.shape(x)[0] for x in (key_value_seq_lengths, key_value_seq_starts) if x is not None]
-                   + [jnp.shape(x)[0] for x in rowed if x is not None and jnp.ndim(x) >= 2], default=1)
+        batches = [(jnp.shape(x)[0],) for x in (key_value_seq_lengths, key_value_seq_starts) if x is not None]
+        batches += [(jnp.shape(x)[0],) for x in rowed if x is not None and jnp.ndim(x) >= 2]
+        rows = int(np.broadcast_shapes(*batches, (1,))[0])
     lengths, starts = (None if x is None else jnp.asarray(x, jnp.int32)
                        for x in (key_value_seq_lengths, key_value_seq_starts))
     positions = None
@@ -1149,22 +1150,23 @@ def triton_attention(query, key, value, causal: bool):
 
 def template_attention(query, key, value, causal: bool, sliding_window, *, sinks, softcap, segment_ids,
                        lengths, starts, block_groups=None, image_groups=None, key_valid=None, key_runs=None,
-                       places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None):
+                       places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None, bias=None):
     """The attention template's route (`attention_route.attend`) over the call's visibility as spans
     (`key_spans`): its causality, window, documents (`segment_ids`, or `CrossDocuments` aligned to their last
     keys), key lengths and starts, block and image groups, and key validity and counted places, with
-    probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook and sinks are
-    the softmax's initial state. On a mesh it runs per shard (`_per_shard`), as the decode kernel does: the
-    key heads repeat until the tensor axes split them, the sinks split with their heads, and the ids, lengths,
-    starts, groups, validity and places with their rows. Its requirements
-    (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
+    probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook, a `bias` one
+    term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the keys' logical places) a key score hook added after
+    it (`template.key_biased`), and sinks are the softmax's initial state. On a mesh it runs per shard
+    (`_per_shard`), as the decode kernel does: the key heads repeat until the tensor axes split them, the
+    sinks split with their heads, and the ids, lengths, starts, groups, validity and places with their rows.
+    Its requirements (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
     """
     if sinks is not None and sinks.shape != (query.shape[2],):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
 
     def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None,
               block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
-              global_rows=None, global_heads=None, seed=None):
+              global_rows=None, global_heads=None, seed=None, bias=None):
         batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
         spans = key_spans(queries, keys, causal, sliding_window, segment_ids, lengths, starts,
                           block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
@@ -1177,8 +1179,10 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                                     dropout_places.queries, dropout_places.keys)
         elif seed is not None and global_rows is not None and global_heads is not None:
             drop = template.Dropout(seed, global_rows, global_heads, dropout_rate)
+        capped = None if softcap is None else functools.partial(template.capped, softcap)
         hooks = template.Hooks(
-            score_mod=None if softcap is None else functools.partial(template.capped, softcap),
+            score_mod=capped if bias is None else functools.partial(template.key_biased, capped),
+            score_params=() if bias is None else (template.Param(bias[:, :, 0], template.Kind.KEY),),
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)
         return attention_route.attend(query, key, value, spans, hooks)
@@ -1194,7 +1198,10 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                       image_groups=(image_groups, ("activation_batch", None)),
                       key_valid=(key_valid, ("activation_batch", None)),
                       key_runs=(key_runs, ("activation_batch", None, None, None)),
-                      places=(places, ("activation_batch", None)), seed=(dropout_seed, (None,)))
+                      places=(places, ("activation_batch", None)), seed=(dropout_seed, (None,)),
+                      bias=(None if bias is None else jnp.broadcast_to(
+                          bias, (query.shape[0], query.shape[2], 1, key.shape[1])),
+                            ("activation_batch", "activation_heads", None, None)))
 
 
 def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
@@ -1504,7 +1511,7 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                                  starts=key_value_seq_starts, block_groups=block_groups,
                                  image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
                                  places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-                                 dropout_places=dropout_places)
+                                 dropout_places=dropout_places, bias=bias)
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
@@ -1759,6 +1766,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                     or key_valid is not None or key_runs is not None
                     or (places is not None and sliding_window is not None)),
         mask=mask is not None, bias=bias is not None,
+        key_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] == 1
+                  and jnp.dtype(bias.dtype).itemsize <= 4),
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
