@@ -34,8 +34,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import fla_gdn, recurrence
-from dew.nn.kernels import recurrence_algebra as algebra
+from dew.nn.kernels import fla_gdn, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     Sequences,
