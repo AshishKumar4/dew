@@ -32,7 +32,7 @@ from test_attention_template import (
     STARTS,
     block_groups,
     cross_documents,
-    dews_mask,
+    case_keep,
     geometry,
     key_validity,
     own_documents,
@@ -350,12 +350,12 @@ def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_refere
 def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
     groups, or key validity and counted places, documents and a window it draws over the mask its spans
-    mean, so it is on par (check 1) with one given that mask (`dews_mask`) under the same key, whose float64
+    mean, so it is on par (check 1) with one given that mask (`case_keep`) under the same key, whose float64
     run is the truth: a call that drew over other keys, or dropped others, would sit far from it."""
     case = CASES[name]
     dropped = functools.partial(scaled_dot_product_attention, dropout_rate=0.25,
                                 dropout_rng=jax.random.key(3), deterministic=False)
-    spanned, mask = keywords(case), jnp.asarray(dews_mask(case))[:, None]
+    spanned, mask = keywords(case), jnp.asarray(case_keep(case))[:, None]
 
     def blocked(query, key, value):
         return dropped(query, key, value, **spanned)
