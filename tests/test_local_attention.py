@@ -149,9 +149,10 @@ def test_packed_documents_restart_their_windows_and_chunks(span, implementation)
                     f"{implementation} packed {span}", seeds=SEEDS['packed'])
 
 
-@pytest.mark.parametrize("given", ["origin", "repeated"])
+@pytest.mark.parametrize("implementation", ["xla", "template"])
+@pytest.mark.parametrize("given", ["origin", "repeated", "wide"])
 @pytest.mark.parametrize("length", [12, 8], ids=["banded", "dense"])
-def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, length):
+def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, length, implementation):
     """A chunk is cut at each token's place counted from the place its
     document's first token is given (`counted_places`): places given from 2
     put the first boundary after two tokens, as a continuation's whole pass
@@ -159,17 +160,24 @@ def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, le
     sharing a place give) still chunk the tokens by their count. The band (12
     tokens, chunks of 4) and the dense call (8) read the same keys, where the
     band once read the given places within its two blocks and missed a
-    chunk's earlier keys."""
-    positions = jnp.arange(length) + 2 if given == "origin" else jnp.zeros((length,), jnp.int32)
+    chunk's earlier keys. Places given from 2^32 + 1 (64-bit), chunks of 3,
+    cut where their own integers say: narrowed to 32 bits first, they would
+    move every boundary (the template's runs, `chunk_runs`)."""
+    chunk, origin = (3, 2 ** 32 + 1) if given == "wide" else (4, 2)
     rows = np.arange(length)
-    places = rows + 2 if given == "origin" else rows
-    keep = (rows[None, :] <= rows[:, None]) & (places[:, None] // 4 == places[None, :] // 4)
-    def band(q, k, v):
-        places = counted_places(positions=positions)
-        return local_attention(q, k, v, chunk=4, places=places, implementation="xla")
+    places = rows + origin if given in ("origin", "wide") else rows
+    keep = (rows[None, :] <= rows[:, None]) & (places[:, None] // chunk == places[None, :] // chunk)
 
-    assert_as_exact(jax.jit(band), jax.jit(masked(np.broadcast_to(keep, (2, length, length)))), drawn(length),
-                    f"{given} places over {length}", seeds=SEEDS['given places'])
+    def band(q, k, v):
+        positions = (jnp.arange(length) + origin if given in ("origin", "wide")
+                     else jnp.zeros((length,), jnp.int32))
+        places = counted_places(positions=positions)
+        return local_attention(q, k, v, chunk=chunk, places=places, implementation=implementation)
+
+    with jax.enable_x64(given == "wide"):
+        assert_as_exact(jax.jit(band), jax.jit(masked(np.broadcast_to(keep, (2, length, length)))),
+                        drawn(length), f"{implementation} {given} places over {length}",
+                        seeds=SEEDS['given places'])
 
 
 @pytest.mark.parametrize("implementation", ["xla", "template"])
