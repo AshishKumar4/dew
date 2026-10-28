@@ -514,3 +514,104 @@ def test_the_model_decodes_as_it_scores_in_parallel():
     with jax.enable_x64(new_val=True):
         truth = np.asarray(model.clone(dtype=jnp.float64).apply(widened(params), ids))
     as_exact(jnp.stack(steps, axis=1), full[:, 3:], truth[:, 3:], "the decoded logits")
+
+
+def ssd_lm() -> CausalTransformer:
+    """Two SSD layers at widths the TPU's Pallas scan takes (`ssd_kernel_runs`): 4 heads of 64
+    channels, a state of 64, chunks of 64 over 128 tokens, a residual of 128 apart from every inner
+    width, in bf16 as a hybrid's step runs them."""
+    config = {"vocab_size": 64, "emb_features": 128, "num_layers": 2, "num_heads": 4, "mlp_features": 0,
+              "max_seq_len": 128, "tie_embeddings": False, "qk_norm": False, "dtype": jnp.bfloat16,
+              "mixer": {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 64, "state_size": 64,
+                        "n_groups": 1, "chunk_size": 64}}}
+    return CausalTransformer(**config)
+
+
+def stepped(model):
+    """`model`'s training step: the next-token loss's gradient over every parameter and the logits,
+    from the parameters and a row of 129 ids, compiled once."""
+    def loss(params, ids):
+        logits = model.apply({"params": params}, ids[:, :-1])
+        wide = jax.nn.log_softmax(logits.astype(jnp.promote_types(logits.dtype, jnp.float32)))
+        return -jnp.mean(jnp.take_along_axis(wide, ids[:, 1:, None], axis=-1)), logits
+    return jax.jit(jax.grad(loss, has_aux=True))
+
+
+def rowed(value) -> np.ndarray:
+    """`value` as rows over its last axis, float64; a vector one row."""
+    value = np.asarray(value, np.float64)
+    return value.reshape(-1, value.shape[-1]) if value.ndim > 1 else value[None]
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu",
+                    reason="needs a tpu, the one backend the ssd kernel runs on")
+def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_the_xla_scan():
+    """A Mamba-2 model's training step compiled on the TPU, its rows split over a mesh of every device
+    the process holds (each shard's scan its own Pallas call, `manual_map`): the logits and every
+    parameter's gradient against the same step on the XLA scan, its kernels chosen as on a CPU
+    (`generation.assumed`), both from the float64 step on the host. Over ORDERS orders of the
+    residual stream (tests/residual_orders.py), an exact symmetry, so only the rounding moves: each
+    output's RMS within FACTOR of the reference's and its worst row within ROW_FACTOR
+    (tests/reference_error.py's over-orders rules); the float64 step under an order first held to
+    the identity's within float64 rounding."""
+    from reference_error import (
+        ORDERS,
+        assert_as_exact_over_orders,
+        assert_computes_the_oracle,
+        assert_rows_as_exact_over_orders,
+        chain_roundings,
+    )
+    from residual_orders import orders, permuted, residual_width
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.ssd import ssd_kernel_runs
+
+    assert ssd_kernel_runs(64, 64, 64, "tpu", dtype=jnp.float32)
+    model, devices = ssd_lm(), jax.devices()
+    ids = np.asarray(jax.random.randint(jax.random.key(0), (2 * len(devices), 129), 0, 64))
+    variables = jax.device_get(model.init(jax.random.key(1), jnp.asarray(ids[:, :-1])))
+    units = residual_width(variables)
+
+    def ordered(result, order):
+        """The step's gradients with the residual's units in `order`, and its logits, which no order
+        moves."""
+        gradients, logits = result
+        return permuted({"params": gradients}, order)["params"], logits
+
+    # The float64 oracle runs on the host: a TPU emulates float64.
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        wide = stepped(model.clone(dtype=jnp.float64))
+        exact = jax.device_get(wide(widened(variables["params"]), ids))
+        last = orders(units, 2, seed=0)[-1]
+        found = jax.device_get(wide(permuted(widened(variables), last)["params"], ids))
+        roundings = chain_roundings(jax.make_jaxpr(wide)(widened(variables["params"]), ids))
+        for (path, leaf), true in zip(jax.tree_util.tree_leaves_with_path(found),
+                                      jax.tree.leaves(ordered(exact, last)), strict=True):
+            assert_computes_the_oracle(np.asarray(leaf), np.asarray(true),
+                                       f"the residual order {jax.tree_util.keystr(path)}",
+                                       roundings=roundings)
+
+    mesh = jax.sharding.Mesh(np.array(devices), ("data",))
+    placed = jax.device_put(ids, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
+    whole = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    kernel, xla = stepped(model), stepped(model)
+    distances: dict = {}
+    with jax.set_mesh(mesh):
+        for order in orders(units, ORDERS, seed=1):
+            params = jax.device_put(permuted(variables, order)["params"], whole)
+            truth = jax.tree_util.tree_leaves_with_path(ordered(exact, order))
+            found = {"dew": jax.device_get(kernel(params, placed))}
+            with generation.assumed("cpu"):
+                found["reference"] = jax.device_get(xla(params, placed))
+            for side, result in found.items():
+                for (path, held), leaf in zip(truth, jax.tree.leaves(result), strict=True):
+                    name = jax.tree_util.keystr(path)
+                    distances.setdefault((name, side), []).append(
+                        np.sqrt(np.mean(np.square(rowed(leaf) - rowed(held)), axis=1)))
+                    distances[name, "size"] = np.sqrt(np.mean(np.square(rowed(held)), axis=1))
+    for name in sorted({name for name, side in distances if side == "dew"}):
+        mine, theirs = np.stack(distances[name, "dew"]), np.stack(distances[name, "reference"])
+        assert_as_exact_over_orders(np.sqrt(np.mean(np.square(mine), axis=1)),
+                                    np.sqrt(np.mean(np.square(theirs), axis=1)), f"the step's {name}")
+        assert_rows_as_exact_over_orders(mine, theirs, f"the step's {name} row by row",
+                                         sizes=distances[name, "size"])
