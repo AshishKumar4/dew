@@ -52,6 +52,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle_of,
     extents,
     refused,
+    stated,
 )
 
 
@@ -86,23 +87,32 @@ def guarded_columns(family: mosaic.Family, value_width: int, dtype) -> int:
     return min(value_width, family.column_unit(dtype))
 
 
-def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles | None:
-    """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its consumers and
-    query blocks, and the widest of the family's key extents (`extents`) that divides the plain key tile, so
-    the plain launch's padded keys are whole tiles of it, whose live set a consumer's registers hold
-    (`resources.live_registers`): its shifted and unshifted sums of `columns` value columns fp32 carried,
-    beside a step's logits and weights fp32 and the two products the step forms (`algebra.stepped`). None
-    where none fits: the plain launch is then illegal at `tiles` (`MosaicForward.legal`)."""
-    budget = family.registers(tiles.consumers)
-    rows = tiles.block_q
-    carried = [(rows, columns, jnp.float32)] * 2
+GUARD_ROWS = 4
+"""The row statistics a guarded walk carries beside a plain one's maximum and denominator (`algebra.Guard`:
+each row's shift, reach, unshifted denominator and liveness), each held by the four threads an accumulator
+row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`guarded_tiles`)."""
 
-    def held(block: int) -> bool:
+
+def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles | None:
+    """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its query blocks, the
+    widest of the family's key extents (`extents`) that divides the plain key tile, so the plain launch's
+    padded keys are whole tiles of it, and the most of the plain launch's consumers, whose live set a
+    consumer's registers hold (`resources.live_registers`): its shifted and unshifted sums of `columns` value
+    columns fp32 and its rows' statistics (`GUARD_ROWS`) carried, beside a step's logits and weights fp32
+    and the two products the step forms (`algebra.stepped`). Uncounted, the statistics left 64 x 64 on two
+    consumers spilling 20 bytes a thread at heads 128 and 256 wide (ptxas, sm90a). None where none fits:
+    the plain launch is then illegal at `tiles` (`MosaicForward.legal`)."""
+    rows = tiles.block_q
+    carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
+
+    def held(block: int, consumers: int) -> bool:
         stepped = [(rows, block, jnp.float32)] * 2 + [(rows, columns, jnp.float32)] * 2
-        return resources.live_registers(family, carried, stepped) <= budget
+        return resources.live_registers(family, carried, stepped) <= family.registers(consumers)
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
-    return next((dataclasses.replace(tiles, block_k=block) for block in blocks if held(block)), None)
+    candidates = (dataclasses.replace(tiles, block_k=block, consumers=consumers)
+                  for consumers in range(tiles.consumers, 0, -1) for block in blocks)
+    return next((candidate for candidate in candidates if held(candidate.block_k, candidate.consumers)), None)
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -122,7 +132,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     def launch(form: algebra.Forward, live: jax.Array | None):
         if live is None:
             status, out = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks, tiles=tiles,
-                                  family=family, training=False, interpret=interpret)
+                                  family=family, training=False, interpret=interpret,
+                                  counted=form.natural == spec.natural)
             return out, status[0], status[1] > 0
         unit = guarded_columns(family, v.shape[-1], v.dtype)
         guarded = guarded_tiles(family, tiles, unit, v.dtype)
@@ -186,11 +197,12 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
     def launch(form: algebra.Forward, live: jax.Array | None):
         if live is None:
+            counted = form.natural == spec.natural
             found = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks, tiles=tiles,
-                            family=family, training=False, interpret=interpret, peaks=True)
+                            family=family, training=False, interpret=interpret, peaks=True, counted=counted)
             status, rows, anchors, others = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks,
                                                     tiles=tiles, family=family, training=True,
-                                                    interpret=interpret, anchors=found)
+                                                    interpret=interpret, anchors=found, counted=counted)
             split = Split(others, rows[2], rows[3], rows[4])
             # Each row's anchor's value row (`[B, H, Qp, Dv]`): its key head's at its key, gathered.
             batch, kv_heads, keys_count = v.shape[0], v.shape[2], v.shape[1]
@@ -476,7 +488,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
 def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, *,
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
             interpret: bool, columns: int | None = None, peaks: bool = False,
-            anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None):
+            anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -576,6 +588,12 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     kind = "peaks" if peaks else "training" if training else "forward"
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
+    # The model's products this launch owns (`stated`): the forward's two, a peak walk's `Q K^T` and a
+    # training walk's `P V` (its `Q K^T` recomputed); a rerun (a guarded launch, the fold's natural walk)
+    # none, as the FLOP count bounds a conditional by every branch, which would count the call twice.
+    widths = width if peaks else value.shape[-1] if training else width + value.shape[-1]
+    cost = (stated(spec, batch, heads, spec.queries or queries, widths, query, key, value) if counted
+            else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
-                         approx_math=approx_math, name=name)(query, key, value, *leaves)
+                         approx_math=approx_math, name=name, cost=cost)(query, key, value, *leaves)

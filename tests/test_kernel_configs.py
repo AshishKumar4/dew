@@ -5,6 +5,7 @@ are the verdict, runs none of them: the file carries no `kernel` mark."""
 
 import dataclasses
 import functools
+import os
 import tempfile
 from pathlib import Path
 
@@ -133,15 +134,23 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
-@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+CONFIG_CELLS = [(dtype, shape) for dtype in ("bfloat16", "float32")
+                for shape, case in support.COMPILED_SHAPES.items()
+                if not (dtype == "float32" and case["width"] > support.fla_gdn.WIDEST)]
+"""Each dtype beside each declared shape it compiles at: an fp32 call takes no keys past `fla_gdn.WIDEST`
+(`support.kernel_cases`)."""
+
+
+@pytest.mark.parametrize(("dtype", "shape"), CONFIG_CELLS)
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target, dtype):
-    """Each declared config at each declared shape, of each dtype apart (one test of both outlasted a CI
-    task's 240 seconds), lowered as on the GPU and compiled by XLA's CUDA backend for a compile-only device
-    on this CPU (tests/kernel_compile.py): it compiles, to no more shared memory than its GPU's block
-    holds. A kernel that does not compile (a two-result inline asm, a mixed-dtype dot) fails here and never
-    reaches a GPU."""
-    found = compile_kernels(support.kernel_cases(target, (dtype,)), target)
+def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target, dtype, shape):
+    """Each declared config at each declared shape, of each dtype and shape apart (one test of a dtype's
+    every shape outlasted the suite's 240 s target, row 1849), lowered as on the GPU and compiled by XLA's
+    CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py): it compiles, to no more
+    shared memory than its GPU's block holds. A kernel that does not compile (a two-result inline asm, a
+    mixed-dtype dot) fails here and never reaches a GPU."""
+    cases = [case for case in support.kernel_cases(target, (dtype,)) if case.name.split("/")[4] == shape]
+    found = compile_kernels(cases, target)
     assert found, "the compile gate must not be vacuous"
     assert not failures(found), "\n".join(failures(found))
 
@@ -275,7 +284,7 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     Mosaic for a compile-only device of the generation on this CPU through ptxas: within the block's shared
     memory, spilling nothing (a derived tile holds its registers: `Template.legal`). A GPU whose family has
     no bundle (`bundles.of`: a B200's tcgen05, consumer Blackwell's TMA-fed mma.sync) runs none."""
-    from kernel_compile import compile_mosaic_kernels
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     cases = _gemm_mainloop_cases(generation_name)
     # Every form the generation's family runs derives a tile at these shapes: an eligibility regression
@@ -287,19 +296,9 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
         forms |= {"kernel gradient exact fp32", "normed biased forward", "normed kernel gradient"}
     assert {case.name.split(" Tiles(")[0] for case in cases} == forms
     found = compile_mosaic_kernels(cases, generation_name)
-    unreported = [record["name"] for record in found if not record.get("kernels")]
-    assert len(found) == len(cases) and not unreported, unreported
     # A spill is the register estimate's defect: the tile was derived to hold them.
-    failed = failures([record for record in found
-                       if "error" in record or record["shared"] > record["limit"]])
-    for record in found:
-        for kernel in record.get("kernels", ()):
-            outside = kernel["shared"] > record["limit"] or kernel["tmem"] > record["tmem_limit"]
-            if kernel["unread"] or outside or kernel["spilled"] > 0:
-                failed.append(f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes (limit "
-                              f"{record['limit']}), {kernel['spilled']} bytes spilled, "
-                              f"unread {kernel['unread']}")
-    assert not failed, "\n".join(failed)
+    failed = mosaic_failures(found)
+    assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -312,7 +311,7 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     most (`_gemm_mainloop_cases(every_consumer_count=True)`); hooked and exactly summed forms on warpgroup
     MMA alone, where the launches take them. Every form and count must be present and lower, within the
     block, spilling nothing. No version guard skips it: a JAX that breaks the contract fails here."""
-    from kernel_compile import compile_mosaic_kernels
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
@@ -326,11 +325,7 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     got = {case.name.split(" Tiles(")[0] for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
     found = compile_mosaic_kernels(cases, generation_name)
-    failed = failures([record for record in found
-                       if "error" in record or not record.get("kernels")
-                       or (record.get("shared") or 0) > record["limit"]])
-    failed += [f"{record['name']} {kernel['kernel']}: {kernel['spilled']} bytes spilled"
-               for record in found for kernel in record.get("kernels", ()) if (kernel["spilled"] or 0) > 0]
+    failed = mosaic_failures(found)
     assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
@@ -375,16 +370,75 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     assert not failed, "\n".join(failed)
 
 
+@pytest.mark.parametrize("generation_name", generations("sm80"))
+def test_a_program_that_launches_no_triton_kernel_gives_no_evidence(generation_name):
+    """A case whose program XLA compiles without a Triton kernel (an elementwise op, XLA's own fusion)
+    states no kernel's shared bytes: the gate fails it, never reading the missing launch as none used
+    (row 1381)."""
+    operand = jax.ShapeDtypeStruct((8,), jnp.float32)
+    case = support.KernelCase("no Triton kernel", lambda: (lambda x: x * 2, (operand,)))
+    assert failures(compile_kernels([case], generation_name))
+
+
+def test_each_triton_call_needs_a_launch_of_its_own():
+    """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
+    A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two
+    `probe` launches, or without `probe_headroom`'s, it has no evidence (row 1381), where matching a launch
+    by a name's prefix took one launch for both calls."""
+    from jax.experimental import pallas as pl
+    from kernel_compile import _compiled, triton_evidence
+
+    def double(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2
+
+    def program(x):
+        shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+
+        def call(name, operand):
+            return pl.pallas_call(double, out_shape=shape, name=name)(operand)
+        return call("probe", call("probe_headroom", call("probe", x)) + 1)
+
+    operand = jax.ShapeDtypeStruct((16, 128), jnp.float32)
+    compiled = _compiled(support.KernelCase("probe", lambda: (program, (operand,))), "sm80", {})
+    assert compiled is not None
+    thunks, programs = compiled
+    assert "shared" in triton_evidence(programs, thunks)
+    for missing, said in ((" probe grid", "probe"), (" probe_headroom grid", "probe_headroom")):
+        lines = "\n".join(thunks).splitlines()
+        dropped = next(index for index, line in enumerate(lines) if missing in line)
+        without = ["\n".join(lines[:dropped] + lines[dropped + 1:])]
+        assert triton_evidence(programs, without) == {
+            "error": f"no launch of its own states the shared bytes of {said}"}
+
+
+def test_records_a_failed_process_of_their_own_wrote_are_refused():
+    """A test that compiles Mosaic GPU kernels after another capability's runs again in a pytest process of
+    its own (`kernel_compile.compiled_apart`), whose records are written before its own checks and teardown:
+    a process that wrote them and then failed gives none (row 1877)."""
+    from kernel_compile import OWN_PROCESS, compiled_apart
+
+    if OWN_PROCESS in os.environ:
+        Path(os.environ[OWN_PROCESS]).write_text("[]")
+        pytest.fail("this process failed after it wrote its records, as a failed teardown does")
+    with pytest.raises(RuntimeError):
+        compiled_apart()
+
+
 def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
     spilling fails; within all three, none."""
     from kernel_compile import mosaic_failures, mosaic_kernels
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
-    record = {"name": "case", "limit": 2048, "shared": 0, "tmem_limit": 512, "kernels": [within]}
+    record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
+    # A kernel whose reports state no resources, spilling nothing, is no evidence: it fails, as a record
+    # with no kernel does (row 1877: a contract gate read only its shared count and positive spills).
+    unstated = {**within, "unread": ["shared bytes", "tensor memory columns"], "shared": None, "tmem": None}
+    assert mosaic_failures([{**record, "kernels": [unstated]}])
+    assert mosaic_failures([{**record, "kernels": []}])
     # The program's own refusal of a block past shared memory fails it whatever its Mosaic kernels say.
     assert mosaic_failures([{**record, "shared": 4096}])
     # Either report without the other, or a report without a field, is read as missing, not as within.

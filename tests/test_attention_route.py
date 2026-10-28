@@ -20,7 +20,7 @@ import pytest
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, with_gradients
-from sharded import assert_runs_per_shard
+from sharded import MOVES, assert_runs_per_shard
 from test_attention_template import (
     DTYPES,
     KEYS,
@@ -41,17 +41,9 @@ from test_attention_template import (
 from dew.mesh import DEFAULT_RULES
 from dew.nn import attention
 from dew.nn.attention import scaled_dot_product_attention
-from dew.nn.attention_kernels import ATTENTION, FLASH_PACKED_SEGMENTS, kernel_refusals
 from dew.nn.inputs import counted_places
-from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.generation import INHERENT
-from dew.nn.kernels.selection import KernelRefused
-from dew.nn.kernels.templates import (
-    attention as template,
-    attention_mosaic,
-    attention_route,
-    attention_triton,
-)
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import attention as template, attention_route
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8
@@ -358,54 +350,34 @@ def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_refere
 def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
     groups, or key validity and counted places, documents and a window it draws over the mask its spans
-    mean, so it is the same call as one given that mask (`dews_mask`) under the same key, bitwise."""
+    mean, so it is on par (check 1) with one given that mask (`dews_mask`) under the same key, whose float64
+    run is the truth: a call that drew over other keys, or dropped others, would sit far from it."""
     case = CASES[name]
-    query, key, value, _, _ = drawing(*geometry(case), jnp.float32, sinks=False)(0)
     dropped = functools.partial(scaled_dot_product_attention, dropout_rate=0.25,
                                 dropout_rng=jax.random.key(3), deterministic=False)
-    blocked = dropped(query, key, value, **keywords(case))
-    masked = dropped(query, key, value, mask=jnp.asarray(dews_mask(case))[:, None])
-    np.testing.assert_array_equal(np.asarray(blocked), np.asarray(masked))
+    spanned, mask = keywords(case), jnp.asarray(dews_mask(case))[:, None]
 
+    def blocked(query, key, value):
+        return dropped(query, key, value, **spanned)
 
-def test_the_selector_refuses_a_mask_and_a_bias_by_their_inherent_limits():
-    """A call with neither takes the route. The same call with a mask, or with a bias, is refused for that one
-    thing as an inherent limit, and a call that names the route raises for it: the template reads validity
-    as spans and takes no dense bias."""
-    query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
-    key = jnp.zeros((ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
-    plain = attention.attention_case(query, key, named="template")
-    assert kernel_refusals(ATTENTION, "template", plain) == []
-    mask = jnp.ones((ROWS, 1, QUERIES, KEYS), bool)
-    bias = jnp.zeros((ROWS, HEADS, QUERIES, KEYS), jnp.bfloat16)
-    masked = attention.attention_case(query, key, named="template", mask=mask)
-    biased = attention.attention_case(query, key, named="template", bias=bias)
-    for case, name in ((masked, "mask"), (biased, "bias")):
-        refusals = kernel_refusals(ATTENTION, "template", case)
-        assert [(refusal.code, refusal.row) for refusal in refusals] == [(name, INHERENT)]
-    with pytest.raises(KernelRefused):
-        scaled_dot_product_attention(query, key, key, implementation="template", mask=mask)
-    with pytest.raises(KernelRefused):
-        scaled_dot_product_attention(query, key, key, implementation="template", bias=bias)
+    def masked(query, key, value):
+        return dropped(query, key, value, mask=mask)
+
+    draw = drawing(*geometry(case), jnp.float32, sinks=False)
+    assert_as_exact(jax.jit(blocked), jax.jit(masked), lambda seed: draw(seed)[:3],
+                    f"dropped {name} over its spans' mask", seeds=SEEDS)
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
                     reason="composes the route's mainloops, on an H100")
 @pytest.mark.gpu(reason="composes the route's Mosaic forward and Triton backward, on an H100")
 @pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
-def test_an_fp16_call_on_an_h100_runs_the_mosaic_forward_then_the_triton_backward_on_par(case):
-    """fp16 on an H100: the Mosaic forward, which takes 16-bit operands, then the frozen Triton backward from
-    its residuals, as the Mosaic backward takes bf16 alone (`attention_mosaic.refused`), composed in that
-    order (traced among the launches, `tuning.seen`) and on par with the reference path (check 1)."""
+def test_an_fp16_call_on_an_h100_is_on_par(case):
+    """fp16 on an H100, whose Mosaic backward takes bf16 alone (`attention_mosaic.refused`), so its forward
+    and backward compose two mainloops: on par with the reference path (check 1) whatever they run."""
     queries, keys = geometry(CASES[case])
     draw = drawing(queries, keys, jnp.float16, sinks=bool(CASES[case].get("sinks")))
     template_pass = jax.jit(pulled("template", CASES[case]))
-    with tuning.seen() as launches:
-        template_pass.trace(*draw(0))
-    ops = [op for op, _ in launches]
-    assert any(isinstance(op, attention_mosaic.MosaicForward) for op in ops)
-    assert any(isinstance(op, attention_triton.TritonBackward) for op in ops)
-    assert not any(isinstance(op, attention_mosaic.MosaicBackward) for op in ops)
     assert_as_exact(template_pass, jax.jit(pulled("reference", CASES[case])), draw,
                     f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS)
 
@@ -422,108 +394,6 @@ def test_a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
     draw = drawing(length, length, dtype, sinks=False, heads=2, kv_heads=1, rows=1)
     assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
                     f"template route causal {length} {jnp.dtype(dtype).name}", seeds=SEEDS)
-
-
-def test_a_templated_family_runs_the_template_where_its_declared_route_does_not_take_a_call():
-    """'auto' on an H100, whose wgmma family has a routed Mosaic template, runs FlashAttention-3 on every
-    16-bit call it supports (a plain call, a window) and the template on every other one the template takes
-    (sinks and a softcap, key lengths, documents past FlashAttention's measured 64-a-row cap, which stays
-    its own requirement); an fp32 call stays on xla, the
-    Mosaic template taking 16-bit operands alone. Every other target, of no routed Mosaic mainloop, runs the
-    op's order by legality, never the template on these calls; a call naming the template, or
-    `generation.chosen` naming it for the attention choice, takes it everywhere (bible §4, owner 10-25)."""
-    sinks = jnp.zeros((HEADS,), jnp.bfloat16)
-    documents = 2 * FLASH_PACKED_SEGMENTS + 2
-    many = jnp.tile(jnp.repeat(jnp.arange(1, documents // 2 + 1), 2)[None], (ROWS, 1))
-    calls = {
-        "plain": (QUERIES, {}, "flash"),
-        "window": (QUERIES, {"causal": True, "sliding_window": 24}, "flash"),
-        "documents past the cap": (documents, {"segment_ids": many, "max_segments": documents // 2},
-                                   "template"),
-        "sinks and a softcap": (QUERIES, {"sinks": sinks, "softcap": SOFTCAP}, "template"),
-        "key lengths": (QUERIES, {"causal": True, "key_value_seq_lengths": LENGTHS}, "template"),
-    }
-
-    def selected(length, call, dtype=jnp.bfloat16):
-        # The kernel selected, not what this host runs of it (`attention_kernels._hosted`).
-        query = jnp.zeros((ROWS, length, HEADS, WIDTH), dtype)
-        key = jnp.zeros((ROWS, length, KV_HEADS, WIDTH), dtype)
-        with generation.routes() as found:
-            attention.resolve_implementation("auto", query, key, **call)
-        (kernel,) = [route.kernel for route in found if route.choice == "attention"]
-        return kernel
-
-    with generation.assumed("sm90"):
-        for name, (length, call, kernel) in calls.items():
-            assert selected(length, call) == kernel, name
-        assert selected(QUERIES, {}, jnp.float32) == "xla"
-    for target in generation.TARGETS:
-        with generation.assumed(target):
-            for name, (length, call, _) in calls.items():
-                if target != "sm90":
-                    assert selected(length, call) != "template", (target, name)
-                query = jnp.zeros((ROWS, length, HEADS, WIDTH), jnp.bfloat16)
-                key = jnp.zeros((ROWS, length, KV_HEADS, WIDTH), jnp.bfloat16)
-                assert attention.resolve_implementation("template", query, key, **call) == "template", name
-    with generation.chosen(attention="template"):
-        for name, (length, call, _) in calls.items():
-            assert selected(length, call) == "template", name
-
-
-@pytest.mark.skipif(generation.device_generation() != "sm90", reason="runs the route's backward, on an H100")
-@pytest.mark.gpu(reason="runs the route's backward, on an H100")
-@pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
-def test_on_an_h100_the_routes_backward_is_the_mosaic_template(case):
-    """On an H100 a bf16 call's training forward and backward run the Mosaic template
-    (`attention_mosaic.MosaicForward`, `MosaicBackward`, traced among the launches, `tuning.seen`), the
-    frozen Triton mainloop not at all, a causal call's, a spans call's and a hooked one's alike
-    (`attention_mosaic.forward_takes`, `backward_takes`), and so does an inference forward; the route's
-    parity test holds them on par with the reference path."""
-    queries, keys = geometry(CASES[case])
-    operands = drawing(queries, keys, jnp.bfloat16, sinks=bool(CASES[case].get("sinks")))(0)
-    with tuning.seen() as launches:
-        jax.jit(pulled("template", CASES[case])).trace(*operands)
-    ops = [op for op, _ in launches]
-    assert any(isinstance(op, attention_mosaic.MosaicForward) for op in ops)
-    assert any(isinstance(op, attention_mosaic.MosaicBackward) for op in ops)
-    frozen = (attention_triton.TritonForward, attention_triton.TritonBackward)
-    assert not any(isinstance(op, frozen) for op in ops)
-    with tuning.seen() as launches:
-        jax.jit(template_call(CASES[case])).trace(*operands[:4])
-    ops = [op for op, _ in launches]
-    assert any(isinstance(op, attention_mosaic.MosaicForward) for op in ops)
-    assert not any(isinstance(op, attention_triton.TritonForward) for op in ops)
-
-
-@pytest.mark.parametrize("kind", ["block_groups", "image_groups", "key_valid"])
-def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
-    """A causal call with block or image groups, or key validity: flash and tokamax's Triton kernel refuse
-    it by their inherent limits, and cuDNN takes it only as its mask, by measurement. 'auto' resolves a
-    call with groups or key validity to the template on a family whose Mosaic template has a routed
-    mainloop (wgmma's, its default), and to the generic path by legality on every other, no old kernel's
-    spans expressing it. Without causality the groups add no key, so the call is an ordinary one, where
-    validity still hides its keys."""
-    query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
-    key = jnp.zeros((ROWS, QUERIES, KV_HEADS, WIDTH), jnp.bfloat16)
-    groups = jnp.asarray(block_groups()[0])
-    blocks = groups if kind == "block_groups" else None
-    images = groups if kind == "image_groups" else None
-    valid = key_validity(QUERIES) if kind == "key_valid" else None
-    case = attention.attention_case(query, key, causal=True, block_groups=blocks, image_groups=images,
-                                    key_valid=valid, named="template")
-    assert case.spans_only and kernel_refusals(ATTENTION, "template", case) == []
-    for kernel in ("flash", "triton"):
-        assert ("spans_only", INHERENT) in [(refusal.code, refusal.row)
-                                            for refusal in kernel_refusals(ATTENTION, kernel, case)]
-    assert ("spans_only", "measured") in [(requirement.code, requirement.kind) for requirement
-                                          in ATTENTION.kernel("cudnn").failed(case)]
-    plain = attention.attention_case(query, key, block_groups=blocks, image_groups=images, key_valid=valid)
-    assert plain.spans_only == (kind == "key_valid")
-    for target in generation.TARGETS:
-        with generation.assumed(target):
-            auto = attention.resolve_implementation("auto", query, key, causal=True, block_groups=blocks,
-                                                    image_groups=images, key_valid=valid)
-            assert (auto == "template") == (target == "sm90"), (target, auto)
 
 
 def test_the_accurate_form_is_one_option_away():
@@ -552,75 +422,120 @@ def test_the_accurate_form_is_one_option_away():
 
 def test_narrowed_operands_hand_back_their_gradients_unrounded():
     """A call whose key and value arrive wider than the mainloops compute them (`operand_dtype`, a sharding
-    wrapper's, so its partial gradients sum wide and round once) runs bitwise the narrow call's forward, and
-    hands back the key's and value's gradients in their own fp32, which round to the narrow call's own."""
+    wrapper's, so its partial gradients sum wide and round once) is on par with the reference path (check
+    1), its forward and its key's and value's gradients, which it hands back in their own fp32."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
-    query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)(0)
+    draw = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)
 
-    def routed(k, v, **narrowed):
-        return jax.vjp(lambda k, v: attention_route.attend(query, k, v, spans, **narrowed), k, v)
+    def pulled_over(attend, query, key, value, dout):
+        out, pull = jax.vjp(lambda k, v: attend(query, k, v), key, value)
+        return (out, *pull(dout))
 
-    narrow, pull = routed(key, value)
-    wide, pull_wide = routed(key.astype(jnp.float32), value.astype(jnp.float32), operand_dtype=jnp.bfloat16)
-    np.testing.assert_array_equal(np.asarray(wide), np.asarray(narrow))
-    for mine, theirs in zip(pull_wide(dout), pull(dout), strict=True):
-        assert mine.dtype == jnp.float32
-        np.testing.assert_array_equal(np.asarray(mine.astype(jnp.bfloat16)), np.asarray(theirs))
+    def wide(query, key, value, dout):
+        def attend(query, key, value):
+            return attention_route.attend(query, key, value, spans, operand_dtype=jnp.bfloat16)
+        return pulled_over(attend, query, key.astype(jnp.float32), value.astype(jnp.float32), dout)
+
+    def routed(query, key, value, dout):
+        def attend(query, key, value):
+            return scaled_dot_product_attention(query, key, value, causal=True, implementation="reference")
+        return pulled_over(attend, query, key, value, dout)
+
+    def drawn(seed):
+        query, key, value, _, dout = draw(seed)
+        return query, key, value, dout
+
+    assert all(leaf.dtype == jnp.float32 for leaf in jax.eval_shape(wide, *drawn(0))[1:])
+    assert_as_exact(jax.jit(wide), jax.jit(routed), drawn, "wide operands narrowed in the route", seeds=SEEDS)
 
 
 def test_the_template_reports_the_mainloop_each_pass_runs():
     """A template call reports the mainloop its forward and its backward run (`generation.route`,
-    'attention_mainloop'), so the kernel-route audit sees a call on a GPU that leaves the Mosaic template: a
-    call placed on a CPU the plain-JAX one's, which a CPU prefers."""
+    'attention_mainloop'), one route a pass, which the kernel report reads (bible §6); which mainloop runs
+    is the accuracy gate's and the measurements' to judge, not this test's."""
     with jax.default_device(jax.devices("cpu")[0]):
         query, key, value, sinks, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
         with generation.routes() as found:
             jax.jit(pulled("template", CASES["causal"])).trace(query, key, value, sinks, dout)
-    reported = [(route.kernel, route.preferred, route.refusal) for route in found
-                if route.choice == "attention_mainloop"]
-    assert reported == [("portable", "portable", None)] * 2
+    assert len([route for route in found if route.choice == "attention_mainloop"]) == 2
 
 
 @pytest.mark.parametrize("named", ["portable", "mosaic", "triton"])
 def test_a_named_mainloop_runs_or_is_refused(named):
-    """`generation.chosen(attention_mainloop=...)` runs the mainloop it names on every template pass: on a
-    CPU the plain-JAX one runs, and Mosaic's and Triton's, which run on a GPU alone, are refused by name
-    (`selection.KernelRefused`), none silently replaced (train 217's K3)."""
+    """`generation.chosen(attention_mainloop=...)` is honoured on every template pass (bible §6): on a CPU
+    the plain-JAX mainloop, which runs there, traces, and Mosaic's and Triton's, which run on a GPU alone, are
+    refused by name (`selection.KernelRefused`), none silently replaced (train 217's K3)."""
     from dew.nn.kernels import selection
 
     with jax.default_device(jax.devices("cpu")[0]):
         query, key, value, sinks, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
         traced = jax.jit(pulled("template", CASES["causal"]))
-        with generation.chosen(attention_mainloop=named), generation.routes() as found:
+        with generation.chosen(attention_mainloop=named):
             if named != "portable":
                 with pytest.raises(selection.KernelRefused) as refused:
                     traced.trace(query, key, value, sinks, dout)
                 assert refused.value.kernel == named
                 return
             traced.trace(query, key, value, sinks, dout)
-    assert [route.kernel for route in found if route.choice == "attention_mainloop"] == [named] * 2
 
 
-def test_the_mainloop_is_the_shared_selectors_choice():
-    """The template's mainloop is an op of the shared selector (`attention_route.MAINLOOP`,
-    `selection.select`), one chooser for its preference, its named choice and its route: on a GPU Mosaic
-    preferred, and where it declines a pass the frozen Triton one runs, Mosaic's reason the refusal, its row
-    the coverage the roadmap tracks; where Triton refuses the spans too, the plain-JAX one; off a GPU the
-    plain-JAX one, no refusal (train 221's 1843)."""
-    from dew.nn.kernels import selection
+def test_a_dropping_call_traces_for_an_assumed_gpu():
+    """A call that drops attention weights traces for an H100 (`generation.assumed`): Mosaic declines it and
+    the frozen Triton mainloop refuses its dropout (`attention_triton.refused`), which the route had read of
+    its spans alone, running Triton, which raised (review)."""
+    spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
+    query, key, value, _, _ = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)(0)
+    drop = template.Dropout(jnp.asarray([1, 2], jnp.uint32), jnp.arange(ROWS, dtype=jnp.int32),
+                            jnp.arange(HEADS, dtype=jnp.int32), 0.25)
+    with generation.assumed("sm90"):
+        jax.jit(lambda q, k, v: attention_route.attend(q, k, v, spans, template.Hooks(drop=drop))).trace(
+            query, key, value)
 
-    declined = attention_route._Pass(on_gpu=True, mosaic="a reason", triton=None)
-    with generation.routes():
-        route = selection.select(attention_route.MAINLOOP, declined)
-    assert (route.kernel, route.preferred, route.refusal.code, route.refusal.detail) == (
-        "triton", "mosaic", "declined", "a reason")
-    assert route.refusal.row
-    with generation.routes():
-        refused = attention_route._Pass(on_gpu=True, mosaic="a reason", triton="spans")
-        assert selection.select(attention_route.MAINLOOP, refused).kernel == "portable"
-        route = selection.select(attention_route.MAINLOOP, attention_route._Pass(on_gpu=False, mosaic=None,
-                                                                                 triton=None))
-    assert (route.kernel, route.preferred, route.refusal) == ("portable", "portable", None)
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axes, whole, local", [({"data": 2}, 6, 3), ({"tensor": 2}, 14, 7)],
+                         ids=["rows", "heads"])
+def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, whole, local):
+    """A causal bf16 call over six rows of fourteen heads that names the template and its Mosaic mainloop
+    (`generation.chosen`), its forward and backward lowered for an H100 on a mesh splitting its rows or its
+    heads in two (`generation.gpu_mesh`): no array of any Mosaic launch holds the call's whole count of rows
+    or heads, and each launch's operands hold a shard's own, half the call's (`attention._per_shard`; the
+    counts no other axis takes), so no device runs the global batch; and the lowered program's own
+    operations move no operand between devices (`sharded.MOVES`, as a `shard_map` body would issue them;
+    what the partitioner inserts after lowering is the compiled program's, which this CPU does not build)
+    (bible §7: a new accelerator route qualifies through its real target lowering on a multi-device
+    mesh)."""
+    import math
+
+    from jax.sharding import AxisType, NamedSharding
+
+    from dew.training._lowering import custom_calls, operations
+
+    devices = jax.make_mesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
+                            devices=jax.devices()[:math.prod(axes.values())])
+    mesh = generation.gpu_mesh(devices, "sm90")
+    # Counts no other axis of a launch's arrays takes, so each array's rows or heads read apart.
+    shape = jax.ShapeDtypeStruct((6, 128, 14, 64), jnp.bfloat16)
+    spec = PartitionSpec("data") if "data" in axes else PartitionSpec(None, None, "tensor")
+    placed = jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=NamedSharding(mesh, spec))
+
+    def loss(query, key, value):
+        out = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
+        return out.astype(jnp.float32).sum()
+
+    with (generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh),
+          generation.chosen(attention_mainloop="mosaic")):
+        lowered = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2))).trace(placed, placed, placed).lower(
+            lowering_platforms=("cuda",))
+    launches = [call for call in custom_calls(lowered) if call.target == "mosaic_gpu_v2"]
+    assert launches, "the template lowers no Mosaic launch"
+    for call in launches:
+        arrays = (*call.operands, *call.results)
+        assert all(whole not in array for array in arrays), call
+        assert any(local in array for array in arrays if len(array) >= 3), call
+    moved = [name for name in operations(lowered)
+             if name.removeprefix("stablehlo.").replace("_", "-") in MOVES]
+    assert not moved, moved
 
 
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():

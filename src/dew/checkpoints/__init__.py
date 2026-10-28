@@ -45,6 +45,17 @@ for the per-process data position), and it restores a local checkpoint only
 where each data-parallel replica is a whole set of hosts, which is not true
 when the fsdp axis spans hosts. The semantics match Orbax's: two directories,
 and the newest checkpoint every process can read wins.
+
+A host that lost its local copy (replaced, its disk wiped, or killed before its
+write landed) recovers it from the replicas that hold it, as Orbax's emergency
+manager restores a slice from a surviving one: where every shard such a process
+held has a copy on a process that still holds the newest local step (the
+data-parallel replicas of a layout whose fsdp axis stays within hosts), the
+newest local step is still the pool's (`_local_latest`), the others restore it
+from their disks, and each shard reaches the process that lost it from one
+replica, over the mesh's own collectives (`_from_replicas`). A layout whose
+shards have no replica on another host sends the pool to the persistent
+checkpoint, as before.
 """
 
 from __future__ import annotations
@@ -76,7 +87,7 @@ from dew._records import JSON, duration, json_value, record, share
 from dew.batch import PARAMETER_ROOTS, Variables
 from dew.cleanup import attempted
 from dew.files import write_atomically
-from dew.mesh import LogicalAxes
+from dew.mesh import LogicalAxes, mesh_axes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
 from dew.telemetry.profile import region
@@ -95,6 +106,9 @@ if TYPE_CHECKING:
 # gathered data position rides along under its own name as uint8 rows.
 type StateLeaf = (jax.Array | np.ndarray | Variables | optax.OptState
                   | DynamicScale | Accumulation | None)
+
+Resume = Literal["auto", "require", "never"]
+"""Whether a run continues its directory's latest checkpoint (`Checkpoints.resumed`)."""
 
 FROZEN_STORE = "frozen"
 """The directory beside the steps that holds every variables collection but
@@ -632,7 +646,7 @@ def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateL
             [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen])
 
 
-def _ema_deltas(metadata: ocp.metadata.StepMetadata) -> dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]:
+def _ema_deltas(metadata: _StepFacts) -> dict[jax.tree_util.KeyPath, jax.ShapeDtypeStruct]:
     """The EMA leaves the checkpoint at `step` stores as byte planes, by path,
     each with the shape and dtype of the weight it is the difference from,
     which are its own. The step's custom metadata records those paths; a
@@ -660,7 +674,7 @@ class _MetadataTree(Protocol):
     def tree(self) -> Variables: ...
 
 
-def _item_metadata(metadata: ocp.metadata.StepMetadata) -> Variables:
+def _item_metadata(metadata: _StepFacts) -> Variables:
     """The named state tree, a dict or Orbax's newer metadata wrapper's `tree`."""
     tree = metadata.item_metadata
     if isinstance(tree, _MetadataTree):
@@ -858,6 +872,189 @@ def _filled(template, restored: dict, step: int):
                                            if field.name not in CHECKPOINTED})
 
 
+def _split_axes(spec: jax.sharding.PartitionSpec) -> list[str]:
+    """The mesh axes `spec` splits an array over, sorted."""
+    return sorted(axis for entry in spec for axis in mesh_axes(entry))
+
+
+def _grid(tree: Mapping[str, StateLeaf]) -> JSON:
+    """What a local save records of where `tree`'s arrays lie, for a process that lost its copy to
+    find each shard it held on a replica (`_covered`): the mesh's axes and its devices' ids in grid
+    order, and, by path, the axes each array splits over. None where an array lies elsewhere than on
+    one mesh by name (a host-owned state's), which no replica recovers."""
+    meshes, split = set(), {}
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        if not isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)):
+            continue
+        if not isinstance(leaf.sharding, jax.sharding.NamedSharding):
+            return None
+        mesh = leaf.sharding.mesh
+        if not isinstance(mesh, jax.sharding.Mesh):
+            return None
+        grid = mesh.devices
+        meshes.add((tuple(mesh.axis_names), tuple(device.id for device in grid.flat), grid.shape))
+        split[jax.tree_util.keystr(path)] = _split_axes(leaf.sharding.spec)
+    if len(meshes) != 1:
+        return None
+    ((axes, devices, shape),) = meshes
+    return {"axes": list(axes), "shape": list(shape), "devices": list(devices), "split": split}
+
+
+def _sources(grid: Mapping[str, object], split: Sequence[str], holders: frozenset[int],
+             process: Mapping[int, int] | None = None) -> np.ndarray | None:
+    """Which device, in `grid`'s order, gives its shard of an array split over the axes `split` to the
+    devices that share it (the same coordinates on those axes): the first, by grid order, on a process
+    of `holders`, each device's process by its id (`process`, the pool's own by default). None where
+    some shard has no copy on any holder."""
+    shape = tuple(_records.integers(grid["shape"], "grid shape"))
+    axes = _records.strings(grid["axes"], "grid axes")
+    if process is None:
+        process = {device.id: device.process_index for device in jax.devices()}
+    devices = _records.integers(grid["devices"], "grid devices")
+    held = np.asarray([process[device] in holders for device in devices], bool).reshape(shape)
+    # The axes a shard's copies differ along come first, then each group's devices along the rest.
+    shared = [axis for axis, name in enumerate(axes) if name not in split]
+    order = [*[axis for axis in range(len(axes)) if axis not in shared], *shared]
+    groups = np.transpose(held, order).reshape(-1, math.prod(shape[axis] for axis in shared) if shared else 1)
+    if not groups.any(axis=1).all():
+        return None
+    first = np.zeros_like(groups)
+    first[np.arange(len(groups)), groups.argmax(axis=1)] = True
+    return np.transpose(first.reshape([shape[axis] for axis in order]), np.argsort(order))
+
+
+def _covered(grid: Mapping[str, object] | None, holders: frozenset[int],
+             process: Mapping[int, int] | None = None) -> bool:
+    """Whether the processes of `holders` hold a copy of every shard of every array a local save
+    placed over `grid` (`_grid`), so a process that lost its copy recovers it from them; each
+    device's process by its id (`process`, the pool's own by default)."""
+    if grid is None:
+        return False
+    split = record(grid["split"], "grid split")
+    return all(_sources(grid, _records.strings(axes, "split axes"), holders, process) is not None
+               for axes in {tuple(_records.strings(axes, "split axes")) for axes in split.values()})
+
+
+def _from_replicas(tree, grid: Mapping[str, object], holders: frozenset[int]):
+    """`tree`'s arrays, each shard on every device that holds it the bytes its first copy on a
+    process of `holders` holds (`_sources`): a process that lost its local copy holds zeros there,
+    and receives each shard as the sum, over the axes its copies lie along, of the source's bits and
+    the others' zeros, which is the source's bits exactly. Every process calls it alike."""
+    masks: dict[tuple[str, ...], jax.Array] = {}
+
+    def recovered(leaf):
+        if not isinstance(leaf, jax.Array):
+            return leaf
+        placed = leaf.sharding
+        assert isinstance(placed, jax.sharding.NamedSharding), "a covered save places by name (`_grid`)"
+        mesh, split = placed.mesh, tuple(_split_axes(placed.spec))
+        # Every axis the copies lie along, those of one device too, so the sum is replicated as its
+        # placement says.
+        along = tuple(name for name in mesh.axis_names if name not in split)
+        if all(mesh.shape[name] == 1 for name in along):
+            return leaf
+        if split not in masks:
+            sources = _sources(grid, split, holders)
+            assert sources is not None, "a recovered step's shards are covered (`_covered`)"
+            every = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*mesh.axis_names))
+            masks[split] = jax.make_array_from_callback(sources.shape, every, lambda index: sources[index])
+        typed = jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+        values = jax.random.key_data(leaf) if typed else leaf
+        held = values.sharding
+        assert isinstance(held, jax.sharding.NamedSharding), "a key's data lies where its key does"
+        words = _UNSIGNED[max(values.dtype.itemsize, 1)]
+
+        def sum_of_sources(value, source):
+            bits = (value.astype(np.uint8) if value.dtype == np.bool_
+                    else jax.lax.bitcast_convert_type(value, words))
+            return jax.lax.psum(jnp.where(source.reshape(()), bits, jnp.zeros_like(bits)), along)
+
+        summing = jax.shard_map(sum_of_sources, mesh=mesh, out_specs=held.spec,
+                                in_specs=(held.spec, jax.sharding.PartitionSpec(*mesh.axis_names)))
+        summed = jax.jit(summing)(jax.device_put(values, held.with_memory_kind("device")), masks[split])
+        value = (summed != 0 if values.dtype == np.bool_
+                 else jax.lax.bitcast_convert_type(summed, values.dtype))
+        value = jax.device_put(value, held)
+        return jax.random.wrap_key_data(value, impl=jax.random.key_impl(leaf)) if typed else value
+
+    return jax.tree.map(recovered, tree)
+
+
+def _zeros(leaf):
+    """Zeros where a placed template leaf lies, each process's shards its own: the shards a process
+    that lost its local copy holds until its replicas give it theirs (`_from_replicas`). A key is
+    read as its key data, as a restore reads it (`_placed`); a leaf nothing places is kept."""
+    sharding = getattr(leaf, "sharding", None)
+    if not isinstance(sharding, jax.sharding.NamedSharding):
+        return leaf
+    shape, dtype = tuple(leaf.shape), leaf.dtype
+    if jnp.issubdtype(dtype, jax.dtypes.prng_key):
+        key_words = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
+        shape, dtype = (*shape, *key_words.shape), key_words.dtype
+    # Every shard of a placement by name is one shape.
+    shard = sharding.shard_shape(shape)
+    return jax.make_array_from_callback(shape, sharding, lambda _: np.zeros(shard, dtype))
+
+
+def _tree_record(tree) -> JSON:
+    """A step's item metadata as JSON: its nesting, and each array's shape and dtype, which a process
+    that lost its local copy reads its restore's checks from (`_RecoveredStep`)."""
+    if isinstance(tree, Mapping):
+        return {"tree": {str(key): _tree_record(value) for key, value in tree.items()}}
+    if isinstance(tree, (list, tuple)):
+        return {"list": [_tree_record(value) for value in tree]}
+    if tree is None:
+        return None
+    # A key's own dtype names its implementation, which no check of a restore reads.
+    key = jnp.issubdtype(tree.dtype, jax.dtypes.prng_key)
+    return {"shape": list(tree.shape), "dtype": "key" if key else str(np.dtype(tree.dtype))}
+
+
+def _from_tree_record(recorded: JSON):
+    """The tree `_tree_record` wrote, its arrays as `jax.ShapeDtypeStruct`s."""
+    if recorded is None:
+        return None
+    entry = record(recorded, "tree record")
+    if "tree" in entry:
+        nested = record(entry["tree"], "tree")
+        return {key: _from_tree_record(json_value(value, key)) for key, value in nested.items()}
+    if "list" in entry:
+        listed = entry["list"]
+        assert isinstance(listed, list), "a list record holds a list"
+        return [_from_tree_record(value) for value in listed]
+    dtype = _records.text(entry["dtype"], "dtype")
+    return jax.ShapeDtypeStruct(tuple(_records.integers(entry["shape"], "shape")),
+                                jax.random.key(0).dtype if dtype == "key" else np.dtype(dtype))
+
+
+@dataclasses.dataclass(frozen=True)
+class _RecoveredStep:
+    """The metadata of a local step this process lost, as a process that holds it read it: what
+    `_step_metadata` gives in Orbax's `StepMetadata`'s place."""
+
+    custom_metadata: dict
+    item_metadata: Mapping[str, object]
+
+
+type _StepFacts = ocp.metadata.StepMetadata | _RecoveredStep
+"""A step's metadata as a restore reads it: Orbax's own, or a lost step's (`_RecoveredStep`)."""
+
+
+def _table_record(table: Mapping[str, np.ndarray]) -> JSON:
+    return {name: {"dtype": str(np.asarray(value).dtype), "shape": list(np.shape(value)),
+                   "hex": np.ascontiguousarray(value).tobytes().hex()} for name, value in table.items()}
+
+
+def _from_table_record(recorded: JSON) -> dict[str, np.ndarray]:
+    table = {}
+    for name, value in record(recorded, "table").items():
+        entry = record(value, name)
+        flat = np.frombuffer(bytes.fromhex(_records.text(entry["hex"], "hex")),
+                             np.dtype(_records.text(entry["dtype"], "dtype")))
+        table[name] = flat.reshape(_records.integers(entry["shape"], "shape"))
+    return table
+
+
 class _RankedSteps(preservation.PreservationPolicy):
     def __init__(self, checkpoints):
         self.checkpoints = checkpoints
@@ -969,7 +1166,10 @@ class Checkpoints:
         self._manager = None
         self._local_manager = None
         self._profile_snapshots: set[int] = set()
-        self._metadata: tuple[bool, int, ocp.metadata.StepMetadata] | None = None
+        self._metadata: tuple[bool, int, _StepFacts] | None = None
+        # The newest local step, the processes holding it and where its arrays lie, where some process
+        # lost its copy and recovers it from them (`_local_latest`); None where every process holds it.
+        self._recovery: tuple[int, frozenset[int], Mapping[str, object]] | None = None
         # The digests the save still in flight records, which no kept step lists yet.
         self._frozen_pending: set[str] = set()
 
@@ -1086,7 +1286,7 @@ class Checkpoints:
 
     def control(self, step: int) -> dict:
         if step == self._local_latest():
-            custom = self._open_local().metadata(step).custom_metadata or {}
+            custom = self._step_metadata(step, local=True).custom_metadata or {}
         else:
             self.kept()
             custom = self._custom(step)
@@ -1152,19 +1352,33 @@ class Checkpoints:
                     self._rank_modes[name] = rule['mode']
         return self._manager
 
-    def _step_metadata(self, step: int, *, local: bool = False) -> ocp.metadata.StepMetadata:
+    def _step_metadata(self, step: int, *, local: bool = False) -> _StepFacts:
         """The most recently inspected committed step, shared by shape and value reads.
 
         Orbax's metadata opens every array's TensorStore. A restore following
         `stored` needs that same immutable metadata, not a second opening of
         all those arrays. A save invalidates it so a later inspection observes
-        the newly committed step. Only one step's metadata is retained.
+        the newly committed step. Only one step's metadata is retained. A
+        local step this process lost is read as the first process holding it
+        read it (`_RecoveredStep`), which every process hands on alike.
         """
         held = self._metadata
         if held is not None and held[:2] == (local, step):
             return held[2]
-        checkpointer = self._open_local() if local else self._open()
-        metadata = checkpointer.metadata(step)
+        metadata: _StepFacts
+        recovery = self._recovery
+        if local and recovery is not None and recovery[0] == step:
+            def read() -> JSON:
+                own = self._open_local().metadata(step)
+                return {"custom": own.custom_metadata or {}, "tree": _tree_record(_item_metadata(own))}
+
+            recorded = record(self._from_holder(recovery[1], read), "recovered step")
+            metadata = (_RecoveredStep(dict(record(recorded["custom"], "custom metadata")),
+                                       record(_from_tree_record(json_value(recorded["tree"], "tree")),
+                                              "item metadata"))
+                        if self._lost(step) else self._open_local().metadata(step))
+        else:
+            metadata = (self._open_local() if local else self._open()).metadata(step)
         self._metadata = local, step, metadata
         return metadata
 
@@ -1222,7 +1436,33 @@ class Checkpoints:
         if self.local_directory is None:
             return None
         steps = from_every_process(self._open_local().latest_step())
-        return steps[0] if None not in steps and len(set(steps)) == 1 else None
+        self._recovery = None
+        if None not in steps and len(set(steps)) == 1:
+            return steps[0]
+        newest = max((step for step in steps if step is not None), default=None)
+        if newest is None:
+            return None
+        # A process that lost its copy recovers it where the processes holding it hold a copy of
+        # every shard it held (`_covered`).
+        holders = frozenset(index for index, step in enumerate(steps) if step == newest)
+        recorded = self._from_holder(holders, lambda: (self._open_local().metadata(newest).custom_metadata
+                                                       or {}).get("grid"))
+        grid = None if recorded is None else record(recorded, "grid")
+        if grid is None or not _covered(grid, holders):
+            return None
+        self._recovery = newest, holders, grid
+        return newest
+
+    def _from_holder(self, holders: frozenset[int], read: Callable[[], JSON]) -> JSON:
+        """What `read` gives on the first of `holders`, the processes holding the local step a process
+        lost, handed to every process (`from_every_process`); every process calls it alike."""
+        return from_every_process(read() if jax.process_index() == min(holders) else None)[min(holders)]
+
+    def _lost(self, step: int) -> bool:
+        """Whether this process lost its copy of local `step`, which it recovers from the processes
+        that hold it (`_local_latest`)."""
+        return self._recovery is not None and self._recovery[0] == step and (
+            jax.process_index() not in self._recovery[1])
 
     def _complete(self, step: int) -> bool:
         if step in self._committed:
@@ -1247,6 +1487,20 @@ class Checkpoints:
             return local if persistent is None else persistent
         return max(persistent, local)
 
+    def resumed(self, resume: Resume = "auto") -> int | None:
+        """The step a run continues under `resume`, the `latest`, or None where it starts afresh:
+        "auto" continues one where the directory holds it; "require" refuses a directory with none,
+        so a job that must continue never trains from scratch; "never" refuses one that holds a run,
+        which a run started afresh would write beside."""
+        latest = self.latest
+        if resume == "require" and latest is None:
+            raise ValueError(f"resume='require' continues a run, and {self.directory} holds no checkpoint "
+                             "to continue")
+        if resume == "never" and latest is not None:
+            raise ValueError(f"resume='never' starts a run afresh, and {self.directory} holds one at step "
+                             f"{latest}; give the new run a directory of its own")
+        return latest
+
     @property
     def best(self) -> int | None:
         return self._best_step(None)
@@ -1258,9 +1512,15 @@ class Checkpoints:
         """Return the directory `restore` reads `step` from.
 
         That is this process's local directory when the step is the local one
-        every process holds, and the persistent directory otherwise.
+        every process holds, and the persistent directory otherwise; a local step
+        this process lost is read from the first process's copy that holds it.
         """
-        return self.local_path if step == self._local_latest() else self.directory
+        if step != self._local_latest():
+            return self.directory
+        if self._lost(step) and self._recovery is not None:
+            holder = epath.Path(self.local_directory or '') / f'process{min(self._recovery[1])}'
+            return f"{holder} (a replica)"
+        return self.local_path
 
     def save(
         self,
@@ -1515,7 +1775,7 @@ class Checkpoints:
         the result where the run's params go:
         `merge(variables, {"params": checkpoints.posthoc_ema(...)})`.
         """
-        from dew.training.posthoc import coefficients
+        from dew.averaging import coefficients
 
         steps = self.profile_steps()
         if not steps:
@@ -1574,6 +1834,7 @@ class Checkpoints:
         """
         state_tree = self._item(state, saved, share)
         written = placement(state_tree)
+        grid = _grid({name: leaf for name, leaf in state_tree.items() if name != 'position'})
         state_tree, deltas = _with_ema_deltas(state_tree)
         if saved is not None:
             state_tree['position'] = jax.tree.map(
@@ -1589,6 +1850,7 @@ class Checkpoints:
                     **_step_record(deltas, control, rung, artifact, boxed),
                     "processes": jax.process_count(),
                     "placement": written,
+                    "grid": grid,
                 },
             )
         if _written_in_place(state_tree):
@@ -1615,8 +1877,8 @@ class Checkpoints:
         reads the step from. It is None for a state saved outside `fit`,
         which trained on no ladder.
         """
-        checkpointer = self._open_local() if step == self._local_latest() else self._open()
-        return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
+        snapshot = self._step_metadata(step, local=step == self._local_latest())
+        return json_value((snapshot.custom_metadata or {}).get('rung'), 'rung')
 
     def boxed(self, step: int | str | None = None) -> dict[tuple[str, ...], LogicalAxes]:
         """The axes the model at `step` boxed on its own parameters, as `save`
@@ -1761,12 +2023,18 @@ class Checkpoints:
         metadata = _item_metadata(snapshot)
         if 'position' not in metadata or (snapshot.custom_metadata or {}).get('tree'):
             return None
-        checkpointer = self._open_local() if from_local else self._open()
-        wanted, read = _position_reads(metadata, from_local=from_local)
-        restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
-            item={'position': wanted}, partial_restore=True, restore_args={'position': read}))
-        table = jax.tree.map(np.asarray, dict(restored['position']))
-        return read_position(table, self.local_path if from_local else self.path(step), share)
+        def read() -> dict[str, np.ndarray]:
+            checkpointer = self._open_local() if from_local else self._open()
+            wanted, reads = _position_reads(metadata, from_local=from_local)
+            restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
+                item={'position': wanted}, partial_restore=True, restore_args={'position': reads}))
+            return jax.tree.map(np.asarray, dict(restored['position']))
+
+        recovery = self._recovery
+        # A lost step's table is the first holder's, every row of the pool's, handed on.
+        table = (_from_table_record(self._from_holder(recovery[1], lambda: _table_record(read())))
+                 if from_local and recovery is not None and recovery[0] == step else read())
+        return read_position(table, self.source(step), share)
 
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
@@ -1797,7 +2065,7 @@ class Checkpoints:
         step = self.pinned(step)
         from_local = step == self._local_latest()
         checkpointer = self._open_local() if from_local else self._open()
-        where = self.local_path if from_local else self.path(step)
+        where = self.source(step) if from_local else self.path(step)
         if from_local and template is None and jax.process_count() > 1:
             raise ValueError(
                 f"The local checkpoint at {where} holds each process's own shards, "
@@ -1827,6 +2095,8 @@ class Checkpoints:
                 restored['ema'] = jax.tree_util.tree_map_with_path(
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
+        elif from_local and self._lost(step):
+            restored, held = self._lost_shards(step, template, frozen, snapshot, metadata, where)
         else:
             from dew.state import CHECKPOINTED
             state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
@@ -1871,6 +2141,9 @@ class Checkpoints:
             if targets:
                 restored = {**restored, 'ema': self._averages(checkpointer, step, metadata, restored,
                                                               targets, deltas)}
+        if from_local and template is not None:
+            restored = self._recovered(step, dict(restored),
+                                       positioned='position' in stored and not mapping and share is not None)
         restored = self._with_frozen(dict(restored), frozen, held)
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
@@ -1942,6 +2215,52 @@ class Checkpoints:
                 f"layout and process count it was written with. Resume with those, or "
                 f"delete {self.local_directory} to resume from the persistent checkpoint "
                 f"at step {self._open().latest_step()} in {self.directory}.")
+
+    def _lost_shards(self, step: int, template, frozen, snapshot: _StepFacts, metadata,
+                     where: str) -> tuple[dict, dict | None]:
+        """What a process that lost its copy of local `step` restores before its replicas give it
+        their shards (`_recovered`): zeros where its template places each leaf, the template checked
+        against what the processes holding the step wrote; and the frozen trees held apart."""
+        from dew.state import CHECKPOINTED
+        state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
+            if not isinstance(template, Mapping) else dict(template)
+        held = _held_apart(state_tree, frozen)
+        self._check_recovered(step, state_tree)
+        # The EMA is stored as byte planes of its difference from the weights, checked as such.
+        checked = dict(state_tree)
+        if checked.get('ema') is not None:
+            checked['ema'], _ = _plane_template(checked['ema'], _ema_deltas(snapshot))
+        _refuse_reshaped(checked, metadata, where)
+        return jax.tree.map(_zeros, state_tree), held
+
+    def _recovered(self, step: int, restored: dict, *, positioned: bool) -> dict:
+        """`restored`, local `step` as each process read it, each shard the first holder's where some
+        process lost its copy (`_from_replicas`), and its position table the first holder's where
+        `positioned`, which holds every process's row (`gather_positions`); as it is otherwise."""
+        recovery = self._recovery
+        if recovery is None or recovery[0] != step:
+            return restored
+        _, holders, grid = recovery
+        table = restored.pop('position', None)
+        restored = _from_replicas(restored, grid, holders)
+        if positioned:
+            restored['position'] = _from_table_record(self._from_holder(
+                holders, lambda: _table_record(jax.tree.map(np.asarray, dict(table or {})))))
+        return restored
+
+    def _check_recovered(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
+        """Refuse a local step this process lost where this run places the state otherwise than the
+        processes holding it wrote it: its replicas hold the shards of that placement alone."""
+        recovery = self._recovery
+        written = (self._step_metadata(step, local=True).custom_metadata or {})
+        if recovery is not None and written.get('processes') == jax.process_count() and (
+                _grid(state_tree) == recovery[2]):
+            return
+        raise ValueError(
+            f"This process lost its copy of local step {step}, which the processes "
+            f"{sorted(recovery[1]) if recovery else []} hold placed on the mesh, layout and process count "
+            f"they wrote it with; this run places the state otherwise. Resume with those, or delete "
+            f"{self.local_directory} to resume from the persistent checkpoint in {self.directory}.")
 
     def close(self) -> None:
         """Wait for pending writes, then close the Orbax managers and the threads and metadata stores
@@ -2124,8 +2443,11 @@ def _effective_weights(run: SavedRun, ema: bool | None, mesh, layout
 
 def _on_host(leaf) -> np.ndarray:
     """`leaf` on the host, a floating one in fp32, bf16 and the float8 types among them, which
-    NumPy's own type hierarchy does not count as floating."""
+    NumPy's own type hierarchy does not count as floating, and a complex one in complex64, both of its
+    components fp32."""
     value = np.asarray(leaf)
+    if jnp.issubdtype(value.dtype, jnp.complexfloating):
+        return value.astype(np.complex64)
     return value.astype(np.float32) if jnp.issubdtype(value.dtype, jnp.inexact) else value
 
 
@@ -2135,8 +2457,15 @@ def _taken(held: np.ndarray, leaf: np.ndarray, count: int, directory: str, first
     that cannot overflow (and is exact wherever its half could round), and `held / 2 + leaf / 2`
     above, exact halves, one rounding either way, so float64's mean rounded to fp32; for a later one
     `held + (leaf - held) / count` where both share a sign, whose difference cannot overflow, and
-    `held * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. An integer or
-    boolean leaf must equal `held`."""
+    `held * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. A complex leaf's real
+    and imaginary parts are each so averaged. An integer or boolean leaf must equal `held`."""
+    if jnp.issubdtype(held.dtype, jnp.complexfloating):
+        # Each component as a real leaf of the same shape, a scalar's included.
+        real, imaginary = (_taken(np.array(part(held)), np.array(part(leaf)), count, directory, first)
+                           for part in (np.real, np.imag))
+        averaged = real.astype(np.complex64)
+        averaged.imag = imaginary
+        return averaged
     if not jnp.issubdtype(held.dtype, jnp.inexact):
         if not np.array_equal(held, leaf):
             raise ValueError(f"an integer or boolean variable of the run in {directory} differs from "

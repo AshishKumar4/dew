@@ -423,8 +423,22 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
                          "data/chunks_per_record/tiny-shakespeare": 1.0})
     assert [row.name for _, row in display.rows()] == ["loss"]
     data_line = shown.data_line
+
+    def words(line):
+        # The line's words, its spacing and separators aside: what it says, not how it is laid out.
+        return [word for word in line.plain.split() if word != "·"]
+
     line = data_line(display.corpus_counts)
-    assert line is not None and line.plain == "data 4,824 rows  ·  0 rejected"
+    assert line is not None
+    # One label: its count, unnamed, and the rejected total, with no reason and no truncation.
+    said = words(line)
+
+    def follows(said, value, label):
+        return any(said[at:at + 2] == [value, label] for at in range(len(said) - 1))
+
+    assert "tiny-shakespeare" not in line.plain
+    assert follows(said, "4,824", "rows") and follows(said, "0", "rejected")
+    assert "(" not in line.plain and "%" not in line.plain
     # mix(web, code).filter(f): the corpora count the rows they fed the mix, the mixture the rows
     # f kept, and f's drops are the mixture's.
     mixture = data_line({"data/rows/web": 3000.0, "data/rows/code": 1824.0, "data/rows/mixture": 4700.0,
@@ -432,8 +446,17 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
                          "data/rejected/code/empty": 0.0, "data/rejected/mixture/filtered": 124.0,
                          "data/truncated/web": 0.25, "data/truncated/code": 0.0})
     assert mixture is not None
-    assert mixture.plain == ("data web 3,000  code 1,824  mixture 4,700 rows  ·  127 rejected (too_long 3, "
-                             "filtered 124)  ·  15.5% truncated")
+    said = words(mixture)
+    # Each label named before its count, in the order the counters came; the rejected total over every
+    # label (2 + 1 + 124) with each reason's count; the truncated share over the truncating labels' rows.
+    named = [said[said.index(label) + 1] for label in ("web", "code", "mixture")]
+    assert named == ["3,000", "1,824", "4,700"]
+    assert said.index("web") < said.index("code") < said.index("mixture")
+    assert follows(said, "4,700", "rows") and follows(said, "127", "rejected")
+    assert follows(said, "15.5%", "truncated")
+    reasons = mixture.plain[mixture.plain.index("(") + 1:mixture.plain.index(")")]
+    assert {tuple(reason.split()) for reason in reasons.split(",")} == {("too_long", "3"),
+                                                                        ("filtered", "124")}
     assert data_line({"train/loss": 1.0}) is None
 
 

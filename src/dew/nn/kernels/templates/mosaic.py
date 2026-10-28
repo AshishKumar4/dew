@@ -378,6 +378,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     operands_in_registers: bool
     """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
     warpgroup MMA reads both from shared memory."""
+    stores_through_registers: bool
+    """Whether a program copies its stored output tiles out through its registers (no TMA store before
+    Hopper: `mosaic_sm80.Mma.persist`), so its epilogue holds its share of the stored tile beside the
+    accumulator (`resources.tile_registers`)."""
     @property
     def lhs_copies(self) -> int:
         """The warps of a role each holding the left operand's fragment for the same rows (mma.sync's warps
@@ -708,6 +712,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     operands from the rings, a block's rows staged at the widest swizzle, 128 bytes."""
     bounded_loads = True
     operands_in_registers = False
+    stores_through_registers = False
     copy_extent = 256
 
     def registers(self, consumers: int) -> int:

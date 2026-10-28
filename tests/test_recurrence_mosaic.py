@@ -113,6 +113,13 @@ def geometry(case: str) -> dict:
             **INTERPRETED_HEADS.get(case, {})}
 
 
+PACKED_DOCUMENTS = 5
+"""The most documents a row of a packed draw holds (`draw`'s starts: its first row's five), the bound a
+packed call takes as a layer passes its batch's (`max_segments`): the template lays its launches for that
+many sequences a row, where unbounded it lays a row's every token (row 1850: the interpreted gradient's
+template arm 60 s a seed unbounded, 35 bounded)."""
+
+
 def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_heads: int, key_width: int,
          value_width: int, packed: bool = False, per_key: bool = False) -> tuple[Chunk]:
     """A draw's operands from `seed`, its keys' and values' dimensions each permuted by an order the seed
@@ -200,9 +207,10 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
         if max(launch.shared for launch in launches) > generation.shared_budget(template.Mosaic.launched()):
             return None
 
-    def rule(given: Chunk):
+    def rule(given: Chunk, max_segments: int | None = None):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
-                           tiles=narrowest, starts=given.starts, scale=hooks.scale, floor=hooks.floor)
+                           tiles=narrowest, starts=given.starts, max_segments=max_segments, scale=hooks.scale,
+                           floor=hooks.floor)
 
     return rule
 
@@ -287,6 +295,36 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
                         functools.partial(draw, dtype, **geometry(case)),
                         f'the mosaic forward on an unseen GPU at {tiles}, in {jnp.dtype(dtype).name}',
                         seeds=SEEDS, truth_fn=truth)
+
+
+@pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
+def test_the_mosaic_launches_state_their_work(training):
+    """A bf16 gated delta rule's forward, or its forward and gradient, through the template, lowered for an
+    H100: every launch states its cost (`_kernel`'s, `templates.gemm.cost`), which Dew's FLOP count reads to
+    size it (`instrumentation._stated_flops`: no launch unsized, row 1895's kernel report), their products
+    together at least the model's recurrent function's (`flops.delta_flops`: the chunked form's preparation
+    and inversion are work past it)."""
+    import re
+
+    from dew.nn.flops import delta_flops
+    from dew.telemetry.instrumentation import _stated_flops
+
+    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 128
+    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+
+    def rule(*operands):
+        return mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1))[0].astype(jnp.float32).sum()
+
+    with generation.assumed("sm90"):
+        fn = jax.grad(rule, argnums=(0, 1, 2)) if training else rule
+        text = jax.jit(fn).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
+    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+    assert launches and all(_stated_flops(line) is not None for line in launches)
+    model = delta_flops(np.asarray([length] * rows), value_heads, width, width)
+    assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
 
 
 def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
@@ -437,10 +475,8 @@ def resource_failures(found: list, plans: dict, family: mosaic.Family) -> list[s
     kernel past its target's shared or tensor memory, or past its plan's shared memory; a kernel that
     spilled whose launch's stated registers its family's thread holds (`Launch.registers` within
     `Family.registers`, the template's legality), so a legal config never spills; and a kernel with no
-    register report (ptxas's) but where an earlier case compiled the same kernel: Mosaic compiles a module
-    once a process, so a case's kernel built before (the training case's forward launches, its forward
-    case's) reports its resources and not ptxas's, its registers the earlier report's (same name and shared
-    bytes)."""
+    register report (ptxas's), which a kernel whose module an earlier case compiled takes from that compile
+    (`kernel_compile.inherited`)."""
     def planned(record: dict, kernel: dict, resource: str) -> int | None:
         """The case's plan's `resource` ('shared', 'registers') for the kernel's launch, None where no launch
         of the plan names it."""
@@ -456,19 +492,9 @@ def resource_failures(found: list, plans: dict, family: mosaic.Family) -> list[s
 
     kernels = [(record, kernel) for record in found for kernel in record.get('kernels', ())]
     budget = family.registers(1)
-    # Each kernel's ptxas report: its own, or an earlier case's of the same kernel.
-    reported: dict = {}
-    unreported = []
-    for record, kernel in kernels:
-        key = (kernel['kernel'], kernel['shared'])
-        if {'registers', 'spills'} & set(kernel['unread']):
-            if key in reported:
-                kernel.update(registers=reported[key]['registers'], spilled=reported[key]['spilled'])
-            else:
-                unreported.append(f"{record['name']} {kernel['kernel']}: no register report, and no earlier "
-                                  f"case compiled it")
-        else:
-            reported.setdefault(key, kernel)
+    unreported = [f"{record['name']} {kernel['kernel']}: no register report, and no earlier case compiled "
+                  f"its module" for record, kernel in kernels
+                  if {'registers', 'spills'} & set(kernel['unread'])]
     return ([f"{record['name']}: {record.get('error', 'no Mosaic GPU kernel compiled')}" for record in found
              if 'error' in record or not record.get('kernels')]
             + [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes (limit "

@@ -144,9 +144,10 @@ def dew_run(server, prompts: np.ndarray, output: int):
 def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directory: Path):
     """Untraced Python costs and a warmed decode-only Dew/XProf capture."""
     import jax
-    from trace_window import DECODE_CATEGORIES, decode_category, device_events, kernel_totals, window_split
+    from trace_window import DECODE_CATEGORIES, decode_category, kernel_totals
 
     import dew
+    from dew.telemetry.trace import device_events, window_split
 
     if -(-len(prompts) // server.admission) + 2 + 2 * steps * server.decode_steps >= output:
         raise ValueError("--output must cover admission, warmup and both decode profiles")

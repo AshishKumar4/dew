@@ -21,7 +21,7 @@ import json
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeGuard
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeGuard, get_args
 
 import jax.numpy as jnp
 import numpy as np
@@ -448,14 +448,15 @@ class Layout:
 LETTERS = tuple(chr(ord("A") + index) for index in range(26))
 
 
+LABEL_NAMES = (*LETTERS, *(first + second for first in LETTERS for second in LETTERS))
+"""Every label, in order: `A` to `Z`, then `AA`, `AB`, ..., `ZZ`, as a release's slots name them."""
+
+
 def label_names(count: int) -> tuple[str, ...]:
-    """The first `count` labels: `A` to `Z`, then `AA`, `AB`, ..., as a release's slots name them."""
-    names = list(LETTERS)
-    for first in LETTERS:
-        names.extend(first + second for second in LETTERS)
-    if count > len(names):
-        raise ValueError(f"{count} options outnumber the {len(names)} labels")
-    return tuple(names[:count])
+    """The first `count` labels of `LABEL_NAMES`."""
+    if count > len(LABEL_NAMES):
+        raise ValueError(f"{count} options outnumber the {len(LABEL_NAMES)} labels")
+    return LABEL_NAMES[:count]
 
 
 @dataclass(frozen=True)
@@ -483,6 +484,21 @@ class Labels:
         if count > len(self.names):
             raise ValueError(f"{count} options outnumber the layout's {len(self.names)} labels")
         return self.names[:count]
+
+    def spelled(self, encoder: Tokenizer, count: int) -> "Labels":
+        """These labels named for `encoder`: themselves where they name their own, else the first `count` of
+        `LABEL_NAMES` whose every variant `encoder` spells as one token, skipping those it spells as
+        two (Qwen3.5 spells " BQ" as two, and 570 of the 702 as one), so a run letters as many options
+        as its tokenizer can. Fewer than `count` such names is refused."""
+        if self.names is not None:
+            return self
+        same = _same(encoder)
+        named = [name for name in LABEL_NAMES
+                 if all(len(_piece(same, variant.format(name))) == 1 for variant in self.variants)]
+        if count > len(named):
+            raise ValueError(f"{count} options outnumber the {len(named)} labels this tokenizer spells as "
+                             f"one token each (of {len(LABEL_NAMES)})")
+        return dataclasses.replace(self, names=tuple(named[:count]))
 
     def ids(self, encoder: Tokenizer, count: int) -> tuple[tuple[int, ...], ...]:
         """Each of the first `count` labels' ids, one a variant."""
@@ -531,10 +547,12 @@ class QuestionLayout(Layout):
     framing: "Framing | None" = None
     """The conversation `segments`' text is the user's turn of, or None for none."""
     blocks: bool = False
-    """Whether each row splits into two blocks (`Encoded.blocks`): what comes before its question (a
-    state-first row's state), and its question to the row's end, a published slot release's prefix
-    and suffix (serve.patch `block_ids`); a backbone that reads blocks attends to each whole, and the
-    second to the first in order. Off, every row is read in order."""
+    """Whether each row splits into two blocks (`Encoded.blocks`), its parts as `segments` order them:
+    a state-first row's state, and its question from its header to the row's end, a published slot
+    release's prefix and suffix (serve.patch `block_ids`); a question-first row's question, and its
+    state from the state's first token to the row's end (the `Text` between them keeps to the part it
+    follows). A backbone that reads blocks attends to each whole, and the second to the first in
+    order. Off, every row is read in order."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -542,6 +560,11 @@ class QuestionLayout(Layout):
         _least("option_tokens", self.option_tokens, 1)
         if self.segments is not None:
             kinds = [type(segment) for segment in self.segments]
+            others = sorted({type(segment).__name__ for segment in self.segments
+                             if not isinstance(segment, QUESTION_KINDS)})
+            if others:
+                raise ValueError(f"a question row holds no schema and no images, so it has no place for "
+                                 f"{others}; its parts are {[kind.__name__ for kind in QUESTION_KINDS]}")
             if kinds.count(Instructions) != 1 or kinds.count(OptionLines) != 1 or kinds.count(AnswerCue) > 1:
                 raise ValueError("a question row's segments hold its instructions and its options once, and "
                                  f"its cue at most once, not {[kind.__name__ for kind in kinds]}")
@@ -583,6 +606,11 @@ class QuestionLayout(Layout):
         slots = (_slots(len(described), order) if order is not None
                  else [1, 0] if isinstance(question, Noul) else list(range(len(described))))
         names = self.labels.names_for(len(slots))
+        # The second block opens where the row's second part begins (`blocks`): the question's header
+        # after a state, or the state's first copy after a question.
+        kinds = [segment for segment in self.segments if isinstance(segment, (State, Instructions))]
+        question_first = bool(kinds) and isinstance(kinds[0], Instructions) and any(
+            isinstance(segment, State) for segment in kinds)
         chunks: list[Chunk | State] = []
         for segment in self.segments:
             if isinstance(segment, Text):
@@ -594,8 +622,8 @@ class QuestionLayout(Layout):
                                 or segment.defaults.get(question.kind, ""))
                 head, tail = segment.headers[question.kind].split("{}")
                 # The question starts at its header: the suffix a release's blocks read from
-                # (serve.patch `suffix_start`).
-                opening = (("suffix", 0),) if self.blocks else ()
+                # (serve.patch `suffix_start`), where it follows the state.
+                opening = (("suffix", 0),) if self.blocks and not question_first else ()
                 chunks.extend([Chunk(head, points=opening),
                                Chunk(instructions, marks=(("question", 0, len(instructions)),)), Chunk(tail)])
             elif isinstance(segment, OptionLines):
@@ -611,7 +639,7 @@ class QuestionLayout(Layout):
                                                                            text=text)
                     chunks.extend([*([Chunk(segment.join)] if index else []),
                                    Chunk(line, marks=((("option", index), 0, len(line)),))])
-            else:
+            elif isinstance(segment, AnswerCue):
                 template = segment.template if len(names) <= segment.at else segment.many
                 chunks.append(Chunk(template.format(labels=segment.join.join(names))))
         copies = [segment for segment in self.segments if isinstance(segment, State)]
@@ -620,8 +648,16 @@ class QuestionLayout(Layout):
         def built(kept: Sequence[str | tuple[int, ...]]) -> Rendered:
             # Under pieces each copy is its own piece, its ids; whole, its text read with the rest.
             given = iter(kept)
-            pieces = [(lambda own: Chunk(ids=own) if isinstance(own, tuple) else Chunk(own))(next(given))
-                      if isinstance(part, State) else part for part in chunks]
+            # The state's first copy opens a question-first row's second block.
+            first = next((at for at, part in enumerate(chunks) if isinstance(part, State)), None)
+            opening = (("suffix", 0),) if self.blocks and question_first else ()
+
+            def piece(at: int, own: str | tuple[int, ...]) -> Chunk:
+                points = opening if at == first else ()
+                return Chunk(ids=own, points=points) if isinstance(own, tuple) else Chunk(own, points=points)
+
+            pieces = [piece(at, next(given)) if isinstance(part, State) else part
+                      for at, part in enumerate(chunks)]
             return rendered_chunks(self._framed(encoder, pieces), encoder, self.unit)
 
         laid, (whole, state_kept) = (self._cut_ids(built, texts, copies, encoder) if self.unit == "pieces"
@@ -1125,6 +1161,16 @@ class AnswerCue:
 type QuestionSegment = Text | State | Instructions | OptionLines | AnswerCue
 """A part of a question row's text (`QuestionLayout.segments`)."""
 
+QUESTION_KINDS: tuple[type, ...] = get_args(QuestionSegment.__value__)
+"""The parts a question row renders (`QuestionSegment`), which its layout refuses any other of."""
+JOINT_KINDS: tuple[type, ...] = get_args(Segment.__value__)
+"""The parts a joint row renders (`Segment`), which its layout refuses any other of: its questions,
+their instructions and options, are its schema's, and it reads no cue."""
+
+type RowSegment = Text | Media | State | Schema | Instructions | OptionLines | AnswerCue
+"""A part of either layout's row (`Segment`, `QuestionSegment`), as a run names its row's parts
+(`DecisionRunConfig.segments`); each layout refuses the parts it has none of."""
+
 
 
 def rendered(value: JSON, policy: Render, specials: Specials) -> str:
@@ -1178,6 +1224,11 @@ class JointLayout(Layout):
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
         kinds = [type(segment) for segment in self.segments]
+        others = sorted({type(segment).__name__ for segment in self.segments
+                     if not isinstance(segment, JOINT_KINDS)})
+        if others:
+            raise ValueError(f"a joint row writes its questions in its schema and reads no cue, so it has no "
+                             f"place for {others}; its parts are {[kind.__name__ for kind in JOINT_KINDS]}")
         if kinds.count(Schema) != 1 or kinds.count(Media) > 1:
             raise ValueError("a joint row's segments hold the schema once, and the images "
                              f"at most once each, not {[kind.__name__ for kind in kinds]}")
@@ -1224,6 +1275,9 @@ class JointLayout(Layout):
             elif isinstance(part, Media) and media:
                 chunk = Chunk(ids=tuple(media), marks=((MEDIA_MARK, 0, len(media)),))
             else:
+                # A state's place, filled once its copies share the room left (below); the schema read as
+                # the row's context; the images' place in a request that has none.
+                assert isinstance(part, (State, Schema, Media)), part
                 chunk = Chunk(ids=())
             laid_out.append((part, chunk))
         # The row without its state, each copy a chunk of no ids, rendered as the row is.
@@ -1367,9 +1421,11 @@ class DecisionInputs:
     - `option_slots` `[B, P]` each window's real options as flat indices
       `q * K + k` into its `[Q, K]` grid, in that order (`compacted`), and
       `slotted` `[B, P]` which of them are real, or None for the grid itself;
-    - `context` `[B, C]` each window row's context tokens, which a backbone's
-      cross-attention reads, `context_lengths` `[B]` how many are real, the
-      padding after them, or None for rows that carry none.
+    - `context` `[B, C]` each window's rows' context tokens end to end, which a
+      backbone's cross-attention reads, `context_lengths` `[B]` how many are
+      real, the padding after them, and `context_segments` `[B, C]` each one's
+      row in the window as `segments` numbers it (0 for padding), which its
+      row's tokens alone read; or None for rows that carry none.
 
     A row of one question with one marker per option, Laya's, has spans one
     token long. A head that reads `option_slots` computes the real options
@@ -1390,6 +1446,7 @@ class DecisionInputs:
     slotted: jnp.ndarray | None = None
     context: jnp.ndarray | None = None
     context_lengths: jnp.ndarray | None = None
+    context_segments: jnp.ndarray | None = None
     readout: jnp.ndarray | None = None
     """`[B, Q]` where a readout of labels reads each question's answer (`Laid.readout`), or None; the
     labels' ids are the readout head's own (`LabelReadout.label_ids`)."""

@@ -52,6 +52,7 @@ from decision_support import decision_rows
 from flax.nnx import bridge
 from recording import RecordingTracker
 from steady_state import steady_state
+from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 from tiny_models import PER_ARCH, TINY
 
 from dew.checkpoints import Checkpoints
@@ -735,18 +736,28 @@ def mask_id(family: Family) -> int:
     return model.mask_token_id if MASK_TOKEN in family.facts else TOKENS[1]
 
 
+GENERATION_SEEDS: Mapping[str, int] = {f"{family} generation {leaf}": 8 for family in ALL
+                                       for leaf in ("raw", "policy")} | {
+    "causal_transformer+gated_delta_hybrid generation raw": 32,
+    "causal_transformer+gated_delta_hybrid generation policy": 64,
+    "multimodal_transformer+gemma3 generation policy": 32}
+"""Check 1's declared seeds for each family's cached generation, raw and under its policy, sized by
+`seeds_for` paired with the cached arm on armada: 8, but where named."""
+
+
 def generation(family: Family, directory: Path) -> None:
-    """Cached greedy decoding continues a prompt with the tokens the full
-    forward pass ranks first at every position it decoded."""
+    """The task continues each prompt after its own tokens, and cached decoding of left-padded prompts
+    scores each drawn token on par with a fresh full forward over the row's unpadded tokens, raw and
+    under the top-k policy that drew it, from the family's float64 twin (check 1,
+    test_text_rollout_contract.py's `assert_generation_scores_as_full_forwards`)."""
     held = loaded(family)
     variables = held.variables or held.model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     task = TextGeneration(held.model, variables, sampling=Sampling(temperature=0.0))
     prompt = token_batch(SEQ // 2, seed=8)[:2]
-    generated = task(prompt.tolist(), SEQ // 2, key=0)
-    tokens = np.asarray(generated.tokens)
+    tokens = np.asarray(task(prompt.tolist(), SEQ // 2, key=0).tokens)
     assert tokens.shape == (2, SEQ) and (tokens[:, :SEQ // 2] == prompt).all()
-    logits = np.asarray(held.model.apply(variables, jnp.asarray(tokens)))
-    np.testing.assert_array_equal(logits[:, SEQ // 2 - 1:-1].argmax(-1), tokens[:, SEQ // 2:])
+    assert_generation_scores_as_full_forwards(held.model, f"{family} generation", params=variables,
+                                              seeds=GENERATION_SEEDS)
 
 
 # --- denoising methods -------------------------------------------------------

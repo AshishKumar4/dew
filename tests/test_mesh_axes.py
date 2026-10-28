@@ -34,7 +34,7 @@ from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.telemetry.instrumentation import COLLECTIVES
+from dew.telemetry.trace import COLLECTIVES
 from dew.training import Layout, MeshSpec, Trainer
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -68,22 +68,27 @@ def test_fsdp_beside_tensor_computes_each_matmul_of_the_step_once():
     residual width left whole, GSPMD gathered a block's activations over
     fsdp and repeated those products on both devices of each pair: 1.21
     times one device's matmul FLOPs on layout_parity's dense decoder."""
-    from dew.telemetry.instrumentation import compiled_flops
-
     def flops(mesh: MeshSpec, devices) -> float:
-        trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                          mesh=mesh, layout=Layout(min_shard=TINY_SHARD), checkpoints=None,
-                          tracker=None)
-        trainer.device_mesh = mesh.build(devices)
-        state, _, _ = trainer.place()
-        trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
-        assert trainer.executable is not None
-        counted = compiled_flops(trainer.executable)
-        assert counted is not None
-        return counted * len(devices)
+        return step_flops(tiny(), mesh, devices, layout=Layout(min_shard=TINY_SHARD))
 
     one = flops(MeshSpec(), jax.devices()[:1])
     assert flops(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
+
+
+def step_flops(model, mesh: MeshSpec, devices, *, layout: Layout, links=None) -> float:
+    """The compiled training step's matmul FLOPs over all `devices` of `mesh`, `model` trained as a
+    language model under `layout` (and `links`, where given)."""
+    from dew.telemetry.instrumentation import compiled_flops
+
+    trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
+                      layout=layout, checkpoints=None, tracker=None, links=links)
+    trainer.device_mesh = mesh.build(devices)
+    state, _, _ = trainer.place()
+    trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
+    assert trainer.executable is not None
+    counted = compiled_flops(trainer.executable)
+    assert counted is not None
+    return counted * len(devices)
 
 
 def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
@@ -96,8 +101,6 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
     tensor shards compute one device's matmul FLOPs. (The latents' kernels
     ride fsdp, so with no fsdp axis they stay whole on every device: a sixth
     of this toy's weights, a thousandth of V3's.)"""
-    from dew.telemetry.instrumentation import compiled_flops
-
     model = models.build(
         "causal_transformer", vocab_size=VOCAB, emb_features=64, num_layers=1, num_heads=4,
         mlp_features=64, max_seq_len=SEQ_LEN,
@@ -106,16 +109,8 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
 
     def flops(mesh: MeshSpec, devices) -> float:
         # A CPU's peak is not in the table, so the run states a link fast enough to spread over.
-        trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                          mesh=mesh, layout=Layout(min_shard=TINY_SHARD, tolerance=1.0),
-                          checkpoints=None, tracker=None, links={TENSOR_AXIS: Link(1e15, 1e12)})
-        trainer.device_mesh = mesh.build(devices)
-        state, _, _ = trainer.place()
-        trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
-        assert trainer.executable is not None
-        counted = compiled_flops(trainer.executable)
-        assert counted is not None
-        return counted * len(devices)
+        return step_flops(model, mesh, devices, layout=Layout(min_shard=TINY_SHARD, tolerance=1.0),
+                          links={TENSOR_AXIS: Link(1e15, 1e12)})
 
     one = flops(MeshSpec(), jax.devices()[:1])
     assert flops(MeshSpec(tensor=4), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)

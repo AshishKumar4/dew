@@ -89,7 +89,7 @@ def packed(length, cuts):
     return segments
 
 
-@pytest.mark.parametrize("implementation", ["reference", "xla"])
+@pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
 @pytest.mark.parametrize("length,window", [(37, 8), (64, 16), (5, 8)])
 def test_sliding_window_matches_splash_local_mask(implementation, length, window):
     keep = np.asarray(splash.LocalMask((length, length), (window - 1, 0), 0)[:, :])
@@ -100,7 +100,7 @@ def test_sliding_window_matches_splash_local_mask(implementation, length, window
                     f"{implementation} window {window} over {length}", seeds=SEEDS['window'])
 
 
-@pytest.mark.parametrize("implementation", ["reference", "xla"])
+@pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
 @pytest.mark.parametrize("length,chunk", [(37, 8), (64, 16), (6, 8)])
 def test_chunks_match_splash_chunked_causal_mask(implementation, length, chunk):
     keep = np.asarray(splash.ChunkedCausalMask((length, length), chunk)[:, :])
@@ -111,13 +111,15 @@ def test_chunks_match_splash_chunked_causal_mask(implementation, length, chunk):
                     f"{implementation} chunk {chunk} over {length}", seeds=SEEDS['chunk'])
 
 
+@pytest.mark.parametrize("implementation", ["xla", "template"])
 @pytest.mark.parametrize("span", [{"window": 5}, {"chunk": 4}, {"window": 16}, {"chunk": 16}])
-def test_packed_documents_restart_their_windows_and_chunks(span):
+def test_packed_documents_restart_their_windows_and_chunks(span, implementation):
     """Chunks count each document's tokens from its first, as it would alone;
     windows count the tokens inside the document; an invalid slot among them
     counts in neither, as the cache counts them. Padding keys (segment 0 and
     invalid) are never read by a real query, one of a document and valid; a
-    padding query's output is no token's."""
+    padding query's output is no token's. The template takes the whole call as
+    its spans, a chunk each query's run of its keys (`chunk_runs`)."""
     length = 29
     segments = packed(length, (7, 18, 26))
     valid = np.ones((2, length), bool)
@@ -141,15 +143,16 @@ def test_packed_documents_restart_their_windows_and_chunks(span):
     def band(q, k, v):
         places = counted_places(segment_ids, jnp.asarray(valid))
         return on_rows(local_attention(q, k, v, **span, places=places, segment_ids=segment_ids,
-                                       valid=jnp.asarray(valid), implementation="xla"), real)
+                                       valid=jnp.asarray(valid), implementation=implementation), real)
 
-    assert_as_exact(jax.jit(band), jax.jit(masked(keep, real)), drawn(length), f"packed {span}",
-                    seeds=SEEDS['packed'])
+    assert_as_exact(jax.jit(band), jax.jit(masked(keep, real)), drawn(length),
+                    f"{implementation} packed {span}", seeds=SEEDS['packed'])
 
 
-@pytest.mark.parametrize("given", ["origin", "repeated"])
+@pytest.mark.parametrize("implementation", ["xla", "template"])
+@pytest.mark.parametrize("given", ["origin", "repeated", "wide", "narrow"])
 @pytest.mark.parametrize("length", [12, 8], ids=["banded", "dense"])
-def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, length):
+def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, length, implementation):
     """A chunk is cut at each token's place counted from the place its
     document's first token is given (`counted_places`): places given from 2
     put the first boundary after two tokens, as a continuation's whole pass
@@ -157,21 +160,33 @@ def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, le
     sharing a place give) still chunk the tokens by their count. The band (12
     tokens, chunks of 4) and the dense call (8) read the same keys, where the
     band once read the given places within its two blocks and missed a
-    chunk's earlier keys."""
-    positions = jnp.arange(length) + 2 if given == "origin" else jnp.zeros((length,), jnp.int32)
+    chunk's earlier keys. Places given from 2^32 + 1 (64-bit), chunks of 3,
+    cut where their own integers say: narrowed to 32 bits first, they would
+    move every boundary; int8 places in chunks of 128, past their largest,
+    are all one chunk (the template's runs, `chunk_runs`)."""
+    chunk, origin = {"wide": (3, 2 ** 32 + 1), "narrow": (128, 0)}.get(given, (4, 2))
     rows = np.arange(length)
-    places = rows + 2 if given == "origin" else rows
-    keep = (rows[None, :] <= rows[:, None]) & (places[:, None] // 4 == places[None, :] // 4)
+    places = rows + origin if given in ("origin", "wide") else rows
+    keep = (rows[None, :] <= rows[:, None]) & (places[:, None] // chunk == places[None, :] // chunk)
+
     def band(q, k, v):
+        if given == "narrow":
+            return local_attention(q, k, v, chunk=chunk, places=jnp.arange(length, dtype=jnp.int8),
+                                   implementation=implementation)
+        positions = (jnp.arange(length) + origin if given in ("origin", "wide")
+                     else jnp.zeros((length,), jnp.int32))
         places = counted_places(positions=positions)
-        return local_attention(q, k, v, chunk=4, places=places, implementation="xla")
+        return local_attention(q, k, v, chunk=chunk, places=places, implementation=implementation)
 
-    assert_as_exact(jax.jit(band), jax.jit(masked(np.broadcast_to(keep, (2, length, length)))), drawn(length),
-                    f"{given} places over {length}", seeds=SEEDS['given places'])
+    with jax.enable_x64(given == "wide"):
+        assert_as_exact(jax.jit(band), jax.jit(masked(np.broadcast_to(keep, (2, length, length)))),
+                        drawn(length), f"{implementation} {given} places over {length}",
+                        seeds=SEEDS['given places'])
 
 
+@pytest.mark.parametrize("implementation", ["xla", "template"])
 @pytest.mark.parametrize("span", [{"window": 6}, {"chunk": 8}])
-def test_gradients_match_the_dense_masked_kernel(span):
+def test_gradients_match_the_dense_masked_kernel(span, implementation):
     """The band's output and its gradients under a drawn readout, its cotangent, for the query, key and
     value, on par with the dense masked kernel's (check 1)."""
     length = 40
@@ -190,9 +205,12 @@ def test_gradients_match_the_dense_masked_kernel(span):
     def gradients(fn):
         return jax.jit(with_gradients(fn))
 
-    assert_as_exact(gradients(lambda q, k, v: local_attention(q, k, v, **span, implementation="xla")),
-                    gradients(masked(np.broadcast_to(keep, (2, length, length)))), draw, f"{span} gradients",
-                    seeds=SEEDS['gradients'])
+    def band(q, k, v):
+        return local_attention(q, k, v, **span, implementation=implementation)
+
+    assert_as_exact(gradients(band),
+                    gradients(masked(np.broadcast_to(keep, (2, length, length)))), draw,
+                    f"{implementation} {span} gradients", seeds=SEEDS['gradients'])
 
 
 def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
@@ -466,80 +484,30 @@ def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_a
                     truth_fn=masked(keep, real))
 
 
-def custom_call_targets(lowered) -> list[str]:
-    """The target of every custom call in a lowered program's StableHLO module, in program order."""
-    from jax.extend.mlir import ir
-
-    targets: list[str] = []
-
-    def visit(operation):
-        if operation.name == "stablehlo.custom_call":
-            targets.append(ir.StringAttr(operation.attributes["call_target_name"]).value)
-        return ir.WalkResult.ADVANCE
-
-    module = lowered.compiler_ir(dialect="stablehlo")
-    with module.context:
-        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
-    return targets
-
-
-@pytest.mark.gpu(reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
-@pytest.mark.skipif(not bf16_dot_runs(), reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
-def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_deterministic_ops):
-    """'auto' hands the band mask of a packed, windowed bf16 call to cuDNN
-    as a bias: finite everywhere, padding rows included, and as close to a
-    float64 oracle as the xla band is. The file's one site not on check 1
-    (ledger row 1321): cuDNN's backward leaves dQ off zero on a query that
-    reads one key, where the oracle and the xla band are exactly zero, so
-    check 1's zero rows fail it. It converts to check 1 against the xla band
-    when the attention template, exact there, takes this route."""
+@pytest.mark.gpu(reason="the band's GPU route, bf16 on a cuda device of sm80 or later")
+@pytest.mark.skipif(not bf16_dot_runs(), reason="the band's GPU route, bf16 on a device of sm80 or later")
+def test_packed_windowed_bf16_attention_runs_its_band_on_par(without_deterministic_ops):
+    """'auto' runs the band of a packed, windowed bf16 call, forward and gradients, on par with the xla band
+    over drawn calls (check 1, float64 the truth), padding rows included, on whatever kernel its route takes:
+    the accuracy gate and the measured speed decide the route, never one kernel's equality to another's
+    (bible §4). Under ledger row 1321 cuDNN's backward left dQ off zero on a query that reads one key, where
+    the xla band is exactly zero, which check 1's zero rows fail: a route through it is red here."""
     batch, length, heads, kv_heads, width, window = 1, 1024, 8, 2, 64, 256
     # Three documents fill 880 of 1024 rows; the rest is padding, segment 0.
     lengths = [300, 200, 380]
     segments = np.concatenate([np.repeat(np.arange(1, 4), lengths),
                                np.zeros(length - sum(lengths), int)])[None]
     segment_ids = jnp.asarray(segments, jnp.int32)
-    keys = jax.random.split(jax.random.key(0), 4)
-    query = jax.random.normal(keys[0], (batch, length, heads, width), jnp.bfloat16)
-    key = jax.random.normal(keys[1], (batch, length, kv_heads, width), jnp.bfloat16)
-    value = jax.random.normal(keys[2], (batch, length, kv_heads, width), jnp.bfloat16)
-    cotangent = jax.random.normal(keys[3], (batch, length, heads, width), jnp.float32)
-    real = jnp.asarray(segments[0] != 0)
 
-    def loss(implementation):
-        def run(query, key, value):
-            out = local_attention(query, key, value, window=window, segment_ids=segment_ids,
-                                  implementation=implementation)
-            return jnp.sum(out.astype(jnp.float32) * cotangent * real[None, :, None, None]), out
-        return jax.jit(jax.value_and_grad(run, argnums=(0, 1, 2), has_aux=True))
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 4)
+        return (jax.random.normal(streams[0], (batch, length, heads, width), jnp.bfloat16),
+                jax.random.normal(streams[1], (batch, length, kv_heads, width), jnp.bfloat16),
+                jax.random.normal(streams[2], (batch, length, kv_heads, width), jnp.bfloat16),
+                jax.random.normal(streams[3], (batch, length, heads, width), jnp.bfloat16))
 
-    targets = custom_call_targets(loss("auto").lower(query, key, value))
-    assert any(target.startswith("__cudnn$fmha") for target in targets), targets
+    def band(implementation):
+        return jax.jit(with_gradients(lambda q, k, v: local_attention(
+            q, k, v, window=window, segment_ids=segment_ids, implementation=implementation)))
 
-    def oracle(query, key, value):
-        q, k, v = (x.astype(jnp.float64) for x in (query, key, value))
-        k, v = (jnp.repeat(x, heads // kv_heads, axis=2) for x in (k, v))
-        logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) / np.sqrt(width)
-        rows = jnp.arange(length)
-        keep = ((rows[None, :] <= rows[:, None]) & (rows[:, None] - rows[None, :] < window)
-                & (segment_ids[0][:, None] == segment_ids[0][None, :]) & real[:, None])
-        logits = jnp.where(keep[None, None], logits, -jnp.inf)
-        weights = jnp.nan_to_num(jax.nn.softmax(logits, axis=-1))
-        out = jnp.einsum("bhqk,bkhd->bqhd", weights, v)
-        return jnp.sum(out * cotangent * real[None, :, None, None]), out
-
-    with jax.enable_x64(new_val=True):
-        (_, want), wants = jax.value_and_grad(oracle, argnums=(0, 1, 2), has_aux=True)(
-            query, key, value)
-    (_, got), grads = loss("auto")(query, key, value)
-    (_, xla), xla_grads = loss("xla")(query, key, value)
-    assert all(bool(jnp.all(jnp.isfinite(x.astype(jnp.float32)))) for x in (got, *grads))
-
-    def error(have, reference):
-        have = np.asarray(have, np.float64)[:, np.asarray(real)] if have.ndim == 4 else have
-        reference = np.asarray(reference)[:, np.asarray(real)] if reference.ndim == 4 else reference
-        return np.max(np.abs(np.asarray(have, np.float64) - reference)) / np.max(np.abs(reference))
-
-    assert error(got, want) <= 2 * error(xla, want)
-    for have, baseline, reference in zip(grads, xla_grads, wants, strict=True):
-        assert error(have, reference) <= 2 * error(baseline, reference)
+    assert_as_exact(band("auto"), band("xla"), draw, "packed windowed band", seeds=FEWEST_SEEDS)

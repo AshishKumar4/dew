@@ -19,14 +19,13 @@ You pass `Trainer` an instance of the objective. A configuration file or a saved
 
 ## Supervised
 
-A model trained on a loss over its outputs needs no objective of its own. `Supervised(model, loss, metrics=(), *, inputs)` applies any Flax module to the batch field `inputs.sample` names, and `loss(outputs, batch)` returns one loss per example (any trailing axes are averaged too):
+A model trained on a loss over its outputs needs no objective of its own. `Supervised(model, loss, metrics=(), *, inputs)` applies any Flax module to the batch field `inputs` names, and `loss(outputs, batch)` returns one loss per example (any trailing axes are averaged too):
 
 ```python
 import optax
 from flax import linen as nn
 
 from dew import Supervised
-from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy
 
 
@@ -34,8 +33,10 @@ def cross_entropy(outputs, batch):
     return optax.softmax_cross_entropy_with_integer_labels(outputs, batch["label"])
 
 
-objective = Supervised(nn.Dense(2), cross_entropy, (Accuracy(),), inputs=InputSpec(Field("x", (2,))))
+objective = Supervised(nn.Dense(2), cross_entropy, (Accuracy(),), inputs="x")
 ```
+
+Naming the field alone, `inputs="x"`, lets the run read the field's per-example shape off its first batch once, before the model initializes, and the objective then declares it as `objective.inputs`. An explicit spec, `inputs=InputSpec(Field("x", (2,)))`, states the shape instead, which a state placed before any data is read (`Trainer.place`) needs. `work=`, a module-level function of a batch, declares the analytical FLOPs of training on it for a model Dew holds no count for, which the run's MFU reads; without it such a run logs no MFU rather than an estimate.
 
 The loss is the mean over the batch's rows, `Objective.row_mean`, so a validation batch's repeated rows count for nothing. Each metric is called the same way and reported as its own mean, under its function's name or its class's (`accuracy`). A loss or metric is a module-level function or a configured callable object, such as `CrossEntropy(labels="label")`: a run's record names it by import path, and saving a run whose loss is a lambda raises. Reading the record back builds a callable object only of a class from Dew, Flax or a package the reader trusts (`RunConfig.load(directory, trust=("mypackage",))`). [Recipes](../recipes.md#python-experiments) trains this objective from a Python experiment file.
 

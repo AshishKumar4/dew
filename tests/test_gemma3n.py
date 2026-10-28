@@ -371,29 +371,49 @@ def test_the_dense_decoders_gradient_is_the_references():
         _, gradient = with_gradients(lambda params: loss(params, rows))(stored, one)
         return gradient
 
-    @as_given
+    layouts = {layout.name: layout for layout in loaded.weight_layouts}
+    if set(names) != set(layouts):
+        raise AssertionError(f"the export writes {sorted(set(names) ^ set(layouts))} beside its layouts")
+
+    @jax.jit
     def differentiated(rows, one):
-        return exported(loaded, gradient_of(rows, one))
+        """The gradient in the source's tensors by name, each its layout's source array (`export`'s
+        tensor before the host copy), in the program that computes it."""
+        gradient = {**loaded.variables, "params": gradient_of(rows, one)}
+        return {name: layouts[name].source_array(gradient).astype(jnp.float32) for name in names}
+
+    def clamped(dtype):
+        """The reference's parameters after its training forward, which clamps the stored coefficients
+        in place, as Dew's projection does: the same values whatever rows that forward reads, and
+        clamping them again leaves them, so one forward clamps them for every call."""
+        reference = references[dtype]
+        with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+            reference(input_ids=torch.from_numpy(draw(0)[0]).long())
+        return {name: leaf.detach().numpy() for name, leaf in reference.named_parameters()}
+
+    held = {dtype: clamped(dtype) for dtype in references}
 
     def reference(dtype, rows, one):
         reference = references[dtype]
         tokens = torch.from_numpy(np.asarray(rows)).long()
         with float64() if dtype == torch.float64 else contextlib.nullcontext():
-            # Its training forward clamps the stored coefficients in place, as Dew's projection does.
-            with torch.no_grad():
-                reference(input_ids=tokens)
-            held = {name: leaf.detach().numpy() for name, leaf in reference.named_parameters()}
-
             def run(weights):
                 return torch.func.functional_call(reference, weights, (),
                                                   {"input_ids": tokens, "labels": tokens}).loss
 
-            _, gradients = torch_with_gradients(run)(held, one)
+            _, gradients = torch_with_gradients(run)(held[dtype], one)
         return {name: gradients[name] for name in names}
 
-    assert_as_exact(differentiated, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
-                    "the dense decoder's gradient", seeds=DENSE_SEEDS,
-                    truth_fn=lambda *inputs: reference(torch.float64, *inputs), orders=orders)
+    # The reference on one thread: its tiny steps gain nothing from more, and Dew's program, dispatched
+    # before it runs, takes the host's other cores meanwhile.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        assert_as_exact(differentiated, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
+                        "the dense decoder's gradient", seeds=DENSE_SEEDS,
+                        truth_fn=lambda *inputs: reference(torch.float64, *inputs), orders=orders)
+    finally:
+        torch.set_num_threads(threads)
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])

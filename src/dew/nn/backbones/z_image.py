@@ -215,9 +215,9 @@ class ZImageTransformer(nn.Module):
         `min(dim, 256)` out."""
         width = at_least_fp32(self.dtype)
         # The scale folded on the host and rounded once (exactly 1 at the published 1000): a division
-        # by a constant left in the program is XLA's to rewrite as a product with its reciprocal,
-        # inexact, which put the time's sinusoids, and every modulation they drive, twice as far from
-        # float64 on JAX 0.12's CPU as on 0.11's.
+        # by a constant left in the program is any XLA backend's to rewrite as a product with its
+        # inexact reciprocal, which moves the time's sinusoids, and every modulation they drive, off
+        # the source's value (measured twice as far from float64 on JAX 0.12's CPU as on 0.11's).
         source_time = (1000.0 - jnp.asarray(time, width)) * jnp.asarray(self.t_scale / 1000.0, width)
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
         maps = self.projections(0, 0)
@@ -276,7 +276,12 @@ class ZImageTransformer(nn.Module):
         # Slots past a row's padded prompt are masked; they sit at the origin.
         leading = jnp.where(slots[None] < spans[:, None], slots[None] + 1, 0)
         caption_positions = jnp.stack([leading, jnp.zeros_like(leading), jnp.zeros_like(leading)], axis=-1)
-        table = (self.axes_dims, self.axes_lens, self.rope_theta)
+        # Each axis's table reaches every position the call takes, `axes_lens` at least: a prompt's
+        # image sits one past its padded span, the grid's rows and columns at their own indices, and
+        # a row's rotation is its own position's however long the table, so a call past the published
+        # lengths rotates at its own places rather than at the last row's.
+        reach = tuple(map(max, self.axes_lens, (budget + 2, rows, columns)))
+        table = (self.axes_dims, reach, self.rope_theta)
         image_rotation = _rotation(image_positions, *table, at_least_fp32(image.dtype))
         caption_rotation = _rotation(caption_positions, *table, at_least_fp32(image.dtype))
         whole_image = jnp.full((batch,), image_span, jnp.int32)

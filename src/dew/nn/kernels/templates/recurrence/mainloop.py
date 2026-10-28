@@ -57,6 +57,7 @@ from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, resources
+from dew.nn.kernels.templates.gemm import cost
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,
@@ -649,6 +650,15 @@ def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, 
     return _planned_launch(call, scope, registers, floor=stages, most=stages), tiles
 
 
+def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
+    """A launch's work over its `tiles` as it states it to XLA and to Dew's FLOP count
+    (`templates.gemm.cost`): the model's products (an fp32 call's parts aside), its exponentials, and its
+    operands' and outputs' bytes once (row 1895's kernel report: unstated, the recurrence made MFU a lower
+    bound)."""
+    stated = cost(int(work.flops * tiles), *arrays, *jax.tree.leaves(out_type))
+    return dataclasses.replace(stated, transcendentals=int(work.exponentials * tiles))
+
+
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
             landing: dict | None = None, persistent: bool = False, reduces: bool = True,
@@ -759,11 +769,13 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
 
     entry.__name__ = name
 
-    if persistent:
-        return family.kernel(entry, out_type=out_type, grid=(programs,), grid_names=("programs",),
-                             consumers=1, interpret=call.interpret)
-    return family.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names, consumers=1,
-                         interpret=call.interpret)
+    def launched(*arrays):
+        laid = ({"grid": (programs,), "grid_names": ("programs",)} if persistent
+                else {"grid": grid, "grid_names": grid_names})
+        return family.kernel(entry, out_type=out_type, **laid, consumers=1, interpret=call.interpret,
+                             name=name, cost=_stated(work, tiles, arrays, out_type))(*arrays)
+
+    return launched
 
 
 def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callable | None = None):
@@ -1464,7 +1476,7 @@ def _padded(x, axis: int, size: int):
     return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
 
 
-def _layout(batch: int, length: int, starts, max_segments: int | None):
+def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None):
     """A call's tokens a chunk at a time: `(chunks, taken [chunks], sequences [N, 5], laid, unlaid)`, each
     chunk's tokens, each sequence's first chunk, chunks, row and whether it begins and ends its row
     (`_states`), and the maps from `[B, T, ...]` to the chunks' rows `[chunks * C, ...]` (a chunk's rows past
@@ -1481,7 +1493,7 @@ def _layout(batch: int, length: int, starts, max_segments: int | None):
         spans = chunked_launch.sequences(batch, length, chunk=CHUNK)
     else:
         documents = length if max_segments is None else max_segments
-        spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * (documents + 1)),
+        spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * (documents + 1), firsts),
                                          chunk=CHUNK)
     table, seqs = jnp.asarray(spans.chunks), jnp.asarray(spans.spans)
     chunks, taken = table.shape[0], table[:, 1]
@@ -1507,7 +1519,8 @@ def _layout(batch: int, length: int, starts, max_segments: int | None):
     return chunks, taken, sequences, laid, unlaid
 
 
-def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, max_segments: int | None = None,
+def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
+            max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False, floor: float | None = None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
@@ -1526,13 +1539,14 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, max_segment
     `templates.recurrence.template`), and its launches issue by `family`'s bundle (the device's, `family_of`,
     where None), interpreted where `interpret`. A decay a key dimension takes the layer's declared `floor`
     (`per_key_refusal`)."""
-    out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale,
-                                 delta=delta, tiles=tiles, wide=wide, family=family, interpret=interpret,
-                                 floor=floor, keeps=False)
+    out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
+                                 max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
+                                 family=family, interpret=interpret, floor=floor, keeps=False)
     return out, final
 
 
-def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, max_segments: int | None = None,
+def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
+                 max_segments: int | None = None,
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
                  floor: float | None = None, keeps: bool = True) -> tuple[jax.Array, jax.Array, tuple]:
@@ -1542,7 +1556,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, max_se
     memories and corrected values, `(w, h, corrected)`, which the port keeps unless a remat rung recomputes
     them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
-                    tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps)
+                    tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps, firsts=firsts)
     call, tiles = run.call, run.tiles
     o = _output(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, call, tiles, scale=run.scale,
                 out_dtype=jnp.float32 if wide else run.dtype, scores=run.scores)
@@ -1582,6 +1596,7 @@ class _Run:
 
 
 def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
+              firsts=None,
               inverse=None, kept=None, floor: float | None = None, keeps: bool = True) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
@@ -1611,7 +1626,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     if starts is not None:
         starts = jnp.asarray(starts, bool)
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
-    chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments)
+    chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
     rows = chunks * CHUNK
     given = held = _Operand(rows, _parts(dtype), dtype)
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
@@ -1693,7 +1708,7 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Fa
     return holds(both[len(forward):], family, shared)
 
 
-def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None,
+def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, firsts=None,
               max_segments: int | None = None, scale: float | None = None,
               family: mosaic.Family | None = None, interpret: bool = False,
               inverse=None, kept=None):
@@ -1707,7 +1722,8 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None,
     states launch at the forward's `tiles` where they are not. Its rounding is fla's; the accurate backward is
     the portable math's token adjoint."""
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=True,
-                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept)
+                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
+                    firsts=firsts)
     call = run.call
     if call.per_key or call.held.parts > 1:
         raise NotImplementedError("the fast backward takes a decay a head in a 16-bit call")

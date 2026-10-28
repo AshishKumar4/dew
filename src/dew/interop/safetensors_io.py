@@ -23,6 +23,7 @@ import numpy as np
 
 from dew._records import JSON
 from dew.files import replacing, write_atomically
+from dew.interop.unread import Stored, Unread
 from dew.interop.weights import ParamTree, insert
 
 SEPARATOR = "/"
@@ -336,19 +337,20 @@ def header_specs(path) -> dict[str, jax.ShapeDtypeStruct]:
         return {name: stored_spec(name, view.get_shape(), view.get_dtype(), filename) for name, view in views}
 
 
-class LazyTensors(Mapping[str, np.ndarray]):
+class LazyTensors[T: np.ndarray | Unread](Mapping[str, T]):
     """Named host tensors, each built only when it is read.
 
     `specs` gives every tensor's shape and dtype up front, which is all a
     shard plan needs; `build(name)` makes the tensor. A writer that reads one
-    shard's tensors at a time holds one shard on the host, not the model.
+    shard's tensors at a time holds one shard on the host, not the model. A
+    load without its weights builds `Unread` ones (`dew.interop.unread`).
     """
 
-    def __init__(self, specs: Mapping[str, jax.ShapeDtypeStruct], build: Callable[[str], np.ndarray]):
+    def __init__(self, specs: Mapping[str, jax.ShapeDtypeStruct], build: Callable[[str], T]):
         self.specs = specs
         self._build = build
 
-    def __getitem__(self, name: str) -> np.ndarray:
+    def __getitem__(self, name: str) -> T:
         if name not in self.specs:
             raise KeyError(name)
         return self._build(name)
@@ -360,7 +362,7 @@ class LazyTensors(Mapping[str, np.ndarray]):
         return len(self.specs)
 
 
-def tensor_specs(tensors: Mapping[str, np.ndarray]) -> Mapping[str, jax.ShapeDtypeStruct]:
+def tensor_specs(tensors: Mapping[str, Stored]) -> Mapping[str, jax.ShapeDtypeStruct]:
     """Stored shape and dtype metadata without reading deferred tensor values."""
     return (tensors.specs if isinstance(tensors, LazyTensors)
             else {name: jax.ShapeDtypeStruct(array.shape, array.dtype) for name, array in tensors.items()})

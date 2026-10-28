@@ -150,7 +150,7 @@ class DPMSolverSDE:
             if times.shape[0] > 1 and bool(jnp.any(sigmas[:-1] <= 0)):
                 raise ValueError("sigma=0 source has no finite update: DPMSolverSDE "
                                  "steps down from the interval's own sigma")
-        low, high = float(schedule.sigma_min), float(schedule.sigma_max)
+        low, high = (float(bound) for bound in schedule.sigma_range)
         if not 0 < low <= high:
             raise ValueError("the Brownian tree needs a positive sigma domain, and this "
                              f"schedule reports [{low}, {high}]")

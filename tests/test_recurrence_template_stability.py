@@ -152,11 +152,16 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     zero on a draw: a chunk's ranges sum each token's terms before it (`mainloop.gradients`), never a token's
     own order-one term added and taken away, which rounded away the `exp(-30)` terms before it (65 to 169
     times the port's distance on three draws, the H100's check 1 140 times, SE-numerics-h100-fd61e11eeb;
-    0.98 to 1.00 times after), held on one draw by the gate's one-draw rule."""
+    0.98 to 1.00 times after), held on one draw by the gate's one-draw rule. On a GPU whose launches do not
+    hold the fast backward (an mma.sync one's) the rule refuses the gradient (row 1926)."""
     regime = 'decays near zero'
     operands, (out, final) = cotangents(HOOKS, regime, 0)
     drawn = (bf16(operands), (out.astype(jnp.bfloat16), final))
     template = with_gradients(functools.partial(chunk, HOOKS, mainloop='mosaic'))
+    if not fast_backward(restarting(lambda given: given, regime)(drawn[0])):
+        with pytest.raises(NotImplementedError):
+            jax.eval_shape(template, *drawn)
+        return
     port = with_gradients(functools.partial(chunk_on, 'fla', HOOKS))
     with jax.enable_x64(new_val=True):
         exact = jax.jit(with_gradients(functools.partial(token_by_token, HOOKS)))(*widened(drawn))

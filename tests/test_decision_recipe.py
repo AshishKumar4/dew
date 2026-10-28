@@ -532,9 +532,19 @@ def test_a_decision_run_reads_letters_as_its_letter_readout():
     from dew.data.dataset import DataPartition
     from dew.decision.config import Letters
     from dew.decision.head import LabelReadout
-    from dew.decision.layout import Labels, QuestionLayout
+    from dew.decision.layout import (
+        AnswerCue,
+        Instructions,
+        Labels,
+        OptionLines,
+        QuestionLayout,
+        RowSegment,
+        State,
+        Text,
+    )
     from dew.decision.objective import tokenizer_of
     from dew.interop import Pretrained
+    from dew.registry import from_record, to_record
 
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
@@ -547,10 +557,18 @@ def test_a_decision_run_reads_letters_as_its_letter_readout():
     assert tokenizer is not None
     assert isinstance(head, LabelReadout) and head.label_ids == labels.ids(tokenizer, 4)
     assert isinstance(layout, QuestionLayout)
-    assert layout.labels == dataclasses.replace(labels, names=labels.names_for(4))
+    assert layout.labels == labels.spelled(tokenizer, 4)
     with pytest.raises(ValueError):
         _, few = dataclasses.replace(run, head=Letters(labels=labels, count=2)).prepare().train("x")
         next(iter(few.train(DataPartition())))
+    # The run names the row's segments: the question first, the state after it.
+    question_first = (Instructions({"choice": "Question: {}", "noul": "Question: {}", "score": "Rate: {}"}),
+                      Text("\nOptions:\n"), OptionLines(), Text("\n<state>\n"), State(render="state"),
+                      Text("\n</state>\n"), AnswerCue())
+    ordered, _ = dataclasses.replace(run, segments=question_first).prepare().train("x")
+    assert isinstance(ordered.layout, QuestionLayout) and ordered.layout.segments == question_first
+    assert from_record(tuple[RowSegment, ...], json.loads(json.dumps(
+        to_record(question_first, tuple[RowSegment, ...]))), dtypes=False) == question_first
 
 
 def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_where_asked():
@@ -586,6 +604,22 @@ def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_wher
     assert "backbone" in adapted.variables[FROZEN]
     with pytest.raises(ValueError):
         dataclasses.replace(run, context_frozen=False, context_layers=None).prepare()
+
+
+def test_a_joint_run_refuses_a_cue_its_rows_cannot_render():
+    """A fresh joint head's run whose segments hold an answer cue, which a joint row has no place for,
+    is refused as it is prepared, never trained on rows that dropped it; the same run without the cue
+    prepares (row 1943)."""
+    from dew.decision.config import JointShape
+    from dew.decision.layout import AnswerCue, Schema, State
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, head=JointShape(), max_len=1024,
+                              segments=(Schema(), State()))
+    run.prepare()
+    with pytest.raises(ValueError):
+        dataclasses.replace(run, segments=(Schema(), State(), AnswerCue())).prepare()
 
 
 def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():

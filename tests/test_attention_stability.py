@@ -742,7 +742,9 @@ def _differentiable(family: Family, forward: Callable, backward: Callable) -> Ca
 
 def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
-    or none for the default), its derivative the mainloop's own backward (`_differentiable`)."""
+    or none for the default), its derivative the mainloop's own backward (`_differentiable`); on an H100 the
+    Mosaic one's default form in both schedules, its derived one (one launch where the call is hookless) and
+    deterministic mode's two launches (`TWO_LAUNCHES`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     mainloop = functools.partial(_differentiable, family)
@@ -769,9 +771,20 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     portable = mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
                         functools.partial(attention_portable.backward, **tiles, **options))
     mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
+    def two_launch_backward(*operands):
+        with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
+            return mosaic_backward(*operands)
+
     if ON_HOPPER and _mosaic_takes(family):
         mainloops["mosaic"] = mainloop(mosaic_forward, mosaic_backward)
+        if not options and family.draw(0)[3] is None:
+            mainloops["mosaic two launches"] = mainloop(mosaic_forward, two_launch_backward)
     return mainloops
+
+
+TWO_LAUNCHES = attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=False, family="wgmma")
+"""The Mosaic backward's two-launch schedule at the derived tiles, the dQ launch then the dK/dV one at the
+refined D: a hookless fast-form call's in deterministic mode, where its derived one is one launch."""
 
 
 ON_HOPPER = generation.device_generation() == "sm90"
@@ -811,19 +824,24 @@ def assert_finite(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None
                                     "values not finite where the reference's are")
 
 
-@pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
-def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family):
-    """Each template mainloop's output and query, key and value gradients in the accurate form
-    (`ACCURATE`), check 1 over the family's draws; a row that sees nothing, zero."""
+ACCURATE_ARMS = [(family, name) for family in TEMPLATE_FAMILIES
+                 for name in _mainloops(FAMILIES[family], ACCURATE)]
+"""Each template family beside each mainloop that takes it in the accurate form (`_mainloops`): a case of
+its own, so none holds a CPU task past the suite's target (row 1849)."""
+
+
+@pytest.mark.parametrize(("family", "name"), ACCURATE_ARMS)
+def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, name):
+    """A template mainloop's output and query, key and value gradients in the accurate form (`ACCURATE`),
+    check 1 over the family's draws; a row that sees nothing, zero."""
     seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
     reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
     truth = with_gradients(_reference(family, anchored=True))
-    for name, mainloop in _mainloops(family, ACCURATE).items():
-        label = f"{name} accurate {family.dtype}"
-        differentiated = jax.jit(with_gradients(mainloop))
-        assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
-        _held_empty(family, differentiated(*draw(0)), label)
+    label = f"{name} accurate {family.dtype}"
+    differentiated = jax.jit(with_gradients(_mainloops(family, ACCURATE)[name]))
+    assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
+    _held_empty(family, differentiated(*draw(0)), label)
 
 
 def _default_is_finite(family_name: str, mainloop_name: str) -> None:
@@ -860,8 +878,30 @@ def test_the_mosaic_mainloops_default_is_finite_where_the_reference_is_at_fp32s_
     _default_is_finite(family, "mosaic")
 
 
-@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
-                                    if FAMILIES[family].folded or FAMILIES[family].overflows])
+HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].draw(0)[3] is None]
+"""The Mosaic families of no sinks or resumed state, whose fast-form backward derives one launch
+(`MosaicBackward.derived`)."""
+
+
+@pytest.mark.skipif(not ON_HOPPER, reason="runs the Mosaic mainloop compiled, on an H100")
+@pytest.mark.gpu(reason="runs the Mosaic mainloop compiled, on an H100")
+@pytest.mark.parametrize("family", HOOKLESS_FAMILIES)
+def test_the_mosaic_two_launch_backward_is_finite_where_the_reference_is_at_fp32s_edges(family):
+    """The Mosaic backward in two launches (`TWO_LAUNCHES`), deterministic mode's for a hookless call, whose
+    derived backward is one launch (`test_the_mosaic_mainloops_default_is_finite_…`), finite in the default
+    form over every family it takes (`_default_is_finite`)."""
+    _default_is_finite(family, "mosaic two launches")
+
+
+GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",)
+"""The families whose frozen Triton default-form check runs on a GPU alone, compiled as its route runs it:
+256 draws interpreted take past the CPU suite's 240 s target (218-257 s, row 1849)."""
+
+
+@pytest.mark.parametrize("family", [
+    pytest.param(family, marks=pytest.mark.gpu(reason="256 draws of the Triton mainloop, compiled"))
+    if family in GPU_TRITON_FAMILIES else family
+    for family in TEMPLATE_FAMILIES if FAMILIES[family].folded or FAMILIES[family].overflows])
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
     """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
     fp32's largest (`_default_is_finite`): it guards its sums' headroom in either form, as the template's
@@ -954,13 +994,13 @@ def test_a_negative_scale_past_the_folds_reach_keeps_a_finite_logit_finite(scale
     weight to NaN, so the fold bounds the factor's magnitude (`algebra.Forward.base2`) and such a call stays
     natural. Each template mainloop's output is the value and its gradients are finite, as the
     reference's are."""
-    family = Family(lambda seed: None, np.ones((1, 1, 1, 1), bool))
-
     def first(fill, *shape):
         return jnp.zeros(shape, jnp.float32).at[..., 0].set(fill)
 
     product = 3e38 / abs(scale) if abs(scale) > 1 else 3e38
     query, key, value, dout = (first(fill, 1, 1, 1, 16) for fill in (product, 1.0, 2.0, 1.0))
+    # Its one draw the call itself, which the mainloops' legality reads (`_mosaic_takes`).
+    family = Family(lambda seed: (query, key, value, None, dout), np.ones((1, 1, 1, 1), bool))
     spans = template.spans(1, 1, 1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), query, key, value)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in pull(dout)), "the reference's gradients"

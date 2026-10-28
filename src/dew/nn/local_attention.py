@@ -1,6 +1,7 @@
 """Attention over nearby keys in memory linear in the sequence: sliding windows
-and chunked local attention, run as one flagged kernel call where a kernel
-takes the window, else as banded blocks of the span."""
+and chunked local attention, run as one whole call where the attention template
+takes it (its spans, a chunk each query's run of keys) or a kernel takes the
+window as a flag, else as banded blocks of the span."""
 
 import functools
 
@@ -62,11 +63,13 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     without them; `right_padded` says each row's valid slots come first
     (`AttentionMetadata.right_padded`).
 
-    No `[S, S]` array is built above two spans. A window flash, cudnn (no
+    No `[S, S]` array is built above two spans. A call the attention template
+    takes runs whole as its spans, which it walks tile by tile: the window, or
+    each query's run of its chunk's keys (`chunk_runs`), with the documents,
+    the valid keys, the sinks and the softcap. A window flash, cudnn (no
     sinks) or splash takes as a flag, without packing, runs there, skipping
-    blocks outside it.
-    Chunks that start at row multiples fold into the batch. Everything else
-    runs banded: query blocks of the span against their own block and the one
+    blocks outside it. Elsewhere chunks that start at row multiples fold into
+    the batch, and everything else runs banded: query blocks of the span against their own block and the one
     before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
     pads to whole spans, so at most two spans take the dense call. A row with
     padding among its tokens runs on its real tokens alone (`compacted`), so
@@ -87,8 +90,13 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         _local_attention, window=window, chunk=chunk, max_segments=max_segments, dtype=dtype,
         precision=precision, force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
         sinks=sinks, softcap=softcap)
-    # A window counts tokens by their distance alone, so only a chunk reads the places.
-    places = None if chunk is None else places
+    # A window counts tokens by their distance alone, so only a chunk reads the places, at 32 bits at
+    # least: a chunk past a narrower dtype's largest is no number of it.
+    if chunk is None or places is None:
+        places = None
+    else:
+        places = jnp.asarray(places)
+        places = places.astype(jnp.promote_types(places.dtype, jnp.int32))
     if valid is not None and not right_padded:
         return compacted(attend, query, key, value, places, segment_ids, valid)
     return attend(query, key, value, places=places, segment_ids=segment_ids, valid=valid)
@@ -108,6 +116,13 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
         causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments)
+    if resolved == 'template':
+        # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
+        # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with
+        # the documents, the valid keys, the sinks and the softcap as they are, no band and no mask.
+        runs = None if chunk is None else chunk_runs(places, query.shape[0], length, chunk)
+        return whole(implementation=implementation, causal=True, sliding_window=window,
+                     segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
     # its additive bias where cudnn runs (docs/performance.md: 16384 packed
     # tokens at window 4096 in 0.60 GiB of temporaries on an L4, where xla
@@ -176,6 +191,19 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
                             segment_ids=segment_ids, valid=valid,
                             implementation=implementation, masked=masked)
     return checkpoint_name(out, 'attention_output')
+
+
+def chunk_runs(places, rows: int, length: int, chunk: int) -> jax.Array:
+    """Each query's run of keys `[lo, hi)` `[B, S, 1, 2]` int32 (`template.spans`' `runs`): its own chunk's
+    keys of `chunk` places at or before it, chunked attention's (`chunk_mask`, under causality). `places`
+    `[S]` or `[B, S]` are counted (`counted_places`), so a chunk's tokens in a document are consecutive
+    slots, and None is the row index; the documents bound a run that starts in the one before."""
+    place = jnp.arange(length) if places is None else jnp.asarray(places)
+    # The remainder in the places' own integers, then its slots: a wide place narrowed first would move it.
+    into = jnp.broadcast_to(jnp.atleast_2d(place % chunk), (rows, length)).astype(jnp.int32)
+    index = jnp.arange(length, dtype=jnp.int32)
+    first = jnp.maximum(index - into, 0)
+    return jnp.stack([first, jnp.broadcast_to(index + 1, first.shape)], axis=-1)[:, :, None, :]
 
 
 def compacted(attend, query, key, value, places, segment_ids, valid):

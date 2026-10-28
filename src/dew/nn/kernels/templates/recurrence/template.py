@@ -74,28 +74,34 @@ class Mosaic(base.Template[mainloop.Tiles]):
     """The chunked rule on the recurrence template's mainloop (`recurrence_chunk.mosaic_rule`), its config
     the forward's tiles. Its operands are the rule's: queries and keys `[B, T, H, Dk]`, values
     `[B, T, HV, Dv]`, the log decay a head's `[B, T, HV]` or a key dimension's `[B, T, HV, Dk]`, the write
-    gate `[B, T, HV]`, each row's initial memory and packed documents' first tokens."""
+    gate `[B, T, HV]`, each row's initial memory and packed documents' first tokens, and their rows'
+    documents' first slots as the batch built them (`firsts`, `dew.batch.Coordinates.firsts`)."""
 
     name: ClassVar[str] = "mosaic_gpu"
     config_cls: ClassVar[type[mainloop.Tiles]] = mainloop.Tiles
 
     def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, g: jax.Array, beta: jax.Array,
              state: jax.Array | None = None, starts: jax.Array | None = None, *,
-             max_segments: int | None = None, scale: float | None = None, delta: bool = True,
-             wide: bool = False, floor: float | None = None, config: mainloop.Tiles,
+             firsts: jax.Array | None = None, max_segments: int | None = None, scale: float | None = None,
+             delta: bool = True, wide: bool = False, floor: float | None = None, config: mainloop.Tiles,
              return_residuals: bool = False):
         from dew.nn.kernels.recurrence_chunk import mosaic_rule
 
         del return_residuals
-        return mosaic_rule(query, key, value, g, beta, state, tiles=config, starts=starts,
+        return mosaic_rule(query, key, value, g, beta, state, tiles=config, starts=starts, firsts=firsts,
                            max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor), None
 
     @staticmethod
     def launched() -> generation.GpuTarget:
         """The target a call's launches run for: this device's where a bundle claims its family, else the
-        interpreted bundle's generation's (`INTERPRETED_GENERATION`)."""
+        interpreted bundle's generation's (`INTERPRETED_GENERATION`), its multiprocessors unstated: an
+        interpreter runs a launch's programs one after another, no wave of them to fill, so the derivation
+        takes the widest tiles that hold (`derived`; packed documents' interpreted gradient took 21 s a draw
+        at the one-wave rule's 16-wide value block and 14 at 32, row 1850)."""
         target = generation.gpu_target()
-        return target if bundle(target) is not None else generation.gpu_target(INTERPRETED_GENERATION)
+        if bundle(target) is not None:
+            return target
+        return dataclasses.replace(generation.gpu_target(INTERPRETED_GENERATION), multiprocessors=None)
 
     def _launches(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, target: generation.GpuTarget, *,
                   backward: bool) -> tuple[mainloop.Launch, ...]:

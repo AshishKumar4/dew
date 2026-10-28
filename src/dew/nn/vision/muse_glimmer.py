@@ -164,7 +164,8 @@ def translate_muse_glimmer_vision_config(hf_config: Mapping[str, object]) -> Rec
         "pos_emb_height": _records.integer(vision.get("pos_emb_height", 32), "pos_emb_height"),
         "pos_emb_width": _records.integer(vision.get("pos_emb_width", 32), "pos_emb_width"),
         "layer_norm_eps": _records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
-        "rope_theta": rope_base(vision, 10000.0),
+        # Transformers 5.17 names its grid rotary 'axial' (MuseGlimmerVisionConfig.default_rope_type).
+        "rope_theta": rope_base(vision, 10000.0, axial=True),
         "layer_types": kinds,
     }}
 

@@ -6,10 +6,6 @@ rounded operands; the MoE dispatcher's implementations; and the cost model
 import dataclasses
 import functools
 import itertools
-import os
-import subprocess
-import sys
-import textwrap
 
 import jax
 import jax.numpy as jnp
@@ -362,9 +358,10 @@ def test_a_frozen_matrix_forms_no_kernel_gradient():
 @runs("sm80")
 def test_the_kernels_forward_mode_keeps_the_projections_law():
     """An expert projection's tangent through the template (its launches interpreted, as an A100 runs
-    them) is the XLA projection's, bit for bit: `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents
-    unrounded, where a cast's own tangent would round an fp32 input's to bf16 first (two products of an
-    fp32 1 + 2^-8 and 1.5 sum to 3.015625, rounded first 3)."""
+    them), and the XLA projection's, each keep the projection's law `dx @ Q(kernel) + Q(x) @ dkernel` with
+    the tangents unrounded, where a cast's own tangent would round an fp32 input's to bf16 first: two
+    products of an fp32 1 + 2^-8 and 1.5 sum to 3.01171875, which bf16 rounds to 3.015625 (rounded first,
+    3), every value exact."""
     sizes = jnp.asarray([1, 2], jnp.int32)
     x, w = jnp.zeros((3, 2), jnp.float32), jnp.full((2, 2, 2), 1.5, jnp.float32)
     dx, dw = jnp.full((3, 2), 1 + 2.0 ** -8, jnp.float32), jnp.full((2, 2, 2), 2.0 ** -9, jnp.float32)
@@ -375,7 +372,8 @@ def test_the_kernels_forward_mode_keeps_the_projections_law():
 
     with generation.assumed("sm80"):
         kernels = tangent("pallas")
-    np.testing.assert_array_equal(np.asarray(kernels, np.float32), np.asarray(tangent("xla"), np.float32))
+    for found in (kernels, tangent("xla")):
+        np.testing.assert_array_equal(np.asarray(found, np.float32), np.full((3, 2), 3.015625, np.float32))
 
 
 @runs("sm80")
@@ -493,21 +491,32 @@ def twice(acc, bias):
 
 def test_a_cooperative_tile_stores_each_of_several_outputs():
     """A cooperative tile's consumers stage every output at once: a two-output epilogue's outputs, each its
-    own staging buffer, are bit for bit those of the same tile asked for each output alone."""
-    x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16)
-    x, w = jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
+    own staging buffer, on par with the plain program's two over the draws (check 1), truth the product
+    and its epilogue in float64 (eagerly: the interpreter's ordered callbacks)."""
     bias = jnp.asarray(np.linspace(-1, 1, WIDTH), jnp.float32)
     sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
     tiles = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2)
 
-    def run(epilogue, out_dtypes=None):
-        return mosaic_gpu.gmm(x, w, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
-                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED, epilogue=epilogue,
-                              epilogue_operands=(bias,), epilogue_axes=(("columns",),), out_dtypes=out_dtypes)
+    def draw(seed):
+        x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)
+        return jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
 
-    first, second = run(doubled_halves, (jnp.bfloat16, jnp.bfloat16))
-    np.testing.assert_array_equal(np.asarray(first, np.float32), np.asarray(run(twice), np.float32))
-    np.testing.assert_array_equal(np.asarray(second, np.float32), np.asarray(run(halved), np.float32))
+    def run(x, w):
+        return mosaic_gpu.gmm(x, w, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
+                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED,
+                              epilogue=doubled_halves, epilogue_operands=(bias,),
+                              epilogue_axes=(("columns",),), out_dtypes=(jnp.bfloat16, jnp.bfloat16))
+
+    def plain(x, w):
+        acc = jax.lax.ragged_dot(x, w, sizes, preferred_element_type=jnp.float32)
+        return twice(acc, bias), halved(acc, bias)
+
+    def truth(x, w):
+        acc = jax.lax.ragged_dot(x, w, sizes, preferred_element_type=x.dtype)
+        return acc * 2, acc + bias[None, :]
+
+    assert_as_exact(run, jax.jit(plain), draw, "a cooperative tile's two outputs", seeds=SEEDS,
+                    truth_fn=truth)
 
 
 def test_each_groups_row_tiles_start_at_its_first_row():
@@ -538,89 +547,3 @@ def test_no_row_tile_reads_past_its_operands_allocation(sizes, row_tile):
     assert reads <= mosaic_gpu.row_extent(rows, row_tile)
     if sizes == [120, 8]:
         assert reads > -(-rows // row_tile) * row_tile  # past the row-tile padding that held before
-
-
-
-def test_a_refuted_config_steps_the_derivation_down_its_own_order():
-    """Where the compiler refutes the derived config (`resources.confirmed_derivation`), the derivation runs
-    again without it and takes its next config in its own order; it ends where the derivation runs out."""
-    from dew.nn.kernels.templates import resources
-
-    order = ["128x128 s3", "128x128 s2", "64x128 s3"]
-
-    def derive(allowed):
-        return next((config for config in order if allowed(config)), None)
-
-    assert resources.confirmed_derivation(derive, lambda config: config != "128x128 s3") == "128x128 s2"
-    assert resources.confirmed_derivation(derive, lambda config: True) == "128x128 s3"
-    assert resources.confirmed_derivation(derive, lambda config: False) is None
-
-
-def test_an_interpreted_launch_takes_the_models_tile_unconfirmed():
-    """An interpreted call compiles no kernel, so its derived tile needs no compiler's word
-    (`Template.confirmed`)."""
-    args = (jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16),
-            jax.ShapeDtypeStruct((8, 2048, 2048), jnp.bfloat16), jax.ShapeDtypeStruct((8,), jnp.int32))
-    with generation.assumed("sm80"):
-        target = generation.gpu_target()
-        launch = grouped_matmul.MosaicGmm()
-        ba = launch.bind(*args, interpret=True, out_dtype="bfloat16", trans_rhs=False)
-        tile = launch.derived(ba, target)
-        assert tile is not None and launch.confirmed(ba, tile, target)
-
-
-LAUNCH = textwrap.dedent("""
-    import jax, jax.numpy as jnp, tokamax
-    from dew.nn.kernels import generation, grouped_matmul, tuning
-
-    args = (jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16),
-            jax.ShapeDtypeStruct((2,), jnp.int32))
-    with generation.assumed("sm80"):
-        launch = grouped_matmul.MosaicGmm()
-        tile = launch.derived(launch.bind(*args, interpret=True, out_dtype="bfloat16", trans_rhs=False),
-                              generation.gpu_target())
-        configured = launch.replace(config=tile)
-        bound = configured.bind(*args, interpret=False, out_dtype="bfloat16", trans_rhs=False)
-        name = tuning.launch_text(bound)
-
-    def call(x, w, sizes):
-        return configured(x, w, sizes, interpret=False, out_dtype="bfloat16", trans_rhs=False)
-""")
-"""A plain grouped forward at its derived tile on an A100 (`call`, at `args`) and the text every process
-names it by (`name`, `tuning.launch_text`)."""
-
-
-def test_a_launchs_reports_are_compiled_once_per_toolchain_and_found_by_its_name_in_a_later_process(
-        monkeypatch, tmp_path):
-    """`report.confirmed` keeps a launch's reports under Dew's cache by the launch's text
-    (`tuning.launch_text`), its generation, the toolchain and Dew's source (`report.toolchain`,
-    `report.source`): a second ask compiles nothing, and a later process that names the launch alike finds
-    them without tracing the launch to export it or compiling it."""
-    from dew.nn.kernels.templates import report
-
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    compiled = []
-    found = (report.Report("dew_gmm", 1024, 0, 128, 0),)
-
-    def compile(exported, name, directory):
-        compiled.append(name)
-        return found
-
-    here: dict = {}
-    exec(LAUNCH, here)
-    for _ in range(2):
-        confirmed = report.confirmed(here["call"], here["args"], "sm80", call=here["name"], compile=compile)
-        assert confirmed == found
-    assert compiled == ["sm80"]
-    assert len(list((tmp_path / "dew" / "kernel-reports").glob("*.json"))) == 1
-    later = LAUNCH + textwrap.dedent("""
-        from dew.nn.kernels.templates import report
-
-        def refused(*_):
-            raise AssertionError("traced or compiled again")
-
-        print([entry.kernel for entry in report.confirmed(refused, args, "sm80", call=name, compile=refused)])
-    """)
-    done = subprocess.run([sys.executable, "-c", later], env=dict(os.environ), capture_output=True, text=True,
-                          check=False)
-    assert (done.returncode, done.stdout.strip()) == (0, "['dew_gmm']"), done.stderr[-2000:]

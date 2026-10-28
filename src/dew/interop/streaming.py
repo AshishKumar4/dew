@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.distributed.host import evict
+from dew.interop.unread import Stored, valued
 from dew.interop.weights import swapped
 from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS
 
@@ -34,10 +35,11 @@ class SourceLeaf:
 
     `members` holds one tensor, or with `stacked` one per expert in expert
     order. `transposed` swaps each member's last two axes. `dtype` is the
-    storage the leaf is read into, which casts only the read part.
+    storage the leaf is read into, which casts only the read part. A load
+    without its weights holds `Unread` members, whose shapes it reads alone.
     """
 
-    members: tuple[np.ndarray, ...]
+    members: tuple[Stored, ...]
     dtype: np.dtype
     transposed: bool = False
     stacked: bool = False
@@ -83,7 +85,7 @@ class SourceLeaf:
                                    member_shape, copy=False) for member in self.members)
         return SourceLeaf(members, self.dtype, stacked=self.stacked)
 
-    def _member(self, member: np.ndarray, index: tuple[slice, ...]) -> np.ndarray:
+    def _member(self, member: Stored, index: tuple[slice, ...]) -> np.ndarray:
         """One member's values at `index` of its view, C-ordered in `dtype`:
         read and cast in the stored layout, which is contiguous, then
         swapped in tiles (`swapped`) where the leaf is transposed."""
@@ -109,10 +111,12 @@ class SourceLeaf:
     def release(self) -> None:
         """Give back the mapped pages the reads faulted in."""
         for member in self.members:
-            evict(member)
+            # An `Unread` member maps no pages.
+            if valued(member):
+                evict(member)
 
 
-type LazyTree = dict[str, np.ndarray | SourceLeaf | LazyTree]
+type LazyTree = dict[str, Stored | SourceLeaf | LazyTree]
 """A variables collection whose leaves are stored arrays or `SourceLeaf` recipes."""
 
 
@@ -233,8 +237,11 @@ class WeightLayout:
         """The source tensor, built from its leaves and brought to contiguous host storage."""
         leaves = self._leaves(variables, scalar_mode)
         # A single transposed bfloat16 kernel copies at 0.15 GiB/s on the RTX 3090 box's CPU;
-        # transposing on its device before the contiguous host copy reaches several GiB/s.
+        # transposing on its device before the contiguous host copy reaches several GiB/s. Only a leaf
+        # already on a device: a host leaf (an export gathered home) transposes where it is, never copied
+        # to the accelerator and back, which would need it to fit there.
         device_transpose = (len(leaves) == 1 and self.transpose is not None
+                            and isinstance(leaves[0], jax.Array)
                             and jax.dtypes.canonicalize_dtype(leaves[0].dtype) == leaves[0].dtype)
         value = np.ascontiguousarray(self._source(leaves, on_host=not device_transpose)).reshape(self.shape)
         return value if self.dtype is None else value.astype(self.dtype)

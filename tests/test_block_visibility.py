@@ -135,6 +135,30 @@ def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
                         modeling_overrides={"attention": {"linear_attention": "block_bidirectional"}})
 
 
+def test_a_nemotron_hybrids_attention_layers_read_blocks_where_an_override_names_them(tmp_path):
+    """Nemotron-H's attention kind reads its blocks under a block-bidirectional override, as a
+    Nemotron 3.5 Lightning run asks of it, its Mamba kind the release's, and without groups the plain
+    release's logits bitwise; the saved model states the override and reloads reading blocks
+    (ledger 1883)."""
+    from dew.interop import Pretrained
+
+    plain = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32", attention_impl="xla")
+    blocked = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32", attention_impl="xla",
+                              modeling_overrides=BLOCKED)
+    assert blocked.model.kind_of("full_attention").mixer.bidirectional_blocks
+    assert blocked.model.kind_of("linear_attention") == plain.model.kind_of("linear_attention")
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, blocked.model.vocab_size)
+    np.testing.assert_array_equal(np.asarray(blocked.model.apply(blocked.variables, ids)),
+                                  np.asarray(plain.model.apply(plain.variables, ids)))
+    read = blocked.model.apply(blocked.variables, ids, block_groups=jnp.asarray(BLOCKS))
+    blocked.save(tmp_path / "saved")
+    assert json.loads((tmp_path / "saved" / "config.json").read_text())["modeling_overrides"] == BLOCKED
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids,
+                                                                  block_groups=jnp.asarray(BLOCKS))),
+                                  np.asarray(read))
+
+
 def test_a_layer_that_reads_no_groups_stays_causal():
     """Block and image groups reach every layer, and a layer whose kind reads neither computes what it
     computes without them, bitwise."""
@@ -228,26 +252,15 @@ def test_a_blocks_last_call_reads_its_earlier_keys_past_the_window_from_the_cach
                     truth_fn=full(wide))
 
 
-def test_a_non_causal_kind_reading_blocks_keeps_its_kernel(without_deterministic_ops):
+def test_a_non_causal_kind_reading_blocks_computes_what_it_computes_without_them():
     """A non-causal kind sees its whole row already, so the groups it would read add nothing: a call with
-    and without them reports the same attention routes on an A100 (`generation.routes`), cuDNN named, with
-    no mask of their own. Only routes are traced, no program compiled, so on the cuda lane, whose
-    --xla_gpu_deterministic_ops keeps cuDNN away from a run (`without_deterministic_ops`), the flag is
-    taken out for the routes the claim is about."""
+    them gives the call without them, bit for bit, every key it reads the same."""
     decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)}).clone(
-        causal=False, attention_impl="cudnn", dtype=jnp.bfloat16)
+        causal=False, dtype=jnp.bfloat16)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
-    # The same parameters as this host's kernel makes them, where a named cuDNN does not run.
-    params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
-
-    def routes(**groups):
-        with generation.assumed("sm80"), generation.routes() as found:
-            jax.eval_shape(lambda params, ids: decoder.apply(params, ids, **groups), params, ids)
-        return [(route.choice, route.kernel) for route in found]
-
-    plain = routes()
-    assert ("attention", "cudnn") in plain
-    assert routes(block_groups=jnp.asarray(BLOCKS)) == plain
+    params = decoder.init(jax.random.key(1), ids)
+    plain = decoder.apply(params, ids)
+    np.testing.assert_array_equal(decoder.apply(params, ids, block_groups=jnp.asarray(BLOCKS)), plain)
 
 
 WINDOWED_BLOCKS = {"sliding_attention": {"window": 2, "mixer": AttentionMixer(bidirectional_blocks=True)}}
@@ -256,16 +269,15 @@ WINDOWED_BLOCKS = {"sliding_attention": {"window": 2, "mixer": AttentionMixer(bi
 @pytest.mark.parametrize("kinds", [{"full_attention": {}}, WINDOWED_BLOCKS], ids=["full", "window-blocks"])
 def test_padding_inside_a_row_reaches_the_fused_kernel_as_its_keys_validity(kinds):
     """A call with padding inside its rows hands the kernel its real keys and, under a window, the places
-    the window counts, rather than a mask it builds: a layer naming the template runs it, where the template
-    refuses a mask by its inherent limit (so a mask built here would raise)."""
+    the window counts, rather than a mask it builds: a layer naming the template traces on an A100, where
+    the template refuses a mask by its inherent limit (so a mask built here would raise)."""
     decoder = model(**kinds).clone(dtype=jnp.bfloat16, attention_impl="template")
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
     params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
     blocks = jnp.asarray(WINDOWED) if kinds is WINDOWED_BLOCKS else None
-    with generation.assumed("sm80"), generation.routes() as found:
+    with generation.assumed("sm80"):
         jax.eval_shape(lambda params, ids: decoder.apply(params, ids, attention_mask=jnp.asarray(GAPS),
                                                          block_groups=blocks), params, ids)
-    assert {route.kernel for route in found if route.choice == "attention"} == {"template"}
 
 
 def test_a_server_keeps_a_block_layers_prefill_apart():

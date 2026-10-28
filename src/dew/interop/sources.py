@@ -35,6 +35,7 @@ from dew.interop.safetensors_io import (
     stored_spec,
     weight_files,
 )
+from dew.interop.unread import Unread, unread
 
 
 def load_shards(directory: Path) -> dict[str, np.ndarray]:
@@ -316,6 +317,24 @@ def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int
 
     header = HfApi().parse_safetensors_file_metadata(name, file, revision=revision)
     return {tensor_name: (list(tensor.shape), tensor.dtype) for tensor_name, tensor in header.tensors.items()}
+
+
+def stored_tensors(source: SourceReference, root: Path) -> LazyTensors[Unread] | None:
+    """`source`'s weight tensors at the snapshot `root` (`snapshot(weights=False)`) as their shapes and
+    dtypes alone, read from their safetensors headers (`StoredWeights.specs`, a Hub source's over HTTP
+    and cached), what a load without its weights translates: each tensor an `Unread` array, its shape
+    and dtype, no value fetched or read. None for a checkpoint of PyTorch pickles alone, whose shapes
+    no header states, which a load reads whole. Raises FileNotFoundError where a header cannot be read
+    (offline, never read online)."""
+    stored = StoredWeights(source.name, root, source.subfolder or "")
+    if not stored.files(""):
+        return None
+    held = stored.specs("")
+    if held is None:
+        raise FileNotFoundError(f"{source.name} at {root.name}: its weights' headers were never read "
+                                "online, and offline they are read from the files alone; load it online "
+                                "once, or with its weights")
+    return unread({name: spec for name, (_, spec) in held.items()})
 
 
 @dataclass(frozen=True)

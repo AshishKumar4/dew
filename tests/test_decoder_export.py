@@ -83,6 +83,9 @@ not established by the tiny untied-cutoff fixtures.
 import dataclasses
 import functools
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import jax
@@ -536,6 +539,21 @@ def test_a_sharded_export_holds_a_few_shards_on_the_host(tmp_path):
     assert measured["rise_gb"] < 4 * 50e6 / 2**30, measured
 
 
+def test_a_failed_export_ends_with_its_own_error(tmp_path):
+    """tools/benchmark_streaming_export.py samples the host's memory from a thread while it saves: a save
+    that fails (its directory here a file) ends the process with the save's error, the sampler stopped with
+    it, where the sampler, stopped only after a save that succeeded, kept the process from exiting (row
+    1579). The deadline is the test's own, past the tiny checkpoint's seconds."""
+    out = tmp_path / "out"
+    out.write_text("a file where the export's directory goes\n")
+    environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
+    run = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "benchmark_streaming_export.py"),
+                          str(FIXTURES / "qwen3-tiny"), "main", str(out)], capture_output=True, text=True,
+                         env=environment | {"JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src")},
+                         timeout=300)
+    assert run.returncode == 1, run.stderr[-2000:]
+
+
 def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it(tmp_path):
     """A Qwen3 decoder built with `partial_rotary_factor=1.0` rotates its whole head, as with none
     stated: written from the model and its variables alone (`PretrainedDecoder.from_model`), it
@@ -948,6 +966,11 @@ def test_a_quantized_packed_tensor_and_its_part_stored_apart_must_be_one_tensor(
     assert jax.tree.structure(apart.variables) == jax.tree.structure(alone.variables)
     for ours, theirs in zip(jax.tree.leaves(apart.variables), jax.tree.leaves(alone.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    # Without its weights the copy is checked by its shape, and the load holds what a load with them does.
+    shapes = Pretrained.load(tmp_path / "apart", dtype="float32", param_dtype=storage, attention_impl="xla",
+                             weights=False)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), apart.variables)
 
 
 def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path):
