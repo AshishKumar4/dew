@@ -57,6 +57,7 @@ from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, resources
+from dew.nn.kernels.templates.gemm import cost
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,
@@ -741,11 +742,18 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
 
     entry.__name__ = name
 
-    if persistent:
-        return family.kernel(entry, out_type=out_type, grid=(programs,), grid_names=("programs",),
-                             consumers=1, interpret=call.interpret)
-    return family.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names, consumers=1,
-                         interpret=call.interpret)
+    def launched(*arrays):
+        # Its work as it states it to XLA and to Dew's FLOP count (`templates.gemm.cost`): the model's
+        # products over its tiles (an fp32 call's parts aside), its exponentials, and its operands' and
+        # outputs' bytes once (row 1895's kernel report: unstated, the recurrence made MFU a lower bound).
+        stated = dataclasses.replace(cost(work.flops * tiles, *arrays, *jax.tree.leaves(out_type)),
+                                     transcendentals=int(work.exponentials * tiles))
+        laid = ({"grid": (programs,), "grid_names": ("programs",)} if persistent
+                else {"grid": grid, "grid_names": grid_names})
+        return family.kernel(entry, out_type=out_type, **laid, consumers=1, interpret=call.interpret,
+                             name=name, cost=stated)(*arrays)
+
+    return launched
 
 
 def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callable | None = None):
