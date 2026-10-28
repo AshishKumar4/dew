@@ -32,7 +32,7 @@ import pytest
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
 from ssd_support import ssd_orbit
 
-from dew.nn.kernels.recurrence_chunk import RESET_DECAY
+from dew.nn.kernels.recurrence_chunk import RESET_DECAY, ssd_operands
 from dew.nn.kernels.ssd import ssd_chunk_scan
 from dew.nn.precision import float32_products, products_dtype
 
@@ -47,15 +47,9 @@ def reference():
 
 
 def blocks(x, dt, A, B, C, state, chunk_size: int, dtype=jnp.float32):
-    """The operands as `chunk_ssd` hands them to a scan: groups expanded, the
-    sequence padded out to whole chunks of `chunk_size`, `x` scaled by its
-    step and the decay `A dt` per step."""
-    _, length, heads, _ = x.shape
-    B, C = (jnp.repeat(t, heads // t.shape[2], axis=2) for t in (B, C))
-    pad = (chunk_size - length % chunk_size) % chunk_size
-    x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
-    dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
-    return tuple(jnp.asarray(t, dtype) for t in (x * dt[..., None], B, C, A[None, None, :] * dt, state))
+    """The operands as the layer hands them to the chunk scan (`ssd_operands`), with the state, in
+    `dtype`."""
+    return tuple(jnp.asarray(t, dtype) for t in (*ssd_operands(x, dt, A, B, C, chunk_size), state))
 
 
 def cotangents(y, final, seed: int = 0):

@@ -59,6 +59,7 @@ from .sharding import (
     HEADS,
     MLP_HIDDEN,
     RESIDUAL,
+    automatic_axes,
     constrain,
     grouped_heads,
     logical_axes,
@@ -146,8 +147,7 @@ def _row_split(x) -> MeshAxes | None:
     left to the partitioner that is larger than one, and the context's rules split nothing else of
     it, as a residual or a feed-forward activation; None otherwise. An axis that left the operand
     whole on its devices would sum the taps' gradient over copies of the same rows."""
-    mesh = jax.sharding.get_abstract_mesh()
-    automatic = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes and mesh.shape[axis] > 1}
+    automatic = set(automatic_axes())
     if not automatic:
         return None
     residual, hidden = (tuple(logical_spec(axes, x.shape)) for axes in (RESIDUAL, MLP_HIDDEN))
