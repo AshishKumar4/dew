@@ -38,7 +38,13 @@ from dew.batch import Variables, real_slots, token_positions, valid_order, with_
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
-from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, with_rounding_keys, write_cache
+from dew.nn.kv_cache import (
+    gather_cache_rows,
+    refuse_unassigned,
+    with_rounding_keys,
+    with_rounding_keys_of,
+    write_cache,
+)
 from dew.nn.protocols import (
     BlockDenoiser,
     BlockDrafting,
@@ -541,8 +547,9 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 32. Rebuilding the prefix retains the prompt's information.
                 https://github.com/huggingface/transformers/issues/49334
                 """
-                empty = model.apply(params, tokens.shape[0],
-                                     method='init_cache', mutable=['cache'])[1]['cache']
+                empty = with_rounding_keys_of(
+                    model.apply(params, tokens.shape[0], method='init_cache', mutable=['cache'])[1]['cache'],
+                    state.cache)
                 answer, updated = model.apply(
                     {**params, 'cache': empty}, history,
                     attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],

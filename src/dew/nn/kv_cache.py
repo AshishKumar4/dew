@@ -97,6 +97,13 @@ def with_rounding_keys(cache: Mapping[str, object], keys: jax.Array) -> Mapping[
         lambda path, leaf: keys.astype(leaf.dtype) if leaf_name(path) == ROUNDING_KEYS else leaf, cache)
 
 
+def with_rounding_keys_of(fresh: Mapping[str, object], held: Mapping[str, object]) -> Mapping[str, object]:
+    """`fresh`, a cache allocated anew, with the `ROUNDING_KEYS` leaves `held`, the rows' cache before
+    it, keeps: a rebuilt cache's rows round by their own keys still."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, new, old: old if leaf_name(path) == ROUNDING_KEYS else new, fresh, held)
+
+
 def overflowed(cache: Mapping[str, object], capacity: int) -> jax.Array:
     """`[rows]`: whether a row's decode calls appended more real tokens than its cache's `capacity`.
 
