@@ -1525,7 +1525,7 @@ def packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed
         missing = [stem + other for other in packing.parts if stem + other not in layouts]
         if missing:
             raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
-        if stem + packing.name in layouts:
+        if stem + packing.name in layouts and packing.name not in packing.parts:
             raise ValueError(f'{stem}{packing.name} is written both whole and as its parts {packing.parts}')
         if part == packing.parts[0]:
             source[stem + packing.name] = packing.layout(
