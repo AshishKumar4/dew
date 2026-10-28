@@ -36,13 +36,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
-from dew.batch import (
-    Coordinates,
-    Variables,
-    coordinates as build_coordinates,
-    merge,
-    shifted_span,
-)
+from dew.batch import Coordinates, Variables, coordinates as build_coordinates, merge, shifted_span
 from dew.mesh import LayoutRefused
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense

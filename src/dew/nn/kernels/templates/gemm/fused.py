@@ -36,7 +36,6 @@ take it rather than run XLA (`selection.KernelRefused`).
 
 import dataclasses
 import functools
-from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -77,9 +76,9 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     leaves, treedef = jax.tree.flatten(values)
-    axes = (generation.Refusal('scalar_prefetch', "the consumer reads scalar prefetch") if prefetch
-            else _axes(consumer, values, acc))
-    if select(EPILOGUE, Tiling(axes)).kernel == 'xla':
+    axes = _stage(EPILOGUE, generation.Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
+                  if prefetch else _axes(consumer, values, acc))
+    if axes is None:
         summed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
                                interpret_on_cpu=interpret_on_cpu, **prologue)
         return consumer(values, summed)
@@ -88,9 +87,8 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc.shape)
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
-    # The selector took the stage, so the analysis found its axes (a refusal is a requirement it fails).
     consumed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
-                             epilogue_operands=tuple(zip(leaves, cast(tuple, axes), strict=True)),
+                             epilogue_operands=tuple(zip(leaves, axes, strict=True)),
                              out_dtype=dtypes[0], out_dtypes=dtypes if several else None,
                              interpret_on_cpu=interpret_on_cpu, **prologue)
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
@@ -106,6 +104,18 @@ class Tiling:
     @property
     def refusal(self) -> generation.Refusal | None:
         return self.found if isinstance(self.found, generation.Refusal) else None
+
+
+def _stage[S: tuple](op: Op[Tiling], found: S | generation.Refusal) -> S | None:
+    """The stage its analysis `found`, where `op`'s selector runs it in the kernel; None where it runs in
+    XLA's program. The selector decides and reports either way: a refusal is a requirement the fused kernel
+    fails, so it selects XLA, or raises where the call names the fused kernel."""
+    match found:
+        case generation.Refusal():
+            select(op, Tiling(found))
+            return None
+        case _:
+            return found if select(op, Tiling(found)).kernel == 'fused' else None
 
 
 def _tileable(code: str) -> Requirement[Tiling]:
@@ -145,10 +155,10 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
     # An operand as given has no producer to fuse, and no stage to choose.
     if isinstance(split, generation.Refusal) and split.code == 'no_producer':
         return fusion(), {}
-    if select(PROLOGUE, Tiling(split)).kernel == 'xla':
+    stage = _stage(PROLOGUE, split)
+    if stage is None:
         return fusion(), {}
-    # The selector took the stage, so the analysis split it (a refusal is a requirement it fails).
-    base, function, sides, axes, jvp = cast(tuple, split)
+    base, function, sides, axes, jvp = stage
     return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
                   'prologue_jvp': jvp}
 
