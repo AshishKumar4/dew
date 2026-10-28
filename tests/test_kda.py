@@ -23,7 +23,16 @@ import numpy as np
 import pytest
 from certified import assert_certified
 from model_support import decode_through
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, with_gradients
+from reference_error import (
+    assert_as_exact,
+    assert_computes_the_oracle,
+    chain_roundings,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    widened,
+    with_gradients,
+)
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
@@ -226,23 +235,52 @@ CERTIFIED_SEEDS = 2
 primitive at a time."""
 
 
+def default_eps_draw(seed):
+    """A default eps gradient site's draw: the layer's input and its output's cotangent, from `seed` and
+    the next."""
+    return (jnp.asarray(np.random.RandomState(seed).randn(B, S, E), jnp.float32),
+            jnp.asarray(np.random.RandomState(seed + 1).randn(B, S, E), jnp.float32))
+
+
+def test_default_eps_gradients_compute_the_transcriptions():
+    """At the gated norm's own eps 1e-5 (ledger row 1348), the layer's gradients in float64 are the
+    transcription's float64 gradients (its autodiff, where central differences were) within the
+    float64 rounding of the layer's own backward (the oracle rule, `assert_computes_the_oracle`, its
+    roundings counted on that program): the function Dew differentiates is the transcription's, which
+    check 2 then holds Dew's float32 program to, element by element."""
+    module, _, variables = layer_and_params(-5.0)
+    for seed in (4, 6):
+        x, cotangent = default_eps_draw(seed)
+        with jax.enable_x64(new_val=True):
+            wide = widened((variables, x, cotangent))
+            backward = with_gradients(module.apply)
+            _, grad_params, grad_x = backward(*wide)
+            roundings = chain_roundings(jax.make_jaxpr(backward)(*wide))
+            _, wanted_x, wanted = with_gradients(partial(oracle_forward, eps=1e-5))(
+                *widened((x, oracle_params(variables), cotangent)))
+        ours, wanted = {"x": grad_x, **oracle_params(grad_params)}, {"x": wanted_x, **wanted}
+        for name, value in ours.items():
+            assert_computes_the_oracle(np.asarray(value), np.asarray(wanted[name]),
+                                       f"the {name} gradient at eps 1e-5, seed {seed}", roundings=roundings)
+
+
 def test_default_eps_gradients_certify_element_by_element(monkeypatch):
     """At the gated norm's own eps 1e-5 (ledger row 1348) a gradient through the norm of a near-zero row
     errs as the row's inverse square, a tail check 1 cannot resolve within 512 seeds, so the layer's
     gradients there are certified instead: the layer's backward run one primitive at a time, every
     element of every operation within its own operation's certified bound (check 2), whatever a row's
-    norm. The program certified is the library's own, which every platform runs: without the test
-    lane's wide CPU arithmetic (`precision.WIDE_CPU_ARITHMETIC`), each of its float32 sums certified as
-    the sum it is. Check 1 holds the gradients at eps 1e-2 (`test_the_layer_gradients_match_the_oracle`)."""
+    norm, on the draws whose float64 gradients compute the transcription's
+    (`test_default_eps_gradients_compute_the_transcriptions`). The program certified is the library's
+    own, which every platform runs: without the test lane's wide CPU arithmetic
+    (`precision.WIDE_CPU_ARITHMETIC`), each of its float32 sums certified as the sum it is. Check 1
+    holds the gradients at eps 1e-2 (`test_the_layer_gradients_match_the_oracle`)."""
     from dew.nn import precision
 
     monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "0")
     module, _, variables = layer_and_params(-5.0)
 
     def draw(seed):
-        rng = np.random.RandomState(seed)
-        return (variables, jnp.asarray(rng.randn(B, S, E), jnp.float32),
-                jnp.asarray(rng.randn(B, S, E), jnp.float32))
+        return (variables, *default_eps_draw(2 * seed + 4))
 
     assert_certified(with_gradients(module.apply), draw, "KDA's gradients at eps 1e-5", seeds=CERTIFIED_SEEDS)
 
