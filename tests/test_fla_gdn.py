@@ -1011,20 +1011,22 @@ def _lowered_dot(product, default: str) -> list:
     with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh), jax.default_matmul_precision(default):
         lowered = jax.jit(call).trace(operand, operand).lower(lowering_platforms=("cuda",))
 
-    def operations(operation):
-        yield operation
-        for region in operation.regions:
-            for block in region.blocks:
-                for inner in block.operations:
-                    yield from operations(inner.operation)
+    precisions = []
 
-    # Triton IR parses only in a context with Triton's dialect, which JAX's own MLIR bindings register.
+    def visit(operation):
+        if operation.name == "tt.dot":
+            precision = ir.IntegerAttr(operation.attributes["inputPrecision"]).value
+            precisions.append(dialect.InputPrecision(precision))
+        return ir.WalkResult.ADVANCE
+
+    # Triton IR parses only in a context with Triton's dialect, which JAX's own MLIR bindings register; its
+    # operations walked as `dew.training._lowering` walks a program's (MLIR's `Operation.walk`).
     context = mlir.make_ir_context()
     dialect.register_dialect(context)
     with context:
-        return [dialect.InputPrecision(ir.IntegerAttr(operation.attributes["inputPrecision"]).value)
-                for call in triton_calls(lowered)
-                for operation in operations(ir.Module.parse(call.ir).operation) if operation.name == "tt.dot"]
+        for call in triton_calls(lowered):
+            ir.Module.parse(call.ir).operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    return precisions
 
 
 def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
