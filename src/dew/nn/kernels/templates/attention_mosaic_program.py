@@ -81,7 +81,9 @@ class BackwardTiles:
     flight (`stages`), the consumers a program (`consumers`), whether the fast form runs as one launch
     (`fused`, `_launch_backward`), the instruction family whose bundle runs it (`family`) and the dK/dV
     programs a key block's head widths split among (`columns`: each its share of dK's and dV's columns, its
-    logits and their cotangents its own, where a whole width's sums pass a consumer's registers)."""
+    logits and their cotangents its own, where a whole width's sums pass a consumer's registers) and the
+    sub-tiles a dK/dV step walks its query tile in (`dkv_splits`, each its own logits and cotangents, a
+    smaller step's tiles beside the sums)."""
 
     block_q: int
     block_k: int
@@ -90,6 +92,7 @@ class BackwardTiles:
     fused: bool = False
     family: str = mosaic_sm90.WGMMA.name
     columns: int = 1
+    dkv_splits: int = 1
 
     def __post_init__(self):
         if self.stages < 2:

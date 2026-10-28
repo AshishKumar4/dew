@@ -324,19 +324,35 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
     """A dK/dV consumer's query tile `index`, its keys the tile's rows (`[bk, bq]`, FlashAttention 3's order,
     hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's SdP_swapAB): its scores `K Qᵀ` (the call's power taken after
     the product) and score cotangents from the query and output cotangent slots (`slots`) and its resident
-    keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query)`, in a column's
+    keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query, count)`, in a column's
     layout), its coordinates (`coords_of(first query)`) and its hook parameters (`params_of(first query,
     like)`). The weights and the score cotangents, their keys as their rows, are dV's and dK's left operands
     from the registers (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`), issued into `accumulators`
     in place; a fused launch stages the cotangents' parts in `staged` for dQ's product, their transpose its
     left operand (`add_dq(first query, dQ)`). The key gradients' sums (`carry`) take the pulled cotangents'
     row sums, and the tile gradients go to `store_tiles(first query, pieces)`, `[bk, bq]` each."""
-    k_smem, v_smem = resident
-    family, tiles, kinds = walk.program.family, walk.program.tiles, walk.kinds
-    shape = (tiles.block_k, tiles.block_q)
+    tiles = walk.program.tiles
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
-    q_first = index * tiles.block_q
+    # The query tile in `tiles.dkv_splits` sub-tiles, each a step of its own whose tiles a consumer's
+    # registers hold beside the sums.
+    sub = tiles.block_q // tiles.dkv_splits
+    for part in range(tiles.dkv_splits):
+        q_first = index * tiles.block_q + part * sub
+        carry, (dk_acc, dv_acc) = _dkv_substep(
+            walk, resident, rows_of, staged, coords_of, params_of, add_dq, store_tiles, shares, q_first,
+            q_slot.at[pl.ds(part * sub, sub)], do_slot.at[pl.ds(part * sub, sub)], carry, (dk_acc, dv_acc))
+    return carry, (dk_acc, dv_acc)
+
+
+def _dkv_substep(walk: _Backward, resident: tuple, rows_of, staged, coords_of, params_of, add_dq, store_tiles,
+                 shares, q_first, q_slot, do_slot, carry, accumulators):
+    """`_dkv_step`'s step over one sub-tile of its query tile, its queries from `q_first` in `q_slot` and
+    `do_slot`."""
+    k_smem, v_smem = resident
+    family, tiles, kinds = walk.program.family, walk.program.tiles, walk.kinds
+    shape = (tiles.block_k, q_slot.shape[0])
+    dk_acc, dv_acc = accumulators
     # The logits from the call's queries, the power taken after the product, exact in fp32: the forward's
     # `(Q 2^p) Kᵀ` but where a query's entry times the power leaves bf16's normal range (below 2^-126). A
     # query staged by the power a step cost a third of the launch (ET-SWAPABL-h100: 3.32 against 2.21 ms
@@ -349,8 +365,8 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
-    exponentials, weights, cotangents, slopes, seen = _scores(walk, coords_of(q_first), params, s, dp,
-                                                             *rows_of(q_first), masked=True)
+    exponentials, weights, cotangents, slopes, seen = _scores(
+        walk, coords_of(q_first, shape=shape), params, s, dp, *rows_of(q_first, shape[1]), masked=True)
     logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
     narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
     # dK's and dV's products against the program's share of the queries' and output cotangents' columns.
@@ -369,7 +385,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
             family.staged(part, staged.at[place])
         # The tile's dQ, its staged cotangents' transpose times the call's keys (`algebra.cotangent_product`'s
         # `a @ b`), added into dQ: the query tile's other key blocks add theirs.
-        dq = family.product(staged.at[0].transpose((1, 0)), k_smem, (tiles.block_q, k_smem.shape[-1]))
+        dq = family.product(staged.at[0].transpose((1, 0)), k_smem, (shape[1], k_smem.shape[-1]))
         add_dq(q_first, dq)
     store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
     key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
@@ -505,9 +521,10 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(consumers)])
 
-        def rows_of(q_first):
-            # A query tile's statistics in a column's layout, the tiles' queries their columns.
-            return tuple(family.columns_of(ref.at[row, head, pl.ds(q_first, block_q)]) for ref in stat_refs)
+        def rows_of(q_first, count):
+            # `count` queries' statistics from `q_first` in a column's layout, the tiles' queries their
+            # columns.
+            return tuple(family.columns_of(ref.at[row, head, pl.ds(q_first, count)]) for ref in stat_refs)
 
         def consumer(index):
             k_first = pair_first + index * block_k
@@ -520,13 +537,12 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                 # Each tile's gradient entries straight to their place in the keys-first `[B, H, Kp, Qp]`
                 # outputs.
                 for ref, piece in zip(tile_refs, pieces, strict=True):
-                    ref[row, head, pl.ds(k_first, block_k), pl.ds(first, block_q)] = piece
+                    ref[row, head, pl.ds(k_first, block_k), pl.ds(first, piece.shape[1])] = piece
 
             # The tiles before this block's first reader its partner reads.
             family.passed(streams, streamed[0], lo, first=streamed[0])
             adds = None if dq_ref is None else functools.partial(add_dq, dq_ref, index)
-            coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first,
-                                          shape=(block_k, block_q), keys_first=True)
+            coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first, keys_first=True)
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[index], v_smem.at[index]
