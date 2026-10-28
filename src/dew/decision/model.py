@@ -119,16 +119,12 @@ class DecisionModel(HeadedModel):
             return _array(self.backbone.apply(backbone, inputs.tokens, rngs=rngs, method=read)), spanned
         if blocked:
             raise ValueError("a row of option positions sets what each token reads, which blocks set too")
-        slots, segments = inputs.slots, inputs.segments
-        other = (slots[:, :, None] > 0) & (slots[:, None, :] > 0) & (slots[:, :, None] != slots[:, None, :])
-        # A token reads its own row's, and the padding its own; an option reads no other option.
-        visible = (segments[:, :, None] == segments[:, None, :]) & ~other
-        if isinstance(self.backbone, TokenModel) and self.backbone.causal:
-            # A causal backbone reads each token's own and the earlier ones, the mask its whole visibility.
-            order = jnp.arange(slots.shape[1])
-            visible = visible & (order[None, :, None] >= order[None, None, :])
+        # A token reads its own document's keys but another option's, as runs (`key_runs`): no [B, L, L] mask;
+        # a causal backbone's runs end at each token.
+        causal = isinstance(self.backbone, TokenModel) and self.backbone.causal
+        runs = key_runs(inputs.slots, inputs.segments, inputs.options.shape[-1], causal=causal)
         return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
-                                          attention_pairwise_mask=visible,
+                                          attention_key_runs=runs,
                                           attention_key_positions=inputs.positions, method="hidden_states",
                                           conditioning=conditioning, rngs=rngs)), spanned
 
