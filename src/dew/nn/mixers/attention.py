@@ -35,7 +35,6 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.documents import CrossDocuments
-from dew.nn.kernels.templates import attention as template
 from dew.nn.flops import attention_flops, projection_flops
 from dew.nn.inputs import (
     PLAIN_CALL,
@@ -47,6 +46,7 @@ from dew.nn.inputs import (
     document_reach,
 )
 from dew.nn.kernels.selection import select
+from dew.nn.kernels.templates import attention as template
 from dew.nn.kv_cache import (
     PAGED,
     PLACES,
@@ -1133,7 +1133,8 @@ class CausalSelfAttention(nn.Module):
         # The decode token's keys as the call's spans: its slot's causal window, a block holding it read
         # whole from its start, the filled slots up to its own alone; their first key is the row's start.
         slot = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(positions, jnp.int32))[:, :1], (rows, 1))
-        spans = key_spans(1, key_length, True, window, key_value_seq_lengths=jnp.maximum(slot[:, 0] + 1, 0),
+        spans = key_spans(1, key_length, causal=True, sliding_window=window,
+                          key_value_seq_lengths=jnp.maximum(slot[:, 0] + 1, 0),
                           block_groups=history.get("block_groups"), key_valid=valid, query_slots=slot,
                           rows=rows)
         return template.dense(spans)[:, None], spans.start[:, 0]
