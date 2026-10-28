@@ -94,6 +94,9 @@ class Counted:
         self.calls.append(len(rows))
         return self.task.forward(variables, rows)
 
+    def compile(self, variables):
+        return self.task.compile(variables)
+
     def answer(self, payload, outputs):
         return self.task.answer(payload, outputs)
 
@@ -179,3 +182,32 @@ def test_the_served_weights_are_restored_in_the_dtype_they_serve_in(example):
     assert dtypes(served) == dtypes(narrow) != dtypes(wide)
     stated = example.loaded(example.Options(model=tiny, dtype="bfloat16", param_dtype="float32"))
     assert dtypes(stated) == dtypes(wide)
+
+
+def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(decide, caplog):
+    """A scoring server (`ScoringServer.from_task`) compiles every pass's program up front, a few
+    shapes the task declares once (`Decide.pass_shapes`): a lone request's and a full pass's at each of
+    the layout's lengths, whatever a request asks. Then requests of every length, question and option
+    count, alone and together, compile none while it serves, where each such shape compiled its own
+    program as it came (ledger 2033)."""
+    import logging
+
+    from test_decision_batches import CASES
+
+    task, variables = decide.scoring()
+    with jax.log_compiles():
+        server = ScoringServer.from_task(task, variables)
+        assert server.programs == decide.pass_shapes
+        assert len({(shape.length, shape.rows) for shape in server.programs}) == len(server.programs) <= 8
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            bodies = [*CASES.values(), REQUEST, {**REQUEST, "state": REQUEST["state"] * 6}]
+            futures = [server.submit(body) for body in bodies]
+            server.run()
+            for future in futures:
+                future.result()
+            single = server.submit({**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])})
+            server.run()
+            single.result()
+    # The forward's own programs (`Decide._forward`); a host-side pad compiles in microseconds.
+    assert not [record for record in caplog.records if record.getMessage().startswith("Compiling logits")]
