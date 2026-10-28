@@ -66,7 +66,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
-from dew.nn.visibility import visible, windowed
+from dew.nn.visibility import windowed
 
 
 def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
@@ -833,8 +833,7 @@ class CausalSelfAttention(nn.Module):
                 (mask, _), causal = self._decode_masks(positions, B, kv_len, None, history), False
             else:
                 last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
-                documents, causal, window = self._cached_call(
-                    positions, visible(last, jnp.arange(kv_len)[None, :], causal=True))
+                documents, causal, window = self._cached_call(positions, jnp.arange(kv_len)[None, :] <= last)
             # A quantized provider stashed its keys in the cache's rotation.
             rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
             if rotation is not None:

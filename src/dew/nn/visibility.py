@@ -15,12 +15,15 @@ from dew.batch import BLOCKS_FIELD, coordinates, document_starts
 
 
 def windowed(query, key, window: int, *, causal: bool):
-    """Whether each key coordinate lies within the window of each query coordinate (broadcast): a
-    causal window bounds the keys behind the query, keeping it and the w - 1 before it, and a two-sided
-    one those within w - 1 of it on either side (`window_sides`). It bounds distance alone; causality
-    is `visible`'s."""
+    """Whether each key coordinate lies within the window of each query coordinate (broadcast), the keys
+    `window_sides` keeps before and after it: a causal window bounds the keys behind the query, keeping
+    it and the w - 1 before it, and a two-sided one those within w - 1 of it on either side. It bounds
+    distance alone; causality is `visible`'s. The scalar form of the template's spans' window
+    (`dew.nn.kernels.templates.attention.spans`), for coordinates no span holds: a stated mask's places,
+    which need not run in order, and a banded layout's rows."""
+    before, after = window_sides(causal, window)
     distance = query - key
-    return (distance < window) if causal else (jnp.abs(distance) < window)
+    return (distance <= before) if causal else ((distance <= before) & (-distance <= after))
 
 
 def visible(query, key, *, causal: bool, window: int | None = None):
