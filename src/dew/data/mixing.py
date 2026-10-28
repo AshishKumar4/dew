@@ -471,21 +471,20 @@ class _MixReads:
         # repeat reads again goes on counting each corpus (`rewound`).
         self.counted: dict[int, Mapping[str, object]] = {}
 
-    def parent(self, index: int, reader: _MixRead) -> pygrain.DatasetIterator[Batch]:
-        """Corpus `index`'s iterator, opened as the mix first draws from or restores it, under the
-        options of the mix's iterator (`reader`), as Grain's interleave opens its iterators."""
+    def parent(self, index: int) -> pygrain.DatasetIterator[Batch]:
+        """Corpus `index`'s iterator, opened as the mix first draws from or restores it. It runs
+        under its own Grain options: the only ones Dew sets above a mix are its loading workers'
+        shared-memory floor (`min_shm_size`), which the worker boundary reads, not a corpus."""
         if index not in self.opened:
             opened = iter(self.corpora[index])
-            opened._ctx.dataset_options = reader._ctx.dataset_options.merge(opened._ctx.dataset_options)
-            reader._stats._parents = [opened._stats]
             if index in self.counted:
                 opened.set_state({**opened.get_state(), _COUNTER: self.counted.pop(index)})
             self.opened[index] = opened
         return self.opened[index]
 
-    def read(self, index: int, reader: _MixRead) -> Batch:
+    def read(self, index: int) -> Batch:
         self.states.pop(index, None)
-        return next(self.parent(index, reader))
+        return next(self.parent(index))
 
     def state(self, index: int) -> Mapping[str, object]:
         """The position of corpus `index`: its parent's, or, unopened, its counts alone (None before
@@ -496,7 +495,7 @@ class _MixReads:
             self.states[index] = self.opened[index].get_state()
         return self.states[index]
 
-    def restore(self, index: int, state: Mapping[str, object], reader: _MixRead) -> None:
+    def restore(self, index: int, state: Mapping[str, object]) -> None:
         """Corpus `index` at `state`, or back at its start, unopened, where it holds its counts alone."""
         self.states.pop(index, None)
         if set(state) <= {_COUNTER}:
@@ -505,7 +504,7 @@ class _MixReads:
             if counts is not None:
                 self.counted[index] = record(counts, "corpus counter")
         else:
-            self.parent(index, reader).set_state(state)
+            self.parent(index).set_state(state)
 
     def close(self, index: int) -> None:
         self.counted.pop(index, None)
@@ -525,14 +524,14 @@ class _MixRead(pygrain.DatasetIterator[Batch]):
         self._group, self._index = group, index
 
     def __next__(self) -> Batch:
-        return self._group.read(self._index, self)
+        return self._group.read(self._index)
 
     def get_state(self) -> Mapping[str, object]:
         return {"parent": self._group.state(self._index)}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         parent = state.get("parent")
-        self._group.restore(self._index, {} if parent is None else record(parent, "mixed corpus"), self)
+        self._group.restore(self._index, {} if parent is None else record(parent, "mixed corpus"))
 
     def close(self) -> None:
         self._group.close(self._index)
