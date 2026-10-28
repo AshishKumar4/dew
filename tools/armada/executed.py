@@ -111,12 +111,14 @@ def started(code, offset):
 
 
 class Opens:
-    """Every open of a file or listing of a directory under tests/ and src/ of the checkout at `root`, by
-    any process, as inotify reports it (`IN_OPEN` on each directory there): `drained` gives those since it
-    was last read, relative to the checkout. `blind` where a directory could not be watched or the kernel's
-    queue overflowed: what was opened then is not known."""
+    """Every open of a data file under tests/ and src/ of the checkout at `root`, by any process, as inotify
+    reports it (`IN_OPEN` on each directory there): `drained` gives those since it was last read, relative to
+    the checkout. Python files are code, which the record takes from what runs, and a directory's own open
+    is a listing, which the audit hook places by who listed it (pytest's collection and the import system
+    are no file's input). `blind` where a directory could not be watched or the kernel's queue overflowed:
+    what was opened then is not known."""
 
-    OPEN, OVERFLOW = 0x20, 0x4000
+    OPEN, OVERFLOW, DIRECTORY = 0x20, 0x4000, 0x40000000
     EVENT = struct.Struct("iIII")
 
     def __init__(self, root: str) -> None:
@@ -151,8 +153,9 @@ class Opens:
                 at += self.EVENT.size + length
                 if mask & self.OVERFLOW:
                     self.blind = True
-                elif watch in self.watched and not name.endswith(".pyc"):
-                    opened.add(os.path.join(self.watched[watch], name) if name else self.watched[watch])
+                elif watch in self.watched and name and not mask & self.DIRECTORY and not name.endswith(
+                        (".py", ".pyc")):
+                    opened.add(os.path.join(self.watched[watch], name))
         opened.discard(str(DURATIONS))
         return opened
 

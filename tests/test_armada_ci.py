@@ -1266,12 +1266,16 @@ def test_a_fixture_reruns_its_readers_alone_though_a_native_reader_reads_it(
                              "        Path('tests/fixtures/late.json').read_text()\n"
                              "        Path('opened').touch()\n"
                              "    threading.Thread(target=late, daemon=True).start()\n",
+        # It waits for that late open while the starter's thread runs, and not past a bound where the starter
+        # was reused and started none.
         "test_c_later.py": "import time\nfrom pathlib import Path\n"
                            "def test_later():\n"
                            "    with Path('runs-later').open('a') as runs: runs.write('x')\n"
                            "    Path('flag').touch()\n"
-                           "    while not Path('opened').exists(): time.sleep(0.01)\n"
-                           "    Path('flag').unlink(); Path('opened').unlink()\n"})
+                           "    bound = time.monotonic() + 10\n"
+                           "    while not Path('opened').exists() and time.monotonic() < bound:\n"
+                           "        time.sleep(0.01)\n"
+                           "    Path('flag').unlink(); Path('opened').unlink(missing_ok=True)\n"})
     verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
 
     def run() -> list[int]:
