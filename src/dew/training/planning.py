@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -219,6 +220,8 @@ class Probe:
     derived: Footprint
     ahead: bool = False
     """Whether the executable is the step compiled ahead (`FitSearch.ahead`), not the search's own."""
+    compile_seconds: float = 0.0
+    """Time spent compiling or loading this program, apart from its shape trace and lowering."""
 
     @classmethod
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
@@ -232,7 +235,8 @@ class Probe:
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
-                "derived": self.derived.record(), "ahead": self.ahead}
+                "derived": self.derived.record(), "ahead": self.ahead,
+                "compile_seconds": self.compile_seconds}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
@@ -622,13 +626,15 @@ class FitSearch[LossT, EffectsT]:
         (`ahead`), and the measure of its fit (`Probe`), the search's state else untouched."""
         options = self.required if self.xla_defaults else self.options(candidate)
         taken = self.ahead is not None
+        began = time.perf_counter()
         if self.ahead is not None:
             executable, self.ahead = self.ahead.taken(candidate.lowered), None
         else:
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
+        seconds = time.perf_counter() - began
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity)
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        return options, executable, dataclasses.replace(probe, ahead=taken)
+        return options, executable, dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
 
     def fits_here(self, split: int) -> bool:
         key = (split, self.rung())

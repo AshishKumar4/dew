@@ -36,13 +36,13 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.experimental.topologies as topologies
-import jax.numpy as jnp
 from jax.experimental import serialize_executable
 
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.nn.kernels.generation import assumed, capability, gpu_target
 from dew.telemetry.instrumentation import StepFlops, step_flops
+from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
     from dew.data.dataset import Loader
@@ -127,9 +127,9 @@ class AheadOfTime:
     temp_bytes: int
     code_bytes: int
     plan: JSON = None
-    """Where a capacity was stated (`compile_ahead`), the plan the run's own fit search makes on those
+    """The plan the run's own fit search makes on those
     GPUs (`Trainer.plan`): every program it compiled, each with the footprint derived for it beside
-    XLA's memory of it, and the plan it took; None where none was stated."""
+    XLA's memory of it, and the plan it took."""
     planned_seconds: float | None = None
     """The seconds that search took, its derivations and every compile: the time a run spends planning
     before its first step on those GPUs."""
@@ -245,15 +245,18 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch)
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
                                    capacity: int | None = None) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only GPUs its
-    mesh is built over (`compile_only_gpus`) and never run: the step `fit` would compile there, as its
-    plan's first candidate lowers it (`Trainer._candidate`), traced as on those GPUs
-    (`dew.nn.kernels.generation.assumed`), at the base rung and the first split, its state the fresh
-    one the trainer builds, abstract and placed by its layout, its batch `batch` as `fit` hands it to
-    the step (`step_batch`), compiled with the options the run's compile there takes. Only GPUs: XLA's
-    CPU executable, loaded again, finds none of its fused functions. Where each GPU is stated
-    `capacity` bytes, the run's own fit search plans the step on them after (`Trainer.compile`), as a
-    run there plans it, every program it compiles reported (`AheadOfTime.plan`) with the seconds it
-    took: what fits those GPUs, and what planning costs a run before its first step, without them."""
+    mesh is built over (`compile_only_gpus`) and never run. The planner `Trainer.compile` uses
+    (`Trainer._plan`) selects and compiles the step once; that executable is serialized, not compiled
+    again. Its batch is what `fit` hands to its step (`step_batch`), its fresh state abstract, and
+    tracing reads the target's kernel choices (`assumed`). The plan reports every compile and the
+    time the search took. `capacity` states bytes per GPU; absent it, memory fit is unknown rather
+    than measured. Profiling, tuning and rollout require execution and are refused."""
+    if capacity is not None and capacity <= 0:
+        raise ValueError("compile-ahead capacity must be positive bytes per GPU")
+    if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
+        raise ValueError("compile-ahead needs a device-resident step over its loader, with no lower_for")
+    if trainer.tune_kernels or pgle_runs():
+        raise ValueError("compile-ahead cannot run kernel tuning or AutoPGLE on absent GPUs")
     devices = list(trainer.device_mesh.devices.flat)
     generations = {gpu_target(device.device_kind).generation for device in devices}
     if {device.platform for device in devices} != {"gpu"} or len(generations) != 1:
@@ -261,26 +264,20 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                          "mesh is built over (MeshSpec.build(compile_only_gpus(generation, count))); this "
                          f"mesh holds {sorted({device.device_kind for device in devices})}")
     (generation,) = generations
+    began = time.perf_counter()
     start = trainer._started()
-    lowered, options = trainer._lowered_for(start.abstract, step_batch(trainer, batch), generation,
-                                            trainer.device_mesh)
-    compiled = lowered.compile(options)
+    with assumed(generation):
+        planned = trainer._plan(start.abstract, step_batch(trainer, batch), None, capacity)
+    seconds = time.perf_counter() - began
+    lowered, compiled = planned.candidate.lowered, planned.executable
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)
     memory = compiled.memory_analysis()
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
-    plan, seconds = None, None
-    if capacity is not None:
-        began = time.perf_counter()
-        # A fresh state's window holds the run's accumulation, which `compile` reads as a number.
-        fresh = dataclasses.replace(start.abstract, window_size=jnp.asarray(trainer.accumulation, jnp.int32))
-        with assumed(generation):
-            trainer.compile(fresh, step_batch(trainer, batch), capacity=capacity)
-        plan, seconds = trainer.plan, time.perf_counter() - began
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), program_of(lowered), executable,
         (in_tree, out_tree),
         flops=step_flops(compiled),
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
-        code_bytes=memory.generated_code_size_in_bytes, plan=plan, planned_seconds=seconds)
+        code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds)

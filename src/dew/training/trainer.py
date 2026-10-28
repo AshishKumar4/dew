@@ -907,20 +907,13 @@ class Trainer(Generic[Loss, Effects]):
                 capacity: int | None = None) -> CompiledStep:
         """Compile a transaction over the state and one already-produced global batch.
 
-        The step consumes the state it is given. The returned state takes over its
-        buffers, so the update runs in place and peak memory holds one copy of the
-        parameters and optimizer state, not two. Keep no reference to a state after
-        stepping it; `new = step(old, batch)` is the whole contract.
+        The step consumes its state: `new = step(old, batch)` donates the old buffers, keeping one
+        copy of parameters and optimizer state. Keep no reference to the old state after stepping.
+        Orbax copies a checkpoint to host before `save` returns, provided `Checkpoints` names neither
+        prioritized keys nor a concurrent transfer limit. The loader's batch is not donated.
 
-        A checkpoint saved before the step is safe: Orbax copies every array to the
-        host before `save` returns, as long as `Checkpoints` names no prioritized keys
-        and no concurrent transfer limit. The batch is not donated, because the loader
-        owns it.
-
-        The step is planned to fit (`dew.training.planning`): the fewest
-        microbatches at the least recomputation, each an attempt of the
-        transaction, a window pooling `split` x `accumulation`. Every batch of
-        a run is split alike, as its first compile planned or its pooling
+        The plan (`dew.training.planning`) takes the fewest microbatches at least recomputation, a
+        transaction pooling `split` x `accumulation`. Batches split as the first plan or the pooling
         state's window holds; later shapes climb the ladder alone. A plan that
         splits or spans devices, left open and unrecorded, is timed on `trials` (`fit`'s, `Trials`)
         against the batch whole a rung up where they ask for it, and the faster kept. Where JAX's AutoPGLE
@@ -946,6 +939,15 @@ class Trainer(Generic[Loss, Effects]):
                 raise ValueError("a step compiled ahead runs where the devices hold the state; this "
                                  "layout keeps the variables on the host")
             return self._compile_host(state, batch)
+        planned = self._plan(state, batch, trials, capacity)
+        return self._runner(planned.released(), self.device_mesh)
+
+    @ruled
+    def _plan(self, state: TrainState, batch: Batch, trials: Trials | None,
+              capacity: int | None) -> Planned:
+        """The device step's plan, shared by `compile` and `compile_ahead`: the search, its record and
+        the trainer at its chosen rung. Its lowering stays alive until the caller has read it;
+        `compile` releases it before keeping the executable, `compile_ahead` serializes it."""
         mesh = self.device_mesh
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)
@@ -959,7 +961,7 @@ class Trainer(Generic[Loss, Effects]):
             devices = local_devices(self.device_mesh)
             self.memory = memory_record(self.executable, devices, candidate.held, fits=True)
             self.links = links
-        return self._runner(planned, mesh)
+        return planned
 
     def _staged(self, state: TrainState, step: int) -> TrainState:
         """`state` to run step `step`: its window of `window_size` microbatches dropped where the step, of
@@ -1011,8 +1013,8 @@ class Trainer(Generic[Loss, Effects]):
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
                  trials: Trials | None, capacity: int | None) -> tuple[Planned, StepFlops | None]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the
-        faster on `trials` of a frontier of two, guided under AutoPGLE (`Planned.guided`) and released
-        (`Planned.released`), with `plan` its record and the objective at its rung, and a microbatch's
+        faster on `trials` of a frontier of two, guided under AutoPGLE (`Planned.guided`), with
+        `plan` its record and the objective at its rung, and a microbatch's
         FLOPs (`plan_flops`). A plan recorded beside the compilation cache (`recorded_rung`) is the first
         candidate, kept untimed; `resumed` is a checkpoint's rung; `capacity` the bytes a device that
         states none holds (`FitSearch.capacity`)."""
@@ -1027,7 +1029,7 @@ class Trainer(Generic[Loss, Effects]):
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
-                                                   mesh, self.step)
+                                                   mesh, self.step, capacity)
         before = self._rung()
         self._climb_to(recorded)
         self._resumed_rung = None
@@ -1068,7 +1070,7 @@ class Trainer(Generic[Loss, Effects]):
         search.told(planned)
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
-        return planned.released(), flops
+        return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int, narrow: bool, launches: str | None) -> Candidate:

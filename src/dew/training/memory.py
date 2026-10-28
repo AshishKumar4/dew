@@ -268,7 +268,7 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
         return None
     # A device that states no memory, one compiled for and absent (`compile_only_gpus`), holds the
     # `capacity` it is stated to, the step's arguments in it as they would be.
-    memory = [device.memory_stats() or ({} if capacity is None else {
+    memory = [device_memory(device) or ({} if capacity is None else {
         'bytes_limit': capacity, 'bytes_in_use': stats.argument_size_in_bytes}) for device in devices]
     if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
@@ -291,6 +291,13 @@ def peak_memory_gib() -> float | None:
     peaks = [stats['peak_bytes_in_use'] for device in jax.local_devices()
              if (stats := device.memory_stats()) is not None and 'peak_bytes_in_use' in stats]
     return max(peaks) / 1024 ** 3 if peaks else None
+
+
+def device_memory(device) -> Mapping[str, int]:
+    """What `device`'s allocator states (`Device.memory_stats`), empty where it states nothing: a CPU's,
+    or a compile-only GPU's (`dew.training.ahead.compile_only_gpus`), none of this process's own, which
+    holds no memory to read."""
+    return (device.memory_stats() or {}) if device in jax.local_devices() else {}
 
 
 def local_devices(mesh: Mesh) -> list:
@@ -325,7 +332,7 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
         for name in ("argument", "output", "alias", "temp", "generated_code")}
     devices_stats: list[JSON] = []
     for device in devices:
-        memory = device.memory_stats() or {}
+        memory = device_memory(device)
         reported: dict[str, JSON] = {key: int(memory[key]) for key in MEMORY_STATS if key in memory}
         devices_stats.append({"id": int(device.id), **reported,
                               "unclaimed": None if not memory else unclaimed(device, memory),
@@ -389,7 +396,7 @@ def temporaries_factor(mesh: Mesh) -> int:
     """How many times its temporaries a step needs room for on this process's tightest device of
     `mesh` (`strands_temporaries`): 2 where an allocator can strand them, else 1."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return max((2 if (memory := device.memory_stats()) is not None
+    return max((2 if (memory := device_memory(device))
                 and strands_temporaries(device.platform, memory) else 1) for device in local)
 
 
