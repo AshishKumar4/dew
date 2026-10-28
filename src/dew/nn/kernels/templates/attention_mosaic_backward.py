@@ -339,9 +339,9 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
     """A dK/dV consumer's query tile `index`, its keys the tile's rows (`[bk, bq]`, FlashAttention 3's order,
     hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's SdP_swapAB): its scores `K Qᵀ` (the call's power taken after
     the product) and score cotangents from the query and output cotangent slots (`slots`) and its resident
-    keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query)`, in a column's
-    layout), its coordinates (`coords_of(first query)`) and its hook parameters (`params_of(first query,
-    like)`). The weights and the score cotangents, their keys as their rows, are dV's and dK's left operands
+    keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query, *places)`, in
+    a column's layout, each phase's read in it), its coordinates (`coords_of(first query)`) and its hook
+    parameters (`params_of(first query, like)`). The weights and the score cotangents, their keys as their rows, are dV's and dK's left operands
     from the registers (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`), issued into `accumulators`
     in place; a fused launch stages the cotangents' parts in `staged` for dQ's product, their transpose its
     left operand (`add_dq(first query, dQ)`). The key gradients' sums (`carry`) take the pulled cotangents'
@@ -365,7 +365,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
     # and dV's product, then dP and the cotangents, so the normalized weights and dP are never live together
     # (a tile chosen masked or whole at run time joined both choices' tiles: 1184 bytes spilled at 64 x 64,
     # one consumer).
-    peak, total, anchor, delta, chosen = rows_of(q_first)
+    peak, total = rows_of(q_first, 0, 1)
     exponentials, weights, slopes, seen, inverse_total = _weighed(walk, coords, params, s, peak, total,
                                                                   masked=True)
     narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
@@ -374,6 +374,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
     dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_columns, walk.interpret)
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
+    anchor, delta, chosen = rows_of(q_first, 2, 3, 4)
     cotangents = _cotangents(walk, coords, s, exponentials, dp, anchor, delta, chosen, seen, inverse_total)
     logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
     scaled = logits * walk.grad_scale
@@ -524,9 +525,11 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(consumers)])
 
-        def rows_of(q_first):
-            # A query tile's statistics in a column's layout, the tiles' queries their columns.
-            return tuple(family.columns_of(ref.at[row, head, pl.ds(q_first, block_q)]) for ref in stat_refs)
+        def rows_of(q_first, *places):
+            # A query tile's statistics at `places` (of peak, total, anchor, delta, chosen) in a column's
+            # layout, the tiles' queries their columns, each read where its phase takes it.
+            return tuple(family.columns_of(stat_refs[place].at[row, head, pl.ds(q_first, block_q)])
+                         for place in places)
 
         def consumer(index):
             k_first = pair_first + index * block_k
