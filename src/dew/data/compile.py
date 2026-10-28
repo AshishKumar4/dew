@@ -1309,7 +1309,7 @@ def native(handed: Handed, *, training: bool) -> Reader:
         batch = {name: np.asarray(column) for name, column in handed.items()}
         if training:
             return lambda partition: _Shared(_Whole(batch), partition)
-        return lambda partition: [_share(batch, partition)]
+        return lambda partition: iter([_share(batch, partition)])
     stream = handed
     if isinstance(handed, pygrain.MapDataset):
         stream = (handed.repeat() if training else handed).to_iter_dataset()
