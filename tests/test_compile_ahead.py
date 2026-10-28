@@ -105,23 +105,22 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_nothing(tmp_path):
-    """`dew train` with `--trainer.compile-ahead.generation`, `.devices` and `.path` compiles the run's
-    first step for one compile-only A100, writes it where it names, and ends with status 0, the step
-    loadable and what it costs stated; it writes no checkpoint or tracking, as it trains nothing
-    (row 1915)."""
+    """A run parsed with `--trainer.compile-ahead.generation`, `.devices` and `.path` (`RunConfig.cli`,
+    its default the run's own config) compiles its first step for one compile-only A100, writes it
+    where it names, and ends with status 0, the step loadable and what it costs stated; it writes no
+    checkpoint or tracking, as it trains nothing (row 1915)."""
     from test_run_options import lm
 
-    from dew.cli.main import main
+    from dew.config.lm import LMRunConfig
     from dew.training.ahead import AheadOfTime, CompiledAhead
 
-    record, runs, path = tmp_path / "record", tmp_path / "runs", tmp_path / "step.dew-aot"
-    lm(tmp_path, drawn=False).save(str(record))
-    settings = {"trainer.name": "ahead", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2"}
+    runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
+    run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
+                           "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
+                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)],
+                          default=lm(tmp_path, drawn=False))
     with pytest.raises(CompiledAhead) as ended:
-        main(["train", str(record / "run.json"),
-              *(flag for name, value in settings.items() for flag in ("--set", f"{name}={value}")),
-              "--trainer.compile-ahead.generation", "sm80", "--trainer.compile-ahead.devices", "1",
-              "--trainer.compile-ahead.path", str(path)])
+        run.run()
     assert ended.value.code == 0
     saved = AheadOfTime.load(path)
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
