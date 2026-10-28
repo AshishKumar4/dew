@@ -1,9 +1,9 @@
 {
- "bytes": 24681179,
+ "bytes": 24727608,
  "license": "lfm1.0",
- "path": "recordings/3fc835be42afafc9d3c1f79194ccf73d297e767ed644cfa4b301812fda811237.npz",
+ "path": "recordings/67998cf24308a6ead34896fe76a6461074cfe15b593b570896271ef8196197b2.npz",
  "reference": "LiquidAI/LFM3-1.7B",
  "repo": "dewml/fixtures",
- "revision": "2e8248ecc1cf428d837f23de8a4306ae470aa967",
- "sha256": "3fc835be42afafc9d3c1f79194ccf73d297e767ed644cfa4b301812fda811237"
+ "revision": "bbeacdacdddbe66273fa616c7e67cc605373d349",
+ "sha256": "67998cf24308a6ead34896fe76a6461074cfe15b593b570896271ef8196197b2"
 }
