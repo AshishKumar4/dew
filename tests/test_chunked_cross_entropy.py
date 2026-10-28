@@ -401,6 +401,14 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     assert moved and max(moved) < matrix.size // 2, moved
 
 
+def scaled_whole_head(states, matrix, scale, bias, targets):
+    """Each token's loss and log Z from the whole logits of a head with a per-token scale and bias
+    (`jax.nn.logsumexp`), the reference a tiled head's terms are held to."""
+    logits = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale).logits(states)
+    log_z = jax.nn.logsumexp(logits, axis=-1)
+    return log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0], log_z
+
+
 @pytest.mark.parametrize('tile', [None, (2, 64)], ids=['whole', 'tiled'])
 def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_orders(tile):
     """One device's head over 512 columns: each token's loss and log Z, and the gradients of a loss
@@ -427,10 +435,7 @@ def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_
         losses, _, log_z = chunked_cross_entropy(states, head, targets, 4, tile=tile)
         return losses, log_z
 
-    def whole(states, matrix, scale, bias, targets):
-        logits = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale).logits(states)
-        log_z = jax.nn.logsumexp(logits, axis=-1)
-        return log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0], log_z
+    whole = scaled_whole_head
 
     def scored(head):
         # Each token's loss and log Z, and the gradients of a loss of both, the cotangent's.

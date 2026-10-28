@@ -1775,7 +1775,7 @@ class Checkpoints:
         the result where the run's params go:
         `merge(variables, {"params": checkpoints.posthoc_ema(...)})`.
         """
-        from dew.training.posthoc import coefficients
+        from dew.averaging import coefficients
 
         steps = self.profile_steps()
         if not steps:
@@ -2443,8 +2443,11 @@ def _effective_weights(run: SavedRun, ema: bool | None, mesh, layout
 
 def _on_host(leaf) -> np.ndarray:
     """`leaf` on the host, a floating one in fp32, bf16 and the float8 types among them, which
-    NumPy's own type hierarchy does not count as floating."""
+    NumPy's own type hierarchy does not count as floating, and a complex one in complex64, both of its
+    components fp32."""
     value = np.asarray(leaf)
+    if jnp.issubdtype(value.dtype, jnp.complexfloating):
+        return value.astype(np.complex64)
     return value.astype(np.float32) if jnp.issubdtype(value.dtype, jnp.inexact) else value
 
 
@@ -2454,8 +2457,15 @@ def _taken(held: np.ndarray, leaf: np.ndarray, count: int, directory: str, first
     that cannot overflow (and is exact wherever its half could round), and `held / 2 + leaf / 2`
     above, exact halves, one rounding either way, so float64's mean rounded to fp32; for a later one
     `held + (leaf - held) / count` where both share a sign, whose difference cannot overflow, and
-    `held * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. An integer or
-    boolean leaf must equal `held`."""
+    `held * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. A complex leaf's real
+    and imaginary parts are each so averaged. An integer or boolean leaf must equal `held`."""
+    if jnp.issubdtype(held.dtype, jnp.complexfloating):
+        # Each component as a real leaf of the same shape, a scalar's included.
+        real, imaginary = (_taken(np.array(part(held)), np.array(part(leaf)), count, directory, first)
+                           for part in (np.real, np.imag))
+        averaged = real.astype(np.complex64)
+        averaged.imag = imaginary
+        return averaged
     if not jnp.issubdtype(held.dtype, jnp.inexact):
         if not np.array_equal(held, leaf):
             raise ValueError(f"an integer or boolean variable of the run in {directory} differs from "

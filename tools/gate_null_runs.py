@@ -42,18 +42,13 @@ def cross_entropy_columns():
     import jax
     import jax.numpy as jnp
     import numpy as np
-    from test_chunked_cross_entropy import columns, eighths, inputs
-
-    from dew.nn.protocols import OutputTable
+    from test_chunked_cross_entropy import columns, eighths, inputs, scaled_whole_head
 
     states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
     states, matrix = eighths(states, matrix)
     scale, bias = columns(512)
 
-    def whole(states, matrix, scale, bias, targets):
-        logits = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale).logits(states)
-        log_z = jax.nn.logsumexp(logits, axis=-1)
-        return log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0], log_z
+    whole = scaled_whole_head
 
     def loss(*arguments):
         losses, log_z = whole(*arguments)

@@ -16,7 +16,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Generic, overload
+from typing import Generic
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
+from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
@@ -156,46 +157,6 @@ the EMA but where the objective reads it in its forward (`Transaction.fetch`).""
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
-
-
-def _project(tree: optax.Params, like: optax.Params) -> optax.Params:
-    """The leaves of tree at the key paths like holds, in like's containers."""
-    leaves = dict(jax.tree_util.tree_flatten_with_path(tree)[0])
-    return jax.tree_util.tree_map_with_path(lambda path, _: leaves[path], like)
-
-
-@overload
-def ema_update(ema: Variables, params: Variables, decay: jax.typing.ArrayLike) -> Variables: ...
-
-
-@overload
-def ema_update(ema: optax.Params, params: optax.Params, decay: jax.typing.ArrayLike) -> optax.Params: ...
-
-
-def ema_update(ema, params, decay):
-    """Update the EMA leaves toward `params`, keeping each leaf's storage dtype.
-
-    Each leaf of `ema` becomes `decay * average + (1 - decay) * live`, and a
-    leaf the step left as it was keeps its average bit for bit wherever that
-    sum is finite, however a program fuses it (a select, not a difference
-    that finite leaves of opposite signs overflow; a NaN decay stays NaN);
-    the live value is the leaf of `params` at the same path; leaves that
-    `ema` does not hold are not averaged. The arithmetic runs in fp32 or
-    wider, so fp64 leaves keep fp64 precision. A decay of 1 or more returns
-    the average leaf as it was, even when it holds nonfinite values, as a
-    frozen reference can.
-    """
-    def step(average, live):
-        dtype = jnp.result_type(average.dtype, live.dtype, decay, jnp.float32)
-        if average.dtype != dtype or live.dtype != dtype:
-            average, live = jax.lax.optimization_barrier((average, live))
-        weight = jnp.asarray(decay, dtype)
-        wide, moved = average.astype(dtype), live.astype(dtype)
-        weighted = weight * wide + (1 - weight) * moved
-        updated = jnp.where((moved == wide) & jnp.isfinite(weighted), wide, weighted)
-        stored = updated.astype(average.dtype)
-        return jnp.where(jnp.asarray(decay) >= 1.0, average, stored)
-    return jax.tree.map(step, ema, _project(params, ema))
 
 
 def write_back(params: Variables, variables: Variables | None) -> Variables:
