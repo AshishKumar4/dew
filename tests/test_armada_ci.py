@@ -1173,9 +1173,9 @@ def commit(root: Path, message: str) -> str:
 
 def test_a_watch_the_kernel_cannot_hold_whole_is_blind_and_keys_nothing(tmp_path):
     """A tree with more directories than inotify will watch (fs.inotify.max_user_watches; here a user
-    namespace's own limit, lowered to 2) leaves the open watch blind: closing it gives no opened files, so no
-    record keeps a key, and nothing raises (Main, 2026-10-28: a failed watch left the reader unset, and its
-    close crashed)."""
+    namespace's own limit, lowered to 2) leaves the open watch blind: closing it gives no opened files, so
+    no record keeps a key, and nothing raises (Main, 2026-10-28: a failed watch left the reader unset, and
+    its close crashed)."""
     for name in ("a", "b", "c"):
         (tmp_path / "tests" / name).mkdir(parents=True)
     script = (
