@@ -25,6 +25,7 @@ from dew.interop.decoder_parts import (
     base_config,
     decoder_tensors,
     kind_mixers,
+    kinds_of,
     read_rope_theta,
     refuse,
     renamed_name,
@@ -108,7 +109,7 @@ def lfm3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderField
     config = base_config(hf_config, used, rope=ropes, layer_types=layer_types, qk_norm=True,
                          tie_embeddings=True)
     used.update(('rope_parameters', 'conv_L_cache', 'conv_bias', 'use_sandwich_norm'))
-    kinds = dict(config['kinds'])
+    kinds = dict(kinds_of(config))
     attention = {'class': 'attention', 'fields': {'gate_projection': 'head'}}
     for kind in ('full_attention', 'sliding_attention'):
         if kind in layer_types:
