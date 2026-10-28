@@ -53,7 +53,7 @@ from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, resources, tail as tail_of
+from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, resources, tail as tail_of
 from dew.nn.kernels.templates.gemm import cost, rows_padded
 
 FAMILY: mosaic.Family = mosaic_sm90.WGMMA
@@ -61,10 +61,10 @@ FAMILY: mosaic.Family = mosaic_sm90.WGMMA
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
-    """The bundle a tile runs on: its instruction family's (`Tiles.family`), mma.sync's a dtype's with its
-    warps arranged for a consumer's share of the tile (`mosaic_sm80.Mma.for_tile`)."""
-    if tiles.family != 'mma.sync':
-        return FAMILY
+    """The bundle a tile runs on: the one it names (`Tiles.family`, `bundles.named`), mma.sync's a dtype's
+    with its warps arranged for a consumer's share of the tile (`mosaic_sm80.Mma.for_tile`)."""
+    if tiles.family != mosaic_sm80.Mma.name:
+        return bundles.named(tiles.family, dtype)
     return mosaic_sm80.Mma.for_tile(dtype, tiles.block_m // tiles.warpgroups, tiles.block_n)
 
 
@@ -76,8 +76,9 @@ class Tiles:
     consumer warpgroups beside a producer that issues the loads, CUTLASS's cooperative sm90 schedule), and
     the multiprocessors of a cluster (`cluster`: 2 pair two row tiles of one group of `gmm`, which load
     their matrix block once between them, multicast), only for a cooperative tile; `tgmm` takes no pair;
-    and the instruction family's bundle that runs it (`family`: Hopper's warpgroup MMA, or Ampere's
-    mma.sync, one warpgroup whose loads `emit_pipeline` issues, the plain product alone); and the programs
+    and the bundle that runs it (`family`, `bundles.named`: Hopper's warpgroup MMA, its loads a producer
+    warpgroup's or, 'wgmma.fed', its first consumer's, or Ampere's mma.sync, one warpgroup whose loads
+    `emit_pipeline` issues, the plain product alone); and the programs
     a multiprocessor runs at once (`programs`, at most its family's, `mosaic.Family.programs`), each in its
     share of the multiprocessor's shared memory (`resources.program_shared`); and the slices a kernel
     gradient's contraction splits into (`splits`, `tgmm`: each group's rows in that many runs of whole steps,
@@ -98,9 +99,12 @@ class Tiles:
         if self.warpgroups not in (1, 2) or self.cluster not in (1, 2) or paired:
             raise ValueError(f"{self}: one warpgroup alone, or two in a cluster of one or two "
                              "multiprocessors")
-        if self.family not in ('wgmma', 'mma.sync') or (self.family == 'mma.sync' and self.cluster != 1):
-            raise ValueError(f"{self}: Hopper's warpgroup MMA, or Ampere's mma.sync on one multiprocessor")
-        wide = self.family == 'wgmma' and self.block_n > 256
+        warpgroup = self.family in (mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name)
+        if not warpgroup and self.family != mosaic_sm80.Mma.name:
+            raise ValueError(f"{self}: Hopper's warpgroup MMA (a producer's or not), or Ampere's mma.sync")
+        if self.cluster > bundles.named(self.family, jnp.bfloat16).cluster:
+            raise ValueError(f"{self}: a cluster of at most its bundle's (`mosaic.Family.cluster`)")
+        wide = warpgroup and self.block_n > 256
         if self.warpgroups == 2 and (self.block_m % 128 or wide):
             # Each consumer's half of the rows is a role's, a multiple of 64 rows, and on warpgroup MMA at
             # most 256 columns.
@@ -110,9 +114,11 @@ class Tiles:
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
 
 
-def derived(family, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
+def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool) -> Tiles | None:
-    """The one tile a GEMM mainloop runs on `family` for a call whose output has `rows` rows (a group's,
+    """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its
+    bundles in preference order, which share its facts but their loaders and registers) for a call whose
+    output has `rows` rows (a group's,
     on average, where `grouped`: a product's rows split among its groups) and `width` columns and whose
     steps run over `depth` (None: a group's rows, padded to whole steps), from the family's facts, the
     call's extents and the device's multiprocessors alone (no table, no ranking;
@@ -121,6 +127,9 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     `launch_of(tile)` the launch whose ring and residency the planner sizes (`resources.plan`: its
     allocations a stage, its registers within a consumer's) on `target`.
 
+    - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
+      producer's where its consumers' registers hold the tile, else one whose first consumer issues the
+      loads, its consumers holding the program's entry registers (`mosaic.ConsumerFed`).
     - Shape: the tile loading its operands fewest times a FLOP within its consumers' registers: an
       accumulator of `resources.held_area` elements A reads them 1/rows + 1/columns times a FLOP, least at
       rows = columns = sqrt(A). So the rows are sqrt(A) in whole roles (no more than the call's, below);
@@ -155,6 +164,8 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
       cluster's tiles one program's.
 
     None where no tile holds."""
+    # The facts the layouts share (their instruction family's); each layout's registers bound the shapes.
+    family = layouts[0]
     unit = family.column_unit(dtype)
     widest = min(width, family.widest_product or width)
     columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
@@ -164,37 +175,23 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     def tiled(consumers: int, programs: int) -> Tiles | None:
         role = family.role_rows * consumers
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
-        if not columns:
-            return None
-        area = resources.held_area(family, consumers)
-        side = max(role, min(most_rows, math.isqrt(area) // role * role))
-        widest = next((block_n for block_n in columns if block_n * side <= area), columns[-1])
-
-        def held(block_n: int) -> int:
-            return min(most_rows, resources.held_rows(family, consumers, block_n))
-
-        # The derived shape, then each narrower or shorter one a tile that stages too shallow gives way to.
-        first = [(held(widest), widest)] if held(widest) >= role else []
-        shapes = [*first, *((block_m, block_n) for block_n in columns if block_n <= widest
-                            for block_m in range(held(block_n), 0, -role) if (block_m, block_n) not in first)]
+        shapes = _shapes(layouts, consumers, columns, role, most_rows)
+        shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
+                                   multiprocessors=multiprocessors, grouped=grouped)
         fallback = None
         for block_m, block_n in shapes:
-            # A pair of multiprocessors a cluster runs two row tiles of one group where its family's loads
-            # multicast and a group averages a tile's rows, which then read its matrix's blocks once; a
-            # pair is two consumers' (`Tiles`), so a one-consumer tile, the fallback, runs alone.
-            cluster = family.cluster if grouped and consumers > 1 and rows >= block_m else 1
-            band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n,
-                               -(-rows // (block_m * cluster)) if grouped else None, cluster=cluster)
             # The shape before a deeper step: it sets how many times a FLOP reads each operand, where a
             # step's depth only sets how many steps a tile takes (and, in registers, its fragments').
             for step in steps:
-                shape = Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster,
-                              family=family.name, programs=programs)
-                planned = resources.plan([launch_of(shape)], family, target,
-                                         programs=programs) if candidate(shape) else None
-                if planned is None:
+                def launches_of(layout, block_m=block_m, block_n=block_n, step=step):
+                    shape = shaped(layout, block_m, block_n, step)
+                    return [launch_of(shape)] if candidate(shape) else None
+
+                found = resources.placed(launches_of, layouts, target, programs=programs)
+                if found is None:
                     continue
-                tile = dataclasses.replace(shape, stages=planned[0].stages)
+                layout, planned = found
+                tile = dataclasses.replace(shaped(layout, block_m, block_n, step), stages=planned[0].stages)
                 if tile.stages >= busy:
                     return tile
                 fallback = fallback or tile
@@ -206,6 +203,37 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     return next((tile for consumers in dict.fromkeys((family.consumers if whole else 1, 1))
                  for programs in range(family.programs(consumers), 0, -1)
                  if (tile := tiled(consumers, programs)) is not None), None)
+
+
+def _shapes(layouts: tuple, consumers: int, columns: list[int], role: int, most_rows: int) -> list[tuple]:
+    """`derived`'s tile shapes at `consumers`, in its order (its Shape): the derived one, then each narrower
+    or shorter one a tile that stages too shallow gives way to, its registers the most generous of
+    `layouts`' (a layout holding fewer gives way at placement, `resources.placed`)."""
+    if not columns:
+        return []
+    area = max(resources.held_area(layout, consumers) for layout in layouts)
+    side = max(role, min(most_rows, math.isqrt(area) // role * role))
+    widest = next((block_n for block_n in columns if block_n * side <= area), columns[-1])
+
+    def held(block_n: int) -> int:
+        return min(most_rows, max(resources.held_rows(layout, consumers, block_n) for layout in layouts))
+
+    first = [(held(widest), widest)] if held(widest) >= role else []
+    return [*first, *((block_m, block_n) for block_n in columns if block_n <= widest
+                      for block_m in range(held(block_n), 0, -role) if (block_m, block_n) not in first)]
+
+
+def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, programs: int, rows: int,
+            width: int, multiprocessors: int, grouped: bool) -> Tiles:
+    """`derived`'s tile of a shape and step on `layout`: a pair of multiprocessors a cluster runs two row
+    tiles of one group where its layout's loads multicast and a group averages a tile's rows, which then
+    read its matrix's blocks once; a pair is two consumers' (`Tiles`), so a one-consumer tile, the
+    fallback, runs alone."""
+    cluster = layout.cluster if grouped and consumers > 1 and rows >= block_m else 1
+    band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n,
+                          -(-rows // (block_m * cluster)) if grouped else None, cluster=cluster)
+    return Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster, family=layout.name,
+                 programs=programs)
 
 
 @dataclasses.dataclass(frozen=True)

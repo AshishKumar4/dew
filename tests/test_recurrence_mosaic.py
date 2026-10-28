@@ -445,7 +445,7 @@ def _model(launch: mainloop.Launch, family: mosaic.Family) -> dict:
     producer = family.warpgroups(roles) > roles
     return {"registers": launch.registers, "budget": family.registers(roles), "consumers": roles,
             "most": family.programs(roles), "register_step": family.register_step,
-            "producer": resources.PRODUCER_REGISTERS if producer else 0}
+            "producer": resources.producer_registers(roles) if producer else 0}
 
 
 class Unbudgeted(template.Mosaic):
