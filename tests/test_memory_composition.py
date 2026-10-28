@@ -445,6 +445,30 @@ def test_serving_quantization_refuses_a_memorys_moving_inner_weights():
                                   np.asarray(spec.apply(model).apply(variables, ids)))
 
 
+def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream():
+    """A memory decoder served quantized (`TextGeneration.quantized`) under a spec that rounds the
+    backward stochastically (`bwd_stochastic_rounding`) draws its inner steps' rounding from its
+    request's own stream (`dew.sampling.text.rounding_keys`), apart from its sampling, through the
+    prefill and every decode step: the task and a server answer one request with the same text, again
+    on a second call; without the stream the decode raised in Qwix's make_rng (ledger 2020)."""
+    pytest.importorskip("qwix")
+    from model_support import Digits
+
+    from dew.inference import RunProcessor, TextGeneration
+    from dew.inference.serving import Server
+    from dew.quantization import Quantization
+    from dew.sampling import Sampling
+
+    model = decoder().clone(max_seq_len=64)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    task = TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=12))
+    bound = task.quantized(Quantization(patterns=(INNER,), bwd_stochastic_rounding="uniform"))
+    first = bound("12", 4, key=3)
+    assert bound("12", 4, key=3).text == first.text
+    assert Server.from_task(bound, slots=2, capacity=64)(["12"], 4, key=3)[0].text == first.text
+
+
 def test_a_qwix_quantized_linear_memory_leaves_the_recurrence():
     """A linear memory whose inner kernel Qwix fake-quantizes (`dew.quantization.Quantization`) computes
     its network as the quantized product, no linear map of its input by its kernel, which the shared

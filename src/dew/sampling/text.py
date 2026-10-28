@@ -55,6 +55,7 @@ from dew.nn.protocols import (
     refuse_prefix,
 )
 from dew.nn.visibility import with_served_blocks
+from dew.objectives.base import ROUNDING_STREAM
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -340,8 +341,33 @@ def row_texts(decoder, generation, prompt_width: int | None) -> tuple[str, ...]:
     return decoder(rows.tokens, rows.lengths, prompt_width)
 
 
+def rounding_keys(keys: jax.Array) -> jax.Array:
+    """The key data of each row's stochastic-rounding stream (`DecoderState.rounding`): a default-impl
+    key, `ROUNDING_STREAM`'s, folded with each word of the row's request key in turn, so it is apart
+    from the sampling stream whatever that key's implementation, as a training step's rounding stream
+    is apart from its dropout (`dew.objectives.base.training_rngs`)."""
+    def derived(words: jax.Array) -> jax.Array:
+        key = jax.random.key(ROUNDING_STREAM)
+        for index in range(words.shape[0]):
+            key = jax.random.fold_in(key, words[index])
+        return jax.random.key_data(key)
+
+    return jax.vmap(derived)(jax.random.key_data(keys))
+
+
+def _rounded(rounding: jax.Array | None) -> tuple[dict[str, jax.Array] | None, jax.Array | None]:
+    """A model call's `stochastic_rounding` stream, the first row's key, and every row's key for the
+    next call (`DecoderState.rounding`); no stream where the decode carries none."""
+    if rounding is None:
+        return None, None
+    keys = jax.random.wrap_key_data(rounding)
+    following = jax.random.key_data(jax.vmap(lambda key: jax.random.fold_in(key, 1))(keys))
+    return {"stochastic_rounding": keys[0]}, following
+
+
 def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
-             cache: Variables | None = None) -> tuple[DecoderState, jax.Array]:
+                  cache: Variables | None = None, rounding: jax.Array | None = None
+                  ) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
     A `Selective` decoder skips the prompt-wide head, the largest array a
@@ -349,10 +375,13 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     cache seeded over the prompt (`_seeded_depths`), so the first block does
     not draft from nothing, and a block drafter's windows take every real
     prompt position's context. `cache` continues a cache the caller holds,
-    whose cursors say where each prompt resumes; None allocates an empty one.
+    whose cursors say where each prompt resumes; None allocates an empty one. `rounding` is each
+    row's stochastic-rounding key data (`rounding_keys`), which the prefill and every later call draws
+    from (`DecoderState.rounding`).
     """
     batch, width = inputs.tokens.shape
     held = _empty_cache(model, params, batch, ops) if cache is None else cache
+    rngs, rounding = _rounded(rounding)
     exposed = isinstance(model, Exposing)
     selective = isinstance(model, Selective)
     real = real_slots(inputs.token_fields, (batch, width))
@@ -364,7 +393,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         *scored,
         decode=True,
         mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])],
-        rngs=None,
+        rngs=rngs,
         method=("states_and_logits_at" if selective else "states_and_logits" if exposed else None),
         capture_intermediates=False,
         **inputs.kwargs(),
@@ -376,7 +405,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     rotary = inputs.token_fields.get("rotary_positions")
     logical = rotary if rotary is not None else token_positions(inputs.token_fields)
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
-                         None if states is None else states[rows, slot])
+                         None if states is None else states[rows, slot], rounding=rounding)
     if rebuild_position(model) is not None:
         if cache is not None or logical is not None or inputs.conditioning:
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
@@ -496,10 +525,11 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
         width = tokens.shape[1]
         positions = ({} if state.positions is None else
                      {"positions": state.positions[:, None] + jnp.arange(width)[None, :]})
+        rngs, rounding = _rounded(state.rounding)
         def append():
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
-                decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=None,
+                decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=rngs,
                 method="states_and_logits" if exposed else None,
                 capture_intermediates=False, **positions)
 
@@ -526,7 +556,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 answer, updated = model.apply(
                     {**params, 'cache': empty}, history,
                     attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
-                    decode=True, mutable=['cache'], method='states_and_logits' if exposed else None)
+                    decode=True, mutable=['cache'], rngs=rngs,
+                    method='states_and_logits' if exposed else None)
                 rows = jnp.arange(tokens.shape[0])[:, None]
                 # The same answer `append` gives: states beside the logits where the model exposes them.
                 picked = jax.tree.map(lambda leaf: leaf[rows, slots], answer)
@@ -549,7 +580,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
         moved = (None if state.positions is None else
                  state.positions + jnp.sum(valid, axis=1, dtype=state.positions.dtype))
         return (dataclasses.replace(state, cache=updated["cache"], logits=logits[:, -1],
-                                    positions=moved,
+                                    positions=moved, rounding=rounding,
                                     tokens=history, lengths=lengths,
                                     hidden=None if states is None else states[:, -1]),
                 logits, states)
@@ -582,12 +613,13 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
         # takes it under its own name.
         placed = ({"rotary_positions": positions} if positions.ndim == 3
                   else {"positions": positions})
+        rngs, rounding = _rounded(state.rounding)
         (logits, states), updated = model.apply(
             {**params, "cache": state.cache}, hidden, ids, depth=depth, attention_mask=valid,
-            input_embeddings=embeds, decode=True, mutable=["cache"], rngs=None,
+            input_embeddings=embeds, decode=True, mutable=["cache"], rngs=rngs,
             prediction_phase=prediction_phase,
             method="mtp_step", capture_intermediates=False, **placed)
-        return dataclasses.replace(state, cache=updated["cache"]), logits, states
+        return dataclasses.replace(state, cache=updated["cache"], rounding=rounding), logits, states
 
     def embed(tokens: jax.Array) -> jax.Array:
         prepared = model.apply(params, tokens, method="token_embeddings")
@@ -632,7 +664,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
                           jnp.zeros(batch * n, bool), empty, empty)
     drafting = isinstance(strategy, Speculative)
     ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafting else None)
-    state, real = prefill_state(model, params, inputs, ops)
+    state, real = prefill_state(model, params, inputs, ops, rounding=rounding_keys(keys))
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, trips), jnp.int32)], axis=1),
         valid=jnp.concatenate([real_slots(inputs.token_fields, (batch, width)),

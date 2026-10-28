@@ -56,6 +56,11 @@ class DecoderState:
     tokens: jax.Array | None = None
     lengths: jax.Array | None = None
     """Compact token history for a positional table change that invalidates KV."""
+    rounding: jax.Array | None = None
+    """Each row's key data of the stochastic-rounding stream (`dew.sampling.text.rounding_keys`), apart
+    from its sampling keys, which a model that rounds gradients stochastically at decode (a quantized
+    memory's moving weights, `dew.quantization.moving_weights`) draws from at each call, every row's
+    key moving on after it; None where the decode carries none."""
 
 
 

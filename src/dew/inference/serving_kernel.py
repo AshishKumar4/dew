@@ -35,7 +35,7 @@ from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, row_step
-from dew.sampling.text import decode_ops, prefill_state
+from dew.sampling.text import decode_ops, prefill_state, rounding_keys
 
 
 @struct.dataclass
@@ -106,9 +106,11 @@ def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacit
     ops = decode_ops(model, params, pad_id, None)
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
                         {"attention_mask": jnp.zeros((slots, 1), bool)})
-    _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops)[0],
-                                                  errors=checkify.user_checks))
     keys = jax.random.key_data(jax.random.key(0))
+    rounding = jnp.zeros((slots, *keys.shape), keys.dtype)
+    _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops,
+                                                                        rounding=rounding)[0],
+                                                  errors=checkify.user_checks))
     return Slots(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), decoder),
                  jnp.zeros((slots, 2 * capacity), jnp.int32),
                  jnp.zeros((slots, 2 * capacity), bool),
@@ -194,7 +196,8 @@ class Dense:
         """
         narrow = cache_sized(model, admission.prompts.tokens.shape[1])
         fresh, real = prefill_state(narrow, params, admission.prompts,
-                               decode_ops(narrow, params, pad_id, None))
+                                    decode_ops(narrow, params, pad_id, None),
+                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys)))
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
             return _placed(resident, incoming, admission.slots, self.groups)
 
@@ -244,7 +247,8 @@ class Paged:
 
         cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
         fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, None),
-                                    cache=cache)
+                                    cache=cache,
+                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys)))
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:
