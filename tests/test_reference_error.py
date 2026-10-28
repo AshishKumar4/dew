@@ -1561,7 +1561,8 @@ def _bits(value):
 
 def _evidence_leaf_by_leaf(dew, reference, truth, their_truth) -> list[tuple]:
     """`_evidence`'s rows as it read them before it read a draw at once: each arm's `leaf_summary` of
-    each leaf alone, paired (`_paired`) where the truths are the same values, an empty leaf exact."""
+    each leaf alone, paired (`_paired`) where the truths are the same values, an empty leaf exact and
+    held to the reference's dtype."""
     from reference_error import LOG_ZERO, NO_ZERO_ROWS, RecordedLeaf, _paired, leaf_summary
 
     row = []
@@ -1571,6 +1572,8 @@ def _evidence_leaf_by_leaf(dew, reference, truth, their_truth) -> list[tuple]:
         recorded = isinstance(their_leaf, RecordedLeaf)
         their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
         if not np.size(leaf):
+            kept = str(jnp.dtype(leaf.dtype))
+            assert kept == their.dtype, (jax.tree_util.keystr(path), kept, their.dtype)
             row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True))
             continue
         paired = recorded or their_truth is truth or np.array_equal(np.asarray(true), np.asarray(their_true))
@@ -1629,10 +1632,10 @@ class _RandomLeaves:
         return truth
 
     def arm(self, truth, dtype):
-        """An arm of `truth` in `dtype`: exact, or off it relatively and at times absolutely too (so a
-        row of zero has a residue), at times exactly zero on a row or not finite at a value."""
+        """An arm of `truth` in `dtype`: exact in float64, or off it relatively and at times absolutely
+        too (so a row of zero has a residue), at times exactly zero on a row or not finite at a value."""
         rng = self.rng
-        if rng.random() < 0.1:
+        if dtype is np.float64 and rng.random() < 0.3:
             return self.laid_out(truth.copy())
         arm = truth * (1 + 2.0 ** -20 * rng.standard_normal(truth.shape))
         if rng.random() < 0.5:
@@ -1661,7 +1664,7 @@ class _RandomLeaves:
             their_truth = {name: [truth[name], self.laid_out(np.array(truth[name])),
                                   self.truth(shapes[name])][rng.integers(3)] for name in names}
         dew = {name: self.arm(truth[name], dtypes[name]) for name in names}
-        if rng.random() < 0.2:
+        if dtypes[names[0]] is not np.float64 and rng.random() < 0.5:
             dew[names[0]] = jnp.asarray(dew[names[0]])
         reference = {name: self.arm(their_truth[name], dtypes[name]) for name in names}
         if rng.random() < 0.2:
