@@ -375,6 +375,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         initializer = self.objective.initializer if initializer is None else initializer
         from dew.nn.inputs import request_key
+        ready_process()  # A key given here opens the backend as the run's does (`key`).
         key = self.key if key is None else request_key(key)
         init_key, run_key = jax.random.split(key)
         initialized = initializer(init_key)

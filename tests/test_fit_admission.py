@@ -157,7 +157,8 @@ def test_data_handed_as_it_is_steps_as_given(handed):
 
 def test_a_handed_validation_batch_is_shared_alike_by_every_reader():
     """Five rows of handed arrays read by two shares: each reads three, the one short filled with a
-    repeat its `VALID_ROWS` marks, so the shares make one global batch and every real row scores once."""
+    repeat its `VALID_ROWS` marks, so the shares make one global batch and every real row scores once;
+    read by one host of two row shards, they are six, the repeat marked."""
     from dew.data.compile import native
 
     columns = regression_rows(5, 0)
@@ -166,6 +167,9 @@ def test_a_handed_validation_batch_is_shared_alike_by_every_reader():
     assert [rows_of(share) for share in shares] == [3, 3]
     # A share that holds only real rows marks none, as a reader's batch does (`FilledBatch`).
     assert sum(int(np.sum(share.get(VALID_ROWS, np.ones(rows_of(share), bool)))) for share in shares) == 5
+    # One host feeding two row shards reads a batch of a whole number of them.
+    whole = next(read(DataPartition(row_multiple=2)))
+    assert (rows_of(whole), int(np.sum(whole[VALID_ROWS]))) == (6, 5)
 
 
 def test_a_trainer_validated_before_it_fits_trains_from_its_seed():

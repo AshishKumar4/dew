@@ -1278,15 +1278,16 @@ class _Whole:
 
 def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
     """`partition`'s share of `batch` (`DataPartition`: rows `index :: count`); `held`, a validation
-    share, filled out to every share's rows and its repeats marked (`DataPartition.held`,
-    `FilledBatch`), so every share reads a batch where any does and every real row scores once."""
-    if partition.count == 1:
-        return batch
+    share, filled out to every share's rows, a whole number of its row shards, its repeats marked
+    (`DataPartition.held`, `FilledBatch`), so every share reads a batch its devices split where any
+    does and every real row scores once."""
     rows = rows_of(batch)
     if not held:
-        return take_batch(batch, np.arange(rows)[partition.cut()])
-    mine, real = partition.held(rows)
-    return FilledBatch(-(-rows // partition.count), real=real).map(take_batch(batch, np.arange(rows)[mine]))
+        return batch if partition.count == 1 else take_batch(batch, np.arange(rows)[partition.cut()])
+    mine, real = partition.held(rows) if partition.count > 1 else (slice(None), True)
+    shards = partition.count * partition.row_multiple
+    filled = -(-rows // shards) * partition.row_multiple
+    return FilledBatch(filled, real=real).map(take_batch(batch, np.arange(rows)[mine]))
 
 
 class _Shared(Forwarding):
