@@ -358,7 +358,7 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
         return finished(spec, guarded_walk(spec, functools.partial(walked_plain, spec)))
     carry = walk(spec, None)
     state = carry if isinstance(carry, Partial) else carry[0]
-    reach = jnp.max(jnp.where(finite(state.m), jnp.abs(state.m), 0.0))
+    reach = reach_of(state.m)
     natural = unfolded(spec)
 
     def folded() -> C:
@@ -369,6 +369,15 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
 
     return jax.lax.cond(reach >= FOLD_REACH, lambda: finished(natural, unfolded_walk()),
                         lambda: finished(spec, guarded_walk(spec, folded)))
+
+
+def reach_of(maxima: jax.Array) -> jax.Array:
+    """How far a folded walk's row `maxima` reach (`walked`, against `FOLD_REACH`): their largest magnitude,
+    a row that saw no key (-inf) none, and one whose maximum the fold took past fp32's largest, or to no
+    number, past every reach, so the call walks again natural, where its logits are finite (a product near
+    fp32's largest before a small scale, times log2(e))."""
+    reached = jnp.where(jnp.isnan(maxima), jnp.inf, jnp.abs(maxima))
+    return jnp.max(jnp.where(maxima == -jnp.inf, 0.0, reached))
 
 
 type Launch[O] = Callable[[Forward, jax.Array | None], tuple[O, jax.Array, jax.Array]]
@@ -395,7 +404,7 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     outputs, maxima, over = launch(spec, None)
     if not spec.base2:
         return guarded_launch(spec, outputs, over)
-    reach = jnp.max(jnp.where(finite(maxima), jnp.abs(maxima), 0.0))
+    reach = reach_of(maxima)
     natural = unfolded(spec)
 
     def unfolded_launch() -> O:
