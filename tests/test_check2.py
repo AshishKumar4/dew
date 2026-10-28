@@ -497,8 +497,10 @@ def _truncating_sum(values: np.ndarray) -> np.float32:
 def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_product_or_a_narrow_partial():
     """The native-dot contract (row 2084's link 1): a GEMM's output summed from its exact bf16 products in
     fp32 by truncating adds in any order, then rounded once to bf16 (or kept in fp32), holds at every
-    element, same-sign products included, whose truncations all err one way; the same sums with a product
-    lost, or with the first half's partial rounded to bf16, break it at nearly every element."""
+    element, same-sign products included, whose truncations all err one way; the same sums with their
+    largest product lost break it at nearly every element, and with the first half's partial rounded to
+    bf16 wherever that rounding outweighs the sum's own (about six elements in seven on Gaussian draws,
+    whose partials sometimes cancel to a bf16 value's neighbourhood; nearly all of one sign)."""
     rng = np.random.default_rng(3)
     for signed in (True, False):
         left, right = (np.asarray(ml_dtypes.bfloat16(rng.normal(size=shape) if signed else
@@ -515,7 +517,7 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
         lost = np.asarray([_truncating_sum(np.delete(row, np.argmax(np.abs(row)))) for row in flat])
         narrow = np.asarray([_truncating_sum(np.concatenate([
             [np.float32(ml_dtypes.bfloat16(_truncating_sum(row[:64])))], row[64:]])) for row in flat])
-        for faulty in (lost, narrow):
+        for faulty, most in ((lost, 0.05), (narrow, 0.25 if signed else 0.05)):
             held = ct.native_dot_holds(faulty.reshape(products.shape[:2]).astype(np.float64), products,
                                        oc.FLOAT32, flushes=False)
-            assert np.mean(held) < 0.05, (signed, np.mean(held))
+            assert np.mean(held) < most, (signed, np.mean(held))

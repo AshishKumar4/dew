@@ -102,7 +102,8 @@ def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narro
     operands: a lost block of sixteen products (one MMA's depth) in one group's rows, refused at those
     rows and nowhere else; a row read under its neighbour group's matrix, refused at that row alone; and,
     in an fp32 output, whose grid shows it, a partial sum over half the depth rounded to bf16 before the
-    rest is added, refused nearly everywhere."""
+    rest is added, refused wherever that rounding outweighs the sum's own (about six elements in seven on
+    Gaussian draws)."""
     with generation.assumed(generation_name):
         x, w, _ = draw(0, signed=True)
         products = forward_products(x, w, SIZES)
@@ -119,4 +120,4 @@ def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narro
         first, rest = (forward_of(half, w, SIZES, jnp.float32) for half in halves)
         narrow = np.asarray(np.float32(bf16(first)) + np.float32(rest), np.float64)
         held = native_dot_holds(narrow, products, FLOAT32, flushes=False)
-        assert np.mean(held) < 0.05
+        assert np.mean(held) < 0.25
