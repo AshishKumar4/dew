@@ -995,8 +995,10 @@ class _Passes(pygrain.IterDataset):
 
 
 class _PassesIterator(pygrain.DatasetIterator):
-    """Its parent's rows and position. The repeat restarts a pass by restoring the parent right
-    after one ends, and any other restore lands inside a pass the run already read from."""
+    """Its parent's rows and position. The repeat restarts a pass by restoring, right after one
+    ends, the very position it took as the first pass's start (Grain's `_parent_starting_state`,
+    the first this iterator gives); any other restore, a checkpoint's even once the last pass
+    ended, lands where its position says, with the counts it holds."""
 
     def __init__(self, parent: pygrain.DatasetIterator, name: str, endless: bool, certain: bool,
                  barren: bool = False):
@@ -1005,6 +1007,7 @@ class _PassesIterator(pygrain.DatasetIterator):
         self._barren = barren
         self._yielded = self._ended = False
         self._empty = 0
+        self._opening: object | None = None
 
     def __next__(self):
         try:
@@ -1027,12 +1030,16 @@ class _PassesIterator(pygrain.DatasetIterator):
         return value
 
     def get_state(self):
-        return self._rows.get_state()
+        state = self._rows.get_state()
+        if self._opening is None:
+            self._opening = state
+        return state
 
     def set_state(self, state) -> None:
-        # Right after a pass ends, this is the repeat rewinding it, which keeps the corpus's counts.
-        self._rows.set_state(rewound(state, self._rows.get_state()) if self._ended else state)
-        self._yielded, self._ended = not self._ended, False
+        # The repeat rewinding the pass that just ended keeps the corpus's counts.
+        rewinding = self._ended and state is self._opening
+        self._rows.set_state(rewound(state, self._rows.get_state()) if rewinding else state)
+        self._yielded, self._ended = not rewinding, False
 
 
 class _Barren(Exception):
@@ -1214,9 +1221,13 @@ class _Ended(pygrain.IterDataset):
 
 
 class _EndedIterator(pygrain.DatasetIterator):
+    """Its parent's rows until a pass of them holds none. Restored ended, it reads no more and
+    keeps the position it was given, the counts of its corpus's stages with it."""
+
     def __init__(self, parent: pygrain.DatasetIterator):
         super().__init__(parent)
         self._rows, self._ended = parent, False
+        self._held: Mapping[str, object] | None = None
 
     def __next__(self):
         if self._ended:
@@ -1228,13 +1239,15 @@ class _EndedIterator(pygrain.DatasetIterator):
             raise StopIteration from None
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._rows.get_state(), "ended": self._ended}
+        return {"parent": self._rows.get_state() if self._held is None else self._held, "ended": self._ended}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         # An ended repeat reads no more, so only one that reads on restores where it was.
         self._ended = boolean(state["ended"], "repeat ended")
+        parent = record(state["parent"], "repeat position")
+        self._held = parent if self._ended else None
         if not self._ended:
-            self._rows.set_state(record(state["parent"], "repeat position"))
+            self._rows.set_state(parent)
 
 
 def _reordered(stage: Shuffle | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:

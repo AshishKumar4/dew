@@ -955,6 +955,49 @@ def test_a_mix_resumed_where_its_rewind_left_a_corpus_unopened_counts_as_the_rea
         resumed.close()
 
 
+def test_a_repeat_restored_after_its_last_pass_counts_what_the_restored_position_holds():
+    """A mix repeated twice and read to its end, then restored in place to a position of its first
+    pass: its corpora count what that position holds, not what the whole read reached (row 2059).
+    Before, a restore after the last pass passed for the repeat's rewind and kept the live counts."""
+    from dew._records import record
+    from dew.data.compile import held
+    from dew.data.dataset import DataPartition
+    from dew.data.mixing import state_counts
+
+    stream = held(mix([counted_source("a"), counted_source("b")]).repeat(2), batch=1)(DataPartition())
+    assert isinstance(stream, grain.DatasetIterator)
+    try:
+        for _ in range(3):
+            next(stream)
+        saved = record(stream.get_state(), "validation state")
+        assert sum(1 for _ in stream) == 13
+        stream.set_state(saved)
+        assert state_counts(record(stream.get_state(), "validation state")) == state_counts(saved)
+    finally:
+        stream.close()
+
+
+def test_a_worker_repeat_restored_ended_keeps_the_counts_its_position_holds():
+    """A loading worker's repeat restored ended (`_Ended`: a pass of its inputs held none) reads no
+    more and keeps the position it was given, so its corpus's counts stand as they were saved (row
+    2059). Before, it dropped that position and its corpus counted from nothing."""
+    from dew.data.lowering import _Ended
+    from dew.data.mixing import Accepted, state_counts
+
+    def opened():
+        rows = grain.MapDataset.source([{"i": np.int32(index)} for index in range(6)]).to_iter_dataset()
+        return iter(_Ended(Accepted(rows, "a", "a")))
+
+    reading = opened()
+    for _ in range(4):
+        next(reading)
+    saved = {**reading.get_state(), "ended": True}
+    restored = opened()
+    restored.set_state(saved)
+    assert state_counts(restored.get_state()) == state_counts(saved)
+    assert next(restored, None) is None
+
+
 def test_a_live_mix_rolled_back_to_where_it_opened_no_corpus_counts_none():
     """A mix read on and rolled back, in place, to its start, where it had opened no corpus: its
     corpora count nothing, as nothing had been counted there. Before, each corpus kept the counts it
