@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
+from dew.batch import CLOSES_WINDOW, EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import rows_of
 from dew.objectives.base import Objective
 
@@ -102,4 +102,4 @@ def batch_consumed(batch: Batch) -> jax.Array:
 def model_batch(batch: Batch) -> Batch:
     """The objective sees only its own inputs, not the trainer's accounting columns."""
     return {name: value for name, value in batch.items()
-            if name not in (TRAINING_FLOPS, TOKENS, EXAMPLES_CONSUMED)}
+            if name not in (TRAINING_FLOPS, TOKENS, EXAMPLES_CONSUMED, CLOSES_WINDOW)}

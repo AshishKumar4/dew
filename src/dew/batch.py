@@ -82,6 +82,12 @@ consumes, which the trainer's step adds to the run's clock (`TrainState.consumed
 batch the objective sees. A repeat filling out a short batch holds none."""
 
 
+CLOSES_WINDOW = "closes_window"
+"""A training batch's step-wide flag, in a run bounded in examples that counts no steps ahead: whether it
+is the last its stream holds, so the update window it ends commits over the microbatches it holds however
+few (`dew.training.transaction.Transaction.prepare_attempt`), where a window of a whole update's would be
+left open, and the examples it consumed with it, as the stream ends."""
+
 CONSUMED_COUNT = "consumed_count"
 """A training batch's host field of the examples it consumes (`ConsumedCount`), which the trainer counts
 as it prepares the batch, so its loop reads the run's progress without waiting on its devices."""

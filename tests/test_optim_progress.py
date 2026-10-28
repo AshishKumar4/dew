@@ -49,11 +49,15 @@ def stepped(schedule, steps: int = STEPS) -> tuple[np.ndarray, int]:
     Linear(peak_value=0.3, warmup_steps="25%", end_value=0.05),
     Power(peak_value=0.3, warmup_steps=4, a=2.0, tail=PowerTail(start=24, end_value=0.01)),
     Exponential(init_value=0.3, end_value=0.01, offset=0.02),
-], ids=["cosine", "cosine-share", "cosine-bare", "linear", "linear-share", "power-tail", "exponential"])
+    Exponential(init_value=0.3, end_value=0.01, every=4),
+    Cosine(peak_value=0.3, warmup_steps=2, end_value=0.01, every=3),
+], ids=["cosine", "cosine-share", "cosine-bare", "linear", "linear-share", "power-tail", "exponential",
+        "exponential-every", "cosine-every"])
 def test_a_schedule_on_progress_is_its_law_over_the_steps_a_lockstep_run_takes(schedule):
     """Each law read at a run's progress, where every update consumes one fortieth of the bound, is the
     same law over a run of forty updates: warmups counted in updates or as shares, a decay from where its
-    warmup ended, a constant to `decay_start`, a power law's tail from `tail.start`, a geometric decay."""
+    warmup ended, a constant to `decay_start`, a power law's tail from `tail.start`, a geometric decay;
+    a schedule of steps of several updates (`every`) holds each value over its step's updates."""
     assert schedule.run_relative()
     (read, own), (values, theirs) = progressed(schedule), stepped(schedule)
     assert_computes_the_oracle(read, values, type(schedule).__name__, roundings=own + theirs)

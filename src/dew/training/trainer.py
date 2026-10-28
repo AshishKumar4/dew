@@ -42,16 +42,7 @@ from dew._coordination import (
     broadcast_from_process_zero,
 )
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import (
-    CONSUMED_COUNT,
-    EXAMPLES_CONSUMED,
-    FROZEN,
-    Batch,
-    ConsumedCount,
-    Variables,
-    owned_dicts,
-    select,
-)
+from dew.batch import CLOSES_WINDOW, FROZEN, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking, Resume
 from dew.cleanup import attempted
 from dew.data.dataset import (
@@ -133,6 +124,8 @@ from dew.training._fit import (
     FitPlan,
     FitRun,
     Start,
+    clocked,
+    consumption_counted,
     declarations,
     first_batch,
     fit_policies,
@@ -199,7 +192,7 @@ from dew.training.planning import (
     untimed_frontier,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, start_capture, stop_capture
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, stop_capture
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -900,7 +893,7 @@ class Trainer(Generic[Loss, Effects]):
                                split=split, record=self.record, fetch=fetch, examples=self._examples).step()
         custom = self.step(self.objective, self.optimizer)
 
-        def run(current, batch, part, tokens):
+        def run(current, batch, part, tokens, closes=None):
             advanced, loss, aux = custom(current, batch)
             return advanced, loss, aux, None
         return run
@@ -1130,7 +1123,8 @@ class Trainer(Generic[Loss, Effects]):
             micro = microbatch(batch, part, split)
             early = [field for field in self.layout.host if field not in late]
             advanced, loss, aux, committed = body(self._fetched(current, shardings, early),
-                                                  self._model_batch(micro), part, batch_tokens(micro))
+                                                  self._model_batch(micro), part, batch_tokens(micro),
+                                                  micro.get(CLOSES_WINDOW))
             stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
                                      batch_consumed(micro))
             return (apart(stepped)[0], *rest)
@@ -1227,7 +1221,8 @@ class Trainer(Generic[Loss, Effects]):
                         and not current.accumulation.replays(prepared.accumulation))):
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
-                advanced, loss, aux, committed = body(current, model_batch(batch), 0, batch_tokens(batch))
+                advanced, loss, aux, committed = body(current, model_batch(batch), 0, batch_tokens(batch),
+                                                      batch.get(CLOSES_WINDOW))
                 advanced, *stepped = outcome(current, advanced, loss, aux, committed, batch, 1,
                                              batch_consumed(batch))
                 # A leaf already where its placement says stays the array it
@@ -1316,9 +1311,8 @@ class Trainer(Generic[Loss, Effects]):
             self.objective, dataset, validation, steps=steps, epochs=epochs, tokens=tokens, examples=examples,
             accumulation=self.accumulation, startup=self._startup)
         self._device, self._prefetch = loader.device, device_prefetch
-        # A run bounded in examples whose read counts no steps ahead keeps its progress in its examples
-        # consumed (`TrainState.consumed`), which its schedule and cadences read.
-        self._examples = examples if examples is not None and steps is None else None
+        self._examples = clocked(examples, steps, custom=self.step is not None,
+                                 rollout=self.rollout is not None)
         self._schedule(None if steps is None else steps // self.accumulation)
         plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
                           written=(log_every, eval_every, checkpoint_every),
@@ -1421,7 +1415,7 @@ class Trainer(Generic[Loss, Effects]):
         while not plan.ended(run.current, run.clock.read, interval.consumed):
             # A schedule's stage ends where the commits reach its tokens.
             self._scheduled(plan, run)
-            self._open_window(run, profile, profiler, seen, compiled)
+            run.open_window(profile, profiler, seen, bool(compiled))
             capturing = tracer is not None and tracer.running
             step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
                           if capturing else contextlib.nullcontext())
@@ -1430,10 +1424,10 @@ class Trainer(Generic[Loss, Effects]):
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
                 batch = waited_read(run, interval, agree=not (seen and run.endless))
-                window = (self._split or 1) * self.accumulation
-                if batch is None and (batch := run.closing(state, window)) is None:
+                if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
+                batch, ahead = self._closes(run, interval, batch)
                 batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
                 device, _ = split_fields(batch)
                 inputs = self.objective.inputs
@@ -1473,13 +1467,11 @@ class Trainer(Generic[Loss, Effects]):
                     first_run(loss, run.current, self.memory, self.device_mesh)
                 run.loss = loss
                 assert run.train is not None
-                position = run.train.source_state
+                position = run.train.source_state if ahead is None else ahead
                 run.current, seen = run.current + 1, seen + 1
                 self._display.step(run.current)
                 interval.count(batch, measured_flops, loss, finite, committed, aux)
                 run.clock.stepped(self.objective.row_tokens(device), rows_of(device))
-                if self._examples is not None and self.accumulation > 1:
-                    run.last = batch
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
                 if run.first_step is None:
@@ -1498,6 +1490,16 @@ class Trainer(Generic[Loss, Effects]):
                     assert profiler is not None
                     self._stop_trace(run, profile, profiler)
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
+
+    def _closes(self, run: FitRun, interval: Interval, batch: Batch) -> tuple[Batch, bytes | None]:
+        """`batch` marked where it is a clocked run's last (`CLOSES_WINDOW`), so the update it ends commits
+        with the microbatches its window holds, known by reading ahead (`FitRun.ends_here`), and the
+        stream's position after it, taken before that read, which the step saves; else as read."""
+        window = (self._split or 1) * self.accumulation
+        if self._examples is None or window == 1:
+            return batch, None
+        position = None if run.train is None else run.train.source_state
+        return {**batch, CLOSES_WINDOW: np.bool_(run.ends_here(interval))}, position
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
@@ -1791,7 +1793,8 @@ class Trainer(Generic[Loss, Effects]):
         # Before the step's save, so a preemption inside the branch saves this step to run it again; at
         # the run's last step, after its final save (`_wind_down`). The points share one length and
         # decay, so those due together are one branch.
-        due = next((branch for branch in plan.branches if branch.due(current, real, before, consumed)), None)
+        crossed = run.committed_examples(interval, current, self.accumulation)
+        due = next((branch for branch in plan.branches if branch.due(current, real, before, crossed)), None)
         branch = None if due is None else due.pending(current, self.accumulation)
         if ending and branch is not None and checkpoints is not None:
             # Kept before the step's final save makes the run look complete (`Checkpoints.cooldown`).
@@ -2165,9 +2168,8 @@ class Trainer(Generic[Loss, Effects]):
         rollout's caller, and only it writes the reason. A count asked of the
         objective directly stays strict.
         """
-        if EXAMPLES_CONSUMED in batch:
-            # The host counts the examples the batch consumes as it prepares it (`ConsumedCount`).
-            batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
+        if self._examples is not None:
+            batch = consumption_counted(batch)
         if self._refusal is None:
             try:
                 return prepare_counts(self.objective, batch, count_model=True)
@@ -2474,17 +2476,6 @@ class Trainer(Generic[Loss, Effects]):
 
     # ------------------------------------------------------------------ Telemetry
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _open_window(run: FitRun, profile: ProfileWindow | None, profiler: Profiler | None, seen: int,
-                     compiled: Mapping[Signature, object]) -> None:
-        """Open the profile window's capture before an iteration's first read, so the step row records
-        the read it waits on, once its warmup steps have run and the run's first step has compiled: the
-        window holds steps, not the compile."""
-        if (profiler is not None and profile is not None and not run.tracing and run.traced == 0
-                and seen >= profile.warmup and compiled):
-            start_capture(profiler)
-            run.tracing = True
 
     def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
         """Stop the window's owned capture (`stop_capture`), then report it on process zero."""

@@ -388,6 +388,17 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
 
 
+def _shuffles_windows(pipeline: Pipeline) -> bool:
+    """Whether `pipeline` counts the examples its rows consume (`Consumed`, a run bounded in examples) and
+    shuffles in a window after a stage that packs or windows its rows."""
+    stages = pipeline.stages
+    if not any(isinstance(stage, Map) and isinstance(stage.step, Consumed) for stage in stages):
+        return False
+    packed = next((index for index, stage in enumerate(stages) if isinstance(stage, (Pack, Windows))), None)
+    return packed is not None and any(isinstance(stage, Shuffle) and bool(stage.window)
+                                      for stage in stages[packed:])
+
+
 def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     """`pipeline`'s training read bounded to its first `examples` source examples: the records as they
     reach the first of the objective's steps that makes several rows of one (`FlatMap.examples`, which
@@ -798,6 +809,13 @@ def _compiled(
     records = _epoch_records(train, build)
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
+    order_records = _order_records(train, build)
+    if order_records is None and _shuffles_windows(train):
+        # A run no plan counts ahead reads its progress off the windows that end its examples
+        # (`CONSUMED`), which a later shuffle could draw before the windows holding the rest of them.
+        raise ValueError(f"{_name(train)} shuffles the windows it packs, which a run bounded in examples "
+                         "and read in its own order reads in the order they end their examples; shuffle "
+                         "the records before the pack, or read it in a global order")
     held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
     return Loader(
         training,
@@ -812,7 +830,7 @@ def _compiled(
         batch_tokens=staged.batch_tokens,
         device=device,
         tail=_tail(train, build),
-        order_records=_order_records(train, build),
+        order_records=order_records,
     )
 
 

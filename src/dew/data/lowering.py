@@ -516,6 +516,29 @@ type Field = Batch | np.ndarray | np.generic | str | bytes | int | float | bool 
 """A record's field, as the steps before a batch leave it."""
 
 
+def _consumed_forward(elements: Sequence[Record]) -> list[Record]:
+    """`elements` in their order, each rejected row's consumed examples (`Rejected.consumed`) carried on
+    to the next row kept after it, as the corpus's reading carries them (`Accepted`), so a group that
+    holds its markers apart from its rows (`_Grouped`) moves none to an earlier row: only a marker no row
+    follows in the group keeps its count, which `_Ungrouped` hands on after the group's rows."""
+    carried: list[Record] = []
+    owed: list[int] = []
+    for element in elements:
+        if isinstance(element, Rejected) and element.consumed:
+            owed.append(len(carried))
+        elif owed and isinstance(element, Mapping) and CONSUMED in element:
+            pending = 0
+            for at in owed:
+                marker = carried[at]
+                assert isinstance(marker, Rejected)
+                pending += marker.consumed
+                carried[at] = dataclasses.replace(marker, consumed=0)
+            element = {**element, CONSUMED: integer(element[CONSUMED], "a row's consumed examples") + pending}
+            owed = []
+        carried.append(element)
+    return carried
+
+
 @dataclasses.dataclass
 class _Grouped:
     """A loading worker's records and the markers of those its steps dropped, a batch's count at a
@@ -529,6 +552,7 @@ class _Grouped:
         self.shared = True
 
     def __call__(self, elements: Sequence[Record]) -> Batch:
+        elements = _consumed_forward(elements)
         markers = [element for element in elements if isinstance(element, Rejected)]
         rows = [element for element in elements if not isinstance(element, Rejected)]
         records = [row for row in rows if isinstance(row, Mapping)]
@@ -560,10 +584,12 @@ class _Ungrouped:
     max_fan_out: int
 
     def flat_map(self, group: Batch) -> Sequence[Record]:
-        markers = list(group["markers"])
+        markers = [marker for marker in group["markers"] if not marker.consumed]
+        # A marker of the examples the group's last rows were the last of follows its rows.
+        trailing = [marker for marker in group["markers"] if marker.consumed]
         held, count = group["held"], integer(group["rows"], "grouped rows")
         if not group["alike"]:
-            return [*markers, *held]
+            return [*markers, *held, *trailing]
         columns: dict[str, np.ndarray | list] = {}
         for name, column in record(held, "grouped records").items():
             # A batch's column: an array, or a list of a field's values that don't stack.
@@ -571,7 +597,7 @@ class _Ungrouped:
                 raise TypeError(f"a grouped column {name!r} is a {type(column).__name__}, not a batch column")
             columns[name] = column
         rows = ({name: column[index] for name, column in columns.items()} for index in range(count))
-        return [*markers, *rows]
+        return [*markers, *rows, *trailing]
 
 
 @dataclasses.dataclass(frozen=True)

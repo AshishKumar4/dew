@@ -114,7 +114,9 @@ class JepaObjective(Objective[Ratio]):
     Evaluation returns the pooled target-encoder embeddings of a batch with
     its labels, which the probe metrics score. `momentum` is the target
     encoder's EMA decay, which rises linearly from its first value to its
-    second over `momentum_steps` updates.
+    second over `momentum_steps` updates, or where None over the run's
+    progress, a run bounded in examples that no plan counts ahead
+    (`EMASpec.progressed`).
 
     `encoder_variables` and `predictor_variables` are the trees each module
     starts from, as `model.init`, `Pretrained.load` or `LoRA.apply` return
@@ -138,7 +140,7 @@ class JepaObjective(Objective[Ratio]):
         mask: MultiBlockMask,
         sample: Field,
         momentum: tuple[float, float] = (0.996, 1.0),
-        momentum_steps: int = 100_000,
+        momentum_steps: int | None = 100_000,
         label_key: str = LABEL_KEY,
         encoder_variables: Variables | None = None,
         predictor_variables: Variables | None = None,
@@ -159,8 +161,9 @@ class JepaObjective(Objective[Ratio]):
         self.is_video = len(sample.shape) == 4
         self.inputs = InputSpec(sample=sample)
         self.ema = EMASpec(
-            decay=optax.linear_schedule(momentum[0], momentum[1], momentum_steps),
+            decay=optax.linear_schedule(momentum[0], momentum[1], momentum_steps or 1),
             select=under("params", CONTEXT_ENCODER),
+            progressed=momentum_steps is None,
         )
 
     def program_key(self) -> tuple[ProgramModule, ...]:

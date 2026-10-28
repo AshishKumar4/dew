@@ -1006,12 +1006,15 @@ class RateState(NamedTuple):
 
 class ProgressState(NamedTuple):
     """A scheduled solver's schedule over a run's progress (`ScheduleBase.progressed`): its `RateState`'s
-    `updates` and `rates`, and the progress the run stood at as its updates reached each count its law
-    marks (`ScheduleBase.marks`), by name, 0 until then."""
+    `updates` and `rates`, the progress the run stood at as its updates reached each count its law
+    marks (`ScheduleBase.marks`), by name, 0 until then, and the progress it stood at as its updates last
+    reached a multiple of the schedule's `every` (`held`), which its value holds to the next one, as a
+    schedule's own steps hold it over updates."""
 
     updates: jax.Array
     rates: Mapping[str, jax.Array]
     marks: Mapping[str, jax.Array]
+    held: jax.Array
 
 
 CONSTANT = 'value'
@@ -1044,7 +1047,8 @@ class _Rate(optax.schedules.StatefulSchedule):
         rates = {path: jnp.asarray(value, self.dtype) for path, value in self.rates.items()}
         if not self.progressed:
             return RateState(updates, rates)
-        return ProgressState(updates, rates, {name: jnp.zeros([], jnp.float32) for name in self.rate.marks()})
+        return ProgressState(updates, rates, {name: jnp.zeros([], jnp.float32) for name in self.rate.marks()},
+                             jnp.zeros([], jnp.float32))
 
     def update(self, state: RateState | ProgressState, *, progress: jax.Array | None = None,
                **extra_args) -> RateState | ProgressState:
@@ -1053,7 +1057,14 @@ class _Rate(optax.schedules.StatefulSchedule):
         if not isinstance(state, ProgressState):
             return state._replace(updates=updates)
         assert progress is not None, "a schedule on a run's progress is handed it at each update"
-        return state._replace(updates=updates, marks=self._marked(state, progress))
+        return state._replace(updates=updates, marks=self._marked(state, progress),
+                              held=self._held(state, progress))
+
+    def _held(self, state: ProgressState, progress: jax.typing.ArrayLike) -> jax.Array:
+        """The progress the schedule's value reads at `state`'s update: the run's own where the update
+        starts one of the schedule's steps (a multiple of `every`), else the one that step started at."""
+        at = jnp.asarray(progress)
+        return jnp.where(state.updates % self.rate.every == 0, at, state.held.astype(at.dtype))
 
     def _marked(self, state: ProgressState, progress: jax.typing.ArrayLike) -> dict[str, jax.Array]:
         """`state`'s marks with the progress of the update that stands at a marked count recorded: where
@@ -1068,7 +1079,7 @@ class _Rate(optax.schedules.StatefulSchedule):
         if isinstance(state, ProgressState):
             # Optax reads the rate once as it builds its state, where the run has consumed nothing.
             progress = jnp.zeros([], jnp.float32) if progress is None else progress
-            at, marks = jnp.asarray(progress), self._marked(state, progress)
+            at, marks = self._held(state, progress), self._marked(state, progress)
             if not self.rate.rates():
                 return state.rates[CONSTANT] * self.rate.progressed({}, at, state.updates, marks)
             return self.rate.progressed(state.rates, at, state.updates, marks)

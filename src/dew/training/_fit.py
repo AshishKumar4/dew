@@ -12,14 +12,14 @@ import types
 from collections.abc import Iterator, Mapping, Sequence
 
 import jax
-import jax.numpy as jnp
+import numpy as np
 from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import position
 from dew._coordination import agreed_next
 from dew._records import JSON
-from dew.batch import CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
+from dew.batch import CONSUMED_COUNT, EXAMPLES_CONSUMED, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
@@ -28,13 +28,14 @@ from dew.distributed.placement import MeshSpec, Placement
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig
 from dew.state import TrainState
-from dew.telemetry.profile import region
+from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Examples, Tokens
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, Taken, TokenClock
 from dew.training.observe import Observe
+from dew.training.profiling import ProfileWindow, start_capture
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
 
@@ -317,9 +318,6 @@ class FitRun:
     taken: Taken | None = None
     scored: frozenset[str] = frozenset()
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
-    last: Batch | None = None
-    """The latest step's batch, held in a run bounded in examples that updates every several steps, whose
-    window its stream's end leaves open (`closing`)."""
     ahead: tuple[Batch | None] | None = None
     """The next batch, or None for the stream's end, read before the step that takes it, where a
     save had to know whether the run ends there (`ends_here`)."""
@@ -339,19 +337,25 @@ class FitRun:
     (`dew.training.cooldown.Pending`): one its checkpoints kept unfinished, as the pool agreed it, or
     one due at its last step, which runs after the step's final save (`Trainer._wind_down`)."""
 
-    def closing(self, state: TrainState, window: int) -> Batch | None:
-        """The run's latest batch (`last`) with every row masked (`VALID_ROWS` False, consuming no
-        example), which a run bounded in examples steps where its stream ends inside an update's window of
-        `window` microsteps, so the window commits over the rows it holds, its mean theirs, as a whole
-        one does, rather than being dropped with the examples it consumed. None where no window is open,
-        or the run holds no batch for one."""
-        last = self.last
-        if last is None or int(state.microstep) % window == 0:
-            self.last = None
-            return None
-        consumed = last[EXAMPLES_CONSUMED]
-        return {**last, VALID_ROWS: jnp.zeros_like(consumed, dtype=bool),
-                EXAMPLES_CONSUMED: jnp.zeros_like(consumed), CONSUMED_COUNT: ConsumedCount(0)}
+    def open_window(self, profile: ProfileWindow | None, profiler: Profiler | None, seen: int,
+                    compiled: bool) -> None:
+        """Open the profile window's capture before an iteration's first read, so the step row records
+        the read it waits on, once its warmup steps have run and the run's first step has `compiled`:
+        the window holds steps, not the compile."""
+        if (profiler is not None and profile is not None and not self.tracing and self.traced == 0
+                and seen >= profile.warmup and compiled):
+            start_capture(profiler)
+            self.tracing = True
+
+    def committed_examples(self, interval: Interval, step: int, accumulation: int) -> tuple[int, int]:
+        """At an update's last step, the consumed examples now and at the update before it, which a
+        cooldown point of examples is crossed between (`dew.training.cooldown.Branch.due`), so its branch
+        starts where an update has committed; none crossed at any other step."""
+        if step % accumulation:
+            return 0, 0
+        crossed = interval.consumed, interval.consumed_committed
+        interval.consumed_committed = interval.consumed
+        return crossed
 
     def ends_here(self, interval: Interval) -> bool:
         """Whether a stream that may run out has, so this step is the run's last: its next batch is
@@ -372,6 +376,31 @@ class FitRun:
         run's traceback."""
         assert self.train is not None
         return next(self.train)
+
+
+def clocked(examples: int | None, steps: int | None, *, custom: bool, rollout: bool) -> int | None:
+    """The examples bound of a run that no plan counts steps ahead of, which keeps its progress in the
+    examples its batches consume (`TrainState.consumed`), its schedule and cadences reading it; None for
+    a run counted otherwise. The transaction hands the run's optimizer that progress and the batches
+    carry the count, which a `custom` step or a `rollout`'s batches do not: refused there."""
+    if examples is None or steps is not None:
+        return None
+    if custom or rollout:
+        raise ValueError("a run bounded in examples that no plan counts ahead reads its progress off the "
+                         "examples its batches consume, which a custom step= or a rollout does not carry; "
+                         "give steps=, or read the data in a global order its plan counts")
+    return examples
+
+
+def consumption_counted(batch: Batch) -> Batch:
+    """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
+    prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
+    its start."""
+    if EXAMPLES_CONSUMED not in batch:
+        raise ValueError("a step after the examples bound dropped the batch's count of the examples it "
+                         f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "
+                         "step that rebuilds its records keeps no count")
+    return {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
 
 
 def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = False) -> Batch | None:

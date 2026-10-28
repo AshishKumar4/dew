@@ -13,7 +13,7 @@ import numpy as np
 
 from dew import position
 from dew._records import record
-from dew.batch import Batch
+from dew.batch import EXAMPLES_CONSUMED, Batch
 from dew.data.dataset import (
     Closeable,
     DataPartition,
@@ -38,9 +38,14 @@ class _HostSteps:
     def __call__(self, value: Batch) -> Batch:
         from dew.data.lowering import _outputs
 
+        # The examples the batch consumes are the trainer's accounting, which no step of the batch's
+        # own sees or changes: a projection or a fresh model-input dict keeps them.
+        consumed = value.get(EXAMPLES_CONSUMED)
+        held = value if consumed is None else {name: column for name, column in value.items()
+                                               if name != EXAMPLES_CONSUMED}
         for step in self.steps:
-            value = record(_outputs(Map(step), None, value)[0], "host map result")
-        return value
+            held = record(_outputs(Map(step), None, held)[0], "host map result")
+        return held if consumed is None else {**held, EXAMPLES_CONSUMED: consumed}
 
 
 class _Host(_CheckpointableMapping):

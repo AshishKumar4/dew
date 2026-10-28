@@ -556,11 +556,14 @@ class EMASpec:
 
     `decay` is a schedule over steps because some objectives ramp the
     momentum; I-JEPA anneals it from 0.996 to 1.0. The step it reads is the
-    count of completed optimizer updates. `select` picks the tracked leaves
-    and defaults to all of them.
+    count of completed optimizer updates, or where `progressed` the run's
+    progress, the share of its examples bound consumed before the update, in
+    a run bounded in examples that no plan counts ahead (`TrainState.consumed`).
+    `select` picks the tracked leaves and defaults to all of them.
     """
     decay: optax.Schedule
     select: PathFilter = everything
+    progressed: bool = False
 
     @classmethod
     def constant(cls, decay: float | None) -> EMASpec | None:

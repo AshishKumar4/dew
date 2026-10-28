@@ -148,6 +148,8 @@ class Interval:
     same as its state's clock (`TrainState.consumed`) without a read off the devices."""
     consumed_before: int = 0
     """`consumed` before the latest step."""
+    consumed_committed: int = 0
+    """`consumed` at the run's last update boundary (`FitRun.committed_examples`)."""
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
               committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
@@ -193,7 +195,8 @@ class Interval:
         (`committed_tokens`), which it takes the clock's field out of."""
         consumed = int(control.pop(CONSUMED_EXAMPLES, 0))
         return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control),
-                   resumable=last_saved, consumed=consumed, consumed_before=consumed)
+                   resumable=last_saved, consumed=consumed, consumed_before=consumed,
+                   consumed_committed=consumed)
 
     @property
     def token_control(self) -> dict[str, int]:

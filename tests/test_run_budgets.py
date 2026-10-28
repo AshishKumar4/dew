@@ -218,21 +218,26 @@ def consumed_by_row(examples: int) -> dict[int, int]:
     return owed
 
 
-@pytest.mark.parametrize("packed", [False, True], ids=["rows", "packed"])
-def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed):
+@pytest.mark.parametrize("packed, workers", [(False, 0), (True, 0), (False, 2)],
+                         ids=["rows", "packed", "workers"])
+def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed, workers):
     """A run bounded to 23 examples, read in order as a stream, whose objective makes 0 to 3 rows of each
     and drops the last row of every fifth: each batch's consumed examples (`EXAMPLES_CONSUMED`) are those
     whose last row it holds, an example of no rows, or of a dropped last row, consumed by the next row
-    kept, rows packed into windows or batched as they are; the batches together consume all 23."""
+    kept, rows packed into windows, batched as they are, or read by loading workers in groups that hold
+    their dropped rows apart; the batches together consume all 23, and the column a projection of the
+    batch would leave out is kept."""
     from dew.batch import EXAMPLES_CONSUMED
     from dew.data.pipeline import ObjectiveData, Pack
 
     owed = consumed_by_row(23)
-    chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)}))
+    chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)})).workers(workers)
     # The objective packs the rows it makes into windows of up to four rows, as a decision objective does.
     pack = Pack(9, fields=("text",)) if packed else None
     objective = ObjectiveData(train=(Fanned(), LastDropped()), pack=pack)
-    loader = compile(chain.batch(BATCH), read="streamed", objective=objective, examples=23)
+    loader = compile(chain.batch(BATCH).select_columns("text"), read="streamed", objective=objective,
+                     examples=23)
+    assert loader.example_steps(23) is None
     stream = loader.train(DataPartition())
     total = 0
     try:
@@ -603,3 +608,23 @@ def test_a_run_config_counts_examples_and_pauses_as_a_fit_does(tmp_path):
     resumed = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, stop=None)).train(
         Pulled(), chain(x), name="budget")
     assert (int(paused.step), int(resumed.step)) == (2 * ACCUMULATION, 3 * ACCUMULATION)
+
+
+def test_asking_a_streamed_runs_steps_reads_none_of_its_data():
+    """A run bounded in examples whose read no plan counts ahead keeps its progress in the examples it
+    consumes, so asking its steps (`Loader.example_steps`) reads none of its data: its objective's
+    expansion makes no row of any example."""
+    from dew.data.pipeline import ObjectiveData
+
+    seen: list[int] = []
+
+    class Watched(Fanned):
+        def flat_map(self, element):
+            seen.append(int(element["id"]))
+            return super().flat_map(element)
+
+    chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)}))
+    loader = compile(chain.batch(BATCH), read="streamed", objective=ObjectiveData(train=(Watched(),)),
+                     examples=23)
+    read = len(seen)
+    assert loader.example_steps(23) is None and len(seen) == read
