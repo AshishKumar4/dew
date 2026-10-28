@@ -503,6 +503,40 @@ def test_a_packed_recurrence_runs_on_each_devices_own_rows():
     assert reduced <= parameters, (reduced, parameters)
 
 
+def _ssd_forward(generation: str, rows: int, devices: int) -> jax.stages.Lowered:
+    """A bf16 Mamba-2 layer's forward over `rows` rows of 128 tokens, its scan on the recurrence template
+    (`SCAN`'s 'mosaic_gpu', named: a declared cell may give the port the generation's forward), lowered for
+    an assumed `generation` over an abstract mesh of `devices` splitting its rows."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.mixers.mamba2 import Mamba2
+
+    layer = Mamba2(emb_features=128, num_heads=4, head_dim=64, state_size=64, chunk_size=64,
+                   dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((rows, 128, 128), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+    device = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation).abstract_device
+    mesh = AbstractMesh((devices,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh), kernel_choices(ssd="mosaic_gpu"):
+        return jax.jit(layer.apply).trace(variables, x).lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_mamba2_forward_runs_its_template_scan_on_each_devices_own_rows(generation):
+    """A Mamba-2 layer's forward on a mesh splitting its rows runs the recurrence template's scan on each
+    device's rows (`SCAN`'s template, `recurrence_chunk.template_rule`, a per-shard map), as its lowered GPU
+    program states it: lowered over two devices and two rows, its Mosaic GPU calls are one device's over one
+    row, operand for operand, and it holds no collective (bible 7's multi-device lowering, row 1963)."""
+    sharded = _operations(_ssd_forward(generation, rows=2, devices=2))
+
+    def mosaic(operations: list[Operation]) -> list[tuple]:
+        return [(operands, results) for name, target, operands, results in operations
+                if name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")]
+
+    assert mosaic(sharded) and mosaic(sharded) == mosaic(_operations(_ssd_forward(generation, rows=1, devices=1)))
+    assert not [name for name, *_ in sharded if _collective(name)]
+
+
 @pytest.mark.parametrize("generation, cores", [
     ("sm80", False), ("sm86", False), ("sm89", True), ("sm90", True), ("sm100", True), ("sm120", True),
     ("v6e", False), ("cpu", False)])
