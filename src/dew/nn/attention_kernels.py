@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.devices import deterministic_ops_requested
+from dew.nn.precision import wide_cpu_arithmetic
 
 from .kernels import decode_attention, generation
 from .kernels.generation import INHERENT, Refusal, bf16_dot_runs, capability, device_generation, gpu_placed
@@ -19,6 +20,51 @@ from .kernels.templates import attention_mosaic_program, attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
+
+
+def xla_kernel_narrows(query) -> bool:
+    """Whether jax.nn's xla attention would compute this call below its
+    query's precision, so 'auto' and 'xla' take the reference path, which
+    computes in the query's dtype (`dew.nn.precision.at_least_fp32`).
+
+    It rounds a float64 query's softmax to float32
+    (`_dot_product_attention_core`: "Softmax and it is always carried out in
+    fp32"), and names the BF16_BF16_F32 algorithm for a bf16 one, which a GPU
+    older than sm80 rejects at run time, past jax's own fallback."""
+    return query.dtype == jnp.float64 or (
+        query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
+
+
+def xla_kernel_rounds_off(query, key, *, folded: bool) -> bool:
+    """Whether jax.nn's xla attention would multiply this call off the arithmetic it names, so 'auto'
+    and 'xla' take the reference path with jax.nn's own logits (`xla_logits`): a bf16 query on a GPU
+    whose query-key product has a side of one, unless the call is `folded` (`folds`), whose products
+    are Dew's (`folded_attention`). jax.nn names BF16_BF16_F32 for that product, which an A100 rounds
+    off round-to-nearest-even at its ties where the same values widened to fp32 multiply exactly (node
+    receipts SF-a100-tie-probe3 and 4, row 1550); it names no algorithm for the probability-value
+    product. Every GPU takes the reference path for these calls, as its products are right on each."""
+    return (query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not folded
+            and 1 in (query.shape[-3], key.shape[-3]))
+
+
+def xla_logits(implementation, resolved: str, query, key, *, folded: bool) -> bool:
+    """Whether a call named 'auto' or 'xla' that the reference path takes for jax.nn's xla kernel, as it
+    would compute a bf16 call off the arithmetic it names (`xla_kernel_narrows`,
+    `xla_kernel_rounds_off`), computes its logits as jax.nn's do: in fp32 from the query and keys
+    widened, scaled after the product (`reference_attention`'s `wide_logits`), so no logit a bf16
+    product would round past its range leaves the softmax a NaN where jax.nn's is finite."""
+    return (implementation in ('auto', 'xla') and resolved == 'reference' and query.dtype == jnp.bfloat16
+            and (xla_kernel_narrows(query) or xla_kernel_rounds_off(query, key, folded=folded)))
+
+
+def xla_kernel_widens_less() -> bool:
+    """Whether jax.nn's xla attention would run this call below the arithmetic its process asks of a CPU,
+    so 'auto' and 'xla' take the reference path: a CPU under Dew's test setting (`WIDE_CPU_ARITHMETIC`),
+    which sums fp32 products in float64 (`precision.accumulated`) where jax's sums them in fp32, and whose
+    reference path differentiates the softmax by its own derivative, exactly zero for a query that reads
+    one key, where jax's takes rowsum(dO * O) and leaves it a rounding. A process without the setting runs
+    jax's kernel on a CPU as on any platform."""
+    return wide_cpu_arithmetic() and generation.backend() == 'cpu'
 
 
 def cudnn_max_head_dim() -> int:
@@ -103,7 +149,7 @@ class AttentionCase:
     `arithmetic` is a call asking what only the
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
     below its query's precision, off the arithmetic it names or below its process's CPU arithmetic
-    (`_xla_kernel_narrows`, `_xla_kernel_rounds_off`, `_xla_kernel_widens_less`), `folds`
+    (`xla_kernel_narrows`, `xla_kernel_rounds_off`, `xla_kernel_widens_less`), `folds`
     one of few query positions `folded_attention` reads on a GPU, and `splash_mask` one whose mask
     splash's descriptor describes, formed only where splash may run, under a name that may choose it
     on a TPU (`TPU_BACKEND`), and False elsewhere."""

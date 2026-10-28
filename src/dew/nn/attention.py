@@ -28,7 +28,18 @@ from dew.mesh import SEQUENCE_AXIS, LayoutRefused, logical_spec, mesh_axes
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.dropout import Dropout
 
-from .attention_kernels import ATTENTION, DECODE, SPLASH_LANES, TPU_BACKEND, AttentionCase, decodes
+from .attention_kernels import (
+    ATTENTION,
+    DECODE,
+    SPLASH_LANES,
+    TPU_BACKEND,
+    AttentionCase,
+    decodes,
+    xla_kernel_narrows,
+    xla_kernel_rounds_off,
+    xla_kernel_widens_less,
+    xla_logits,
+)
 from .attention_sinks import sink_softmax
 from .decode_geometry import folded_attention, folds
 from .documents import (
@@ -42,7 +53,7 @@ from .documents import (
 from .flops import cross_attention_flops, projection_flops, self_attention_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
-from .kernels.generation import bf16_dot_runs, gpu_placed
+from .kernels.generation import gpu_placed
 from .kernels.selection import forced, select, selected
 from .kernels.templates import attention as template, attention_route
 from .precision import (
@@ -57,7 +68,6 @@ from .precision import (
     operand_precision,
     rms_statistics,
     rounded_to,
-    wide_cpu_arithmetic,
 )
 from .rope import rotate
 from .sharding import (
@@ -1724,51 +1734,6 @@ def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
             or (dtype is not None and jnp.dtype(dtype) != query.dtype))
 
 
-def _xla_kernel_narrows(query) -> bool:
-    """Whether jax.nn's xla attention would compute this call below its
-    query's precision, so 'auto' and 'xla' take the reference path, which
-    computes in the query's dtype (`dew.nn.precision.at_least_fp32`).
-
-    It rounds a float64 query's softmax to float32
-    (`_dot_product_attention_core`: "Softmax and it is always carried out in
-    fp32"), and names the BF16_BF16_F32 algorithm for a bf16 one, which a GPU
-    older than sm80 rejects at run time, past jax's own fallback."""
-    return query.dtype == jnp.float64 or (
-        query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
-
-
-def _xla_kernel_rounds_off(query, key, *, folded: bool) -> bool:
-    """Whether jax.nn's xla attention would multiply this call off the arithmetic it names, so 'auto'
-    and 'xla' take the reference path with jax.nn's own logits (`xla_logits`): a bf16 query on a GPU
-    whose query-key product has a side of one, unless the call is `folded` (`folds`), whose products
-    are Dew's (`folded_attention`). jax.nn names BF16_BF16_F32 for that product, which an A100 rounds
-    off round-to-nearest-even at its ties where the same values widened to fp32 multiply exactly (node
-    receipts SF-a100-tie-probe3 and 4, row 1550); it names no algorithm for the probability-value
-    product. Every GPU takes the reference path for these calls, as its products are right on each."""
-    return (query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not folded
-            and 1 in (query.shape[-3], key.shape[-3]))
-
-
-def xla_logits(implementation, resolved: str, query, key, *, folded: bool) -> bool:
-    """Whether a call named 'auto' or 'xla' that the reference path takes for jax.nn's xla kernel, as it
-    would compute a bf16 call off the arithmetic it names (`_xla_kernel_narrows`,
-    `_xla_kernel_rounds_off`), computes its logits as jax.nn's do: in fp32 from the query and keys
-    widened, scaled after the product (`reference_attention`'s `wide_logits`), so no logit a bf16
-    product would round past its range leaves the softmax a NaN where jax.nn's is finite."""
-    return (implementation in ('auto', 'xla') and resolved == 'reference' and query.dtype == jnp.bfloat16
-            and (_xla_kernel_narrows(query) or _xla_kernel_rounds_off(query, key, folded=folded)))
-
-
-def _xla_kernel_widens_less() -> bool:
-    """Whether jax.nn's xla attention would run this call below the arithmetic its process asks of a CPU,
-    so 'auto' and 'xla' take the reference path: a CPU under Dew's test setting (`WIDE_CPU_ARITHMETIC`),
-    which sums fp32 products in float64 (`precision.accumulated`) where jax's sums them in fp32, and whose
-    reference path differentiates the softmax by its own derivative, exactly zero for a query that reads
-    one key, where jax's takes rowsum(dO * O) and leaves it a rounding. A process without the setting runs
-    jax's kernel on a CPU as on any platform."""
-    return wide_cpu_arithmetic() and generation.backend() == 'cpu'
-
-
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
@@ -1793,8 +1758,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         mask=mask is not None, bias=bias is not None,
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
-        narrows=(_xla_kernel_narrows(query) or _xla_kernel_rounds_off(query, key, folded=folded)
-                 or _xla_kernel_widens_less()),
+        narrows=(xla_kernel_narrows(query) or xla_kernel_rounds_off(query, key, folded=folded)
+                 or xla_kernel_widens_less()),
         folds=folded,
         splash_mask=False, shards=sequence_shards(), dropout=dropout)
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
@@ -1862,8 +1827,9 @@ def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None,
                                               force_fp32_for_softmax=force_fp32_for_softmax, named='xla'),
                                mask=True, folds=False)
     chosen = selected(ATTENTION, case, 'xla').name
-    rounds = _xla_kernel_narrows(query) or _xla_kernel_rounds_off(query, key, folded=False)
-    return 'xla' if chosen == 'reference' and query.dtype == jnp.bfloat16 and rounds else chosen
+    arithmetic = query.dtype == jnp.bfloat16 and (
+        xla_kernel_narrows(query) or xla_kernel_rounds_off(query, key, folded=False))
+    return 'xla' if chosen == 'reference' and arithmetic else chosen
 
 
 def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = False) -> bool:
