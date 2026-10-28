@@ -147,7 +147,8 @@ def _paths(name: str) -> tuple:
 def _smallest_of_each(names) -> list[str]:
     """The smallest checkpoint of each code path (`_paths`), in name order."""
     chosen: dict[object, str] = {}
-    for name in sorted(names, key=lambda name: (FIXTURES / name / "model.safetensors").stat().st_size):
+    # By the bytes read, an open the test cache records, so a resized checkpoint re-keys this file (SLOP023).
+    for name in sorted(names, key=lambda name: len((FIXTURES / name / "model.safetensors").read_bytes())):
         chosen.setdefault(_paths(name), name)
     return sorted(chosen.values())
 

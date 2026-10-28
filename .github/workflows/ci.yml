@@ -232,7 +232,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     timeout-minutes: ${{ (startsWith(github.ref_name, 'ci/full-whole-') || startsWith(github.ref_name, 'ci/base-')
-      || github.ref_name == 'base/kernels') && 110 || 60 }}
+      || github.ref_name == 'base/kernels' || needs.scope.outputs.policy == 'off') && 110 || 60 }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -254,6 +254,8 @@ jobs:
         # It reads records and never writes them; a fork's pull request receives no repository secret.
         DEW_XLA_CACHE_READ_TOKEN: ${{ secrets.DEW_XLA_CACHE_READ_TOKEN }}
         DEW_TEST_CACHE: ${{ needs.scope.outputs.policy }}
+        # The whole suite's run alone runs the whole_suite cells (tools/armada/ci.py `selected`).
+        DEW_WHOLE_SUITE: ${{ startsWith(github.ref_name, 'ci/full-whole-') && '1' || '' }}
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
           ${{ (startsWith(github.ref_name, 'ci/full-whole-') && '48')
@@ -298,7 +300,14 @@ jobs:
         # above what every file takes on its containers when no row is cached (a change to a module
         # most tests import, and the daily run, which proves the commit again with every file): 160,
         # or a background run's share.
-        if [ -n "$BACKGROUND_POOL" ]; then bound="--pool=$BACKGROUND_POOL --deadline=6000"; else bound="--deadline=2700"; fi
+        # A cold suite (the cache's policy off: a lock, JAX's build or the recorder changed) compiles everything
+        # anew, so its deadline is 5400 s (Main, 2026-10-28: train 254's cold suite left 780 tasks unstarted at 2,698 s).
+        if [ -n "$BACKGROUND_POOL" ]; then bound="--pool=$BACKGROUND_POOL --deadline=6000"
+        elif [ "$DEW_TEST_CACHE" = off ]; then bound="--deadline=5400"
+        else bound="--deadline=2700"; fi
+        # A train staged on the testing train's tip runs on the pool its branch names (ci/stage-...-p<N>: its lease's
+        # suite share, the land queue's promote.sh), so it asks no more than it leased (Main, 2026-10-28).
+        case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) bound="$bound --pool=${GITHUB_REF_NAME##*-p}" ;; esac
         # A commit the proven job found proved (a run that passed, or, on main, the land queue's proof of the tip it
         # graded green, red rows its regrade passed included) runs no suite again, whatever its stored verdict or the
         # cache's policy; but for the background whole suite, which proves main's tip anew (train 237's review).
