@@ -21,6 +21,7 @@ import optax
 import pytest
 import selection_margins
 from affine_run import dataset
+from lm_support import token_batch_of
 from recording import RecordingTracker
 from reference_error import (
     as_given,
@@ -30,7 +31,6 @@ from reference_error import (
     widened,
     windows,
 )
-from token_support import token_batch_of
 
 from dew.artifacts import TokenScores
 from dew.batch import TEXT_KEY, coordinates

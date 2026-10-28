@@ -6,8 +6,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from episode_support import PROMPT, RESPONSE, build, trained_batch
+from episode_support import build, trained_batch
 from rl_support import token_mean
+from tool_policy import PROMPT, RESPONSE
 
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective

@@ -16,7 +16,8 @@ import pytest
 from data_support import record_batches
 from diffusion_stubs import batch_for
 from diffusion_support import images_of
-from objective_cases import cases, corpus_windows
+from objective_cases import cases
+from objective_data import corpus_windows
 from reference_error import assert_computes_the_oracle, chain_roundings
 from test_guidance_distillation import FIXTURES, FLUX
 
