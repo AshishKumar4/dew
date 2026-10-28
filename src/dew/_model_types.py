@@ -24,3 +24,7 @@ attention_output_norm), its pre_feedforward_layernorm is the MLP's pre-norm
 (the block's post_attention_layernorm), and its post_feedforward_layernorm
 normalizes the MLP output (mlp_output_norm). Gemma's decoders and Gemma 4's
 vision tower share the layout."""
+
+LAYER_SCALAR_COLLECTIONS = {"trainable": "params", "frozen": "constants"}
+"""The collection a decoder block keeps its layer scalar in, by mode (`BlockWiring.layer_scalar`):
+Google's release makes it a parameter, and Transformers a buffer, which Dew keeps as a constant."""

@@ -13,7 +13,7 @@ from collections.abc import Hashable, Mapping, Sequence
 from dew.registry import read_arguments
 
 from ..attention_residuals import ResidualSite
-from ..mixers import MixerBase
+from ..mixer_base import MixerBase
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 
 
