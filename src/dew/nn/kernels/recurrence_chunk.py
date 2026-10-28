@@ -1274,7 +1274,14 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     return select(SCAN, case).kernel if report else selected(SCAN, case).name
 
 
-SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {}
+SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
+    ('wgmma', 'forward'): ('pallas', "on an H100 PCIe, the port's forward 0.840 ms against the template's 0.954 on "
+                                     "Nemotron-H 4B's SSD (chunk 256) and 0.329 against 0.377 on Nemotron-H 30B's "
+                                     "(chunk 128), each the same `chunk(SSD, ...)` call (SE-1964-h100-5e6e356e0)"),
+    ('mma.sync', 'forward'): ('pallas', "on an A100 SXM4 40GB, the port's forward 1.486 ms against the template's "
+                                        "1.821 on Nemotron-H 4B's SSD and 0.529 against 0.769 on 30B's, each the "
+                                        "same `chunk(SSD, ...)` call (SE-1964-a100-5e6e356e0)"),
+}
 """The cells, each an instruction family and a product (`ScanCase.cell`), where a receipt timing the same
 product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows the port of
 mamba_ssm's kernels faster than the recurrence template, each its old route's kernel and that receipt: the
