@@ -1047,20 +1047,24 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
     ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
     ({"tools/armada/session.py": "# the session\n"}, "off"),
-    ({".github/workflows/ci.yml": "on: []\n"}, "off"),
+    ({"tools/armada/executed.py": "# the recorder\n"}, "on"),
+    ({".github/workflows/ci.yml": "on: []\n"}, "on"),
     ({"Makefile": "all:\n"}, "off"),
     ({"CHANGELOG.md": "# Changes\n\n- an entry\n"}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "off"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
-        "the test session", "a workflow", "a file no record places", "the changelog", "the pool",
-        "the environment's variables"])
+        "the test session", "the recorder", "a workflow", "a file no record places", "the changelog",
+        "the pool", "the environment's variables"])
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
-    place what changed, a tool among them, and every file runs ('off') for a change to what every test
-    process runs or reads, or to a file the records do not place. .armada.json's pool decides where tasks
-    run, not what a test sees (owner, 2026-10-27: a pool change reran every file)."""
+    place what changed, a tool and a workflow among them, and every file runs ('off') for a change to what
+    every test process runs or reads, or to a file the records do not place. .armada.json's pool decides
+    where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file); the recorder
+    (executed.py, followed.py, watched.py) observes a run and changes none of its outcomes, a change to what
+    it records bumping RECORD_FORMAT instead (Main, 2026-10-28: 5 of 10 trains ran with the cache off, a
+    workflow or the recorder changed, and 0.75% of rows were reused)."""
     armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
                        "locks/cpu.txt": "jax==1\n", ".armada.json": armada}.items():
@@ -1165,6 +1169,36 @@ def commit(root: Path, message: str) -> str:
         git(root, "add", "-A")
     git(root, "commit", "-qm" if first else "-qam", message)
     return git(root, "rev-parse", "HEAD").strip()
+
+
+def test_a_changed_workflow_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
+    """A change under .github/ reruns the files whose runs read the changed file, which the records place as
+    any of the checkout's files, and reuses every other file's green row, under the policy CI computes for
+    the change from main (Main, 2026-10-28: a workflow change turned the cache off for the whole suite)."""
+    (tmp_path / ".github/workflows").mkdir(parents=True)
+    (tmp_path / ".github/workflows/ci.yml").write_text("name: CI\n")
+    (tmp_path / "tests/test_reader.py").write_text(
+        "from pathlib import Path\n"
+        "def test_reader():\n"
+        "    with Path('runs-reader').open('a') as runs: runs.write('x')\n"
+        "    assert Path('.github/workflows/ci.yml').read_text().startswith('name')\n")
+    (tmp_path / "tests/test_other.py").write_text(
+        "from pathlib import Path\n"
+        "def test_other():\n"
+        "    with Path('runs-other').open('a') as runs: runs.write('x')\n")
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+
+    def run() -> list[int]:
+        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+        assert [row["exitCode"] for row in rows] == [0, 0]
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("reader", "other")]
+
+    assert run() == [1, 1]
+    (tmp_path / ".github/workflows/ci.yml").write_text("name: CI, again\n")
+    commit(tmp_path, "the workflow changes")
+    assert ci.policy(base) == "on"
+    assert run() == [2, 1]
 
 
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
