@@ -483,6 +483,12 @@ decoder's own remat is where it starts, and it moves up one rung at a time
 past a rung that keeps nothing more of its layers' names than the next, never
 past a policy the ladder names."""
 
+OFFLOADED_FULL = REMAT_POLICIES['minimal_offloaded']
+"""'full''s sibling off the ladder: it keeps what 'minimal' keeps in pinned host memory where 'full'
+recomputes it, at 'full''s device bytes, so it fits nowhere 'full' does not. A plan at 'full' is timed
+against it (`dew.training.memory.offloaded_full`), and a run that took it resumes at it, a rung as high
+as 'full' (`restore_recompute`)."""
+
 
 def remat_record(remat: RematPolicy | None) -> JSON:
     """`remat` as a record stores it: a policy's name in `REMAT_POLICIES` if

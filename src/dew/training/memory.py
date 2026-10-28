@@ -24,7 +24,7 @@ from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
-from dew.nn.backbones.decoder_block import DECODER_REMAT, REMAT_POLICIES, remat_record
+from dew.nn.backbones.decoder_block import DECODER_REMAT, OFFLOADED_FULL, REMAT_POLICIES, remat_record
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.protocols import Recomputing, RematChoosing, TritonGemm
@@ -522,7 +522,7 @@ def offloaded_full[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> li
     the host link costs less than recomputing them."""
     full = remat_record(REMAT_POLICIES['full'])
     entries = objective.program_key()
-    moved = [entry.module.with_remat(REMAT_POLICIES['minimal_offloaded'])
+    moved = [entry.module.with_remat(OFFLOADED_FULL)
              if entry.trained and isinstance(entry.module, Recomputing)
              and isinstance(entry.module, RematChoosing) and entry.module.recompute_record() == full
              else None for entry in entries]

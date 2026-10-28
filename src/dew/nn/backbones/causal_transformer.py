@@ -94,6 +94,7 @@ from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
+    OFFLOADED_FULL,
     BlockWiring,
     DecoderBlock,
     Mixture,
@@ -2345,6 +2346,9 @@ class CausalTransformer(nn.Module):
     def restore_recompute(self, record: JSON) -> Self:
         records = [remat_record(remat) for remat in DECODER_REMAT]
         here = remat_record(self.remat)
+        if record == remat_record(OFFLOADED_FULL) and here in records:
+            # 'full''s timed sibling, as high as 'full', which the run took where the two were timed.
+            return self.clone(remat=OFFLOADED_FULL)
         if here in records and record in records and records.index(record) > records.index(here):
             return self.clone(remat=DECODER_REMAT[records.index(record)])
         return self

@@ -580,9 +580,8 @@ class FitSearch[LossT, EffectsT]:
                       "residuals to the host")
             if self.fits_here(split):
                 plans.append(self.found(split))
-            else:
-                self.objective.substitute(held)
-        elif (frontier and opens_frontier(split, candidates[0], self.mesh)
+            self.objective.substitute(held)
+        if (frontier and opens_frontier(split, candidates[0], self.mesh)
               and self.onward(lambda: remat_more(self.objective))):
             self.objective.tile_head()
             self.objective.unfuse_head()
