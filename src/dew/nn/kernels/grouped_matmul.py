@@ -534,6 +534,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     EXACT_SUMS: ClassVar[bool] = False
     """Whether the kernel adds each depth step's product apart (`exact_sums`); one that does not is not
     eligible where the call asks for it."""
+    STAGED_ROWS: ClassVar[bool] = False
+    """Whether a consumer prepares its share of each step's rows stage itself (the kernel gradient's
+    prologue and group zeroing, `registers`)."""
 
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
@@ -555,13 +558,28 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # compile gate's H100 run).
         dtype = ba.arguments['tokens'].dtype
         family, block = mosaic_gpu.family_of(config, dtype), (config.block_m, config.block_n, config.block_k)
-        # A transposed matrix (the input gradient's) is loaded a step deep and sliced in registers
-        # (`mosaic_sm80.Mma.products`, `resources.tile_registers`).
-        transposed = bool(ba.arguments.get('trans_rhs', False))
         hooks = ba.arguments['hooks']
         stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
-        plain = resources.tile_registers(family, config.warpgroups, block, dtype, transposed=transposed,
-                                         stored=stored)
+        plain = resources.tile_registers(family, config.warpgroups, block, dtype, stored=stored)
+        accumulator = -(-config.block_m * config.block_n // config.warpgroups // resources.THREADS)
+        # A kernel gradient's consumer prepares its depth half of each step's rows stage in registers (the
+        # prologue, the neighbouring groups' rows zeroed: `mosaic_gpu._staged_halves`), apart from the
+        # products, which read shared memory on such a family; mma.sync's products hold that stage in
+        # registers already. sm90's kernel gradient needs 24 more than the forward at 128 x 192 and 128 x
+        # 256 (148 and 181, DECIDE1).
+        staged = 0
+        if self.STAGED_ROWS and not family.operands_in_registers:
+            staged = -(-config.block_k * config.block_m // config.warpgroups * jnp.dtype(dtype).itemsize
+                       // 4 // resources.THREADS)
+        if ba.arguments.get('exact_sums'):
+            # The running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), lives throughout;
+            # each step's starts at its product, after the step's rows are staged, so the staging takes the
+            # step's registers where it needs more. Counted here, the one estimate legality reads
+            # (`Template.legal`): an exact kernel gradient needs 96, 149-152 and 216-224 at 128 x 64,
+            # 128 x 128 and 128 x 192 on sm90 (DECIDE1), two accumulators and the held registers.
+            plain += accumulator + max(0, staged - accumulator)
+        else:
+            plain += staged
         if hooks.prologue is None:
             return plain
         # The rows' stage a consumer rewrites: its share of a product's rows by the step, or of a kernel
@@ -752,6 +770,7 @@ class MosaicTgmm(_Mosaic):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
 
     EXACT_SUMS: ClassVar[bool] = True
+    STAGED_ROWS: ClassVar[bool] = True
 
     def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
         return mosaic_gpu.tgmm_allocations(
@@ -772,22 +791,11 @@ class MosaicTgmm(_Mosaic):
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """`_Mosaic.legal` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family whose
         products read registers loading its transposed stage in whole roles of rows (the step, `block_k`: a
-        32-row stage failed to cast to the 64-row layout, ns-regs2), and with `exact_sums` a second fp32
-        accumulator, the running sum beside a step's, in each consumer's live set (`resources.tile_registers`)
-        within its family's registers."""
+        32-row stage failed to cast to the 64-row layout, ns-regs2)."""
         if config.cluster != 1 or not super().legal(ba, config, target):
             return False
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        if family.operands_in_registers and config.block_k % family.role_rows:
-            return False
-        if not ba.arguments.get('exact_sums'):
-            return True
-        dtype = ba.arguments['tokens'].dtype
-        block = (config.block_m, config.block_n, config.block_k)
-        running = -(-config.block_m * config.block_n // config.warpgroups // resources.THREADS)
-        return (resources.tile_registers(family, config.warpgroups, block, dtype,
-                                         stored=(ba.arguments['out_dtype'],)) + running
-                <= family.registers(config.warpgroups))
+        return not (family.operands_in_registers and config.block_k % family.role_rows)
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:

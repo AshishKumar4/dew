@@ -5,7 +5,7 @@ their training shapes."""
 import dataclasses
 import functools
 import importlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import NamedTuple
 
 import jax
@@ -24,6 +24,12 @@ class KernelCase(NamedTuple):
 
     name: str
     call: Callable[[], tuple[Callable, tuple[jax.ShapeDtypeStruct, ...]]]
+    models: Mapping[str, Mapping[str, int]] | None = None
+    """Each of its Mosaic GPU kernels' resources by its template's model, by kernel name: the registers a
+    consumer thread holds (`registers`), the budget a launch holds them within (`budget`), its consumer
+    warpgroups (`consumers`), a producer warpgroup's registers a thread (`producer`, 0 without one) and the
+    most programs its family runs a multiprocessor (`most`), which the compile gate decides on as it decides
+    on ptxas's need (`kernel_compile.mosaic_failures`)."""
 
 
 def _pinned(launch, tiles, *args, **kwargs):

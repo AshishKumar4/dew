@@ -28,6 +28,18 @@ PRODUCER_REGISTERS = 40
 THREADS = 128
 """The threads of a role: a warpgroup's, each family's compute and producer roles alike."""
 
+COPIED_REGISTERS = 32
+"""The registers a thread holds for one copy of an output's rows out through registers (no TMA store before
+Hopper: `templates.mosaic.copied`), which bounds its rows (`copied_rows`): a whole 128 x 128 fp32 tile's 128
+beside the next tile's accumulator spilled on sm86 and sm89 at some shapes and held at others (DECIDE3)."""
+
+
+def copied_rows(columns: int, dtype) -> int:
+    """The most rows of `columns` columns of `dtype` one copy through registers moves (`COPIED_REGISTERS` a
+    thread of a role's): a power of two, at least one."""
+    rows = COPIED_REGISTERS * 4 * THREADS // (columns * jnp.dtype(dtype).itemsize)
+    return 1 << max(0, rows.bit_length() - 1)
+
 
 SMEM_ALIGNMENT = 1024
 """The bytes each shared-memory allocation of a Mosaic GPU kernel starts at a multiple of (its lowering's
@@ -58,22 +70,18 @@ def live_registers(family: "Family", carried, *phases) -> int:
 
 
 def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype, *,
-                   transposed: bool = False, stored=()) -> int:
+                   stored=()) -> int:
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
     of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
     fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
     each of its replicating warps: `lhs_copies`, `rhs_copies`), the right one's a sub-step deep where
-    it loads it so (`Family.fragment_depth`), but a `transposed` one, which it loads a step deep and
-    slices a sub-step at a time, both live at once (sm86 and sm89 spilled 8 bytes at an input gradient's
-    128 x 128 x 32 a step's count held, FAMBASE-4). Where the family copies its outputs out through its
-    registers (`Family.stores_through_registers`), its epilogue holds its share of the tile in the widest
-    of the `stored` dtypes beside the accumulator: GEMMMODEL2's mma.sync tiles (7 shapes on sm80, sm86 and
-    sm89) spilled 24 bytes only at a 128 x 128 fp32 output, which this counts at 296 registers, and held
-    every bf16 128 x 128 one (232 here; ptxas 244 to 255) and fp32 64 x 128 one (168; ptxas 201 to
-    255)."""
+    it loads it so (`Family.fragment_depth`), a transposed one's too: the input gradient needs no more
+    than the forward at any mma.sync tile measured (GEMMMODEL4/5: 104-120 against 112-128 at 64 x 128 x 32,
+    184-216 against 184-224 at 128 x 128 x 32). Where the family copies its outputs out through its
+    registers (`Family.stores_through_registers`), its epilogue holds one copy's rows (`copied_rows`) in the
+    widest of the `stored` dtypes beside the accumulator."""
     rows, columns, depth = block
-    sub = family.fragment_depth(depth)
-    share, sub = rows // consumers, depth + sub if transposed and sub < depth else sub
+    share, sub = rows // consumers, family.fragment_depth(depth)
     fragments = ([(share * family.lhs_copies, depth, dtype), (sub, columns * family.rhs_copies, dtype)]
                  if family.operands_in_registers else [])
     accumulator = (share, columns, jnp.float32)
@@ -81,7 +89,8 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     if not (family.stores_through_registers and stored):
         return walk
     widest = max(stored, key=lambda stored_dtype: jnp.dtype(stored_dtype).itemsize)
-    return max(walk, live_registers(family, [accumulator, (share, columns, widest)]))
+    copied = (min(share, copied_rows(columns, widest)), columns, widest)
+    return max(walk, live_registers(family, [accumulator, copied]))
 
 
 def program_shared(block: int, programs: int) -> int:
