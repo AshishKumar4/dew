@@ -421,6 +421,32 @@ def test_the_templates_arithmetic_is_on_par_with_dews_reference_attention(case, 
                     seeds=SEEDS, truth_fn=dews if alibi is not None else exact)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_a_calls_alibi_over_its_keys_places_is_its_key_score_hook(dtype):
+    """A call's ALiBi bias over its keys' logical places (`alibi_bias`, `[B, H, 1, K]`, places that hold
+    still across padding and restart at a document, as the attention mixer counts them) runs on the
+    template (`implementation='template'`) as its key score hook, after a softcap, on par with Dew's
+    reference path over the same bias (check 1, the reference in float64 its truth)."""
+    queries, keys = 6, 6
+    places = jnp.asarray([[0, 1, 1, 2, 0, 1], [0, 0, 1, 2, 3, 3]])
+    segment_ids = jnp.asarray([[1, 1, 1, 1, 2, 2], [1, 1, 1, 1, 1, 1]])
+    bias = alibi_bias(places, 4, dtype=jnp.float32)
+
+    def attend(implementation):
+        def run(query, key, value):
+            return scaled_dot_product_attention(query, key, value, causal=True, segment_ids=segment_ids,
+                                                bias=bias.astype(query.dtype), softcap=SOFTCAP,
+                                                implementation=implementation)
+        return run
+
+    def summed(query, key, value):
+        with jax.default_matmul_precision(FP32_SUMS):
+            return attend("reference")(query, key, value)
+
+    assert_as_exact(jax.jit(attend("template")), jax.jit(summed), drawing(queries, keys, dtype),
+                    f"template alibi {jnp.dtype(dtype).name}", seeds=SEEDS, truth_fn=attend("reference"))
+
+
 LAYOUTS = ("causal-documents-window", "cross-causal-lengths-starts")
 
 
