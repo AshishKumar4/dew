@@ -59,6 +59,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     approximate,
     bundle_of,
     extents,
+    reducing,
     refused,
     stated,
 )
@@ -607,4 +608,6 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
-                         approx_math=approx_math, name=name, cost=cost)(query, key, value, *leaves)
+                         approx_math=approx_math, name=name, cost=cost,
+                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod))(
+                             query, key, value, *leaves)
