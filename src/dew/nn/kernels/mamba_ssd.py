@@ -131,20 +131,26 @@ def _row_block(batch: int, length: int, chunk: int, width: int, bm: int, bn: int
     return m, h, c, start, _limit(c, length, chunk), pl.ds(start + m * bm, bm)
 
 
-def _extracted(values):
+def _extracted(values, *, interpret: bool):
     """`values` `[rows, n]` split into parts whose sums along a row keep every bit: `(high, low)`, `high`
     each value rounded to a multiple of its row's unit, a power of two past `n` times its largest
     magnitude over 2^23, so any running sum of `high` is exact, and `low` what the rounding left, whose
     sums round only far below it (Rump's ExtractScalar). A row with a non-finite value keeps its values
     whole as `high`. Elementwise and a row maximum: a Triton kernel's own ops, where a sequential loop over
-    a tile's columns lowered to garbage on an A100's."""
+    a tile's columns lowered to garbage on an A100's. The rounded `unit + values` is the split itself:
+    interpreted, XLA's fusion with the values' product contracted across it unless fenced
+    (`optimization_barrier`, which Triton lowers no rule for and keeps the rounding without), and the
+    whole-chunks initial state's gradient was 3.6 times mamba_ssm's distance from float64, 0.79 fenced."""
     largest = jnp.max(jnp.abs(values), axis=1, keepdims=True) * values.shape[1]
     # A power of two at least twice the largest sum, exactly: its exponent's bits alone, times four (an
     # exp2 of a log2's ceiling rounds on a CPU).
     exponent = jax.lax.bitcast_convert_type(jnp.where(largest > 0, largest, 1.0), jnp.int32) & 0x7F800000
     unit = jax.lax.bitcast_convert_type(exponent, jnp.float32) * 4.0
     finite = jnp.isfinite(unit)
-    high = jnp.where(finite, (unit + values) - unit, values)
+    added = unit + values
+    if interpret:
+        added = jax.lax.optimization_barrier(added)
+    high = jnp.where(finite, added - unit, values)
     return high, values - high
 
 
@@ -206,7 +212,7 @@ def _documents(batch: int, padded: int):
     return pl.BlockSpec((None, padded), lambda i, bc, h: (bc % batch, 0))
 
 
-def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int):
+def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int, interpret: bool):
     """mamba_ssm's `_chunk_cumsum_fwd_kernel` (ssd_chunk_state.py:39-86) without the step's bias,
     softplus and limit, for one chunk of `BH` heads: the step, zero past the row's end, and `A dt`
     cumulated over the chunk as a pair `(hi, lo)`, the running sums of its exactly summed high parts and
@@ -229,7 +235,7 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int)
     step_ref[:, steps] = dt
     # Each step's decay split so its high parts' running sum is exact (`_extracted`): the prefix's rounded
     # half, and its low parts' sum the compensation.
-    parts = _extracted(dt * a_ref[heads].astype(jnp.float32)[:, None])
+    parts = _extracted(dt * a_ref[heads].astype(jnp.float32)[:, None], interpret=interpret)
     if not seq:
         hi_ref[:, steps], lo_ref[:, steps] = two_sum(*(jnp.cumsum(part, axis=1) for part in parts))
         return
@@ -262,7 +268,7 @@ class ChunkCumsum(_Launch):
         bh = config.bm
         out = pl.BlockSpec((None, bh, padded), lambda b, c, h: (b, h, 0))
         step, da = pl.pallas_call(
-            functools.partial(_chunk_cumsum_kernel, length=length, chunk=chunk, bh=bh),
+            functools.partial(_chunk_cumsum_kernel, length=length, chunk=chunk, bh=bh, interpret=interpret),
             grid=(batch, padded // chunk, heads // bh),
             in_specs=[pl.BlockSpec((None, length, heads), lambda b, c, h: (b, 0, 0)),
                       pl.BlockSpec((heads,), lambda b, c, h: (0,)),
@@ -277,7 +283,7 @@ class ChunkCumsum(_Launch):
 
 
 def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, *, length: int,
-                             chunk: int, bh: int):
+                             chunk: int, bh: int, interpret: bool):
     """mamba_ssm's `_chunk_cumsum_bwd_kernel` (ssd_chunk_state.py:101-174) without the step's bias,
     softplus and limit, for one chunk of `BH` heads: the step's gradient `ddA A + ddt` back in Dew's
     `[T, H]`, and `A`'s `sum ddA dt` over the chunk for XLA to sum, its high parts summed exactly
@@ -291,7 +297,7 @@ def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, 
     ddt = dacs * a_ref[heads].astype(jnp.float32)[:, None] + ddt_ref[:, steps]
     write_rows(out_ref.at[steps, heads], limit, ddt.T)
     dt = read_rows(dt_ref.at[steps, heads], limit).astype(jnp.float32).T
-    high, low = _extracted(dacs * dt)
+    high, low = _extracted(dacs * dt, interpret=interpret)
     da_ref[...] = jnp.sum(high, axis=1) + jnp.sum(low, axis=1)
 
 
@@ -311,7 +317,8 @@ class ChunkCumsumBwd(_Launch):
         first = pl.BlockSpec((None, bh, padded), lambda b, c, h: (b, h, 0))
         rows = pl.BlockSpec((None, length, heads), lambda b, c, h: (b, 0, 0))
         out, da = pl.pallas_call(
-            functools.partial(_chunk_cumsum_bwd_kernel, length=length, chunk=chunk, bh=bh),
+            functools.partial(_chunk_cumsum_bwd_kernel, length=length, chunk=chunk, bh=bh,
+                              interpret=interpret),
             grid=(batch, padded // chunk, heads // bh),
             in_specs=[first, first, rows, pl.BlockSpec((heads,), lambda b, c, h: (0,))],
             out_specs=[rows, pl.BlockSpec((None, None, bh), lambda b, c, h: (b, c, h))],
