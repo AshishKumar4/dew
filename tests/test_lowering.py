@@ -661,13 +661,17 @@ def _split_delta_forward(length: int, devices: int) -> jax.stages.Lowered:
 
 def test_a_gated_delta_net_split_over_the_sequence_runs_each_devices_own_slice():
     """A gated delta net on a mesh splitting its sequence runs the recurrence on each device's slice, as its
-    lowered H100 program states it: over two devices and 256 tokens, every Mosaic GPU call of the layer over
-    one device's 128 tokens is among its calls, operand for operand, beside its slice's summary (the rule
-    from `[0 | I]`), where the rule ran the whole sequence on every device before (row 1437); and its
-    collectives are the conv's halo and the summaries' gathers alone, no activation reduced
+    lowered H100 program states it: over two devices and 256 tokens, every kernel call of the layer over one
+    device's 128 tokens is among its calls, operand for operand, beside its slice's summary (the rule from
+    `[0 | I]`), where the rule ran the whole sequence on every device before (row 1437); and its collectives
+    are the conv's halo and the summaries' gathers alone, no activation reduced
     (`recurrence_chunk.entering_memory`, `linear.sequence_conv`)."""
+    def kernels(operations: list[Operation]) -> list[tuple]:
+        return [(target, operands, results) for name, target, operands, results in operations
+                if name == "stablehlo.custom_call"]
+
     operations = _operations(_split_delta_forward(256, 2))
-    calls, local = _mosaic_calls(operations), _mosaic_calls(_operations(_split_delta_forward(128, 1)))
+    calls, local = kernels(operations), kernels(_operations(_split_delta_forward(128, 1)))
     assert local and all(call in calls for call in local), (calls, local)
     collectives = {_collective(name) for name, *_ in operations if _collective(name)}
     assert collectives <= {"all-gather", "collective-permute"}, collectives
