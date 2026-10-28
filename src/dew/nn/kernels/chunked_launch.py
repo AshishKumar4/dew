@@ -179,10 +179,44 @@ def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> S
                      xp.stack([first, lengths, base, entered, left], axis=1).astype(np.int32))
 
 
+def spanned(launch, *operands, chunk: int, spans: Sequences | None, **options):
+    """`launch` over `operands`, the first `[B, T, ...]`, and the sequences `spans`, the rows' own
+    (`sequences`) where None, in chunks of `chunk` tokens."""
+    spans = sequences(*operands[0].shape[:2], chunk=chunk) if spans is None else spans
+    return launch(*operands, *spans, chunk=chunk, **options)
+
+
 def _aligned(spans: Sequences, batch: int, length: int, chunk: int) -> bool:
     """Whether every chunk starts on a multiple of `chunk`: the rows' own spans over whole chunks."""
     return (length % chunk == 0 and spans.spans.shape[0] == batch
             and spans.chunks.shape[0] == batch * length // chunk)
+
+
+class Laid(NamedTuple):
+    """A per-chunk launch's call as it lays its tokens out (`laid`): its sequences (`Sequences`), its rows'
+    `batch` and `length`, the keys' heads and `width`, the values' heads and `columns`, the value heads a key
+    head serves (`group`), the rows' tokens, and whether every chunk is whole and aligned (`_aligned`)."""
+
+    spans: Sequences
+    batch: int
+    length: int
+    key_heads: int
+    width: int
+    value_heads: int
+    columns: int
+    group: int
+    tokens: int
+    aligned: bool
+
+
+def laid(keys, values, chunk_spans, sequence_spans, chunk: int) -> Laid:
+    """The launch geometry (`Laid`) of `keys` `[B, T, H, K]` and `values` `[B, T, HV, V]` over the
+    sequences `chunk_spans` and `sequence_spans` (`Sequences`) in chunks of `chunk` tokens."""
+    spans = Sequences(chunk_spans, sequence_spans)
+    batch, length, key_heads, width = keys.shape
+    value_heads, columns = values.shape[2:]
+    return Laid(spans, batch, length, key_heads, width, value_heads, columns, value_heads // key_heads,
+                batch * length, _aligned(spans, batch, length, chunk))
 
 
 def _chunk_of(chunk_ref, chunk: int, aligned: bool):

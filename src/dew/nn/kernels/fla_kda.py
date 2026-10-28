@@ -48,8 +48,10 @@ from dew.nn.kernels.chunked_launch import (
     _picks,
     _row,
     _rows,
+    laid,
     read_rows,
     sequences,
+    spanned,
     write_rows,
 )
 from dew.nn.kernels.fla_gdn import _dot, _tril_inverse, _weighted_values
@@ -148,8 +150,7 @@ def intra_rows(q, k, g, beta, *, scale: float, chunk: int = 64, spans: Sequences
     """`(Aqk, Akk)` `[B, T, HV, BT]`, each token's row of its chunk, `Aqk` in `k`'s dtype and `Akk` fp32,
     every pair's decay its own (`_intra_rows_kernel`): a program per place of each chunk (`spans`, the
     rows' own where None) and `BH` value heads."""
-    spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _INTRA_ROWS(q, k, g, beta, *spans, chunk=chunk, scale=scale, interpret=interpret)
+    return spanned(_INTRA_ROWS, q, k, g, beta, chunk=chunk, spans=spans, scale=scale, interpret=interpret)
 
 
 def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chunk: int, aligned: bool,
@@ -290,10 +291,8 @@ class RecomputeWU(_Launch):
              chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        spans = Sequences(chunk_spans, sequence_spans)
-        batch, length, key_heads, width = k.shape
-        value_heads, columns = v.shape[2:]
-        group, tokens = value_heads // key_heads, batch * length
+        spans, batch, length, _, width, value_heads, columns, group, tokens, aligned = laid(
+            k, v, chunk_spans, sequence_spans, chunk)
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
 
         headed = functools.partial(_headed, tokens)
@@ -301,7 +300,7 @@ class RecomputeWU(_Launch):
         keyed = jax.ShapeDtypeStruct((tokens, value_heads, width), k.dtype)
         queries = q is not None
         found = pl.pallas_call(
-            functools.partial(_w_u_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
+            functools.partial(_w_u_kernel, chunk=chunk, aligned=aligned,
                               bk=min(config.bk, width), bv=min(config.bv, columns), queries=queries,
                               exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),
@@ -373,15 +372,13 @@ class ChunkFwdO(_Launch):
              config: Tiles, wide: bool = False, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        spans = Sequences(chunk_spans, sequence_spans)
-        batch, length, key_heads, width = q.shape
-        value_heads, columns = v.shape[2:]
-        group, tokens = value_heads // key_heads, batch * length
+        spans, _, _, _, width, value_heads, columns, group, tokens, aligned = laid(
+            q, v, chunk_spans, sequence_spans, chunk)
         bv = min(config.bv, columns)
         dtype = jnp.float32 if wide else v.dtype
         values = pl.BlockSpec((tokens, None, bv), lambda i_v, i_t, i_h: (0, i_h, i_v))
         out = pl.pallas_call(
-            functools.partial(_o_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
+            functools.partial(_o_kernel, chunk=chunk, aligned=aligned,
                               scale=scale, bk=min(config.bk, width), exact=interpret),
             grid=(columns // bv, spans.chunks.shape[0], value_heads),
             in_specs=[pl.BlockSpec((None, 4), lambda i_v, i_t, i_h: (i_t, 0)),
@@ -579,10 +576,8 @@ class BwdWyDqkg(_Launch):
              config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        spans = Sequences(chunk_spans, sequence_spans)
-        batch, length, key_heads, width = k.shape
-        value_heads, columns = v.shape[2:]
-        group, tokens = value_heads // key_heads, batch * length
+        spans, batch, length, _, width, value_heads, columns, group, tokens, aligned = laid(
+            k, v, chunk_spans, sequence_spans, chunk)
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
 
         headed = functools.partial(_headed, tokens)
@@ -591,7 +586,7 @@ class BwdWyDqkg(_Launch):
         states = pl.BlockSpec((h.shape[0], None, width, columns), lambda i_t, head: (0, head, 0, 0))
         wide = jax.ShapeDtypeStruct((tokens, value_heads, width), jnp.float32)
         dq, dk, dv2, dg, db, da = pl.pallas_call(
-            functools.partial(_wy_dqkg_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
+            functools.partial(_wy_dqkg_kernel, chunk=chunk, aligned=aligned,
                               scale=scale, bk=min(config.bk, width), bv=min(config.bv, columns),
                               exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),

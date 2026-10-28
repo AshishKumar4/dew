@@ -54,10 +54,14 @@ jax.config.update("jax_enable_x64", val=True)
 LAMBDA, C, TAIL = 0.5, 30.0, 15
 
 
-def torch_uniform(key, shape, dtype=jnp.float64):
-    """PyTorch's default `nn.Linear` draw, uniform within 1 / sqrt(shape[0]), as the paper's MLP starts."""
-    limit = math.sqrt(1.0 / shape[0])
-    return jax.random.uniform(key, shape, dtype, -limit, limit)
+def torch_uniform(inputs: int):
+    """PyTorch's default `nn.Linear` draw for a layer of `inputs` inputs, its weight's and its bias's
+    alike, uniform within 1 / sqrt(inputs), as the paper's MLP starts."""
+    limit = math.sqrt(1.0 / inputs)
+
+    def draw(key, shape, dtype=jnp.float64):
+        return jax.random.uniform(key, shape, dtype, -limit, limit)
+    return draw
 
 
 class Profile(nn.Module):
@@ -76,9 +80,11 @@ class Profile(nn.Module):
             x = FourierPyramid(grids, features=4, global_scale=1000.0, level_scale=0.30, init_noise=1e-5,
                                param_dtype=jnp.float64)((eta[..., None] + C) / (2 * C))
         for _ in range(self.depth - 1):
-            x = jnp.tanh(nn.Dense(self.width, kernel_init=torch_uniform, bias_init=torch_uniform,
-                                  dtype=jnp.float64, param_dtype=jnp.float64)(x))
-        return nn.Dense(1, kernel_init=torch_uniform, bias_init=torch_uniform, dtype=jnp.float64,
+            init = torch_uniform(x.shape[-1])
+            x = jnp.tanh(nn.Dense(self.width, kernel_init=init, bias_init=init, dtype=jnp.float64,
+                                  param_dtype=jnp.float64)(x))
+        init = torch_uniform(x.shape[-1])
+        return nn.Dense(1, kernel_init=init, bias_init=init, dtype=jnp.float64,
                         param_dtype=jnp.float64)(x)[..., 0]
 
 
@@ -95,7 +101,12 @@ class BurgersProfile(Residuals):
     def profile(self, variables, eta):
         """U at one eta: the learned part made odd, and the known tail."""
         y = jnp.sinh(eta)
-        tail = -(y ** (LAMBDA / (1 + LAMBDA))) * (y / (1 + y)) ** TAIL
+        # y^(1/3) (y / (1 + y))^15 with the powers of y combined, (y / (1 + y))^(15 + 1/3) (1 + y)^(1/3):
+        # its derivatives at eta = 0, where the points start, are its own zeros rather than a negative
+        # power of zero times zero, and each factor stays bounded at sinh(c), where y^(15 + 1/3) and a
+        # quotient's (1 + y)^30 would overflow its derivatives.
+        power = LAMBDA / (1 + LAMBDA)
+        tail = -((y / (1 + y)) ** (TAIL + power)) * (1 + y) ** power
         learned = self.model.apply(variables, jnp.stack([eta, -eta]))
         return learned[0] - learned[1] + tail
 

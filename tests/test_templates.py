@@ -10,9 +10,10 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement, select
 from dew.nn.kernels.templates.base import Call, Template, Unfitted, call
+from dew.nn.kernels.tuning import Unpinnable
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -175,3 +176,29 @@ def test_a_selector_runs_the_first_kernel_that_takes_the_call_and_a_named_one_on
     assert _selected({"named": None, "b": True}, ("xla",)) == "b"
     assert _selected({"named": None}, ("xla",)) == "xla"
     assert _selected({"named": None, "b": True}, ("xla",), named="named") == "named"
+
+
+def test_an_explicit_config_the_call_cannot_hold_is_refused_as_a_pin_is():
+    """A config the op carries passes the same check a pin does on the call itself (row 1866 K1): 64 rows
+    of 512 fp32 columns stage 128 KiB, past an A10's block, so a launch carrying it raises `Unpinnable`
+    on an A10 and runs on an A100."""
+    x = jnp.ones((4096, 512), jnp.float32)
+    with generation.assumed("sm86"), pytest.raises(Unpinnable):
+        Doubling().replace(config=Block(64))(x)
+    with generation.assumed("sm80"):
+        assert jnp.array_equal(Doubling().replace(config=Block(64))(x), x * 2)
+
+
+def test_a_launch_builds_its_key_only_where_something_reads_it(monkeypatch):
+    """A launch with no collector, pin or tuning read never builds its key (`KernelOp.keyed`, which traces
+    its hooks; row 1866 K4); a collector reads it."""
+    built = []
+    original = Doubling.keyed
+    monkeypatch.setattr(Doubling, "keyed", lambda self, ba: built.append(1) or original(self, ba))
+    x = jnp.ones((64, 8), jnp.float32)
+    with generation.assumed("sm80"):
+        Doubling()(x)
+        assert built == []
+        with tuning.seen():
+            Doubling()(x)
+    assert built == [1]
