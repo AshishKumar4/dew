@@ -1461,7 +1461,7 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     def names(path: tuple[str, ...]) -> str | tuple[str, ...] | None:
         if (len(path) == 6 and path[2:4] == ('mlp', 'experts') and path[-1] == 'kernel'
                 and model.mixture is not None):
-            named = tuple(family.tensor_name('.'.join((*path[1:4], str(expert), *path[4:])), config)
+            named = tuple(family.tensor_name('.'.join(expert_path(path, expert)[1:]), config)
                           for expert in range(model.mixture.experts))
             if any(name is None for name in named):
                 raise ValueError(f'{path} has no tensor name for each expert')
@@ -1479,10 +1479,10 @@ def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
                  names: Callable[[tuple[str, ...]], str | tuple[str, ...] | None]) -> dict[str, WeightLayout]:
     """Bind each leaf, by its path collection first, to the source tensor `names` gives it.
 
-    A leaf is stored as the load oriented it, a 2-D kernel transposed. None
-    writes nothing, as for the tied head. A tuple names one source tensor per
-    expert of a stacked leaf, in expert order: the slices the load stacked
-    (`hf_decoders._stack_experts`).
+    A leaf is stored as the load oriented it (`stored_order`), a matrix
+    kernel's two axes swapped. None writes nothing, as for the tied head. A
+    tuple names one source tensor per expert of a stacked leaf, in expert
+    order: the slices the load stacked (`expert_slot`).
     """
     layouts: dict[str, WeightLayout] = {}
     for path, value in leaves.items():
@@ -1498,12 +1498,13 @@ def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
         else:
             raise ValueError(f"{'.'.join(path)} holds {value.shape}, not one slice for each of "
                              f"{len(named)} named experts")
-        kernel = path[-1] == 'kernel' and len(shape) == 2
+        # A tree built natively stores each leaf as it is shaped: no grouped rows folded.
+        order = stored_order(path, len(shape), len(shape))
+        stored = shape if order is None else tuple(shape[axis] for axis in order)
         for target, expert in slices:
             if target in layouts:
                 raise ValueError(f"{'.'.join(path)} and {layouts[target].paths[0]} both write {target}")
-            layouts[target] = WeightLayout(target, (path,), shape[::-1] if kernel else shape,
-                                           (1, 0) if kernel else None, expert_index=expert)
+            layouts[target] = WeightLayout(target, (path,), stored, order, expert_index=expert)
     return layouts
 
 
@@ -1708,6 +1709,36 @@ class Reading(NamedTuple):
     stored: Stored | None
     packing: Packed | None
     parts: tuple[Part, ...]
+
+
+def stored_order(path: tuple[str, ...], stored_ndim: int, leaf_ndim: int) -> tuple[int, ...] | None:
+    """The axis order that writes the leaf at `path`, of `leaf_ndim` axes past any expert's, back as the
+    tensor the checkpoint stores, of `stored_ndim`: a kernel stored as a matrix, a torch Linear's
+    `[out, in]`, is the leaf's `[in, out]` with those two axes swapped, under any the leaf holds ahead
+    of them (a grouped projection's groups, which DeepSeek V4's stored rows fold); None for any other
+    leaf, and for a kernel stored with more axes, which its pack orders (`Packed.transpose`). The one
+    orientation a load reads a part by (`hf_decoders.read_decoder`) and both exports write it back by
+    (`decoder_bindings`, `leaf_layouts`)."""
+    if path[-1] != 'kernel' or stored_ndim != 2:
+        return None
+    lead = leaf_ndim - 2
+    return (*range(lead), lead + 1, lead)
+
+
+def expert_slot(path: tuple[str, ...]) -> tuple[tuple[str, ...], int] | None:
+    """The stacked leaf a per-expert `experts/K/<projection>/kernel` path is a slice of, and K: a load
+    stacks the experts' kernels in K's order on the leaf's first axis (`hf_decoders._stack_experts`),
+    and an export writes each back from its slice (`WeightLayout.expert_index`). None for any other
+    path. `expert_path` is its inverse."""
+    if len(path) >= 4 and path[-4] == 'experts' and path[-3].isdigit() and path[-1] == 'kernel':
+        return (*path[:-3], path[-2], path[-1]), int(path[-3])
+    return None
+
+
+def expert_path(stacked: tuple[str, ...], expert: int) -> tuple[str, ...]:
+    """The per-expert path whose kernel is slice `expert` of the stacked leaf at `stacked`
+    (`expert_slot`'s inverse)."""
+    return (*stacked[:-2], str(expert), *stacked[-2:])
 
 
 def held_parts(readings: Sequence[Reading]) -> dict[str, Part]:

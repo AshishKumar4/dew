@@ -32,26 +32,17 @@ def _held(path: tuple[str, ...]) -> tuple[str, ...]:
     return path
 
 
-def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
-    """Return the leaf `hf_decoders._stack_experts` stacked a per-expert
-    `experts/K/projection/kernel` path into, and K."""
-    if (len(path) >= 4 and path[-4] == "experts" and path[-3].isdigit()
-            and path[-1] == "kernel"):
-        return (*path[:-3], path[-2], path[-1]), int(path[-3])
-    return path, None
+def _leaf_rank(variables: Mapping[str, object], path: tuple[str, ...], expert_index: int | None,
+               stored_ndim: int) -> int:
+    """Return the rank of the leaf a stored tensor is bound to, past an expert's axis.
 
-
-def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
-                  expert_index: int | None) -> int:
-    """Return how many axes a bound leaf carries ahead of its stored matrix.
-
-    A kernel stores `[in, out]` where its source stores `[out, in]`, and a
-    grouped projection's leaf keeps one such matrix per group: DeepSeek
+    A grouped projection's leaf keeps one stored matrix per group: DeepSeek
     V4's `[groups, in, rank]` is stored `[groups * rank, in]`, the group
-    axis folded into the rows (modeling_deepseek_v4.py:294-323). The
-    transpose is the same swap of the trailing pair under those axes, so
-    the leaf says how many there are. A per-expert source tensor is one
-    slice of its stacked leaf, which is taken before the transpose.
+    axis folded into the rows (modeling_deepseek_v4.py:294-323), so the
+    leaf says how many axes its orientation (`decoder_parts.stored_order`)
+    swaps under. A per-expert source tensor is one slice of its stacked
+    leaf, which is taken before the transpose. A path that holds no array
+    is the stored tensor's own rank.
     """
     node: object = variables
     for part in path:
@@ -59,9 +50,8 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
             raise ValueError(f"the loaded tree holds no {path}, which {part!r} names")
         node = node[part]
     if not isinstance(node, np.ndarray | Unread | jax.Array | SourceLeaf):
-        return 0
-    rank = node.ndim - (0 if expert_index is None else 1)
-    return max(rank - 2, 0)
+        return stored_ndim
+    return node.ndim - (0 if expert_index is None else 1)
 
 
 def reading_layout(name: str, reading: decoder_parts.Reading, config,
@@ -84,15 +74,16 @@ def reading_layout(name: str, reading: decoder_parts.Reading, config,
 
 def _leaf_layout(name: str, part: decoder_parts.Part, family: decoder_parts.DecoderFamily,
                  variables: Mapping[str, object], place: Place) -> WeightLayout | None:
-    transpose = None
     tensor = part.tensor
     if part.path is None:
         return None
-    path, expert_index = _stacked_expert(part.path)
+    path, expert_index = decoder_parts.expert_slot(part.path) or (part.path, None)
     paths = (place(path),)
-    if path[-1] == "kernel" and tensor.ndim == 2:
-        lead = _leading_axes(variables, path, expert_index)
-        transpose = (*range(lead), lead + 1, lead)
+    transpose = decoder_parts.stored_order(path, tensor.ndim, tensor.ndim)
+    if transpose is not None:
+        # The swap sits under any axes the leaf holds ahead of its stored matrix (`_leaf_rank`).
+        transpose = decoder_parts.stored_order(path, tensor.ndim,
+                                               _leaf_rank(variables, path, expert_index, tensor.ndim))
     # A floating weight is written in its leaf's dtype, bfloat16 and FP8
     # included (`weights.checkpoint_dtype`'s test); an index table carries
     # the width the checkpoint stored it in back.

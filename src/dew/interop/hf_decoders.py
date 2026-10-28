@@ -57,6 +57,7 @@ from dew.interop.decoder_parts import (
     record_int,
     refuse,
     refuse_drafter,
+    stored_order,
     translated,
 )
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
@@ -904,12 +905,12 @@ def read_decoder(
             continue
         stored = held(part.tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
-        # torch Linear holds [out, in]; a stacked expert kernel arrives
+        # torch Linear holds [out, in] (`stored_order`); a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
         insert(
             variables,
             path,
-            SourceLeaf((stored,), dtype, transposed=path[-1] == "kernel" and stored.ndim == 2),
+            SourceLeaf((stored,), dtype, transposed=stored_order(path, stored.ndim, stored.ndim) is not None),
             name,
         )
     _stack_experts(params)
