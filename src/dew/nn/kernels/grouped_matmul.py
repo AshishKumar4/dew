@@ -767,7 +767,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if (config.warpgroups > family.consumers or config.programs > family.programs(config.warpgroups)
                 or config.stages < 2
                 or config.block_m % (family.role_rows * config.warpgroups)
-                or config.block_n % family.column_unit(dtype) or config.block_k not in family.depths(dtype)):
+                or config.block_n % family.column_unit(dtype) or not family.stores_columns(config.block_n)
+                or config.block_k not in family.depths(dtype)):
             return False
         hooks = ba.arguments['hooks']
         axes = {axis for name, axes_of in (('prologue_operands', hooks.prologue_axes),

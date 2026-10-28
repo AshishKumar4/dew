@@ -471,6 +471,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """The columns a tile's width steps by for operands of `dtype`: the swizzle a block's rows are
         staged in, or the row its stores lay over a role's threads."""
 
+    def stores_columns(self, columns: int) -> bool:
+        """Whether its stores take an output tile `columns` wide (a multiple of `column_unit`): any such
+        width, unless its stores lay a row over a role's threads (`Mma`)."""
+        del columns
+        return True
+
     @abc.abstractmethod
     def depths(self, dtype) -> tuple[int, ...]:
         """The depths a step may take for operands of `dtype`, widest first: the swizzles its products

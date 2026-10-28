@@ -157,7 +157,8 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     None where no tile holds."""
     unit = family.column_unit(dtype)
     widest = min(width, family.widest_product or width)
-    columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
+    columns = [block_n for block_n in range(widest - widest % unit, 0, -unit)
+               if width % block_n == 0 and family.stores_columns(block_n)]
     steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
     busy = 2 + (0 if family.operands_in_registers else _IN_FLIGHT)
 

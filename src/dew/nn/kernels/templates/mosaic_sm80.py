@@ -138,9 +138,17 @@ class Mma(mosaic.Family):
         return cost.REGISTERS // (consumers * resources.THREADS * self.registers(consumers))
 
     def column_unit(self, dtype) -> int:
-        # Its stores move a row through registers, laid over the role's threads, one element or more each.
+        # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
+        # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64
+        # columns; row 2078's probe: every attention launch on sm80 at 64-column tiles).
         del dtype
-        return resources.THREADS
+        return resources.THREADS // 2
+
+    def stores_columns(self, columns: int) -> bool:
+        # A row lays over the role's threads evenly: whole threads' elements a row, or threads sharing
+        # each element. 192 columns, a thread and a half's, find no layout (UNIT64-2: a 64 x 192 forward
+        # on sm80, "Layout inference failed").
+        return columns % resources.THREADS == 0 or resources.THREADS % columns == 0
 
     def depths(self, dtype) -> tuple[int, ...]:
         # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
