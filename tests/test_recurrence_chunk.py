@@ -189,8 +189,9 @@ def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
     """The chunked op rounds its output once, after the skip and the norm, as the decode step's reference
     does, on the portable math and on the port (the delta rule with a decay, its kernels interpreted off
     a GPU): a bf16 token whose readout `0.1` (a unit query and key, the write gate or the scale 0.1)
-    the skip `-0.10009765625` nearly cancels leaves a residual on par with the reference's from float64, and
-    the norm reads it, where a readout rounded to bf16 first cancels to zero."""
+    the skip `-0.10009765625` nearly cancels leaves the reference's residual, float64's exactly where the
+    reference's is (exact data) and on par with it from float64 where not, and the norm reads it, where a
+    readout rounded to bf16 first cancels to zero."""
     unit = jnp.zeros((1, 1, 1, 8), jnp.bfloat16).at[..., 0].set(1.0)
     beta = jnp.full((1, 1, 1), 1.0 if hooks.delta else 0.1, jnp.float32)
     operands = Chunk(unit, unit, jnp.ones((1, 1, 1, 8), jnp.bfloat16),
@@ -209,9 +210,14 @@ def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
 
     want = reference(operands, beta, jnp.float32)
     with jax.enable_x64(new_val=True):
-        truth = reference(*widened((operands, beta)), jnp.float64)
-    assert_as_exact_as_the_reference(np.asarray(found[:, 0]), np.asarray(want), np.asarray(truth),
-                                     f'the output rounded once, {hooks}')
+        truth = np.asarray(reference(*widened((operands, beta)), jnp.float64))
+    if np.array_equal(np.asarray(want, np.float64), truth):
+        # Exact data (a unit query and key against a gate of 0.1 and the skip): the residual is fp32's exactly,
+        # the reference's float64 value, which the op's must be too.
+        np.testing.assert_array_equal(np.asarray(found[:, 0], np.float64), truth)
+    else:
+        assert_as_exact_as_the_reference(np.asarray(found[:, 0]), np.asarray(want), truth,
+                                         f'the output rounded once, {hooks}')
     assert np.all(np.asarray(found) != 0.0)
 
 
