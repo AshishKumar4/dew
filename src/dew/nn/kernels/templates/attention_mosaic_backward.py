@@ -447,6 +447,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     score hook's key and tile gradients the first's), dK and dV joined along their widths."""
     columns = walk.program.tiles.columns
     width, value_width = query.shape[-1] // columns, value.shape[-1] // columns
+    # The dK/dV program at its own walked query tile (`BackwardTiles.dkv`).
+    walk = dataclasses.replace(walk, program=dataclasses.replace(walk.program, tiles=walk.program.tiles.dkv))
     launched = [_dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index, spans,
                              score_params, walk=walk,
                              shares=((column * width, width), (column * value_width, value_width)))

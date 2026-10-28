@@ -366,9 +366,11 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     block_q, block_k = config.block_q, config.block_k
     products = [(block_q, block_k, jnp.float32)] * 2
     if dq:
-        carried = [(block_q, width, jnp.float32)] * (2 if accurate else 1)
+        carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
         return resources.live_registers(family, carried, products, cotangents)
+    block_q = config.dkv.block_q
+    products = [(block_q, block_k, jnp.float32)] * 2
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
     fused = [(block_q, width, jnp.float32)] if config.fused else []
@@ -465,9 +467,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dtype = query.dtype
         width, value_width = (_width(array.shape[-1], family, dtype) for array in (query, value))
         padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
-        launches = [_dkv_allocations(family, config, width, value_width, dtype,
+        launches = [_dkv_allocations(family, config.dkv, width, value_width, dtype,
                                      parts=_parts(self.accurate, dtype),
-                                     stages=min(config.stages, padded_q // config.block_q),
+                                     stages=min(config.stages, padded_q // config.dkv.block_q),
                                      columns=config.columns)]
         if not config.fused:
             launches.append(_dq_allocations(family, config, width, value_width, dtype,
