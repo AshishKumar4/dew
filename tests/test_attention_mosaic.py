@@ -1028,10 +1028,12 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
 def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     """A score hook that forms a unit column (`q_pos[:, :1]`, `axis` 0) or a unit row (`k_pos[:1, :]`, 1,
     which Mosaic GPU selects by a reduction across warps, its scratch the launch's warpgroups reserve,
-    ledger 1428), the training forward and the backward compiled by ptxas for an H100 on this CPU
-    (tests/kernel_compile.py), within its shared memory and registers."""
+    ledger 1428), the training forward and the backward lowered and compiled by ptxas for an H100 on this
+    CPU (tests/kernel_compile.py), within its shared memory (`failures`: no lowering error, no block past
+    it). Its registers at the derived tiles are the template's register model's (ledger 1617), hooked or
+    not."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    from kernel_compile import compile_mosaic_kernels, failures
 
     queries = 256
     spans = template.spans(queries, queries, 1, causal=True)
@@ -1053,4 +1055,4 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     found = compile_mosaic_kernels([KernelCase("forward", lambda: (trained, (query, key, key))),
                                     KernelCase("backward", lambda: (backward, (query, key, key, query)))],
                                    "sm90")
-    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert not failures(found), "\n".join(failures(found))
