@@ -24,16 +24,17 @@ COUNTED_RECORDS = {"lm", "diffusion", "jepa"}
 """The kinds whose training data states its record count, which an epoch reads; a decision run's
 questions stream through a filter, whose count no read states before it ends."""
 
-MESH = {"data": 4, "tensor": 2}
-"""Eight devices, four row shards of a batch of eight: two rows each, which a split in two and a
-ramp's first batch of four still divide."""
+MESH = {"tensor": 2}
+"""Eight devices, two a tensor and four row shards of a batch of eight (`MeshSpec`'s data axis takes
+the rest): two rows each, which a split in two and a ramp's first batch of four still divide."""
 
 
 def trained(kind: str, root: Path, name: str, **settings: object) -> Path:
     """`dew train` over `kind`'s run.json under `root`, its options `settings` (`--set path=value`, a
     mapping as JSON), at most as many steps as it is given: the run's directory."""
-    record = root / f"record-{name}"
-    KINDS[kind](root / name, drawn=False).save(str(record))
+    record, data = root / f"record-{name}", root / name
+    data.mkdir()
+    KINDS[kind](data, drawn=False).save(str(record))
     given = {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.log_every": "1",
              "trainer.eval_every": "None", "trainer.checkpoint_every": "None", "trainer.mesh": MESH,
              "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", "val_metrics": "[]",
