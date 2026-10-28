@@ -107,14 +107,16 @@ class Tiles:
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
 
 
-def derived(family, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, holds,
-            grouped: bool) -> Tiles | None:
+def derived(family, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
+            candidate, launch_of, grouped: bool) -> Tiles | None:
     """The one tile a GEMM mainloop runs on `family` for a call whose output has `rows` rows (a group's,
     on average, where `grouped`: a product's rows split among its groups) and `width` columns and whose
     steps run over `depth` (None: a group's rows, padded to whole steps), from the family's facts, the
     call's extents and the device's multiprocessors alone (no table, no ranking;
-    docs/design/kernel-templates.md §7). `holds(tile)` is the launch's legality on the device (its
-    staged bytes within a block, its registers within a consumer's: `Template.legal`).
+    docs/design/kernel-templates.md §7). `candidate(tile)` is the launch's legality apart from its
+    resources (its granularity, its blocks dividing the call, its side operands' copies), and
+    `launch_of(tile)` the launch whose ring and residency the planner sizes (`resources.plan`: its
+    allocations a stage, its registers within a consumer's) on `target`.
 
     - Shape: the tile loading its operands fewest times a FLOP within its consumers' registers: an
       accumulator of `resources.held_area` elements A reads them 1/rows + 1/columns times a FLOP, least at
@@ -135,10 +137,11 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
       adds at most a third of its work).
     - Step: the family's widest depth dividing the call's (`Family.depths`) at those rows, a shallower
       one before fewer rows (a family whose products read registers holds a step's fragments).
-    - Stages: the deepest a block holds (`holds`, `resources.deepest`), at least those the walk keeps busy
-      (one loading ahead beside the one consumed and, on a family that keeps its products in flight,
-      the one in flight: `_IN_FLIGHT`); a tile that cannot stage that deep gives way to the next
-      narrower or shorter one.
+    - Stages: the deepest its program's share of shared memory holds at those programs (`resources.plan`,
+      the planner every template's derivation reads), at least those the walk keeps busy (one loading
+      ahead beside the one consumed and, on a family that keeps its products in flight, the one in
+      flight: `_IN_FLIGHT`); a tile that cannot stage that deep gives way to the next narrower or
+      shorter one.
     - Cluster: where grouped and a group's rows span at least as many row tiles as the family's cluster
       takes (`Family.cluster`: a pair on warpgroup MMA), that many multiprocessors a cluster, running row
       tiles of one group that load its matrix block once between them (multicast), CUTLASS's and
@@ -157,7 +160,6 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
 
     def tiled(consumers: int, programs: int) -> Tiles | None:
         role = family.role_rows * consumers
-        shared = resources.program_shared(family.most_shared, programs)
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
         if not columns:
             return None
@@ -183,13 +185,13 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
             # The shape before a deeper step: it sets how many times a FLOP reads each operand, where a
             # step's depth only sets how many steps a tile takes (and, in registers, its fragments').
             for step in steps:
-                tile = resources.deepest(
-                    lambda stages, block_m=block_m, block_n=block_n, step=step, band=band, cluster=cluster:
-                    Tiles(block_m, block_n, step, stages, band, warpgroups=consumers, cluster=cluster,
-                          family=family.name, programs=programs),
-                    holds, shared // ((block_m + block_n) * step))
-                if tile is None:
+                shape = Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster,
+                              family=family.name, programs=programs)
+                planned = resources.plan([launch_of(shape)], family, target,
+                                         programs=programs) if candidate(shape) else None
+                if planned is None:
                     continue
+                tile = dataclasses.replace(shape, stages=planned[0].stages)
                 if tile.stages >= busy:
                     return tile
                 fallback = fallback or tile

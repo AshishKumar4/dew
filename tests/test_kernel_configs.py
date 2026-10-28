@@ -380,23 +380,29 @@ def _model(launch, ba, config) -> dict:
 
 
 def _derived_and_refused(launch, ba, target) -> tuple:
-    """A launch's derived tile, and the tiles its derivation asked about and its model refused for their
-    registers alone (`Template._held`: legal with every register held, not legal as they are), whose need
-    the gate checks refuses them too: a model over the need throws tiles away (`kernel_compile.decisions`).
-    Each is the largest such of its rows and columns, the one a derivation would take had it held."""
-    legal, asked = type(launch).legal, []
+    """A launch's derived tile, and the tiles its derivation asked the planner about (`launch_of`) that
+    it refused for their registers alone (`resources.plan`: a ring its program's share holds, the registers
+    not), whose need the gate checks refuses them too: a model over the need throws tiles away
+    (`kernel_compile.decisions`). Each is the largest such of its rows and columns, at the deepest ring
+    the planner holds without the registers, the one a derivation would take had they held."""
+    launch_of, asked = type(launch).launch_of, []
 
-    def recorded(self, ba, tile, target):
-        asked.append(tile)
-        return legal(self, ba, tile, target)
+    def recorded(self, ba, tile):
+        planned = launch_of(self, ba, tile)
+        asked.append((tile, planned))
+        return planned
 
-    with mock.patch.object(type(launch), "legal", recorded):
+    with mock.patch.object(type(launch), "launch_of", recorded):
         config = launch.derived(ba, target)
-    with mock.patch.object(type(launch), "_held", lambda *_: True):
-        fitting = [tile for tile in dict.fromkeys(asked) if launch.legal(ba, tile, target)]
     refused: dict = {}
-    for tile in fitting:
-        if not launch.legal(ba, tile, target):
+    for tile, planned in asked:
+        family = mosaic_gpu.family_of(tile, ba.arguments['tokens'].dtype)
+        if resources.plan([planned], family, target, programs=tile.programs) is not None:
+            continue
+        held = resources.plan([dataclasses.replace(planned, registers=0)], family, target,
+                              programs=tile.programs)
+        if held is not None:
+            tile = dataclasses.replace(tile, stages=held[0].stages)
             shape = (tile.block_m, tile.block_n, tile.block_k, tile.warpgroups)
             refused[shape] = max(refused.get(shape, tile), tile, key=lambda each: each.stages)
     return config, list(refused.values())
