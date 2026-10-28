@@ -20,7 +20,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import BATCH, TimingRegression as Regression, batches
-from process_support import assert_exits_cleanly
+from process_support import assert_exits_cleanly, running
 from recording import RecordingTracker
 
 from dew.artifacts import Representations
@@ -763,16 +763,6 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
     assert_exits_cleanly(program)
 
 
-def _running(pid: int) -> bool:
-    """Whether process `pid` runs: it exists and has not ended (a zombie has). One that ends between
-    the open of its state and the read fails the read with ESRCH, and has ended too."""
-    try:
-        status = Path(f"/proc/{pid}/stat").read_text()
-    except (FileNotFoundError, ProcessLookupError):
-        return False
-    return status.rsplit(")", 1)[1].split()[0] != "Z"
-
-
 def test_a_process_that_ends_as_its_state_is_read_is_not_running(monkeypatch):
     """A loading worker that ends after its state file opens and before it is read: the kernel fails
     the read with ESRCH, which says the process has ended, as a missing file does."""
@@ -790,7 +780,7 @@ def test_a_process_that_ends_as_its_state_is_read_is_not_running(monkeypatch):
 
     monkeypatch.setattr(Path, "read_text", ended_while_read)
     try:
-        assert not _running(child.pid)
+        assert not running(child.pid)
     finally:
         child.kill()
         child.wait()
@@ -847,14 +837,14 @@ def test_a_killed_program_leaves_no_loading_worker_running():
         parent.send_signal(signal.SIGKILL)
         parent.wait(timeout=30)
         deadline = time.monotonic() + 60
-        while (any(map(_running, workers)) or _segments_marked(mark)) and time.monotonic() < deadline:
+        while (any(map(running, workers)) or _segments_marked(mark)) and time.monotonic() < deadline:
             time.sleep(0.5)
-        assert [pid for pid in workers if _running(pid)] == []
+        assert [pid for pid in workers if running(pid)] == []
         assert _segments_marked(mark) == set()
     finally:
         parent.kill()
         for pid in workers:
-            if _running(pid):
+            if running(pid):
                 os.kill(pid, signal.SIGKILL)
         for name in _segments_marked(mark):
             Path("/dev/shm", name).unlink(missing_ok=True)

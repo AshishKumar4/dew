@@ -207,3 +207,28 @@ def test_a_decoder_gains_a_loop_over_its_own_block_that_one_pass_leaves_as_it_wa
     assert not np.array_equal(twice.apply(params, ids), plain.apply(params, ids))
     assert plain.with_passes(2) is None and plain.with_passes(None, (1, 3)) is None
     assert twice.with_passes(4).loop == Loop(4, step_norm=False, layers=(1, 3))
+
+
+DELTA_NETS = {'linear_attention': {'mixer': {'class': 'gated_delta_net', 'fields': {
+    'linear_num_key_heads': 2, 'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
+    'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}}
+"""A stack of gated delta nets, whose decode state is a recurrent memory and a convolution tail."""
+
+
+def test_each_pass_of_a_shared_cache_step_starts_from_the_cache_the_step_found(rng):
+    """Every pass of a `Loop(shared_cache=True)` step starts from the cache as the step found it
+    (`SharedPassView`), its recurrent memory and convolution tail with its cursors: allocating the
+    cache leaves every entry zero, and a stack of gated delta nets prefills, bit for bit, what the same
+    loop with a cache of its own per pass prefills, where the second pass took the prompt again over
+    the state the first pass left (audit NN-A1)."""
+    models = [tiny(loop=Loop(2, shared_cache=shared), layer_types=('linear_attention',) * 2, kinds=DELTA_NETS)
+              for shared in (True, False)]
+    ids = tokens(rng)
+    params = models[0].init(rng, ids)
+    prefilled = []
+    for model in models:
+        made, step = decode_steps(model)
+        cache = made(params, ids.shape[0])
+        assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
+        prefilled.append(step(params, cache, ids)[0])
+    np.testing.assert_array_equal(*prefilled)

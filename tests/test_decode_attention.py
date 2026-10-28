@@ -586,6 +586,28 @@ def test_a_row_whose_documents_lie_below_its_start_reads_nothing(cross):
     np.testing.assert_array_equal(np.asarray(cotangent), 0)
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_decode_step_over_no_keys_returns_the_empty_result(generation):
+    """A decode step of no cache capacity, its row's length 0 and a sink beside it, chosen for an A100 or an
+    H100 (`generation.assumed`): the decode kernel's dense and paged layouts return the empty result, the
+    reference's value product over no keys, zero, before any split config forms over no steps (audit K6:
+    an IndexError on both GPUs)."""
+    from dew.nn.kernels import decode_attention
+    from dew.nn.kernels.generation import assumed
+
+    query, key = jnp.ones((1, 1, 1, 64), jnp.bfloat16), jnp.zeros((1, 0, 1, 64), jnp.bfloat16)
+    lengths, sinks = jnp.zeros((1,), jnp.int32), jnp.zeros((1,), jnp.bfloat16)
+    want = scaled_dot_product_attention(query, key, key, sinks=sinks, implementation="reference")
+    np.testing.assert_array_equal(np.asarray(want, np.float32), 0.0)
+    pages = jnp.zeros((1, 1, 16, 64), jnp.bfloat16)
+    with assumed(generation), chosen(decode="decode"):
+        dense = scaled_dot_product_attention(query, key, key, key_value_seq_lengths=lengths, sinks=sinks)
+        paged = decode_attention.attend_paged(query[:, 0], pages, pages, jnp.zeros((1, 0), jnp.int32),
+                                              lengths, sinks=sinks)
+    np.testing.assert_array_equal(np.asarray(dense), np.asarray(want))
+    np.testing.assert_array_equal(np.asarray(paged), np.asarray(want[:, 0]))
+
+
 def test_a_lone_query_whose_heads_do_not_group_is_refused_by_name():
     """A lone query of 5 heads over 3 key heads is no grouped query: the core leaves it as it is, and
     the kernel refuses its head counts, as it refuses them in any call."""
@@ -804,8 +826,9 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
                                          f"paged decode kernel, natural {natural}, {config}")
 
 
+@pytest.mark.parametrize("kernel", ["dense", "natural", "paged"])
 @pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
-def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
+def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, kernel):
     """The dense kernel under a decode step's attention and its gradient, in bf16 and fp32 at
     Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256, a 1024-slot cache), and the
     paged kernel at Qwen3-0.6B's (16 query heads over 8 of 128) with pages of 16 and 32 keys over 1024
@@ -813,7 +836,8 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     every GPU here, lowered for each GPU on this CPU and compiled by Triton
     within its block's shared memory; and the dense kernel in the accurate form (`natural`), raw without
     sinks and scaled with them, which the interpreted suite lowers for no GPU. A first filter: the A100
-    runs them; the H100 and the RTX PRO 6000 have this check alone."""
+    runs them; the H100 and the RTX PRO 6000 have this check alone. Each kernel a case of its own, so none
+    holds a CPU task past the suite's target (row 1849: 420 to 460 s a GPU together)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
@@ -870,6 +894,7 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     cases += [KernelCase(f"paged/{size}/{splits}",
                          lambda size=size, splits=splits: pinned(lambda: paged(size), paged_op, splits))
               for size in (16, 32) for splits in decode_attention.SPLITS]
+    cases = [case for case in cases if case.name.startswith(f"{kernel}/")]
     found = compile_kernels(cases, target)
     assert len(found) == len(cases)
     assert not failures(found), "\n".join(failures(found))

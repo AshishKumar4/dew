@@ -24,7 +24,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kv_cache import KVCache
 from dew.nn.ngpt import NGPT
-from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
+from dew.nn.rope import LongRopeScaling, RopeScaling, Scaling, YarnScaling
 
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
@@ -148,6 +148,14 @@ class MixerContext:
     output_init_std: float | None = None
     """The std of the projection back to the residual stream, which a
     depth-scaled init shrinks; None follows `init_std`."""
+
+    def rotary_scaling(self) -> Scaling | None:
+        """The layer's one rope scaling, which every rotation it makes takes (`rotary_freqs`): its
+        kind-resolved YaRN record or its Llama 3.1 or LongRoPE ramp. A layer given both is refused by
+        name: they are two scalings of the same frequencies."""
+        if self.yarn is not None and self.rope_scaling is not None:
+            raise ValueError("yarn and rope_scaling are two rope scalings; a layer takes one")
+        return self.rope_scaling if self.yarn is None else self.yarn
 
     def policies(self) -> dict[str, bool]:
         """Whether this layer asks each of the attention policies that change

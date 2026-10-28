@@ -1263,31 +1263,19 @@ def rewritten_warm_read(tmp_path, read: str, loading):
     return loader.train(DataPartition())
 
 
-@pytest.mark.parametrize("read", ["indexed", "streamed"])
-def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_since_it_was_committed(
-        tmp_path, read):
-    """Worker processes read a published generation's manifest checked against the size and digest
-    its cache's CURRENT committed it under, as the process that compiled the read does: a manifest
-    rewritten since, the same records in other bytes, is refused, not read."""
-    from dew.data.dataset import Loading
-
-    reader = rewritten_warm_read(tmp_path, read, Loading(workers=2, threads=1, read_buffer=2))
-    try:
-        with pytest.raises(OSError):
-            next(reader)
-    finally:
-        reader.close()
-
-
 @pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+@pytest.mark.parametrize("workers", [0, 2], ids=["in process", "worker processes"])
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
-def test_a_cached_read_its_cache_refuses_leaves_no_shard_iterator_half_built(tmp_path, read):
-    """A read whose published generation the cache refuses, its manifest rewritten since it was
-    committed, raises where it opens, and the iterators it opened close whole: none is left half
-    built for the collector to close, so no close raises unraisably."""
+def test_a_cached_read_its_cache_refuses_raises_and_leaves_no_iterator_half_built(tmp_path, read, workers):
+    """A warm read of a published generation whose manifest was rewritten since its cache's CURRENT
+    committed it, the same records in other bytes, is refused, not read, in this process and in
+    worker processes, which check the manifest against the size and digest CURRENT committed it
+    under as the process that compiled the read does. The iterators it opened close whole, Dew's
+    and Grain's: Grain builds a pool's iterators here for their first state, which reads no storage,
+    so none is left half built for the collector to close and no close raises unraisably."""
     from dew.data.dataset import Loading
 
-    reader = rewritten_warm_read(tmp_path, read, Loading(workers=0, threads=1, read_buffer=0))
+    reader = rewritten_warm_read(tmp_path, read, Loading(workers=workers, threads=1, read_buffer=workers))
     try:
         with pytest.raises(OSError):
             next(reader)

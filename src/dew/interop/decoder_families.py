@@ -146,6 +146,10 @@ ENTRIES = (
         preserve_source_layout=False,
         # LlamaConfig's context (configuration_llama.py:71), which a YaRN record's omitted lengths read.
         defaults={"max_position_embeddings": 2048},
+        # Megatron's names for its fields, which Nanbeige's releases repeat beside them.
+        repeated={"ffn_hidden_size": "intermediate_size", "num_query_groups": "num_key_value_heads",
+                  "rotary_base": "rope_theta", "kv_channels": "head_dim",
+                  "seq_length": "max_position_embeddings"},
         padding_idx=True,
     ),
 )
