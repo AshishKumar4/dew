@@ -7,6 +7,7 @@ states its own sides."""
 
 from typing import Literal
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
