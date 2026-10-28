@@ -1011,15 +1011,14 @@ class _LaidTruths:
         runs = [(len(list(run)), size, width)
                 for (width, size), run in itertools.groupby(keys, lambda key: key[:2])]
         values = np.concatenate([np.zeros(0), *(truths[at].reshape(-1) for *_, at in keys)])
-        own, resolved = [np.zeros(0)], [np.zeros(0)]
-        for (_, size, width), block in zip(runs, _blocks(values, runs), strict=True):
+        blocks, resolved = _blocks(values, runs), [np.zeros(0)]
+        for (_, size, width), block in zip(runs, blocks, strict=True):
             if width:
-                own.append(_rows_rms(block, width))
                 # Each leaf's `distance(truth, 0)`, at each of its rows.
                 resolved.append(np.repeat(RESOLUTION * np.sqrt(np.mean(np.square(block - 0.0), axis=1)),
                                           size // width))
-        own = np.concatenate(own)
-        finite = [np.isfinite(block).all(axis=1) for block in _blocks(values, runs)]
+        own = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(values, runs))])
+        finite = [np.isfinite(block).all(axis=1) for block in blocks]
         return _LaidTruths(truths, [at for *_, at in keys], runs, values, own,
                            np.where(own > np.concatenate(resolved), own, 0.0),
                            np.concatenate([np.zeros(0, bool), *finite]))
@@ -1030,6 +1029,17 @@ def _blocks(values: np.ndarray, runs) -> list[np.ndarray]:
     ends = list(itertools.accumulate((leaves * size for leaves, size, _ in runs), initial=0))
     return [values[start:stop].reshape(leaves, size)
             for start, stop, (leaves, size, _) in zip(ends[:-1], ends[1:], runs, strict=True)]
+
+
+def _rows(values: np.ndarray, runs) -> list[np.ndarray]:
+    """`values` laid by `runs` (`_LaidTruths`), each width's rows, its runs' together, one (rows, width)
+    matrix."""
+    ends = list(itertools.accumulate((leaves * size for leaves, size, _ in runs), initial=0))
+    spans = {}
+    for start, stop, (_, _, width) in zip(ends[:-1], ends[1:], runs, strict=True):
+        if width:
+            spans[width] = (spans.get(width, (start,))[0], stop)
+    return [values[start:stop].reshape(-1, width) for width, (start, stop) in spans.items()]
 
 
 def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
@@ -1050,8 +1060,7 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
         finite = np.concatenate([np.isfinite(block).all(axis=1) for block in _blocks(values, held.runs)])
         errors = values - held.values
         mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
-        rows = np.concatenate([np.zeros(0), *(_rows_rms(block, width) for (_, _, width), block in zip(
-            held.runs, _blocks(errors, held.runs), strict=True) if width)])
+        rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
         # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
         counts = np.repeat([size // width if width else 0 for _, size, width in held.runs],
                            [leaves for leaves, _, _ in held.runs])
@@ -1067,21 +1076,23 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
             firsts = (np.cumsum(taken) - taken)[some]
             worst_log[some] = np.maximum.reduceat(logs, firsts)
             worst[some] = np.maximum.reduceat(over, firsts)
+        # The rows of float64 zero, each leaf's its span of them.
         unsized = np.flatnonzero(~sized)
-        cuts = np.cumsum(counts - taken)[:-1]
-        zero_rows = np.split(unsized - np.repeat(starts, counts - taken), cuts)
-        zero_errors, zero_sizes = np.split(rows[unsized], cuts), np.split(held.own[unsized], cuts)
+        zero_rows = unsized - np.repeat(starts, counts - taken)
+        zero_errors, zero_sizes = rows[unsized], held.own[unsized]
+        ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
         mse, worst, worst_log, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), (
             finite & held.finite).tolist()
         names = {}
         for index, at in enumerate(held.laid):
             if read[index]:
-                dtype = getattr(references[at], "dtype", np.asarray(references[at]).dtype)
+                reference, span = references[at], slice(ends[index], ends[index + 1])
+                dtype = reference.dtype if hasattr(reference, "dtype") else np.asarray(reference).dtype
                 if dtype not in names:
                     names[dtype] = str(jnp.dtype(dtype))
-                summaries[at] = RecordedLeaf(mse[index], worst[index], zero_rows[index], zero_errors[index],
+                summaries[at] = RecordedLeaf(mse[index], worst[index], zero_rows[span], zero_errors[span],
                                              finite=finite[index], dtype=names[dtype],
-                                             zero_sizes=zero_sizes[index], worst_log=worst_log[index])
+                                             zero_sizes=zero_sizes[span], worst_log=worst_log[index])
     for at, reference in enumerate(references):
         if reference is not None and summaries[at] is None:
             summaries[at] = leaf_summary(reference, held.truths[at])
