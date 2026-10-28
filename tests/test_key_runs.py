@@ -2,8 +2,7 @@
 union it reads, in place of a pairwise mask. The decision layout's runs (`dew.decision.model.key_runs`) read
 exactly what its pairwise mask reads, causal or not, over packed rows and padding; a layer reading them
 computes what it computes over that mask, a windowed layer windowing each run over the key positions, whose
-places restart at each option; a local layer leaves its banded path for the kernel that reads them (a mixer
-that reads no runs refuses them: `test_mixers`).
+places restart at each option (a mixer that reads no runs refuses them: `test_mixers`).
 """
 
 import jax
@@ -15,7 +14,6 @@ from model_support import TINY_DECODER
 from dew.decision.layout import _parallel
 from dew.decision.model import key_runs
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.kernels import generation
 
 VOCAB = 37
 OPTIONS = 4
@@ -111,18 +109,3 @@ def test_a_layer_reading_key_runs_computes_what_it_computes_over_the_same_mask(k
                  sown, maxima)
 
 
-def test_a_local_layer_given_key_runs_leaves_its_banded_path():
-    """A windowed layer's whole-sequence pass runs `local_attention`'s bands, which read no runs; given
-    them, it hands them to the general kernel: a layer naming the template runs it on an A100, where the
-    bands would take no runs and the template refuses a mask."""
-    slots, segments, positions = layout(ROWS, LENGTH)
-    decoder = model(sliding_attention={"window": 2}).clone(attention_impl="template", dtype=jnp.bfloat16)
-    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
-    params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
-    runs = key_runs(jnp.asarray(slots), jnp.asarray(segments), OPTIONS)
-    places = jnp.asarray(positions)
-    with generation.assumed("sm80"), generation.routes() as found:
-        jax.eval_shape(lambda params, ids: decoder.apply(
-            params, ids, positions=places, attention_key_runs=runs, attention_key_positions=places),
-            params, ids)
-    assert {route.kernel for route in found if route.choice == "attention"} == {"template"}

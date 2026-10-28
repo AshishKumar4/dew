@@ -295,6 +295,32 @@ def test_a_fetch_follows_a_redirect_and_keeps_the_bytes_the_server_sent(header):
     assert row["bytes"] == body and row["content_sha256"] == hashlib.sha256(body).hexdigest()
 
 
+def test_a_fetch_on_a_second_io_loop_reads_with_that_loops_own_session():
+    """A process can run two of fsspec's IO loops: two threads taking its lazily made lock at once each
+    start one, and a forked process starts its own (fsspec's `reset_lock`), its first loop running on
+    (row 1942). A fetch on the second reads its url through that loop's own session, where fsspec's
+    instance cache, which tells running loops apart by nothing, hands it the first loop's."""
+    from fsspec.asyn import get_loop, reset_lock
+
+    body = b"x" * 64
+
+    def handle(request):
+        request.send_response(200)
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+
+    with serving(handle) as address:
+        fetch = Fetch(max_bytes=len(body))
+        first = fetch({"url": f"http://{address}/first"})
+        before = get_loop()
+        reset_lock()
+        second = fetch({"url": f"http://{address}/second"})
+        assert get_loop() is not before and before.is_running()
+    assert not isinstance(first, Rejected) and not isinstance(second, Rejected)
+    assert first["bytes"] == second["bytes"] == body
+
+
 @pytest.mark.parametrize("hops", [0, 10])
 def test_a_redirect_to_a_local_file_is_not_followed(tmp_path, hops):
     """A server's redirect to a file on this host is never followed, first or past the hops a

@@ -36,42 +36,20 @@ OFFSET = 1 << 16
 
 
 def cross_entropy_columns():
-    """tests/test_chunked_cross_entropy.py's head over 512 columns, ordered by its columns: each
-    token's loss and log Z, and the gradients of a loss of both for the states, the head, the scale
-    and the bias, `jax.nn.logsumexp`'s whole logits the reference."""
+    """tests/test_chunked_cross_entropy.py's head over 512 columns, ordered by its columns, as its check-1
+    site draws and scores it (`column_order_case`): each token's loss and log Z, and the gradients for the
+    states, the head, the scale and the bias under the site's cotangent, `jax.nn.logsumexp`'s whole logits
+    the reference, its column-wise gradients relabelled back so every order's are the same values."""
     import jax
-    import jax.numpy as jnp
-    import numpy as np
-    from test_chunked_cross_entropy import columns, eighths, inputs
+    from test_chunked_cross_entropy import column_order_case
 
-    from dew.nn.protocols import OutputTable
+    draw, _, whole = column_order_case()
 
-    states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
-    states, matrix = eighths(states, matrix)
-    scale, bias = columns(512)
-
-    def whole(states, matrix, scale, bias, targets):
-        logits = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale).logits(states)
-        log_z = jax.nn.logsumexp(logits, axis=-1)
-        return log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0], log_z
-
-    def loss(*arguments):
-        losses, log_z = whole(*arguments)
-        return jnp.sum(losses + 1e-2 * jnp.square(log_z)), (losses, log_z)
-
-    scored = jax.grad(loss, argnums=(0, 1, 2, 3), has_aux=True)
-
-    def reference(states, matrix, scale, bias, targets, relabel):
-        with jax.default_matmul_precision("highest"):
-            (d_states, d_matrix, d_scale, d_bias), (losses, log_z) = scored(states, matrix, scale, bias,
-                                                                             targets)
+    def reference(*drawn):
+        *arguments, relabel = drawn
+        (losses, log_z), d_states, d_matrix, d_scale, d_bias = whole(*arguments)
         return {"losses": losses, "log Z": log_z, "states": d_states, "head": d_matrix[:, relabel],
                 "scale": d_scale[relabel], "bias": d_bias[relabel]}
-
-    def draw(seed):
-        order = np.random.default_rng(seed).permutation(512)
-        relabel = np.argsort(order)
-        return (states, matrix[:, order], scale[order], bias[order], relabel[targets], relabel)
 
     return jax.jit(reference), draw, None, None
 

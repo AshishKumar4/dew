@@ -1016,14 +1016,13 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
 
 
 
-def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
-    """Fit, save, restore, sample: the restored task's unconditional branch is the one the training
-    step encoded (`DiffusionObjective.blank_conditions` over the step's own towers), to the bit, with a
-    bf16 CLIP as the published hybrid DiT has, and the task samples as the objective's own does."""
+def saved_clip_run(directory):
+    """A text-to-image run with a bf16 CLIP, as the published hybrid DiT has, after one training step,
+    saved in `directory` with its inference record: its config, objective and state."""
     from pathlib import Path
 
     config = stating(dataclasses.replace(
-        run_config(tmp_path, preset=Flow()),
+        run_config(directory, preset=Flow()),
         text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
                            dtype="bfloat16")), guidance=CFG(5.0), ema_decay=None)
     objective = config.build()
@@ -1032,9 +1031,17 @@ def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
     batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
              **objective.inputs.tokenize(["a bird"] * jax.device_count())}
     state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints = Checkpoints(str(directory))
     checkpoints.save(1, state, None, artifact=objective.inference_record())
     checkpoints.wait()
+    return config, objective, state
+
+
+def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
+    """Fit, save, restore, sample: the restored task's unconditional branch is the one the training
+    step encoded (`DiffusionObjective.blank_conditions` over the step's own towers), to the bit, with a
+    bf16 CLIP as the published hybrid DiT has, and the task samples as the objective's own does."""
+    _, objective, state = saved_clip_run(tmp_path)
     original = objective.pipeline(state, ema=False)
     restored = TextToImage.from_run(str(tmp_path), ema=False)
 
@@ -1050,21 +1057,7 @@ def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
 def test_binding_new_encoder_weights_encodes_both_branches_with_them(tmp_path):
     """A restored task binds a new encoder tree: its conditional and unconditional features and
     samples match a fresh task over those weights, not the old ones."""
-    from pathlib import Path
-
-    config = stating(dataclasses.replace(
-        run_config(tmp_path, preset=Flow()),
-        text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
-                           dtype="bfloat16")), guidance=CFG(5.0), ema_decay=None)
-    objective = config.build()
-    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
-    state = trainer.initial_state()
-    batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
-             **objective.inputs.tokenize(["a bird"] * jax.device_count())}
-    state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(1, state, None, artifact=objective.inference_record())
-    checkpoints.wait()
+    config, _, _ = saved_clip_run(tmp_path)
     restored = TextToImage.from_run(str(tmp_path), ema=False)
     prompts = ["a bird", "a cat"]
     old_blank = restored.prepare(prompts, key=0, steps=8).unconditional
