@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from dew.data.processors import FeatureExtractor
-    from dew.data.text import PinnedTokenizer
+    from dew.data.text import PinnedFiles, PinnedTokenizer
 
 Raw = TypeVar("Raw")
 """One item of a modality's raw data: a prompt, a waveform."""
@@ -448,6 +448,9 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     module: JittableModule
     params: Variables
     extractor: FeatureExtractor
+    files: PinnedFiles
+    """The checkpoint's configuration and feature extractor files, resolved once (`pin_files`), which
+    the tower's configuration and `extractor` were read from and its weights share the commit of."""
     dtype: Dtype | None = None
     param_dtype: str = "float32"
     parameter_collections: ClassVar[tuple[str, ...] | None] = ("params",)
@@ -457,6 +460,7 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     def from_pretrained(cls, checkpoint: str = "facebook/wav2vec2-base-960h", *, seconds: float = 1.0,
                         dtype=None, param_dtype: str = "float32",
                         params: Variables | None = None) -> HFAudio:
+        from dew.data.text import pin_files
         from dew.interop.pickles import host_view
         from dew.interop.torchax_fallback import INSTALL
 
@@ -469,13 +473,20 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
             raise ImportError(
                 f"hf_audio runs transformers' audio model through torchax: {INSTALL}"
             ) from error
+        # The configuration and the feature extractor read from one resolution of the checkpoint's
+        # files, the weights from its commit, so the features and the tower are one checkpoint's.
+        files = pin_files(checkpoint, ["*.json"])
+        revision = files.snapshot["revision"]
+        assert revision is None or isinstance(revision, str)
+        config = AutoConfig.from_pretrained(files.directory)
         if params is None:
-            model = AutoModel.from_pretrained(checkpoint, dtype=getattr(torch, param_dtype))
+            model = AutoModel.from_pretrained(checkpoint, revision=revision, config=config,
+                                              dtype=getattr(torch, param_dtype))
         else:
             # Supplied weights replace every tensor, so the tower is built
             # without storage.
             with torch.device("meta"):
-                model = AutoModel.from_config(AutoConfig.from_pretrained(checkpoint))
+                model = AutoModel.from_config(config)
         if model.config.is_encoder_decoder:
             model = model.get_encoder()
         model.eval()
@@ -491,8 +502,8 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
         # Torch's copies are no longer read: the forward runs on the arrays above.
         torch.nn.Module.to(model, "meta")
         return cls(checkpoint=checkpoint, seconds=seconds, module=module, params=params,
-                   extractor=AutoFeatureExtractor.from_pretrained(checkpoint), dtype=resolve_dtype(dtype),
-                   param_dtype=param_dtype)
+                   extractor=AutoFeatureExtractor.from_pretrained(files.directory), files=files,
+                   dtype=resolve_dtype(dtype), param_dtype=param_dtype)
 
     @property
     def input_name(self) -> str:
@@ -553,6 +564,12 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     def recorded_fields(self) -> dict:
         return {"checkpoint": self.checkpoint, "seconds": self.seconds,
                 "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype}
+
+    def dependencies(self) -> Mapping[str, object]:
+        """The encoder's fields and the hashes of the configuration and feature extractor files it
+        reads, so an extractor that changed under the checkpoint's name (its normalization, its
+        sampling rate) changes the identity too (row 1871, DATA-05)."""
+        return {**super().dependencies(), "files": self.files.snapshot}
 
 
 __all__ = ["CLIPText", "CharTable", "ConditionEncoder", "HFAudio", "T5Text"]

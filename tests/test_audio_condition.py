@@ -95,6 +95,28 @@ def test_the_audio_tower_encodes_what_transformers_computes(towers, name, key):
     assert np.array_equal(np.asarray(context.mask), np.ones(expected.shape[:2], np.int32))
 
 
+def test_an_audio_towers_identity_holds_the_extractor_files_it_reads(towers, tmp_path):
+    """An audio tower's dependency record hashes the configuration and feature extractor files it was
+    read from: an extractor whose normalization changed under the same checkpoint name changes the
+    identity, as it changes the features, and the same files keep it (row 1871, DATA-05)."""
+    import json
+    import shutil
+
+    copy = tmp_path / "wav2vec2"
+    shutil.copytree(towers / "wav2vec2", copy)
+    first = HFAudio.from_pretrained(str(copy), seconds=0.25)
+    again = HFAudio.from_pretrained(str(copy), seconds=0.25)
+    assert first.dependencies() == again.dependencies()
+    stated = copy / "preprocessor_config.json"
+    extractor = json.loads(stated.read_text())
+    stated.write_text(json.dumps({**extractor, "do_normalize": not extractor["do_normalize"]}))
+    changed = HFAudio.from_pretrained(str(copy), seconds=0.25)
+    assert changed.extractor.do_normalize != first.extractor.do_normalize
+    assert changed.dependencies() != first.dependencies()
+    assert changed.dependencies()["files"]["files"]["preprocessor_config.json"] != (
+        first.dependencies()["files"]["files"]["preprocessor_config.json"])
+
+
 def test_an_audio_condition_rebuilt_from_its_record_encodes_the_same(towers):
     """A run's record rebuilds the tower around its saved parameters, built
     without weights of its own, and it reads the same audio the same way."""

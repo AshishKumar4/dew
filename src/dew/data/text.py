@@ -60,14 +60,18 @@ _TOKENIZER_FILES = ["*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken"]
 
 
 @dataclasses.dataclass(frozen=True)
-class PinnedTokenizer:
-    """A Hugging Face tokenizer resolved once to immutable files
-    (`pin_tokenizer`): the snapshot its identity hashes and the directory it
-    reads its vocabulary and templates from, which are one revision by
-    construction."""
+class PinnedFiles:
+    """A checkpoint's files resolved once to immutable files (`pin_files`): the snapshot its identity
+    hashes and the directory they are read from, which are one revision by construction."""
 
     snapshot: Mapping[str, object]
     directory: str
+
+
+@dataclasses.dataclass(frozen=True)
+class PinnedTokenizer(PinnedFiles):
+    """A Hugging Face tokenizer resolved once to immutable files (`pin_tokenizer`): it reads its
+    vocabulary and templates from the directory its snapshot hashes."""
 
     def transformers(self) -> PreTrainedTokenizerBase:
         """The transformers tokenizer of these files, whose chat template
@@ -80,14 +84,19 @@ class PinnedTokenizer:
 
 
 def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokenizer:
-    """Resolve `name` once: a local directory, or a hub repo (optionally
-    `repo@revision`) downloaded at the commit its revision names, with every
-    file its loader can read hashed. The Hub cache keeps a commit's files in
-    a directory named for the commit, which is the revision recorded; offline
-    (`HF_HUB_OFFLINE`), or with `local_files_only`, the name resolves to the
-    commit the local cache holds."""
+    """Resolve `name`'s tokenizer once, every file its loader can read hashed (`pin_files`)."""
     if name == "byte":
         raise ValueError("'byte' names Dew's byte vocabulary (ByteTokenizer), which has no tokenizer files")
+    pinned = pin_files(name, _TOKENIZER_FILES, local_files_only=local_files_only)
+    return PinnedTokenizer(pinned.snapshot, pinned.directory)
+
+
+def pin_files(name: str, patterns: Sequence[str], *, local_files_only: bool = False) -> PinnedFiles:
+    """Resolve `name` once: a local directory, or a hub repo (optionally `repo@revision`) downloaded
+    at the commit its revision names, its files of `patterns` hashed. The Hub cache keeps a commit's
+    files in a directory named for the commit, which is the revision recorded; offline
+    (`HF_HUB_OFFLINE`), or with `local_files_only`, the name resolves to the commit the local cache
+    holds."""
     directory = Path(name)
     repo = resolved = None
     if not directory.is_dir():
@@ -95,14 +104,14 @@ def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokeniz
 
         repo, separator, revision = name.rpartition("@")
         repo, revision = (repo, revision) if separator else (name, None)
-        directory = Path(snapshot_download(repo, revision=revision, allow_patterns=_TOKENIZER_FILES,
+        directory = Path(snapshot_download(repo, revision=revision, allow_patterns=list(patterns),
                                            local_files_only=local_files_only))
         resolved = directory.name
     files = {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
-             for pattern in _TOKENIZER_FILES
+             for pattern in patterns
              for path in directory.rglob(pattern) if path.is_file()}
     snapshot = {"name": repo, "revision": resolved, "files": files}
-    return PinnedTokenizer(snapshot, str(directory))
+    return PinnedFiles(snapshot, str(directory))
 
 
 def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: bool = False,
