@@ -1440,6 +1440,29 @@ def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_e
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b", "c")] == [1, 1, 2]
 
 
+def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recorded_with_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The plan's checkout, clean, keys rows as the task's checkout does, though the task's holds an editable
+    install's metadata under src/ (setuptools' dewml.egg-info) and the fetched fixtures' payloads, which the
+    planner never downloads: a build's output is no input, and a fetched payload is keyed by the digest its
+    manifest pins (Main, 2026-10-28: a one-file change planned 493 tasks, as the planner's src/ listing and
+    walk lacked them)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    payload = tmp_path / "tests/fixtures/model.npz"
+    payload.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests/fixtures/model.npz.fetched.json").write_text(json.dumps({"sha256": "ab" * 32}))
+    built = tmp_path / "src/dewml.egg-info"
+    built.mkdir(parents=True)
+    (built / "PKG-INFO").write_text("Name: dewml\n")
+    payload.write_bytes(b"payload")
+    armada_task(ci, monkeypatch, verdict)
+    payload.unlink()
+    (built / "PKG-INFO").unlink()
+    built.rmdir()
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
+
+
 def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, monkeypatch, cache_worker):
     """The plan looks records up under the class .armada.json pins the tasks to, never its own host's: rows
     recorded on another class plan every file a task of its own, as before."""
