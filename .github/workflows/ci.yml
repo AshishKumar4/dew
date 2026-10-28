@@ -245,6 +245,10 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+        # The test cache's read-only token, for the plan armada runs here (.armada.json's local plan): the files
+        # whose rows the cache holds for exactly these inputs share one task (tools/armada/ci.py `reusable`).
+        # It reads records and never writes them; a fork's pull request receives no repository secret.
+        DEW_XLA_CACHE_READ_TOKEN: ${{ secrets.DEW_XLA_CACHE_READ_TOKEN }}
         DEW_TEST_CACHE: ${{ needs.scope.outputs.policy }}
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
