@@ -999,3 +999,15 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
 
     assert_as_exact_over_instances(scored, oracle(model), draw, "router z-loss",
                                    seeds=ROUTER_SEEDS, truth_fn=oracle(model.clone(dtype=jnp.float64)))
+
+
+def test_a_decoder_whose_cache_outgrew_its_learned_positions_admits_rows_its_table_covers():
+    """A learned position table of eight places resized to a sixteen-slot cache keeps its eight rows
+    (`with_cache_capacity`), so the run admits rows of eight inputs and refuses a stage's rows of
+    twelve, which would read past the table, where it took the cache's sixteen before (row 1982)."""
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, position_embedding="learned").with_cache_capacity(16)
+    objective = LMObjective(model, 8)
+    objective.inputs.check({TEXT_KEY: np.zeros((2, 9), np.int32)})
+    with pytest.raises(ValueError):
+        objective.inputs.check({TEXT_KEY: np.zeros((2, 13), np.int32)})

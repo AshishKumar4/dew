@@ -115,30 +115,55 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     )
 
 
+MEANFLOW_SEEDS = 128
+"""Check 1's declared seeds for a MeanFlow step through a fused attention kernel: the most paired sizing
+(`seeds_for` with the fused step as `dew_fn`, its confirming block) gave on the GPUs the site runs on, 128
+for Triton's kernel on an A100 and an H100 and 8 for cuDNN's (node receipts TL-a100-sizing-1851-679,
+TL-h100-sizing-1851-679), the largest declared as docs/design/testing.md's check 1 rules (d28b1c318)."""
+
+
 def agrees_with_xla(kernel: str) -> None:
-    """A MeanFlow step through the fused attention `kernel` runs, and its loss and gradient agree
-    with the xla kernel's within bf16's rounding of the step's scale."""
-    def run(implementation):
+    """A MeanFlow step through the fused attention `kernel` runs, and its loss and every parameter's
+    gradient are on par with the xla kernel's (check 1), both in bf16, the truth the step of the
+    model in float64 on xla. Each draw holds its own weights, images and the step's key, which draws
+    the step's times and noise: adaLN-Zero's gates and output start at zero, where attention reaches
+    neither the output nor any gradient (ledger 789), and drawn weights let every parameter take part."""
+    def over(implementation: str, dtype: str) -> MeanFlowObjective:
         model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
-                          interval=True, attention_impl=implementation, dtype="bfloat16")
+                          interval=True, attention_impl=implementation, dtype=dtype)
         inputs = InputSpec(Field("image", (16, 16, 3)),
                            {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
-        task = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
-        params = task.init(jax.random.PRNGKey(0))
-        pixels = jax.random.randint(jax.random.PRNGKey(1), (8, 16, 16, 3), 0, 256)
-        batch = {"image": np.asarray(pixels, np.uint8), **task.inputs.tokenize(["a", "b", "c", "d"] * 2)}
-        step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-        def loss_of(tree):
-            return task.scalar_loss({**params, "params": tree}, batch, step)[0]
+        return MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
 
-        loss, grads = jax.jit(jax.value_and_grad(loss_of))(params["params"])
-        return float(loss), jax.tree.leaves(grads)
+    fused, xla, wide = over(kernel, "bfloat16"), over("xla", "bfloat16"), over("xla", "float64")
+    template = xla.init(jax.random.PRNGKey(0))
+    with jax.enable_x64(new_val=True):
+        held = jax.tree.map(jnp.asarray, widened(template))
+    tokens = xla.inputs.tokenize(["a", "b", "c", "d"] * 4)
 
-    (fused, fused_grads), (xla, xla_grads) = run(kernel), run("xla")
-    assert fused == pytest.approx(xla, rel=2 ** -7)
-    for left, right in zip(fused_grads, xla_grads, strict=True):
-        scale = float(jnp.max(jnp.abs(right))) + 1e-12
-        assert float(jnp.max(jnp.abs(left - right))) <= 2 * 2 ** -7 * scale
+    def draw(seed):
+        leaves, tree = jax.tree.flatten(template["params"])
+        keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves) + 2)
+        params = jax.tree.unflatten(tree, [0.3 * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                           for key, leaf in zip(keys[2:], leaves, strict=True)])
+        pixels = np.asarray(jax.random.randint(keys[0], (16, 16, 16, 3), 0, 256), np.uint8)
+        return params, pixels, np.asarray(keys[1])
+
+    def stepped(task, rest):
+        """The step's loss and the gradient of every parameter, a function of the parameters, the
+        images and the step's raw key."""
+        def run(params, pixels, key):
+            batch = {"image": pixels, **tokens}
+            step = Step(step=jnp.asarray(0), key=jnp.asarray(key), ema=None)
+
+            def loss_of(tree):
+                return task.scalar_loss({**rest, "params": tree}, batch, step)[0]
+
+            return jax.value_and_grad(loss_of)(params)
+        return run
+
+    assert_as_exact(stepped(fused, template), stepped(xla, template), draw, f"MeanFlow step on {kernel}",
+                    seeds=MEANFLOW_SEEDS, truth_fn=stepped(wide, held))
 
 
 @pytest.mark.gpu(reason="a fused attention kernel runs on a cuda device")
