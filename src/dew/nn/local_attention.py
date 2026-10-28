@@ -90,8 +90,13 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         _local_attention, window=window, chunk=chunk, max_segments=max_segments, dtype=dtype,
         precision=precision, force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
         sinks=sinks, softcap=softcap)
-    # A window counts tokens by their distance alone, so only a chunk reads the places.
-    places = None if chunk is None else places
+    # A window counts tokens by their distance alone, so only a chunk reads the places, at 32 bits at
+    # least: a chunk past a narrower dtype's largest is no number of it.
+    if chunk is None or places is None:
+        places = None
+    else:
+        places = jnp.asarray(places)
+        places = places.astype(jnp.promote_types(places.dtype, jnp.int32))
     if valid is not None and not right_padded:
         return compacted(attend, query, key, value, places, segment_ids, valid)
     return attend(query, key, value, places=places, segment_ids=segment_ids, valid=valid)
