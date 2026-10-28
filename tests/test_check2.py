@@ -480,3 +480,42 @@ def test_an_exp_past_its_range_is_held_at_its_neighbours_however_far():
         for native in (np.float32([np.inf, 0.0] * 3), np.float32([biggest, least] * 3)):
             assert ct.LEVELS["exp"]([far], native, oc.FLOAT32, flushes).tolist() == [1] * 6
     assert not np.any(ct.CONTRACTS["exp"]({}, [far], np.float32([1.0] * 6), oc.FLOAT32))
+
+
+def _truncating_sum(values: np.ndarray) -> np.float32:
+    """`values` summed in fp32 in their order, each add truncated toward zero, as a tensor core adds."""
+    total = np.float32(0)
+    for value in values:
+        exact = np.float64(total) + np.float64(value)
+        stepped = np.float32(exact)
+        if abs(np.float64(stepped)) > abs(exact):
+            stepped = np.nextafter(stepped, np.float32(0))
+        total = stepped
+    return total
+
+
+def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_product_or_a_narrow_partial():
+    """The native-dot contract (row 2084's link 1): a GEMM's output summed from its exact bf16 products in
+    fp32 by truncating adds in any order, then rounded once to bf16 (or kept in fp32), holds at every
+    element, same-sign products included, whose truncations all err one way; the same sums with a product
+    lost, or with the first half's partial rounded to bf16, break it at nearly every element."""
+    rng = np.random.default_rng(3)
+    for signed in (True, False):
+        left, right = (np.asarray(ml_dtypes.bfloat16(rng.normal(size=shape) if signed else
+                                                     rng.uniform(0.5, 2.0, size=shape)), np.float64)
+                       for shape in ((16, 128), (4, 128)))
+        products = left[:, None, :] * right[None, :, :]
+        orders = [rng.permutation(128) for _ in range(products.shape[0] * products.shape[1])]
+        flat = products.reshape(-1, 128)
+        summed = np.asarray([_truncating_sum(row[order]) for row, order in zip(flat, orders, strict=True)])
+        for out, native in ((oc.FLOAT32, summed), (oc.BFLOAT16, summed.astype(ml_dtypes.bfloat16))):
+            held = ct.native_dot_holds(np.asarray(native, np.float64).reshape(products.shape[:2]), products,
+                                       out, flushes=False)
+            assert np.all(held), (signed, out.name)
+        lost = np.asarray([_truncating_sum(np.delete(row, np.argmax(np.abs(row)))) for row in flat])
+        narrow = np.asarray([_truncating_sum(np.concatenate([
+            [np.float32(ml_dtypes.bfloat16(_truncating_sum(row[:64])))], row[64:]])) for row in flat])
+        for faulty in (lost, narrow):
+            held = ct.native_dot_holds(faulty.reshape(products.shape[:2]).astype(np.float64), products,
+                                       oc.FLOAT32, flushes=False)
+            assert np.mean(held) < 0.05, (signed, np.mean(held))

@@ -323,6 +323,33 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool) -> np.ndarray:
     return np.isfinite(error) & (error <= np.nextafter(allowance, np.inf))
 
 
+TRUNCATING = {name: dataclasses.replace(fmt, name=f"{name}, truncating adds", precision=fmt.precision - 1)
+              for name, fmt in FORMATS.items()}
+"""Each format's sums as a GPU's tensor cores carry an MMA step's: each add truncated, not rounded, an error
+up to a whole unit in the last place, twice round to nearest's (src/dew/nn/kernels/templates/product.py),
+the unit roundoff of a format one bit narrower."""
+
+
+def native_dot_holds(native, products, out: Format, flushes: bool) -> np.ndarray:
+    """Whether each element of a native GEMM's output is a value its exact `products` (float64, summed along
+    the last axis) admit, as check 2 holds a fused template GEMM natively (row 2084, link 1): accumulated in
+    fp32 in any order by adds that truncate (`TRUNCATING`), within γ_n of their magnitudes of the exact sum
+    plus what underflow loses past that (as `_terms_hold`), then rounded once to nearest in `out`, the
+    output's format. Rounding is monotone, so the output lies between the nearest `out` values of the
+    allowance's two ends."""
+    count = products.shape[-1]
+    exact = exact_sum(products, -1)
+    accumulator = FORMATS["float32"]
+    underflow = 2.0 ** accumulator.emin if flushes else 2.0 ** (accumulator.emin - accumulator.precision)
+    allowance = (gamma(count, TRUNCATING["float32"]) + 2.0 ** -52) * magnitude_sum(products, -1) + \
+        count * underflow
+    zero = np.zeros_like(exact)
+    low = rounded(np.nextafter(exact - allowance, -np.inf), zero, out)
+    high = rounded(np.nextafter(exact + allowance, np.inf), zero, out)
+    native = np.asarray(native, np.float64)
+    return np.isfinite(native) & (native >= low) & (native <= high)
+
+
 def _floats(operands, flushes: bool):
     return [_read(value, flushes) for value in operands]
 
