@@ -1,6 +1,7 @@
 """Attention over nearby keys in memory linear in the sequence: sliding windows
-and chunked local attention, run as one flagged kernel call where a kernel
-takes the window, else as banded blocks of the span."""
+and chunked local attention, run as one whole call where the attention template
+takes it (its spans, a chunk each query's run of keys) or a kernel takes the
+window as a flag, else as banded blocks of the span."""
 
 import functools
 
@@ -62,11 +63,13 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     without them; `right_padded` says each row's valid slots come first
     (`AttentionMetadata.right_padded`).
 
-    No `[S, S]` array is built above two spans. A window flash, cudnn (no
+    No `[S, S]` array is built above two spans. A call the attention template
+    takes runs whole as its spans, which it walks tile by tile: the window, or
+    each query's run of its chunk's keys (`chunk_runs`), with the documents,
+    the valid keys, the sinks and the softcap. A window flash, cudnn (no
     sinks) or splash takes as a flag, without packing, runs there, skipping
-    blocks outside it.
-    Chunks that start at row multiples fold into the batch. Everything else
-    runs banded: query blocks of the span against their own block and the one
+    blocks outside it. Elsewhere chunks that start at row multiples fold into
+    the batch, and everything else runs banded: query blocks of the span against their own block and the one
     before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
     pads to whole spans, so at most two spans take the dense call. A row with
     padding among its tokens runs on its real tokens alone (`compacted`), so
@@ -191,9 +194,10 @@ def chunk_runs(places, rows: int, length: int, chunk: int) -> jax.Array:
     `[S]` or `[B, S]` are counted (`counted_places`), so a chunk's tokens in a document are consecutive
     slots, and None is the row index; the documents bound a run that starts in the one before."""
     place = jnp.arange(length) if places is None else jnp.asarray(places)
-    place = jnp.broadcast_to(jnp.atleast_2d(place), (rows, length)).astype(jnp.int32)
+    # The remainder in the places' own integers, then its slots: a wide place narrowed first would move it.
+    into = jnp.broadcast_to(jnp.atleast_2d(place % chunk), (rows, length)).astype(jnp.int32)
     index = jnp.arange(length, dtype=jnp.int32)
-    first = jnp.maximum(index - place % chunk, 0)
+    first = jnp.maximum(index - into, 0)
     return jnp.stack([first, jnp.broadcast_to(index + 1, first.shape)], axis=-1)[:, :, None, :]
 
 
