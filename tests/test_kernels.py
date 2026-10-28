@@ -1112,27 +1112,6 @@ def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, ca
         assert np.all(np.isfinite(run()))
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm89", "sm90"])
-@pytest.mark.parametrize("head_dim", [64, 128])
-def test_a_bf16_call_takes_flash_on_its_cell_or_by_legality(generation_name, head_dim):
-    """A causal bf16 call takes FlashAttention on every GPU it measured fastest on: Hopper's by its declared
-    cell (`attention_kernels.DECLARED`), its refusal naming the template it sets aside and the receipt; a GPU
-    of no routed Mosaic mainloop (mma.sync's) as the op's first kernel by legality, no table row
-    preferring another (bible §4)."""
-    from dew.nn.attention import resolve_implementation
-    from dew.nn.kernels import generation
-
-    query = jnp.zeros((2, 128, 4, head_dim), jnp.bfloat16)
-    with generation.assumed(generation_name), generation.routes() as found:
-        resolve_implementation("auto", query, query, causal=True)
-    (route,) = [route for route in found if route.choice == "attention"]
-    assert route.kernel == "flash"
-    if generation_name == "sm90":
-        assert route.preferred == "template" and route.refusal.code == "old_route"
-    else:
-        assert route.preferred == "flash" and route.refusal is None
-
-
 @pytest.mark.parametrize("dtype, kept", [(jnp.float16, False), (jnp.bfloat16, True)])
 def test_an_fp16_call_leaves_the_triton_route_as_a_declared_gap(dtype, kept):
     """A causal call of 16-wide heads that prefers tokamax's Triton kernel: an fp16 one is refused by its

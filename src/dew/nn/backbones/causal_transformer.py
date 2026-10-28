@@ -1331,6 +1331,16 @@ class CausalTransformer(nn.Module):
         """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
         return self.continuum is not None
 
+    def affine_head(self) -> bool:
+        """Whether the head past the continuum level (`head_logits`) is affine in its states, read from
+        the bound model: a table's product and a bias, with no transform, logit softcap, nGPT gains or
+        quantizer of the head's own input (`SteppedInContext`); a checkpoint's quantizer of the trunk's
+        modules alone leaves it affine, and a tied head reads its table with none."""
+        quantized = (isinstance(self, QuantizesInputs) and not self.tie_embeddings
+                     and self.input_quantizer(self.lm_head) is not None)
+        return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
+                and not quantized)
+
     @nn.nowrap
     def in_context_level(self, variables):
         """The continuum level's parameters in `variables`, None without a level (`SteppedInContext`)."""
