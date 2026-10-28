@@ -175,21 +175,20 @@ def _count(barriers) -> int:
     return math.prod(barriers) if isinstance(barriers, tuple) else int(barriers)
 
 
-def shared_bytes(family: "Family", scope: Scope) -> int:
-    """The shared memory a program of `scope` asks for, as Mosaic GPU's resource estimate counts it: every
-    array rounded up to `SMEM_ALIGNMENT` (`allocated`), the walks the largest of them, the tiles scoped after
-    the walks the larger of them and the walks on a family that scopes its walks apart
-    (`Family.walks_scoped`) and beside the program's otherwise, the family's reduction scratch where the
-    program reduces (`Family.reduction_scratch`), then every barrier (`BARRIER_BYTES`)."""
-    def barrier(leaf) -> bool:
-        return isinstance(leaf, (plgpu.Barrier, plgpu.ClusterBarrier))
+def _barrier(leaf) -> bool:
+    return isinstance(leaf, (plgpu.Barrier, plgpu.ClusterBarrier))
 
+
+def scratch_bytes(family: "Family", scope: Scope) -> int:
+    """The shared memory a program of `scope` asks for besides its barriers, as Mosaic GPU's resource
+    estimate counts it (its `smem_scratch_bytes`): every array rounded up to `SMEM_ALIGNMENT`
+    (`allocated`), the walks the largest of them, the tiles scoped after the walks the larger of them and
+    the walks on a family that scopes its walks apart (`Family.walks_scoped`) and beside the program's
+    otherwise, and the family's reduction scratch where the program reduces (`Family.reduction_scratch`)."""
     def arrays(tree) -> list[int]:
         return [math.prod(leaf.shape) * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(tree)
-                if not barrier(leaf)]
+                if not _barrier(leaf)]
 
-    barriers = sum(_count(leaf.num_barriers) for tree in (scope.program, scope.walks)
-                   for leaf in jax.tree.leaves(tree) if barrier(leaf))
     sizes = arrays(scope.program)
     walks = [allocated(*arrays(walk)) for walk in scope.walks]
     after = [math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in scope.after]
@@ -198,7 +197,15 @@ def shared_bytes(family: "Family", scope: Scope) -> int:
     else:
         sizes += after
     scratch = [family.reduction_scratch] if scope.reduces and family.reduction_scratch else []
-    return allocated(*sizes, *scratch) + max([0, *walks]) + BARRIER_BYTES * barriers
+    return allocated(*sizes, *scratch) + max([0, *walks])
+
+
+def shared_bytes(family: "Family", scope: Scope) -> int:
+    """The shared memory a program of `scope` asks for: its scratch (`scratch_bytes`), then every
+    barrier (`BARRIER_BYTES`)."""
+    barriers = sum(_count(leaf.num_barriers) for tree in (scope.program, scope.walks)
+                   for leaf in jax.tree.leaves(tree) if _barrier(leaf))
+    return scratch_bytes(family, scope) + BARRIER_BYTES * barriers
 
 
 @dataclasses.dataclass(frozen=True)

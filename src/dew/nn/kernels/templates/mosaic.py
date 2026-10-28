@@ -591,11 +591,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def loaded(self, copies) -> None:
         """Each `(view, ref, barrier)` copied whole into its shared-memory `ref`."""
 
-    def output_columns(self, columns: int, dtypes) -> int:
-        """The columns of a `columns`-wide output tile a consumer stages in shared memory at once
-        (`persist`'s stores): the whole tile's, where a family stages it whole."""
-        del dtypes
-        return columns
+    def output_staging(self, outputs: tuple, consumers: int) -> list:
+        """The shared memory `persist` stages each of `outputs` (`(shape, dtype)`, a tile's) in, which a
+        template's allocations count as its own (`resources.Scope`): the whole tile, where a family stages
+        it whole."""
+        del consumers
+        return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
 
     def published(self) -> None:
         """A consumer's writes to shared memory made visible to the readers that read it asynchronously
@@ -784,9 +785,11 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         streamed(rings, tiles, lo, hi)
 
-    def output_columns(self, columns: int, dtypes) -> int:
-        # Two chunk buffers, not the whole tile (`output_staging`).
-        return math.prod(output_staging(columns, dtypes))
+    def output_staging(self, outputs: tuple, consumers: int) -> list:
+        # Each consumer's share of each output in two chunk buffers, not the whole tile (`output_staging`).
+        return [plgpu.SMEM((consumers, output_staging(shape[1], (dtype,))[1], shape[0],
+                            output_staging(shape[1], (dtype,))[0]), dtype)
+                for shape, dtype in outputs]
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
@@ -795,9 +798,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # share of each output in chunks (`output_staging`: two buffers of `staged_columns`) and stores each
         # by TMA, waiting only for a buffer's last store to read it before it writes it again.
         rings = self.opened(streams)
-        staging = [plgpu.SMEM((consumers, output_staging(shape[1], (dtype,))[1], shape[0],
-                               output_staging(shape[1], (dtype,))[0]), dtype)
-                   for shape, dtype in outputs]
+        staging = self.output_staging(outputs, consumers)
 
         def producer():
             @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))

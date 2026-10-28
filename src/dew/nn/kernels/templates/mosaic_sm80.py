@@ -224,7 +224,7 @@ class Mma(mosaic.Family):
                 pl.when(active)(lambda: consumer(0, tile, walk, store, active=True))
                 pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
 
-        pl.run_scoped(tiled, *(plgpu.SMEM(shape, dtype) for shape, dtype in outputs))
+        pl.run_scoped(tiled, *self.output_staging(outputs, consumers))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
