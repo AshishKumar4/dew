@@ -19,6 +19,7 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
+import inspect
 from typing import Any, ClassVar
 
 import jax
@@ -170,19 +171,25 @@ def gated_rms(out, z, weight, norm: OutputNorm):
     return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
 
 
+ROW = {"rows": True}
+"""A field's metadata where it holds an entry a row (`Step`'s; a decode launch keys its rows' count bucketed,
+`StepLaunch.ROWS`)."""
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class Gated:
     """The operands the hooks read beside the queries, keys and values, a decode token's (`Step`) and a
     chunked sequence's (`recurrence_chunk.Chunk`) alike, each None where its hook is off: the log
     decay, the gates' pre-activations, the write gate, the skip's `D`, the epilogue's gate and
-    weight, and a rated decay's rate. A value kind the hooks gain is a field here."""
-    log_decay: jax.Array | None = None
-    gate: jax.Array | None = None
+    weight, and a rated decay's rate. A value kind the hooks gain is a field here, an entry a row where its
+    metadata says so (`ROW`)."""
+    log_decay: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    gate: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     log_a: jax.Array | None = None
     bias: jax.Array | None = None
-    beta: jax.Array | None = None
+    beta: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     skip: jax.Array | None = None
-    z: jax.Array | None = None
+    z: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     weight: jax.Array | None = None
     rate: jax.Array | None = None
 
@@ -201,15 +208,16 @@ class Step(Gated):
     `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by `round_to_bf16`), or wider for the reference.
     `active` `[rows]` marks the rows that draw. A pytree
     of its arrays, so it crosses `jit` and a transformation as a token's operands do; the `Hooks` are
-    its static form."""
-    state: jax.Array
-    query: jax.Array | None = None
-    key: jax.Array | None = None
-    value: jax.Array | None = None
-    token: jax.Array | None = None
-    held: jax.Array | None = None
+    its static form. Its fields are the decode launch's operands and their names (`OPERANDS`, `StepLaunch`),
+    those an entry a row marked (`ROW`)."""
+    state: jax.Array = dataclasses.field(metadata=ROW)
+    query: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    key: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    value: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    token: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    held: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     taps: jax.Array | None = None
-    active: jax.Array | None = None
+    active: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
 
 
 def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, channels: int):
@@ -223,9 +231,8 @@ def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, ch
     return key_heads
 
 
-OPERANDS = ('state', 'query', 'key', 'value', 'token', 'held', 'taps', 'log_decay', 'gate', 'beta', 'log_a',
-            'bias', 'skip', 'z', 'weight', 'rate')
-"""`StepLaunch`'s array operands after `active`, in its order."""
+OPERANDS = tuple(field.name for field in dataclasses.fields(Step) if field.name != 'active')
+"""`StepLaunch`'s array operands beside `active`, by name: `Step`'s fields."""
 
 
 def _names(hooks: Hooks) -> tuple[str, ...]:
@@ -275,7 +282,8 @@ def _prologue(hooks: Hooks, given: dict, work):
         token, held = given['token'], given['held']
         key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
         window = jnp.concatenate([held.astype(token.dtype), token[:, None]], axis=1).astype(work)
-        pre = jnp.sum(window * jnp.swapaxes(given['taps'].astype(work), 0, 1)[None], axis=1)
+        taps = given['taps'].astype(work)
+        pre = short_conv.preactivation(list(jnp.swapaxes(window, 0, 1)), list(jnp.swapaxes(taps, 0, 1)), None)
         query, key, value = _split(_activated(pre, hooks.conv), key_heads, value_heads, key_width,
                                    value_width)
         # The history and the token, then all but the oldest: a one-tap conv holds none.
@@ -504,7 +512,7 @@ class _ConvRefs:
         streams = []
         for stream, (first, width) in zip(windows, self.pieces, strict=True):
             taps = [self.taps[pl.ds(first, width), j].astype(jnp.float32) for j in range(len(stream))]
-            pre = short_conv._preactivation(stream, taps, None)
+            pre = short_conv.preactivation(stream, taps, None)
             streams.append(pre if conv.activation is None
                            else pre * short_conv._sigmoid(pre, interpret=interpret))
         return tuple(x[0] for x in streams)
@@ -544,6 +552,18 @@ COLUMNS = Launch(32, 8)
 """The launch over value columns: 32 a program, 16 to 64 measured within 3% on an RTX 4080."""
 
 
+def _operands_named(fwd):
+    """`fwd` (`StepLaunch._fwd`) with its operands, `Step`'s fields (`OPERANDS`), named in its signature as
+    keyword arguments, which a launch's arguments bind to by name (`tuning`'s keys and stored launches)."""
+    parameter = inspect.Parameter
+    given = inspect.signature(fwd).parameters.values()
+    fwd.__signature__ = inspect.Signature([
+        *(each for each in given if each.kind is parameter.POSITIONAL_OR_KEYWORD),
+        *(parameter(name, parameter.KEYWORD_ONLY, default=None) for name in OPERANDS),
+        *(each for each in given if each.kind is parameter.KEYWORD_ONLY)])
+    return fwd
+
+
 @dataclasses.dataclass(frozen=True)
 class StepLaunch(tuning.KernelOp):
     """A decode token in one launch over rows and value heads (`_kernel`), its `hooks` inlined. Off a GPU
@@ -551,28 +571,21 @@ class StepLaunch(tuning.KernelOp):
 
     config_cls: ClassVar[type[Launch]] = Launch
 
-    ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay',
-                                       'gate', 'beta', 'z', 'state')
+    ROWS: ClassVar[tuple[str, ...]] = tuple(field.name for field in dataclasses.fields(Step)
+                                            if field.metadata.get('rows'))
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats and every row active, so a timed launch steps each row's state and history."""
         return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
                 for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
 
-    def _fwd(self, active: jax.Array, state: jax.Array, query: jax.Array | None, key: jax.Array | None,
-             value: jax.Array | None, token: jax.Array | None, held: jax.Array | None, taps: jax.Array | None,
-             log_decay: jax.Array | None, gate: jax.Array | None, beta: jax.Array | None,
-             log_a: jax.Array | None, bias: jax.Array | None, skip: jax.Array | None, z: jax.Array | None,
-             weight: jax.Array | None, rate: jax.Array | None, *, hooks: Hooks, dtype: str, interpret: bool,
-             config: Launch,
-             return_residuals: bool = False):
+    @_operands_named
+    def _fwd(self, active: jax.Array, *, hooks: Hooks, dtype: str, interpret: bool, config: Launch,
+             return_residuals: bool = False, **operands):
         from jax.experimental.pallas import triton as plgpu
 
-        arrays = {'state': state, 'query': query, 'key': key, 'value': value, 'token': token, 'held': held,
-                  'taps': taps, 'log_decay': log_decay, 'gate': gate, 'beta': beta, 'log_a': log_a,
-                  'bias': bias, 'skip': skip, 'z': z, 'weight': weight, 'rate': rate}
-        given = {name: arrays[name] for name in _names(hooks)}
-        rows, value_heads, key_width, value_width = state.shape
+        given = {name: operands[name] for name in _names(hooks)}
+        rows, value_heads, key_width, value_width = given['state'].shape
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
                      if hooks.conv is not None else given['query'].shape[1])
 
@@ -617,7 +630,7 @@ class StepLaunch(tuning.KernelOp):
         flags = pl.BlockSpec((None, 1), lambda r, h, c: (r, 0))
         in_specs = [flags, *(specs[name](given[name]) for name in given)]
         out_specs = [held_state]
-        out_shape = [jax.ShapeDtypeStruct(state.shape, state.dtype)]
+        out_shape = [jax.ShapeDtypeStruct(given['state'].shape, given['state'].dtype)]
         if hooks.conv is not None:
             out_specs.append(per_row(given['held']))
             out_shape.append(jax.ShapeDtypeStruct(given['held'].shape, given['held'].dtype))
@@ -714,8 +727,8 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     if 'log_decay' in given and hooks.decay == 'scalar':
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
     named = jnp.dtype(operand if dtype is None else dtype).name
-    # Positional, None where a hook is off.
-    state, *history, out = StepLaunch()(flags, *(given.get(name) for name in OPERANDS), hooks=hooks,
+    # By name, None where a hook is off.
+    state, *history, out = StepLaunch()(flags, **{name: given.get(name) for name in OPERANDS}, hooks=hooks,
                                         dtype=named, interpret=not triton_runs())
     return out, history[0] if history else None, state
 
