@@ -917,7 +917,8 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
         return run
 
     assert_as_exact(as_given(walked), as_given(source(torch.float32)), draw,
-                    "DDIM at eta 1 against Diffusers", seeds=WALK_SEEDS, truth_fn=as_given(source(torch.float64)))
+                    "DDIM at eta 1 against Diffusers", seeds=WALK_SEEDS,
+                    truth_fn=as_given(source(torch.float64)))
 
 
 def test_rk4s_update_divides_by_six_as_ieee_division_does():
