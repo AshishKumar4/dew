@@ -247,7 +247,7 @@ REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
-         "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64, "mlp": 64}
+         "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64, "mlp": 64, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 documents run alone compared with themselves resolve PARITY in every logit and parameter gradient (on
 armada). Mamba2's 8 heads of 32 over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a
@@ -365,7 +365,8 @@ POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "a
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}
 """Layer fields a kind needs to build at all, beyond the test's context."""
 
-ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory", "short_conv"}
+ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory",
+                  "short_conv"}
 """The registry's kinds that mix tokens without attention, whose layers' attention policies are not theirs."""
 
 
