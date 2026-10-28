@@ -399,11 +399,13 @@ key heads, value heads, key and value widths, and whether the decay is a key dim
 
 def _model(launch: mainloop.Launch, family: mosaic.Family) -> dict:
     """A launch's register model as the compile gate decides on it (`kernel_compile.decisions`): its stated
-    registers (`Launch.registers`) against its family's budget, one consumer role and the producer's beside
-    it where the family streams from a role of its own."""
-    producer = family.warpgroups(1) > 1
-    return {"registers": launch.registers, "budget": family.registers(1), "consumers": 1,
-            "most": family.programs(1), "producer": resources.PRODUCER_REGISTERS if producer else 0}
+    registers (`Launch.registers`) against its family's budget at its consumer roles (`Launch.consumers`, a
+    walk's `Tiles.walkers`), and the producer's beside them where the family streams from a role of its
+    own."""
+    roles = launch.consumers
+    producer = family.warpgroups(roles) > roles
+    return {"registers": launch.registers, "budget": family.registers(roles), "consumers": roles,
+            "most": family.programs(roles), "producer": resources.PRODUCER_REGISTERS if producer else 0}
 
 
 def compiled_cases(target: str, plans: dict, refused: list) -> list:
