@@ -12,8 +12,8 @@ from flax.typing import Dtype, PrecisionLike
 from dew import _records
 from dew.interop.weights import in_params
 from dew.nn.activations import HIDDEN_ACT
-from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record

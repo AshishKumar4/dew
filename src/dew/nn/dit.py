@@ -25,11 +25,12 @@ from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
 from .activations import gelu_exact_torch, gelu_tanh
-from .attention import LayerNorm, NormalAttention, QKNorm
+from .attention_blocks import NormalAttention, QKNorm
 from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .mlp import GatedMLP
+from .norms import LayerNorm
 from .precision import at_least_fp32, float32_dot_general, fp32_result_dot_general, weighted_total
 from .rope import rotary_freqs
 from .scan_orders import (

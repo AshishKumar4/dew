@@ -43,7 +43,6 @@ from dew.batch import coordinates
 from dew.interop.components import bind_component, component_source
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.weights import ParamTree, translate_parameters
-from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
@@ -52,6 +51,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
+from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import float32_dot_general
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype

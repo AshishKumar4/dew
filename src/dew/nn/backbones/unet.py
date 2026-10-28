@@ -9,10 +9,11 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from ..attention import GroupNorm, RMSNorm, Stage, stage_attention
+from ..attention_blocks import Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..conv import Conv
 from ..flops import MissingFlopsCount, patch_lengths
+from ..norms import GroupNorm, RMSNorm
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 

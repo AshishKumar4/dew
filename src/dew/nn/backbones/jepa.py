@@ -34,7 +34,6 @@ from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
 from dew.nn.scatter import gather_positions
 
-from ..attention import LayerNorm
 from ..dit import (
     ModulatedBlock,
     _JepaStackOptions,
@@ -43,6 +42,7 @@ from ..dit import (
     scan_ordered_pos_embed,
 )
 from ..flops import MissingFlopsCount, counted_flops, patch_lengths, projection_flops, real_lengths
+from ..norms import LayerNorm
 from ..scan_orders import ScanOrder
 from ..sharding import constrain, down_projection, explicit_spec, rows_like, rows_taken
 from .decoder_stack import pipelined_blocks, pipelines

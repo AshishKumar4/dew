@@ -345,7 +345,8 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     key folded by the layer, and a training call that drops with no key is refused."""
     from torchax.interop import jax_view, torch_view
 
-    from dew.nn.attention import causal_attention_mask, scaled_dot_product_attention
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.attention_masks import causal_attention_mask
     from dew.nn.kv_cache import write_cache
     from dew.nn.local_attention import compacted
     from dew.nn.visibility import windowed
@@ -1243,7 +1244,7 @@ class TorchCausalLM(nn.Module):
             raise TypeError("a tier-3 model has no cross-attention to read a context with")
         laid = self._laid(tokens, packing)
         if attention_key_runs is not None:
-            from dew.nn.attention import visibility_mask
+            from dew.nn.attention_masks import visibility_mask
 
             # The runs as the mask they state, the stated visibility this path reads.
             length = jnp.shape(tokens)[1]

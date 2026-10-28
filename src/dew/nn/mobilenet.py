@@ -22,9 +22,10 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.dropout import Dropout
 
 from .activations import gelu_tanh
-from .attention import RMSNorm, scaled_dot_product_attention
+from .attention import scaled_dot_product_attention
 from .blocks import torch_nearest_resize
 from .conv import Conv
+from .norms import RMSNorm
 from .sharding import logical_axes
 
 
