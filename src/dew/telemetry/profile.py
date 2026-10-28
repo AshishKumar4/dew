@@ -434,7 +434,7 @@ class Profiler:
         reasons = [] if failures else held_back(capture, metadata)
         metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
         metadata["capture_errors"] = [str(error) for error in failures]
-        metadata["capture_reasons"] = reasons
+        metadata["capture_reasons"] = [*reasons]
         try:
             _reports(capture, converter, metadata)
         except BaseException as error:
