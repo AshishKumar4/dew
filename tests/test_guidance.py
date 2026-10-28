@@ -267,3 +267,16 @@ def test_a_unit_scale_guides_to_the_conditional_prediction_exactly():
     scaled = (jnp.zeros((1, 1)), jnp.zeros((1, 1)), jnp.ones((1,)))
     _, moved = jax.jvp(guide, (least, -least, jnp.ones((1,), jnp.float32)), scaled)
     np.testing.assert_array_equal(np.asarray(moved), [[2.0 ** -125]])
+
+
+def test_an_integer_scale_guides_and_differentiates():
+    """An integer scale, CFG++'s 1 among them, guides as its float does and carries a tangent: the
+    gradient through it in the predictions is finite (ledger 1917)."""
+    from dew.sampling.guidance import guide
+
+    conditional, unconditional = jnp.asarray([[2.0]]), jnp.asarray([[1.0]])
+    for scale in (1, 3):
+        np.testing.assert_array_equal(np.asarray(guide(conditional, unconditional, scale)),
+                                      np.asarray(guide(conditional, unconditional, float(scale))))
+        gradient = jax.grad(lambda c, scale=scale: guide(c, unconditional, scale).sum())(conditional)
+        np.testing.assert_array_equal(np.asarray(gradient), [[float(scale)]])
