@@ -660,10 +660,10 @@ def test_a_streamed_split_reads_its_configurations_files_online_and_offline_alik
     monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **options: {
         "name": path, "type": "file", "size": 64, "blob_id": f"blob:{path}"})
     root = f"hf://datasets/owner/rows@{commit}/"
-    online = Hub("owner/rows", name="clean").files.urls
+    online = Hub("owner/rows", name="clean").files.url
     assert online == (root + "processed/clean-0.parquet",)
     offline(monkeypatch)
-    assert Hub("owner/rows", name="clean").files.urls == online
+    assert Hub("owner/rows", name="clean").files.url == online
 
 
 @pytest.mark.parametrize("listing, split, expected", [
