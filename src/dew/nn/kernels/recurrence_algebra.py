@@ -522,30 +522,20 @@ def tril_inverse(diagonal, index):
     return inverse + (index[:, None] == index[None, :])
 
 
-def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue) -> dict:
-    """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` of one chunk's `A = tril(beta_s (k_s . k_t)
-    exp2(g_s - g_t), -1)`, a decay a head: `system`'s blocks, inverted (`inverted`)."""
-    return inverted(system(keys, gates, lows, betas, columns, issue), issue)
-
-
-def system(keys: Load, gates, lows, betas, columns: int, issue: Issue, *,
-           laid: tuple | None = None) -> dict:
+def system(keys: Load, decay: Callable[[int, int], jax.Array], betas, count: int, columns: int,
+           issue: Issue) -> dict:
     """The blocks `{(i, j): [SUB, SUB]}` for `j <= i` of one chunk's `A = tril(beta_s (k_s . k_t) exp2(g_s -
-    g_t), -1)`, a decay a head: `keys(i, c)` sub-chunk `i`'s key column block `c` of `columns`, `gates`,
-    `lows` and `betas` each sub-chunk's prefix halves and write gates, fp32, and `laid` the halves `(gates,
-    lows)` as a column's vectors, where a mainloop's layouts keep a column's vector apart from a row's (Mosaic
-    GPU's, whose vectors are one or the other of a tile's). Every block of `k k^T` sums its column blocks'
-    products ('intra')."""
-    count = len(gates)
-    column_gates, column_lows = (gates, lows) if laid is None else laid
+    g_t), -1)` over its `count` sub-chunks, a decay a head: `keys(i, c)` sub-chunk `i`'s key column block `c`
+    of `columns`, `decay(i, j)` the pairs' decays from sub-chunk `j` to `i` and `betas` each sub-chunk's
+    write gates, fp32. Every block of `k k^T` sums its column blocks' products ('intra'): fla's kkt (the
+    GDN port's solve)."""
 
     def block(i, j):
         product = sum(issue("intra", keys(i, c), keys(j, c).T) for c in range(columns))
-        decay = decayed(gates[i], lows[i], column_gates[j], column_lows[j])
+        pairs = decay(i, j)
         if i == j:
-            lag = _lags(decay.shape)
-            decay = jnp.where(lag > 0, decay, 0.0)
-        return product * decay * betas[i][:, None]
+            pairs = jnp.where(_lags(pairs.shape) > 0, pairs, 0.0)
+        return product * pairs * betas[i][:, None]
 
     return {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
 
@@ -580,17 +570,22 @@ def doubled(a, issue: Issue):
     return inverse
 
 
-def inverted(blocks: dict, issue: Issue) -> dict:
+def inverted(blocks: dict, issue: Issue, *, neighbours_first: bool = False) -> dict:
     """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` from `A`'s strictly lower blocks `blocks`
     (the diagonal ones strictly lower themselves): forward substitution inverts each diagonal block
     (`tril_inverse`), and neighbouring inverses merge as `X_ij = -X_ii sum_m A_im X_mj` ('merge'), nearest the
-    diagonal first."""
+    diagonal first: fla's solve (chunk_fwd.py's for the gated delta rule). With `neighbours_first`, a pair of
+    neighbours merges as `-(X_ii A_ij) X_jj`, the product order fla's chunk_intra.py takes for Kimi delta
+    attention."""
     count = max(i for i, _ in blocks) + 1
     index = jnp.arange(blocks[0, 0].shape[0])
     inverse = {(i, i): tril_inverse(blocks[i, i], index) for i in range(count)}
     for distance in range(1, count):
         for i in range(distance, count):
             j = i - distance
+            if distance == 1 and neighbours_first:
+                inverse[i, j] = -issue("merge", issue("merge", inverse[i, i], blocks[i, j]), inverse[j, j])
+                continue
             inner = functools.reduce(jnp.add, (issue("merge", blocks[i, m], inverse[m, j])
                                                for m in range(j, i)))
             inverse[i, j] = -issue("merge", inverse[i, i], inner)
