@@ -20,14 +20,7 @@ import numpy as np
 import pytest
 from diffusion_support import SourceOracle, relative_gap, walk
 from flax import linen as nn
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    declared_seeds,
-    indexed_recording,
-    recording,
-)
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 from tool_support import run_from
 
 from dew.diffusion import (
@@ -314,9 +307,15 @@ def test_a_solvers_settings_reach_the_data(case, solver, steps):
     assert_reaches_its_data(case, solver, steps)
 
 
-FLAXDIFF = dict(np.load(Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "solvers.npz"))
-FLAXDIFF_ROUNDING = np.load(
-    Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "rounding.npz")
+FLAXDIFF = Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "solvers.npz"
+
+
+@functools.cache
+def writer(name: str):
+    """tools/`name`.py, whose seeded draw a recording's inputs are drawn again by, loaded as a script
+    from its directory."""
+    with run_from(name, "tools") as module:
+        return module
 
 
 @dataclass(frozen=True)
@@ -334,10 +333,10 @@ class StandIn:
 
 
 def flaxdiff_walk(solver, x_T):
-    """Every interval of the fixture's grid from `x_T`, with the reference's
-    stand-in denoiser read through the Karras schedule's own sigma."""
+    """Every interval of Dew's twelve-point grid, FlaxDiff's, from `x_T` in its precision, with the
+    reference's stand-in denoiser read through the Karras schedule's own sigma."""
     process, _ = karras_process()
-    times = jnp.asarray(FLAXDIFF["times"])
+    times = process.times(12).astype(x_T.dtype)
     denoise = StandIn(process)
 
     x, state = x_T, solver.init(x_T, times, process, key=jax.random.PRNGKey(0))
@@ -350,6 +349,19 @@ def flaxdiff_walk(solver, x_T):
     return jnp.stack(latents)
 
 
+def assert_on_par_with_flaxdiff(site: str, dew) -> None:
+    """`dew(inputs)`, Dew's leaves on a draw (its float64 truth too, run widened), on par with `site`'s
+    recording of FlaxDiff's own float32 run over its declared seeds (check 1), the recording's
+    float64 sketch holding the truth to FlaxDiff's float64 twin (`indexed_recording`)."""
+    seeds = declared_seeds(FLAXDIFF)[site]
+    draw, recorded, truth = indexed_recording(recording(FLAXDIFF), site, seeds,
+                                              inputs_of=writer("flaxdiff_solver_reference").draw,
+                                              truth_fn=dew)
+    compiled = jax.jit(dew)
+    assert_as_exact(lambda index, inputs: compiled(inputs), recorded, draw, site, seeds=seeds,
+                    truth_fn=truth)
+
+
 @pytest.mark.parametrize("name,solver", [("rk4", RK4()), ("multistep", MultiStepDPM())],
                          ids=["rk4", "multistep"])
 def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
@@ -357,31 +369,21 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     `generate_samples` (AshishKumar4/FlaxDiff@15c55b0, run as published by
     tools/flaxdiff_solver_reference.py) from the same x_T over the same
     twelve-point grid: eleven solver intervals, then the clean prediction
-    at the grid's last point. The output is held to FlaxDiff's float64 run
-    by the float64 rule, and, through the clip to [-1, 1] that FlaxDiff's
-    `post_process` applies as the pipeline's output step, to that run's
-    clipped images: the stand-in's clean predictions reach |x| = 3, so the
-    clip moves most entries and the unclipped comparison is the one that
-    reads the walk. RK4's clipped comparison averages 8192 independent
-    initial entries, since its pointwise stages give identical rounding
-    under pixel permutations. In a 64-copy pilot, every disjoint four-copy
-    subset stayed below ratio 0.98 on default, AVX and Ice Lake CPU codegen;
-    the chosen four copies reach 0.92. Its oracle widens FlaxDiff's timestep
-    casts too, so sigma arithmetic runs in float64."""
+    at the grid's last point, over the recorded seeds (check 1). The output
+    is held as it is and through the clip to [-1, 1] that FlaxDiff's
+    `post_process` applies as the pipeline's output step: the stand-in's
+    clean predictions reach |x| = 3, so the clip moves most entries and the
+    unclipped comparison is the one that reads the walk."""
     process, _ = karras_process()
-    closed = sample(StandIn(process), jnp.asarray(FLAXDIFF["x_T"]), 12, solver=solver, key=jax.random.key(0))
-    assert_as_exact_as_the_reference(closed, FLAXDIFF[f"{name}/closed"], FLAXDIFF[f"{name}/closed_f64"],
-                                     f"{name} closed")
-    assert float(np.abs(FLAXDIFF[f"{name}/closed_f64"]).max()) > 2
-    if name == "rk4":
-        def clipped(value):
-            return jnp.clip(sample(StandIn(process), value, 12, solver=solver, key=jax.random.key(0)), -1, 1)
-        actual = jax.jit(clipped)(jnp.asarray(FLAXDIFF_ROUNDING["x_T"]))
-        assert_as_exact_as_the_reference(actual, FLAXDIFF_ROUNDING["clipped"],
-                                         FLAXDIFF_ROUNDING["clipped_f64"], "rk4 clipped")
-    else:
-        assert_as_exact_as_the_reference(jnp.clip(closed, -1, 1), FLAXDIFF[f"{name}/clipped"],
-                                         FLAXDIFF[f"{name}/clipped_f64"], f"{name} clipped")
+
+    def closing(inputs):
+        x_T = jnp.asarray(inputs["x_T"])
+        closed = sample(StandIn(process), x_T, solver=solver, key=jax.random.key(0),
+                        times=process.times(12).astype(x_T.dtype))
+        return {"closed": closed, "clipped": jnp.clip(closed, -1, 1)}
+
+    assert_on_par_with_flaxdiff(f"{name} closed", closing)
+    assert float(jnp.abs(closing(writer("flaxdiff_solver_reference").draw(0))["closed"]).max()) > 2
 
 
 @pytest.mark.parametrize("name,solver", [("rk4", RK4()), ("multistep", MultiStepDPM())],
@@ -396,16 +398,16 @@ def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver):
     the last one through the walk, held to FlaxDiff's float64 run by the
     float64 rule. The grid is Dew's own `times(12)`."""
     process, _ = karras_process()
-    np.testing.assert_array_equal(process.times(12), FLAXDIFF["times"])
-    x_T = jnp.asarray(FLAXDIFF["x_T"])
-    latents = flaxdiff_walk(solver, x_T)
-    for step in range(latents.shape[0]):
-        assert_as_exact_as_the_reference(latents[step], FLAXDIFF[f"{name}/latents"][step],
-                                         FLAXDIFF[f"{name}/latents_f64"][step],
-                                         f"{name} after interval {step}")
-    (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x)[-1], x_T)[1](jnp.asarray(FLAXDIFF["cotangent"]))
-    assert_as_exact_as_the_reference(gradient, FLAXDIFF[f"{name}/grad"], FLAXDIFF[f"{name}/grad_f64"],
-                                     f"{name} gradient")
+    np.testing.assert_array_equal(process.times(12), recording(FLAXDIFF)["times"])
+
+    def walked(inputs):
+        x_T = jnp.asarray(inputs["x_T"])
+        latents = flaxdiff_walk(solver, x_T)
+        cotangent = jnp.asarray(inputs["cotangent"])
+        (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x)[-1], x_T)[1](cotangent)
+        return {**{f"after {index}": latent for index, latent in enumerate(latents)}, "gradient": gradient}
+
+    assert_on_par_with_flaxdiff(f"{name} walk", walked)
 
 
 @pytest.mark.parametrize("solver", [DDIM(), Euler()], ids=lambda s: type(s).__name__)
@@ -686,12 +688,6 @@ def test_empty_guidance_interval_generates_the_unguided_samples():
 EDM = Path(__file__).resolve().parent / "fixtures" / "edm" / "heun.npz"
 
 
-@functools.cache
-def edm_generator():
-    """tools/edm_reference.py, whose seeded draw the recorded inputs are drawn again by, loaded as a
-    script from its directory."""
-    with run_from("edm_reference", "tools") as module:
-        return module
 
 
 class EDMOracle(nn.Module):
@@ -735,7 +731,7 @@ def assert_walks_as_edm(name: str, *, final_denoise: bool) -> None:
                                  final_denoise=final_denoise)}
 
     seeds = declared_seeds(EDM)[name]
-    draw, recorded, truth = indexed_recording(stored, name, seeds, inputs_of=edm_generator().draw)
+    draw, recorded, truth = indexed_recording(stored, name, seeds, inputs_of=writer("edm_reference").draw)
     assert_as_exact(walked, recorded, draw, name, seeds=seeds, truth_fn=truth)
 
 
