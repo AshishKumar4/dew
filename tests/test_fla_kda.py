@@ -84,6 +84,29 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
                     truth_fn=jax.jit(run(recurrence)))
 
 
+@ON_A_GPU
+def test_the_keys_gradient_takes_the_gated_keys_range_under_a_steep_first_decay():
+    """The port's keys' gradient through its WY backward (`fla_kda.bwd_wy_dqkg`) over the range the forward
+    gates its keys by (`_w_u_kernel`), both prefix halves': one fp32 chunk whose first token's log decay is
+    -1e8 and every later one's near -0.02, so past the first token the rounded prefix holds none of the
+    later decays and only its remainder does. From the rounded prefix alone the gradient differentiated a
+    write the forward did not make (a key's gradient 1 where the write it gates decays by exp(-62 * 0.02),
+    row 2103). On par with the portable math from float64 on the draw (the gate's one-draw rule)."""
+    q, k, v, g, beta, h0, do, dht = support.delta_operands(0, 1, 64, 1, 1, 16, 16, per_key=True)
+    g = (-0.02 + 0.005 * jnp.tanh(g)).at[:, 0].set(-1e8)
+    drawn = (q, k, v, g, beta, h0, do, dht)
+
+    def key_gradient(rule, operands) -> np.ndarray:
+        *given, out_grad, final_grad = operands
+        # Its output, final memory, then the queries' and the keys' gradients.
+        return np.asarray(jax.jit(through(rule, out_grad, final_grad))(*given)[3], np.float64)
+
+    with jax.enable_x64(True):
+        exact = key_gradient(recurrence, widened(drawn))
+    assert_as_exact_as_the_reference(key_gradient(fla_rule, drawn), key_gradient(math, drawn), exact,
+                                     "fla_kda's keys' gradient under a steep first decay")
+
+
 BF16_LAYER_SEEDS = 64
 """The bf16 layer site's declared draws (`seeds_for`, paired: the port and the math read the same
 rounded projections, so their upstream rounding is shared)."""

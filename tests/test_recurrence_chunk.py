@@ -394,7 +394,8 @@ def test_the_peeled_transition_carries_the_peeled_memory_and_its_adjoint(packed,
         np.testing.assert_array_equal(np.asarray(found, np.float64), exact[name], err_msg=name)
 
 
-@pytest.mark.parametrize('shards', [3, 4])
+@pytest.mark.parametrize('shards', [pytest.param(3, marks=pytest.mark.mesh(devices=3)),
+                                    pytest.param(4, marks=pytest.mark.mesh(devices=4))])
 @pytest.mark.parametrize('dense', [True, False], ids=['dense', 'decay'])
 def test_each_shard_enters_with_the_spans_before_it_applied_in_turn(dense, shards):
     """The memory each shard of a sequence enters its span with across a mesh axis (`recurrence_algebra
