@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike, VariableDict
 
-from dew.batch import LAYER_SCALAR_COLLECTIONS
+from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.interop.unread import Stored
 from dew.interop.weights import Tree, translate_parameters
 from dew.nn.attention import RMSNorm

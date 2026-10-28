@@ -20,8 +20,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
-from dew._model_types import SANDWICH_NORMS
-from dew.batch import LAYER_SCALAR_COLLECTIONS
+from dew._model_types import LAYER_SCALAR_COLLECTIONS, SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout

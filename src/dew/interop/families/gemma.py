@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from flax.traverse_util import flatten_dict
 
 from dew import _records
-from dew.batch import LAYER_SCALAR_COLLECTIONS
+from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     FUSED_EXPERTS,

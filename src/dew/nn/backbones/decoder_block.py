@@ -15,8 +15,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew._records import JSON
-from dew.batch import LAYER_SCALAR_COLLECTIONS
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
