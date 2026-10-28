@@ -229,13 +229,14 @@ def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed):
     whose last row it holds, an example of no rows, or of a dropped last row, consumed by the next row
     kept, rows packed into windows or batched as they are; the batches together consume all 23."""
     from dew.batch import EXAMPLES_CONSUMED
-    from dew.data.pipeline import ObjectiveData
+    from dew.data.pipeline import ObjectiveData, Pack
 
     owed = consumed_by_row(23)
     chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)}))
-    chain = chain.pack(8) if packed else chain
-    loader = compile(chain.batch(BATCH), read="streamed",
-                     objective=ObjectiveData(train=(Fanned(), LastDropped())), examples=23)
+    # The objective packs the rows it makes into windows of up to four rows, as a decision objective does.
+    pack = Pack(9, fields=("text",)) if packed else None
+    objective = ObjectiveData(train=(Fanned(), LastDropped()), pack=pack)
+    loader = compile(chain.batch(BATCH), read="streamed", objective=objective, examples=23)
     stream = loader.train(DataPartition())
     total = 0
     try:
