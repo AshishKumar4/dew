@@ -15,7 +15,7 @@ from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
-from dew.data.pipeline import Configured, ObjectiveData, Rejected
+from dew.data.pipeline import Configured, ObjectiveData, Pipeline, Rejected
 from dew.data.plan import Manifest
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
@@ -1153,7 +1153,7 @@ def test_column_verbs_preserve_simultaneous_renames_and_selection(read):
 
 
 def _stamped(facts):
-    """A run-scoped step that writes the run's row count into each record."""
+    """A step that writes the row count its facts state into each record."""
     count = facts["rows"]
     return lambda row: {**row, "rows": np.int32(count)}
 
@@ -1193,6 +1193,41 @@ class _Noised(grain.RandomMapTransform):
 
     def random_map(self, element, rng):
         return {**element, "noise": int(rng.integers(0, 1000))}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_an_objectives_configured_step_over_a_mixture_binds_to_each_corpus_own_facts(read):
+    """An objective's configured step that neither draws nor expands runs on each corpus before the
+    mixture, bound to the facts that corpus states: corpora of 2 and 3 records, which share no row
+    count, each stamp their own."""
+    members = [Memory([{"size": np.int32(size)}] * size, identity=f"corpus {size}") for size in (2, 3)]
+    objective = ObjectiveData(train=(Configured(_stamped, needs=("rows",)),))
+    loader = compile(mix(members).batch(1), objective=objective, read=read, loading=READ)
+    stream = loader.train(DataPartition())
+    try:
+        batches = list(itertools.islice(stream, 10))
+    finally:
+        stream.close()
+    assert len(batches) == 10 and {int(batch["size"][0]) for batch in batches} == {2, 3}
+    for batch in batches:
+        np.testing.assert_array_equal(batch["rows"], batch["size"])
+
+
+def test_a_configured_step_states_whether_it_expands_and_binding_to_another_is_refused():
+    """As a configured step states that it draws, it states that it expands a record into several
+    (`Configured.expands`): one stated so reads each record as its expansion makes it, and one that
+    binds to an expansion unstated, or states one and binds to a map, is refused before it reads."""
+    rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(4)]))
+    doubled = compile(rows.map(Configured(lambda facts: _Doubled(), needs=(), expands=True)).batch(8),
+                      read="memory", loading=READ).train(DataPartition())
+    try:
+        assert sorted(next(doubled)["id"].tolist()) == [0, 0, 1, 1, 2, 2, 3, 3]
+    finally:
+        doubled.close()
+    for configured in (Configured(lambda facts: _Doubled(), needs=()),
+                       Configured(lambda facts: (lambda row: row), needs=(), expands=True)):
+        with pytest.raises(ValueError):
+            compile(rows.map(configured).batch(2), read="memory", loading=READ)
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed"])
