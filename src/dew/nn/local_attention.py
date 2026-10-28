@@ -28,6 +28,7 @@ from .attention import (
 from .documents import with_documents
 from .inputs import sequence_blocks
 from .kernels.selection import forced
+from .kernels.templates import attention as template
 from .sharding import HEADS, KV_HEADS, explicit_spec, manual_map, rows_like, rows_spec, sequence_shards
 from .visibility import same_chunk, visible
 
@@ -120,7 +121,7 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
         # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with
         # the documents, the valid keys, the sinks and the softcap as they are, no band and no mask.
-        runs = None if chunk is None else chunk_runs(places, query.shape[0], length, chunk)
+        runs = None if chunk is None else chunk_runs(places, segment_ids, query.shape[0], length, chunk)
         return whole(implementation=implementation, causal=True, sliding_window=window,
                      segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
@@ -193,17 +194,18 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     return checkpoint_name(out, 'attention_output')
 
 
-def chunk_runs(places, rows: int, length: int, chunk: int) -> jax.Array:
-    """Each query's run of keys `[lo, hi)` `[B, S, 1, 2]` int32 (`template.spans`' `runs`): its own chunk's
-    keys of `chunk` places at or before it, chunked attention's (`chunk_mask`, under causality). `places`
-    `[S]` or `[B, S]` are counted (`counted_places`), so a chunk's tokens in a document are consecutive
-    slots, and None is the row index; the documents bound a run that starts in the one before."""
-    place = jnp.arange(length) if places is None else jnp.asarray(places)
-    # The remainder in the places' own integers, then its slots: a wide place narrowed first would move it.
-    into = jnp.broadcast_to(jnp.atleast_2d(place % chunk), (rows, length)).astype(jnp.int32)
-    index = jnp.arange(length, dtype=jnp.int32)
-    first = jnp.maximum(index - into, 0)
-    return jnp.stack([first, jnp.broadcast_to(index + 1, first.shape)], axis=-1)[:, :, None, :]
+def chunk_runs(places, segment_ids, rows: int, length: int, chunk: int) -> jax.Array:
+    """Each query's run of keys `[lo, hi)` `[B, S, 1, 2]` (`template.spans`' `runs`): its own chunk's keys
+    of `chunk` places at or before it within its document, chunked attention's, as the template's spans
+    take a chunk (`template.spans`' `chunk`, the one algorithm), one interval a query, which every
+    mainloop walks. `places` `[S]` or `[B, S]`, None for the row index."""
+    positions = None
+    if places is not None:
+        place = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(places)), (rows, length))
+        positions = place, place
+    spans = template.spans(length, length, rows, causal=True, chunk=chunk, positions=positions,
+                           segment_ids=segment_ids)
+    return jnp.stack([spans.start, spans.end], axis=-1)[:, :, None, :]
 
 
 def compacted(attend, query, key, value, places, segment_ids, valid):

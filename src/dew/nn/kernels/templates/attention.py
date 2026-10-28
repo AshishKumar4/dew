@@ -180,8 +180,9 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     query's key intervals `[lo, hi)`, R of them, static, whose union it may see, intersected with all the
     rest: a window over `positions` is searched within each run alone, whose key places never decrease
     (its builder's contract: a layout whose places restart, as a decision row's options do, splits its
-    runs there), so the spans keep R intervals a query `[B, Q, R]`. Lengths and starts are int32 token
-    coordinates; places and ids keep their own dtypes."""
+    runs there), so the spans keep R intervals a query `[B, Q, R]`, but one run a query, which is one
+    interval `[B, Q]` as every mainloop walks it. Lengths and starts are int32 token coordinates; places
+    and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
     from dew.nn.visibility import block_ends, block_starts, window_sides
 
@@ -262,6 +263,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
             query_places, key_places = _widened(positions)
             by_places.append((key_places, _moved(query_places, -before), _moved(query_places, after)))
         start, end = _within_runs(jnp.asarray(runs, jnp.int32), start, end, keys, by_places)
+        if start.shape[-1] == 1:
+            start, end = start[..., 0], end[..., 0]
     blocks = True if causal and (block_groups is not None or image_groups is not None) else None
     narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
