@@ -117,6 +117,7 @@ def _beside(name: str):
 child_groups = _beside("child_groups")
 session = _beside("session")
 r2 = _beside("r2")
+watched = _beside("watched")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
@@ -166,7 +167,8 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
-          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py")
+          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
+          "tools/armada/watched.py")
 """The files every test file's key covers whole, beside every lock (a GPU node builds its environment
 from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
 and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
@@ -703,6 +705,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               "DEW_COLLECTED": str(collection)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
+    # Every data file the task's processes open, held from before pytest starts until its group stopped
+    # (`watched`): each is the input of every file the task runs.
+    opens = watched.Opens(os.getcwd())
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
 
@@ -723,6 +728,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
+    # A process of the group still running may yet open a file: no record of this task keeps a key.
+    closed = opens.closed()
+    opened = None if left else closed
     reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
@@ -777,16 +785,17 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:
         # A traced run's rows, timed under tracing, are no rows to reuse.
-        record(python, ran, executed_report, common, network)
+        record(python, ran, executed_report, common, network, opened)
     return 0
 
 
-def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False) -> None:
-    """Keep each row a task ran with the files its tests executed, where they read the backend and
-    its peak memory on a GPU and its children's pools: `gpu_tier` reads the reads, `gpu_needs` the
-    memory. A green row keeps
-    its key too, which `reused` reads it back by; a red row has none, so a later run never reuses
-    an earlier green row of its file."""
+def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False,
+           opened: set[str] | None = None) -> None:
+    """Keep each row a task ran with the files its tests executed and read, every data file the task's
+    processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
+    they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
+    reads, `gpu_needs` the memory. A green row keeps its key too, which `reused` reads it back by; a red
+    row has none, so a later run never reuses an earlier green row of its file."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return
@@ -796,6 +805,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
+        if ran["depends"] is not None:
+            ran = {**ran, "depends": None if opened is None else sorted({*ran["depends"], *opened})}
         if row_["exitCode"] == 0 and name not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None

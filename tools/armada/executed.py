@@ -8,12 +8,8 @@ is wrapped so that a path it opens relative to a directory descriptor is placed 
 Hidden directories (the checkout's .git and environments) and compiled bytecode are never inputs.
 
 A native reader raises no audit event (Rust's tokenizers and safetensors, tensorstore, a child's C
-code), so every directory under tests/ and src/ is watched for opens (`Opens`, inotify): each open of
-a file there, by any process, joins the record of the test file running as the watch is read, at each
-change of test file, so an open a thread makes after its file ended widens the next file's record,
-never narrows one. Where the watches could not all be set (fs.inotify.max_user_watches) or the
-kernel's queue overflowed, no record has a key: a record that saw some opens and not others would be
-partial (owner, 2026-10-27).
+code): the data files a task's processes open are its supervisor's to see (`watched`, held by
+`ci.py`'s `tested` around the whole run), each the input of every file the task ran.
 
 It counts a file once per test file through sys.monitoring's function-start event, disabled after
 the first and restarted at each test file, so it costs about nothing. What collection and
@@ -31,11 +27,9 @@ the files they execute, what session-scoped fixtures read is every file's, and w
 module's body, which runs once, as it is imported, is its own test file's too, and every file's
 before collection."""
 
-import ctypes
 import json
 import os
 import shutil
-import struct
 import sys
 import tempfile
 from multiprocessing.process import BaseProcess
@@ -110,56 +104,6 @@ def started(code, offset):
     return sys.monitoring.DISABLE
 
 
-class Opens:
-    """Every open of a data file under tests/ and src/ of the checkout at `root`, by any process, as inotify
-    reports it (`IN_OPEN` on each directory there): `drained` gives those since it was last read, relative to
-    the checkout. Python files are code, which the record takes from what runs, and a directory's own open
-    is a listing, which the audit hook places by who listed it (pytest's collection and the import system
-    are no file's input). `blind` where a directory could not be watched or the kernel's queue overflowed:
-    what was opened then is not known."""
-
-    OPEN, OVERFLOW, DIRECTORY = 0x20, 0x4000, 0x40000000
-    EVENT = struct.Struct("iIII")
-
-    def __init__(self, root: str) -> None:
-        self.blind = False
-        self.watched: dict[int, str] = {}
-        libc = ctypes.CDLL(None, use_errno=True)
-        self.fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
-        if self.fd < 0:
-            self.blind = True
-            return
-        for top in ("tests", "src"):
-            for directory, names, _ in os.walk(os.path.join(root, top)):
-                names[:] = [name for name in names if name != "__pycache__" and not name.startswith(".")]
-                watch = libc.inotify_add_watch(self.fd, directory.encode(), self.OPEN)
-                if watch < 0:
-                    self.blind = True
-                    return
-                self.watched[watch] = os.path.relpath(directory, root)
-
-    def drained(self) -> set[str]:
-        opened: set[str] = set()
-        while self.fd >= 0:
-            try:
-                data = os.read(self.fd, 1 << 16)
-            except BlockingIOError:
-                break
-            at = 0
-            while at < len(data):
-                watch, mask, _, length = self.EVENT.unpack_from(data, at)
-                start = at + self.EVENT.size
-                name = data[start:start + length].split(b"\0", 1)[0].decode()
-                at += self.EVENT.size + length
-                if mask & self.OVERFLOW:
-                    self.blind = True
-                elif watch in self.watched and name and not mask & self.DIRECTORY and not name.endswith(
-                        (".py", ".pyc")):
-                    opened.add(os.path.join(self.watched[watch], name))
-        opened.discard(str(DURATIONS))
-        return opened
-
-
 def conftest(name: str) -> bool:
     return Path(name).name == "conftest.py"
 
@@ -189,12 +133,6 @@ os.environ |= {CHILDREN: str(children), "DEW_EXECUTED_ROOT": root,
                "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
                "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, "")}
 followed.opening(lambda read: current[-1].add(read), root)
-opens = Opens(root)
-
-
-def settled() -> None:
-    """The opens since the watch was last read, the record running now's (`Opens`)."""
-    current[-1].update(opens.drained())
 
 
 sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
@@ -207,7 +145,6 @@ sys.addaudithook(audited)
 def pytest_runtest_protocol(item, nextitem):
     name = item.nodeid.split("::")[0]
     if not running or running[-1] != name:
-        settled()
         running[:] = [name]
         current[:] = [own.setdefault(name, set())]
         os.environ["DEW_EXECUTED_FILE"] = name
@@ -260,21 +197,18 @@ def pytest_fixture_setup(fixturedef, request):
     if fixturedef.scope != "session":
         yield
         return
-    settled()
     current.append(shared)
     readers.append(everywhere)
     sys.monitoring.restart_events()
     try:
         yield
     finally:
-        settled()
         current.pop()
         readers.pop()
         sys.monitoring.restart_events()
 
 
 def pytest_sessionfinish(session):
-    settled()
     sys.monitoring.set_events(TOOL, 0)
     out = os.environ.get("DEW_EXECUTED")
     if out:
@@ -284,7 +218,7 @@ def pytest_sessionfinish(session):
         recorded = {}
         for name, files in own.items():
             child = found.get(name, {"files": set(), "reads": set(), "peak": None, "shares": 0, "pools": 0})
-            whole = name not in spawned | lost and not opens.blind
+            whole = name not in spawned | lost
             # The share a process of this file takes: its own peak, or a child's that took its fraction.
             peaks = [held for held in (gpu_peak(), child["peak"]) if held is not None]
             peak = max(peaks) if len(own) == 1 and whole and peaks else None
