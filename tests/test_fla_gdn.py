@@ -285,12 +285,7 @@ def test_a_tokens_decay_gradient_sums_only_the_terms_through_it():
 def wy_math(k, v, beta, g, chunk=64):
     """`(w, u, inverse)` from `(k, v, beta, g)` through the inverse of `I + tril(beta k k^T
     exp2(g_s - g_t), -1)`, per chunk and head: the WY representation in whatever dtype it is given."""
-    batch, length, heads = k.shape[:3]
-
-    def chunks(x):
-        return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, heads, *x.shape[3:]), 3, 2)
-
-    kc, vc, bc, gc = chunks(k), chunks(v), chunks(beta), chunks(g)
+    kc, vc, bc, gc = (support.head_chunks(x, chunk) for x in (k, v, beta, g))
     decay = jnp.exp2(gc[..., :, None] - gc[..., None, :])
     lower = jnp.tril(jnp.einsum('bnhsk,bnhtk->bnhst', kc, kc) * decay * bc[..., :, None], -1)
     inverse = jnp.linalg.inv(jnp.eye(chunk, dtype=k.dtype) + lower)
