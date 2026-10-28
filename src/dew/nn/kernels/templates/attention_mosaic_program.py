@@ -342,13 +342,13 @@ class _Spans(NamedTuple):
 
 def reached(spec: algebra.Forward, queries: int) -> int | None:
     """The query and key pairs a call of `queries` queries (unpadded) reaches, by its form: every pair of a
-    full call; a causal call's, each query's keys up to its diagonal aligned to the last key (`algebra.seen`);
-    None for a spans call, whose pairs its arrays decide, which no launch states before it runs."""
+    full call; a causal call's, each query's keys up to its own place (`algebra.seen`'s `k_pos <= q_pos`,
+    the first key aligned to the first query); None for a spans call, whose pairs its arrays decide, which
+    no launch states before it runs."""
     if spec.form == "full":
         return queries * spec.keys
     if spec.form == "causal":
-        offset = spec.keys - queries
-        return sum(min(spec.keys, max(0, row + 1 + offset)) for row in range(queries))
+        return sum(min(spec.keys, row + 1) for row in range(queries))
     return None
 
 
