@@ -1,13 +1,17 @@
-"""Every option of the common run layer reaches what consumes it, in every kind of run (row 1901).
+"""Options of the common run layer reach what consumes them in every kind of run, part of row 1901.
 
 Seven of twenty defects a run's consumers found on GPUs were options a kind of run or the command line
 did not hand on (rows 1610, 1772, 1786, 1884, 1889, 1894, 1895). Every kind builds its objective, its
 data and its metrics from `RunConfig`'s fields (`prepare`), and trains through `RunConfig.train`, where
 alone the trainer, `fit`'s arguments, the checkpoints and the tracker are built from its
-`TrainerConfig`. So each kind here, a language model's, a decision's, a diffusion model's and a JEPA's,
-is set its options and observed where each acts: the scalars and the checkpoints its run writes, the
-state it ends on and the model it trains; and an option a kind builds nothing from is refused before
-it trains, rather than dropped. Nothing here reads a config's fields back."""
+`TrainerConfig`. Each kind here, a language model's, a decision's, a diffusion model's and a JEPA's, is
+set these and observed where each acts, in the scalars and checkpoints its run writes and the state it
+ends on: on the command line, its name and checkpoint directory, steps, accumulation, cadences of logs,
+evaluations and checkpoints, checkpoints kept, dynamic loss scale, learning rate, validation metrics and
+summaries; from Python, its key, data seed, mesh, layout and adapter. An option a kind builds nothing
+from (source options of a fresh model, a model name its source decides, process options its process
+does not carry) is refused before it trains, rather than dropped. The trainer's other options, each kind
+over, are row 1901's still. Nothing here reads a config's fields back."""
 
 import csv
 import dataclasses
@@ -161,7 +165,7 @@ def scalars(run: Path) -> dict[int, dict[str, float]]:
 
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_every_trainer_option_set_on_the_command_line_reaches_the_kinds_run(kind, tmp_path):
+def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(kind, tmp_path):
     """`dew train` over a kind's run.json with its options set (`--set`): four steps pooled two to an
     update commit at the second's and the fourth's end (`train/grad_norm`), under a dynamic loss
     scale (`train/loss_scale`) and the learning rate set (`train/learning_rate`); every step is
@@ -258,7 +262,8 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
     """XLA's flags, the compilation cache and the process pool are set before JAX opens a backend,
     as `run()` and `dew train` do: a run prepared and trained in a process that carries none of the
     one it states is refused before it trains, not trained without it."""
-    stated = {"xla_flags": "--xla_gpu_deterministic_ops=true",
+    # A flag value no lane sets (tests/lane_environment.py), so this process carries none of it.
+    stated = {"xla_flags": "--xla_dump_hlo_pass_re=run-options-1901",
               "compilation_cache_dir": str(tmp_path / "cache"), "multi_host": True}[option]
     run = KINDS[kind](tmp_path, drawn=False)
     trainer = TrainerConfig(**{"checkpoint_dir": str(tmp_path / "runs"), "steps": 1, "eval_every": None,

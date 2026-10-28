@@ -34,13 +34,13 @@ def apply_xla_flags(flags: str | None) -> None:
 
 
 def flags_hold(flags: str) -> bool:
-    """Whether every flag of `flags` holds in XLA_FLAGS as XLA reads it (`xla_flag`): the value its
-    last occurrence gives, a bare flag's 'true'."""
+    """Whether every flag of `flags` holds in XLA_FLAGS as XLA reads it (`xla_flag`): each read as XLA
+    reads `flags` alone, its last occurrence's value, a bare flag's 'true'."""
+    asked = {}
     for token in flags.split():
         name, equals, value = token.removeprefix("--").partition("=")
-        if xla_flag(name) != (value if equals else "true"):
-            return False
-    return True
+        asked[name] = value if equals else "true"
+    return all(xla_flag(name) == value for name, value in asked.items())
 
 
 def xla_flag(name: str) -> str | None:
