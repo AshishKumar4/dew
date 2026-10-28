@@ -380,16 +380,20 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
     # the routed ones, the padding among them, are a last group, whose tiles store zeros. A group's tiles
     # start at its first row (`tile_groups`), so a tile reads up to a tile's rows past the last group's
-    # first: every row-bearing operand is allocated to the schedule's extent (`row_extent`), zeros past
-    # its rows, which a group's stores never reach (a 128-row lhs of groups [120, 8] at 64-row tiles read
-    # rows 120 to 183 unpredicated on an A100, cp.async's loads).
+    # first. Where a family's loads past an operand's rows read zeros (`Family.bounded_loads`: TMA's) the
+    # operands stay as they are; elsewhere every row-bearing operand is allocated to the schedule's extent
+    # (`row_extent`), zeros past its rows, which a group's stores never reach (a 128-row lhs of groups
+    # [120, 8] at 64-row tiles read rows 120 to 183 unpredicated on an A100, cp.async's loads), as the
+    # interpreter's are, whose slices past an array clamp rather than read zeros. On an H100 that copy was a
+    # kernel of its own each call, 0.035 to 0.33 ms beside a dense product of 0.34 to 2.4 (BREAKDOWN1-h100:
+    # 0.33 ms of Llama 3 8B gate_up's 2.69 ms input gradient).
     lhs = rows_padded(lhs, 0, TMA_ROWS)
     m = lhs.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
     row_tile = tiles.block_m * tiles.cluster
     table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
-    extent = row_extent(m, row_tile)
+    extent = m if family_of(tiles, lhs.dtype).bounded_loads and not interpret else row_extent(m, row_tile)
     lhs = _rows_extended(lhs, 0, extent)
     prologue_operands = tuple(_side_extended(side, axes, extent)
                               for side, axes in zip(prologue_operands, prologue_axes, strict=True))
