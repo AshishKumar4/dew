@@ -4,7 +4,9 @@ A model's logits over a vocabulary, a classifier's over its classes, a decision'
 options and a sampler's over its next token are each a categorical distribution over the last axis.
 Every log-likelihood Dew takes of one composes on this module: the normalized log probabilities
 (`log_probs`), a label's cross entropy (`cross_entropy`), a soft target's (`soft_cross_entropy`), a
-divergence from a reference distribution (`kl_divergence`), the entropy (`entropy`), the divergence
+divergence from a reference distribution (`kl_divergence`), the entropy (`entropy`), the proper scoring
+rules' charges of a forecast against a target distribution beside the logarithmic one (`brier`,
+`spherical`, `ranked_probability`) and a target smoothed toward the even one (`smoothed`), the divergence
 among a group's members over the classes they share (`group_divergence`), and, for a head
 that reads its vocabulary in blocks (`dew.objectives.lm.chunked`), the running partition it combines
 block by block (`rescaled`), a label's cross entropy from it (`target_loss`) and the log partition of
@@ -28,9 +30,9 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew.nn.precision import at_least_fp32
 
-__all__ = ["cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative", "label_entry",
-           "log_probs", "partition", "probabilities", "rescaled", "segment_log_partition",
-           "soft_cross_entropy", "target_loss"]
+__all__ = ["brier", "cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative",
+           "label_entry", "log_probs", "partition", "probabilities", "ranked_probability", "rescaled",
+           "segment_log_partition", "smoothed", "soft_cross_entropy", "spherical", "target_loss"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -282,6 +284,41 @@ def entropy(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
     log_p = log_probs(logits, where)
     held = jnp.where(jnp.isneginf(log_p), 0.0, log_p)
     return -(jnp.exp(log_p) * held).sum(axis=-1)
+
+
+def smoothed(targets: jax.Array, where: jax.Array | None = None, share: float = 0.0) -> jax.Array:
+    """`targets` over the last axis with `share` of their mass spread evenly over the classes `where`
+    holds, `(1 - share) t_k + share / K` for a row of K classes, and nothing on the others."""
+    held = jnp.ones(targets.shape, bool) if where is None else where
+    count = jnp.sum(held, axis=-1, keepdims=True)
+    return jnp.where(held, (1.0 - share) * targets + share / count, 0.0)
+
+
+def brier(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
+    """The quadratic score as a charge, `sum_k (p_k - t_k)^2` over the last axis, between 0 and 2."""
+    p = probabilities(logits, where)
+    gaps = (p - targets) ** 2
+    return jnp.sum(gaps if where is None else jnp.where(where, gaps, 0.0), axis=-1)
+
+
+def spherical(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
+    """The spherical score as a charge, `1 - (t . p) / |p|` over the last axis, between 0 and 1."""
+    p = probabilities(logits, where)
+    return 1.0 - jnp.sum(targets * p, axis=-1) / jnp.linalg.norm(p, axis=-1)
+
+
+def ranked_probability(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
+    """The ranked probability score of classes that are ordered levels: the squared gaps between the
+    forecast's and the target's cumulative distributions over the K - 1 cuts between a row's K levels,
+    `sum_k (P_k - T_k)^2 / (K - 1)` over the last axis, the levels `where` holds leading the row."""
+    p = probabilities(logits, where)
+    held = jnp.ones(targets.shape, bool) if where is None else where
+    # The target's cumulative sum at the forecast's precision or wider, never a bfloat16 target's own.
+    target = jnp.where(held, targets, 0.0).astype(jnp.result_type(p.dtype, targets.dtype))
+    gaps = (jnp.cumsum(p, axis=-1) - jnp.cumsum(target, axis=-1)) ** 2
+    cuts = jnp.maximum(jnp.sum(held, axis=-1) - 1, 1)
+    # The last cut, past every level, is always zero.
+    return jnp.sum(jnp.where(held, gaps, 0.0), axis=-1) / cuts
 
 
 def group_divergence(logits: jax.Array, groups: jax.Array, classes: jax.Array,

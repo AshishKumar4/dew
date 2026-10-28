@@ -106,23 +106,30 @@ def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
     assert drawn[0] == drawn[1] == drawn[2]
 
 
+CLAUSES, HYPOTHESES = 24, 6
+"""The ragged rows' real options: one question of `CLAUSES` and `HYPOTHESES` of three. At three rows of 40,
+6 x 3 and 24 a window was 1504 tokens and 13 questions of 40 slots deep, and the site's 512 draws took 201-266
+s on armada (ledger 1851); at 24, 6 x 3 and 12, 1240 tokens, 0.45 s a draw with its float64 truth, 231.6 s
+at 512 (run-tests rows-memory-i); here two windows of short questions."""
+
+
 def ragged() -> list[Example]:
-    """Ragged rows: one question of forty options, six of three and one of twenty-four. A window's grid
-    is its bound's questions times forty slots, more than the 128 (`OPTION_TILE`) its real options
-    compact into."""
-    clauses = Choice("Which clause?", [f"c{index}" for index in range(40)])
-    hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(6)}
-    intents = Choice("Which intent?", [f"i{index}" for index in range(24)])
-    return [Example("a clause on fees", {"clause": clauses}, {"clause": "c7"}),
-            Example("a contract", hypotheses, dict.fromkeys(hypotheses, "unsaid")),
-            Example("book a flight", {"intent": intents}, {"intent": "i3"})]
+    """Ragged rows, each in a window of its own: one question of `CLAUSES` options and `HYPOTHESES` of three,
+    their questions' text short. A window's grid is its bound's questions times `CLAUSES` slots, more than
+    the 128 (`OPTION_TILE`) its real options compact into."""
+    clauses = Choice("c?", [f"c{index}" for index in range(CLAUSES)])
+    hypotheses = {f"h{index}": Choice(f"h{index}?", ["y", "n", "u"]) for index in range(HYPOTHESES)}
+    return [Example("fees", {"clause": clauses}, {"clause": "c7"}),
+            Example("deal", hypotheses, dict.fromkeys(hypotheses, "u"))]
 
 
 OPTION_SEEDS = 512
-"""The compacted-options site's declared draws, sized by `seeds_for` paired (both arms read the same head,
-states and cotangent, so their upstream rounding is shared): the head's scalar parameters, the prior's
-logit scale among them, take their gradient's error from one sum over every option, whose ratio to the
-reference's varies widely from draw to draw."""
+"""The compacted-options site's declared draws, the larger of two sizings by `seeds_for` paired, with its
+confirming block, on armada over two streams of draws, 256 and 512 (run-tests rows-memory-probe14-462cd0cea),
+as docs/design/testing.md's check 1 rules (d28b1c318); both arms read the same head, states and cotangent,
+so their upstream rounding is shared. The head's scalar parameters, the prior's logit scale among them,
+take their gradient's error from one sum over every option, whose ratio to the reference's varies widely
+from draw to draw. The site took 190.1 s at it."""
 
 ALGEBRAIC_ZEROS = ("to_k",)
 """The head's modules whose bias gradient is zero by algebra: a key's bias shifts every key's logit of a
@@ -201,14 +208,14 @@ def zeroed(tree):
 
 
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
-    """Rows of 40, 6 x 3 and 24 real options packed into windows of a grid as many questions deep as a
-    window holds, which the packing compacts into the slots its bounds allow. The compaction is the
-    joint head's alone (the backbone reads the rows' tokens, never their option slots), so the head is
-    what check 1 holds: over draws of the backbone's states and of a cotangent on each real option, its
-    every real option's logit and the gradients of its parameters, of the states and of the vocabulary
-    rows it reads are on par with the grid's from float64, the compaction only reordering the sums over
-    the grid's option slots. The backbone's own gradient is its backward of those states' gradient, one
-    program on both. The loss reads only the real options."""
+    """Rows of `CLAUSES` and `HYPOTHESES` x 3 real options, ragged, packed into two windows of a grid as
+    many questions deep as a window holds, which the packing compacts into the slots its bounds allow.
+    The compaction is the joint head's alone (the backbone reads the rows' tokens, never their option
+    slots), so the head is what check 1 holds: over draws of the backbone's states and of a cotangent
+    on each real option, its every real option's logit and the gradients of its parameters, of the
+    states and of the vocabulary rows it reads are on par with the grid's from float64, the compaction
+    only reordering the sums over the grid's option slots. The backbone's own gradient is its backward
+    of those states' gradient, one program on both. The loss reads only the real options."""
     examples = ragged()
     objective = ragged_objective(examples)
     data = decision_rows(examples, len(examples), examples, objective=objective.data())
@@ -216,16 +223,16 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
     options = np.asarray(slotted["options"])
     bounds = objective.bounds
-    assert options.shape[1:] == (bounds.questions, 40)
+    assert options.shape[1:] == (bounds.questions, CLAUSES)
     starts = np.asarray(slotted["spans"])[..., 0]
     owners = np.where(slotted["questions"], np.take_along_axis(slotted["segments"], starts, axis=1), 0)
     totals = [int(options[window][owners[window] == row].sum()) for window in range(len(options))
               for row in range(1, int(np.max(slotted["segments"][window])) + 1)]
-    assert sorted(totals) == [18, 24, 40]
+    assert sorted(totals) == sorted([CLAUSES, 3 * HYPOTHESES])
     # A window's real options compact into the slots its bounds allow, a multiple of 128.
     capacity = -(-bounds.options // 128) * 128
     compact = laid_out(slotted, bounds.segments)
-    assert compact.option_slots.shape == (len(options), capacity)
+    assert compact.option_slots.shape == (len(options), capacity) and capacity < bounds.questions * CLAUSES
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
     grid = laid_out(batch, bounds.segments)
     variables = objective.init(jax.random.key(0))

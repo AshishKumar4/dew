@@ -12,7 +12,6 @@ from pathlib import Path
 import jax
 import pytest
 
-from dew.devices import flags_hold
 from dew.training import prepare_process
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,15 +19,27 @@ STATED = "--xla_dump_hlo_pass_re=fusion=all --xla_dump_hlo_as_text"
 """Flags no lane sets (tests/lane_environment.py), one valued with an '=' of its own."""
 
 
-def test_a_flag_holds_as_xla_reads_it_its_last_occurrence_winning(monkeypatch):
+HOLDS = """
+import json, sys
+from dew.devices import flags_hold
+
+print(json.dumps([flags_hold(flags) for flags in sys.argv[1:]]))
+"""
+"""A fresh process, its backend never opened, asking whether each set of flags holds."""
+
+
+def test_a_flag_holds_as_xla_reads_it_its_last_occurrence_winning():
     """A flag holds where XLA would read the value asked of it: a later occurrence overrides an earlier
     one, in XLA_FLAGS and in the flags asked alike, a bare flag reads as true, and a value may hold
     an '='."""
-    monkeypatch.setenv("XLA_FLAGS", "--xla_dump_hlo_pass_re=x --xla_dump_hlo_as_text "
-                                    "--xla_dump_hlo_pass_re=fusion=all")
-    assert not flags_hold("--xla_dump_hlo_pass_re=x")
-    assert flags_hold(STATED)
-    assert flags_hold("--xla_dump_hlo_pass_re=x --xla_dump_hlo_pass_re=fusion=all")
+    env = {**os.environ, "XLA_FLAGS": "--xla_dump_hlo_pass_re=x --xla_dump_hlo_as_text "
+                                      "--xla_dump_hlo_pass_re=fusion=all",
+           "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
+    asked = ["--xla_dump_hlo_pass_re=x", STATED, "--xla_dump_hlo_pass_re=x --xla_dump_hlo_pass_re=fusion=all"]
+    done = subprocess.run([sys.executable, "-c", HOLDS, *asked], capture_output=True, text=True, env=env,
+                          cwd=ROOT, check=False)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == [False, True, True]
 
 
 def test_flags_that_do_not_hold_after_the_backend_opened_are_refused_where_the_process_is_prepared(
@@ -72,3 +83,35 @@ def test_a_process_started_with_its_runs_flags_is_prepared_again_after_its_backe
     assert done.returncode == 0, done.stderr
     kept = json.loads(done.stdout.strip().splitlines()[-1])
     assert kept == {"pass": "fusion=all", "text": "true", "cache": cache}
+
+
+SET_LATE = """
+import json, os, sys
+import dew
+import jax
+from dew.training import prepare_process
+
+flags = sys.argv[1]
+jax.devices()
+os.environ["XLA_FLAGS"] = f"{os.environ.get('XLA_FLAGS', '')} {flags}".strip()
+try:
+    prepare_process(xla_flags=flags)
+except ValueError:
+    print(json.dumps("refused"))
+else:
+    print(json.dumps("prepared"))
+"""
+"""A fresh process whose backend opened without the run's flags, which then writes them into its
+environment itself and prepares with them."""
+
+
+def test_flags_written_into_the_environment_after_the_backend_opened_do_not_hold(tmp_path):
+    """The backend read its flags as it opened; flags written into the environment after that match
+    the environment and nothing the backend runs with, so preparing with them is refused (row 1984).
+    Before, the environment alone was read, and the run went on without them."""
+    env = {**os.environ, "XLA_FLAGS": os.environ.get("XLA_FLAGS", ""),
+           "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
+    done = subprocess.run([sys.executable, "-c", SET_LATE, STATED], capture_output=True, text=True, env=env,
+                          cwd=ROOT, check=False)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == "refused"

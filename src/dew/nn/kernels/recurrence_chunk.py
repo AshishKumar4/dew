@@ -920,7 +920,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     from .templates.recurrence import mainloop, template
 
     dtype = jnp.result_type(query, key, value)
-    query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
+    query, key, value = (x.astype(dtype) for x in (query, key, value))
+    # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
+    # call's own, as the portable math takes it (Mamba-2's fp32 `dt`).
+    beta = beta.astype(dtype) if delta else beta
     g = g.astype(jnp.float32)
     # Interpreted off a GPU (an assumed one's calls lower for it); a GPU no bundle claims runs no launch.
     device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'

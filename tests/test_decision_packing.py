@@ -229,7 +229,8 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     test_fla_kda)."""
     objective = objective_for(arm)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
-                                          objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm])
+                                          objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm],
+                              PACKING_WINDOWS.get(arm, 2))
 
 
 def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
@@ -292,12 +293,16 @@ def rows_alone(decide, batch):
     return np.concatenate([logits[place] for place in every]), grads
 
 
-PACKING_SEEDS = {"joint": 256, "marker": 256, "parallel": 256, "flash": 8, "readout": 8}
+PACKING_SEEDS = {"joint": 256, "marker": 64, "parallel": 256, "flash": 8, "readout": 8}
 """Check 1's declared seeds for each arm's packed window: the most paired sizing (`seeds_for` with the
 packed window as `dew_fn`) gives on any platform the site runs on. An H100 took 256 for the joint arm
-and 128 for the marker and parallel arms (node receipts TL-h100-packing-size-*-3), an A100 128 for the
-joint arm and 256 for the marker and parallel arms (SF-a100-packing-seeds), armada 16, 8 and 8 (run-tests
-sf-packing-cpu-sizing-898ec4ac6); the flash arm's is an A100's, and the readout arm's 8 is an A100's
+and 128 for the parallel arm (node receipts TL-h100-packing-size-*-3), an A100 128 for the joint arm
+and 256 for the parallel arm (SF-a100-packing-seeds), armada 16 and 8 (run-tests
+sf-packing-cpu-sizing-898ec4ac6). The marker arm's one window a draw (`PACKING_WINDOWS`) took 64 on an
+H100, 32 on an A100 (node receipts TL-h100-sizing-1851-679, TL-a100-sizing-1851-679) and 8 on armada
+(run-tests rows-memory-probe12-8ce8072b5), each with its confirming block, the largest declared as
+docs/design/testing.md's check 1 rules (d28b1c318);
+the flash arm's is an A100's, and the readout arm's 8 is an A100's
 (SF-readout-sizing), an H100's and armada's. The A100's are the head's gradients whose float64
 truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the marker and parallel arms'
 scorer_out bias, shared by a question's options, and the joint arm's attention key biases (ledger
@@ -305,12 +310,18 @@ scorer_out bias, shared by a question's options, and the joint arm's attention k
 each draw twice the work."""
 
 
-def assert_rows_decided_alone(objective, wide_modules, seeds: int) -> None:
-    """Two packed windows of the examples decide each row's questions as the row does alone where its
-    window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
+PACKING_WINDOWS = {"marker": 1}
+"""The packed windows a draw holds where an arm's site takes fewer than two: the marker arm's one window
+packs several rows, and its draw at two windows took 0.50 s on armada against 0.31 at one, where the
+256 draws two windows took on an A100 brought it past the suite's 240 s a test (ledger 1851)."""
+
+
+def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 2) -> None:
+    """`count` packed windows of the examples decide each row's questions as the row does alone where
+    its window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
     over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
     in windows of their own."""
-    batch = windows(objective, 2)
+    batch = windows(objective, count)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
     # more sequence (`dew.nn.attention.flash_attention`).

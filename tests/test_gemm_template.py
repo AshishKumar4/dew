@@ -493,6 +493,57 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
                         "dense 65x40x100 gradients", seeds=SEEDS, truth_fn=with_gradients(truth))
 
 
+def test_a_named_kernel_runs_the_calls_derivative_too():
+    """A grouped product traced on an A100 within `generation.chosen(grouped_matmul='xla')`, its pullback
+    run after the block closes, as MoE's implementation='xla' scopes only its own call: every grouped
+    dispatch its gradient reports runs XLA's program, the kernel the call named (train 243's review), not
+    the launches an unnamed call would select."""
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.normal(size=(ROUTED, DEPTH)), jnp.bfloat16)
+    w = jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, WIDTH)), jnp.bfloat16)
+    with generation.assumed("sm80"), generation.routes() as found:
+        with generation.chosen(grouped_matmul="xla"):
+            y, pull = jax.vjp(lambda x, w: template.gemm(x, w, jnp.asarray(SIZES), out_dtype=jnp.bfloat16), x, w)
+        pull(jnp.ones_like(y))
+    assert {route.kernel for route in found if route.choice == "grouped_matmul"} == {"xla"}
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_dense_layers_product_through_the_template_holds_check_1(generation_name):
+    """A model's projection, `dew.nn.dense.Dense` over `[batch, sequence, width]` rows with its product as
+    GatedMLP and GatedDeltaNet form it (`float32_dot_general`), through the GEMM template's dense product
+    (`template.dot_general`; its launches named, as a dense cell declares XLA's dot faster): the output and
+    the gradients of the rows, the kernel and the bias hold check 1 from float64 against the same layer
+    run on XLA's dot."""
+    from dew.nn.dense import Dense
+    from dew.nn.precision import float32_dot_general
+
+    layer = Dense(128, dot_general=float32_dot_general, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(2, 64, 256)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(256, 128)) / 16, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(128,)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(2, 64, 128)), jnp.bfloat16))
+
+    def projected(x, kernel, bias):
+        return layer.apply({"params": {"kernel": kernel, "bias": bias}}, x)
+
+    def on_xla(x, kernel, bias):
+        with generation.chosen(grouped_matmul="xla"):
+            return projected(x, kernel, bias)
+
+    def truth(x, kernel, bias):
+        wide = jnp.float64
+        return jnp.dot(x.astype(wide), kernel.astype(wide)) + bias.astype(wide)
+
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
+        assert_as_exact(jax.jit(with_gradients(projected)), jax.jit(with_gradients(on_xla)), draw,
+                        f"dense layer through the template on {generation_name}", seeds=SEEDS,
+                        truth_fn=with_gradients(truth))
+
+
 def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
     """A draw of a dense product's bf16 operands, `[rows, depth]` and `[depth, width]`, and with
     `cotangent` a bf16 cotangent of its bf16 output."""
