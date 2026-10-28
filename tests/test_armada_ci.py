@@ -1160,6 +1160,14 @@ def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkey
     assert run() == {"heavy": 6, "light": 2}
 
 
+def green_runs(ci, monkeypatch, root: Path, verdict, policy: str, names: tuple[str, ...]) -> list[int]:
+    """One armada task of the checkout at `root` under `policy`, every row green: how many times each of
+    `names`' tests has run so far (its runs-NAME file, a mark per run)."""
+    rows = armada_task(ci, monkeypatch, verdict, policy)
+    assert [row["exitCode"] for row in rows] == [0] * len(names)
+    return [len((root / f"runs-{name}").read_text()) for name in names]
+
+
 def commit(root: Path, message: str) -> str:
     """Checkout `root`'s changes committed, and the commit's sha: every file at the first, which makes the
     repository, and the tracked and staged changes after, so what a run leaves in the checkout stays out."""
@@ -1210,9 +1218,7 @@ def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, mon
     base = commit(tmp_path, "base")
 
     def run(policy: str | None = None) -> list[int]:
-        rows = armada_task(ci, monkeypatch, verdict, policy or ci.policy(base))
-        assert [row["exitCode"] for row in rows] == [0, 0]
-        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("reader", "other")]
+        return green_runs(ci, monkeypatch, tmp_path, verdict, policy or ci.policy(base), ("reader", "other"))
 
     assert run() == [1, 1]
     (tmp_path / ".github/workflows/ci.yml").write_text("name: CI, again\n")
@@ -1253,9 +1259,7 @@ def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, m
     base = commit(tmp_path, "base")
 
     def run() -> list[int]:
-        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
-        assert [row["exitCode"] for row in rows] == [0, 0]
-        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("plain", "sized")]
+        return green_runs(ci, monkeypatch, tmp_path, verdict, ci.policy(base), ("plain", "sized"))
 
     assert run() == [1, 1]
     assert run() == [1, 1]
@@ -1282,9 +1286,7 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
     base = commit(tmp_path, "base")
 
     def run() -> list[int]:
-        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
-        assert [row["exitCode"] for row in rows] == [0, 0]
-        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("first", "second")]
+        return green_runs(ci, monkeypatch, tmp_path, verdict, ci.policy(base), ("first", "second"))
 
     assert run() == [1, 1]
     (tmp_path / "tools/first.py").write_text("VALUE = 2\n")
