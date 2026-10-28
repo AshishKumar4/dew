@@ -54,6 +54,7 @@ from dew.interop.decoder_parts import (
     held_parts,
     hf_activation,
     modeling_overrides,
+    part_plan,
     record_float,
     record_int,
     refuse,
@@ -905,14 +906,12 @@ def read_decoder(
             continue
         stored = held(part.tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
-        # torch Linear holds [out, in]; a stacked expert kernel arrives
-        # [E, in, out], which is the layout dew keeps.
-        insert(
-            variables,
-            path,
-            SourceLeaf((stored,), dtype, transposed=path[-1] == "kernel" and stored.ndim == 2),
-            name,
-        )
+        # The part's plan (`part_plan`): torch Linear holds [out, in]; a stacked expert kernel arrives
+        # [E, in, out], which is the layout dew keeps. Each expert's slice goes in at its own path
+        # until `_stack_experts` stacks them.
+        plan = part_plan(part, stored, family)
+        transposed = plan is not None and plan.order is not None
+        insert(variables, path, SourceLeaf((stored,), dtype, transposed=transposed), name)
     _stack_experts(params)
     return (variables if lazy else materialize(variables)), readings
 

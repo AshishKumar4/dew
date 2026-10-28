@@ -23,7 +23,7 @@ from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead
 from dew.decision.layout import MarkerLayout, Specials
 from dew.decision.model import DecisionModel
-from dew.interop.decoder_parts import Packed, joined_packed
+from dew.interop.decoder_parts import Packed, packed_layouts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, save_sharded
 from dew.lora import FACTORS
 from dew.registry import from_record
@@ -169,9 +169,9 @@ def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
         return f"{module}.{torch_leaf}"
 
     variables = {"params": params}
-    layouts = native_layouts(variables, name_of, in_params(_head_path))
-    tensors = {layout.name: layout.export(variables) for layout in layouts}
-    return joined_packed(tensors, IN_PROJ)
+    layouts = packed_layouts({layout.name: layout for layout in native_layouts(
+        variables, name_of, in_params(_head_path))}, IN_PROJ)
+    return {name: layout.export(variables) for name, layout in layouts.items()}
 
 
 def _token(value: object, name: str) -> int:
