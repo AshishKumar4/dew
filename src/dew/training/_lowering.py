@@ -29,7 +29,6 @@ import logging
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import cast
 
 import jax
 from jax.extend.mlir import ir
@@ -160,15 +159,13 @@ def _kernel_name(location: ir.Location) -> str | None:
 
 
 def _named(location: ir.Location) -> str | None:
-    """The name a location carries: a name location's own, a call site's callee's, or the first of a fused
-    location's parts that carries one; None where none does."""
+    """The name a location carries, as JAX lowers an equation's (`mlir._source_info_to_location`): a name
+    location's own (its name stack), or a call site's callee's (a traceback without a name stack); None
+    where it carries none."""
     if location.typeid == ir.NameLoc.static_typeid:
         return ir.NameLoc(location).name_str
     if location.typeid == ir.CallSiteLoc.static_typeid:
         return _named(ir.CallSiteLoc(location).callee)
-    if location.typeid == ir.FusedLoc.static_typeid:
-        parts = cast("list[ir.Location]", ir.FusedLoc(location).locations)
-        return next((name for name in map(_named, parts) if name is not None), None)
     return None
 
 
