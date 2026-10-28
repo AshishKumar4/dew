@@ -104,6 +104,12 @@ class Mma(mosaic.Family):
         return cls(jnp.dtype(dtype), m_warps)
 
     @property
+    def transposed_rows(self) -> int:
+        # MMA_LHS's first row tile is m_warps * 16. The old 64-row requirement predated the 2x2 warp
+        # split (MWARPS2); its 32-row tile lowers and keeps the gradient's output tile square (BC-A100-DW32).
+        return self.m_warps * 16
+
+    @property
     def lhs_copies(self) -> int:
         return 4 // self.m_warps
 

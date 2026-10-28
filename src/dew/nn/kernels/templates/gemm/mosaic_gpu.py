@@ -423,7 +423,10 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                    jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
         table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
-    extent = m if family_of(tiles, lhs.dtype).bounded_loads and not interpret else row_extent(m, row_tile)
+    # Dense tiles start on their own row grid, so only the last tile can overread. The grouped extent
+    # adds an almost-whole tile even at aligned rows, forcing a copy on mma.sync (BC-A100-EXTENT-AB1).
+    extent = (m if family_of(tiles, lhs.dtype).bounded_loads and not interpret else
+              -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile))
     lhs = _rows_extended(lhs, 0, extent)
     prologue_operands = tuple(_side_extended(side, axes, extent)
                               for side, axes in zip(prologue_operands, prologue_axes, strict=True))

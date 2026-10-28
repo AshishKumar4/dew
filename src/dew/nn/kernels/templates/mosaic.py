@@ -403,6 +403,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     Hopper: `mosaic_sm80.Mma.persist`), so its epilogue holds its share of the stored tile beside the
     accumulator (`resources.tile_registers`)."""
     @property
+    def transposed_rows(self) -> int:
+        """The row unit of a step read as a transposed MMA operand: a role's rows unless its register
+        layout permits a smaller atom."""
+        return self.role_rows
+
+    @property
     def lhs_copies(self) -> int:
         """The warps of a role each holding the left operand's fragment for the same rows (mma.sync's warps
         along a tile's columns, JAX's `MMALayouts`' `lhs` replicated over them): one, unless replicated."""
