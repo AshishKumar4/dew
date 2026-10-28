@@ -29,10 +29,10 @@ from dew.nn.precision import (
     L2NORM_EPS,
     at_least_fp32,
     compensated_add,
-    float32_einsum,
     float32_products,
     l2norm,
     products_dtype,
+    rms_statistics,
     stochastic_bf16,
 )
 
@@ -128,31 +128,18 @@ def round_to_bf16(state, key, value):
     return stochastic_bf16(state, mixed ^ (mixed >> 16))
 
 
-def update(state, query, key, value, decay, write, *, delta: bool, in_kernel: bool = False):
+def update(state, query, key, value, decay, write, *, delta: bool):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` per key dimension `[...,
     Dk]` (`exp(g)`) and `write` the write gate, broadcast against the values `[..., Dv]`: its output
     `[..., Dv]` and the updated state.
-    Under the delta rule both readouts are products with the old state, `(q decay)^T S + (q . k) d` with
-    `d = write (v - (k decay)^T S)`, so one pass over the state serves them and the write; without it the
-    output reads the updated state, `q^T S'` (row 1859). `q . k` is a product (`float32_einsum`), summed
-    as Dew sums one, not a reduction whose order XLA chooses by the shape it is batched at: under a skip
-    that cancels it (`(q . k) write` against `D`), a reduction a token at a time and the same in the
-    portable rule's batched adjoint rounded a last bit apart, which put the portable gradient's cancelled
-    row 4.9 times the token
-    recurrence's distance from float64 (test_recurrence_stability's rated site under resets on chunk
-    edges, seed 6). A kernel's body (`in_kernel`, the fused step's) sums it in its own registers, where
-    Pallas's Triton lowering takes no platform-dependent product."""
+    The output reads the updated state, `q^T S'`, as the recurrence states it, with the delta rule and
+    without: the one-pass form `(q decay)^T S + (q . k) write (v - (k decay)^T S)` overflowed where
+    `q^T S'` stays finite, its `q . k` past fp32's largest at keys and queries of 2^80 against a write of
+    2^-80 (rows 1859 and 1962)."""
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
     written = corrected * write
     updated = state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
-    if not delta:
-        # Without the delta rule the output reads the updated state, `q^T S'`, as the recurrence states it:
-        # `(q . k) (write v)` overflowed where `q^T S'` stays finite (`q . k` past fp32's largest at keys
-        # and queries of 2^80 against a write of 2^-80, row 1859).
-        return jnp.sum(query[..., :, None] * updated, axis=-2), updated
-    read_query = jnp.sum((query * decay)[..., :, None] * state, axis=-2)
-    score = (jnp.sum(query * key, axis=-1) if in_kernel else float32_einsum('...d,...d->...', query, key))
-    return read_query + score[..., None] * written, updated
+    return jnp.sum(query[..., :, None] * updated, axis=-2), updated
 
 
 def _held(updated, key, value, dtype):
@@ -178,9 +165,9 @@ def gated(gates: Gates, gate, log_a, bias, beta):
 
 
 def gated_rms(out, z, weight, norm: OutputNorm):
-    """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`,
-    the mean a product by the reciprocal, as XLA's."""
-    inverse = jax.lax.rsqrt(jnp.sum(out * out, axis=-1, keepdims=True) * (1.0 / out.shape[-1]) + norm.epsilon)
+    """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`, its
+    inverse RMS the one statistic every norm takes (`rms_statistics`)."""
+    inverse = rms_statistics(out, norm.epsilon)[1]
     return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
 
 
@@ -449,7 +436,7 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
             write_gate = scalar('beta') if hooks.gated_write else jnp.ones((1,), jnp.float32)
         decay = jnp.broadcast_to(decay, key.shape)
         out, updated = update(state_ref[...].astype(jnp.float32), query, key, value, decay, write_gate,
-                              delta=hooks.delta, in_kernel=True)
+                              delta=hooks.delta)
         if hooks.skip:
             out = out + scalar('skip') * value
         if hooks.output is not None:

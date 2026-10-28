@@ -18,16 +18,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from lm_support import token_batch_of
 from model_support import TINY_DECODER
 from reference_error import assert_as_exact
 from test_lm_objective import assert_as_exact_over_instances, written_cross_entropy
-from token_support import token_batch_of
 
-from dew.batch import coordinates
+from dew.batch import TEXT_KEY, coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 
 VOCAB = 37

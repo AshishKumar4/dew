@@ -79,7 +79,9 @@ class Tiles:
     and the instruction family's bundle that runs it (`family`: Hopper's warpgroup MMA, or Ampere's
     mma.sync, one warpgroup whose loads `emit_pipeline` issues, the plain product alone); and the programs
     a multiprocessor runs at once (`programs`, at most its family's, `mosaic.Family.programs`), each in its
-    share of the multiprocessor's shared memory (`resources.program_shared`)."""
+    share of the multiprocessor's shared memory (`resources.program_shared`); and the slices a kernel
+    gradient's contraction splits into (`splits`, `tgmm`: each group's rows in that many runs of whole steps,
+    each run's fp32 partial summed after), where its output tiles underfill a wave (`split_count`)."""
     block_m: int
     block_n: int
     block_k: int
@@ -89,6 +91,7 @@ class Tiles:
     cluster: int = 1
     family: str = 'wgmma'
     programs: int = 1
+    splits: int = 1
 
     def __post_init__(self):
         paired = self.cluster == 2 and self.warpgroups == 1
@@ -107,14 +110,16 @@ class Tiles:
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
 
 
-def derived(family, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, holds,
-            grouped: bool) -> Tiles | None:
+def derived(family, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
+            candidate, launch_of, grouped: bool) -> Tiles | None:
     """The one tile a GEMM mainloop runs on `family` for a call whose output has `rows` rows (a group's,
     on average, where `grouped`: a product's rows split among its groups) and `width` columns and whose
     steps run over `depth` (None: a group's rows, padded to whole steps), from the family's facts, the
     call's extents and the device's multiprocessors alone (no table, no ranking;
-    docs/design/kernel-templates.md §7). `holds(tile)` is the launch's legality on the device (its
-    staged bytes within a block, its registers within a consumer's: `Template.legal`).
+    docs/design/kernel-templates.md §7). `candidate(tile)` is the launch's legality apart from its
+    resources (its granularity, its blocks dividing the call, its side operands' copies), and
+    `launch_of(tile)` the launch whose ring and residency the planner sizes (`resources.plan`: its
+    allocations a stage, its registers within a consumer's) on `target`.
 
     - Shape: the tile loading its operands fewest times a FLOP within its consumers' registers: an
       accumulator of `resources.held_area` elements A reads them 1/rows + 1/columns times a FLOP, least at
@@ -135,10 +140,11 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
       adds at most a third of its work).
     - Step: the family's widest depth dividing the call's (`Family.depths`) at those rows, a shallower
       one before fewer rows (a family whose products read registers holds a step's fragments).
-    - Stages: the deepest a block holds (`holds`, `resources.deepest`), at least those the walk keeps busy
-      (one loading ahead beside the one consumed and, on a family that keeps its products in flight,
-      the one in flight: `_IN_FLIGHT`); a tile that cannot stage that deep gives way to the next
-      narrower or shorter one.
+    - Stages: the deepest its program's share of shared memory holds at those programs (`resources.plan`,
+      the planner every template's derivation reads), at least those the walk keeps busy (one loading
+      ahead beside the one consumed and, on a family that keeps its products in flight, the one in
+      flight: `_IN_FLIGHT`); a tile that cannot stage that deep gives way to the next narrower or
+      shorter one.
     - Cluster: where grouped and a group's rows span at least as many row tiles as the family's cluster
       takes (`Family.cluster`: a pair on warpgroup MMA), that many multiprocessors a cluster, running row
       tiles of one group that load its matrix block once between them (multicast), CUTLASS's and
@@ -157,7 +163,6 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
 
     def tiled(consumers: int, programs: int) -> Tiles | None:
         role = family.role_rows * consumers
-        shared = resources.program_shared(family.most_shared, programs)
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
         if not columns:
             return None
@@ -183,13 +188,13 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
             # The shape before a deeper step: it sets how many times a FLOP reads each operand, where a
             # step's depth only sets how many steps a tile takes (and, in registers, its fragments').
             for step in steps:
-                tile = resources.deepest(
-                    lambda stages, block_m=block_m, block_n=block_n, step=step, band=band, cluster=cluster:
-                    Tiles(block_m, block_n, step, stages, band, warpgroups=consumers, cluster=cluster,
-                          family=family.name, programs=programs),
-                    holds, shared // ((block_m + block_n) * step))
-                if tile is None:
+                shape = Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster,
+                              family=family.name, programs=programs)
+                planned = resources.plan([launch_of(shape)], family, target,
+                                         programs=programs) if candidate(shape) else None
+                if planned is None:
                     continue
+                tile = dataclasses.replace(shape, stages=planned[0].stages)
                 if tile.stages >= busy:
                     return tile
                 fallback = fallback or tile
@@ -380,16 +385,20 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
     # the routed ones, the padding among them, are a last group, whose tiles store zeros. A group's tiles
     # start at its first row (`tile_groups`), so a tile reads up to a tile's rows past the last group's
-    # first: every row-bearing operand is allocated to the schedule's extent (`row_extent`), zeros past
-    # its rows, which a group's stores never reach (a 128-row lhs of groups [120, 8] at 64-row tiles read
-    # rows 120 to 183 unpredicated on an A100, cp.async's loads).
+    # first. Where a family's loads past an operand's rows read zeros (`Family.bounded_loads`: TMA's) the
+    # operands stay as they are; elsewhere every row-bearing operand is allocated to the schedule's extent
+    # (`row_extent`), zeros past its rows, which a group's stores never reach (a 128-row lhs of groups
+    # [120, 8] at 64-row tiles read rows 120 to 183 unpredicated on an A100, cp.async's loads), as the
+    # interpreter's are, whose slices past an array clamp rather than read zeros. On an H100 that copy was a
+    # kernel of its own each call, 0.035 to 0.33 ms beside a dense product of 0.34 to 2.4 (BREAKDOWN1-h100:
+    # 0.33 ms of Llama 3 8B gate_up's 2.69 ms input gradient).
     lhs = rows_padded(lhs, 0, TMA_ROWS)
     m = lhs.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
     row_tile = tiles.block_m * tiles.cluster
     table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
-    extent = row_extent(m, row_tile)
+    extent = m if family_of(tiles, lhs.dtype).bounded_loads and not interpret else row_extent(m, row_tile)
     lhs = _rows_extended(lhs, 0, extent)
     prologue_operands = tuple(_side_extended(side, axes, extent)
                               for side, axes in zip(prologue_operands, prologue_axes, strict=True))
@@ -591,8 +600,16 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
                               for side, axes in zip(prologue_operands, prologue_axes, strict=True))
 
     group_sizes = group_sizes.astype(jnp.int32)
-    group_starts, group_ends, group_num_blocks, group_block_starts = _group_blocks(group_sizes, block_k)
     out_dtype = jnp.dtype(out_dtype)
+    if tiles.splits > 1:
+        # Each group's rows in `splits` runs of whole steps from the group's first block, the first and last
+        # clipped to its rows: each run a group of its own, its fp32 partial summed after.
+        sliced = _sliced(group_sizes, block_k, tiles.splits)
+        partials = tgmm(lhs, rhs, sliced, tiles=dataclasses.replace(tiles, splits=1), out_dtype=jnp.float32,
+                        multiprocessors=multiprocessors, interpret=interpret, prologue=prologue,
+                        prologue_operands=prologue_operands, prologue_axes=prologue_axes)
+        return partials.reshape(g, tiles.splits, m, n).sum(axis=1).astype(out_dtype)
+    group_starts, group_ends, group_num_blocks, group_block_starts = _group_blocks(group_sizes, block_k)
     return _tgmm_streamed(
         (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts),
         (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=multiprocessors,
@@ -784,6 +801,43 @@ def _zero_neighbours_of(family: mosaic.Family, refs: list, step, start, end, ste
     pl.when(first)(lambda: zero(lambda rows: rows >= lax.rem(start, block_k)))
     pl.when(last)(lambda: zero(lambda rows: rows <= lax.rem(end - 1, block_k)))
     return first | last
+
+
+def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, multiprocessors: int,
+                step_seconds: float | None, bandwidth: float | None) -> int:
+    """Dew: the slices a kernel gradient's contraction splits into at `tiles` (`Tiles.splits`, `tgmm`),
+    from the call's extents and the device's facts. Over a wave (`multiprocessors` x `tiles.programs`)
+    and `rows` in steps a group (on average), the busiest program walks ceil(tiles x s / wave) output
+    tiles of ceil(steps / s) steps at s slices. The split is the least s whose walk, with the time its
+    fp32 partials take written and read back (2s + 1 passes over the output at `bandwidth`, in steps of
+    `step_seconds`), is shorter than the unsplit walk, each slice keeping at least the ring's stages and
+    one more; one where none is, or where the device states no rate. A bounded comparison over the
+    facts, no table, no timing: Key's 2560 x 1024 gradient over 24,576 rows on an H100 splits in three,
+    2 x 128 steps against 384."""
+    if step_seconds is None or bandwidth is None:
+        return 1
+    wave = multiprocessors * tiles.programs
+    output = groups * (depth // tiles.block_m) * (width // tiles.block_n)
+    steps = -(-rows // max(groups, 1) // tiles.block_k)
+
+    def walk(splits: int) -> float:
+        passes = 0 if splits == 1 else 2 * splits + 1
+        partials = passes * groups * depth * width * 4 / bandwidth / step_seconds
+        return -(-output * splits // wave) * -(-steps // splits) + partials
+
+    return next((splits for splits in range(2, steps // (tiles.stages + 1) + 1) if walk(splits) < walk(1)), 1)
+
+
+def _sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
+    """Dew: each group's rows as `splits` consecutive runs (group-major, a run's size each): the group's
+    `block_k`-row blocks, from its first row's block, shared out in whole blocks as evenly as they divide, the
+    first run starting at the group's first row and the last ending at its last; a run of a group with
+    fewer blocks than runs is empty."""
+    starts, ends, blocks, block_starts = _group_blocks(group_sizes, block_k)
+    shares = jnp.arange(1, splits)[None, :] * blocks[:, None] // splits
+    inner = jnp.clip(block_starts[:, None] + shares * block_k, starts[:, None], ends[:, None])
+    bounds = jnp.concatenate([starts[:, None], inner, ends[:, None]], axis=1)
+    return jnp.diff(bounds, axis=1).reshape(-1).astype(jnp.int32)
 
 
 def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:

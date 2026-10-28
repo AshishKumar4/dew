@@ -11,22 +11,8 @@ from attention_oracle import exact_attention
 from reference_error import assert_as_exact
 
 from dew.batch import coordinates
-from dew.nn.attention import (
-    alibi_bias,
-    chunk_mask,
-    combined_attention_mask,
-    scaled_dot_product_attention,
-    with_key_lengths,
-    with_key_starts,
-)
-from dew.nn.documents import (
-    CrossDocuments,
-    aligned_places,
-    cross_document_mask,
-    document_ids,
-    document_mask,
-    with_documents,
-)
+from dew.nn.attention import alibi_bias, chunk_mask, key_spans, scaled_dot_product_attention
+from dew.nn.documents import CrossDocuments, cross_document_mask, document_mask
 from dew.nn.inputs import counted_places
 from dew.nn.kernels.templates import attention as template
 from dew.nn.precision import FP32_SUMS
@@ -208,81 +194,20 @@ def arguments(case: dict) -> dict:
     return keywords
 
 
-def dews_mask(case: dict) -> np.ndarray:
-    """The keys Dew's reference path keeps for `case`, `[B, Q, K]`, composed as
-    `scaled_dot_product_attention` composes them: another sequence's documents under causality or a
-    window aligned to their last keys (`cross_document_mask`), else causality and a window on the
-    indices (`combined_attention_mask`) narrowed to the documents (`with_documents`); a chunk as
-    `chunk_mask` keeps it over the call's places (the attention layer's `_chunked`), its indices where it
-    names none, as a window does where the call names places and real keys (the layer's counted places);
-    then key lengths and starts, and the real keys."""
-    keywords = arguments(case)
+def case_keep(case: dict) -> np.ndarray:
+    """The keys each query of `case` sees, `[B, Q, K]`: its spans as a mask (`template.dense`), whose meaning
+    the written-out cases hold (`CORE_CASES`, `SLOT_CASES` and the window, block and image cases)."""
     queries, keys = geometry(case)
-    ids = keywords.get("segment_ids")
-    causal, window = keywords.get("causal", False), keywords.get("sliding_window")
-    # Each query's own key: its index, or a cache call's slot, its document's first key plus its aligned
-    # place, none where that lies before its document's keys.
-    slots = np.broadcast_to(np.arange(queries), (ROWS, queries))
-    cross = False
-    if isinstance(ids, CrossDocuments) and (causal or window is not None):
-        cross = True
-        mask = cross_document_mask(ids, causal=causal, sliding_window=window)
-        query_ids, key_ids = (np.asarray(x) for x in document_ids(ids))
-        first = np.argmax(key_ids[:, None, :] == query_ids[:, :, None], axis=-1)
-        ranks = np.asarray(aligned_places(ids))
-        slots = np.where(ranks >= 0, first + ranks, -1)
-    elif window is not None and "positions" in keywords:
-        query_places, key_places = (np.asarray(x) for x in keywords["positions"])
-        counted = windowed(query_places[:, :, None], key_places[:, None, :], window, causal=causal)[:, None]
-        base = combined_attention_mask(queries, keys, causal, None, None)
-        mask = counted if base is None else base & counted
-    else:
-        mask = combined_attention_mask(queries, keys, causal, window, None)
-    held = (slots >= 0) & (slots < keys)
-    for groups, whole in ((keywords.get("block_groups"), True), (keywords.get("image_groups"), False)):
-        if groups is None or not causal:
-            continue
-        # A block's keys are seen by every query of its document whose own key is in it: a whole
-        # block's whatever the window (transformers' `block_sequence_ids`), an image's within the
-        # window, which bounds the keys behind (Gemma's).
-        own = np.where(held, np.take_along_axis(groups, np.clip(slots, 0, keys - 1), axis=1), -1)
-        same = (own[:, :, None] == groups[:, None, :]) & (own[:, :, None] >= 0)
-        if window is not None and not whole:
-            same = same & windowed(slots[:, :, None], np.arange(keys)[None, None, :], window, causal=causal)
-        if ids is not None:
-            same = same & np.asarray(document_mask(ids))
-        mask = same[:, None] if mask is None else mask | same[:, None]
-    if ids is not None and not cross:
-        mask = with_documents(mask, ids)
-    if "chunk" in keywords:
-        places = keywords.get("positions", (jnp.arange(queries), jnp.arange(keys)))
-        chunked = chunk_mask(*places, keywords["chunk"])
-        mask = chunked if mask is None else jnp.logical_and(mask, chunked)
-    if "lengths" in keywords:
-        mask = with_key_lengths(mask, keywords["lengths"], keys)
-    mask = with_key_starts(mask, keywords.get("starts"), keys)
-    if "valid" in keywords:
-        real = jnp.asarray(keywords["valid"])[:, None, None, :]
-        mask = real if mask is None else jnp.logical_and(mask, real)
-    if "runs" in keywords:
-        # A query keeps a key one of its runs holds.
-        runs = np.asarray(keywords["runs"])
-        index = np.arange(keys)[None, None, :, None]
-        held = np.any((index >= runs[:, :, None, :, 0]) & (index < runs[:, :, None, :, 1]), axis=-1)
-        mask = held[:, None] if mask is None else jnp.logical_and(mask, held[:, None])
-    full = np.ones((ROWS, queries, keys), bool)
-    return full if mask is None else np.broadcast_to(np.asarray(mask)[:, 0], full.shape)
+    return np.asarray(template.dense(template.spans(queries, keys, ROWS, **arguments(case))))
 
 
 @pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values(), ONE_RUN],
                          ids=[*CASES, *RUN_CASES, "one-run"])
-def test_key_spans_keep_the_keys_dews_masks_keep(case):
-    """Each call form's spans (`template.spans`, `template.dense`) keep exactly the keys Dew's reference
-    path keeps, under `jax.jit` too, the bounds traced."""
-    expected = dews_mask(case)
+def test_key_spans_traced_keep_the_keys_they_keep_eagerly(case):
+    """Each call form's spans (`template.spans`, `template.dense`) keep the same keys under `jax.jit`, the
+    bounds traced, as eagerly."""
+    expected = case_keep(case)
     queries, keys = geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
-    np.testing.assert_array_equal(np.asarray(template.dense(spans)), expected)
     static = {name: case[name] for name in ("causal", "sliding_window", "chunk") if name in case}
     if case is CASES["block-causal"]:
         # A block runs to its end, past the query's own place.
@@ -467,7 +392,7 @@ def test_the_templates_arithmetic_is_on_par_with_dews_reference_attention(case, 
     measured from float64 (`exact_attention` under that mask); a query that keeps no key reads zero on
     both. The template sums its fp32 products as the kernels it stands for do, so the reference path
     sums its own as an accelerator does (`FP32_SUMS`)."""
-    mask = jnp.asarray(dews_mask(case))[:, None]
+    mask = jnp.asarray(case_keep(case))[:, None]
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     sinks = SINKS if hooks.get("sinks") else None
@@ -506,7 +431,7 @@ def test_every_parameter_layout_and_the_output_hook_are_on_par(case, dtype):
     dense bias, `s * t_q + b_k + B_qk`, and an output gate `o * sigmoid(g)`, on par with Dew's reference
     path taking them as it can: the temperature in the queries, the biases as one dense bias, the gate
     on its output; both measured from float64."""
-    mask = jnp.asarray(dews_mask(case))[:, None]
+    mask = jnp.asarray(case_keep(case))[:, None]
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     streams = jax.random.split(jax.random.key(5), 4)
@@ -707,6 +632,98 @@ def test_a_window_holding_no_key_keeps_its_lower_bound_against_an_image():
     blocks = template.spans(1, 2, 1, causal=True, sliding_window=2, positions=places, segment_ids=ids,
                             block_groups=groups)
     np.testing.assert_array_equal(np.asarray(template.dense(blocks)), [[[False, True]]])
+
+
+CORE_CASES = {
+    "causal": ((3, 3), {"causal": True}, [[1, 0, 0], [1, 1, 0], [1, 1, 1]]),
+    "a window of two either side": ((4, 4), {"sliding_window": 2},
+                                    [[1, 1, 0, 0], [1, 1, 1, 0], [0, 1, 1, 1], [0, 0, 1, 1]]),
+    "a causal window of two": ((4, 4), {"causal": True, "sliding_window": 2},
+                               [[1, 0, 0, 0], [1, 1, 0, 0], [0, 1, 1, 0], [0, 0, 1, 1]]),
+    "documents": ((4, 4), {"segment_ids": jnp.asarray([[1, 1, 2, 2]])},
+                  [[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1]]),
+    "causal documents": ((4, 4), {"causal": True, "segment_ids": jnp.asarray([[1, 1, 2, 2]])},
+                         [[1, 0, 0, 0], [1, 1, 0, 0], [0, 0, 1, 0], [0, 0, 1, 1]]),
+    "padding's id": ((4, 4), {"segment_ids": jnp.asarray([[1, 1, 0, 0]])},
+                     [[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]),
+    "a cache call's document": ((2, 4), {"causal": True, "segment_ids": CrossDocuments(
+        jnp.asarray([[1, 1]]), jnp.asarray([[1, 1, 1, 1]]))}, [[1, 1, 1, 0], [1, 1, 1, 1]]),
+    "key lengths": ((2, 4), {"lengths": jnp.asarray([3])}, [[1, 1, 1, 0], [1, 1, 1, 0]]),
+    "key starts": ((2, 4), {"starts": jnp.asarray([1])}, [[0, 1, 1, 1], [0, 1, 1, 1]]),
+    "causal chunks of two": ((4, 4), {"causal": True, "chunk": 2},
+                             [[1, 0, 0, 0], [1, 1, 0, 0], [0, 0, 1, 0], [0, 0, 1, 1]]),
+    "chunks over places that restart": ((4, 4), {"causal": True, "chunk": 2,
+                                                 "segment_ids": jnp.asarray([[1, 1, 2, 2]]),
+                                                 "positions": (jnp.asarray([[0, 1, 0, 1]]),) * 2},
+                                        [[1, 0, 0, 0], [1, 1, 0, 0], [0, 0, 1, 0], [0, 0, 1, 1]]),
+    "two runs": ((1, 4), {"runs": jnp.asarray([[[[0, 1], [2, 3]]]])}, [[1, 0, 1, 0]]),
+    "a cache call's document within key lengths and starts": (
+        (2, 4), {"causal": True, "lengths": jnp.asarray([3]), "starts": jnp.asarray([1]),
+                 "segment_ids": CrossDocuments(jnp.asarray([[1, 1]]), jnp.asarray([[1, 1, 1, 1]]))},
+        [[0, 1, 1, 0], [0, 1, 1, 0]]),
+    "a cache call's document in chunks": (
+        (2, 4), {"causal": True, "chunk": 2,
+                 "segment_ids": CrossDocuments(jnp.asarray([[1, 1]]), jnp.asarray([[1, 1, 1, 1]]))},
+        [[0, 0, 1, 0], [0, 0, 1, 1]]),
+    "a window over places beside an invalid key": (
+        (4, 4), {"causal": True, "sliding_window": 2, "valid": jnp.asarray([[True, False, True, True]]),
+                 "positions": (jnp.asarray([[0, 1, 1, 2]]),) * 2},
+        [[1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 1, 0], [0, 0, 1, 1]]),
+}
+"""Call forms of one row and the keys each query sees, `(queries, keys)`, `template.spans`' keywords and the
+keep written out by hand: causality and windows on the indices, documents of the call and of a cache call
+(its queries aligned to their document's last keys, under key lengths and starts and in chunks counted from
+its slots), padding's id, key lengths and starts, chunks on the indices and on places that restart at a
+document, a window over places beside an invalid key, and a query's two runs."""
+
+
+@pytest.mark.parametrize("case", CORE_CASES.values(), ids=CORE_CASES)
+def test_each_coordinate_keeps_the_keys_written_out(case):
+    """Each coordinate's spans (`template.spans`, `template.dense`) keep exactly the written-out keys."""
+    (queries, keys), keywords, expected = case
+    spans = template.spans(queries, keys, 1, **keywords)
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray([expected], bool))
+
+
+@pytest.mark.parametrize(("query", "key", "kept"), [(2, 1, True), (1, 2, True), (2, 2, True), (4, 1, False),
+                                                    (1, 4, False)])
+def test_a_two_sided_window_over_unsigned_places_keeps_its_neighbours(query, key, kept):
+    """A two-sided window of two (`windowed`) over unsigned coordinates keeps the keys one place either side
+    and the query's own, and none further: no distance wraps."""
+    found = windowed(jnp.asarray(query, jnp.uint32), jnp.asarray(key, jnp.uint32), 2, causal=False)
+    assert bool(found) == kept
+
+
+SLOTS = np.asarray([[3, 4, 5], [1, 2, -1]], np.int32)
+"""A cache call's queries' own keys in a 6-key cache: a row of three tokens appended at slots 3 to 5, and one
+of two at slots 1 and 2 beside a padding query (-1)."""
+SLOT_CASES = {
+    "causal": ({"causal": True},
+               [[[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1]],
+                [[1, 1, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0], [0, 0, 0, 0, 0, 0]]]),
+    "window of two": ({"causal": True, "sliding_window": 2},
+                      [[[0, 0, 1, 1, 0, 0], [0, 0, 0, 1, 1, 0], [0, 0, 0, 0, 1, 1]],
+                       [[1, 1, 0, 0, 0, 0], [0, 1, 1, 0, 0, 0], [0, 0, 0, 0, 0, 0]]]),
+    "chunks of two": ({"causal": True, "chunk": 2},
+                      [[[0, 0, 1, 1, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 1, 1]],
+                       [[1, 1, 0, 0, 0, 0], [0, 0, 1, 0, 0, 0], [0, 0, 0, 0, 0, 0]]]),
+    "a block of slots 2 to 4": ({"causal": True, "sliding_window": 1,
+                                 "block_groups": np.asarray([[-1, -1, 0, 0, 0, -1]] * 2, np.int32)},
+                                [[[0, 0, 1, 1, 1, 0], [0, 0, 1, 1, 1, 0], [0, 0, 0, 0, 0, 1]],
+                                 [[0, 1, 0, 0, 0, 0], [0, 0, 1, 1, 1, 0], [0, 0, 0, 0, 0, 0]]]),
+}
+"""Spans over `SLOTS` and the keys each query sees, written out by hand: causality ends a query's keys at its
+slot, a window or a chunk counts from it, a block holding it is read whole past the window, and a padding
+query sees none."""
+
+
+@pytest.mark.parametrize("case", SLOT_CASES.values(), ids=SLOT_CASES)
+def test_a_cache_calls_queries_see_keys_from_their_own_slots(case):
+    """A cache call's queries at their own slots (`key_spans`' `query_slots`): the keys each sees are the
+    case's written-out ones."""
+    options, expected = case
+    spans = key_spans(3, 6, query_slots=jnp.asarray(SLOTS), **{"sliding_window": None, **options})
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected, bool))
 
 
 @pytest.mark.parametrize(("query", "key"), [(jnp.int64, jnp.uint64), (jnp.int32, jnp.uint32)])
