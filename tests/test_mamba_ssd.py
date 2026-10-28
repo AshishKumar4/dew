@@ -83,18 +83,12 @@ def through(chunk: int, starts, dy, dfinal):
     return run
 
 
-# tools/mamba_ssd_reference.py's cases: bf16 and fp32 operands over packed documents, a ragged last chunk
-# and groups of three heads; fp32 over whole chunks and one group; fp32 at a state wider than one
-# 128-wide product, as Falcon-H1's 256. The summing kernels also take two heads a program, a group's
-# three split two and one.
-CASES = [
-    pytest.param("bf16", None, id="bf16"),
-    pytest.param("bf16", 2, id="bf16-summing-two-of-three-heads"),
-    pytest.param("ragged-documents", None, id="ragged-documents"),
-    pytest.param("ragged-documents", 2, id="ragged-documents-summing-two-of-three-heads"),
-    pytest.param("whole-chunks", None, id="whole-chunks"),
-    pytest.param("wide-state-documents", None, id="wide-state-documents"),
-]
+CASES = {"bf16": (None, 2), "ragged-documents": (None, 2), "whole-chunks": (None,),
+         "wide-state-documents": (None,)}
+"""tools/mamba_ssd_reference.py's cases, each with the heads a program its summing kernels take (None their
+own): bf16 and fp32 operands over packed documents, a ragged last chunk and groups of three heads, a group's
+three also split two and one; fp32 over whole chunks and one group; fp32 at a state wider than one 128-wide
+product, as Falcon-H1's 256."""
 
 
 def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
@@ -114,12 +108,13 @@ def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
                         and value.tobytes() == other.tobytes()), f"{case}: {name} differs"
 
 
-@pytest.mark.parametrize("case, heads", CASES)
-def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
+@pytest.mark.parametrize("case", CASES)
+def test_the_port_is_as_exact_as_mamba_ssm(case):
     """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
 
-    The truth is mamba_ssm's minimal torch reference in float64. With `heads`, kernels summing a group's heads
-    take that many a program; both configured forms see the same declared draws and every leaf.
+    The truth is mamba_ssm's minimal torch reference in float64. Each of the case's head counts (`CASES`:
+    kernels summing a group's heads take that many a program) runs every declared draw, each draw's truth
+    taken once for all of them.
     """
     stored = recording(SEEDED)
     precision = str(stored.pop(PRECISION, "no precision"))
@@ -142,16 +137,24 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         return ssd_value_and_grad(lambda *values: mamba_ssd.ssd_scan(*values, seq, chunk, INTERPRETED),
                                   inputs, jnp.asarray(arrays["dy"], dtype), jnp.asarray(arrays["dfinal"]))
 
-    pins = {}
-    if heads:
-        _, inputs = draw(0)
-        rows, state = min(64, chunk), min(32, inputs["B"].shape[-1])
-        pins = {mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
-                mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
-                mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
-    with tuning.pinned(pins):
-        assert_as_exact(jax.jit(run), reference, draw, f"mamba_ssm {case}, heads={heads}",
-                        seeds=seeds, truth_fn=truth)
+    _, inputs = draw(0)
+    rows, state = min(64, chunk), min(32, inputs["B"].shape[-1])
+
+    def pinned(heads):
+        """`run` with its summing kernels taking `heads` a program, or their own where None."""
+        pins = {} if heads is None else {
+            mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
+            mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
+            mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
+        with tuning.pinned(pins):
+            return jax.jit(run).lower(*draw(0)).compile()
+
+    forms = [pinned(heads) for heads in CASES[case]]
+    count = len(forms)
+    assert_as_exact(lambda *args: tuple(form(*args) for form in forms),
+                    lambda *args: (reference(*args),) * count, draw,
+                    f"mamba_ssm {case}, heads {CASES[case]}", seeds=seeds,
+                    truth_fn=lambda *args: (truth(*args),) * count)
 
 
 def test_the_port_takes_widths_padded_to_powers_of_two():
