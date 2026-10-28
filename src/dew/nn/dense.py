@@ -29,18 +29,38 @@ from flax.core import meta
 from flax.linen.module import InterceptorContext
 from flax.typing import Array
 
+from dew.cache import INTERCEPTED
+
 from .kernels.templates.gemm import template
 from .precision import accumulated, biased
+
+
+def _direct_qwix_interception() -> bool:
+    """Direct Qwix calls expose no public running-provider query. Keep their active ancestor check
+    here until Flax or Qwix exposes it; lifted transforms retain this stack when parents change.
+    A quantized child may run below an ordinary parent, so every active ancestor matters."""
+    from flax.linen.module import _context
+
+    return any("_unquantized_type" in vars(layer) for module in _context.module_stack if module is not None
+               for layer in type(module).__mro__)
+
+
+def intercepted() -> bool:
+    """A Dew interception scope (quantization, LoRA), or a direct Qwix scope outside Dew's wrapper entry
+    points: a wrapper that owns the layers' products, which reach it as `jax.lax.dot_general` calls."""
+    return INTERCEPTED.value or _direct_qwix_interception()
 
 
 def _product(layer: nn.Dense | nn.DenseGeneral):
     """The layer's product: its `dot_general_cls` (an interceptor's: a quantized product), as flax picks
     it, else its `dot_general`, or lax's at its stated precision (`accumulated`: the plain product, its fp32
     sum taken in float64 on a CPU under Dew's tests), through the GEMM template's dense product where a
-    launch takes it (`template.dot_general`; XLA's program wherever the template declares XLA faster)."""
+    launch takes it (`template.dot_general`; XLA's program wherever the template declares XLA faster), but
+    where a wrapper owns the products (`intercepted`: Qwix quantizes them as it intercepts `dot_general`)."""
     if layer.dot_general_cls is not None:
         return layer.dot_general_cls()
-    return template.dot_general(layer.dot_general if layer.dot_general is not None else _accumulated_dot_general)
+    product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
+    return product if intercepted() else template.dot_general(product)
 
 
 def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None,

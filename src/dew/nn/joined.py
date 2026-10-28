@@ -16,27 +16,11 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
-from dew.cache import INTERCEPTED
-from dew.nn.dense import _plain_dense
+from dew.nn.dense import _plain_dense, intercepted
 from dew.nn.precision import biased, float32_dot_general
 
 from .kernels.generation import INHERENT, measured_kernel
 from .kernels.selection import Kernel, Op, Requirement, select
-
-
-def _direct_qwix_interception() -> bool:
-    """Direct Qwix calls expose no public running-provider query. Keep their active ancestor check
-    here until Flax or Qwix exposes it; lifted transforms retain this stack when parents change.
-    A quantized child may run below an ordinary parent, so every active ancestor matters."""
-    from flax.linen.module import _context
-
-    return any("_unquantized_type" in vars(layer) for module in _context.module_stack if module is not None
-               for layer in type(module).__mro__)
-
-
-def _intercepted() -> bool:
-    """A Dew interception scope, or a direct Qwix scope outside Dew's wrapper entry points."""
-    return INTERCEPTED.value or _direct_qwix_interception()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,7 +66,7 @@ def join_case(projections: Sequence[nn.Module]) -> JoinCase:
                         and projection.dot_general_cls is None for projection in projections),
         uniform=len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
                       projection.promote_dtype) for projection in projections}) == 1,
-        intercepted=_intercepted(),
+        intercepted=intercepted(),
         held=all(projection.has_variable('params', 'kernel') for projection in projections))
 
 
