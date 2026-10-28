@@ -637,6 +637,29 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
 
 
+@runs("sm90")
+@pytest.mark.parametrize(("rows", "depth", "width"), [(320, 128, 2816), (200, 128, 2816), (320, 256, 1408)])
+def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width):
+    """A dense kernel gradient on a Hopper part of 8 multiprocessors whose 11 output tiles leave its last
+    wave at most half full (`tail.balanced`): its tail's steps balanced over the programs, a
+    program's range crossing a tile's boundary, each tile fixed up across them, on par with XLA's over
+    the draws (check 1), truth float64's; at rows a step does not divide, and at a tile of 256 x 128."""
+    draw = _dense_draw(rows, depth, width, cotangent=True)
+    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8)
+
+    def dew(x, w, dy):
+        del w
+        return template.gemm_t(x, dy, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)[0]
+
+    def plain(x, w, dy, wide=jnp.float32, out=jnp.bfloat16):
+        del w
+        return jnp.dot(x.T.astype(wide), dy.astype(wide)).astype(out)
+
+    with generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"):
+        assert_as_exact(jax.jit(dew), jax.jit(plain), draw, f"balanced dense gradient {rows}x{depth}x{width}",
+                        seeds=SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
 @pytest.mark.gpu(reason="checks Triton's MMA accumulation on a GPU")
 @pytest.mark.skipif(not generation.triton_runs(), reason="needs a GPU the Pallas kernels compile for")
 def test_a_dense_products_exact_sums_survive_one_row_tile():

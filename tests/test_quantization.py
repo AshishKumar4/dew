@@ -96,6 +96,17 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     assert not np.array_equal(wrapped, plain)
 
 
+def test_a_model_qwix_quantized_directly_is_not_quantized_again():
+    """Qwix holds one provider a model, so quantizing a model a direct `qwix.quantize_model` call already
+    quantized would replace that quantization: `Quantization.apply` refuses it (`qwix.is_quantized`)."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.dense import Dense
+
+    provider = qwix.QtProvider([qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)])
+    with pytest.raises(ValueError, match="quantize the model once"):
+        Quantization().apply(qwix.quantize_model(Dense(8), provider))
+
+
 def test_a_dense_qwix_quantizes_directly_takes_its_gradient_on_a_cpu():
     """A Dew Dense Qwix quantizes directly (`qwix.quantize_model`, outside `quantize_with`'s trace)
     differentiates on a CPU: its product calls a backward of its own (a custom_vjp), so the float64
