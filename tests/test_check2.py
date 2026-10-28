@@ -366,8 +366,9 @@ def test_a_split_holds_each_piece_to_its_own_run():
 def test_rsqrt_and_logistic_name_their_exact_values():
     """rsqrt is exact at the powers of four and logistic at zero, which their contracts hold bit for bit:
     a result a step off there breaks, as do a wrong pole sign and a missed limit."""
-    fours = np.float32([1.0, 4.0, 0.25, 2.0 ** -148, 2.0 ** 126])
-    roots = np.float32([1.0, 0.5, 2.0, 2.0 ** 74, 2.0 ** -63])
+    # Normal operands: a lane that flushes reads a subnormal one as zero, whose rsqrt is the pole.
+    fours = np.float32([1.0, 4.0, 0.25, 2.0 ** -126, 2.0 ** 126])
+    roots = np.float32([1.0, 0.5, 2.0, 2.0 ** 63, 2.0 ** -63])
     assert np.all(ct.CONTRACTS["rsqrt"]({}, [fours], roots, oc.FLOAT32))
     off = np.nextafter(roots, np.float32(np.inf))
     assert not np.any(ct.CONTRACTS["rsqrt"]({}, [fours], off, oc.FLOAT32))
