@@ -29,6 +29,7 @@ cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA,
 accumulator only where the epilogue's VJP reads it.
 """
 
+import contextlib
 import functools
 
 import jax
@@ -37,7 +38,7 @@ import numpy as np
 from flax.typing import PrecisionLike
 from jax.extend import core as jax_core
 
-from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates.product import declared
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import seen_whole
@@ -92,8 +93,16 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     def forward(*operands):
         return value(*operands), ()
 
+    # A kernel the call names (`generation.chosen`, MoE's implementation='xla') runs its derivative's products
+    # too, wherever the pullback runs: a reverse pass traced outside the call's block would otherwise select
+    # them afresh.
+    named = selection.forced(grouped_matmul.GROUPED.choice)
+
     def backward(saved, operands, cotangent, live):
-        del saved
+        with generation.chosen(**{grouped_matmul.GROUPED.choice: named}) if named else contextlib.nullcontext():
+            return _pulled(operands, cotangent, live)
+
+    def _pulled(operands, cotangent, live):
         lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays = operands
         # The operands a reverse pass differentiates, by their place among the operands' leaves: a frozen
         # matrix's kernel gradient, or an operand no reverse pass reaches, is never formed.
