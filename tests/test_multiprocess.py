@@ -1538,6 +1538,15 @@ def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, ax
 
 
 @pytest.mark.distributed
+def test_a_pass_only_root_is_asked_to_keep_runs_alike_on_every_rank(tmp_path):
+    """Process 0 alone is asked to keep a pass's decisions, which scores no metric: both ranks score
+    every batch and end, with root's loss, and root writes each batch's file."""
+    first, second = run_pool("evaluation_kept", tmp_path / "out", 2, run_dir=tmp_path / "run")
+    assert first["scores"] == second["scores"] and "val/loss" in first["scores"]
+    assert first["written"] == second["written"] == ["val-00000.npz", "val-00001.npz"]
+
+
+@pytest.mark.distributed
 def test_ranks_whose_clocks_differ_evaluate_at_roots(tmp_path):
     """Rank 1's step and schedule step run ahead of rank 0's. Both report
     root's step and event identity, and a diffusion validation loss, which
