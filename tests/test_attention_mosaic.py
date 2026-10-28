@@ -244,14 +244,14 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
                     residuals_from=None, target: generation.GpuTarget | None = None,
                     config: attention_mosaic.BackwardTiles | None = None, width: int = 128,
-                    value_width: int | None = None):
+                    value_width: int | None = None, spans: template.KeySpans | None = None):
     """The backward in the form `form` names (`BACKWARD_FORMS`; None, the default form at `config`, else its
-    derived one) over the call form `call` of `shape` (its keys `keys`, its query heads `width` wide and its
-    value heads `value_width`) on `target` (`_device`), from the training forward's residuals at its pick:
-    this mainloop's, or `residuals_from`'s (another mainloop's `forward`, as the route feeds the Triton
-    mainloop's)."""
+    derived one) over the call form `call` of `shape` (or `spans` where given; its keys `keys`, its query
+    heads `width` wide and its value heads `value_width`) on `target` (`_device`), from the training
+    forward's residuals at its pick: this mainloop's, or `residuals_from`'s (another mainloop's `forward`, as
+    the route feeds the Triton mainloop's)."""
     keys = shape[1] if keys is None else keys
-    spans = template.spans(shape[1], keys, shape[0], **CALLS[call])
+    spans = template.spans(shape[1], keys, shape[0], **CALLS[call]) if spans is None else spans
     draw = _drawn(shape, jnp.bfloat16, width, keys=keys, value_width=value_width)
     accurate, config = (False, config) if form is None else BACKWARD_FORMS[form]
     trained = attention_mosaic.forward if residuals_from is None else residuals_from
@@ -320,6 +320,20 @@ def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
     `FORM_TILES`, under the interpreter."""
     _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=width,
                    value_width=value_width, tiles=FORM_TILES)
+
+
+@INTERPRETS
+def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_interpreted():
+    """The derived backward of heads 256 wide (dK's and dV's widths split among programs,
+    `BackwardTiles.columns`, where one program's sums pass a consumer's registers) over a packed row's two
+    documents read causally, each document one block read both ways (row 2110's `--split whole`), under the
+    interpreter."""
+    rows, queries = SHAPES["interpreted"][:2]
+    documents = jnp.asarray([[1] * (queries // 2 - 10) + [2] * (queries // 2 + 10)] * rows, jnp.int32)
+    spans = template.spans(queries, queries, rows, causal=True, segment_ids=documents,
+                           block_groups=documents)
+    _check_backward("causal", SHAPES["interpreted"], form=None, interpret=True, width=256, value_width=256,
+                    spans=spans)
 
 
 @INTERPRETS

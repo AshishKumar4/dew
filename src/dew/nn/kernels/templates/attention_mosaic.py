@@ -369,7 +369,8 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         carried = [(block_q, width, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
         return resources.live_registers(family, carried, products, cotangents)
-    carried = [(block_k, width, jnp.float32), (block_k, value_width, jnp.float32)]
+    carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
+                                                                 jnp.float32)]
     fused = [(block_q, width, jnp.float32)] if config.fused else []
     return resources.live_registers(family, carried, products, fused)
 
@@ -415,7 +416,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
         # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless call's.
         hooked = self.score_mod is not None or ba.arguments["initial"] is not None
-        return (not config.fused or not (self.accurate or hooked)) and super().legal(ba, config, target)
+        if (config.fused and (self.accurate or hooked)) or not super().legal(ba, config, target):
+            return False
+        # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows.
+        dtype = ba.arguments["query"].dtype
+        family = bundle_of(config, dtype)
+        shares = [_width(ba.arguments[name].shape[-1], family, dtype) / config.columns
+                  for name in ("query", "value")]
+        return config.columns == 1 or (not config.fused and all(
+            share % family.column_unit(dtype) == 0 for share in shares))
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
@@ -435,11 +444,17 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         hooked = self.score_mod is not None or ba.arguments["initial"] is not None
         fused = not (self.accurate or hooked or deterministic_ops_requested())
 
-        def tiles(rows: int, walked: int, consumers: int) -> BackwardTiles:
-            return BackwardTiles(walked, rows, 2, consumers, fused=fused, family=family.name)
+        # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
+        # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
+        for columns in (1, 2, 4):
+            def tiles(rows: int, walked: int, consumers: int, columns=columns) -> BackwardTiles:
+                return BackwardTiles(walked, rows, 2, consumers, fused=fused and columns == 1,
+                                     family=family.name, columns=columns)
 
-        return _derived(family, query.dtype, key.shape[1], query.shape[1], tiles,
-                        lambda config: self.legal(ba, config, target), overlapped=False)
+            if config := _derived(family, query.dtype, key.shape[1], query.shape[1], tiles,
+                                  lambda config: self.legal(ba, config, target), overlapped=False):
+                return config
+        return None
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                      target: generation.GpuTarget) -> int:
@@ -452,7 +467,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
         launches = [_dkv_allocations(family, config, width, value_width, dtype,
                                      parts=_parts(self.accurate, dtype),
-                                     stages=min(config.stages, padded_q // config.block_q))]
+                                     stages=min(config.stages, padded_q // config.block_q),
+                                     columns=config.columns)]
         if not config.fused:
             launches.append(_dq_allocations(family, config, width, value_width, dtype,
                                             min(config.stages, padded_k // config.block_k)))

@@ -79,7 +79,9 @@ class BackwardTiles:
     """A backward's config, one for its launches: the query block a dQ consumer takes and the key block a
     dK/dV consumer takes (`block_q`, `block_k`, so both launches' logits are one tile's), the tiles in
     flight (`stages`), the consumers a program (`consumers`), whether the fast form runs as one launch
-    (`fused`, `_launch_backward`) and the instruction family whose bundle runs it (`family`)."""
+    (`fused`, `_launch_backward`), the instruction family whose bundle runs it (`family`) and the dK/dV
+    programs a key block's head widths split among (`columns`: each its share of dK's and dV's columns, its
+    logits and their cotangents its own, where a whole width's sums pass a consumer's registers)."""
 
     block_q: int
     block_k: int
@@ -87,6 +89,7 @@ class BackwardTiles:
     consumers: int
     fused: bool = False
     family: str = mosaic_sm90.WGMMA.name
+    columns: int = 1
 
     def __post_init__(self):
         if self.stages < 2:
