@@ -57,8 +57,9 @@ BATCH_AXES = frozenset({'exp'})
 SELECTION_AXES = frozenset({'vocab', 'output'})
 
 
-def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Split a declared parameter's axes into a contracted and an output side.
+def _matrix_sides(axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """Split a declared parameter's axes into a contracted and an output side, None where they are
+    not two.
 
     A dimension continues the side before it when the declaration leaves it
     unnamed, as the spatial dimensions of a patch embedding are. It also
@@ -79,11 +80,7 @@ def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple
         else:
             sides.append([dimension])
     if len(sides) != 2:
-        raise ValueError(
-            f"{jax.tree_util.keystr(path)} is declared {axes}, which is not one "
-            f"contracted side and one output side, so Muon cannot tell what its "
-            f"matrix is. An axis that stacks matrices rather than being part of "
-            f"one belongs in BATCH_AXES.")
+        return None
     return tuple(sides[0]), tuple(sides[1])
 
 
@@ -95,47 +92,66 @@ def weight_decay_mask(params):
         isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "bias"), params)
 
 
-def muon_weight_dimension_numbers(params):
-    """Build a `MuonDimensionNumbers` per parameter, None where AdamW steps in.
-
-    Which group a parameter lands in is read off the logical axes its module
-    declares (`dew.nn.sharding`), the same table the sharding derivation
-    reads, so one declaration answers both questions.
+def muon_partition(params) -> dict[str, str]:
+    """Where Muon's parameter split sends each parameter (`muon_weight_dimension_numbers`), by its path
+    (`jax.tree_util.keystr`): 'muon', or 'adamw' and why, the record a run keeps of the split.
 
     AdamW takes a parameter of rank below two, a bias, and a parameter that
     maps into or out of a discrete index: the vocabulary, the model's output
     space, or the expert a router picks. That is the split four labs
-    cross-confirmed. Everything else is a matrix and goes to Muon.
+    cross-confirmed. It takes too, by rule, a parameter Muon cannot
+    orthogonalize as one matrix: one whose declared axes are not one contracted
+    side and one output side (a depthwise convolution's taps, Gated
+    DeltaNet's conv1d of rank 3), and an undeclared one of rank above two,
+    whose matrix axes no declaration names. Everything else is a matrix and
+    goes to Muon.
 
-    An undeclared matrix of rank two, or one declared with no axis named
-    (replicated, as Gemma 3n's AltUp matrices are), takes Linen's kernel
-    convention, contracting axis 0 into axis 1. An undeclared parameter of higher rank
-    raises, because its matrix axes are what this spec cannot guess, and
-    orthogonalizing the wrong pair would show up as a worse loss curve.
+    Which group a parameter lands in is read off the logical axes its module
+    declares (`dew.nn.sharding`), the same table the sharding derivation
+    reads, so one declaration answers both questions. An undeclared matrix of
+    rank two, or one declared with no axis named (replicated, as Gemma 3n's
+    AltUp matrices are), takes Linen's kernel convention, contracting axis 0
+    into axis 1.
+    """
+    return {jax.tree_util.keystr(path): reason
+            for path, (_, reason) in _placements(params).items()}
+
+
+def muon_weight_dimension_numbers(params):
+    """Build a `MuonDimensionNumbers` per parameter, None where AdamW steps in (`muon_partition`).
 
     Optax reads one spec tree shaped like the parameters and treats a None
     leaf as an AdamW parameter (optax/contrib/_muon.py:660-675).
     """
+    placed = _placements(params)
+    return jax.tree_util.tree_map_with_path(lambda path, _: placed[path][0], params)
+
+
+def _placements(params) -> dict[jax.tree_util.KeyPath, tuple[optax.contrib.MuonDimensionNumbers | None, str]]:
+    """Each parameter's Muon dimension numbers, None for AdamW, and the reason (`muon_partition`)."""
     declared = declarations(params)
 
     def leaf(path: jax.tree_util.KeyPath, param: jax.Array, decays: bool):
         if not decays:
-            return None
+            return None, "adamw: a bias or of rank below two"
         axes = declared_axes(path, param.ndim, declared)
         # A declaration that names no axis says how the parameter shards (whole, on every device),
         # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
         if axes is None or all(axis is None for axis in axes):
             if param.ndim > 2:
-                raise ValueError(
-                    f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no "
-                    "declared logical axes, so Muon cannot tell which of its axes "
-                    "form the matrix. Declare it with @logical_axes on its module.")
-            return optax.contrib.MuonDimensionNumbers()
+                return None, f"adamw: of rank {param.ndim} and no declared axes, so not one matrix"
+            return optax.contrib.MuonDimensionNumbers(), "muon"
         named = {axis for axis in axes if axis is not None}
         if SELECTION_AXES & named or axes[-1] in BATCH_AXES:
-            return None
-        return optax.contrib.MuonDimensionNumbers(*_matrix_sides(path, axes))
-    return jax.tree_util.tree_map_with_path(leaf, params, weight_decay_mask(params))
+            return None, "adamw: a lookup into or out of a discrete index"
+        sides = _matrix_sides(axes)
+        if sides is None:
+            return None, f"adamw: declared {tuple(axes)}, not one contracted and one output side"
+        return optax.contrib.MuonDimensionNumbers(*sides), "muon"
+
+    placed = jax.tree_util.tree_map_with_path(leaf, params, weight_decay_mask(params),
+                                              is_leaf=lambda node: isinstance(node, tuple))
+    return dict(jax.tree_util.tree_flatten_with_path(placed, is_leaf=lambda node: isinstance(node, tuple))[0])
 
 
 def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, **opts):
