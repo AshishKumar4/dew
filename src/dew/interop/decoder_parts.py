@@ -20,7 +20,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
-from dew._model_types import SANDWICH_NORMS
+from dew._model_types import LAYER_SCALAR_COLLECTIONS, SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
@@ -28,7 +28,7 @@ from dew.interop.unread import Stored, equal, valued
 from dew.interop.weights import check_tree
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS, Mixture
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
@@ -1803,6 +1803,21 @@ class WeightPreparer(Protocol):
 
 
 @dataclass(frozen=True)
+class SourceCode:
+    """A source's own modeling code, which a save writes beside the weights (`sources.code_modules`) so
+    transformers opens the save with it: the `source` holding it (a Hub repo, or a local directory), the
+    commit to read it at (None for a directory), and the `auto_map` its config names it by. A family's
+    reference release (`DecoderFamily.release_code`), or a loaded source's own (`Pretrained.code`)."""
+
+    source: str | Path
+    revision: str | None
+    auto_map: Mapping[str, str | list[str | None] | None]
+    folder: str | None = None
+    """The component folder within a Hub repo the code sits in beside its config, as a load selects it
+    (`SourceReference.subfolder`); a directory source is that folder already."""
+
+
+@dataclass(frozen=True)
 class DecoderFamily:
     """Holds one family's config, tensor paths and export vocabulary.
 
@@ -1872,6 +1887,10 @@ class DecoderFamily:
     aliases: Mapping[str, str] = field(default_factory=dict)
     """The config class's `attribute_map`: another spelling of a field, read as that field before
     `defaults` fill what neither spells."""
+    release_code: SourceCode | None = None
+    """The release whose own code is the family's reference, where transformers has no class for it:
+    a model exported natively (`PretrainedDecoder.from_model`) writes its `auto_map` and its modules,
+    fetched at that commit, so the export opens through that code as the release does."""
     repeated: Mapping[str, str] = field(default_factory=dict)
     """Fields a release repeats under another name that the config class neither declares nor reads,
     each with the field it repeats: read where the release states that field at the same value, as the

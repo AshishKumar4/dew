@@ -437,8 +437,8 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     which ragged_dot cannot do with an unmapped expert matrix. A continuation
     keeps tokens up to its first EOS and reports the steps it took.
     """
-    from dew.sampling.sample import sample
     from dew.sampling.solvers import RowKeys
+    from dew.sampling.walks import sample
 
     batch, prompt = inputs.tokens.shape
     if budget == 0:
