@@ -15,12 +15,20 @@ executable (`jax.experimental.serialize_executable`), for a host of that topolog
     ahead = compile_ahead(trainer, batch)
     ahead.peak_bytes, ahead.flops.hardware
     ahead.save("step.dew-aot")
+
+A configured run does both ends: `--trainer.compile-ahead.generation sm90 --trainer.compile-ahead.devices
+8 --trainer.compile-ahead.path step.dew-aot` compiles its first step for eight H100s and exits
+(`AheadTarget`), and `--trainer.ahead step.dew-aot` on a host of that topology runs it in place of
+compiling its first step, where it is the very program the run compiles first (`AheadOfTime.taken`).
+A trainer over its own devices compiles ahead too, so a CPU host checks the whole round trip.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
+import logging
 import pickle
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,7 +42,10 @@ from dew.nn.kernels.generation import capability, gpu_target
 from dew.telemetry.instrumentation import StepFlops, step_flops
 
 if TYPE_CHECKING:
+    from dew.data.dataset import Loader
     from dew.training.trainer import Trainer
+
+_log = logging.getLogger(__name__)
 
 THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
 """Resident threads a multiprocessor holds by compute capability, 1536 on the others the targets name
@@ -89,17 +100,22 @@ def compile_only_gpus(generation: str, count: int = 1) -> tuple:
 
 @dataclasses.dataclass(frozen=True)
 class AheadOfTime:
-    """A training step compiled for `devices` GPUs of `generation` (`compile_ahead`): the executable,
-    serialized, and what it costs. `flops` are its matmuls' and convolutions' on one device, read
-    off its optimized program as a run's are (`dew.telemetry.instrumentation.step_flops`, which
+    """A training step compiled for `devices` GPUs of `generation`, or for `devices` of the platform its
+    trainer's mesh is built over where `generation` is None (`compile_ahead`): the executable,
+    serialized, the program it was compiled from (`program`, `program_of`), and what it costs.
+    `flops` are its matmuls' and convolutions' on one device, read off its optimized program as a
+    run's are (`dew.telemetry.instrumentation.step_flops`, which
     counts the cuBLAS and cuDNN calls XLA's own cost analysis cannot see into), None where it runs a
     loop of unstated length; the byte counts are XLA's memory analysis of one device: the arguments
     it reads (the state and the batch's share), the outputs it writes, those that alias an argument
     (the donated state), its temporaries and its code."""
 
-    generation: str
+    generation: str | None
     devices: int
     mesh: dict[str, int]
+    platform: str
+    program: str
+    """The step's program as it lowered (`program_of`), which a run that loads it lowers too (`taken`)."""
     executable: bytes
     trees: tuple
     """The trees of the executable's inputs and outputs, as `serialize_executable.serialize` gives them."""
@@ -131,39 +147,97 @@ class AheadOfTime:
 
     def loaded(self) -> jax.stages.Compiled:
         """The executable, loaded onto this process's devices, which must be `devices` GPUs of
-        `generation`: called with the state and batch the step was compiled for, it runs the step."""
+        `generation`, or `devices` of its platform: called with the state and batch the step was
+        compiled for, it runs the step."""
         found = jax.devices()
-        generations = {gpu_target(device.device_kind).generation for device in found}
-        if len(found) != self.devices or generations != {self.generation}:
-            raise ValueError(f"this step was compiled for {self.devices} {self.generation} GPUs; this "
-                             f"process has {len(found)} of {sorted(generations)}")
+        here = {device.platform if self.generation is None else gpu_target(device.device_kind).generation
+                for device in found}
+        wanted = self.platform if self.generation is None else self.generation
+        if len(found) != self.devices or here != {wanted}:
+            raise ValueError(f"this step was compiled for {self.devices} {wanted} devices; this process "
+                             f"has {len(found)} of {sorted(here)}")
         in_tree, out_tree = self.trees
         return serialize_executable.deserialize_and_load(self.executable, in_tree, out_tree,
                                                          backend=found[0].client)
 
 
-def compile_ahead(trainer: Trainer, batch: Batch) -> AheadOfTime:
-    """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only GPUs its
-    mesh is built over (`compile_only_gpus`) and never run: the step `fit` would compile there,
-    traced as on those GPUs (`dew.nn.kernels.generation.assumed`) and compiled with the options the
-    run's compile there takes, at the base rung and the plan's first split, its state the fresh one
-    the trainer builds, abstract and placed by its layout."""
+    def taken(self, lowered: jax.stages.Lowered) -> jax.stages.Compiled:
+        """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
+        that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
+        that differs, which the executable would not run as the run's step."""
+        if program_of(lowered) != self.program:
+            raise ValueError("the step compiled ahead is another program than the one this run compiles "
+                             "first: compile it ahead from this run's config and data "
+                             "(--trainer.compile-ahead), with this Dew, and no plan recorded for another "
+                             "rung")
+        return self.loaded()
+
+
+def program_of(lowered: jax.stages.Lowered) -> str:
+    """A step's program as `lowered` holds it, its text's digest: two lowerings of one step agree."""
+    return hashlib.sha256(lowered.as_text().encode()).hexdigest()
+
+
+@dataclasses.dataclass(frozen=True)
+class AheadTarget:
+    """Where a configured run compiles its first step ahead and saves it, then exits, training nothing
+    (`TrainerConfig.compile_ahead`): for `devices` GPUs of the CUDA `generation` (`compile_only_gpus`),
+    which this host need not have, written to `path` (`AheadOfTime.save`)."""
+
+    generation: str
+    devices: int
+    path: str
+
+    def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
+                                  steps: int | None) -> CompiledAhead:
+        """`trainer`, built over this target's devices (`compile_only_gpus`), its first step over
+        `loader`'s first batch compiled ahead (`compile_ahead`) and saved, as what ends the run."""
+        from dew.training._fit import first_batch
+
+        trainer.validate(steps=steps)
+        ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh))
+        ahead.save(self.path)
+        return CompiledAhead(self.path, ahead)
+
+
+class CompiledAhead(SystemExit):
+    """Raised by a configured run under `compile_ahead` once its first step is compiled and saved
+    (`AheadTarget.compiled`). Compiling was the whole run, so uncaught it ends the program with status 0
+    and no traceback, the step's cost logged; `ahead` is the step and `path` where it was saved."""
+
+    def __init__(self, path: str, ahead: AheadOfTime):
+        super().__init__(0)
+        self.path, self.ahead = path, ahead
+        _log.info("the step compiled ahead for %s %s devices holds %s bytes a device at its peak; saved "
+                  "to %s", ahead.devices, ahead.generation or ahead.platform, ahead.peak_bytes, path)
+
+
+def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> AheadOfTime:
+    """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the devices its mesh is
+    built over and never run: the step `fit` would compile there, as its plan's first candidate lowers
+    it (`Trainer._candidate`), at the base rung and the first split, its state the fresh one the
+    trainer builds, abstract and placed by its layout, compiled with the options the run's compile
+    takes. Over compile-only GPUs of one generation (`compile_only_gpus`) it traces as on those GPUs
+    (`dew.nn.kernels.generation.assumed`); over the trainer's own devices, as they are."""
     devices = list(trainer.device_mesh.devices.flat)
-    generations = {gpu_target(device.device_kind).generation for device in devices}
-    if {device.platform for device in devices} != {"gpu"} or len(generations) != 1:
-        raise ValueError("compile_ahead compiles for the compile-only GPUs of one generation a trainer's "
-                         "mesh is built over (MeshSpec.build(compile_only_gpus(generation, count))); this "
-                         f"mesh holds {sorted({device.device_kind for device in devices})}")
-    (generation,) = generations
+    platforms = {device.platform for device in devices}
+    generations = ({gpu_target(device.device_kind).generation for device in devices} if platforms == {"gpu"}
+                   else {None})
+    if len(platforms) != 1 or len(generations) != 1:
+        raise ValueError("compile_ahead compiles for one platform's devices, one generation of GPUs "
+                         "(MeshSpec.build(compile_only_gpus(generation, count))); this mesh holds "
+                         f"{sorted({device.device_kind for device in devices})}")
+    (generation,), (platform,) = generations, platforms
     start = trainer._started()
     lowered, options = trainer._lowered_for(start.abstract, batch, generation, trainer.device_mesh)
     compiled = lowered.compile(options)
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)
     memory = compiled.memory_analysis()
     if memory is None:
-        raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
+        raise ValueError(f"XLA states no memory of the step it compiled for {generation or platform}")
     return AheadOfTime(
-        generation, len(devices), dict(trainer.device_mesh.shape), executable, (in_tree, out_tree),
+        generation, len(devices), dict(trainer.device_mesh.shape), platform, program_of(lowered),
+        executable, (in_tree, out_tree),
         flops=step_flops(compiled),
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,

@@ -27,7 +27,7 @@ from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._records import JSON
+from dew._records import JSON, json_value, record
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
@@ -56,6 +56,7 @@ from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
     from dew.training._lowering import KernelReport
+    from dew.training.ahead import AheadOfTime
     from dew.training.rollout import Rollout
     from dew.training.trainer import StepFn
 
@@ -549,6 +550,9 @@ class FitSearch[LossT, EffectsT]:
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
     dropped: str | None = None
     """The rung (`rung`) the narrow copies were dropped at."""
+    ahead: AheadOfTime | None = None
+    """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
+    is that program (`AheadOfTime.taken`)."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
@@ -612,9 +616,13 @@ class FitSearch[LossT, EffectsT]:
     def measured(self, split: int, candidate: Candidate
                  ) -> tuple[jax.stages.CompilerOptions | None, jax.stages.Compiled | None, Probe]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
-        where it fits the devices, and the measure of its fit (`Probe`), the search's state untouched."""
+        where it fits the devices, or for the search's first compile the step compiled ahead
+        (`ahead`), and the measure of its fit (`Probe`), the search's state else untouched."""
         options = self.required if self.xla_defaults else self.options(candidate)
-        executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
+        if self.ahead is not None:
+            executable, self.ahead = self.ahead.taken(candidate.lowered), None
+        else:
+            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
         fit, headroom = step_fits(executable, self.mesh, candidate.held)
         return options, executable, Probe.read(split, candidate, self.current(), fit, headroom, executable)
 
@@ -663,6 +671,21 @@ class FitSearch[LossT, EffectsT]:
             self.objective.substitute(held)
             self.objective.restore_head(tile, fused=fused)
             self.xla_defaults, self.narrow = defaults, narrow
+
+    def advice(self, planned: Planned, recorded: JSON, resumed: JSON) -> dict[str, JSON] | None:
+        """The cheaper remat rung the run is told of (`cheaper`): none for a resumed run, which
+        continues its checkpoint's rung; the one a recorded plan's run measured, where the run took that
+        plan, its split and rung, and none where the search moved off it; else measured now."""
+        if resumed is not None:
+            return None
+        if recorded is not None:
+            kept = record(recorded, 'recorded plan')
+            told = json_value(kept.get('cheaper'), 'recorded cheaper rung')
+            plan = {**planned.rung, 'split': planned.split}
+            taken = all(kept.get(field) == value for field, value in plan.items())
+            return told if taken and isinstance(told, dict) else None
+        probe = self.cheaper(planned)
+        return None if probe is None else probe.record()
 
     def climb(self) -> bool:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.

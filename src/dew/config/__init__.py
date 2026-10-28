@@ -79,6 +79,7 @@ from dew.registry import (
 )
 from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
+from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead, compile_only_gpus
 from dew.training.budget import Pause, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
@@ -507,6 +508,23 @@ class TrainerConfig:
     first compile there fails here, in seconds and without the GPU; XLA's
     compile of the whole step still needs one. The program exits with status
     0 once the step lowers, and opens no W&B run.
+    """
+    compile_ahead: AheadTarget | None = None
+    """Compile the run's first step for GPUs this host lacks, save it, then exit without training.
+
+    `--trainer.compile-ahead.generation sm90 --trainer.compile-ahead.devices 8
+    --trainer.compile-ahead.path step.dew-aot` builds the run as it would over eight compile-only
+    H100s (`dew.training.ahead`), compiles its first step there with XLA's CUDA compiler, which needs
+    the CUDA plugin and no GPU, and writes it with what it costs: each device's peak bytes and the
+    step's FLOPs, read before booking the GPUs. The program exits with status 0, and writes no
+    checkpoint or tracking.
+    """
+    ahead: str | None = None
+    """Run the step `compile_ahead` saved at this path as the run's first step, in place of compiling it.
+
+    The run lowers its first step as it would and runs the saved executable where that is the same
+    program, on a host of the topology it was compiled for; another program, from another config,
+    data shape, Dew or a plan recorded for another rung, is refused before the run trains.
     """
     tune_kernels: bool = False
     """Measure each Pallas launch of the step that has no config measured on this GPU.
@@ -1451,6 +1469,8 @@ class RunConfig:
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
+        if trainer.compile_ahead is not None:
+            raise self.compiled_ahead(objective, dataset, steps, rollout)
         tracker = checkpoints = None
         try:
             wandb_tracker = None
@@ -1484,15 +1504,15 @@ class RunConfig:
             # The whole pool accepts the resume before its record is replaced or its state restored.
             agreed("run resume", check_resumed)
             agreed("run metadata", record_run)
-            # The trainer holds mesh, microbatches, layout, accumulation, split,
-            # dynamic_scale, profile and tune_kernels; prepare_process read the
-            # process fields, and the rest are fit's arguments or built the
-            # checkpoints and the tracker.
+            # The trainer holds mesh, microbatches, layout, accumulation, split, dynamic_scale, profile and
+            # tune_kernels; prepare_process read the process fields, and the rest are fit's arguments or
+            # built the checkpoints and the tracker.
             state = Trainer(
                 objective, self.optim, key=trainer.key, mesh=trainer.mesh,
                 microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
                 split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
                 tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
+                ahead=None if trainer.ahead is None else AheadOfTime.load(trainer.ahead),
                 tune_kernels=trainer.tune_kernels,
             ).fit(
                 dataset, steps=steps, tokens=trainer.tokens,
@@ -1520,6 +1540,21 @@ class RunConfig:
 
         finally:
             _closed(tracker, checkpoints, sys.exception())
+
+    def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
+                                         steps: int | None, rollout: Rollout | None) -> CompiledAhead:
+        """The run's first step compiled for its `compile_ahead` target and saved
+        (`AheadTarget.compiled`), its trainer built as `train` builds it, over that target's
+        compile-only GPUs, with no checkpoints or tracker: what ends a run that compiles ahead."""
+        trainer, target = self.trainer, self.trainer.compile_ahead
+        assert target is not None
+        devices = compile_only_gpus(target.generation, target.devices)
+        built = Trainer(
+            objective, self.optim, key=trainer.key, mesh=trainer.mesh.build(devices),
+            microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
+            split=trainer.split, dynamic_scale=trainer.dynamic_scale, rollout=rollout,
+            tune_kernels=trainer.tune_kernels)
+        return target.compiled(built, dataset, steps)
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
               tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:

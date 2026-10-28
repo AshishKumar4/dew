@@ -7,6 +7,7 @@ under one placement, whichever backend compiles it. What it costs and its execut
 a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import dataclasses
+import json
 
 import jax
 import jax.numpy as jnp
@@ -25,10 +26,11 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def fine_tune(mesh) -> Trainer:
-    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
+def fine_tune(mesh, *, ahead=None, width: int | None = None) -> Trainer:
+    fields = TINY_DECODER if width is None else {**TINY_DECODER, "emb_features": width}
+    model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), split=1)
+                   layout=Layout(min_shard=TINY_SHARD), split=1, ahead=ahead)
 
 
 @pytest.mark.mesh(devices=8)
@@ -72,13 +74,49 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
 
 
 @pytest.mark.mesh(devices=8)
-def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
-    """A trainer whose mesh is this host's own devices runs its step here; compiling it ahead is
-    refused, as it compiles for no other topology."""
-    from dew.training.ahead import compile_ahead
+def test_a_run_given_its_step_compiled_ahead_runs_it_and_trains_as_one_that_compiled_it(tmp_path):
+    """Compiled ahead over this host's own eight devices and saved, the step runs as a fresh run's first
+    step in place of its compile (`Trainer(ahead=...)`): the run trains to the parameters the same run
+    that compiled its own step trains to, bit for bit, one program having run both. A step compiled
+    ahead for a wider model is another program, refused before the run trains (row 1915)."""
+    from dew.training.ahead import AheadOfTime, compile_ahead
 
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    compile_ahead(fine_tune(MeshSpec(fsdp=8).build()), batch).save(tmp_path / "step.dew-aot")
+    compile_ahead(fine_tune(MeshSpec(fsdp=8).build(), width=48), batch).save(tmp_path / "wide.dew-aot")
+
+    def trained(ahead):
+        trainer = fine_tune(MeshSpec(fsdp=8).build(), ahead=ahead)
+        return trainer.fit(batch, steps=2, log_every=1).variables["params"]
+
+    taken, compiled = trained(AheadOfTime.load(tmp_path / "step.dew-aot")), trained(None)
+    for ours, theirs in zip(jax.tree.leaves(taken), jax.tree.leaves(compiled), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
     with pytest.raises(ValueError):
-        compile_ahead(fine_tune(MeshSpec(fsdp=8).build()), token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+        trained(AheadOfTime.load(tmp_path / "wide.dew-aot"))
+
+
+def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_nothing(tmp_path):
+    """`dew train` with `trainer.compile_ahead` set compiles the run's first step for one compile-only
+    A100, writes it where it names, and ends with status 0, the step loadable and what it costs
+    stated; it writes no checkpoint or tracking, as it trains nothing (row 1915)."""
+    from test_run_options import lm
+
+    from dew.cli.main import main
+    from dew.training.ahead import AheadOfTime, CompiledAhead
+
+    record, runs, path = tmp_path / "record", tmp_path / "runs", tmp_path / "step.dew-aot"
+    lm(tmp_path, drawn=False).save(str(record))
+    target = {"generation": "sm80", "devices": 1, "path": str(path)}
+    settings = {"trainer.name": "ahead", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
+                "trainer.compile_ahead": json.dumps(target)}
+    with pytest.raises(CompiledAhead) as ended:
+        main(["train", str(record / "run.json"),
+              *(flag for name, value in settings.items() for flag in ("--set", f"{name}={value}"))])
+    assert ended.value.code == 0
+    saved = AheadOfTime.load(path)
+    assert (saved.generation, saved.devices, saved.platform) == ("sm80", 1, "gpu") and saved.peak_bytes > 0
+    assert not runs.exists()
 
 
 ACCUMULATION_CELLS = [("sm80", "bfloat16"), ("sm90", "float32")]
