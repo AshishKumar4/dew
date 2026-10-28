@@ -743,7 +743,7 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
         offset = m * bm + k * bk
         steps = pl.ds(start + offset, bk)
         cb = cb_ref[pl.ds(offset, bk), pl.ds(m * bm, bm)].T
-        cb = cb * jnp.exp(jnp.minimum(algebra.apart(*da_m, *_read(da_ref, steps)), 0.0).T)
+        cb = cb * jnp.exp(jnp.minimum(algebra.apart(*_read(da_ref, steps), *da_m), 0.0).T)
         cb = jnp.where(_causal(offset, bk, m * bm, bm).T, cb, 0.0).astype(dout_ref.dtype)
         return acc + _dot(cb, read_rows(dout_ref.at[steps], _from(limit, offset)), exact=exact)
 
