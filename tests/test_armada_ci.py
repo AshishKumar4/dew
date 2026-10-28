@@ -1867,11 +1867,12 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
 
 
 def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci, tmp_path, monkeypatch):
-    """A suite the test cache's policy turns off (a lock, JAX's build or the recorder changed) runs every file
-    cold: each task pays the compiles and imports no warm run did, so its weight carries COLD_SECONDS beside its
-    estimate, which sizes armada's pool to the fleet rather than to the longest task, and its deadline is 5400 s,
-    not 2700 (Main, 2026-10-28: train 254's cold suite, 2,169 tasks planned on 242 containers, about 470 s a task
-    against an estimated 120, left 780 tasks unstarted at its 2,698 s deadline). A warm suite keeps both."""
+    """A suite the test cache's policy turns off (a lock, JAX's build or the recorder changed) runs every
+    file cold: each task pays the compiles and imports no warm run did, so its weight carries COLD_SECONDS
+    beside its estimate, which sizes armada's pool to the fleet rather than to the longest task, and its
+    deadline is 5400 s, not 2700 (Main, 2026-10-28: train 254's cold suite, 2,169 tasks planned on 242
+    containers, about 470 s a task against an estimated 120, left 780 tasks unstarted at its 2,698 s
+    deadline). A warm suite keeps both."""
     for name in ("test_a", "test_b"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(

@@ -615,13 +615,21 @@ def borrowed(timings: dict, python: str) -> dict:
     return {**timings, **{key: filled(timings.get(key, {})) for key in ("files", "rows")}}
 
 
+COLD_SECONDS = 360.0
+"""What a task adds to its estimate when it runs cold, the test cache's policy off (a lock, JAX's build or
+the recorder changed): the compiles and imports no warm run paid. Train 254's cold suite ran about 470 s a
+task where its plan estimated about 120 (1,389 tasks in 2,700 s on 242 containers, 2026-10-28)."""
+
+
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
     then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
     the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files
     whose rows the cache holds for exactly these inputs (`reusable`) share one task, which looks each up
-    again in its container, so the verdict names every file and containers scale with the change."""
+    again in its container, so the verdict names every file and containers scale with the change. Under the
+    policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by the work, not the
+    longest task, as warm estimates did."""
     cache = os.environ.get("DEW_TEST_CACHE") or "on"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     recorded = recorded_tests()
@@ -655,7 +663,7 @@ def plan(target: float, timings: dict) -> list[dict]:
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": group, "rows": [row(python, name, group) for name in names],
-                            "weight": weight, "cache": cache})
+                            "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache})
     rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
     for index in range(COLLECT_TASKS if rest else 0):
         names = rest[index::COLLECT_TASKS]
