@@ -78,7 +78,7 @@ from ..inputs import (
     coordinates_of,
     numbered_blocks,
 )
-from ..kv_cache import KVCache
+from ..kv_cache import DecodeCursor, KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
@@ -155,7 +155,7 @@ class CausalTransformer(nn.Module):
     fields and needs no subclass. The field comments name the family that sets
     each one. A classic GPT block is `norm_type='layer'`, `norm_bias`, an
     ungated `mlp`, `mlp_bias` and learned positions; the learned positions
-    advance from each decode row's cache cursor.
+    advance from each decode row's count of its real tokens (`DecodeCursor`).
 
     `layer_types` is the pattern, one kind per layer, and `kinds` says what
     each kind does. `kv_shared_layers` lists the layers that share by index: a
@@ -538,16 +538,19 @@ class CausalTransformer(nn.Module):
         return tuple(self.layer_types)
 
     def kind_of(self, layer_type: str) -> "ResolvedKind":
-        """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset."""
+        """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset.
+        A rope scaling is one setting, YaRN's record or a Llama 3.1 or LongRoPE ramp: a kind that gives
+        either takes it in place of the model's, never beside it (`MixerContext.rotary_scaling`)."""
         kind = (self.kinds or {}).get(layer_type, LayerKind())
+        scaled = kind.rope_scaling is not None or kind.yarn is not None
         return ResolvedKind(
             window=kind.window,
             bidirectional_window=kind.bidirectional_window,
             chunk=kind.chunk,
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
-            rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
-            yarn=self.yarn if kind.yarn is None else kind.yarn,
+            rope_scaling=kind.rope_scaling if scaled else self.rope_scaling,
+            yarn=kind.yarn if scaled else self.yarn,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
@@ -912,6 +915,7 @@ class CausalTransformer(nn.Module):
                 features=self.emb_features, dtype=self.dtype, name='embed_positions',
                 embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                                 else nn.initializers.normal(self.initializer_range)))
+            self.decode_cursor = DecodeCursor()
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
@@ -1315,6 +1319,16 @@ class CausalTransformer(nn.Module):
         """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
         return self.continuum is not None
 
+    def affine_head(self) -> bool:
+        """Whether the head past the continuum level (`head_logits`) is affine in its states, read from
+        the bound model: a table's product and a bias, with no transform, logit softcap, nGPT gains or
+        quantizer of the head's own input (`SteppedInContext`); a checkpoint's quantizer of the trunk's
+        modules alone leaves it affine, and a tied head reads its table with none."""
+        quantized = (isinstance(self, QuantizesInputs) and not self.tie_embeddings
+                     and self.input_quantizer(self.lm_head) is not None)
+        return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
+                and not quantized)
+
     @nn.nowrap
     def in_context_level(self, variables):
         """The continuum level's parameters in `variables`, None without a level (`SteppedInContext`)."""
@@ -1659,16 +1673,14 @@ class CausalTransformer(nn.Module):
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
             # The tokens' places as every layer reads them (`Coordinates`), whichever fields the
-            # caller gave them in; a cached call's continue from its cache's cursor.
+            # caller gave them in; a cached call's continue from the model's own count of each row's
+            # real tokens (`DecodeCursor`), whatever mixer its first layer runs.
             tokens_at = coordinates_of(attention_metadata, *tokens.shape)
-            places = tokens_at.positions
-            if places is None:
-                valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
-                places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
-                # A first cached call finds no cursor yet: its tokens start the row.
-                start = self.layers[0].self_attn.get_variable('cache', 'cache_index') if decode else None
-                if start is not None:
-                    places = places + start[:, None]
+            valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
+            # Every cached call counts its real tokens, those at given places too, so a later call
+            # without places continues after them.
+            counted = self.decode_cursor(valid) if decode else jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
+            places = counted if tokens_at.positions is None else tokens_at.positions
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
         if self.embedding_norm and self.embedding_norm_reads == 'inputs':
             x = self.embedding_layernorm(x)
@@ -1803,7 +1815,7 @@ class CausalTransformer(nn.Module):
         injected = x
         shared = SharedPassView() if loop.shared_cache else None
         first_pass = run_block if shared is None else nn.map_variables(
-            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.first_out,
+            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.outside,
             mutable=True)
         x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
         for step in range(1, loop.steps):
@@ -2349,8 +2361,17 @@ class CausalTransformer(nn.Module):
 
     @property
     def cache_rebuild_position(self) -> int | None:
-        scaling = self.rope_scaling
-        return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
+        """Where LongRoPE's factors switch from short to long, past which cached keys go stale: the
+        original length of every trunk layer's LongRoPE, its kind's or the model's (`kind_of`), None
+        where no layer takes LongRoPE. Kinds that switch at different lengths are refused, since a cache
+        rebuilds at one."""
+        originals = {kind.rope_scaling.original_max_position_embeddings
+                     for kind in map(self.kind_of, set(self.per_layer_types))
+                     if isinstance(kind.rope_scaling, LongRopeScaling)}
+        if len(originals) > 1:
+            raise ValueError(f"layer kinds switch LongRoPE's factors at {sorted(originals)} tokens; a cache "
+                             "rebuilds its keys at one")
+        return next(iter(originals), None)
 
     @nn.nowrap
     def block_chunks(self) -> tuple[int | None, ...]:

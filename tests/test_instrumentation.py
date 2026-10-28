@@ -405,7 +405,8 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from tool_support import load
 
-    from dew.telemetry.instrumentation import collective, hlo_instructions
+    from dew.telemetry.instrumentation import hlo_instructions
+    from dew.telemetry.trace import collective
 
     mesh = Mesh(np.asarray(jax.devices()[:8]), ("data",))
 

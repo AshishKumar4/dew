@@ -536,12 +536,9 @@ class CausalSelfAttention(nn.Module):
             if self.ctx.partial_rotary_type != "default":
                 raise ValueError("M-RoPE requires default partial rotary")
             section = self.mrope_section
-        if self.ctx.yarn is not None and self.ctx.rope_scaling is not None:
-            raise ValueError("yarn and rope_scaling are two rope scalings; a layer takes one")
         return rotary_freqs(
             rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, rot_dim=self._rot_dim(),
-            partial_rotary_type=self.ctx.partial_rotary_type,
-            rope_scaling=self.ctx.rope_scaling if self.ctx.yarn is None else self.ctx.yarn,
+            partial_rotary_type=self.ctx.partial_rotary_type, rope_scaling=self.ctx.rotary_scaling(),
             dtype=dtype, reach=reach, section=section)
 
     def _group_fields(self) -> tuple[str, ...]:

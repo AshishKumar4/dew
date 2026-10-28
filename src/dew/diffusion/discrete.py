@@ -32,20 +32,31 @@ import numpy as np
 from flax import linen as nn
 
 from dew._distributions import counted, draw, row_draw, wellformed
-from dew.batch import Coordinates, Variables, coordinates, real_slots, token_id, token_ids, token_layout
+from dew.batch import (
+    COORDINATES_FIELD,
+    Coordinates,
+    Variables,
+    coordinates,
+    real_slots,
+    token_id,
+    token_ids,
+    token_layout,
+    token_positions,
+    with_validity,
+)
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.diffusion.schedules import common
 from dew.interop.weights import decoding_storage
 from dew.nn import categorical
 from dew.nn.inputs import (
-    RESPONSE_FIELDS,
     ModelInputs,
     Request,
     continuation_keys,
     local_rows,
     mesh_of,
     prompt_major,
+    unruled_fields,
 )
 from dew.nn.kernels.options import program
 from dew.nn.protocols import Logits, ShiftsLogits, TokenModel
@@ -378,7 +389,7 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
     capacity = model.max_seq_len if bounded else None
     if capacity is not None and inputs.tokens.shape[1] + budget > capacity:
         raise ValueError("prompt plus max_new_tokens exceeds max_seq_len")
-    unruled = sorted(inputs.token_fields.keys() - RESPONSE_FIELDS.keys())
+    unruled = unruled_fields(inputs.token_fields)
     if unruled:
         raise ValueError(f"masked generation cannot extend token fields {unruled}: a response has no "
                          f"rule for their slots (dew.nn.inputs.RESPONSE_FIELDS)")
@@ -396,16 +407,23 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
     slots may change, and count on from the prompt's last real token. The
     positions are the ones the model reads (`Coordinates.places`): the given
     ones, else each real token's place in its packed document, else its rank
-    among its row's real tokens.
+    among its row's real tokens, read from the request's `Coordinates` where
+    it carries them (`token_positions`, `token_layout`) and written back
+    there, else from and to its fields.
     """
     batch, prompt = inputs.tokens.shape
     fields = inputs.token_fields
     valid = real_slots(fields, (batch, prompt))
-    positions = coordinates((batch, prompt), segments=fields.get("segment_ids"), valid=valid,
-                            positions=fields.get("positions")).places()
-    written = replace(inputs, token_fields={**fields, "positions": positions, "attention_mask": valid})
-    extended = written.extended(jnp.full((batch, width), mask_id, jnp.int32))
-    return extended, extended.token_fields["attention_mask"] & (jnp.arange(prompt + width) >= prompt)
+    _, segments = token_layout(fields)
+    positions = coordinates((batch, prompt), segments=segments, valid=valid,
+                            positions=token_positions(fields)).places()
+    laid = fields.get(COORDINATES_FIELD)
+    placed = ({**fields, COORDINATES_FIELD: replace(laid, positions=positions)}
+              if isinstance(laid, Coordinates) else {**fields, "positions": positions})
+    extended = replace(inputs, token_fields=with_validity(placed, valid)).extended(
+        jnp.full((batch, width), mask_id, jnp.int32))
+    response = jnp.arange(prompt + width) >= prompt
+    return extended, real_slots(extended.token_fields, extended.tokens.shape) & response
 
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys: jax.Array,

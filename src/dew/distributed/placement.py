@@ -758,7 +758,7 @@ class Layout:
 
 def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> dict[str, tuple[str, ...]]:
     """The collectives a training step runs over each axis of `mesh` above size one, by the role a
-    placement gives the axis, in HLO's names (`dew.telemetry.instrumentation.COLLECTIVES`).
+    placement gives the axis, in HLO's names (`dew.telemetry.trace.COLLECTIVES`).
 
     An axis whose devices each compute their own share of a batch, its rows (`rows`) or the
     sequence axis's positions, sums the step's loss and the gradients of what it holds whole

@@ -41,6 +41,20 @@ class ConditionalSourceOracle(nn.Module):
 
 
 
+FLAXDIFF_TIMES = 8192
+"""The times of one seed's draw at FlaxDiff's tangent grids (`flaxdiff_times`)."""
+
+
+def flaxdiff_times(seed: int) -> dict[str, np.ndarray]:
+    """A seed's times at which FlaxDiff's tangent grids are recorded over check 1's seeds
+    (tools/flaxdiff_schedules_reference.py seeds) and drawn again here: the 33 from 0 to 1 its
+    comparison read, both ends among them, and FLAXDIFF_TIMES uniform on [0, 1). A grid's rounding
+    grows with its sigma toward t = 1, where the tangent steepens, so a draw holds enough times for
+    each seed to reach that end."""
+    drawn = np.random.default_rng(seed).uniform(0, 1, FLAXDIFF_TIMES)
+    return {"t": np.concatenate([np.linspace(0, 1, 33), drawn]).astype(np.float32)}
+
+
 def apg_walked(case, label, x_T):
     """A `tools/guidance_reference.py` APG case walked by Dew: `case["steps"]` Euler steps of the linear
     path over `ConditionalSourceOracle` at `label`, APG guiding the guider's steps

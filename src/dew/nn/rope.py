@@ -200,9 +200,13 @@ class YarnScaling:
     attention_factor: float | None = None
 
 
+type Scaling = RopeScaling | LongRopeScaling | YarnScaling
+"""A rotary's one frequency scaling: Llama 3.1's ramp, LongRoPE's factors or YaRN's (`rotary_freqs`)."""
+
+
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
                  partial_rotary_type: str = 'proportional',
-                 rope_scaling: RopeScaling | LongRopeScaling | YarnScaling | None = None, *,
+                 rope_scaling: Scaling | None = None, *,
                  dtype: DTypeLike, reach=None, section: Sequence[int] | None = None):
     """Return cos and sin of the rotary angles at absolute `positions`: [P, pairs].
 
