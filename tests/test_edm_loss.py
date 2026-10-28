@@ -25,7 +25,15 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
+from certified import assert_certified
+from reference_error import (
+    assert_as_exact,
+    assert_fp32_reduction_bound,
+    chain_roundings,
+    declared_seeds,
+    indexed_recording,
+    recording,
+)
 from tool_support import run_from
 
 from dew.diffusion.presets import EDM
@@ -78,13 +86,12 @@ def recorded_site(site: str):
 
 
 def edm_loss(inputs):
-    """Dew's pixel loss on a draw: its sigmas, per-element loss and the gradient of its mean in F."""
+    """Dew's pixel loss on a draw: its per-element loss and the gradient of its mean in F."""
     process = EDM(regime="pixel")()
     weights = {name: jnp.asarray(inputs[name]) for name in ("a", "b", "c")}
     output = jax.grad(lambda offset: jnp.mean(per_element(process, inputs, weights, offset=offset)))(
         jnp.zeros(nhwc(inputs["images"]).shape))
-    return {"sigma": process.schedule.sigmas(jnp.asarray(inputs["normals"]))[:, None],
-            "loss": per_element(process, inputs, weights),
+    return {"loss": per_element(process, inputs, weights),
             "grad/network_output": jnp.transpose(output, (0, 3, 1, 2))}
 
 
@@ -101,23 +108,30 @@ def edm2_loss(inputs):
         return jnp.mean(per_element(process, inputs, weights, head, offset))
 
     gradient, output = jax.grad(mean, argnums=(0, 1))(weights, jnp.zeros(nhwc(inputs["images"]).shape))
-    return {"sigma": process.schedule.sigmas(jnp.asarray(inputs["normals"]))[:, None],
-            "loss": per_element(process, inputs, weights, head),
+    return {"loss": per_element(process, inputs, weights, head),
             "grad/network_output": jnp.transpose(output, (0, 3, 1, 2)),
             "grad/logvar_weight": gradient["head"]["params"]["linear"][MP_KERNEL].T}
 
 
 @pytest.mark.parametrize("regime,site", [("pixel", "edm"), ("latent", "edm2")])
 def test_the_training_sigmas_are_nvlabs(regime, site):
-    """EDM's exp(N(-1.2, 1.2^2)) for pixels and EDM2's exp(N(-0.4, 1)) for
-    latents, on the same standard normals NVlabs' loss drew, on par with
-    them over the recorded seeds (check 1)."""
+    """EDM's exp(N(-1.2, 1.2^2)) for pixels and EDM2's exp(N(-0.4, 1)) for latents, on the same standard
+    normals NVlabs' loss draws (tools/edm_loss_reference.py's `draw`): each sigma's every operation within
+    its certified bound (check 2), and each within float32's rounding over the computation's chain of the
+    published formula's float64 value (the oracle rule). A [1024] lognormal spread's error is its largest
+    sigma's one rounding, 0 or an ulp, which no pooled check 1 resolves within 512 seeds."""
     schedule = EDM(regime=regime)().schedule
-    draw, recorded, truth, seeds = recorded_site(site)
-    assert_as_exact(lambda index, inputs: {"sigma": schedule.sigmas(jnp.asarray(inputs["normals"]))[:, None]},
-                    as_given(lambda index, inputs: {"sigma": recorded(index, inputs)["sigma"]}), draw,
-                    f"{site} sigmas", seeds=seeds,
-                    truth_fn=as_given(lambda index, inputs: {"sigma": truth(index, inputs)["sigma"]}))
+    mean, spread = {"pixel": (-1.2, 1.2), "latent": (-0.4, 1.0)}[regime]
+
+    def draw(seed):
+        return (jnp.asarray(generator().draw(seed)["normals"]),)
+
+    assert_certified(schedule.sigmas, draw, f"{site} sigmas", seeds=8)
+    roundings = chain_roundings(jax.make_jaxpr(schedule.sigmas)(*draw(0)))
+    for seed in range(8):
+        (normals,) = draw(seed)
+        exact = np.exp(mean + spread * np.asarray(normals, np.float64))
+        assert_fp32_reduction_bound(schedule.sigmas(normals), exact, exact, roundings)
 
 
 def test_the_pixel_loss_and_its_gradient_are_edmloss():

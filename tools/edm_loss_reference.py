@@ -16,7 +16,7 @@ preconditioners wrap is an affine stand-in, F(x, c_noise) = a x + b c_noise
 training sigma, and the noise before it is scaled by sigma) return stored
 draws; and there are no labels or augmentation. What lands, over the seeds
 check 1 draws (`record_case`, tools/recorded_references.py): each loss's
-training sigmas, per-element loss and the gradient of its mean in the
+per-element loss and the gradient of its mean in the
 network's output and in the logvar head's weight, computed as published in
 float32 and by its float64 twin (the float32 casts retargeted), whose
 distance from the first is the float32 run's rounding, summarized (each
@@ -96,27 +96,25 @@ def replayed(normals: torch.Tensor, noise: torch.Tensor):
 
 
 def run(loss, net, network, arrays: dict, dtype) -> dict[str, np.ndarray]:
-    """One loss evaluation: the sigmas it hands `net`, its per-element values,
+    """One loss evaluation: its per-element values,
     and the gradient of their mean in the stand-in `network`'s output and in
     the logvar head's weight. The stand-in's own weights are a linear map of
     the first gradient, so theirs adds nothing."""
     images, normals, noise = (torch.tensor(arrays[name], dtype=dtype)
                               for name in ("images", "normals", "noise"))
-    sigmas, outputs = [], []
+    outputs = []
 
     def keep(_, __, output):
         output.retain_grad()
         outputs.append(output)
 
-    hooks = (net.register_forward_pre_hook(lambda _, args: sigmas.append(args[1].detach().clone())),
-             network.register_forward_hook(keep))
+    hooks = (network.register_forward_hook(keep),)
     with replayed(normals, noise):
         value = loss(net=net, images=images)
     for hook in hooks:
         hook.remove()
     value.mean().backward()
-    # Each image's sigma a row of its own: a lognormal spread's largest would size the whole leaf.
-    out = {"sigma": sigmas[0].reshape(-1, 1).numpy(), "loss": value.detach().numpy(),
+    out = {"loss": value.detach().numpy(),
            "grad/network_output": outputs[0].grad.numpy()}
     head = getattr(net, "logvar_linear", None)
     if head is not None:
