@@ -609,6 +609,11 @@ class _Groups:
 
     def flat_map(self, group: list[Record]) -> Sequence[Record]:
         rows = [record(value, "batched input") for value in group]
+        # The source examples the group's rows consume are the run's accounting, out of the step's sight:
+        # a step that keeps its rows keeps each row's, and one that makes others gives their sum to its
+        # last row, as a record step's expansion does (`_consumed_by`).
+        consumed = [integer(row[CONSUMED], "a row's consumed examples") for row in rows if CONSUMED in row]
+        rows = [{name: value for name, value in row.items() if name != CONSUMED} for row in rows]
         columns = {name: [row[name] for row in rows] for name in rows[0]}
         made = dict(self.stage.step(columns))
         counts = {len(values) for values in made.values()}
@@ -619,9 +624,16 @@ class _Groups:
             if count != len(rows):
                 raise ValueError(f"map(batched=True) keeps the {len(rows)} rows it reads, and its step "
                                  f"returned {count}; flat_map(batched=True) changes the count")
-            return [{**row, **{name: values[index] for name, values in made.items()}}
+            kept = [{**row, **{name: values[index] for name, values in made.items()}}
                     for index, row in enumerate(rows)]
-        return [{name: values[index] for name, values in made.items()} for index in range(count)]
+            return kept if not consumed else [{**row, CONSUMED: held}
+                                              for row, held in zip(kept, consumed, strict=True)]
+        outputs = [{name: values[index] for name, values in made.items()} for index in range(count)]
+        if not consumed:
+            return outputs
+        if not outputs:
+            return [Rejected("batched step made no rows", consumed=sum(consumed))]
+        return [*({**row, CONSUMED: 0} for row in outputs[:-1]), {**outputs[-1], CONSUMED: sum(consumed)}]
 
 
 @dataclasses.dataclass(frozen=True)
