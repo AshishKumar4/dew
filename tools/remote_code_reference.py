@@ -42,9 +42,13 @@ above:
 """
 
 import argparse
+import io
 import json
 import runpy
 import shutil
+import struct
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -56,6 +60,10 @@ from reference_source import config_lookups, record_padding
 from safetensors.torch import load_file, save_file
 from torch_precision import float64, float64_twin
 from transformers import AutoConfig
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+# NumPy alone, as the release's environment holds no JAX.
+from remote_code_draws import CHUNKS, PADDED, SITES, draw, positions
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 _PINNED = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop"
@@ -75,7 +83,12 @@ RELEASES = {
     # Triton conv from lfm3_conv.py, which its CPU run passes by.
     "lfm3-tiny": (*_PINNED["LFM3"][:2],
                   ("configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"), "AutoModelForCausalLM"),
+    # The same release with its convolutions' bias (`conv_bias`), which its padding masks around.
+    "lfm3-biased-tiny": (*_PINNED["LFM3"][:2], ("configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"),
+                         "AutoModelForCausalLM"),
 }
+LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0"}
+"""The license of each release a recording (`--record`) runs, as its Hub card states it."""
 """Each fixture's release: the Hub repo, the commit its code is read at, the
 files that code is, and the auto class its language model registers as. Each
 release's float64 run is built and run under `torch_precision.float64`, which
@@ -200,6 +213,124 @@ def opens(name: str, export: Path, scratch: Path) -> None:
         raise SystemExit(1)
 
 
+def send(stream, arrays: dict) -> None:
+    """`arrays` over a pipe to the other side of a recording (`received`)."""
+    buffer = io.BytesIO()
+    np.savez(buffer, **arrays)
+    stream.write(struct.pack("<Q", len(buffer.getvalue())) + buffer.getvalue())
+    stream.flush()
+
+
+def received(stream) -> dict:
+    """The arrays the other side of a recording sent (`send`)."""
+    size = struct.unpack("<Q", stream.read(8))[0]
+    with np.load(io.BytesIO(stream.read(size))) as arrays:
+        return dict(arrays)
+
+
+def released_outputs(model, site: str, inputs: dict) -> dict[str, np.ndarray]:
+    """The release's outputs at a recorded `site` (tests/remote_code_draws.py), as Dew's forward
+    gives them (tests/model_support.py's `remote_code_site`), the gradients by the release's own tensor
+    names."""
+    ids = torch.from_numpy(inputs["ids"].astype(np.int64))
+    if site == "gradients":
+        model.zero_grad()
+        with torch.enable_grad():
+            logits = model(input_ids=ids).logits
+            (logits * torch.from_numpy(inputs["cotangent"]).to(logits.dtype)).sum().backward()
+        return {name: parameter.grad.detach().numpy() for name, parameter in model.named_parameters()}
+    with torch.no_grad():
+        if site == "packed":
+            return {"logits": model(input_ids=ids, position_ids=torch.from_numpy(
+                positions().astype(np.int64))).logits.numpy()}
+        if site == "decode":
+            cache, steps, start = None, [], 0
+            for chunk in CHUNKS:
+                out = model(input_ids=ids[:, start:start + chunk], past_key_values=cache, use_cache=True)
+                cache, start = out.past_key_values, start + chunk
+                steps.append(out.logits)
+            return {"logits": torch.cat(steps, dim=1).numpy()}
+        if site == "biased":
+            logits = model(input_ids=ids, attention_mask=torch.from_numpy(inputs["attention_mask"])).logits
+            return {"row0": logits[0].numpy(), "row1": logits[1, PADDED:].numpy()}
+        return {"logits": model(input_ids=ids).logits.numpy()}
+
+
+def serve(name: str) -> None:
+    """The release's side of a recording (`--record`): its fp32 outputs and their float64 truth at each
+    site and draw the pipe brings."""
+    with tempfile.TemporaryDirectory() as scratch:
+        native = released_model(name, Path(scratch) / "fp32").float()
+        # Its float64 twin (`float64_twin`): built inside `float64`, its constructor's tables float64's.
+        wide = float64_twin(native, lambda: released_model(name, Path(scratch) / "f64"))
+        while True:
+            request = received(sys.stdin.buffer)
+            site = str(request.pop("site"))
+            reference = released_outputs(native, site, request)
+            with float64():
+                truth = released_outputs(wide, site, request)
+            send(sys.stdout.buffer, {**{f"reference.{leaf}": value for leaf, value in reference.items()},
+                                     **{f"truth.{leaf}": value for leaf, value in truth.items()}})
+
+
+def record(name: str, release_python: str) -> None:
+    """`name`'s recording over seeds at each of its sites (tests/remote_code_draws.py's `SITES`,
+    `record_case(..., summary=True)`), the release served by `release_python` in the environment its code
+    runs under, as `released.npz` beside the fixture: what its test holds Dew to by check 1. The
+    gradients' leaves are the release's tensors, each read into Dew's parameter it loads as (its
+    `WeightLayout.restore`)."""
+    # Dew's side, in Dew's environment: the release's runs in `release_python`'s.
+    from model_support import remote_code_site
+    from recorded_references import provenance, record_case, save
+
+    from dew.interop import Pretrained
+
+    source = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    vocabulary = int(json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"])
+    layouts = {layout.name: layout for layout in source.weight_layouts}
+    shapes = {".".join(path): leaf.shape for path, leaf in _leaves(source.variables)}
+    worker = subprocess.Popen([release_python, __file__, name, "--serve"], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE)
+    arrays = {}
+    try:
+        for site in SITES[name]:
+            def evaluate(inputs, site=site):
+                send(worker.stdin, {"site": np.asarray(site), **inputs})
+                returned = received(worker.stdout)
+                arms = ({leaf.removeprefix(f"{kind}."): value for leaf, value in returned.items()
+                         if leaf.startswith(f"{kind}.")} for kind in ("reference", "truth"))
+                if site != "gradients":
+                    return tuple(arms)
+                return tuple({".".join(layouts[tensor].paths[0][1:]): layouts[tensor].restore(
+                    value, shapes[".".join(layouts[tensor].paths[0])]) for tensor, value in arm.items()}
+                    for arm in arms)
+
+            arrays.update(record_case(
+                f"{name} {site}", lambda seed, site=site: draw(site, seed, vocabulary), evaluate,
+                remote_code_site(source, site), truth_proxy=remote_code_site(source, site, wide=True),
+                store_inputs=False, summary=True))
+    finally:
+        worker.kill()
+    repo, revision = RELEASES[name][:2]
+    versions = subprocess.run([release_python, "-c", "import torch, transformers; "
+                               "print(transformers.__version__, torch.__version__)"],
+                              capture_output=True, text=True, check=True).stdout.split()
+    arrays[f"{name}.provenance"] = provenance(
+        repo, revision, "cpu",
+        f"python tools/remote_code_reference.py {name} --record --release-python <python>",
+        transformers=versions[0], torch=versions[1])
+    print(save(FIXTURES / name / "released.npz", arrays, reference=repo, license=LICENSES[name]), flush=True)
+
+
+def _leaves(tree, path=()):
+    """`tree`'s leaves with their key paths."""
+    if isinstance(tree, dict):
+        for key, value in tree.items():
+            yield from _leaves(value, (*path, key))
+    else:
+        yield path, tree
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("names", nargs="*", default=sorted(RELEASES))
@@ -208,7 +339,18 @@ def main() -> None:
     parser.add_argument("--padding", action="store_true", help="record the rows each lookup leaves untrained")
     parser.add_argument("--opens", type=Path,
                         help="check that a Dew export of the fixture opens as the release does")
+    parser.add_argument("--record", action="store_true", help="record the release over seeds at its sites")
+    parser.add_argument("--serve", action="store_true", help="the release's side of --record's pipe")
+    parser.add_argument("--release-python", default=sys.executable,
+                        help="the Python whose transformers runs the release's code, for --record")
     arguments = parser.parse_args()
+    if arguments.serve:
+        serve(arguments.names[0])
+        return
+    if arguments.record:
+        for name in arguments.names:
+            record(name, arguments.release_python)
+        return
     with tempfile.TemporaryDirectory() as scratch:
         if arguments.opens is not None:
             for name in arguments.names:
