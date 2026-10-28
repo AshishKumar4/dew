@@ -136,7 +136,7 @@ def sample(pipe: TextToImage, key: int | jax.Array) -> tuple[np.ndarray, dict[st
 def quality(pipe: TextToImage) -> dict:
     from dew.data.text import load_tokenizer
     from dew.eval.images import clip_image_text_cosine
-    from dew.nn.text_encoders import DEFAULT_MODEL
+    from dew.nn.text_checkpoints import DEFAULT_MODEL
 
     tokenizer = load_tokenizer(DEFAULT_MODEL)
     tokens = tokenizer(list(PROMPTS), padding="max_length", max_length=tokenizer.model_max_length,
