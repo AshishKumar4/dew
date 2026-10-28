@@ -433,11 +433,12 @@ def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
     residual joins the reduced exponent's fractional part (`power2` takes the integral one), so the
     conversion's rounding does not reach a large value under a small weight, where XLA had folded
     `exp2(x * log2(e))` back to `exp(x)` until JAX 0.12 stopped reassociating constant products
-    (jax-ml/jax 2d3744395). The joined exponent rounds at its own ulp, at most 2^-25 below one half, which
-    moves the weight by under a fifth of its ulp: the weight's error is the base-2 exponential's on
-    [-1/2, 1/2], as the reference's `exp` is (libdevice's reduces its argument so and takes the same
-    exponential), where a correction added after the exponential rounded the weight once more, half an ulp
-    (1.55 times the reference's error on an A100's and an H100's edge weights). The factors that carry a
+    (jax-ml/jax 2d3744395). The joined exponent lies within an ulp of the conversion of [-1/2, 1/2] and
+    rounds at its own ulp, at most 2^-25 there, which moves the weight by at most a quarter of its ulp: the
+    weight's error is about the base-2 exponential's on that interval, as the reference's `exp` is
+    (libdevice's reduces its argument so and takes the same exponential), where a correction added after
+    the exponential rounded the weight once more, half an ulp (1.55 times the reference's error on an
+    A100's and an H100's edge weights). The factors that carry a
     state take it too (`Forward.power`); the backward's weights keep `jnp.exp`, as the reference does."""
     # Normalize the factor before splitting: at a tiny raw scale its residual would be subnormal.
     factor, exponent = np.frexp(scale * LOG2E)
@@ -468,11 +469,12 @@ def headroom(dtype) -> bool:
 
 def compensates(dtype) -> bool:
     """Whether a walk over values of `dtype` keeps what its running sums' additions drop
-    (`Forward.compensated`): fp32's, whose weights and products are exact, so their sums' order is the whole
-    of the output's error, and a chain of them errs past the reference's, which sums a row as a tree (jax's
-    attention on an A100 and an H100: 1.7 to 2.1 times its error over equal weights, a tile's chain of 32 keys
-    then the tiles' chain). A 16-bit dtype's weights round to it first, as the reference's do, an error
-    beside which the sums' order is nothing."""
+    (`Forward.compensated`): fp32's, whose products round at fp32's own precision, so where a row holds many
+    comparable terms the order of their sum leads the output's error, and a chain of them errs past the
+    reference's, which sums a row as a tree (jax's attention on an A100 and an H100: 1.7 to 2.1 times its
+    error over equal weights, whose products are exact, a tile's chain of 32 keys then the tiles' chain). A
+    16-bit dtype's weights round to it first, as the reference's do, an error beside which the sums' order
+    is nothing."""
     return jnp.dtype(dtype) == jnp.float32
 
 
@@ -996,17 +998,14 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
     if accumulate is None:
         chunk = chunk_of(spec)
         times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk)
-        after = stepped(state, m, factor, p, (jnp.zeros_like(state.acc),), held, times)
-        # `B` as `split_taken` takes it, each addition's rounding kept where the walk compensates (`added`).
+        # `B` takes the old anchor's term before the factor (`split_taken`), its rounding kept where the walk
+        # compensates (`added`), then the tile's other keys' products as a step takes them.
         low = state.low
         acc, acc_low = added(state.acc, None if low is None else low.acc,
                              (split_term(own, moved, rows(arg.key), arg.multiplier),))
-        acc, acc_low = added(carry_factor(acc, factor, held),
-                             None if acc_low is None else carry_factor(acc_low, factor, held),
-                             tuple(beyond_weights(product, held)
-                                   for product in products_of(parts, value, keys.dot, chunk)))
-        if after.low is not None:
-            after = after._replace(low=after.low._replace(acc=acc_low))
+        joined = state._replace(acc=acc, low=None if low is None else low._replace(acc=acc_low))
+        after = stepped(joined, m, factor, p, products_of(parts, value, keys.dot, chunk), held, times)
+        acc = after.acc
     else:
         # The tile's fp32 weights done with before its products, so they hold no registers through them.
         after = Partial(state.acc, m, denominator_after(state.total, factor, p))

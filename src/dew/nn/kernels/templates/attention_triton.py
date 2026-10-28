@@ -359,15 +359,17 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         """The fp32 words a thread holds live across the walk, the program's spread over its threads: the
-        block's weighted values `[block_q, Dv]` and a tile's logits `[block_q, block_k]`, and in a training
-        walk the anchor's value row beside them, `[block_q, Dv]` (`algebra.training_step`). Measured where
+        block's weighted values `[block_q, Dv]` and a tile's logits `[block_q, block_k]`, in a compensated
+        walk what the values' sums dropped beside them (`algebra.Partial.low`, fp32 values'), and in a
+        training walk the anchor's value row, `[block_q, Dv]` (`algebra.training_step`). Measured where
         it passes a thread's registers: the training walk at 128 by 64 in four warps, 320 a thread, takes
         10x the plain forward's time on an A100 and 4.6x on an H100, at 64 by 64 2.1x and 2.0x
         (TRAINTILES3-a100, TRAINTILES2-h100)."""
-        rows, value_width = config.block_q, ba.arguments["value"].shape[-1]
-        words = rows * value_width + rows * config.block_k
+        rows, value = config.block_q, ba.arguments["value"]
+        sums = 2 if algebra.compensates(value.dtype) else 1
+        words = sums * rows * value.shape[-1] + rows * config.block_k
         if ba.arguments.get("residuals"):
-            words += rows * value_width
+            words += rows * value.shape[-1]
         return words // (32 * config.warps)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
