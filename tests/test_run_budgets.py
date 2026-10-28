@@ -347,26 +347,26 @@ class Echoed(Pulled):
         return ObjectiveData(train=(Repeated(),))
 
 
-CLOCKED_BATCH = 4
-"""A clocked run's batch: its 20 rows fill five batches, two updates of two and a last window of one."""
+CLOCKED_RECORDS = 18
+"""A clocked run's records: their 36 rows fill five batches, two updates of two and a last window of one."""
 CLOCKED_END = PEAK / 4
 """Where a clocked run's rate ends, so its last update moves the weight too."""
 
 
 def clocked_descent(accumulation: int):
     """The reference arm of a clocked run updating every `accumulation` batches (`clocked_run`): the losses
-    of each step and the final weight of Adam on `Echoed` over `x`'s RECORDS records read in order, each
-    `id % 3 + 1` rows, in batches of CLOCKED_BATCH rows (the last short), at a rate falling linearly from
+    of each step and the final weight of Adam on `Echoed` over `x`'s CLOCKED_RECORDS records read in
+    order, each `id % 3 + 1` rows, in batches of BATCH rows (the last short), at a rate falling linearly from
     PEAK to CLOCKED_END over the run's progress, the share of its records whose last row an earlier batch held
     (`TrainState.consumed`); a window the stream ends inside commits over its own rows at a closing step
     of no rows, which reports the window's loss. In float64, the truth."""
     @as_given
     def descended(x):
-        ids = np.arange(1, RECORDS + 1)
-        owner = np.repeat(np.arange(RECORDS), ids % 3 + 1)
+        ids = np.arange(1, CLOCKED_RECORDS + 1)
+        owner = np.repeat(np.arange(CLOCKED_RECORDS), ids % 3 + 1)
         rows, last = x[owner], np.r_[owner[1:] != owner[:-1], True]
-        batches = [(rows[start:start + CLOCKED_BATCH], int(np.sum(last[start:start + CLOCKED_BATCH])))
-                   for start in range(0, len(rows), CLOCKED_BATCH)]
+        batches = [(rows[start:start + BATCH], int(np.sum(last[start:start + BATCH])))
+                   for start in range(0, len(rows), BATCH)]
         w = first = second = jnp.zeros(FEATURES, x.dtype)
         losses, consumed = [], 0
         for update, at in enumerate(range(0, len(batches), accumulation)):
@@ -383,7 +383,7 @@ def clocked_descent(accumulation: int):
             first, second = 0.9 * first + 0.1 * gradient, 0.999 * second + 0.001 * jnp.square(gradient)
             corrected = (first / (1 - 0.9 ** (update + 1)), second / (1 - 0.999 ** (update + 1)))
             moved = corrected[0] / (jnp.sqrt(corrected[1]) + 1e-8)
-            w = w - (PEAK + (CLOCKED_END - PEAK) * consumed / RECORDS) * moved
+            w = w - (PEAK + (CLOCKED_END - PEAK) * consumed / CLOCKED_RECORDS) * moved
             if len(window) == accumulation:
                 consumed += window[-1][1]
         return {"w": w, "loss": jnp.stack(losses)}
@@ -391,19 +391,20 @@ def clocked_descent(accumulation: int):
 
 
 def clocked_run(accumulation: int):
-    """A run bounded to RECORDS examples of `x`, read in order as a stream, whose objective makes
+    """A run bounded to CLOCKED_RECORDS examples of `x`, read in order as a stream, whose objective makes
     `id % 3 + 1` rows of each, under `Linear` from PEAK to CLOCKED_END, updating every `accumulation`
-    batches of CLOCKED_BATCH rows: no pass counts
+    batches of BATCH rows: no pass counts
     its steps ahead, so its schedule reads the examples its batches consumed. Its losses of every step and
     its final weight."""
     @as_given
     def trained(x):
         tracker = RecordingTracker()
-        chain = Pipeline(Memory({"x": x, "id": np.arange(1, RECORDS + 1, dtype=np.int32)})).read("streamed")
+        ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
+        chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed")
         optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
         trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation)
-        state = trainer.fit(chain.batch(CLOCKED_BATCH), examples=RECORDS, log_every=1)
-        assert state is not None and int(state.consumed) == RECORDS
+        state = trainer.fit(chain.batch(BATCH), examples=CLOCKED_RECORDS, log_every=1)
+        assert state is not None and int(state.consumed) == CLOCKED_RECORDS
         return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(losses(tracker))}
     return trained
 
@@ -414,7 +415,10 @@ def test_a_run_no_pass_counts_ahead_reads_its_schedule_off_the_examples_it_consu
     its rate falls over the share of its examples its batches consumed, each example consumed by the batch
     that holds its last row, and its losses and weight are Adam's at that rate (check 1); updating every
     two batches, the window its stream ends inside commits over its own rows."""
-    assert_as_exact(clocked_run(accumulation), clocked_descent(accumulation), records,
+    def drawn(seed: int) -> tuple[np.ndarray]:
+        return (np.random.default_rng(seed).normal(size=(CLOCKED_RECORDS, FEATURES)).astype(np.float32),)
+
+    assert_as_exact(clocked_run(accumulation), clocked_descent(accumulation), drawn,
                     f"clocked run of {accumulation}", seeds=EXAMPLES_SEEDS)
 
 
