@@ -1268,6 +1268,29 @@ def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, m
     assert run() == [1, 2]
 
 
+def test_a_fixture_added_or_removed_reruns_every_file(ci, tmp_path, monkeypatch, cache_worker):
+    """A fixture's arrival or removal is every file's input, as a test may ask whether one exists
+    (`Path.exists`, a collection by presence) without opening it, which no record sees; its contents stay
+    its openers' alone (train 253's review: a test asserting a fixture's absence was reused green once the
+    fixture came)."""
+    (tmp_path / "tests/fixtures").mkdir(parents=True)
+    (tmp_path / "tests/fixtures/present.json").write_text("{}\n")
+    (tmp_path / "tests/test_absent.py").write_text(
+        "from pathlib import Path\n"
+        "def test_absent():\n"
+        "    with Path('runs-absent').open('a') as runs: runs.write('x')\n"
+        "    assert not Path('tests/fixtures/unexpected.json').exists()\n")
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert [row["exitCode"] for row in rows] == [0]
+    (tmp_path / "tests/fixtures/unexpected.json").write_text("{}\n")
+    git(tmp_path, "add", "tests/fixtures/unexpected.json")
+    commit(tmp_path, "a fixture arrives")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert [row["exitCode"] for row in rows] != [0] and len((tmp_path / "runs-absent").read_text()) == 2
+
+
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
     """A change under tools/ reruns the files whose runs executed or read the changed tool, which their keys
     hash, and reuses every other file's green row, though it read another tool: the policy CI computes for
@@ -1319,9 +1342,9 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
-    runs outside every test process), another test module, or a fixture it never opens (its openers'
-    input alone); it runs again once what its test process runs or reads changes: a plugin loaded into
-    it, a Python file added that can change what an import finds (a conftest.py, a top-level package
+    runs outside every test process), another test module, or a change to a fixture it never opens (its
+    openers' input alone); it runs again once what its test process runs or reads changes: a plugin loaded
+    into it, a Python file added that can change what an import finds (a conftest.py, a top-level package
     under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
@@ -1331,6 +1354,8 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     armada.mkdir(parents=True)
     for tool in (ROOT / "tools/armada").glob("*.py"):
         (armada / tool.name).write_text(tool.read_text())
+    (tmp_path / "tests/fixtures").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests/fixtures/data.json").write_text("{}\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
@@ -1864,6 +1889,32 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
         words = (tmp_path / "words").read_text().split()
         assert words[:2] == ["map", f"--commit={'a' * 40}"] and words[-2:] == [base, "{item}"]
         assert [word for word in words if word.startswith("--priority")] == priority
+
+
+def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci, tmp_path, monkeypatch):
+    """A suite the test cache's policy turns off (a lock, JAX's build or the recorder changed) runs every
+    file cold: each task pays the compiles and imports no warm run did, so its weight carries COLD_SECONDS
+    beside its estimate, which sizes armada's pool to the fleet rather than to the longest task, and its
+    deadline is 5400 s, not 2700 (Main, 2026-10-28: train 254's cold suite, 2,169 tasks planned on 242
+    containers, about 470 s a task against an estimated 120, left 780 tasks unstarted at its 2,698 s
+    deadline). A warm suite keeps both."""
+    for name in ("test_a", "test_b"):
+        (tmp_path / "tests" / f"{name}.py").write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_a.py::test_x": 30.0, "tests/test_b.py::test_y": 30.0}))
+    timings = {"files": {"3.12:tests/test_a.py": 30.0, "3.12:tests/test_b.py": 30.0}}
+    monkeypatch.setenv("DEW_TEST_CACHE", "on")
+    warm = {entry["tests"]: entry["weight"] for entry in ci.plan(120.0, timings) if entry["python"] == "3.12"}
+    monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    cold = {entry["tests"]: entry["weight"] for entry in ci.plan(120.0, timings) if entry["python"] == "3.12"}
+    assert cold == {tests: weight + ci.COLD_SECONDS for tests, weight in warm.items()}
+
+    def deadline(policy: str) -> list[str]:
+        calls = suite_step(tmp_path / f"cold-{policy}", "ci/batch-abc-1", "", policy, 2)
+        [run] = [call for call in calls if call[0] == "run"]
+        return [word for word in run if word.startswith("--deadline")]
+
+    assert deadline("off") == ["--deadline=5400"] and deadline("on") == ["--deadline=2700"]
 
 
 def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):

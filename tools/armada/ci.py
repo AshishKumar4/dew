@@ -220,7 +220,8 @@ def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
     .armada.json's parts a test process sees (`armada_seen`), and the names of the Python files under
     tests/ but its test modules and of src/'s own entries, whose arrival can change what an import finds
-    (a conftest.py, a helper or a top-level package that shadows another), which a record does not see. A
+    (a conftest.py, a helper or a top-level package that shadows another), and of every fixture and package
+    data file (an existence query no record sees), which a record does not see. A
     module within a package under src/ is its importers' input alone, with its package's other modules
     (`inputs`), a test module is no other file's, and a fixture or a package's data is its openers'
     (executed.py's `Opens`): so a train that loses a head runs again only what that head's files reached
@@ -229,6 +230,17 @@ def shared(python: str) -> str:
     for path in sorted(Path("tests").rglob("*.py")):
         if "__pycache__" not in path.parts and not path.name.startswith("test_"):
             digest.update(str(path).encode())
+    # The names of every fixture and every package's data: a test may ask whether one exists (`Path.exists`,
+    # a collection by presence) without opening it, which no record sees, so an arrival or a removal is every
+    # file's input; a file's contents stay its openers' (train 253's review: a test asserting a fixture's
+    # absence was reused green once the fixture came).
+    # A build's output and a fetched payload, which a planner's checkout lacks, are not named: they are their
+    # build's and their manifest's (`built`, FETCHED, `contents`), whose names are.
+    for root in ("tests", "src"):
+        for path in sorted(Path(root).rglob("*")):
+            if (path.is_file() and path.suffix != ".py" and not built(path)
+                    and not path.with_name(path.name + FETCHED).is_file()):
+                digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
@@ -615,13 +627,21 @@ def borrowed(timings: dict, python: str) -> dict:
     return {**timings, **{key: filled(timings.get(key, {})) for key in ("files", "rows")}}
 
 
+COLD_SECONDS = 360.0
+"""What a task adds to its estimate when it runs cold, the test cache's policy off (a lock, JAX's build or
+the recorder changed): the compiles and imports no warm run paid. Train 254's cold suite ran about 470 s a
+task where its plan estimated about 120 (1,389 tasks in 2,700 s on 242 containers, 2026-10-28)."""
+
+
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
     then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
     the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files
     whose rows the cache holds for exactly these inputs (`reusable`) share one task, which looks each up
-    again in its container, so the verdict names every file and containers scale with the change."""
+    again in its container, so the verdict names every file and containers scale with the change. Under the
+    policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by the work, not the
+    longest task, as warm estimates did."""
     cache = os.environ.get("DEW_TEST_CACHE") or "on"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     recorded = recorded_tests()
@@ -655,7 +675,7 @@ def plan(target: float, timings: dict) -> list[dict]:
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": group, "rows": [row(python, name, group) for name in names],
-                            "weight": weight, "cache": cache})
+                            "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache})
     rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
     for index in range(COLLECT_TASKS if rest else 0):
         names = rest[index::COLLECT_TASKS]
@@ -1417,8 +1437,8 @@ def main() -> int:
         print(policy(args.base))
         return 0
     if args.operation == "plan":
-        timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
-        print(json.dumps({"include": plan(args.target, timings)}))
+        print(json.dumps({"include": plan(args.target, json.loads(args.timings.read_text())
+                                          if args.timings.is_file() else {})}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
