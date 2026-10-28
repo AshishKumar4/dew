@@ -1951,12 +1951,13 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
-    """A test whose own seconds in a task's run pass the group target (.armada.json's `target`) is flagged from
-    the verdict's rows, as no cut can bring its group within the target; a whole_suite cell is not, as it runs
-    on the whole suite alone, however pytest comes to mark it (its own mark, its class's, a parameter set's, a
-    mark held in a name), which the run records in its row; and with the record a change is measured against, a
-    test the record lacks fails the check (owner, 2026-10-28: a test file past the group target is its owner's
-    P1 the run it is measured, and a new slow test fails its lane's check; row 2073's cell ran 1,540 s)."""
+    """A test whose own seconds in a task's run pass the group target (.armada.json's `target`) is flagged
+    from the verdict's rows, as no cut can bring its group within the target; a whole_suite cell is not, as it
+    runs on the whole suite alone, however pytest comes to mark it (its own mark, its class's, a parameter
+    set's, a mark held in a name), which the run records in its row; and with the record a change is measured
+    against, a test the record lacks fails the check (owner, 2026-10-28: a test file past the group target is
+    its owner's P1 the run it is measured, and a new slow test fails its lane's check; row 2073's cell ran
+    1,540 s)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_slow.py": "import time\nimport pytest\ncell = pytest.mark.whole_suite\n"
                        "def test_old(): time.sleep(0.4)\n"
