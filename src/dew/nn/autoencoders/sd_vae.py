@@ -3,7 +3,6 @@ import jax.numpy as jnp
 
 from .api import LatentNormalization, ModuleAutoEncoder
 from .kl import AutoencoderKL
-from .vae import load_pretrained_vae
 
 
 def published_normalization(config: dict) -> tuple[float, float]:
@@ -33,9 +32,10 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
         self.revision = revision
         self.dtype = dtype
         if model is None:
-            pretrained = load_pretrained_vae(modelname, revision=revision, params=params)
-            config = pretrained["config"]
-            params = pretrained["params"]
+            from .pretrained import load_kl_vae
+
+            _, params, _, config = load_kl_vae(modelname, dtype, revision=revision, subfolder=None,
+                                               params=params)
             model = AutoencoderKL.from_diffusers(config, dtype)
             shift, scale = published_normalization(config)
             latent_shift = shift if latent_shift is None else latent_shift

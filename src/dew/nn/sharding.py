@@ -453,15 +453,35 @@ def rows_like(x: jax.Array, like: jax.Array) -> jax.Array:
     return x if placed is None else jax.sharding.reshard(x, placed)
 
 
+def automatic_axes() -> tuple[str, ...]:
+    """The axes of the context's mesh larger than one device that no
+    `shard_map` holds manual: those over which XLA's partitioner, not a
+    kernel, would split an operand."""
+    mesh = jax.sharding.get_abstract_mesh()
+    return tuple(name for name in mesh.axis_names if mesh.shape[name] > 1 and name not in mesh.manual_axes)
+
+
 def seen_whole(value: jax.Array) -> bool:
     """Whether a Pallas kernel, which sees local arrays and carries no
     manual-axis type, can take `value` where it is traced: no mesh axis
-    outside a `shard_map` splits it, and no `shard_map` that checks varying
-    axes holds it."""
-    mesh = jax.sharding.get_abstract_mesh()
-    split = any(mesh.shape[name] > 1 for name in mesh.axis_names
-                if name not in mesh.manual_axes)
-    return not split and not jax.typeof(value).mat.varying
+    outside a `shard_map` splits it (`automatic_axes`), and no `shard_map`
+    that checks varying axes holds it."""
+    return not automatic_axes() and not jax.typeof(value).mat.varying
+
+
+def per_shard(kernel: str) -> None:
+    """Raise unless the kernel named `kernel` launches per shard: every
+    axis of the context's mesh larger than one device manual (`manual_map`,
+    a `shard_map`), so each device's launch reads its own operands. Under an
+    automatic axis XLA's partitioner splits the operands around a call that
+    reads them whole, and every device runs the whole batch (row 1923; the
+    gated delta net's template, 1897). The kernels' launch points call it as
+    they trace (`templates.mosaic.Family.kernel`, the TPU and Triton GEMM
+    launches); a selector refuses such a call first (`seen_whole`)."""
+    if axes := automatic_axes():
+        raise ValueError(f"{kernel} launches with the mesh's {', '.join(axes)} automatic: a kernel reads its "
+                         f"operands whole, so it launches only where every axis larger than one device is "
+                         f"manual (`manual_map`), each device on its own rows")
 
 
 def _qualified(cls: type) -> str:

@@ -29,6 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox.gmm import make_group_metadata
 
 from dew.nn.kernels.templates.gemm import cost, rows_padded
+from dew.nn.sharding import per_shard
 
 LANES = 128
 """A vreg's lanes: Mosaic TPU tiles a block's minor dimensions by them (a block of two dimensions or more
@@ -137,6 +138,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         return m_tile_ids[slot], column
 
     out_shape = tuple(jax.ShapeDtypeStruct((m, width), dtype) for dtype in dtypes)
+    per_shard("dew_gmm")
     outs = pl.pallas_call(
         kernel,
         out_shape=out_shape,
@@ -230,6 +232,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
         return group_ids[slot], block, column
 
     out_shape = jax.ShapeDtypeStruct((groups, depth, width), jnp.dtype(out_dtype))
+    per_shard("dew_tgmm")
     return pl.pallas_call(
         kernel,
         out_shape=out_shape,

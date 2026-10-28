@@ -15,10 +15,11 @@ import pytest
 from affine_run import Replaying, dataset
 from reference_error import assert_as_exact, over_windows, widened, windows, with_gradients
 
+from dew.batch import TEXT_KEY
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.continuum import ContinuumLevel
 from dew.nn.ngpt import NGPT
-from dew.objectives.lm import TEXT_KEY, LMObjective, Samples
+from dew.objectives.lm import LMObjective, Samples
 from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
 from dew.training import Checkpoints, Trainer
 

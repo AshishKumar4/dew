@@ -735,11 +735,8 @@ def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coord
 
     starts = None if value.starts is None else jnp.concatenate(
         [value.starts, jnp.zeros((len(value.starts), width), value.starts.dtype)], axis=1)
-    # No document starts in the response: each row's firsts stand, past its last now `width` further.
-    firsts = value.firsts
-    if firsts is not None and value.starts is not None:
-        length = value.starts.shape[1]
-        firsts = jnp.where(firsts < length, firsts, length + width)
+    # No document starts in the response: its firsts built again over the longer rows (`document_firsts`).
+    firsts = None if starts is None else document_firsts(starts, value.max_segments + 1)
     return replace(value, valid=continued(value.valid, _response_validity),
                    positions=continued(value.positions, _response_positions),
                    segments=continued(value.segments, _response_document), starts=starts, firsts=firsts,

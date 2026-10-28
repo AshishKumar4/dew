@@ -13,7 +13,7 @@ import dataclasses
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple, NoReturn, Protocol, TypedDict
+from typing import NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
 
 import jax
 import numpy as np
@@ -305,6 +305,10 @@ class WrapperFields(AudioFields):
     tokens_per_image: int | None
     video_token_id: int | None
     extra_placeholder_ids: tuple[int, ...]
+    unported: NotRequired[Mapping[str, str]]
+    """The wrapper's media components Dew has no port of, by their tensors' prefix (past `model.`) to
+    the reason: a load takes its language model alone (`text_only`), and a multimodal load refuses
+    them by name."""
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:

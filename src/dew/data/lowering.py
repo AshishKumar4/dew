@@ -76,11 +76,10 @@ from dew.data.mixing import (
     Accepted,
     Chunked,
     CorpusCounts,
-    PrimedMix,
+    KeyedMix,
     ProportionalSelection,
     Proportions,
     TokenDeficit,
-    primed_maps,
     rewound,
     token_weights,
 )
@@ -1415,16 +1414,23 @@ class _Build:
         source = pipeline.source
         if not isinstance(source, Mixture):
             raise ValueError("phases need the global phased lowering")
-        parents = [self.child(index).records(child, partition)
-                   for index, child in enumerate(source.pipelines)]
+        # The mix's corpora share its read budget, each reading with its share of the threads and the
+        # read-ahead: a mix of hundreds of corpora holds what a read of one does, and a corpus whose
+        # share is no thread reads on the thread that draws from it.
+        members = len(source.pipelines)
+        builds = [self.child(index) for index in range(members)]
+        builds = [dataclasses.replace(build, loading=dataclasses.replace(
+            build.loading, threads=build.loading.threads // members,
+            read_buffer=build.loading.read_buffer // members)) for build in builds]
+        parents = [build.records(child, partition)
+                   for build, child in zip(builds, source.pipelines, strict=True)]
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
-            checked = primed_maps(mapped)
-            selection = ProportionalSelection([len(parent) for parent in checked], _weights(source))
-            return pygrain.MapDataset.select_from_datasets(checked, selection)
+            selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source))
+            return pygrain.MapDataset.select_from_datasets(mapped, selection)
         streams = [
-            Accepted(_as_iter(parent, self.loading), _name(child), _label(child))
-            for parent, child in zip(parents, source.pipelines, strict=True)
+            Accepted(_as_iter(parent, build.loading), _name(child), _label(child))
+            for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
         ]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
@@ -1438,7 +1444,7 @@ class _Build:
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
             )
-        return PrimedMix(streams, source.weights, keys)
+        return KeyedMix(streams, source.weights, keys)
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int, *, marked: bool = False
