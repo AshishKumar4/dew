@@ -118,7 +118,8 @@ def test_the_training_sigmas_are_nvlabs(regime, site):
     """EDM's exp(N(-1.2, 1.2^2)) for pixels and EDM2's exp(N(-0.4, 1)) for latents, on the same standard
     normals NVlabs' loss draws (tools/edm_loss_reference.py's `draw`): each sigma's every operation within
     its certified bound (check 2), and each within float32's rounding over the computation's chain of the
-    published formula's float64 value (the oracle rule). A [1024] lognormal spread's error is its largest
+    published formula's float64 value (the oracle rule), its magnitude the sigma times one plus the
+    exponent's terms, which an error in the exponent scales by. A [1024] lognormal spread's error is its largest
     sigma's one rounding, 0 or an ulp, which no pooled check 1 resolves within 512 seeds."""
     schedule = EDM(regime=regime)().schedule
     mean, spread = {"pixel": (-1.2, 1.2), "latent": (-0.4, 1.0)}[regime]
@@ -130,8 +131,10 @@ def test_the_training_sigmas_are_nvlabs(regime, site):
     roundings = chain_roundings(jax.make_jaxpr(schedule.sigmas)(*draw(0)))
     for seed in range(8):
         (normals,) = draw(seed)
-        exact = np.exp(mean + spread * np.asarray(normals, np.float64))
-        assert_fp32_reduction_bound(schedule.sigmas(normals), exact, exact, roundings)
+        wide = np.asarray(normals, np.float64)
+        exact = np.exp(mean + spread * wide)
+        terms = exact * (1 + abs(mean) + np.abs(spread * wide))
+        assert_fp32_reduction_bound(schedule.sigmas(normals), exact, terms, roundings)
 
 
 def test_the_pixel_loss_and_its_gradient_are_edmloss():
