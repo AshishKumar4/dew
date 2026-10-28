@@ -1106,19 +1106,22 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
 
 
-def test_a_durations_change_reruns_only_the_groups_cut_from_it(ci, tmp_path, monkeypatch, cache_worker):
+def test_a_durations_change_reruns_only_the_groups_whose_tests_it_moves(ci, tmp_path, monkeypatch, cache_worker):
     """The durations record is no file's input but a split file's groups', which are cut from that file's
-    own entries: a change to another file's entries reuses every row, and one to the split file's reruns
-    its groups alone, under the policy CI computes for the change from main (a refresh reran the whole
-    suite while the record was every file's input)."""
-    for name in ("heavy", "light"):
+    own entries: a change to another file's entries reuses every row, and so does one to the split file's
+    seconds that leaves each of its tests in its group, as a group's key holds the tests it runs, not their
+    timings; one that moves a test to another group reruns the groups (a refresh reran the whole suite while
+    the record was every file's input; Main, 2026-10-28: each train's fold of main's durations re-keyed every
+    split file, row 2000)."""
+    count = {"heavy": 3, "light": 2}
+    for name, tests in count.items():
         (tmp_path / f"tests/test_{name}.py").write_text(
             "from pathlib import Path\n"
             + "".join(f"def test_{name}_{index}():\n"
                       f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
-                      for index in range(2)))
-    record = {"tests/test_heavy.py::test_heavy_0": 200.0, "tests/test_heavy.py::test_heavy_1": 200.0,
-              "tests/test_light.py::test_light_0": 1.0, "tests/test_light.py::test_light_1": 1.0}
+                      for index in range(tests)))
+    heavy = {f"tests/test_heavy.py::test_heavy_{index}": seconds for index, seconds in enumerate((300.0, 1.0, 1.0))}
+    record = {**heavy, "tests/test_light.py::test_light_0": 1.0, "tests/test_light.py::test_light_1": 1.0}
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(record))
     verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
     base = commit(tmp_path, "base")
@@ -1129,15 +1132,21 @@ def test_a_durations_change_reruns_only_the_groups_cut_from_it(ci, tmp_path, mon
             "3.12:tests/test_heavy.py#1/2", "3.12:tests/test_heavy.py#2/2", "3.12:tests/test_light.py"]
         return {name: len((tmp_path / f"runs-{name}").read_text()) for name in ("heavy", "light")}
 
-    assert run() == {"heavy": 2, "light": 2}
+    assert run() == {"heavy": 3, "light": 2}
     (tmp_path / "tests/test_durations.json").write_text(
         json.dumps({**record, "tests/test_light.py::test_light_0": 2.0}))
     commit(tmp_path, "the light file's entry moves")
-    assert run() == {"heavy": 2, "light": 2}
+    assert run() == {"heavy": 3, "light": 2}
+    # The heavy file's seconds change, each test kept in its group: the first alone, the other two together.
+    (tmp_path / "tests/test_durations.json").write_text(
+        json.dumps({**record, "tests/test_heavy.py::test_heavy_0": 301.0}))
+    commit(tmp_path, "the heavy file's entries move, its groups as they were")
+    assert run() == {"heavy": 3, "light": 2}
+    # Its last test turns heavy: the cut moves, and both groups run again.
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {**record, "tests/test_heavy.py::test_heavy_0": 201.0, "tests/test_heavy.py::test_heavy_1": 201.0}))
-    commit(tmp_path, "the heavy file's entries move")
-    assert run() == {"heavy": 4, "light": 2}
+        {**record, "tests/test_heavy.py::test_heavy_0": 1.0, "tests/test_heavy.py::test_heavy_2": 300.0}))
+    commit(tmp_path, "the heavy file's cut moves")
+    assert run() == {"heavy": 6, "light": 2}
 
 
 def commit(root: Path, message: str) -> str:
