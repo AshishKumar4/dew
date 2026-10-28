@@ -29,6 +29,7 @@ from dew.interop.families.gpt_neox import GPT_NEOX
 from dew.interop.families.gpt_oss import GPT_OSS
 from dew.interop.families.k2_horizon import K2_HORIZON
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
+from dew.interop.families.lfm3 import LFM3
 from dew.interop.families.llama import GRANITEMOE, MISTRAL, MIXTRAL, llama_config, ministral_config
 from dew.interop.families.llama4 import LLAMA4_TEXT
 from dew.interop.families.mamba import MAMBA
@@ -123,6 +124,8 @@ ENTRIES = (
         tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
     ),
     K2_HORIZON,
+    # Before Ministral, which takes any config with sliding layers.
+    LFM3,
     DecoderFamily(
         ("ministral",),
         ministral_config,

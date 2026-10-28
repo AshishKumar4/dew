@@ -213,11 +213,13 @@ class CausalSelfAttention(nn.Module):
     temperature_tuning: tuple[float, float] | None = None
     """A (floor_scale, attn_scale) that scales each query by its position
     (`temperature_scale`), rotated or not: Llama 4's unrotated layers'."""
-    gate_projection: Literal['query', 'own'] = 'query'
+    gate_projection: Literal['query', 'own', 'head'] = 'query'
     """Where the output gate comes from: the doubled query projection
-    (Qwen3.5), or a `gate_proj` of its own over the layer's input (Muse
-    Glimmer, modeling_muse_glimmer.py:305, 351). Either way the branch
-    multiplies by its sigmoid."""
+    (Qwen3.5), a `gate_proj` of its own over the layer's input (Muse
+    Glimmer, modeling_muse_glimmer.py:305, 351), or such a `gate_proj` with one
+    gate a head, which scales the head's every value (LFM3,
+    modeling_lfm3.py:229, 268-269). Either way the branch multiplies by its
+    sigmoid."""
     bidirectional_images: bool = False
     """Whether a causal layer lets each token of an image (`AttentionMetadata.image_groups`) see the
     image's later tokens too, within its window (Gemma 3's, and Gemma 4's sliding layers')."""
@@ -382,8 +384,9 @@ class CausalSelfAttention(nn.Module):
         query = self.ctx.num_heads * self.ctx.head_dim * (2 if doubled else 1)
         sites = {'q_proj': (self.ctx.emb_features, query),
                  'o_proj': (self.ctx.num_heads * self.value_dim, self.ctx.emb_features)}
-        if self.ctx.output_gate and self.gate_projection == 'own':
-            sites['gate_proj'] = (self.ctx.emb_features, self.ctx.num_heads * self.ctx.head_dim)
+        if self.ctx.output_gate and self.gate_projection != 'query':
+            per_head = self.ctx.head_dim if self.gate_projection == 'own' else 1
+            sites['gate_proj'] = (self.ctx.emb_features, self.ctx.num_heads * per_head)
         if not self.ctx.kv_shared:
             sites['k_proj'] = (self.ctx.emb_features, self.ctx.num_kv_heads * self.ctx.head_dim)
             if not self.ctx.k_eq_v:
@@ -626,9 +629,9 @@ class CausalSelfAttention(nn.Module):
                 2, axis=-1)
         else:
             query = projected.reshape(B, S, self.ctx.num_heads, self.ctx.head_dim)
-        if self.ctx.output_gate and self.gate_projection == 'own':
+        if self.ctx.output_gate and self.gate_projection != 'query':
             gate = checkpoint_name(self.gate_proj(x), 'output_gate')
-            gate = gate.reshape(B, S, self.ctx.num_heads, self.ctx.head_dim)
+            gate = gate.reshape(B, S, self.ctx.num_heads, -1)
         held = None
         if self.ctx.kv_shared:
             key, value, positions, *held = self._shared_kv(kv_store, decode)
@@ -1231,7 +1234,7 @@ class AttentionMixer(MixerBase):
     """XSA (arXiv 2603.09078, lm-engine's `exclusive_self_attention`): each
     head's output loses its component along the token's own value
     (`exclusive_self_attention`)."""
-    gate_projection: Literal['query', 'own'] = 'query'
+    gate_projection: Literal['query', 'own', 'head'] = 'query'
     """Where the decoder's output gate comes from (`CausalSelfAttention.gate_projection`)."""
     qk_norm_weight: bool = True
     """Whether the decoder's qk norm has a weight (`CausalSelfAttention.qk_norm_weight`): Muse

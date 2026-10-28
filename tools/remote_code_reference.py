@@ -65,6 +65,9 @@ RELEASES = {
                    "AutoModel"),
     "mimo-v2-tiny": ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
                      ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM"),
+    # modeling_lfm3.py imports its Triton conv from lfm3_conv.py, which its CPU run passes by.
+    "lfm3-tiny": ("LiquidAI/LFM3-1.7B", "40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd",
+                  ("configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"), "AutoModelForCausalLM"),
 }
 """Each fixture's release: the Hub repo, the commit its code is read at, the
 files that code is, and the auto class its language model registers as. Each
