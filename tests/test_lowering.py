@@ -86,6 +86,10 @@ GPUS = sorted({generation for generation, target in TARGETS.items()
 SHORT_CONV = {"short_conv_forward", "short_conv_backward"}
 """The short conv's kernels (`causal_conv1d`), which every GPU step with a recurrent mixer calls."""
 
+ATTENTION_TRITON = {"attention_forward", "attention_forward_headroom", "attention_dq", "attention_dkv"}
+"""The attention template's frozen Triton mainloop's kernels, which a step's attention layer takes on a GPU
+whose Mosaic template has none (`attention_kernels._attention_preferred`)."""
+
 
 def chosen(generation: str, probe: str) -> set[tuple[str, str]]:
     """The Pallas choices `generation`'s rows name whose kernels `probe` runs."""
@@ -158,8 +162,10 @@ def test_a_hybrid_language_model_step_lowers_for_the_gpu_with_every_kernel_its_g
     kernels, those of every Pallas choice the generation's row names for a step's layers (the norms and
     SwiGLU), and the gated delta rule's training kernels (`recurrence_chunk.GATED_DELTA`, no row read):
     the recurrence template's Mosaic launches on a warpgroup-MMA GPU, whose training cell it takes, no
-    Triton kernel among them, else the port's, so none was interpreted or refused there."""
-    delta = set() if family(generation) == 'wgmma' else FAMILIES['gated_delta_rule', 'fla'][1]
+    Triton kernel among them, else the port's, so none was interpreted or refused there; its attention
+    layer the template's, Mosaic's on a warpgroup-MMA GPU, else its Triton mainloop's."""
+    triton = family(generation) != 'wgmma'
+    delta = FAMILIES['gated_delta_rule', 'fla'][1] | ATTENTION_TRITON if triton else set()
     expected = SHORT_CONV | delta | set().union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
     assert set(triton_kernels(_step_lowered(generation))) == expected
 
