@@ -8,33 +8,47 @@ from tool_support import load
 
 
 @pytest.mark.mesh(devices=8)
-def test_unet_run_once_phases(tmp_path):
-    tool = load("layout_parity")
+def test_unet_run_once_phases(tmp_path_factory):
     times = {}
+    counts = {}
 
     def timed(name, fn):
-        started = time.perf_counter()
-        found = fn()
-        times[name] = round(time.perf_counter() - started, 2)
-        return found
+        def wrapped(*args, **kwargs):
+            started = time.perf_counter()
+            found = fn(*args, **kwargs)
+            times[name] = round(times.get(name, 0.0) + time.perf_counter() - started, 2)
+            counts[name] = counts.get(name, 0) + 1
+            return found
+        return wrapped
 
+    started = time.perf_counter()
+    fixture_tool = load("layout_parity")
+    times["load_fixture_module"] = round(time.perf_counter() - started, 2)
+    draws = fixture_tool.References(tmp_path_factory.mktemp("layout-draws"), prepare=True,
+                                    reserve=4 << 30)
+    started = time.perf_counter()
+    tool = load("layout_parity")
+    times["load_test_module"] = round(time.perf_counter() - started, 2)
+    for module, prefix in ((fixture_tool, "fixture_"), (tool, "")):
+        module.source_digest = timed(f"{prefix}source_digest", module.source_digest.__wrapped__
+                                     if hasattr(module.source_digest, "__wrapped__")
+                                     else module.source_digest)
+    fixture_tool.References.held = timed("held", fixture_tool.References.held)
+    fixture_tool.References.noted = timed("noted", fixture_tool.References.noted)
+    tool.model_case = timed("model_case", tool.model_case)
+    tool.Judge.audit = timed("audit", tool.Judge.audit)
+    tool.Judge.reference = timed("judge_reference", tool.Judge.reference)
+    tool.Judge.batch_seed = timed("batch_seed", tool.Judge.batch_seed)
+    tool.audited = timed("audited", tool.audited)
+    tool.recording_loss = timed("recording_loss", tool.recording_loss)
+    tool._trainer = timed("trainer_build", tool._trainer)
+    tool.Arm.__init__ = timed("arm_construct", tool.Arm.__init__)
+    tool.Arm.__call__ = timed("arm_call", tool.Arm.__call__)
+    tool.ran = timed("ran", tool.ran)
+    tool.drawn_batch = timed("drawn_batch", tool.drawn_batch)
     with jax.enable_x64(new_val=True):
-        case, reference = timed("model_case", lambda: tool.model_case("unet", "float32", {}, {}))
-        timed("source_digest", tool.source_digest)
-        timed("drawn_batch", lambda: tool.drawn_batch(case, 0))
-        held = tool.References(tmp_path, prepare=True, reserve=4 << 30)
-        judge = tool.Judge(reference, held, "unet")
-        timed("audit", judge.audit)
-        timed("reference_arm_construct", lambda: judge.arm)
-        timed("reference_first", lambda: judge.reference(0))
-        timed("reference_second", lambda: judge.reference(0))
-        arm = timed("layout_arm_construct", lambda: tool.Arm(case, tool.LAYOUTS["tensor4"]))
-        timed("layout_arm_run", lambda: arm(0))
-        timed("ran_whole", lambda: tool.ran("unet", "tensor4", arm, judge))
-        timed("flops_per_device", lambda: judge.flops_per_device)
-        trainer = timed("trainer_build", lambda: tool._trainer(case, tool.LAYOUTS["fsdp2_tensor2"],
-                                                                record=True))
-        state = timed("trainer_place", lambda: trainer.place()[0])
-        batch = timed("placed_batch", lambda: tool.placed(tool.drawn_batch(case, 0), trainer.device_mesh))
-        timed("trainer_compile_other_layout", lambda: trainer.compile(state, batch))
-    raise AssertionError("phases:\n" + "\n".join(f"{name}={seconds}" for name, seconds in times.items()))
+        rows = timed("run_whole", tool.run)(
+            ["unet"], ("tensor4",), dtype="float32", seeds=0, windows={"dense_grpo": 4}, mixture={},
+            objective={}, references=draws, speak=lambda line: None, keep=lambda rows: None)
+    lines = [f"{name}={seconds} (x{counts.get(name, 1)})" for name, seconds in times.items()]
+    raise AssertionError("phases:\n" + "\n".join([*lines, f"row={rows}"]))
