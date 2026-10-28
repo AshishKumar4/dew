@@ -1209,6 +1209,40 @@ def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, mon
     assert run("on") == [3, 2]
 
 
+def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, monkeypatch, cache_worker):
+    """A test whose run read its cgroup's CPU or memory limit (dew.data's `Host.current` sizes loading by them)
+    keys those limits: on a container of other limits its row is not reused though nothing else changed, and a
+    file that read none is reused (row 1998; Main, 2026-10-28: a row green on 4 vCPUs was reused on 8)."""
+    cgroup = tmp_path.parent / f"{tmp_path.name}-cgroup"
+    cgroup.mkdir()
+    (cgroup / "cpu.max").write_text("400000 100000\n")
+    (cgroup / "memory.max").write_text("17179869184\n")
+    monkeypatch.setenv("DEW_CGROUP_ROOT", str(cgroup))
+    (tmp_path / "tests/test_sized.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def test_sized():\n"
+        "    with Path('runs-sized').open('a') as runs: runs.write('x')\n"
+        "    assert Path(os.environ['DEW_CGROUP_ROOT'], 'cpu.max').read_text().split()[1] == '100000'\n")
+    (tmp_path / "tests/test_plain.py").write_text(
+        "from pathlib import Path\n"
+        "def test_plain():\n"
+        "    with Path('runs-plain').open('a') as runs: runs.write('x')\n")
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+
+    def run() -> list[int]:
+        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+        assert [row["exitCode"] for row in rows] == [0, 0]
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("plain", "sized")]
+
+    assert run() == [1, 1]
+    assert run() == [1, 1]
+    # The same checkout on a container of 8 vCPUs, not 4.
+    (cgroup / "cpu.max").write_text("800000 100000\n")
+    assert run() == [1, 2]
+
+
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
     """A change under tools/ reruns the files whose runs executed or read the changed tool, which their keys
     hash, and reuses every other file's green row, though it read another tool: the policy CI computes for
