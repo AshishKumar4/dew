@@ -277,15 +277,16 @@ class Allocations:
     staged: tuple
     outputs: tuple
 
-    def scope(self, family: mosaic.Family, tiles: "Tiles") -> resources.Scope:
+    def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None) -> resources.Scope:
         """Its allocations by lifetime (`resources.shared_bytes`): a ring family's streams the program's,
-        a family whose walks scope their streams apart (`mosaic.Family.walks_scoped`) a walk's; each
-        output staged as its family stages it (`mosaic.Family.output_columns` of each consumer's share)."""
+        a family whose walks scope their streams apart (`mosaic.Family.walks_scoped`) a walk's, in no more
+        slots than a walk's `steps` where they are known (`emit_pipeline` allocates no more); each output
+        staged as its family stages it (`mosaic.Family.output_staging`, the allocations `persist` makes)."""
         consumers = tiles.warpgroups
-        staging = tuple(plgpu.SMEM((consumers, shape[0], family.output_columns(shape[1], (dtype,))), dtype)
-                        for shape, dtype in self.outputs)
+        staging = tuple(family.output_staging(self.outputs, consumers))
         if family.walks_scoped:
-            walk = tuple(plgpu.SMEM((tiles.stages, *shape), dtype) for shape, dtype in self.blocks.values())
+            slots = tiles.stages if steps is None else min(tiles.stages, steps)
+            walk = tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in self.blocks.values())
             return resources.Scope(program=(self.staged, staging), walks=(walk,))
         multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
         streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
