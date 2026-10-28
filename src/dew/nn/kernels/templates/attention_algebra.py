@@ -1606,7 +1606,8 @@ def no_dq_sums(rows: int, width: int, kinds: int) -> DqSums:
     nothing = jnp.zeros((rows,), jnp.float32)
     zeros = jnp.zeros((rows, width), jnp.float32)
     params = (nothing,) * kinds
-    return DqSums(zeros, nothing, nothing, params, params, zeros, nothing, jnp.full((rows,), NO_SHIFT, jnp.float32))
+    return DqSums(zeros, nothing, nothing, params, params, zeros, nothing,
+                  jnp.full((rows,), NO_SHIFT, jnp.float32))
 
 
 def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:

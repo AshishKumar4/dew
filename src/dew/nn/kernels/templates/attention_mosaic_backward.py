@@ -300,9 +300,9 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
     q_first = index * tiles.block_q
     peak, denominator, centre, rest, chosen = rows_of(q_first)
     # The logits from the query taken by its power in registers (`_Backward.scaled`), dK from the call's own.
-    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), k_smem.transpose((1, 0)),
-                                  walk.interpret)
-         if walk.scaled else family.product(q_slot, k_smem.transpose((1, 0)), shape))
+    keys = k_smem.transpose((1, 0))
+    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), keys, walk.interpret)
+         if walk.scaled else family.product(q_slot, keys, shape))
     dp = family.product(do_slot, v_smem.transpose((1, 0)), shape)
     params = params_of(q_first, s)
 
