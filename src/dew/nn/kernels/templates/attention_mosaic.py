@@ -465,8 +465,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
         # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
+        # Its fused form's dQ tiles, a consumer's share of a slot's queries, take no wgmma (M is 64): two
+        # launches there.
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
         dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
+        fused = fused and not fed
         for columns in (1, 2, 4):
             def tiles(rows: int, walked: int, consumers: int, columns=columns) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=fused and columns == 1,

@@ -65,12 +65,13 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     holders, rows = (1, block_q // consumers) if split else (consumers, block_q)
     swizzle = mosaic.swizzle_for(dtype, rows, width, value_width) if split else None
     staged = [plgpu.SMEM((consumers, parts, block_k, rows), dtype)] if config.fused else []
+    # Each holder's output stages: the consumers sharing a key block store their summed sums once.
     scoped = [mosaic.staged((holders, block_k, width), dtype, swizzle),
               mosaic.staged((holders, block_k, value_width), dtype, swizzle), *staged,
-              plgpu.SMEM((consumers, max(block_q, block_k), width // columns), jnp.float32),
-              *([] if value_width == width else [plgpu.SMEM((consumers, block_k, value_width // columns),
+              plgpu.SMEM((holders, max(block_q, block_k), width // columns), jnp.float32),
+              *([] if value_width == width else [plgpu.SMEM((holders, block_k, value_width // columns),
                                                             jnp.float32)]),
-              plgpu.SMEM((consumers, block_k), jnp.float32),
+              plgpu.SMEM((holders, block_k), jnp.float32),
               plgpu.Barrier(num_barriers=holders), plgpu.Barrier(num_barriers=holders)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, value_width), dtype)}
     swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
