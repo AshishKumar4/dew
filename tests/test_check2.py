@@ -331,10 +331,12 @@ def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn,
     assert ct.certified(fn, *operands)[1] == []
     params, given, results = _first_equation(fn, operands, name)
     contract = ct.CONTRACTS[name]
-    for result in results:
+    for index, result in enumerate(results):
         native = np.asarray(result)
-        assert np.all(contract(params, given, native, None)), name
-        assert not np.all(contract(params, given, _off_by_one_element(native), None)), name
+        # As `_held` hands it: a positional primitive's contract reads its own operand alone.
+        operands = [given[index]] if name in ct.POSITIONAL else given
+        assert np.all(contract(params, operands, native, None)), name
+        assert not np.all(contract(params, operands, _off_by_one_element(native), None)), name
 
 
 def test_a_barrier_holds_each_result_to_its_own_operand():
