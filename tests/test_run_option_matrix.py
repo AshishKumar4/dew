@@ -15,20 +15,29 @@ from dew.checkpoints import Checkpoints
 from dew.cli.main import main
 from dew.training._lowering import Lowered
 
-pytestmark = pytest.mark.mesh(devices=2)
+pytestmark = pytest.mark.mesh(devices=8)
 
 COUNTED = {"lm", "decision"}
 """The kinds whose objectives count tokens (`Objective.counts_tokens`), which a token budget reads."""
+
+COUNTED_RECORDS = {"lm", "diffusion", "jepa"}
+"""The kinds whose training data states its record count, which an epoch reads; a decision run's
+questions stream through a filter, whose count no read states before it ends."""
+
+MESH = {"data": 4, "tensor": 2}
+"""Eight devices, four row shards of a batch of eight: two rows each, which a split in two and a
+ramp's first batch of four still divide."""
 
 
 def trained(kind: str, root: Path, name: str, **settings: object) -> Path:
     """`dew train` over `kind`'s run.json under `root`, its options `settings` (`--set path=value`, a
     mapping as JSON), at most as many steps as it is given: the run's directory."""
     record = root / f"record-{name}"
-    KINDS[kind](root, drawn=False).save(str(record))
+    KINDS[kind](root / name, drawn=False).save(str(record))
     given = {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.log_every": "1",
-             "trainer.eval_every": "None", "trainer.multi_host": "False",
-             "trainer.compilation_cache_dir": "None", "val_metrics": "[]", **settings}
+             "trainer.eval_every": "None", "trainer.checkpoint_every": "None", "trainer.mesh": MESH,
+             "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", "val_metrics": "[]",
+             **settings}
     flags = [flag for path, value in given.items()
              for flag in ("--set", f"{path}={json.dumps(value) if isinstance(value, dict) else value}")]
     assert main(["train", str(record / "run.json"), *flags]) == 0
@@ -64,8 +73,7 @@ def test_a_kinds_run_cools_down_and_skips_its_final_save_as_set(kind, tmp_path):
     """Four steps with a cooldown branched at the second (`cooldowns`) and no checkpoint, the final
     save off (`checkpoint_final`): the second step's scalars hold the cooled branch's scores, and the
     run saves nothing."""
-    run = trained(kind, tmp_path, "cooled", **{"trainer.steps": 4, "trainer.checkpoint_every": "None",
-                                                 "trainer.checkpoint_final": "False",
+    run = trained(kind, tmp_path, "cooled", **{"trainer.steps": 4, "trainer.checkpoint_final": "False",
                                                  "trainer.cooldowns": {"at": [2], "length": 1}})
     assert any(name.startswith("cooldown_") for name in scalars(run)[2])
     assert saved(run) == []
@@ -73,11 +81,16 @@ def test_a_kinds_run_cools_down_and_skips_its_final_save_as_set(kind, tmp_path):
 
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_is_as_long_as_its_epochs_and_examples(kind, tmp_path):
-    """A run of two epochs ends at twice the step one epoch ends at (`epochs`), and one of sixteen
-    examples, two batches of eight, at the second step (`examples`)."""
-    once = saved(trained(kind, tmp_path, "once", **{"trainer.epochs": 1}))[-1]
-    twice = saved(trained(kind, tmp_path, "twice", **{"trainer.epochs": 2}))[-1]
-    assert twice == 2 * once
+    """A run of two epochs ends at twice the step one epoch ends at (`epochs`), where the kind's data
+    states its record count, and is refused where it does not; one of sixteen examples, two batches of
+    eight, ends at the second step (`examples`)."""
+    if kind in COUNTED_RECORDS:
+        once = saved(trained(kind, tmp_path, "once", **{"trainer.epochs": 1}))[-1]
+        twice = saved(trained(kind, tmp_path, "twice", **{"trainer.epochs": 2}))[-1]
+        assert twice == 2 * once
+    else:
+        with pytest.raises(ValueError):
+            trained(kind, tmp_path, "once", **{"trainer.epochs": 1})
     assert saved(trained(kind, tmp_path, "sixteen", **{"trainer.examples": 16}))[-1] == 2
 
 
