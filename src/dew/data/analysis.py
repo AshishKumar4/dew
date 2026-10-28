@@ -551,10 +551,15 @@ def _bind(stage: Configured, metadata: Mapping[str, object]) -> Map | RandomMap 
     resolved = stage.factory(metadata)
     if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
         raise ValueError(f"Configured {_identity(stage).name} random={stage.random} disagrees with its step")
+    if isinstance(resolved, Expansion) != stage.expands:
+        raise ValueError(f"Configured {_identity(stage).name} expands={stage.expands} disagrees with its "
+                         "step")
     if stage.one_to_one and (isinstance(resolved, Expansion) or _declares_rejects(resolved)):
         raise ValueError(f"Configured {_identity(stage).name} states one_to_one=True and binds to a step "
                          "that drops or expands records")
-    return record_stage(resolved, configured=binding)
+    bound = record_stage(resolved, configured=binding)
+    # An objective's expansion keeps the mark its configured step carried (`Configured.examples`).
+    return dataclasses.replace(bound, examples=True) if stage.examples else bound
 
 
 def _keyed(stage: Stage) -> bool:

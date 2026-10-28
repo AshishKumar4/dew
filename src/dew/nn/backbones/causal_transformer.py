@@ -1734,7 +1734,7 @@ class CausalTransformer(nn.Module):
         if context is not None:
             # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
             # a standalone call, and a cached and a full one, project the same values.
-            context = CrossContext(context.embeddings.astype(self.context_dtype), context.lengths)
+            context = dataclasses.replace(context, embeddings=context.embeddings.astype(self.context_dtype))
         # A layer whose mixer reads no pairwise mask or key runs refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None and key_runs is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask or "
@@ -1755,6 +1755,12 @@ class CausalTransformer(nn.Module):
         engram_ids = (None if self.engram is None else self.engram_hashes(
             tokens, None if coordinates is None else coordinates.valid,
             None if coordinates is None else coordinates.positions, decode, media_mask))
+        if context is not None and context.segments is not None:
+            # A context of several documents is read by the call's tokens of each document alone.
+            if coordinates is None or coordinates.segments is None:
+                raise ValueError("a context of several documents is read by packed rows, which name "
+                                 "their tokens' documents (segment_ids or coordinates)")
+            context = dataclasses.replace(context, queries=coordinates.segments)
         # A block router's blocks are numbered once for every routed layer.
         block = None if self.mixture is None else self.mixture.routing_block
         blocks = None if block is None else numbered_blocks(
