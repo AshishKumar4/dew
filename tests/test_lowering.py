@@ -612,8 +612,8 @@ def test_a_remat_rung_keeping_the_delta_rules_residuals_runs_the_templates_forwa
     """A gated delta net under a remat rung that saves its delta rule's names (`DELTA_RULE_RESIDUALS`: its
     output and the template's inverse and memory, named as the port names its own) runs the template's
     forward launches once, as the layer without remat does, where the rung that saves nothing ('full')
-    replays them in the backward: a Qwen3.5-4B training step under 'full' ran each GDN layer's forward twice,
-    63.6 ms of its 1.6 s on an H100 (row 2023)."""
+    replays them in the backward: a Qwen3.5-4B training step at 4x6,144 tokens a device under 'full' ran
+    each GDN layer's forward twice, 63.6 ms of its 1.6 s on an H100 (row 2023)."""
     from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
 
     unrematted, saved, full = (_template_launches(policy) for policy in (None, DELTA_RULE_RESIDUALS, ()))

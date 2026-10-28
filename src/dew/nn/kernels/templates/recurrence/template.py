@@ -205,9 +205,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         value blocks, no more than its waves (a grouped grid still fills a wave), whose launches hold their
         registers at that many roles' budget (`Family.registers`) and their shared memory, at its stage
         rule (`_staged`); one role else. A walk's chain waits a chunk on its products: the states launch
-        took 1.04 ms over 66 waves of programs of about 6.6 chunks in a Qwen3.5-4B training step on an H100,
-        one 256-thread program a multiprocessor (design-walks-kda.md: two roles hold its 128 registers' need
-        and the reverse launch's 184 within their 232, and read the head's keys once for both)."""
+        took 1.04 ms over 66 waves of programs of about 6.6 chunks in a Qwen3.5-4B training step at 4x6,144
+        tokens a device on an H100, one 256-thread program a multiprocessor (two roles hold its 128
+        registers' need and the reverse launch's 184 within their 232, and read the head's keys once for
+        both)."""
         family = bundle(target, _dtype(ba))
         assert family is not None
         _, columns, _ = _widths(ba, family)
