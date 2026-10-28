@@ -327,10 +327,13 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
 
     def truth(seed):
         # The seed's noise drawn once in float32, as the arms draw it, then widened: drawn under x64, the
-        # process would draw other noise and walk another trajectory. The denoiser in float64 over its
-        # weights widened; the text encoder and the decoder, whose roundings the evaluation and the
-        # reference make alike, stay as they are.
-        step, x_T = stepped(seed)
+        # process would draw other noise and walk another trajectory, and the gate runs every truth under
+        # x64 (`reference_error.truth_of`), so the draw turns it off (row 2064). The denoiser in float64
+        # over its weights widened; the text encoder and the decoder, whose roundings the evaluation and
+        # the reference make alike, stay as they are.
+        with jax.enable_x64(new_val=False):
+            step, x_T = stepped(seed)
+        assert x_T.dtype == jnp.float32, x_T.dtype
         with jax.enable_x64(new_val=True):
             wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64))
             return np.asarray(walked(wide, DiffusionObjective(wide, **settings), widened(variables), step,
