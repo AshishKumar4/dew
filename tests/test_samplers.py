@@ -332,11 +332,12 @@ class StandIn:
         return x_0, (x - x_0) / sigma
 
 
-def flaxdiff_walk(solver, x_T):
-    """Every interval of Dew's twelve-point grid, FlaxDiff's, from `x_T` in its precision, with the
-    reference's stand-in denoiser read through the Karras schedule's own sigma."""
+def flaxdiff_walk(solver, x_T, times):
+    """Every interval of `times`, Dew's twelve-point grid on the host (a multistep solver checks its
+    gaps there), from `x_T` in its precision, with the reference's stand-in denoiser read through the
+    Karras schedule's own sigma."""
     process, _ = karras_process()
-    times = process.times(12).astype(x_T.dtype)
+    times = times.astype(x_T.dtype)
     denoise = StandIn(process)
 
     x, state = x_T, solver.init(x_T, times, process, key=jax.random.PRNGKey(0))
@@ -375,11 +376,12 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     clean predictions reach |x| = 3, so the clip moves most entries and the
     unclipped comparison is the one that reads the walk."""
     process, _ = karras_process()
+    times = np.asarray(process.times(12))
 
     def closing(inputs):
         x_T = jnp.asarray(inputs["x_T"])
         closed = sample(StandIn(process), x_T, solver=solver, key=jax.random.key(0),
-                        times=process.times(12).astype(x_T.dtype))
+                        times=times.astype(x_T.dtype))
         return {"closed": closed, "clipped": jnp.clip(closed, -1, 1)}
 
     assert_on_par_with_flaxdiff(f"{name} closed", closing)
@@ -398,13 +400,14 @@ def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver):
     the last one through the walk, held to FlaxDiff's float64 run by the
     float64 rule. The grid is Dew's own `times(12)`."""
     process, _ = karras_process()
-    np.testing.assert_array_equal(process.times(12), recording(FLAXDIFF)["times"])
+    times = np.asarray(process.times(12))
+    np.testing.assert_array_equal(times, recording(FLAXDIFF)["times"])
 
     def walked(inputs):
         x_T = jnp.asarray(inputs["x_T"])
-        latents = flaxdiff_walk(solver, x_T)
+        latents = flaxdiff_walk(solver, x_T, times)
         cotangent = jnp.asarray(inputs["cotangent"])
-        (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x)[-1], x_T)[1](cotangent)
+        (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x, times)[-1], x_T)[1](cotangent)
         return {**{f"after {index}": latent for index, latent in enumerate(latents)}, "gradient": gradient}
 
     assert_on_par_with_flaxdiff(f"{name} walk", walked)
