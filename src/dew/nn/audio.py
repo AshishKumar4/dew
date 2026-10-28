@@ -22,7 +22,8 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
-from dew.interop.weights import ParamTree, check_shapes, native_shape, placed
+from dew.interop.unread import Stored
+from dew.interop.weights import Tree, check_shapes, native_shape, placed
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import accumulated, capped_logits, float32_dot_general, float32_products, products_dtype
@@ -630,11 +631,11 @@ def audio_weight_path(name: str, config: Gemma3nAudio | Gemma4Audio) -> tuple[st
 
 
 def audio_weights(
-    tensors: Mapping[str, np.ndarray],
+    tensors: Mapping[str, Stored],
     config: Gemma3nAudio | Gemma4Audio,
     *,
     param_dtype: str = "float32",
-) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+) -> tuple[Tree[Stored], tuple[WeightLayout, ...]]:
     """Translate reference weights into params and frozen clipping constants, with the layouts
     that write each tensor back from them (`placed`).
 
