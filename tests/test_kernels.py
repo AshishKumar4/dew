@@ -939,9 +939,9 @@ def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
 def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_rate):
     """Without sinks the reference path (`reference_attention`) is flax's
     `dot_product_attention` handed the key heads repeated over their group and
-    its probability product (`weighted_values`), bitwise: in each compute dtype,
-    the softmax forced to fp32 or not, an fp32 bias wider than half-precision
-    logits and a causal mask. Its probability draw is Dew's own (row 1521: the
+    its probability product (`weighted_values`), on par with it from float64
+    over drawn operands (check 1): in each compute dtype, the softmax forced to
+    fp32 or not, an fp32 bias wider than half-precision logits and a causal mask. Its probability draw is Dew's own (row 1521: the
     keep bits every route draws from one rng, `template.dropout_keep`, so a
     route never changes which weights drop) and its multiplier Dew's (row 1533:
     1 / (1 - rate) rounded once in at least fp32), applied where flax applies
@@ -965,11 +965,16 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
                 force_fp32_for_softmax=forced, dropout_rate=dropout_rate, dropout_rng=dropped(seed),
                 deterministic=not dropout_rate)
 
-    def theirs(query, key, value, bias, seed):
+    def flax(*, softmax_in_fp32):
+        def run(query, key, value, bias, seed):
+            return flax_attention(query, key, value, bias, seed, softmax_in_fp32=softmax_in_fp32)
+        return run
+
+    def flax_attention(query, key, value, bias, seed, *, softmax_in_fp32):
         with jax.default_matmul_precision(FP32_SUMS):
             weights = nn.dot_product_attention_weights(
                 query, jnp.repeat(key, 2, axis=2), bias=bias,
-                mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], force_fp32_for_softmax=forced,
+                mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], force_fp32_for_softmax=softmax_in_fp32,
                 einsum=jnp.einsum)
             if dropout_rate:
                 wide = at_least_fp32(query.dtype)
@@ -980,9 +985,10 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
             return weighted_values('...hqk,...khd->...qhd', weights, jnp.repeat(value, 2, axis=2))
 
     # Two programs, so on par from float64 over the draws (check 1), not bit for bit (bible §6).
-    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw,
+    # The truth's softmax in float64: flax's forced one would narrow it to fp32.
+    assert_as_exact(jax.jit(ours), jax.jit(flax(softmax_in_fp32=forced)), draw,
                     f"the reference path against flax, {jnp.dtype(dtype).name}, forced {forced}, "
-                    f"rate {dropout_rate}", seeds=FLAX_SEEDS, truth_fn=theirs)
+                    f"rate {dropout_rate}", seeds=FLAX_SEEDS, truth_fn=flax(softmax_in_fp32=False))
 
 
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the routing is a CPU's")

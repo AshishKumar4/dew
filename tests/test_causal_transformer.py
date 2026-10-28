@@ -1159,10 +1159,12 @@ def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixtur
     def hidden(model):
         return lambda params, ids: model.apply(params, ids, method=CausalTransformer.hidden_states)
 
-    def split(params, ids):
-        return jax.jit(hidden(model))(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
+    compiled = jax.jit(hidden(model))
 
-    assert_as_exact(as_given(split), jax.jit(hidden(model)), model_draw(model, (16, 32), 512),
+    def split(params, ids):
+        return compiled(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
+
+    assert_as_exact(as_given(split), compiled, model_draw(model, (16, 32), 512),
                     f"one device against four, {'MoE' if mixture else 'dense'}", seeds=SEEDS['layouts'],
                     truth_fn=hidden(model.clone(dtype=jnp.float64)))
 

@@ -704,7 +704,7 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
     assert launches
     for call in launches:
         spans, query = call.operands[:2]
-        assert spans == (rows, 2) and query[:3] == (rows, 16, heads), call
+        assert spans == (rows, 2) and call.operand_types[0] == "i32" and query[:3] == (rows, 16, heads), call
 
 
 def paged_case(page_size, windowed=False):
