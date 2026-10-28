@@ -280,7 +280,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     if capacity is not None:
         mesh = trainer.device_mesh
         devices = compile_only_gpus(generation, len(devices), capacity)
-        trainer.mesh = trainer.device_mesh = jax.sharding.Mesh(
+        trainer.mesh = trainer.device_mesh = trainer.state_mesh = jax.sharding.Mesh(
             np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names, axis_types=mesh.axis_types)
     began = time.perf_counter()
     start = trainer._started()
