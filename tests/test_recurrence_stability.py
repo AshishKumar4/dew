@@ -398,7 +398,7 @@ PORT_GRADIENT_SEEDS = {
 LAST_WRITE = ('resets on chunk edges', 'spread gates')
 """The regimes whose final memory the port holds as the last token's write alone, a document starting on
 the last token, or spread gates' steep decays leaving its write alone: one rounding a value, which check 1's
-pooled parity did not resolve within 512 seeds on an A100 (row 2047). Check 1 holds their output; their
+pooled parity did not resolve within 512 seeds on an A100 (row 2049). Check 1 holds their output; their
 final memory is held finite where float64's is."""
 
 PORT = pytest.mark.gpu(reason="the SSD port compiled, as a GPU runs it")
