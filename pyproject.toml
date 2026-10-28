@@ -330,6 +330,7 @@ markers = [
     "gpu(reason): tests only a cuda device runs; tests/conftest.py skips them on any other backend, and a GPU session runs them with -m gpu",
     "tpu(reason): tests only a tpu runs; tests/conftest.py skips them on any other backend, and the TPU tier (dew-ops' dewops.node.tpu, a Colab TPU at main's tip after each train) runs them with -m tpu",
     "torchax: tests whose code imports torchax, which renames torch's privateuse1 backend process-wide; CI runs these files in tasks of their own (tools/armada/ci.py)",
+    "whole_suite: an accuracy check past the 240 s task target on an armada CPU worker at its declared draws; train CI sets it aside and the every-fifth-train whole suite runs it, where a red is bisected and a P1, until it fits or its draws shard across tasks (tests/test_parallelism_matrix.py WHOLE_SUITE)",
     "kernel: tests of a GPU kernel's code (Pallas, Triton, fla): the CPU suite lowers and interprets them, and the kernel lab's GPU tier runs every one, with every gpu test, on each target GPU before the kernel lands, but for check 1 on the TPU SSD kernel, which no user runs on a GPU",
 ]
 # A warning is a failure waiting to be reported, so the ones dew is

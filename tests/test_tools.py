@@ -14,6 +14,7 @@ import dataclasses
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -437,28 +438,169 @@ def test_residual_orders_preserve_a_looped_ngpt():
                                            float(reordered.sum()), float(truth.sum()), roundings=roundings)
 
 
-@pytest.mark.parametrize("model", ["dit", "dense_mdlm"])
-def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(model):
-    """The fp64 anchor is the reference's step with every sum in fp64, the
-    noise and masks the trainer's first step draws included, so each leaf is a
-    rounding of the reference's: an fp32 distance, not a different step. A
-    diffusion objective and a masked one draw by row, so their floor rests on
-    the anchor alone; the anchor built only decoders, and computed no step for
-    these (765a6f97)."""
+class Drawing:
+    """A loss of one weight against each row's own uniform draw and the boundary of its noised target,
+    as `tools/layout_parity.py`'s arms record them, with one of the departures a layout tool must refuse
+    before it judges a ratio: `transform` of the draw, a `loose` draw from the step's key past every
+    draw, the target `narrowed` to float32 past its boundary, or the draw read `unbounded`, past no
+    boundary."""
+
+    def __init__(self, transform=lambda noise: noise, *, loose=False, narrowed=False, unbounded=False):
+        self.transform, self.loose, self.narrowed, self.unbounded = transform, loose, narrowed, unbounded
+
+    def objective(self):
+        from dew.objectives.base import Aux, Objective
+
+        drawing = self
+
+        class Drawn(Objective):
+            def fresh_variables(self, key, held):
+                return {"params": {"w": jnp.asarray(.2)}}
+
+            def loss(self, variables, batch, step):
+                w, rows = variables["params"]["w"], batch["y"].shape[0]
+                noise = drawing.transform(step.sample("noise", jax.random.uniform, (), dtype=jnp.float32,
+                                                      rows=rows))
+                target = step.boundary("target", batch["y"] + noise)
+                if drawing.narrowed:
+                    target = target * jnp.float32(2)
+                if drawing.loose:
+                    target = target + jax.random.normal(step.key, target.shape, target.dtype)
+                if drawing.unbounded:
+                    target = target + noise * noise
+                return jnp.sum((w - target) ** 2), Aux({})
+
+        return Drawn()
+
+    def recorded(self, tool, *, wide: bool):
+        """The loss over draw 0's batch of four rows, audited (`audited`) by the loaded `tool` as it
+        audits an arm, or its float64 anchor where `wide`, and what it drew and started from
+        (`witnessed`)."""
+        params = {"w": jnp.asarray(.2, jnp.float64 if wide else jnp.float32)}
+        batch = {"y": np.arange(4, dtype=np.float32)}
+        places = jnp.arange(4, dtype=jnp.int32)
+        fields = {"step": jnp.asarray(0), "key": jax.random.key(3), "ema": None,
+                  "example_key": jax.random.key(4), "example_index": places, "example_count": 4}
+        loss, kinds = tool.recording_loss(self.objective(), {}, fields)
+        tool.audited(loss, kinds, params, batch, "drawing", wide=wide)
+        _, values = loss(params, batch)
+        return tool.witnessed({"values": values, "example_index": places}, "drawing")
+
+
+def test_layout_parity_holds_every_arm_to_the_references_sample():
+    """An arm that drew and started from the reference's values, at every example, is coupled to it; one
+    whose draw is transformed for one example, or that records a name the reference does not, is
+    refused before any ratio is taken (`coupled`)."""
     tool = load("layout_parity")
-    import benchmark_models
-
-    case = dataclasses.replace(tool.zoo()[model], dtype="float32")
-    # As the tool runs: the reference and the anchor both under x64.
     with jax.enable_x64(new_val=True):
-        batch = benchmark_models.global_batch(case)
-        reference = tool.computed_reference(case, batch, 1)
-        loss, gradient = tool.anchor_step(case, batch)
+        reference = Drawing().recorded(tool, wide=False)
+        tool.coupled(reference, Drawing().recorded(tool, wide=False), "the same arm")
+        moved = Drawing(lambda noise: noise.at[2].multiply(1 + 2 ** -20)).recorded(tool, wide=False)
+        with pytest.raises(tool.CouplingRefused):
+            tool.coupled(reference, moved, "one example's draw transformed")
+        with pytest.raises(tool.CouplingRefused):
+            tool.coupled(reference, {**reference, "extra": reference["noise"]}, "a name the reference lacks")
 
-    assert loss == pytest.approx(reference.losses[0], rel=1e-5)
-    errors = tool.leaf_errors(gradient, reference.gradient, "float32")
-    assert max(errors.values()) <= tool.rounding_limit("float32"), max(
-        errors.items(), key=lambda item: item[1])
+
+@pytest.mark.parametrize("departure", ["loose", "narrowed", "unbounded"])
+def test_layout_parity_refuses_a_loss_whose_randomness_or_rounding_escapes_its_witness(departure):
+    """A draw from the step's key past every draw is refused in any arm; a float32 rounding past the
+    float64 anchor's boundaries, or a draw read past no boundary, is refused in the anchor, where the
+    oracle's function starts at its boundaries, and the same loss without the departure is audited
+    clean."""
+    tool = load("layout_parity")
+    wide = departure != "loose"
+    with jax.enable_x64(new_val=True):
+        Drawing().recorded(tool, wide=wide)
+        with pytest.raises(tool.CouplingRefused):
+            Drawing(**{departure: True}).recorded(tool, wide=wide)
+
+
+def test_layout_parity_refuses_a_recording_step_whose_rows_sit_apart_from_their_column():
+    """A recording step that ran two evaluations, one of whose rows sat at a place its slot and the
+    batch's column do not give it (`column_ok` false, as `Transaction` reports a layout that moved rows
+    apart from their column), is refused before its record is read (`witnessed`); the same record with
+    every row in place is read whole."""
+    tool = load("layout_parity")
+    record = {"values": {"noise": np.zeros((2, 4), np.float32)},
+              "example_index": np.tile(np.arange(4), (2, 1)), "column_ok": np.asarray([True, True]),
+              "evaluated": np.asarray([True, True])}
+    assert sorted(tool.witnessed(record, "in place")["noise"]) == [0, 1, 2, 3]
+    with pytest.raises(tool.CouplingRefused):
+        tool.witnessed({**record, "column_ok": np.asarray([True, False])}, "rows apart")
+
+
+@pytest.mark.parametrize("model", ["dense_sft", "jepa"])
+def test_layout_parity_anchors_a_model_on_the_references_own_sample(model):
+    """A model's float64 anchor is the reference's first step in float64 on each draw: it draws and
+    starts from the reference's values, bit for bit (`Judge.anchor`), its loss read past its boundaries
+    in float64, and a draw cached under its seed is read back as computed, its record bit for bit, never
+    under another seed's name."""
+    tool = load("layout_parity")
+    _, reference = tool.model_case(model, "float32", {}, {})
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        held = tool.References(Path(directory), prepare=True)
+        judge = tool.Judge(reference, held, model)
+        judge.audit()
+        anchored = judge.anchor(1)
+        read = tool.Judge(reference, tool.References(Path(directory)), model)
+        tool.coupled(judge.reference(1).record, read.reference(1).record, "read back")
+        assert read.anchor(1).loss == anchored.loss
+        with pytest.raises(FileNotFoundError):
+            read.reference(2)
+
+
+def test_a_shared_draw_cache_computes_past_its_disk_reserve_and_keeps_nothing_there():
+    """A cache of draws that a task's cells share keeps a draw only while its disk keeps `reserve` free:
+    past it the draw is computed, as it would be kept, and nothing is written, so the cells of a model
+    of thousands of draws never fill the task's disk (moe_grpo's filled a 6 GB tmpfs)."""
+    import shutil
+
+    tool = load("layout_parity")
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        full = tool.References(Path(directory), prepare=True, reserve=shutil.disk_usage(directory).free)
+        computed = tool.Judge(reference, full, "jepa").reference(1)
+        assert not any(Path(directory).iterdir())
+        kept = tool.Judge(reference, tool.References(Path(directory), prepare=True), "jepa").reference(1)
+        tool.coupled(computed.record, kept.record, "computed past the reserve")
+        assert computed.loss == kept.loss and any(Path(directory).iterdir())
+
+
+def test_the_layout_parity_command_runs_its_main():
+    """`python tools/layout_parity.py` runs the tool, which refuses `--prepare` with no `--references`
+    directory to write, where a script whose entry point is gone exits 0 having checked nothing."""
+    command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa", "--prepare"]
+    finished = subprocess.run(command, capture_output=True, text=True, timeout=600)
+    assert finished.returncode != 0, finished.stdout[-2000:]
+
+
+def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
+    """A prepare run with a window of two draws keeps both draws of every check-1 seed and of its
+    redraw's (`REDRAW`): a run reading those references finds the reference and the float64 anchor of
+    the last draw a windowed check reads, and none past it."""
+    from reference_error import REDRAW
+
+    tool = load("layout_parity")
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    last = (1 + REDRAW) * 2 * 2 - 1
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        prepare = tool.References(Path(directory), prepare=True)
+        assert tool.prepared(["jepa"], dtype="float32", seeds=2, windows=2, mixture={}, objective={},
+                             references=prepare, speak=lambda line: None)
+        read = tool.Judge(reference, tool.References(Path(directory)), "jepa")
+        read.anchor(last)  # read where it is kept: a run of layouts that misses a draw is refused
+        with pytest.raises(FileNotFoundError):
+            read.reference(last + 1)
+
+
+def test_layout_parity_fails_a_run_with_an_inconclusive_row():
+    """An inconclusive layout, or a model whose reference is refused, fails the run as a mismatch does;
+    only a working or a refused-by-design layout passes it."""
+    tool = load("layout_parity")
+    assert tool.verdict([{"status": "works"}, {"status": "refused"}]) == 0
+    for status in ("INCONCLUSIVE", "MISMATCH", "REDUNDANT", "error"):
+        assert tool.verdict([{"status": "works"}, {"status": status}]) == 1
 
 
 def test_layout_parity_reaches_every_leaf_of_a_model_that_initializes_its_output_to_zeros():

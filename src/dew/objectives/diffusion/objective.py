@@ -757,6 +757,8 @@ class DiffusionObjective(Objective[Ratio]):
         probability = jnp.float32(self.unconditional_prob)
         dropped = step.sample("condition dropout", lambda key: jax.random.bernoulli(key, probability),
                               rows=count)
+        # Which rows go unconditioned is a choice the model's computation starts from.
+        dropped = step.boundary("unconditioned", dropped)
         return jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value), given, blank)
 
     def _sampling_batch(self, batch):
@@ -831,9 +833,18 @@ class DiffusionObjective(Objective[Ratio]):
         representation's `targets`. The noised input and the target are where
         the model's computation starts (`Step.boundary`)."""
         schedule = self.process.schedule
-        rates = broadcast_rates(schedule, t, samples)
-        noisy, c_in, target = self.process.prediction.forward_diffusion(samples, noise, rates)
+        noisy, _, target = self.process.prediction.forward_diffusion(
+            samples, noise, broadcast_rates(schedule, t, samples))
         noisy, target = step.boundary("noised input", noisy), step.boundary("target", target)
+        # The model's conditioning is read off the times past where its computation starts, at the
+        # precision its parameters hold, so a float64 twin conditions in float64 on the times the run
+        # drew, and a run conditions on them as it always has.
+        held = [leaf.dtype for leaf in jax.tree.leaves(variables.get("params", {}))
+                if jnp.issubdtype(leaf.dtype, jnp.floating)]
+        t = step.boundary("model times", t)
+        t = t.astype(jnp.result_type(t.dtype, samples.dtype, *held))
+        rates = broadcast_rates(schedule, t, samples)
+        c_in = self.process.prediction.get_input_scale(rates)
         inputs = (variables, noisy * c_in, schedule.model_time(t))
         aligned = None
         if self.alignment is None:
