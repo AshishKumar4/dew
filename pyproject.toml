@@ -388,9 +388,7 @@ concurrency = ["thread", "multiprocessing"]
 version = {attr = "dew.__version__"}
 
 [tool.setuptools.package-data]
-# The releases whose own code is a family's reference (dew.interop.families), which
-# tools/remote_code_reference.py records its fixtures from too.
-dew = ["py.typed", "interop/families/release_code.json"]
+dew = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

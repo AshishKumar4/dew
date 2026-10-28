@@ -1684,6 +1684,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                          text_only=False, overrides=overrides, prediction_depths=prediction_depths)
         forwarded = isinstance(routed.route, TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and component.tensor_prefix)
+        config_root = root
         if weights or reads_shared:
             weight_source = source.component(component.weights_folder)
             root = weight_source.weights(root)
@@ -1698,7 +1699,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides,
-            remote=remote, routed=routed, prediction_depths=prediction_depths)
+            remote=remote, routed=routed, prediction_depths=prediction_depths, config_root=config_root)
     else:
         _unread_overrides(overrides, "a release without a native backbone")
     missing = False
@@ -1931,13 +1932,15 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                         overrides: Mapping[str, object] | None = None,
                         remote: Path | None = None, pinned: sources.SourceReference | None = None,
                         routed: _Routed | None = None,
-                        text_only: bool = False, prediction_depths: int | None = None
-                        ) -> tuple[Pretrained, bool]:
+                        text_only: bool = False, prediction_depths: int | None = None,
+                        config_root: Path | None = None) -> tuple[Pretrained, bool]:
     """Decode native source weights and bind their processors and export layout, and whether the
     bundle is a wrapper's language model taken alone (`text_only`). `remote` is the source's own code
     where the load runs it, and `pinned` where it was fetched (`source_route`). `routed` is the route a
     caller decided for this config already (`_routed`), a composite's for its backbone before reading
     its weights, which the load takes rather than route the config, and verify its code, again.
+    `config_root` is the snapshot the source's config was read from, which pins its own code
+    (`_kept_code`): a composite's, before its weights resolve; `root` where None.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
     their own routes; this boundary handles native decoders and media wrappers,
@@ -1945,6 +1948,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     `overrides` (`Pretrained.load`'s `modeling_overrides`) join the source's own.
     """
     name_or_dir, commit = source.name, source.revision
+    # Before any weights resolve: a conversion's snapshot may be another commit than the config's.
+    config_root = root if config_root is None else config_root
     directory = source.directory(root)
     gguf_path = None if gguf_file is None else source.file(root, gguf_file)
     # The config's own folder, where a source keeps the code it names (`_kept_code`).
@@ -2005,7 +2010,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                     # The weights' commit: a pickle repo's may be its conversion's.
                     revision=resolved_commit,
                     tokenizer="byte" if named == "byte" else None,
-                    code=_kept_code(route, remote, config, configured, root))
+                    code=_kept_code(route, remote, config, configured, config_root))
 
     if family == "diffusion_gemma":
         return bundle(PretrainedBlockDecoder), False

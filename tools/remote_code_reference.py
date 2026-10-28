@@ -43,6 +43,7 @@ above:
 
 import argparse
 import json
+import runpy
 import shutil
 import tempfile
 from pathlib import Path
@@ -57,9 +58,10 @@ from torch_precision import float64, float64_twin
 from transformers import AutoConfig
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
-_PINNED = json.loads((Path(__file__).resolve().parents[1] / "src" / "dew" / "interop" / "families"
-                      / "release_code.json").read_text())
-"""The releases whose own code is a Dew family's reference, which the family exports with too."""
+_PINNED = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop"
+                             / "release_pins.py"))
+"""The releases whose own code is a Dew family's reference (dew.interop.release_pins), read by path: this
+tool runs in the release's own environment, which need not hold Dew's."""
 
 RELEASES = {
     "llada-tiny": ("GSAI-ML/LLaDA-8B-Base", "0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
@@ -69,9 +71,9 @@ RELEASES = {
                    "AutoModel"),
     "mimo-v2-tiny": ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
                      ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM"),
-    # The family's own pin (src/dew/interop/families/release_code.json). modeling_lfm3.py imports its
+    # The family's own pin (dew.interop.release_pins). modeling_lfm3.py imports its
     # Triton conv from lfm3_conv.py, which its CPU run passes by.
-    "lfm3-tiny": (_PINNED["lfm3"]["repo"], _PINNED["lfm3"]["revision"],
+    "lfm3-tiny": (*_PINNED["LFM3"][:2],
                   ("configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"), "AutoModelForCausalLM"),
 }
 """Each fixture's release: the Hub repo, the commit its code is read at, the
@@ -139,14 +141,70 @@ def _stored_once(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return kept
 
 
+OPENED = """import json, sys, numpy, torch
+from transformers import AutoModelForCausalLM
+model, info = AutoModelForCausalLM.from_pretrained(sys.argv[1], trust_remote_code=True, dtype=torch.float32,
+                                                   output_loading_info=True)
+ids = torch.from_numpy(numpy.load(sys.argv[2]).astype('int64'))
+with torch.no_grad():
+    numpy.save(sys.argv[3], model(input_ids=ids).logits.numpy())
+torch.save(model.state_dict(), sys.argv[4])
+print(json.dumps({"class": type(model).__name__, **{key: sorted(value) for key, value in info.items()}}))
+"""
+"""A fresh interpreter's offline open of an export through its own code (`opens`)."""
+
+
+def opens(name: str, export: Path, scratch: Path) -> None:
+    """Whether `export`, a Dew save of `name`'s fixture (`PretrainedDecoder.from_model(...).save`), opens
+    offline through the release's own transformers loader as the release does: a fresh interpreter, the
+    hub offline and its module cache empty, so it reads the export's own code alone, builds the release's
+    class with every weight matched, holding the release's state tensor for tensor and computing its
+    logits bit for bit over the fixture's ids (ledger 2038). Run in the release's environment, after Dew's
+    writes the export:
+      python -c 'from dew.interop import Pretrained, PretrainedDecoder; loaded = Pretrained.load(
+          "tests/fixtures/hf/lfm3-tiny"); PretrainedDecoder.from_model(loaded.model, loaded.variables).save(
+          "/tmp/lfm3-export")'
+      <the release's Python> tools/remote_code_reference.py lfm3-tiny --opens /tmp/lfm3-export"""
+    import os
+    import subprocess
+    import sys
+
+    run = subprocess.run([sys.executable, "-c", OPENED, str(export), str(FIXTURES / name / "input_ids.npy"),
+                          str(scratch / "logits.npy"), str(scratch / "state.pt")], check=True,
+                         capture_output=True, text=True,
+                         env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+                              "HF_MODULES_CACHE": str(scratch / "modules")})
+    opened = json.loads(run.stdout.strip().splitlines()[-1])
+    released = released_model(name, scratch / "release")
+    ids = torch.from_numpy(np.load(FIXTURES / name / "input_ids.npy").astype(np.int64))
+    with torch.no_grad():
+        logits = released.float()(input_ids=ids).logits.numpy()
+    state, held = released.state_dict(), torch.load(scratch / "state.pt")
+    checks = {"class": opened["class"] == type(released).__name__,
+              "every weight matched": not any(opened[key] for key in ("missing_keys", "unexpected_keys",
+                                                                       "mismatched_keys", "error_msgs")),
+              "state": sorted(state) == sorted(held)
+              and all(torch.equal(state[key], held[key]) for key in state),
+              "logits bitwise": np.array_equal(np.load(scratch / "logits.npy"), logits)}
+    print(name, "opens as the release does" if all(checks.values()) else f"differs: {checks}")
+    if not all(checks.values()):
+        raise SystemExit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("names", nargs="*", default=sorted(RELEASES))
     parser.add_argument("--check", action="store_true", help="compare with logits.npy instead of writing")
     parser.add_argument("--draw", action="store_true", help="draw the fixture's weights and ids first")
     parser.add_argument("--padding", action="store_true", help="record the rows each lookup leaves untrained")
+    parser.add_argument("--opens", type=Path,
+                        help="check that a Dew export of the fixture opens as the release does")
     arguments = parser.parse_args()
     with tempfile.TemporaryDirectory() as scratch:
+        if arguments.opens is not None:
+            for name in arguments.names:
+                opens(name, arguments.opens, Path(scratch))
+            return
         if arguments.padding:
             for name in arguments.names:
                 record_padding(*config_lookups(*released_classes(name, Path(scratch) / "padding")),
