@@ -42,7 +42,16 @@ from dew._coordination import (
     broadcast_from_process_zero,
 )
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import EXAMPLES_CONSUMED, FROZEN, VALID_ROWS, Batch, Variables, owned_dicts, select
+from dew.batch import (
+    CONSUMED_COUNT,
+    EXAMPLES_CONSUMED,
+    FROZEN,
+    Batch,
+    ConsumedCount,
+    Variables,
+    owned_dicts,
+    select,
+)
 from dew.checkpoints import Checkpoints, Ranking, Resume
 from dew.cleanup import attempted
 from dew.data.dataset import (
@@ -1350,11 +1359,13 @@ class Trainer(Generic[Loss, Effects]):
         length (`FitPlan.cadences`), its scores declared, its best and stop policies, and its refusals
         made before anything is placed (`_preflight`)."""
         logged, evaluated, saved, local, suites = FitPlan.cadences(
-            loader, held, metrics, steps, tokens, self.accumulation, written, self.checkpoints)
+            loader, held, metrics, steps, tokens, self.accumulation, written, self.checkpoints,
+            self._examples)
         declared = declarations(suites, metrics, summaries, loss=self.objective.defines_validation_loss)
         selection, plateau, pause = fit_policies(self.objective, best, stop, declared, saved, steps=steps,
                                                  tokens=tokens, accumulation=self.accumulation,
-                                                 checkpointed=self.checkpoints is not None)
+                                                 checkpointed=self.checkpoints is not None,
+                                                 examples=self._examples)
         self._preflight(loader, plateau, suites, preview=preview, stated=dataset,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         return FitPlan(
@@ -1364,7 +1375,8 @@ class Trainer(Generic[Loss, Effects]):
             suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
             held_best=restore_best and self.checkpoints is None, observe=observe, summaries=tuple(summaries),
             declared=declared,
-            branches=() if cooldowns is None else cooldowns.branches(steps, tokens, self.accumulation),
+            branches=() if cooldowns is None else cooldowns.branches(steps, tokens, self.accumulation,
+                                                                     self._examples),
         )
 
     def _schedule(self, updates: int | None) -> None:
@@ -1397,13 +1409,13 @@ class Trainer(Generic[Loss, Effects]):
         seen = 0
         run.notice = PreemptionNotice()
         run.clock = TokenClock(*interval.clocked(state.accumulation))
-        if run.cooling is not None and not plan.ended(run.current, run.clock.read):
+        if run.cooling is not None and not plan.ended(run.current, run.clock.read, interval.consumed):
             # A branch a preemption cut short runs again before the run reads on from where it stood.
             state, cut = self._cooled(plan, run, interval, state, shardings, position, run.cooling)
             if cut:
                 run.preempted = run.current
                 return self._wind_down(plan, run, interval, state, shardings, position, profiler)
-        while not plan.ended(run.current, run.clock.read):
+        while not plan.ended(run.current, run.clock.read, interval.consumed):
             # A schedule's stage ends where the commits reach its tokens.
             self._scheduled(plan, run)
             self._open_window(run, profile, profiler, seen, compiled)
@@ -1415,7 +1427,8 @@ class Trainer(Generic[Loss, Effects]):
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
                 batch = waited_read(run, interval, agree=not (seen and run.endless))
-                if batch is None and (batch := self._closing(run, state)) is None:
+                window = (self._split or 1) * self.accumulation
+                if batch is None and (batch := run.closing(state, window)) is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
                 batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
@@ -1482,19 +1495,6 @@ class Trainer(Generic[Loss, Effects]):
                     assert profiler is not None
                     self._stop_trace(run, profile, profiler)
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
-
-    def _closing(self, run: FitRun, state: TrainState) -> Batch | None:
-        """The run's latest batch with every row masked (`VALID_ROWS` False, consuming no example), which a
-        run bounded in examples steps where its stream ends inside an update's window, so the window
-        commits over the rows it holds, its mean theirs, as a whole one does, rather than being dropped
-        with the examples it consumed. None where no window is open, or the run counts no examples."""
-        last = run.last
-        if last is None or int(state.microstep) % ((self._split or 1) * self.accumulation) == 0:
-            run.last = None
-            return None
-        consumed = last[EXAMPLES_CONSUMED]
-        return {**last, VALID_ROWS: jnp.zeros_like(consumed, dtype=bool),
-                EXAMPLES_CONSUMED: jnp.zeros_like(consumed)}
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
@@ -1608,13 +1608,13 @@ class Trainer(Generic[Loss, Effects]):
             "cooldown record", lambda: checkpoints.cooldown(current) if jax.process_index() == 0 else None)
         run.cooling = broadcast_from_process_zero(kept)
         pending = run.cooling is not None
-        complete = (plan.ended(current, interval.real_tokens) and checkpoints is not None
+        complete = (plan.ended(current, interval.real_tokens, interval.consumed) and checkpoints is not None
                     and checkpoints.latest is not None and not pending)
         # The step the run reads from, as the pre-read's empty-stream check reads it, and the FLOP
         # count's refusal cleared before the prefetch worker counts its first batch.
         run.current = current
         self._refusal = None
-        if not complete and (pending or not plan.ended(current, interval.real_tokens)):
+        if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
             # A ramp's stages begin where updates do (`Ramp.stages`).
             partition = DataPartition.of(mesh, window=self.accumulation)
             run.source = plan.dataset.train(partition)
@@ -1747,7 +1747,8 @@ class Trainer(Generic[Loss, Effects]):
         aux = {name: value for name, value in aux.items() if name not in (TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         run.stepped = (loss, aux, accepted)
-        logged = plan.falls(plan.log_every, current, real, before)
+        consumed = interval.consumed, interval.consumed_before
+        logged = plan.falls(plan.log_every, current, real, before, consumed)
         if logged:
             self._take(plan, run, interval, state)
 
@@ -1760,18 +1761,18 @@ class Trainer(Generic[Loss, Effects]):
                 due = elapsed >= plan.checkpoint_every.total_seconds()
                 run.checkpoint_due = agree_process_phase(None, phase="checkpoint clock", available=due) > 0
         else:
-            run.checkpoint_due = plan.falls(plan.checkpoint_every, current, real, before)
-        run.local_due = plan.falls(plan.local_every, current, real, before)
-        due = plan.due(current, real, before)
-        evaluation_due = bool(due) or plan.falls(plan.eval_every, current, real, before)
+            run.checkpoint_due = plan.falls(plan.checkpoint_every, current, real, before, consumed)
+        run.local_due = plan.falls(plan.local_every, current, real, before, consumed)
+        due = plan.due(current, real, before, consumed)
+        evaluation_due = bool(due) or plan.falls(plan.eval_every, current, real, before, consumed)
         # A run's last step, its budget's or the step after which its stream runs out, is scored and saved
         # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
         # evaluates or pauses could save first (a ranked save scores every suite), so only there is the
         # stream read ahead (`FitRun.ends_here`): no other step's save waits on a batch a stream has yet to
         # make.
         ending = plan.finished(current, real) or (
-            (evaluation_due or plan.paused(current, real)) and run.ends_here(interval))
-        paused = not ending and plan.paused(current, real)
+            (evaluation_due or plan.paused(current, real, consumed[0])) and run.ends_here(interval))
+        paused = not ending and plan.paused(current, real, consumed[0])
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
             self._read_taken(run)
@@ -1787,7 +1788,7 @@ class Trainer(Generic[Loss, Effects]):
         # Before the step's save, so a preemption inside the branch saves this step to run it again; at
         # the run's last step, after its final save (`_wind_down`). The points share one length and
         # decay, so those due together are one branch.
-        due = next((branch for branch in plan.branches if branch.due(current, real, before)), None)
+        due = next((branch for branch in plan.branches if branch.due(current, real, before, consumed)), None)
         branch = None if due is None else due.pending(current, self.accumulation)
         if ending and branch is not None and checkpoints is not None:
             # Kept before the step's final save makes the run look complete (`Checkpoints.cooldown`).
@@ -2037,7 +2038,7 @@ class Trainer(Generic[Loss, Effects]):
             scores = run.evaluation.scores
         # A token update may cross the pause and the budget at once, which still saves the whole state.
         self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True,
-                    full=plan.paused(current, run.clock.read))
+                    full=plan.paused(current, run.clock.read, interval.consumed))
         if run.cooling is not None and run.preempted is None and run.paused is None:
             # The last step's branch, its main model scored and saved first, which a resume from the
             # step runs again where a preemption cuts it short.
@@ -2161,6 +2162,9 @@ class Trainer(Generic[Loss, Effects]):
         rollout's caller, and only it writes the reason. A count asked of the
         objective directly stays strict.
         """
+        if EXAMPLES_CONSUMED in batch:
+            # The host counts the examples the batch consumes as it prepares it (`ConsumedCount`).
+            batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
         if self._refusal is None:
             try:
                 return prepare_counts(self.objective, batch, count_model=True)

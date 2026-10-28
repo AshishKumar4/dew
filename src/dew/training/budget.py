@@ -13,7 +13,7 @@ from typing import Literal
 from dew._records import JSON, is_share, recorded_duration, share
 from dew.data.dataset import Loader
 from dew.objectives.base import Metric, TrainingScalar
-from dew.training.cadence import Cadence, Tokens
+from dew.training.cadence import Cadence, Examples, Tokens
 from dew.training.evaluation import Summary
 
 
@@ -74,11 +74,13 @@ class Plateau:
 
 
 def every_step(value: int | str | None, steps: int | None, tokens: int | None, accumulation: int, *,
-               name: str) -> Cadence:
+               name: str, examples: int | None = None) -> Cadence:
     """`value`, a cadence of steps or a share of the run such as `5%` (`dew._records.share`), resolved
     once against the run's planned length: a share of `steps` microsteps, `accumulation` an update,
     the whole updates nearest it and at least one; of a token budget alone, a cadence of that many
-    committed tokens (`Tokens`). A share of a run with no planned length is refused by `name`."""
+    committed tokens (`Tokens`); of a run bounded to `examples` no pass counts steps ahead of, a cadence
+    of that many consumed examples (`Examples`). A share of a run with no planned length is refused by
+    `name`."""
     if not isinstance(value, str):
         return value
     if not is_share(value):
@@ -88,6 +90,8 @@ def every_step(value: int | str | None, steps: int | None, tokens: int | None, a
         return max(1, round(fraction * (steps // accumulation))) * accumulation
     if tokens is not None:
         return Tokens(max(1, math.ceil(fraction * tokens)))
+    if examples is not None:
+        return Examples(max(1, math.ceil(fraction * examples)))
     raise ValueError(f"{name}={value!r} is a share of the run, which has no planned length: give it "
                      "steps=, epochs=, examples= or tokens=")
 
@@ -96,6 +100,8 @@ def recorded(cadence: Cadence | str | datetime.timedelta) -> JSON:
     """`cadence` as a run's plan records it: its steps, its committed tokens or its duration."""
     if isinstance(cadence, Tokens):
         return {"tokens": cadence.every}
+    if isinstance(cadence, Examples):
+        return {"examples": cadence.every}
     if isinstance(cadence, datetime.timedelta):
         return recorded_duration(cadence)
     return cadence
@@ -108,25 +114,31 @@ class Pause:
     budget still sizes the learning-rate schedule. A budget of steps, epochs or examples pauses at
     the whole update nearest the fraction, a token budget at the first update whose tokens reach
     it, and with both the first reached. Resume without it, or with a later fraction, to go on;
-    with the same one the run is already where it pauses, so nothing trains."""
+    with the same one the run is already where it pauses, so nothing trains. A run bounded in examples
+    that counts no steps ahead pauses at the first step whose batch brings its consumed examples to the
+    fraction."""
     fraction: float
 
     def __post_init__(self):
         if not 0 < self.fraction < 1:
             raise ValueError(f"Pause needs a fraction of the budget in (0, 1), got {self.fraction}")
 
-    def at(self, steps: int | None, tokens: int | None, accumulation: int) -> tuple[int | None, int | None]:
-        """The step and the real tokens a run of `steps` microsteps, `accumulation` an update, and of
-        `tokens` pauses at, each None where that budget is not set. Refuses a pause before the first
+    def at(self, steps: int | None, tokens: int | None, accumulation: int, examples: int | None = None
+           ) -> tuple[int | None, int | None, int | None]:
+        """The step, the real tokens and the consumed examples a run of `steps` microsteps,
+        `accumulation` an update, of `tokens` and, where no pass counts its steps ahead, bounded to
+        `examples`, pauses at, each None where that budget is not set. Refuses a pause before the first
         update or at the budget's end, where the run ends anyway."""
         updates = None if steps is None else steps // accumulation
         step = None if updates is None else round(self.fraction * updates) * accumulation
         real = None if tokens is None else math.ceil(self.fraction * tokens)
+        consumed = None if examples is None or steps is not None else math.ceil(self.fraction * examples)
         if step == 0 or (updates is not None and step is not None and step >= updates * accumulation) or (
-                tokens is not None and real is not None and real >= tokens):
+                tokens is not None and real is not None and real >= tokens) or (
+                examples is not None and consumed is not None and consumed >= examples):
             raise ValueError(f"Pause({self.fraction}) of {steps} steps and {tokens} tokens falls before the "
                              "first update or at the budget's end; pause between them")
-        return step, real
+        return step, real, consumed
 
 
 __all__ = ["Pause", "Plateau", "every_step", "recorded", "run_length", "run_steps",

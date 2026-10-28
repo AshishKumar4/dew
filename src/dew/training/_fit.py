@@ -12,13 +12,14 @@ import types
 from collections.abc import Iterator, Mapping, Sequence
 
 import jax
+import jax.numpy as jnp
 from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import position
 from dew._coordination import agreed_next
 from dew._records import JSON
-from dew.batch import Batch
+from dew.batch import CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
@@ -29,7 +30,7 @@ from dew.optim import OptimConfig
 from dew.state import TrainState
 from dew.telemetry.profile import region
 from dew.training.budget import Pause, Plateau, every_step, recorded
-from dew.training.cadence import Cadence, Tokens
+from dew.training.cadence import Cadence, Examples, Tokens
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, Taken, TokenClock
@@ -101,8 +102,8 @@ class FitPlan:
     """Where each evaluation writes every validation batch's scoring artifacts (`Evaluation.run`)."""
     best: tuple[Best, ...] = ()
     stop: Plateau | None = None
-    pause: tuple[int | None, int | None] = (None, None)
-    """The step and the real tokens a `Pause` ends the run at (`Pause.at`)."""
+    pause: tuple[int | None, int | None, int | None] = (None, None, None)
+    """The step, the real tokens and the consumed examples a `Pause` ends the run at (`Pause.at`)."""
     suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
     held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
     """Every validation split by name, its metrics and cadence resolved."""
@@ -123,14 +124,16 @@ class FitPlan:
         return ((self.steps is not None and step >= self.steps)
                 or (self.tokens is not None and real >= self.tokens))
 
-    def paused(self, step: int, real: int) -> bool:
-        """Whether the run has reached where its `Pause` ends it, after `real` tokens."""
-        at, tokens = self.pause
-        return (at is not None and step >= at) or (tokens is not None and real >= tokens)
+    def paused(self, step: int, real: int, consumed: int = 0) -> bool:
+        """Whether the run has reached where its `Pause` ends it, after `real` tokens and `consumed`
+        examples."""
+        at, tokens, examples = self.pause
+        return ((at is not None and step >= at) or (tokens is not None and real >= tokens)
+                or (examples is not None and consumed >= examples))
 
-    def ended(self, step: int, real: int) -> bool:
+    def ended(self, step: int, real: int, consumed: int = 0) -> bool:
         """Whether this fit has nothing left to train: its budget reached, or its pause."""
-        return self.finished(step, real) or self.paused(step, real)
+        return self.finished(step, real) or self.paused(step, real, consumed)
 
     def horizon(self, real: int) -> int | None:
         """The least count of committed tokens past `real` at which something this plan reads of the
@@ -173,6 +176,8 @@ class FitPlan:
         def before_end(every: Cadence | str | datetime.timedelta) -> bool:
             if isinstance(every, Tokens):
                 return self.tokens is None or every.every < self.tokens
+            if isinstance(every, Examples):
+                return every.every < self.dataset.examples if self.dataset.examples is not None else True
             return bool(every) and (self.steps is None or not isinstance(every, int) or every < self.steps)
 
         cadences = (self.eval_every, *(suite.every for suite in self.suites.values()))
@@ -180,29 +185,35 @@ class FitPlan:
             (self.validation or self.best or self.stop) and before_end(self.checkpoint_every))
 
     @staticmethod
-    def falls(every: Cadence | str | datetime.timedelta, step: int, real: int, before: int) -> bool:
-        """Whether a cadence of steps (`int`) or of committed tokens (`Tokens`, the step having brought them
-        from `before` to `real`) falls on `step`; a duration or none never does here."""
+    def falls(every: Cadence | str | datetime.timedelta, step: int, real: int, before: int,
+              consumed: tuple[int, int] = (0, 0)) -> bool:
+        """Whether a cadence of steps (`int`), of committed tokens (`Tokens`, the step having brought them
+        from `before` to `real`) or of consumed examples (`Examples`, the step having brought them to the
+        first of `consumed` from the second) falls on `step`; a duration or none never does here."""
         if isinstance(every, Tokens):
             return every.due(real, before)
+        if isinstance(every, Examples):
+            return every.due(*consumed)
         return isinstance(every, int) and bool(every) and step % every == 0
 
     @staticmethod
     def cadences(loader: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
                  metrics: Sequence[Metric], steps: int | None, tokens: int | None, accumulation: int,
                  written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
-                 checkpoints: Checkpoints | None = None) -> tuple[
+                 checkpoints: Checkpoints | None = None, examples: int | None = None) -> tuple[
                      int | Tokens, Cadence, Cadence | datetime.timedelta, Cadence, dict[str, EvalSuite]]:
         """`fit`'s log, validation and checkpoint cadences, its `checkpoints`' local one
         (`Checkpoints.local_every`), and its suites' (`validation_suites`), each
         written as steps, a duration or a share of the run such as "5%", resolved once against its planned
         length: the whole updates nearest that share of its `steps` microsteps, `accumulation` an update,
         at least one; of a budget of `tokens` alone, each time the committed tokens pass a multiple of that
-        share of them (`dew.training.budget.every_step`). A schedule's warmup may be a share too
+        share of them, and of a run bounded to `examples` no pass counts steps ahead of, each time its
+        consumed examples pass a multiple of that share (`dew.training.budget.every_step`). A schedule's
+        warmup may be a share too
         (`dew.optim.Cosine.warmup_steps`), and the start records what each resolved to
         (`recorded`)."""
         def cadence(value, name: str) -> Cadence:
-            return every_step(value, steps, tokens, accumulation, name=name)
+            return every_step(value, steps, tokens, accumulation, name=name, examples=examples)
 
         log_every, eval_every, checkpoint_every = written
         logged, evaluated = cadence(log_every, "log_every"), cadence(eval_every, "eval_every")
@@ -262,11 +273,12 @@ class FitPlan:
                                  'step': run.current, 'rule': rule}
         return stopping.should_stop
 
-    def due(self, step: int, real: int = 0, before: int = 0) -> tuple[str, ...]:
+    def due(self, step: int, real: int = 0, before: int = 0, consumed: tuple[int, int] = (0, 0)
+            ) -> tuple[str, ...]:
         """The suites whose own cadence falls on `step`, which brought the committed tokens from
-        `before` to `real` (`falls`)."""
+        `before` to `real` and the consumed examples as `consumed` says (`falls`)."""
         return tuple(name for name, suite in self.suites.items()
-                     if self.falls(suite.every, step, real, before))
+                     if self.falls(suite.every, step, real, before, consumed))
 
 
 @dataclasses.dataclass
@@ -306,7 +318,7 @@ class FitRun:
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
     last: Batch | None = None
     """The latest step's batch, held in a run bounded in examples that updates every several steps, whose
-    window its stream's end leaves open (`Trainer._closing`)."""
+    window its stream's end leaves open (`closing`)."""
     ahead: tuple[Batch | None] | None = None
     """The next batch, or None for the stream's end, read before the step that takes it, where a
     save had to know whether the run ends there (`ends_here`)."""
@@ -325,6 +337,20 @@ class FitRun:
     """The cooldown branch the run is to run at its current step before it reads on, resolved
     (`dew.training.cooldown.Pending`): one its checkpoints kept unfinished, as the pool agreed it, or
     one due at its last step, which runs after the step's final save (`Trainer._wind_down`)."""
+
+    def closing(self, state: TrainState, window: int) -> Batch | None:
+        """The run's latest batch (`last`) with every row masked (`VALID_ROWS` False, consuming no
+        example), which a run bounded in examples steps where its stream ends inside an update's window of
+        `window` microsteps, so the window commits over the rows it holds, its mean theirs, as a whole
+        one does, rather than being dropped with the examples it consumed. None where no window is open,
+        or the run holds no batch for one."""
+        last = self.last
+        if last is None or int(state.microstep) % window == 0:
+            self.last = None
+            return None
+        consumed = last[EXAMPLES_CONSUMED]
+        return {**last, VALID_ROWS: jnp.zeros_like(consumed, dtype=bool),
+                EXAMPLES_CONSUMED: jnp.zeros_like(consumed), CONSUMED_COUNT: ConsumedCount(0)}
 
     def ends_here(self, interval: Interval) -> bool:
         """Whether a stream that may run out has, so this step is the run's last: its next batch is
@@ -372,16 +398,17 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
 
 def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, stop, scored,
                                  checkpoint_every, *, steps: int | None, tokens: int | None,
-                                 accumulation: int, checkpointed: bool):
+                                 accumulation: int, checkpointed: bool, examples: int | None = None):
     """A fit's best selection and its stop policy over `objective`: a `Plateau` with its metric bound
-    to the objective, or the step and tokens a `Pause` of a run of `steps` and `tokens`, updates of
-    `accumulation`, ends it at (`Pause.at`), which needs the run `checkpointed` to resume from."""
+    to the objective, or the step, tokens and examples a `Pause` of a run of `steps` and `tokens`, or
+    bounded to `examples` no pass counts steps ahead of, updates of `accumulation`, ends it at
+    (`Pause.at`), which needs the run `checkpointed` to resume from."""
     if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
         raise ValueError("checkpoint_every duration must be positive")
     if isinstance(stop, Pause) and not checkpointed:
         raise ValueError("a Pause ends a run its checkpoint resumes, and this trainer has no "
                          "checkpointer; pass Checkpoints(directory)")
-    pause = stop.at(steps, tokens, accumulation) if isinstance(stop, Pause) else (None, None)
+    pause = stop.at(steps, tokens, accumulation, examples) if isinstance(stop, Pause) else (None, None, None)
     plateau = stop if isinstance(stop, Plateau) else None
     raw = (
         ()

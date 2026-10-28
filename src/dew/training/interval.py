@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.batch import Batch
+from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
 from dew.state import Accumulation
@@ -34,6 +34,10 @@ BAD_LOSS_STEPS = 5
 
 COMMITTED_TOKENS = "committed_tokens"
 """The checkpoint control field that holds a run's tokens, those its committed updates trained on."""
+
+CONSUMED_EXAMPLES = "consumed_examples"
+"""The checkpoint control field that holds the examples a run's dispatched batches consumed, as its host
+counted them (`Interval.consumed`), where it counts them."""
 
 
 def committed_tokens(control: dict) -> int:
@@ -138,10 +142,19 @@ class Interval:
     waited: float = 0.0
     compiling: float = 0.0
     compiles: int = 0
+    consumed: int = 0
+    """The examples the run's dispatched batches consumed, the runs before this fit's included, as the host
+    counted each batch (`dew.batch.ConsumedCount`): what its cadences and pause of examples read, the
+    same as its state's clock (`TrainState.consumed`) without a read off the devices."""
+    consumed_before: int = 0
+    """`consumed` before the latest step."""
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
               committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
-        """Add one step: its records, its FLOPs, its loss and its optimizer commit."""
+        """Add one step: its records, its FLOPs, its loss, its optimizer commit and its consumed examples."""
+        held = batch.get(CONSUMED_COUNT)
+        self.consumed_before = self.consumed
+        self.consumed += held.examples if isinstance(held, ConsumedCount) else 0
         self.since_log += 1
         self.steps += 1
         self.samples += rows_of(batch)
@@ -178,14 +191,16 @@ class Interval:
     def resumed(cls, control: dict, *, last_saved: int | None) -> Interval:
         """An interval from now on, its token clock read off a checkpoint's `control`
         (`committed_tokens`), which it takes the clock's field out of."""
+        consumed = int(control.pop(CONSUMED_EXAMPLES, 0))
         return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control),
-                   resumable=last_saved)
+                   resumable=last_saved, consumed=consumed, consumed_before=consumed)
 
     @property
     def token_control(self) -> dict[str, int]:
-        """The token clock a checkpoint keeps (`Checkpoints.control`): the committed updates' real
-        tokens."""
-        return {COMMITTED_TOKENS: self.real_tokens}
+        """The clocks a checkpoint keeps (`Checkpoints.control`): the committed updates' real tokens, and
+        the examples consumed where the run counts them."""
+        consumed = {CONSUMED_EXAMPLES: self.consumed} if self.consumed else {}
+        return {COMMITTED_TOKENS: self.real_tokens, **consumed}
 
     @property
     def real_tokens(self) -> int:

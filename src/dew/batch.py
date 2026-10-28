@@ -9,6 +9,7 @@ them imports another for these."""
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, ClassVar
@@ -79,6 +80,19 @@ EXAMPLES_CONSUMED = "examples_consumed"
 examples (`dew.data.pipeline.CONSUMED`): the batch's sum over its real rows is the examples its dispatch
 consumes, which the trainer's step adds to the run's clock (`TrainState.consumed`) and takes out of the
 batch the objective sees. A repeat filling out a short batch holds none."""
+
+
+CONSUMED_COUNT = "consumed_count"
+"""A training batch's host field of the examples it consumes (`ConsumedCount`), which the trainer counts
+as it prepares the batch, so its loop reads the run's progress without waiting on its devices."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ConsumedCount:
+    """A training batch's consumed examples as its host counted them before placing it, the sum of its
+    `EXAMPLES_CONSUMED` column: an object no device holds (`dew.distributed.batches.split_fields`)."""
+
+    examples: int
 
 
 def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:

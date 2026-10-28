@@ -390,23 +390,64 @@ def clocked_descent(accumulation: int):
     return descended
 
 
-def clocked_run(accumulation: int):
+def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = None, log_every=1):
     """A run bounded to CLOCKED_RECORDS examples of `x`, read in order as a stream, whose objective makes
     `id % 3 + 1` rows of each, under `Linear` from PEAK to CLOCKED_END, updating every `accumulation`
-    batches of BATCH rows: no pass counts
-    its steps ahead, so its schedule reads the examples its batches consumed. Its losses of every step and
-    its final weight."""
+    batches of BATCH rows, checkpointed to `directory` where given: its final state and its tracker."""
+    tracker = RecordingTracker()
+    ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
+    chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed")
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation,
+                      checkpoints=None if directory is None else Checkpoints(str(directory)))
+    return trainer.fit(chain.batch(BATCH), examples=CLOCKED_RECORDS, log_every=log_every, stop=stop), tracker
+
+
+def clocked_run(accumulation: int, directory=None, stops: tuple[Pause | None, ...] = (None,)):
+    """A clocked run (`clocked_fit`) fitted once under each of `stops` in turn, each fit resuming the one
+    before from `directory`: no pass counts its steps ahead, so its schedule reads the examples its
+    batches consumed. Its losses of every step and its final weight."""
     @as_given
     def trained(x):
-        tracker = RecordingTracker()
-        ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
-        chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed")
-        optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
-        trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation)
-        state = trainer.fit(chain.batch(BATCH), examples=CLOCKED_RECORDS, log_every=1)
+        stepped, state = [], None
+        for stop in stops:
+            state, tracker = clocked_fit(x, accumulation, directory=directory, stop=stop)
+            stepped += losses(tracker)
         assert state is not None and int(state.consumed) == CLOCKED_RECORDS
-        return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(losses(tracker))}
+        return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(stepped)}
     return trained
+
+
+def clocked_records(seed: int) -> tuple[np.ndarray]:
+    """A clocked run's corpus of one draw: CLOCKED_RECORDS rows of FEATURES coordinates, unit normals."""
+    return (np.random.default_rng(seed).normal(size=(CLOCKED_RECORDS, FEATURES)).astype(np.float32),)
+
+
+def test_a_clocked_runs_share_of_its_examples_falls_where_its_batches_pass_it():
+    """A run bounded in examples that counts no steps ahead logs at a share of its examples (`25%`, every 5
+    of 18) at each step whose batch brings its consumed examples past a multiple of that share
+    (`Examples`), and at its last."""
+    ids = np.arange(1, CLOCKED_RECORDS + 1)
+    owner = np.repeat(np.arange(CLOCKED_RECORDS), ids % 3 + 1)
+    last = np.r_[owner[1:] != owner[:-1], True]
+    consumed = np.cumsum([int(np.sum(last[start:start + BATCH])) for start in range(0, len(owner), BATCH)])
+    passing = [step for step, (now, before) in enumerate(zip(consumed, np.r_[0, consumed[:-1]], strict=True),
+                                                         start=1) if now // 5 > before // 5]
+    _, tracker = clocked_fit(*clocked_records(0), 1, log_every="25%")
+    logged = [step for step, scalars in tracker.scalars if "train/loss" in scalars]
+    assert logged == sorted({*passing, len(consumed)})
+
+
+def test_a_clocked_run_paused_at_half_its_examples_and_resumed_trains_on_as_one_that_never_paused(tmp_path):
+    """A run bounded in examples that counts no steps ahead, paused once half its examples are consumed and
+    resumed without the pause, lands where the whole run does, step for step and in its weight
+    (check 1): its checkpoint held the examples it consumed with its data position."""
+    directories = iter(range(1 << 20))
+
+    def paused(x):
+        return clocked_run(2, tmp_path / str(next(directories)), (Pause(0.5), None))(x)
+
+    assert_as_exact(as_given(paused), clocked_run(2), clocked_records, "paused clocked run", seeds=PAUSE_SEEDS)
 
 
 @pytest.mark.parametrize("accumulation", [1, 2])
@@ -415,10 +456,7 @@ def test_a_run_no_pass_counts_ahead_reads_its_schedule_off_the_examples_it_consu
     its rate falls over the share of its examples its batches consumed, each example consumed by the batch
     that holds its last row, and its losses and weight are Adam's at that rate (check 1); updating every
     two batches, the window its stream ends inside commits over its own rows."""
-    def drawn(seed: int) -> tuple[np.ndarray]:
-        return (np.random.default_rng(seed).normal(size=(CLOCKED_RECORDS, FEATURES)).astype(np.float32),)
-
-    assert_as_exact(clocked_run(accumulation), clocked_descent(accumulation), drawn,
+    assert_as_exact(clocked_run(accumulation), clocked_descent(accumulation), clocked_records,
                     f"clocked run of {accumulation}", seeds=EXAMPLES_SEEDS)
 
 
