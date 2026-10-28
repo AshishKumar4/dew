@@ -121,7 +121,8 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
         # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with
         # the documents, the valid keys, the sinks and the softcap as they are, no band and no mask.
-        runs = None if chunk is None else chunk_runs(places, segment_ids, valid, query.shape[0], length, chunk)
+        runs = (None if chunk is None
+                else chunk_runs(places, segment_ids, valid, query.shape[0], length, chunk))
         return whole(implementation=implementation, causal=True, sliding_window=window,
                      segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
