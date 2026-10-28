@@ -7,7 +7,6 @@ under one placement, whichever backend compiles it. What it costs and its execut
 a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import dataclasses
-import logging
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +20,7 @@ from dew._records import listed, record
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
 from dew.registry import models
+from dew.telemetry.instrumentation import Compiles
 from dew.training import Layout, MeshSpec, Trainer
 
 VOCAB, SEQ_LEN, BATCH = 96, 16, 8
@@ -35,7 +35,7 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, 
                    layout=Layout(min_shard=TINY_SHARD), split=1, ahead=ahead, links=links)
 
 
-def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch, caplog):
+def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
     """A compile-only GPU with stated memory takes the run's own fit search, whose one fitting
     program is the saved executable, not another compile outside the report. The report records
     that compile's time and memory, and planning creates no device state or runner to execute."""
@@ -44,13 +44,11 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
     original_state_mesh = trainer.state_mesh
-    with caplog.at_level(logging.DEBUG, logger="jax._src.dispatch"):
+    with Compiles("step") as compiles:
         ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30)
     assert tuple(trainer.device_mesh.devices.flat) == compile_only_gpus("sm90", 1, 2**30)
     assert trainer.state_mesh is trainer.device_mesh and trainer.state_mesh is not original_state_mesh
-    step_compiles = [message for message in caplog.messages
-                     if message.startswith("Finished XLA compilation of jit(step)")]
-    assert len(step_compiles) == 1
+    assert compiles.count == 1
     plan = record(ahead.plan, "plan")
     (probe,) = listed(plan["probes"], "probes", read=record, what="probes")
     assert probe["fits"] is True and probe["temp"] == ahead.temp_bytes
