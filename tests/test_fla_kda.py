@@ -29,7 +29,7 @@ from dew.nn import kernels
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import chunked_launch, fla_kda
 from dew.nn.kernels.recurrence_chunk import fla_rule
-from dew.nn.precision import FP32_SUMS, l2norm
+from dew.nn.precision import FP32_SUMS
 
 pytestmark = pytest.mark.kernel
 

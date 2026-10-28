@@ -777,18 +777,17 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     try:
         training = kernel_of('training')
     except KernelRefused as refusal:
-        # Bound beyond the handler, which unbinds its own name as it exits.
-        refused = refusal
-    else:
-        refused = None
-    if refused is not None:
-        def refusing(*operands):
-            raise refused
-
-        return _by_product(functools.partial(run, forward), refusing, *operands)
+        return _by_product(functools.partial(run, forward), functools.partial(_refusing, refusal), *operands)
     if forward == training:
         return run(forward, *operands)
     return _by_product(functools.partial(run, forward), functools.partial(run, training), *operands)
+
+
+def _refusing(refusal: KernelRefused, *operands):
+    """A product whose kernel refused the call (`_per_product`'s training): raises `refusal` where it is
+    traced."""
+    del operands
+    raise refusal
 
 
 def _by_product(forward, training, *operands):
