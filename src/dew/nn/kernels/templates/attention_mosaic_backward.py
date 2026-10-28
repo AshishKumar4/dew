@@ -82,7 +82,8 @@ class _Backward:
     fused: bool
     kinds: tuple[Kind, ...]
     approx_math: bool
-    """Whether its launches take the hardware's approximate transcendentals (`approximate`)."""
+    """Whether its launches take the hardware's approximate transcendentals (`approximate`): never in the
+    accurate form."""
 
     @property
     def how(self) -> algebra.Recompute:
@@ -509,7 +510,10 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
                        spec.queries)
     hooks = Hooks(score_mod, tuple(map(Param, score_params, score_kinds)))
-    approx_math = approximate(hooks, (tiles.block_q, tiles.block_k), value_width, differentiated=True)
+    # The accurate form's exponentials exact: the hardware's ex2.approx flushes a subnormal weight to zero,
+    # whose product with a large score cotangent the reference keeps (row 2022, ET-SUBFIX2-h100).
+    approx_math = not accurate and approximate(hooks, (tiles.block_q, tiles.block_k), value_width,
+                                               differentiated=True)
     walk = _Backward(program, spec, accurate, tiles.consumers, interpret, tiles.fused, score_kinds,
                      approx_math)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)

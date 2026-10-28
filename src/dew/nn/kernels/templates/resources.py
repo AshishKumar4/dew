@@ -69,6 +69,19 @@ def live_registers(family: "Family", carried, *phases) -> int:
     return int(-(-(words(carried) + phase) // THREADS)) + family.held_registers
 
 
+def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
+                      rhs_parts: int = 1) -> list:
+    """The operand fragments a product `[rows, depth] @ [depth, columns]` holds at once where its family's
+    products read registers (`Family.operands_in_registers`), none where they read shared memory: its left
+    operand a step deep, its right one a sub-step (`Family.fragment_depth`), each in the warps replicating it
+    (`lhs_copies`, `rhs_copies`), each in its dtype (`lhs`, `rhs`) and as many times as it has parts (an fp32
+    operand split into 16-bit parts): the GEMM's tiles' (`tile_registers`) and the recurrence's products'."""
+    if not family.operands_in_registers:
+        return []
+    return ([(rows * family.lhs_copies, depth, lhs)] * lhs_parts
+            + [(family.fragment_depth(depth), columns * family.rhs_copies, rhs)] * rhs_parts)
+
+
 def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype, *,
                    stored=()) -> int:
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
@@ -81,9 +94,8 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     registers (`Family.stores_through_registers`), its epilogue holds one copy's rows (`copied_rows`) in the
     widest of the `stored` dtypes beside the accumulator."""
     rows, columns, depth = block
-    share, sub = rows // consumers, family.fragment_depth(depth)
-    fragments = ([(share * family.lhs_copies, depth, dtype), (sub, columns * family.rhs_copies, dtype)]
-                 if family.operands_in_registers else [])
+    share = rows // consumers
+    fragments = operand_fragments(family, share, depth, columns, dtype, dtype)
     accumulator = (share, columns, jnp.float32)
     walk = live_registers(family, [accumulator], fragments)
     if not (family.stores_through_registers and stored):
@@ -162,12 +174,15 @@ class Scope:
     """A program's shared-memory allocations by lifetime, as its kernel scopes them (`shared_bytes`): those
     live for the whole `program` (arrays, barriers, a ring's: `plgpu.SMEM`, `plgpu.Barrier`,
     `plgpu.ClusterBarrier`, nested in sequences and mappings); each walk's own, one after another (`walks`:
-    an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`; and whether the
-    program `reduces` across warps, reserving its family's scratch."""
+    an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`; whether the
+    program `reduces` across warps, reserving its family's scratch (`Family.reduction_scratch`); and its
+    `reducing_warpgroups`, each reserving its share where its arithmetic reduces implicitly
+    (`Family.warpgroup_reduction_scratch`, the kernel's)."""
     program: tuple = ()
     walks: tuple = ()
     after: tuple = ()
     reduces: bool = False
+    reducing_warpgroups: int = 0
 
 
 def _count(barriers) -> int:
@@ -184,7 +199,8 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
     estimate counts it (its `smem_scratch_bytes`): every array rounded up to `SMEM_ALIGNMENT`
     (`allocated`), the walks the largest of them, the tiles scoped after the walks the larger of them and
     the walks on a family that scopes its walks apart (`Family.walks_scoped`) and beside the program's
-    otherwise, and the family's reduction scratch where the program reduces (`Family.reduction_scratch`)."""
+    otherwise, and the family's reduction scratch where the program reduces (`Family.reduction_scratch`)
+    and its warpgroups' shares where they reduce implicitly (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
         return [math.prod(leaf.shape) * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(tree)
                 if not _barrier(leaf)]
@@ -197,6 +213,8 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
     else:
         sizes += after
     scratch = [family.reduction_scratch] if scope.reduces and family.reduction_scratch else []
+    if scope.reducing_warpgroups:
+        scratch.append(family.warpgroup_reduction_scratch * scope.reducing_warpgroups)
     return allocated(*sizes, *scratch) + max([0, *walks])
 
 

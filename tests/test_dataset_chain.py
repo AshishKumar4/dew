@@ -863,7 +863,8 @@ def test_show_prints_the_chain_as_written_then_the_records_and_leaves_a_reader_w
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     """A memory read runs a corpus's steps before its repeat and reads the rest as it goes: every
     row it delivers was cut short after the repeat, so its truncated share is one, whatever the
-    rows the memory read held before."""
+    rows the memory read held before, and the cut's record counts the row and the three tokens it
+    removed of the field it cut."""
     from dew.data.steps.text import LengthPolicy
 
     rows = Memory([{"text": np.arange(5, dtype=np.int32)} for _ in range(4)])
@@ -878,6 +879,42 @@ def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     counts = data.statistics()
     assert counts["data/rows/memory"] == 1
     assert counts["data/truncated/memory"] == 1.0
+    assert counts["data/cut/memory/text"] == counts["data/cut_examples/memory/text"] == 1
+    assert counts["data/cut_removed/memory/text"] == 3
+
+
+def test_successive_cuts_of_a_record_compose_in_its_record():
+    """Two cuts of one field, a text of 9 tokens cut to 6 and then to 2, record the 7 tokens they removed
+    of one row, not the last cut's 4; a cut of another field stands beside them, its own row counted, and
+    the loader's counters read the composed record."""
+    from dew.data.steps.text import LengthPolicy
+
+    rows = Memory([{"text": np.arange(9, dtype=np.int32), "label": np.arange(5, dtype=np.int32)}])
+    chain = (rows.map(LengthPolicy(6)).map(LengthPolicy(2)).map(LengthPolicy(3, field="label"))
+             .batch(1))
+    data = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        next(stream)
+    finally:
+        stream.close()
+    counts = data.statistics()
+    assert counts["data/cut/memory/text"] == 1 and counts["data/cut_removed/memory/text"] == 7
+    assert counts["data/cut/memory/label"] == 1 and counts["data/cut_removed/memory/label"] == 2
+
+
+def test_a_rendered_prompt_kept_to_its_length_counts_the_start_it_removed():
+    """A prompt longer than its length, kept by its end (`long="truncate"`), records the cut: its row
+    cut short, one row and the tokens of its start removed, as every length policy does."""
+    from dew.data.prompts import LENGTH_KEY
+    from dew.data.steps.chat import RenderPrompt
+
+    prompt = {"prompt": "a prompt of many bytes"}
+    rendered = RenderPrompt("byte", max_prompt_len=8, long="truncate").map(prompt)
+    whole = RenderPrompt("byte", max_prompt_len=64).map(prompt)
+    removed = int(whole[LENGTH_KEY]) - 8
+    assert removed > 0 and rendered["_dew_truncated"] and rendered["_dew_cut"] == {"prompt": (1, removed)}
+    assert "_dew_cut" not in whole
 
 
 def test_a_character_filter_and_caption_dropout_keep_and_empty_their_records():

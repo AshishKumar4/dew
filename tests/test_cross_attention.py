@@ -737,3 +737,19 @@ def test_a_served_requests_host_context_is_checked_on_the_host():
         ticket = server.submit(host, BUDGETS[0], key=0)
     server.run()
     assert_same_generation(ticket.result(), bound(given, BUDGETS[0], key=0))
+
+
+def test_a_tokens_context_is_present_where_its_document_holds_keys_whatever_their_order():
+    """A token reads the cross-attention where its document holds any of the context's keys (`holds_keys`),
+    the keys in any order and with padding (0) anywhere among them, and a padding token never does: as
+    the membership of every query among the keys says, over drawn ids (exact, booleans)."""
+    from dew.nn.documents import CrossDocuments, holds_keys
+
+    rng = np.random.default_rng(0)
+    queries = rng.integers(0, 6, (4, 32)).astype(np.int32)
+    keys = rng.integers(0, 6, (4, 48)).astype(np.int32)
+    keys[:, ::7] = 0
+    member = np.any((queries[:, :, None] == keys[:, None, :]) & (keys[:, None, :] > 0), axis=-1)
+    held = holds_keys(CrossDocuments(jnp.asarray(queries), jnp.asarray(keys)))
+    np.testing.assert_array_equal(np.asarray(held), member & (queries > 0))
+    assert member.any() and not member.all()
