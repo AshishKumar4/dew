@@ -745,14 +745,17 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
         dQ program its query and output-gradient tiles and the key and value tiles of every stage but the
         one in use; a dK/dV program its key and value tiles and the query and output-gradient tiles of
         every stage but the one in use; and two `block_q` by `block_k` tiles on their way between
-        products. A bound fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21: at or
-        above them on every config it refused, within the budget on all but two of the A10's compiled
-        ones)."""
+        products. fp32 operands, which Triton's products take as tf32, stage the one in use too. A bound
+        fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21, 16-bit: at or above them on
+        every config it refused, within the budget on all but two of the A10's compiled ones; fp32 at 64-
+        and 128-wide heads on every config of the space compiled for an A100, 2026-10-28: at or above them,
+        where the 16-bit count fell up to 19968 bytes short)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
-        rows = max(config.block_q + (config.dq_stages - 1) * config.block_k,
-                   config.block_k + (config.dkv_stages - 1) * config.block_q)
+        held = 1 if size >= 4 else 0
+        rows = max(config.block_q + (config.dq_stages - 1 + held) * config.block_k,
+                   config.block_k + (config.dkv_stages - 1 + held) * config.block_q)
         return (rows * (width + value_width) + 2 * config.block_q * config.block_k) * size
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
