@@ -415,13 +415,15 @@ def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
     """The natural form's forward exponential (`Forward.power`): `exp(x * scale)` as the hardware's
     base-2 exponential of `x * scale * log2(e)`, the logits staying natural. The conversion keeps its
     rounded product and its residual (`two_product`), the factor's own rounding among them, and the
-    exponential takes the residual as a linear correction on the reduced exponent's fractional part
-    (`power2` the integral one), so the conversion's rounding does not reach a large value under a small
-    weight: one rounding more than `jnp.exp` no longer, where XLA had folded `exp2(x * log2(e))` back to
-    `exp(x)` until JAX 0.12 stopped reassociating constant products (jax-ml/jax 2d3744395). The residual is
-    about an fp32 ulp of the exponent, whose square is below the exponential's rounding. The factors that
-    carry a state take it too (`Forward.power`); the backward's weights keep `jnp.exp`, as the reference
-    does."""
+    residual joins the reduced exponent's fractional part (`power2` takes the integral one), so the
+    conversion's rounding does not reach a large value under a small weight, where XLA had folded
+    `exp2(x * log2(e))` back to `exp(x)` until JAX 0.12 stopped reassociating constant products
+    (jax-ml/jax 2d3744395). The joined exponent rounds at its own ulp, at most 2^-25 below one half, which
+    moves the weight by under a fifth of its ulp: the weight's error is the base-2 exponential's on
+    [-1/2, 1/2], as the reference's `exp` is (libdevice's reduces its argument so and takes the same
+    exponential), where a correction added after the exponential rounded the weight once more, half an ulp
+    (1.55 times the reference's error on an A100's and an H100's edge weights). The factors that carry a
+    state take it too (`Forward.power`); the backward's weights keep `jnp.exp`, as the reference does."""
     # Normalize the factor before splitting: at a tiny raw scale its residual would be subnormal.
     factor, exponent = np.frexp(scale * LOG2E)
     x = x * np.float32(2.0 ** int(exponent))
@@ -437,10 +439,7 @@ def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
     exponent += (bounded - exponent >= 0.5).astype(x.dtype)
     live = (jnp.abs(x) < jnp.inf) & (hi >= -150.0) & (hi <= 128.0)
     lo = jnp.where(live, lo, 0.0)
-    base = jnp.exp2(bounded - exponent)
-    # Add the small correction, rather than rounding 1 + correction before its product.
-    corrected = base + base * (lo * np.float32(np.log(2.0)))
-    return power2(corrected, exponent)
+    return power2(jnp.exp2((bounded - exponent) + lo), exponent)
 
 
 def headroom(dtype) -> bool:
