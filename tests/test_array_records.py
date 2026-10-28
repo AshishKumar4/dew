@@ -405,8 +405,7 @@ def watched(opened: list, slow: tuple[threading.Event, threading.Event] | None =
 def test_a_trim_asked_for_while_another_trims_is_made_before_the_trimmer_lets_go(arrayrecord_paths):
     """A read that leaves the process past its idle bound while another read's trim is closing a
     reader asks that trim to go again, which it does before it lets go: once both reads are done the
-    process holds no more idle readers than the bound. Before, the second read's request was dropped
-    and the bound stayed exceeded by the reader it left idle (row 2059)."""
+    process holds no more idle readers than the bound (row 2059)."""
     from dew.data.sources.records import ShardReaders
 
     bound, opened = Loading().threads, []

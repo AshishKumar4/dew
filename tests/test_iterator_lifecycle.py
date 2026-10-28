@@ -911,9 +911,7 @@ def delivered_and_counted(chain) -> tuple[dict[str, int], dict[str, float]]:
 def test_a_nested_mix_repeated_whole_counts_every_corpus_it_delivered_on_both_passes():
     """A mix whose first member is itself a mix, repeated whole and read pass by pass: every corpus,
     at either level, counts every row the two passes delivered of it and twice the rejections of
-    one pass, the counts going on across the outer rewind that reopens the inner mix (row 2059).
-    Before, the inner mix's corpora, rewound past a member the outer mix had not opened, counted
-    only their last pass."""
+    one pass, the counts going on across the outer rewind that reopens the inner mix (row 2059)."""
     def nested():
         return mix([mix([counted_source("a"), counted_source("b")]), counted_source("c")])
 
@@ -957,8 +955,7 @@ def test_a_mix_resumed_where_its_rewind_left_a_corpus_unopened_counts_as_the_rea
 
 def test_a_repeat_restored_after_its_last_pass_counts_what_the_restored_position_holds():
     """A mix repeated twice and read to its end, then restored in place to a position of its first
-    pass: its corpora count what that position holds, not what the whole read reached (row 2059).
-    Before, a restore after the last pass passed for the repeat's rewind and kept the live counts."""
+    pass: its corpora count what that position holds, not what the whole read reached (row 2059)."""
     from dew._records import record
     from dew.data.compile import held
     from dew.data.dataset import DataPartition
@@ -980,7 +977,7 @@ def test_a_repeat_restored_after_its_last_pass_counts_what_the_restored_position
 def test_a_worker_repeat_restored_ended_keeps_the_counts_its_position_holds():
     """A loading worker's repeat restored ended (`_Ended`: a pass of its inputs held none) reads no
     more and keeps the position it was given, so its corpus's counts stand as they were saved (row
-    2059). Before, it dropped that position and its corpus counted from nothing."""
+    2059)."""
     from dew.data.lowering import _Ended
     from dew.data.mixing import Accepted, state_counts
 
@@ -1000,8 +997,8 @@ def test_a_worker_repeat_restored_ended_keeps_the_counts_its_position_holds():
 
 def test_a_live_mix_rolled_back_to_where_it_opened_no_corpus_counts_none():
     """A mix read on and rolled back, in place, to its start, where it had opened no corpus: its
-    corpora count nothing, as nothing had been counted there. Before, each corpus kept the counts it
-    had reached since, carried into a rollback as into a repeat's rewind (row 2059)."""
+    corpora count nothing, as nothing had been counted there; a rollback carries no counts, as a
+    repeat's rewind does (row 2059)."""
     from dew._records import record
     from dew.data.compile import _diagnostic
     from dew.data.mixing import data_metrics, state_counts
