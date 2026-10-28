@@ -1194,8 +1194,8 @@ tangent) and its tiling over the geometry (`ssd_kernel_runs`)."""
 
 def scan_case(x, B, chunk_size: int, *, tpu: bool = True) -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
-    `chunk_size` chunks; on a TPU where `tpu` asks, the platform its Pallas scan builds for, which
-    logs the choice once a geometry (`ssd_kernel_platform`)."""
+    `chunk_size` chunks; on a TPU where `tpu` asks, the platform its Pallas scan builds for
+    (`ssd_kernel_platform`)."""
     widths = (x.shape[-1], B.shape[-1], chunk_size)
     return ScanCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(x).mat.varying),
                     dtype=jnp.dtype(x.dtype), widths=widths,

@@ -27,8 +27,6 @@ holds the kernel to `chunk_ssd` and its `jax.grad`.
 
 from __future__ import annotations
 
-import functools
-import logging
 
 import jax
 import jax.numpy as jnp
@@ -39,7 +37,6 @@ from jax.typing import DTypeLike
 from ..precision import float32_products, products_dtype
 from . import generation
 
-_log = logging.getLogger(__name__)
 
 MIN_WIDTH = 8
 """The narrowest chunk, head width or state width the kernel is chosen for.
@@ -90,29 +87,14 @@ def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: st
     return chunk_size >= MIN_CHUNK and _program_words(*widths) <= TPU_PROGRAM_WORDS
 
 
-@functools.cache
-def _announce(backend: str, chunk_size: int, head_dim: int, state_size: int,
-              platform: str | None) -> None:
-    """One line per geometry a process traces, from the trace that chose."""
-    geometry = f"chunk {chunk_size}, head width {head_dim}, state {state_size}"
-    if platform is None:
-        _log.info("mamba2 ssd scan on %s: the xla path (%s, %d fp32 words a program)",
-                  backend, geometry, _program_words(chunk_size, head_dim, state_size))
-    else:
-        _log.info("mamba2 ssd scan on %s: the pallas kernel (%s)", platform, geometry)
-
-
 def ssd_kernel_platform(chunk_size: int, head_dim: int, state_size: int, *,
                         dtype: DTypeLike) -> str | None:
     """Return the backend to build this `dtype` scan's kernel for, or None for the XLA path.
 
-    The choice is logged once per geometry.
-    """
+    The scan's route is the selector's to report (`recurrence_chunk.SCAN`, `generation`'s Route
+    collection), where the kernel report reads it (row 971)."""
     backend = generation.backend()
-    platform = backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend,
-                                          dtype=dtype) else None
-    _announce(backend, chunk_size, head_dim, state_size, platform)
-    return platform
+    return backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend, dtype=dtype) else None
 
 
 def _triangles(size: int):
