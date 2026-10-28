@@ -1230,9 +1230,11 @@ class TorchCausalLM(nn.Module):
         return logits.astype(at_least_fp32(logits.dtype))
 
     def hidden_states(self, tokens, train: bool = False, *, conditioning: Mapping[str, object] | None = None,
-                      attention_pairwise_mask=None, attention_key_positions=None, **packing) -> jax.Array:
+                      attention_pairwise_mask=None, attention_key_runs=None, attention_key_positions=None,
+                      **packing) -> jax.Array:
         """The states the output head reads, `[B, S, features]`, for rows laid as `logits` lays them
-        (`_laid`). `attention_pairwise_mask` `[B, S, S]` states what each token sees, which then
+        (`_laid`). `attention_pairwise_mask` `[B, S, S]`, or `attention_key_runs` `[B, S, R, 2]` (the keys
+        each token sees as runs, `AttentionMetadata.key_runs`), states what each token sees, which then
         replaces documents and causality, and `attention_key_positions` `[B, S]` the keys' positions a
         window counts (on Dew's attention only), as Dew's own decoders read them; the tokens' rotary
         positions are the packing's (`positions`, `coordinates`).
@@ -1240,6 +1242,13 @@ class TorchCausalLM(nn.Module):
         if conditioning:
             raise TypeError("a tier-3 model has no cross-attention to read a context with")
         laid = self._laid(tokens, packing)
+        if attention_key_runs is not None:
+            from dew.nn.attention import visibility_mask
+
+            # The runs as the mask they state, the stated visibility this path reads.
+            length = jnp.shape(tokens)[1]
+            attention_pairwise_mask = visibility_mask(length, length, False, None,
+                                                      key_runs=attention_key_runs)[:, 0]
         if attention_pairwise_mask is None:
             return self._run(tokens, train, laid)[1]
         if self.graph.attention_impl is None:
