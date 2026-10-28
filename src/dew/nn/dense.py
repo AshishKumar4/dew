@@ -32,7 +32,7 @@ from flax.typing import Array
 from dew.cache import INTERCEPTED
 
 from .kernels.templates.gemm import template
-from .precision import accumulated, biased
+from .precision import accumulated, biased, float32_dot_general
 
 
 def _direct_qwix_interception() -> bool:
@@ -54,13 +54,17 @@ def intercepted() -> bool:
 def _product(layer: nn.Dense | nn.DenseGeneral):
     """The layer's product: its `dot_general_cls` (an interceptor's: a quantized product), as flax picks
     it, else its `dot_general`, or lax's at its stated precision (`accumulated`: the plain product, its fp32
-    sum taken in float64 on a CPU under Dew's tests), through the GEMM template's dense product where a
+    sum taken in float64 on a CPU under Dew's tests). A plain product (lax's or `float32_dot_general`: its
+    operands' dtype out, at the layer's precision) goes through the GEMM template's dense product where a
     launch takes it (`template.dot_general`; XLA's program wherever the template declares XLA faster), but
-    where a wrapper owns the products (`intercepted`: Qwix quantizes them as it intercepts `dot_general`)."""
+    where a wrapper owns the products (`intercepted`: Qwix quantizes them as it intercepts `dot_general`). A
+    product with a policy of its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`)
+    is the layer's own: the template reads no policy from a callable."""
     if layer.dot_general_cls is not None:
         return layer.dot_general_cls()
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
-    return product if intercepted() else template.dot_general(product)
+    plain = layer.dot_general in (None, float32_dot_general)
+    return template.dot_general(product) if plain and not intercepted() else product
 
 
 def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None,

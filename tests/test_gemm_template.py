@@ -545,6 +545,32 @@ def test_a_dense_layers_product_through_the_template_holds_check_1(generation_na
                         truth_fn=with_gradients(truth))
 
 
+@pytest.mark.parametrize("policy", ["fp32_result_dot_general", "head_dot_general"])
+def test_a_head_keeps_its_own_products_fp32_result(policy):
+    """A bf16 projection whose product states a policy of its own, a DiT's prediction head
+    (`fp32_result_dot_general`, `PatchSequenceOutput`'s) and a vocabulary head (`head_dot_general`), where a
+    launch takes the dense products: its prediction and its gradients stay its own product's, the prediction
+    fp32 (train 252's review: the template's bf16 product rounded the prediction before the loss)."""
+    from dew.nn.dense import Dense
+    from dew.nn.precision import fp32_result_dot_general, head_dot_general
+
+    heads = {"fp32_result_dot_general": fp32_result_dot_general(),
+             "head_dot_general": head_dot_general(jnp.bfloat16)}
+    layer = Dense(256, dot_general=heads[policy], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 64, 256), jnp.bfloat16)
+    params = jax.eval_shape(lambda: layer.init(jax.random.key(0), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(params, x):
+        prediction = layer.apply(params, x)
+        return jnp.sum(prediction.astype(jnp.float32) ** 2), prediction
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        (_, prediction), grads = jax.eval_shape(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True),
+                                                params, x)
+    assert prediction.dtype == jnp.float32
+    assert grads[1].dtype == x.dtype
+
+
 def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
     """A draw of a dense product's bf16 operands, `[rows, depth]` and `[depth, width]`, and with
     `cotangent` a bf16 cotangent of its bf16 output."""
