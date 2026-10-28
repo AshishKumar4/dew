@@ -1010,8 +1010,12 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal):
     pairs = tokens * (tokens + 1) // 2 if causal else tokens * tokens
     forward = 2 * rows * heads * pairs * (width + width)
 
+    # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
+    # of its own.
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+
     def counted(fn, *arrays):
-        with generation.assumed("sm90"):
+        with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
             text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
         launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
         assert launches and all(_stated_flops(line) is not None for line in launches)
