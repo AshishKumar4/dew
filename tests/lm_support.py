@@ -3,7 +3,7 @@
 import jax.numpy as jnp
 import numpy as np
 
-from dew.objectives.lm import TEXT_KEY
+from dew.batch import TEXT_KEY
 
 
 def token_batch_of(vocab: int, seq: int, batch: int = 4, seed: int = 0) -> dict:
