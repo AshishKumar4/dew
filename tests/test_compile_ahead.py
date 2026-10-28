@@ -46,7 +46,7 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     original_state_mesh = trainer.state_mesh
     with caplog.at_level(logging.DEBUG, logger="jax._src.dispatch"):
         ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30)
-    assert tuple(trainer.device_mesh.devices.flat) == compile_only_gpus("sm90", 1, capacity=2**30)
+    assert tuple(trainer.device_mesh.devices.flat) == compile_only_gpus("sm90", 1, 2**30)
     assert trainer.state_mesh is trainer.device_mesh and trainer.state_mesh is not original_state_mesh
     step_compiles = [message for message in caplog.messages
                      if message.startswith("Finished XLA compilation of jit(step)")]
