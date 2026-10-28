@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config
@@ -46,10 +46,15 @@ def test_a_grouped_model_saves_in_the_remote_codes_layout(tmp_path):
     assert_reloads(loaded, tmp_path, fixture('input_ids'))
 
 
+YARN_EXPORT_SEEDS = 8
+"""The single-group export's declared draws of ids against transformers' Llama read of it (check 1)."""
+
+
 def test_a_single_group_exports_as_llama_with_its_yarn(tmp_path):
     """The 0.9B's shape, one group under YaRN, exports as Llama, whose norm
     is the same product in fp32 and whose rotary builds the same YaRN:
-    transformers' LlamaForCausalLM reads it back within the float64 gate."""
+    transformers' LlamaForCausalLM reads it back on par with its fp32 forward
+    from its float64 one over drawn ids (check 1)."""
     from tools.decoder_export_reference import Case, reference_logits
 
     loaded = load()
@@ -57,11 +62,17 @@ def test_a_single_group_exports_as_llama_with_its_yarn(tmp_path):
     PretrainedDecoder.from_model(single, loaded.variables).save(tmp_path)
     config = json.loads((tmp_path / 'config.json').read_text())
     assert config['model_type'] == 'llama'
-    ids = fixture('input_ids')
+    shape = np.shape(fixture('input_ids'))
     case = Case('llama', 'k2-horizon-tiny')
-    actual = np.asarray(single.apply(loaded.variables, ids))
-    assert_as_exact_as_the_reference(actual, reference_logits(case, tmp_path, ids),
-                                     reference_logits(case, tmp_path, ids, wide=True), 'Llama YaRN export')
+
+    def draw(seed):
+        return (np.random.default_rng(seed).integers(0, config['vocab_size'], shape).astype(np.int32),)
+
+    def read(wide):
+        return as_given(lambda ids: reference_logits(case, tmp_path, np.asarray(ids), wide=wide))
+
+    assert_as_exact(lambda ids: single.apply(loaded.variables, ids), read(wide=False), draw,
+                    'Llama YaRN export', seeds=YARN_EXPORT_SEEDS, truth_fn=read(wide=True))
 
 
 @pytest.mark.parametrize('size, groups, layers, width', [('0.9b', 1, 28, 1536), ('3.7b', 2, 36, 2560),

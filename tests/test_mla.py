@@ -37,14 +37,7 @@ import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    float64_forward,
-    torch_with_gradients,
-    with_gradients,
-)
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from selection_margins import indexer_margins
 from tool_support import load
 
@@ -532,11 +525,15 @@ def test_the_mla_kind_rotates_by_the_models_rope_scaling(scaling):
     np.testing.assert_array_equal(inside, standalone)
 
 
+LLAMA3_SCALED_SEEDS = 8
+"""The llama3-scaled DeepSeek V3's declared draws of ids against transformers' eager forward (check 1)."""
+
+
 def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by_it(tmp_path):
     """A DeepSeek V3 checkpoint whose config scales its rope by Llama 3.1's ramp loads through the
-    shared rope codec, and its latent attention rotates by the ramp: Dew's logits as exact as
-    transformers' DeepseekV3 under the same config (`assert_as_exact_as_the_reference`, the truth its
-    float64 twin), where the family read YaRN alone and refused the checkpoint (audit NN-04)."""
+    shared rope codec, and its latent attention rotates by the ramp: Dew's logits on par with
+    transformers' DeepseekV3 under the same config from its float64 twin over drawn ids (check 1),
+    where the family read YaRN alone and refused the checkpoint (audit NN-04)."""
     import shutil
 
     from transformers import AutoModelForCausalLM
@@ -555,15 +552,22 @@ def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by
     # The eager experts, which run in float64 too: the grouped kernel takes float32 or narrower.
     reference = AutoModelForCausalLM.from_pretrained(
         tmp_path, dtype=torch.float32, attn_implementation="eager", experts_implementation="eager").eval()
-    ids = np.load(source / "input_ids.npy")
-    given = torch.from_numpy(ids.astype(np.int64))
-    with torch.no_grad():
-        theirs = reference(input_ids=given).logits.numpy()
-        with float64():
-            wide = float64_twin(reference)(input_ids=given).logits.numpy()
-    _, terms = float64_forward(loaded.model, loaded.variables, ids)
-    assert_as_exact_as_the_reference(np.asarray(loaded.model.apply(loaded.variables, ids)), theirs, wide,
-                                     "a llama3-scaled DeepSeek V3's logits", terms=terms)
+    shape = np.load(source / "input_ids.npy").shape
+    wide = float64_twin(reference)
+
+    def draw(seed):
+        return (np.random.default_rng(seed).integers(0, config["vocab_size"], shape).astype(np.int32),)
+
+    def logits_of(model, precision):
+        def run(ids):
+            with torch.no_grad(), precision():
+                return model(input_ids=torch.from_numpy(np.asarray(ids, np.int64))).logits.double().numpy()
+        return as_given(run)
+
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids),
+                    logits_of(reference, contextlib.nullcontext), draw,
+                    "a llama3-scaled DeepSeek V3's logits", seeds=LLAMA3_SCALED_SEEDS,
+                    truth_fn=logits_of(wide, float64))
 
 
 # --------------------------------------------------------------------------
