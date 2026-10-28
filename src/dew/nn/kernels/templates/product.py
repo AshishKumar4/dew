@@ -4,6 +4,7 @@ kernels do not compute it where they do not. A template declares a product once,
 caller asked for, and keeps the declaration through every mainloop and its VJP's products."""
 
 import dataclasses
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -75,3 +76,52 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
                                        preferred_element_type=jnp.float64)
             return wide.astype(jnp.float32)
     return jax.lax.dot_general(lhs, rhs, dimension_numbers, preferred_element_type=jnp.float32)
+
+
+BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
+"""bf16's largest finite value, `(2 - 2^-7) 2^127`, an fp32 value."""
+
+
+def formed(x: jax.Array, count: int) -> tuple[jax.Array, ...]:
+    """fp32 `x` as `count` bf16 parts, largest first, each the last's remainder rounded (exact): three sum to
+    `x` exactly, two to 16 of its significand's bits. The first saturates at bf16's largest (an fp32 value
+    past it rounds to infinity in bf16, its remainder then NaN), the next parts taking the difference."""
+    pieces, rest = [], x
+    for _ in range(count):
+        piece = jnp.clip(rest, -BF16_LARGEST, BF16_LARGEST).astype(jnp.bfloat16)
+        pieces.append(piece)
+        rest = rest - piece.astype(jnp.float32)
+    return tuple(pieces)
+
+
+def terms(left: int, right: int) -> list[tuple[int, int]]:
+    """The pairs `(i, j)` of two operands' parts (`formed`, `left` and `right` of them) a product of them
+    issues, smallest first: those whose orders sum under the larger count, each part's bits beside the
+    other's leading ones (three parts each, 24 bits of each operand's significand)."""
+    count = max(left, right)
+    return sorted(((i, j) for i, j in itertools.product(range(left), range(right)) if i + j < count),
+                  key=lambda term: -sum(term))
+
+
+class Transposed:
+    """A register operand a product takes transposed, `value^T`: a mainloop stages it and reads the tile
+    transposed, where a transpose of registers would move every element between threads."""
+
+    def __init__(self, value: jax.Array):
+        self.value = value
+
+    @property
+    def shape(self) -> tuple:
+        return (*self.value.shape[:-2], self.value.shape[-1], self.value.shape[-2])
+
+
+class Exact:
+    """A register operand exact in a 16-bit dtype (a mask of zeros and ones): a mainloop stages it as one
+    part, where an fp32 operand takes three."""
+
+    def __init__(self, value: jax.Array):
+        self.value = value
+
+    @property
+    def shape(self) -> tuple:
+        return self.value.shape

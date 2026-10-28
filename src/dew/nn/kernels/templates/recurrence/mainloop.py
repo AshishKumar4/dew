@@ -34,8 +34,8 @@ The decay's prefix is compensated, a `(hi, lo)` pair in base 2 within each chunk
 A 16-bit call's numbers are fla's (`fla_gdn.chunk_gated_delta_rule`'s): the values the launches pass (the
 inverse, `w`, `u`, the memories and the corrected values) and the operands the algebra rounds are in its
 dtype, the memory fp32 across chunks. An fp32 call keeps them fp32; as the tensor cores take 16-bit operands
-alone (mma.sync's), an fp32 operand is three bf16 parts summing to it exactly (`_split`) and its product the
-six of the parts' whose orders sum under three, an fp32 product's accuracy.
+alone (mma.sync's), an fp32 operand is three bf16 parts summing to it exactly (`product.formed`) and its
+product the six of the parts' whose orders sum under three, an fp32 product's accuracy.
 
 Decode is not on the mainloop: a one-token step takes `recurrence.step` (row 1424 for its Mosaic form)."""
 
@@ -57,7 +57,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
-from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, resources
+from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, product, resources
 from dew.nn.kernels.templates.gemm import cost
 
 INTERPRETED = mosaic_sm90.WGMMA
@@ -115,22 +115,6 @@ class Tiles:
         return self.block_v if self.block_o is None else self.block_o
 
 
-BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
-"""bf16's largest finite value, `(2 - 2^-7) 2^127`, an fp32 value."""
-
-
-def _split(x, parts: int = PARTS) -> tuple:
-    """fp32 `x` as `parts` bf16 parts, largest first, each the last's remainder rounded (exact): three sum to
-    `x` exactly, two to 16 of its significand's bits. The first saturates at bf16's largest (an fp32 value
-    past it rounds to infinity in bf16, its remainder then NaN), the next parts taking the difference."""
-    pieces, rest = [], x
-    for _ in range(parts):
-        piece = jnp.clip(rest, -BF16_LARGEST, BF16_LARGEST).astype(jnp.bfloat16)
-        pieces.append(piece)
-        rest = rest - piece.astype(jnp.float32)
-    return tuple(pieces)
-
-
 def per_key_refusal(dtype, floor: float | None) -> str | None:
     """Why the mainloop refuses a call of `dtype` under a decay a key dimension, None where it takes it: its
     intra launch factors each pair's decay over the chunk's sub-chunks (`algebra.key_decayed_pairs`), which
@@ -150,8 +134,8 @@ def _parts(dtype) -> int:
 
 
 class _Parts:
-    """A tile in shared memory as the 16-bit parts its products take (one, or an fp32 tile's three, `_split`),
-    each a view of a stream's slot, and `dtype` the tile's own."""
+    """A tile in shared memory as the 16-bit parts its products take (one, or an fp32 tile's three,
+    `product.formed`), each a view of a stream's slot, and `dtype` the tile's own."""
 
     def __init__(self, refs, dtype):
         self.refs, self.dtype = tuple(refs), jnp.dtype(dtype)
@@ -193,12 +177,12 @@ class _Issuer:
     def _operand(self, x, name: str, other=None) -> tuple:
         if isinstance(x, _Parts):
             return x.refs
-        if isinstance(x, algebra.Exact):
+        if isinstance(x, product.Exact):
             # One part, in the product's own tile for exact operands (`{name}.exact`).
             (buffer,) = self.buffers[f"{name}.exact"]
             return (self.call.family.staged(x.value, buffer),)
-        if isinstance(x, algebra.Transposed):
-            # Staged as it is and read transposed (`algebra.Transposed`).
+        if isinstance(x, product.Transposed):
+            # Staged as it is and read transposed (`product.Transposed`).
             return tuple(ref.T for ref in self._operand(x.value, name, other))
         buffers = self.buffers[name]
         if isinstance(buffers, list):
@@ -212,13 +196,13 @@ class _Issuer:
             place = min(free, key=lambda place: held[place][1])
             held[place] = [x, uses]
             buffers = buffers[place]
-        values = _split(x, len(buffers)) if len(buffers) > 1 else (x,)
+        values = product.formed(x, len(buffers)) if len(buffers) > 1 else (x,)
         family = self.call.family
         return tuple(family.staged(value, buffer) for value, buffer in zip(values, buffers, strict=True))
 
     def summed(self, products: list) -> jax.Array:
         """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
-        accumulator in place (`Family.summed`): one accumulator held where each its own held two (Kimi delta
+        accumulator in place (`Family.issued`): one accumulator held where each its own held two (Kimi delta
         attention's output, `algebra.key_decayed_output`)."""
         operands = [(self._operand(lhs, name, rhs), self._operand(rhs, name, lhs))
                     for name, lhs, rhs in products]
@@ -227,9 +211,7 @@ class _Issuer:
 
         def issued(acc):
             for left, right in operands:
-                count = max(len(left), len(right))
-                for i, j in ((i, j) for i in range(len(left)) for j in range(len(right)) if i + j < count):
-                    acc = family.products(acc, left[i], right[j], interpret)
+                acc = family.issued(acc, left, right, interpret)
             return acc
 
         return family.summed(shape, issued, interpret)
@@ -237,20 +219,7 @@ class _Issuer:
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
         left = self._operand(lhs, name, rhs)
         right = self._operand(rhs, name, lhs)
-        shape = (lhs.shape[0], rhs.shape[1])
-        count = max(len(left), len(right))
-        terms = sorted(((i, j) for i in range(len(left)) for j in range(len(right)) if i + j < count),
-                       key=lambda term: -sum(term))
-        family, interpret = self.call.family, self.call.interpret
-
-        def product(i: int, j: int) -> jax.Array:
-            return family.summed(shape, lambda acc: family.products(acc, left[i], right[j], interpret),
-                                 interpret)
-
-        # Each part's product on its own, summed in fp32 smallest first: a tensor core's accumulation
-        # truncates (mma.sync's), so a part accumulated onto a larger one loses its last bit where a sum
-        # rounds it.
-        return functools.reduce(jnp.add, (product(i, j) for i, j in terms))
+        return self.call.family.apart((lhs.shape[0], rhs.shape[1]), left, right, self.call.interpret)
 
 
 def _diagonal(size: int, family: mosaic.Family) -> jax.Array:
@@ -261,8 +230,8 @@ def _diagonal(size: int, family: mosaic.Family) -> jax.Array:
 
 @dataclasses.dataclass(frozen=True)
 class _Operand:
-    """A launch's operand in global memory, `[parts * rows, columns]`: its parts (`_split`) stacked `rows`
-    apart, each `[rows, columns]`, and `dtype` its value's (fp32 where three parts)."""
+    """A launch's operand in global memory, `[parts * rows, columns]`: its parts (`product.formed`) stacked
+    `rows` apart, each `[rows, columns]`, and `dtype` its value's (fp32 where three parts)."""
 
     rows: int
     parts: int
@@ -286,7 +255,7 @@ class _Operand:
         """`value` `[rows, columns]` as its parts at `row` and `column`, through `smem` (a `[rows, columns]`
         tile of its stored dtype the launch lands its stores in, `_landed`), its last copy left in flight
         unless `wait` (`Family.stored`, `_walk_stores`)."""
-        pieces = _split(value.astype(jnp.float32)) if self.parts > 1 else (value,)
+        pieces = product.formed(value.astype(jnp.float32), self.parts) if self.parts > 1 else (value,)
         family.stored([piece.astype(self.stored) for piece in pieces],
                       self.views(ref, row, rows, column, columns), smem=smem, wait=wait)
 
@@ -299,7 +268,9 @@ class _Operand:
 
     def split(self, x):
         """`x` `[rows, columns]` in its dtype as its stacked parts."""
-        return jnp.concatenate(_split(x.astype(jnp.float32)), 0) if self.parts > 1 else x.astype(self.dtype)
+        if self.parts == 1:
+            return x.astype(self.dtype)
+        return jnp.concatenate(product.formed(x.astype(jnp.float32), self.parts), 0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -441,7 +412,7 @@ def _merges(call: _Call) -> tuple:
 
 def _summing(call: _Call) -> tuple:
     """`algebra.summed_back`'s staging: the fp32 operand's three bf16 parts and the triangle's one
-    (`algebra.Exact`) its 'summed' product takes, and the scratch its columns' sums across warps take
+    (`product.Exact`) its 'summed' product takes, and the scratch its columns' sums across warps take
     (`_columns`)."""
     return (*_staging(_Operand(CHUNK, PARTS, jnp.dtype(jnp.float32)), (CHUNK, CHUNK)),
             (plgpu.SMEM((CHUNK, CHUNK), jnp.bfloat16),), _column_scratch(call))
@@ -1542,7 +1513,8 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                     scored = algebra.chunk_scores(
                         queries.__getitem__, keys.__getitem__, width // call.block, gate, low, held.dtype,
                         _Issuer(call), laid=laid)
-                    pieces = _split(scored.astype(jnp.float32), held.parts) if held.parts > 1 else (scored,)
+                    pieces = (product.formed(scored.astype(jnp.float32), held.parts) if held.parts > 1
+                              else (scored,))
                     for piece, buffer in zip(pieces, staged, strict=True):
                         family.staged(piece, buffer)
 
@@ -1575,9 +1547,9 @@ def prefix(g):
     `precision.two_product`, plus its product with the rounding's remainder) summed compensated
     (`precision.compensated_add`), so a difference of two positions is as precise as its own range."""
     scale = np.float32(LOG2_E)
-    product, error = precision.two_product(g, jnp.full_like(g, scale), bit_split=True)
+    scaled, error = precision.two_product(g, jnp.full_like(g, scale), bit_split=True)
     error = error + g * float(np.float32(LOG2_E - float(scale)))
-    return lax.associative_scan(precision.compensated_add, (product, error), axis=g.ndim - 2)
+    return lax.associative_scan(precision.compensated_add, (scaled, error), axis=g.ndim - 2)
 
 
 def _padded(x, axis: int, size: int):
@@ -2126,7 +2098,7 @@ def _gradient_stored(call: _Call, kind: str, block: int, grad, *, weights: Seque
     del block
     family = call.family
     if kind == "dw":
-        pieces = _split(grad.astype(jnp.float32)) if call.held.parts > 1 else (grad,)
+        pieces = product.formed(grad.astype(jnp.float32), call.held.parts) if call.held.parts > 1 else (grad,)
         family.stored([piece.astype(call.held.stored) for piece in pieces], weights, smem=landing["weights"])
         return
 
