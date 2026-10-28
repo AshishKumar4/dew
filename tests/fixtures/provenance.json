@@ -798,7 +798,7 @@
      "runs": "jax"
     }
    ],
-   "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors): the closing clean prediction. rounding.npz adds RK4's clipped output over four copies of the independent initial states (128, 64); its float64 namespace widens every explicit jnp.float32 timestep cast so sigma arithmetic also runs in float64. The original solvers.npz arrays are unchanged."
+   "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors) over the float32 grid (its steps_override): the closing clean prediction, unclipped and through clip_images. Recorded over the seeds check 1 draws (record_case, summarized), x_T and the cotangent a seeded NumPy draw the test makes again; the float64 twin widens every explicit jnp.float32 of the schedule and the sampler's common steps, so sigma arithmetic runs in float64 on the float32 grid's times."
   },
   "flow/densities.npz": {
    "tool": "tools/flow_density_reference.py",
