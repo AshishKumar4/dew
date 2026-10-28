@@ -209,8 +209,6 @@ class GpuTarget:
     for. Empty resources remain unknown. The standard-library-only table can
     also be read by a Torch reference's environment without importing JAX.
 
-    `head_tile` is the chunked LM head's `(tokens, columns)` tile where one was
-    measured to beat the default (`dew.objectives.lm.chunked.chunked_tile`).
     `multiprocessors` is the canonical device's streaming multiprocessors, a real
     device's own where it reports them (`gpu_target`), which a launch sizes its
     programs by (`dew.nn.kernels.decode_attention`). `clock_hz` and
@@ -233,7 +231,6 @@ class GpuTarget:
     kernels: Mapping[str, str] = dataclasses.field(default_factory=dict)
     dense_peaks: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict)
     aliases: tuple[str, ...] = ()
-    head_tile: tuple[int, int] | None = None
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
@@ -381,16 +378,16 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'xla_triton_gemm': 'off', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined',
                'delta_gates': 'joined'},
-              {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
-              multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9),
+              {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
+              memory_bandwidth=2039e9),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'xla_triton_gemm': 'off'},
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
-               'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
-              multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9),
+               'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), multiprocessors=58,
+              clock_hz=2040e6, memory_bandwidth=300e9),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'xla_triton_gemm': 'off', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'delta_gates': 'joined'}, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
