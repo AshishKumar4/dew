@@ -470,7 +470,7 @@ def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
     return {**record, "model": current(record["model"])}
 
 
-def _one_scaling(fields: Mapping[str, object]) -> dict[str, object]:
+def _one_scaling(fields: Mapping[str, object]) -> Mapping[str, object]:
     """A decoder's or layer kind's fields with an earlier `yarn` field read as its `rope_scaling`: the
     fields it wrote, as YaRN's record. Fields setting both are refused: they were two scalings."""
     current = dict(fields)

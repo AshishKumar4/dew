@@ -174,7 +174,9 @@ def rope_scaling_from_record(record: Mapping[str, object]) -> "Scaling":
     """Build the scaling a record holds: a class record (`{"class", "fields"}`, as the registry writes a
     union field) by its class, else the one its rope_type names, LongRoPE's, YaRN's or Llama 3.1's."""
     if 'class' in record:
-        return from_record(Scaling, record)
+        built = from_record(Scaling, record)
+        assert isinstance(built, RopeScaling | LongRopeScaling | YarnScaling)
+        return built
     kinds = {'longrope': LongRopeScaling, 'yarn': YarnScaling}
     return from_record(kinds.get(str(record.get('rope_type')), RopeScaling), record)
 
