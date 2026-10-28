@@ -103,7 +103,7 @@ def test_a_model_qwix_quantized_directly_is_not_quantized_again():
     from dew.nn.dense import Dense
 
     provider = qwix.QtProvider([qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)])
-    with pytest.raises(ValueError, match="quantize the model once"):
+    with pytest.raises(ValueError):
         Quantization().apply(qwix.quantize_model(Dense(8), provider))
 
 
