@@ -119,13 +119,14 @@ power-of-two width from 16 to 256, a capacity of whole blocks and one of its dty
 def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and in
-    either form whether a row's sums of `dtype` values need a guard (`algebra.headroom`). A decode
+    either form whether a row's sums of `dtype` values need a guard (`algebra.headroom`) and keep their
+    additions' rounding (`algebra.compensates`). A decode
     block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(capped, softcap),
                            natural=natural, headroom=algebra.headroom(dtype),
-                           initial=sinks)
+                           initial=sinks, compensated=algebra.compensates(dtype))
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
@@ -139,12 +140,11 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
     rows = jnp.arange(QUERIES)
     spans = ((jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)),)
 
-    def body(step, state):
+    def keys_at(step):
         key, value = read(step)
         coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], spans)
         logits = algebra.modify(spec, kernel_dot(query, key.T, interpret), coords)
-        keys = algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
-        return algebra.plain_step(spec, state, keys)
+        return algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
 
     def walk(live=None) -> algebra.Partial:
         # The plain walk where `live` is None, else the guarded one, those rows shifting.
@@ -155,7 +155,7 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         elif live is not None:
             start = algebra.headroomed(start, live)
         first, last = steps
-        return jax.lax.fori_loop(first, last, body, start)
+        return algebra.plain_walk(spec, first, last, keys_at, start)
 
     if not spec.headroom:
         return walk()

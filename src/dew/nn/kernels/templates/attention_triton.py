@@ -307,7 +307,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), as the
         # plain-JAX and Mosaic mainloops do: the template's production route runs this one on a GPU.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
-                               self.score_mod, self.natural, algebra.headroom(value.dtype), initial)
+                               self.score_mod, self.natural, algebra.headroom(value.dtype), initial,
+                               compensated=algebra.compensates(value.dtype))
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
