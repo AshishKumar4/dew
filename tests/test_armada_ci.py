@@ -1820,10 +1820,9 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
     for ref, priority in (("fix/lane", []), ("ci/batch-abc-1", ["--priority=10"])):
-        ran = subprocess.run(["bash", "-c", step["run"].replace("${{ github.sha }}", "a" * 40)
-                              .replace("${{ github.ref_name }}", ref)], cwd=ROOT, capture_output=True, text=True,
-                             timeout=60, env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
-                                              "GITHUB_REF_NAME": ref})
+        script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
+        ran = subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=60,
+                             env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref})
         assert ran.returncode == 0, ran.stderr
         assert (tmp_path / "items").read_text().split() == gates
         words = (tmp_path / "words").read_text().split()
