@@ -155,6 +155,7 @@ from dew.training.distributed import (
     traced_start,
 )
 from dew.training.evaluation import EvalSuite, Evaluation, Summary, admit_split
+from dew.training.footprint import candidate_footprint, traced_loss
 from dew.training.interval import Interval, TokenClock, held, throughput
 from dew.training.memory import (
     climb_to,
@@ -793,18 +794,8 @@ class Trainer(Generic[Loss, Effects]):
             weak_type=aval.weak_type), jax.jit(self._model_batch).trace(batch).out_avals)
 
     def _loss_shape(self, state: TrainState, batch: Batch, window: int):
-        batch = self._model_shapes(batch)
-        # Shapes and dtypes only: a resident frozen leaf sits in another memory space than the moving ones,
-        # and the loss the realization runs reads a snapshot in one space. The step's key is drawn inside the
-        # trace, so an abstract state compiles a step as a placed one does.
-        params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
-
-        def loss(params, batch, microstep, key, step, ema):
-            return self.objective._loss(params, batch, Step(
-                microstep, jax.random.fold_in(key, step), with_ema(params, ema),
-                qk_stats=clips_qk(state.opt_state), example_count=window * rows_of(batch) or None))
-
-        return jax.eval_shape(loss, params, batch, state.microstep, state.key, state.step, state.ema)
+        loss, (variables, *rest) = traced_loss(self.objective, state, window)
+        return jax.eval_shape(loss, variables, self._model_shapes(batch), *rest)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
                                  shape_only=False):
@@ -1061,7 +1052,6 @@ class Trainer(Generic[Loss, Effects]):
                                      mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
-
         self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
@@ -1102,7 +1092,10 @@ class Trainer(Generic[Loss, Effects]):
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
             lowered, launches = lower(), launches or "[]"
-        return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches, lower.report())
+        footprint = candidate_footprint(self.objective, state, self._model_shapes(micro),
+                                        split * self.accumulation, self.device_mesh, prepared, held)
+        return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches, lower.report(),
+                         footprint)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
                   narrow: bool | None = None):

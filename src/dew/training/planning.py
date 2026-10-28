@@ -39,6 +39,7 @@ from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
 from dew.telemetry.profile import active_profile, capture_options
 from dew.training.distributed import batch_divisor
+from dew.training.footprint import Footprint
 from dew.training.memory import (
     compiled_if_it_fits,
     head_fused_of,
@@ -124,6 +125,8 @@ class Candidate:
     program: jax.stages.Lowered | None
     launches: str
     kernels: KernelReport
+    footprint: Footprint
+    """What it takes of a device beside the state, derived from its shapes before it compiles."""
 
     @property
     def lowered(self) -> jax.stages.Lowered:
@@ -202,9 +205,10 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
 @dataclasses.dataclass(frozen=True)
 class Probe:
     """One compile of a plan's search (`planned`): the split, the rows of
-    its microbatch and the rung (`rung_record`) it compiled at, and what
+    its microbatch and the rung (`rung_record`) it compiled at, what
     the fit check read, this process's tightest headroom and XLA's
-    temporaries and arguments, None where none were read."""
+    temporaries and arguments, None where none were read, and what the
+    candidate's shapes derived it would take (`Footprint`)."""
     split: int
     rows: int
     rung: Mapping[str, JSON]
@@ -212,6 +216,7 @@ class Probe:
     headroom: int | None
     temp: int | None
     argument: int | None
+    derived: Footprint
     ahead: bool = False
     """Whether the executable is the step compiled ahead (`FitSearch.ahead`), not the search's own."""
 
@@ -222,11 +227,12 @@ class Probe:
         stats = None if executable is None else executable.memory_analysis()
         return cls(split, rows_of(candidate.micro), rung, fit, headroom,
                    None if stats is None else int(stats.temp_size_in_bytes),
-                   None if stats is None else int(stats.argument_size_in_bytes))
+                   None if stats is None else int(stats.argument_size_in_bytes), candidate.footprint)
 
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
-                "headroom": self.headroom, "temp": self.temp, "argument": self.argument, "ahead": self.ahead}
+                "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
+                "derived": self.derived.record(), "ahead": self.ahead}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
