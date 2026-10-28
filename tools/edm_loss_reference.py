@@ -151,14 +151,23 @@ def main() -> None:
                         edm2, published("NVlabs/edm2", EDM2, "training/training_loop.py", name,
                                         keep={"EDM2Loss"}))
 
+    # Each precision's two networks, built once (a Precond builds its whole UNet before the stand-in replaces
+    # it) and given each draw's parameters in place.
+    models = {}
+    for dtype in (torch.float32, torch.float64):
+        networks, _, edm2, _ = built[dtype]
+        precond = edm2.Precond(SIZE, CHANNELS, 0, use_fp16=False, logvar_channels=LOGVAR_CHANNELS,
+                               **TINY_UNET).eval()
+        precond.unet = Affine(dtype)
+        models[dtype] = (networks.EDMPrecond(SIZE, CHANNELS, model_type="Affine"), precond.to(dtype))
+
     def evaluated(inputs, which):
         results = []
         for dtype in (torch.float32, torch.float64):
-            networks, losses, edm2, loop = built[dtype]
-            net = networks.EDMPrecond(SIZE, CHANNELS, model_type="Affine")
-            precond = edm2.Precond(SIZE, CHANNELS, 0, use_fp16=False, logvar_channels=LOGVAR_CHANNELS,
-                                   **TINY_UNET).eval()
-            precond.unet = Affine(dtype)
+            _, losses, _, loop = built[dtype]
+            net, precond = models[dtype]
+            for model in (net, precond):
+                model.zero_grad(set_to_none=True)
             with torch.no_grad():
                 for model in (net.model, precond.unet):
                     for parameter in ("a", "b", "c"):
@@ -166,7 +175,6 @@ def main() -> None:
                 precond.logvar_fourier.freqs.copy_(torch.tensor(inputs["logvar/freqs"], dtype=dtype))
                 precond.logvar_fourier.phases.copy_(torch.tensor(inputs["logvar/phases"], dtype=dtype))
                 precond.logvar_linear.weight.copy_(torch.tensor(inputs["logvar/weight"], dtype=dtype))
-            precond.to(dtype)
             if which == "edm":
                 results.append(run(losses.EDMLoss(), net, net.model, inputs, dtype))
             else:
