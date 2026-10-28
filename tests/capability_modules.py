@@ -20,7 +20,8 @@ from flax import linen as nn, nnx
 from flax.nnx import bridge
 
 from dew.diffusion.process import DenoisingCondition
-from dew.inputs.encoders import CharTable, ConditionEncoder
+from dew.inputs.condition import ConditionEncoder
+from dew.inputs.encoders import CharTable
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.dit import masked_mean
 from dew.nn.protocols import Lacks
