@@ -70,7 +70,7 @@ from .sharding import (
     sequence_shards,
     split_positions,
 )
-from .visibility import same_chunk, visible, window_sides, windowed
+from .visibility import same_chunk, window_sides, windowed
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu", "template"]
 """Names which kernel an attention call runs.
@@ -130,15 +130,12 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     A negative query slot denotes an invalid token. Cache validity excludes
     unfilled slots; a window retains the query and its preceding W-1 keys.
     """
-    positions = jnp.asarray(query_positions)
-    if positions.ndim == 1:
-        positions = positions[None, :]
-    q_pos = positions[:, :, None]
-    keys = jnp.arange(kv_len)[None, None, :]
-    mask = (q_pos >= 0) & visible(q_pos, keys, causal=True, window=sliding_window)
-    if key_valid is not None:
-        mask = mask & jnp.asarray(key_valid, bool)[:, None, :]
-    return mask[:, None]
+    positions = jnp.atleast_2d(jnp.asarray(query_positions, jnp.int32))
+    seen = visibility_mask(positions.shape[1], kv_len, causal=True, sliding_window=sliding_window,
+                           query_slots=positions)
+    # The filled slots ANDed after the spans, which then search no keys' ids: a batch-sharded cache's
+    # validity takes no gather under explicit sharding (test_parallelism_matrix's data4_explicit).
+    return seen if key_valid is None else seen & jnp.asarray(key_valid, bool)[:, None, None, :]
 
 
 def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
@@ -166,16 +163,10 @@ def structural_mask(query_positions, kv_len: int, causal: bool,
     """The `[B, 1, T, S]` keys that causality and a window leave each query,
     from shared `[T]` or per-row `[B, T]` positions, or None when neither
     applies. A negative query position sees nothing."""
-    if causal:
-        return causal_attention_mask(query_positions, kv_len, sliding_window)
-    if sliding_window is None:
+    if not causal and sliding_window is None:
         return None
-    positions = jnp.asarray(query_positions)
-    if positions.ndim == 1:
-        positions = positions[None, :]
-    keys = jnp.arange(kv_len)[None, None, :]
-    queries = positions[:, :, None]
-    return ((queries >= 0) & windowed(queries, keys, sliding_window, causal=False))[:, None]
+    positions = jnp.atleast_2d(jnp.asarray(query_positions, jnp.int32))
+    return visibility_mask(positions.shape[1], kv_len, causal, sliding_window, query_slots=positions)
 
 
 def chunk_mask(query_positions, key_positions, chunk_size: int):
@@ -201,29 +192,32 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
     fused kernels take them as flags. Unset stays unset, so a caller that
     distinguishes no mask from an all-true one keeps doing so.
     """
-    structural = structural_mask(jnp.arange(query_length), key_length, causal, sliding_window)
-    if structural is not None:
-        mask = structural if mask is None else jnp.logical_and(mask, structural)
-    return mask
+    if not causal and sliding_window is None:
+        return mask
+    return visibility_mask(query_length, key_length, causal, sliding_window, mask=mask)
 
 
 def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
               segment_ids=None, key_value_seq_lengths=None, key_value_seq_starts=None, *, block_groups=None,
-              image_groups=None, key_valid=None, key_runs=None, places=None,
-              rows: int | None = None) -> template.KeySpans:
+              image_groups=None, key_valid=None, key_runs=None, places=None, chunk: int | None = None,
+              query_slots=None, rows: int | None = None) -> template.KeySpans:
     """The keys each query of a call sees as the template's spans (`template.spans`), from the
-    coordinates `scaled_dot_product_attention` takes: causality, a window, documents (`CrossDocuments`
-    aligned to their last keys), key lengths and starts, block and image groups, and the keys' validity
-    `key_valid` `[B, K]`, and each query's key runs `key_runs` `[B, Q, R, 2]`, whose union it may see
-    (`template.spans`'s `runs`). `places` `[B, S]` are a call's own tokens' places a window counts by
-    (`counted_places`), by default their indices, or a pair, its queries' `[B, Q]` and its keys' `[B, K]`.
-    `rows` is the call's batch, by default the coordinates' own, or one where none carries it, which every
-    row shares."""
+    coordinates `scaled_dot_product_attention` takes: causality, a window, a chunk of `chunk` places
+    (`chunk_mask`), documents (`CrossDocuments` aligned to their last keys), key lengths and starts, block
+    and image groups, and the keys' validity `key_valid` `[B, K]`, and each query's key runs `key_runs`
+    `[B, Q, R, 2]`, whose union it may see (`template.spans`'s `runs`). `places` `[B, S]` are a call's own
+    tokens' places a window or a chunk counts by (`counted_places`), by default their indices, or a pair,
+    its queries' `[B, Q]` and its keys' `[B, K]`. `query_slots` `[B, Q]` are the queries' own keys in a
+    cache call, -1 for padding (`template.spans`' `slots`). `rows` is the call's batch, by default the
+    coordinates' own, or one where none carries it, which every row shares."""
     pair = places if isinstance(places, tuple) else (places, places)
-    given = [None if segment_ids is None else document_ids(segment_ids)[0], key_value_seq_lengths,
-             key_value_seq_starts, block_groups, image_groups, key_valid, key_runs, pair[0]]
     if rows is None:
-        rows = next((jnp.shape(x)[0] for x in given if x is not None), 1)
+        # The batch the coordinates broadcast to: a row's lengths and starts `[B]`, every other one's
+        # leading axis where it has a row axis.
+        rowed = [None if segment_ids is None else document_ids(segment_ids)[0], block_groups, image_groups,
+                 key_valid, key_runs, pair[0], query_slots]
+        rows = max([jnp.shape(x)[0] for x in (key_value_seq_lengths, key_value_seq_starts) if x is not None]
+                   + [jnp.shape(x)[0] for x in rowed if x is not None and jnp.ndim(x) >= 2], default=1)
     lengths, starts = (None if x is None else jnp.asarray(x, jnp.int32)
                        for x in (key_value_seq_lengths, key_value_seq_starts))
     positions = None
@@ -231,22 +225,24 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
         positions = (jnp.broadcast_to(jnp.atleast_2d(pair[0]), (rows, query_length)),
                      jnp.broadcast_to(jnp.atleast_2d(pair[1]), (rows, key_length)))
     valid = None if key_valid is None else jnp.broadcast_to(key_valid, (rows, key_length))
+    slots = None if query_slots is None else jnp.broadcast_to(query_slots, (rows, query_length))
     return template.spans(query_length, key_length, rows, causal=causal, sliding_window=sliding_window,
-                          positions=positions, segment_ids=segment_ids, lengths=lengths, starts=starts,
-                          block_groups=block_groups, image_groups=image_groups, valid=valid, runs=key_runs)
+                          chunk=chunk, positions=positions, segment_ids=segment_ids, lengths=lengths,
+                          starts=starts, block_groups=block_groups, image_groups=image_groups, valid=valid,
+                          runs=key_runs, slots=slots)
 
 
 def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_window: int | None, mask=None,
                     segment_ids=None, key_value_seq_lengths=None, key_value_seq_starts=None, *,
                     block_groups=None, image_groups=None, key_valid=None, key_runs=None,
-                    places=None) -> jax.Array:
+                    places=None, chunk: int | None = None, query_slots=None) -> jax.Array:
     """The keys each query sees, `[B or 1, 1, Q, K]`: the call's spans (`key_spans`) as a mask
     (`template.dense`), narrowed by `mask`. It is the mask a call's coordinates mean on the paths
     whose kernel does not read them all."""
     seen = template.dense(key_spans(query_length, key_length, causal, sliding_window, segment_ids,
                                     key_value_seq_lengths, key_value_seq_starts, block_groups=block_groups,
                                     image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-                                    places=places))[:, None]
+                                    places=places, chunk=chunk, query_slots=query_slots))[:, None]
     return seen if mask is None else jnp.logical_and(seen, mask)
 
 
@@ -294,8 +290,8 @@ def with_key_lengths(mask: jax.Array | None, lengths: jax.Array, key_length: int
     """`mask` narrowed to each row's first `lengths[b]` keys, `[B, 1, 1, K]`
     where there was no mask. This is the mask a `key_value_seq_lengths`
     call means on the paths whose kernel takes no lengths."""
-    kept = (jnp.arange(key_length) < lengths[:, None])[:, None, None, :]
-    return kept if mask is None else jnp.logical_and(mask, kept)
+    return visibility_mask(1, key_length, causal=False, sliding_window=None, mask=mask,
+                           key_value_seq_lengths=lengths)
 
 
 def with_key_starts(mask: jax.Array | None, starts: jax.Array | None, key_length: int) -> jax.Array | None:
@@ -304,8 +300,8 @@ def with_key_starts(mask: jax.Array | None, starts: jax.Array | None, key_length
     starts leave `mask` as it is."""
     if starts is None:
         return mask
-    kept = (jnp.arange(key_length) >= jnp.asarray(starts)[:, None])[:, None, None, :]
-    return kept if mask is None else jnp.logical_and(mask, kept)
+    return visibility_mask(1, key_length, causal=False, sliding_window=None, mask=mask,
+                           key_value_seq_starts=starts)
 
 
 def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = False,

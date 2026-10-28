@@ -78,7 +78,7 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
 
 
 def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
-                summary: bool = False) -> dict[str, np.ndarray]:
+                summary: bool = False, dew=None) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
     function that can run here, which plans the count. With no proxy, the recorded reference alone
@@ -91,7 +91,11 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     error from its truth, its worst sized row, its errors on the truth's rows of zero, finiteness) and
     its truth's sketch
     (`truth_sketch`), which the test's own float64 path is held to (`indexed_recording`'s `truth_fn`):
-    kilobytes where outputs over (1 + REDRAW) times the seeds are gigabytes."""
+    kilobytes where outputs over (1 + REDRAW) times the seeds are gigabytes. With `dew(inputs)`, Dew's
+    own outputs on a seed's inputs, the recorded reference confirms the count paired, as check 1's
+    verdict pairs it (`seeds_for`'s `dew_fn`), for a site whose errors are heavy-tailed across draws
+    alike in both arms (a lognormal training sigma), where the reference compared with itself on other
+    draws never resolves."""
     if proxy is None and truth_proxy is not None:
         raise ValueError("a planning truth requires its proxy")
     # Without a proxy nothing is drawn ahead: the recorded reference's own doublings draw what they read.
@@ -99,38 +103,46 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
                seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
                          truth_fn=None if truth_proxy is None else jax.jit(truth_proxy)))
     print(f"{label}: starting with {planned} seeds", flush=True)
-    records = []
+    # Each seed drawn once, as the sizing reads it: a paired sizing reads its pilots from SIZING_FROM, which a
+    # run of every seed below it would draw too.
+    records = {}
 
-    def ensure(count):
-        for seed in range(len(records), count):
+    def record(seed):
+        if seed not in records:
             inputs = draw(seed)
             reference, truth = evaluate(inputs)
-            records.append((inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)))
+            records[seed] = (inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth))
+        return records[seed]
+
+    def ensure(count):
+        for seed in range(count):
+            record(seed)
 
     def recorded_draw(seed):
-        ensure(seed + 1)
-        return np.int32(seed), records[seed][0]
+        return np.int32(seed), record(int(seed))[0]
 
     ensure((1 + REDRAW) * planned)
     # The recorded reference is read by index from the host's records, as given.
     confirmed = seeds_for(as_given(lambda index, inputs: records[int(index)][1]), recorded_draw, label,
-                          truth_fn=lambda index, inputs: records[int(index)][2])
+                          truth_fn=lambda index, inputs: records[int(index)][2],
+                          dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)))
     # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
     # than the recorded reference confirms leaves draws the recording does not keep.
     kept = (1 + REDRAW) * confirmed
     ensure(kept)
+    kept_records = [records[seed] for seed in range(kept)]
     if summary:
-        result = _finished(label, _evidence(label, range(kept), records[:kept]), confirmed)
+        result = _finished(label, _evidence(label, range(kept), kept_records), confirmed)
         print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
         return result
     result = {}
     for index, kind in enumerate(("input", "reference", "truth")):
         if kind == "input" and not store_inputs:
             continue
-        for name in records[0][index]:
-            result[f"{label}.{kind}.{name}"] = np.stack([record[index][name] for record in records[:kept]])
+        for name in kept_records[0][index]:
+            result[f"{label}.{kind}.{name}"] = np.stack([entry[index][name] for entry in kept_records])
     if not store_inputs:
-        result[f"{label}.input_digest"] = np.asarray([input_digest(record[0]) for record in records[:kept]])
+        result[f"{label}.input_digest"] = np.asarray([input_digest(entry[0]) for entry in kept_records])
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result

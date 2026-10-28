@@ -21,7 +21,7 @@ def run():
         from dew.training import prepare_process
         prepare_process(multi_host=False)
     import jax
-    from affine_run import fit_one_step
+    from affine_training import fit_one_step
     fit_one_step()
     return jax.config.jax_compilation_cache_dir
 

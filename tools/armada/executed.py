@@ -7,6 +7,10 @@ pytest's collection's own listings are not, as what they find is recorded as it 
 is wrapped so that a path it opens relative to a directory descriptor is placed (`followed.opening`).
 Hidden directories (the checkout's .git and environments) and compiled bytecode are never inputs.
 
+A native reader raises no audit event (Rust's tokenizers and safetensors, tensorstore, a child's C
+code): the data files a task's processes open are its supervisor's to see (`watched`, held by
+`ci.py`'s `tested` around the whole run), each the input of every file the task ran.
+
 It counts a file once per test file through sys.monitoring's function-start event, disabled after
 the first and restarted at each test file, so it costs about nothing. What collection and
 session-scoped fixtures execute serves every test file after them, so it joins every file's record.
@@ -129,6 +133,8 @@ os.environ |= {CHILDREN: str(children), "DEW_EXECUTED_ROOT": root,
                "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
                "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, "")}
 followed.opening(lambda read: current[-1].add(read), root)
+
+
 sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
 sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)

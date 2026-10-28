@@ -29,6 +29,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import resources
+from dew.nn.sharding import per_shard
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
 Operand = Ref | jax.Array
@@ -183,11 +184,22 @@ def stored(parts, views, *, smem, wait: bool = True) -> None:
 
 
 def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
-               copy: Callable = plgpu.copy_smem_to_gmem) -> None:
+               copy: Callable = plgpu.copy_smem_to_gmem, widest: int | None = None) -> None:
     """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a
     power-of-two ladder of static-size `copy`s (a TMA store's descriptor has static extents; `copied`
-    moves the rows through registers where a GPU has no TMA), the largest `most` rows'."""
+    moves the rows through registers where a GPU has no TMA), the largest `most` rows'; with `widest`, in
+    copies of at most `widest` rows, whole ones first (a copy through registers holds its rows:
+    `resources.copied_rows`)."""
     start, size = first, most
+    if widest is not None and widest < most:
+        for whole in range(most // widest):
+            @pl.when(stored // widest > whole)
+            def _(whole=whole):
+                copy(o_smem.at[pl.ds(first + whole * widest, widest)],
+                     o_gmem.at[pl.ds(row_start + first + whole * widest, widest),
+                               pl.ds(column, o_smem.shape[1])])
+
+        start, size = first + stored // widest * widest, widest - 1
     while size:
         rung = 1 << int(math.log2(size))
         size //= 2
@@ -375,9 +387,16 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
+    register_step: int = 8
+    """The allocator's registers per thread in one step (setmaxnreg's eight-register granularity).
+    A compile gate tests admits at their actual cap, refusals one such step below it."""
     operands_in_registers: bool
     """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
     warpgroup MMA reads both from shared memory."""
+    products_overlap: bool
+    """Whether a warpgroup's products run asynchronously, an issued product's accumulator held while the
+    program goes on (warpgroup MMA's), where each mma.sync product completes before the next: a launch's
+    products issued in turn hold their accumulators at once on the one, one at a time on the other."""
     stores_through_registers: bool
     """Whether a program copies its stored output tiles out through its registers (no TMA store before
     Hopper: `mosaic_sm80.Mma.persist`), so its epilogue holds its share of the stored tile beside the
@@ -712,6 +731,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     operands from the rings, a block's rows staged at the widest swizzle, 128 bytes."""
     bounded_loads = True
     operands_in_registers = False
+    products_overlap = True
     stores_through_registers = False
     copy_extent = 256
 
@@ -732,6 +752,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                cluster: int = 1, cost: pl.CostEstimate | None = None) -> Callable:
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
+        per_shard(name or self.name)
         clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             num_threads=consumers + 1, thread_name="wg",

@@ -242,7 +242,7 @@ def native_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ..
     return shape if order is None else tuple(shape[axis] for axis in order)
 
 
-def _stored_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
+def stored_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
     """The shape of the source tensor a leaf of `shape` at `path` is read from (`_orders`' inverse):
     a kernel's axes as the source stores them, any other leaf's as they are."""
     order, _ = _orders(path, len(shape))
@@ -261,7 +261,7 @@ def native_layouts(variables: Mapping[str, Mapping[str, object]], name_of: Calla
             if path_of(name) != (collection, *path) or not isinstance(leaf, (np.ndarray, jax.Array)):
                 raise ValueError(f"{name} reads into {path_of(name)}, not an array at ({collection}, "
                                  f"{', '.join(path)})")
-            shapes[name] = _stored_shape(path, leaf.shape)
+            shapes[name] = stored_shape(path, leaf.shape)
     return source_layouts("", shapes, path_of, ())
 
 

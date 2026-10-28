@@ -477,20 +477,19 @@ def test_a_streamed_mix_beneath_a_shuffle_refuses_a_member_joining():
         member_rows([corpus("a", 0), corpus("b", 1)], above=shuffled, saved=saved)
 
 
-def test_a_member_joining_a_resumed_mix_is_read_ahead_before_the_mix_gives_a_row():
-    """A member that joins a resumed mix has its first row read ahead before the mix gives one, as
-    every member has at the start, and resumes beside the others however small its weight."""
+def test_a_member_joining_a_resumed_mix_resumes_beside_the_others():
+    """A member that joins a resumed mix starts at its first row and reads beside the others,
+    however small its weight."""
     _, saved = member_rows([corpus("a", 0)])
     rows, _ = member_rows([corpus("a", 0), corpus("b", 1)], saved=saved, weights=[1, 1e-9], batches=1)
     assert rows
 
 
 @pytest.mark.parametrize("by", ["records", "tokens"])
-def test_a_streamed_mix_resumed_while_a_member_holds_a_row_read_ahead_reads_on_as_uninterrupted(by):
-    """A streamed mix reads every member's first row ahead before it gives a row, so a position it
-    saves after its first row falls while the other member holds its first row unread. Resumed
-    there, by records or by tokens, the mix gives that row and reads on record for record as the
-    uninterrupted one does."""
+def test_a_streamed_mix_resumed_after_its_first_row_reads_on_as_uninterrupted(by):
+    """A streamed mix saved after its first row, the other member not yet drawn, resumes there, by
+    records or by tokens, and reads on record for record as the uninterrupted one does, the other
+    member's first row among them."""
     members = [corpus("a", 0), corpus("b", 1)]
 
     def rows(saved=None):
@@ -1717,9 +1716,8 @@ def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
     changed.close()
 
 
-def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
-    """A share weighted too small to be chosen is still read ahead before the mixture emits a row,
-    and its first row lets it."""
+def test_token_mixer_emits_a_row_beside_a_share_too_small_to_be_chosen():
+    """A share weighted too small to be chosen leaves the mixture its rows, read as it draws them."""
     parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
                grain.MapDataset.source([{"targets": 1}]).repeat().to_iter_dataset()]
     reader = iter(TokenDeficit(parents, (1, 1e-9), ("normal", "tiny"), tokens=Targets(),

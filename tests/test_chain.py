@@ -20,9 +20,10 @@ import numpy as np
 import optax
 import pytest
 from bank_support import identical
-from episode_support import GROUPS, PROMPT, RESPONSE, SAMPLING, TURNS, Harness, ToolPolicy, verify
+from episode_support import SAMPLING, Harness, verify
 from flax import linen as nn
 from rl_support import TinyHead
+from tool_policy import GROUPS, PROMPT, RESPONSE, TURNS, ToolPolicy
 
 from dew.batch import part
 from dew.data import Memory, presets
