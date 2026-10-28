@@ -97,22 +97,34 @@ def test_each_device_holds_one_stage_of_the_pipelined_run(stages):
         assert stage <= placed <= stage + 8 * leaves, (placed, inside, outside)
 
 
+SMOOTH = {"eps": 1e-4}
+"""An Adam denominator's epsilon above a gradient's rounding, so each update is a smooth function of
+its gradient. At Adam's 1e-8 a gradient within rounding of zero steps by lr one way or the other,
+an error of 2 lr that no layout makes or removes, and check 1's ratio would count such gradients in
+a draw rather than the layout's rounding."""
+
 OPTIMIZERS = {
-    "adamw": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1), {}),
-    "muon": (OptimConfig(optimizer="muon", learning_rate=1e-2, weight_decay=0.1), {}),
+    "adamw": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1,
+                          optimizer_opts=SMOOTH), {}),
+    "muon": (OptimConfig(optimizer="muon", learning_rate=1e-2, weight_decay=0.1, optimizer_opts=SMOOTH), {}),
     "muonclip": (OptimConfig(optimizer="muonclip", learning_rate=1e-2,
-                             optimizer_opts={"qk_clip_threshold": 0.05}), {"qk_norm": False}),
-    "lamb": (OptimConfig(optimizer="lamb", learning_rate=1e-2, weight_decay=0.1), {}),
-    "groups": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, param_groups=(
-        ParamGroup("mlp", ("*mlp*",), learning_rate_multiplier=0.5, weight_decay=0.0),
-        ParamGroup("rest", ("*",)))), {}),
+                             optimizer_opts={**SMOOTH, "qk_clip_threshold": 0.05}), {"qk_norm": False}),
+    "lamb": (OptimConfig(optimizer="lamb", learning_rate=1e-2, weight_decay=0.1, optimizer_opts=SMOOTH), {}),
+    "groups": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, optimizer_opts=SMOOTH,
+                           param_groups=(ParamGroup("mlp", ("*mlp*",), learning_rate_multiplier=0.5,
+                                                    weight_decay=0.0),
+                                         ParamGroup("rest", ("*",)))), {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
-    "int8": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8"),
+    "int8": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8",
+                         optimizer_opts=SMOOTH),
              {"emb_features": 8, "num_heads": 2, "num_kv_heads": 1, "mlp_features": 256}),
 }
 """Each optimizer whose rules read a leaf as one layer, with the decoder fields its rule needs to act:
 the weight-decay mask's rank, Muon's matrix axes, QK-Clip's per-layer maxima (on a decoder whose queries
 and keys no norm divides), LAMB's trust ratio, a param group's patterns and int8 moments' threshold."""
+
+LORA_OPTIMIZER = OptimConfig(optimizer="adamw", learning_rate=1e-2, optimizer_opts=SMOOTH)
+"""What the LoRA cell trains its factors with."""
 
 SEEDS = {"adamw": 8, "muon": 8, "muonclip": 8, "lamb": 8, "groups": 8, "int8": 8, "lora": 8, "lora_pull": 8}
 """Each cell's check-1 seeds, sized paired by `seeds_for` (`dew_fn`, the stage layout's arm) on armada."""
@@ -281,8 +293,8 @@ def test_a_lora_adapter_over_a_stage_local_run_trains_as_one_device():
     """A LoRA adapter's factors and its frozen base, both held stacked by stage, train two steps as
     one device trains them (check 1)."""
     model, _ = lora()
-    assert_trains_as_one_device(model, OptimConfig(optimizer="adamw", learning_rate=1e-2), "stage-local lora",
-                                SEEDS["lora"], variables=lambda seed: lora(seed)[1])
+    assert_trains_as_one_device(model, LORA_OPTIMIZER, "stage-local lora", SEEDS["lora"],
+                                variables=lambda seed: lora(seed)[1])
 
 
 def stream():
