@@ -496,12 +496,15 @@ def test_a_dropping_call_traces_for_an_assumed_gpu():
 @pytest.mark.parametrize("axes, whole, local", [({"data": 2}, 6, 3), ({"tensor": 2}, 14, 7)],
                          ids=["rows", "heads"])
 def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, whole, local):
-    """A causal bf16 call over six rows of fourteen heads that names the template, its forward and backward
-    lowered for an H100 on a mesh splitting its rows or its heads in two (`generation.gpu_mesh`): every array
-    of every Mosaic launch holds each shard's own rows or heads, half the call's (`attention._per_shard`),
-    never the call's whole count, so no device runs the global batch; and the program moves no operand
-    between devices (`sharded.MOVES`): no gather brings another shard's queries, keys or values to it (bible
-    §7: a new accelerator route qualifies through its real target lowering on a multi-device mesh)."""
+    """A causal bf16 call over six rows of fourteen heads that names the template and its Mosaic mainloop
+    (`generation.chosen`), its forward and backward lowered for an H100 on a mesh splitting its rows or its
+    heads in two (`generation.gpu_mesh`): no array of any Mosaic launch holds the call's whole count of rows
+    or heads, and each launch's operands hold a shard's own, half the call's (`attention._per_shard`; the
+    counts no other axis takes), so no device runs the global batch; and the lowered program's own
+    operations move no operand between devices (`sharded.MOVES`, as a `shard_map` body would issue them;
+    what the partitioner inserts after lowering is the compiled program's, which this CPU does not build)
+    (bible §7: a new accelerator route qualifies through its real target lowering on a multi-device
+    mesh)."""
     import math
 
     from jax.sharding import AxisType, NamedSharding
@@ -520,7 +523,8 @@ def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, whol
         out = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
         return out.astype(jnp.float32).sum()
 
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+    with (generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh),
+          generation.chosen(attention_mainloop="mosaic")):
         lowered = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2))).trace(placed, placed, placed).lower(
             lowering_platforms=("cuda",))
     launches = [call for call in custom_calls(lowered) if call.target == "mosaic_gpu_v2"]

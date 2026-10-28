@@ -331,7 +331,7 @@ def test_a_decode_step_traced_with_x64_on_runs_the_decode_kernel():
         query = jax.ShapeDtypeStruct((2, 4, 2, 64), jnp.float32)
         key = jax.ShapeDtypeStruct((2, 64, 2, 64), jnp.float32)
         mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
-        with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh), chosen(decode="decode"):
+        with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
             jax.jit(attended).trace(query, key, key).lower(lowering_platforms=("cuda",))
 
 
@@ -351,16 +351,8 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
     mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
     for differentiated in (jax.value_and_grad(loss, argnums=(0, 1, 2)),
                            lambda *arrays: jax.jvp(loss, arrays, arrays)):
-        with assumed(generation), jax.sharding.use_abstract_mesh(mesh), chosen(decode="decode"):
+        with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
             jax.jit(differentiated).trace(query, key, key).lower(lowering_platforms=("cuda",))
-
-
-def _decoded_lengths(query, key, value):
-    """Two rows of a decode step reading 1 and 20 keys through the decode kernel, named for the step
-    (`generation.chosen`), so it lowers or is refused by name."""
-    with chosen(decode="decode"):
-        return scaled_dot_product_attention(query, key, value,
-                                            key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
@@ -375,7 +367,8 @@ def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation)
 
     mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(_decoded_lengths).trace(query, key, key).lower(lowering_platforms=("cuda",))
+        jax.jit(decode_step(jnp.asarray([1, 20], jnp.int32))[0]).trace(query, key, key).lower(
+            lowering_platforms=("cuda",))
 
 
 @pytest.mark.parametrize("implementation", ["xla", "reference"])
@@ -561,6 +554,8 @@ def test_a_decode_step_over_no_keys_returns_the_empty_result(generation):
         dense = scaled_dot_product_attention(query, key, key, key_value_seq_lengths=lengths, sinks=sinks)
         paged = decode_attention.attend_paged(query[:, 0], pages, pages, jnp.zeros((1, 0), jnp.int32),
                                               lengths, sinks=sinks)
+    # Exact data: the result's own shape, every entry exactly zero.
+    assert dense.shape == query.shape and paged.shape == query[:, 0].shape
     np.testing.assert_array_equal(np.asarray(dense, np.float32), 0.0)
     np.testing.assert_array_equal(np.asarray(paged, np.float32), 0.0)
 
@@ -624,7 +619,8 @@ def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_ten
 
     mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("tensor",)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(_decoded_lengths).trace(query, key, key).lower(lowering_platforms=("cuda",))
+        jax.jit(decode_step(jnp.asarray([1, 20], jnp.int32))[0]).trace(query, key, key).lower(
+            lowering_platforms=("cuda",))
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")

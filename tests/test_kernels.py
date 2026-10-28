@@ -889,6 +889,32 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
         assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
 
 
+def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
+    """A layer whose rows are padded on the left builds its mask and runs the kernel a materialized mask
+    takes (`kernel_for_materialized_mask`): 'auto' on par with the reference path over the real tokens
+    (check 1), the reference model in float64 the truth."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    valid = jnp.arange(300)[None] >= jnp.asarray([[0], [7]])
+
+    def model(implementation, dtype=jnp.float32):
+        return CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
+                                 max_seq_len=320, attention_impl=implementation, dtype=dtype)
+
+    def draw(seed):
+        tokens = jnp.asarray(np.random.default_rng(seed).integers(1, 64, (2, 300)), jnp.int32)
+        return model('auto').init(jax.random.key(seed), tokens), tokens
+
+    def applied(implementation, dtype=jnp.float32):
+        def apply(params, tokens):
+            out = model(implementation, dtype).apply(params, tokens, attention_mask=valid)
+            return jnp.where(valid[..., None], out, 0)
+        return apply
+
+    assert_as_exact(jax.jit(applied('auto')), jax.jit(applied('reference')), draw,
+                    "a padded layer's built mask", seeds=8, truth_fn=applied('reference', jnp.float64))
+
+
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
 @pytest.mark.parametrize("forced", [True, False])
 @pytest.mark.parametrize("dropout_rate", [0.0, 0.25])

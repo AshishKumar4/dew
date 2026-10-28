@@ -212,8 +212,11 @@ def test_a_dropping_call_runs_and_a_chosen_template_runs_it():
                                             deterministic=False)
 
     assert dropping_call().shape == (ROWS, QUERIES, HEADS, WIDTH)
-    with generation.chosen(attention="template"):
+    with generation.chosen(attention="template"), generation.routes() as chosen:
         out = dropping_call()
+    # The chosen kernel's contract: the call reports, and so runs, the kernel it was given.
+    (named,) = [route for route in chosen if route.choice == "attention"]
+    assert named.kernel == "template"
     assert out.shape == (ROWS, QUERIES, HEADS, WIDTH)
 
 
