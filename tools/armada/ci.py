@@ -243,13 +243,14 @@ def contents(name: str) -> bytes:
 def cache_key(common: str, name: str, split: str, depends: list[str]) -> str:
     """The key of test file `name`'s row in `split`'s group whose run executed or read `depends`
     (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
-    file, the group and its file's entries in the durations record (`recorded_entries`), which split.py
-    cuts it from, the record's only part a run's outcome depends on."""
+    file, the group and the tests split.py cuts into it from the durations record (`members`), the record's
+    only part a run's outcome depends on: not their seconds, which each train's fold of main's durations
+    moves (Main, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000)."""
     digest = hashlib.sha256(common.encode())
     for path in inputs(name, depends):
         digest.update(path.encode() + contents(path))
     if split and split != COLLECT:
-        digest.update(split.encode() + json.dumps(recorded_entries(name), sort_keys=True).encode())
+        digest.update(split.encode() + json.dumps(members(name, split)).encode())
     return digest.hexdigest()
 
 
@@ -379,9 +380,14 @@ def durations_record() -> dict[str, float]:
     return json.loads(session.DURATIONS.read_text()) if session.DURATIONS.is_file() else {}
 
 
-def recorded_entries(name: str) -> dict[str, float]:
-    """Test file `name`'s entries in the durations record."""
-    return {node: seconds for node, seconds in durations_record().items() if node.split("::")[0] == name}
+def members(name: str, split: str) -> list[str]:
+    """The node ids of test file `name`'s recorded tests that split.py cuts into group `split` ("G/N"):
+    the file's entries in the durations record in node-id order, cut by their seconds (`session.groups`)."""
+    recorded = {node: seconds for node, seconds in durations_record().items() if node.split("::")[0] == name}
+    ordered = sorted(recorded)
+    index, count = (int(part) for part in split.split("/"))
+    run = session.groups([recorded[node] for node in ordered], count)[index - 1]
+    return ordered[run.start:run.stop]
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
