@@ -89,8 +89,8 @@ pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
 'template' is the attention template's route (`attention_route.attend`): the call's visibility as
 spans, a softcap as a score hook and sinks as the initial state, on the template's Triton or Mosaic
-mainloop on a GPU and its plain-JAX one elsewhere. 'auto' takes it on every GPU and TPU, where the
-call's declared old route does not take it (`attention_kernels._attention_preferred`, `DECLARED`).
+mainloop on a GPU and its plain-JAX one elsewhere. 'auto' takes it on every GPU, where the call's
+declared old route does not take it (`attention_kernels._attention_preferred`, `DECLARED`).
 'auto', every module's default, resolves per trace (`resolve_implementation`),
 so a configuration logged as 'auto' runs on the next machine too: the attention selector (`ATTENTION`,
 `dew.nn.kernels.selection.select`) takes the call's declared old route where a receipt measured it faster,

@@ -429,10 +429,11 @@ list shrinks as the template wins."""
 
 def _attention_preferred(case: AttentionCase) -> str:
     """The kernel `case` runs where its cell declares no old route that takes it (`DECLARED`): the template
-    on every GPU and TPU, which hands a call it does not take to the next kernel by legality, and xla on a
-    CPU, which has no instruction family."""
+    on every GPU, which hands a call it does not take to the next kernel by legality; splash on a TPU, until
+    a receipt (CELLS-v5e) measures the template there (theme A10); xla on a CPU, which has no instruction
+    family."""
     del case
-    return 'template' if generation.backend() in ('gpu', 'tpu') else 'xla'
+    return {'gpu': 'template', 'tpu': 'tpu'}.get(generation.backend(), 'xla')
 
 
 def _hosted(kernel: str) -> str:
