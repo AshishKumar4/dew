@@ -26,10 +26,10 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import cast
 
 import jax
 from jax.extend.mlir import ir
@@ -47,13 +47,13 @@ class KernelCall:
     kernel's compiler, 'triton', 'mosaic_gpu' or 'mosaic_tpu', a library's 'gemm', 'convolution' or
     'attention', or None for a call nothing sizes), its kernel's `name` (Triton's config names it, a
     Mosaic TPU call's `kernel_name`, a Mosaic GPU call's location, the name-stack entry its `mpmd_map`
-    lowers under, None where its location names none; any other call's target), a Pallas kernel's IR as
-    Pallas serialized it (Triton IR, or Mosaic's module bytecode), its `config` (Triton's warps and stages, a
-    Mosaic GPU kernel's hash), and the FLOPs its kernel states (its cost estimate), None where it states
-    none."""
+    lowers under, its kernel's hash where its location names none; any other call's target), a Pallas
+    kernel's IR as Pallas serialized it (Triton IR, or Mosaic's module bytecode), its `config` (Triton's
+    warps and stages, a Mosaic GPU kernel's hash), and the FLOPs its kernel states (its cost estimate), None
+    where it states none."""
 
     kind: str | None
-    name: str | None
+    name: str
     ir: bytes
     config: str
     flops: float | None
@@ -138,8 +138,10 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         config = ir.DictAttr(attributes["mhlo.backend_config"])
         stated = (json.loads(ir.StringAttr(config["cost_estimate_json"]).value)
                   if "cost_estimate_json" in config else {})
-        return KernelCall(kind, _kernel_name(operation.location), ir.StringAttr(config["module"]).value_bytes,
-                          ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16], stated.get("flops"))
+        hashed = ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16]
+        # A call whose location names no kernel is named by its kernel's hash, apart from every other.
+        return KernelCall(kind, _kernel_name(operation.location) or hashed,
+                          ir.StringAttr(config["module"]).value_bytes, hashed, stated.get("flops"))
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
@@ -165,7 +167,8 @@ def _named(location: ir.Location) -> str | None:
     if location.typeid == ir.CallSiteLoc.static_typeid:
         return _named(ir.CallSiteLoc(location).callee)
     if location.typeid == ir.FusedLoc.static_typeid:
-        return next((name for name in map(_named, ir.FusedLoc(location).locations) if name is not None), None)
+        parts = cast("list[ir.Location]", ir.FusedLoc(location).locations)
+        return next((name for name in map(_named, parts) if name is not None), None)
     return None
 
 
@@ -201,8 +204,7 @@ class KernelReport:
                          for route in self.routes)
         launches: dict[tuple[str, str], dict] = {}
         for call in self.calls:
-            # A call whose location names no kernel is its own kernel's, by its config (its kernel's hash).
-            entry = launches.setdefault((call.kind or "", call.name if call.name is not None else call.config), {
+            entry = launches.setdefault((call.kind or "", call.name), {
                 "kind": call.kind, "name": call.name, "calls": 0, "configs": [], "flops": 0.0})
             entry["calls"] += 1
             if call.config not in entry["configs"]:

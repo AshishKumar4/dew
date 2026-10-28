@@ -296,7 +296,6 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
     """The first candidate with a config and weights, as `load_pretrained_vae`
     reads it, or None. Every miss is appended to `errors`, so the caller can
     raise the last one."""
-    from flax.serialization import msgpack_restore
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
@@ -322,8 +321,7 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
         if weights_path is None:
             return {"config": config, "params": params}
         if weights == FLAX_WEIGHTS:
-            with open(weights_path, "rb") as handle:
-                return {"config": config, "params": _shared_upsamplers(msgpack_restore(handle.read()))}
+            return {"config": config, "params": _restored(Path(weights_path))}
         return {"config": config, "params": _read_vae_weights(Path(config_path).parent)}
     return None
 
@@ -370,6 +368,17 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
     ) from last_error
 
 
+def _restored(msgpack: Path) -> dict:
+    """diffusers' Flax VAE params in `msgpack`, each upsampler's convolution the shared upsampling's
+    (`_shared_upsamplers`)."""
+    from flax.serialization import msgpack_restore
+
+    restored = msgpack_restore(msgpack.read_bytes())
+    if not isinstance(restored, dict):
+        raise ValueError(f"{msgpack} does not hold a param tree")
+    return _shared_upsamplers(restored)
+
+
 def _shared_upsamplers(tree: dict) -> dict:
     """diffusers' Flax tree with each upsampler's `conv` the shared upsampling's `Conv_0`
     (`blocks.Upsample`), as `_vae_path` maps the torch tensors."""
@@ -381,15 +390,9 @@ def _shared_upsamplers(tree: dict) -> dict:
 
 def _read_vae_weights(directory: Path) -> dict:
     """Read the params in `directory`, whichever of the two layouts it holds."""
-    from flax.serialization import msgpack_restore
-
-    msgpack = directory / "diffusion_flax_model.msgpack"
+    msgpack = directory / FLAX_WEIGHTS
     if msgpack.exists():
-        with open(msgpack, "rb") as handle:
-            restored = msgpack_restore(handle.read())
-        if not isinstance(restored, dict):
-            raise ValueError(f"{msgpack} does not hold a param tree")
-        return _shared_upsamplers(restored)
+        return _restored(msgpack)
     from dew.interop.safetensors_io import read_weights
 
     try:

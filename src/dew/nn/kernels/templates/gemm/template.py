@@ -99,7 +99,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     named = selection.forced(grouped_matmul.GROUPED.choice)
 
     def backward(saved, operands, cotangent, live):
-        with generation.chosen(**{grouped_matmul.GROUPED.choice: named}) if named else contextlib.nullcontext():
+        choice = {grouped_matmul.GROUPED.choice: named}
+        with generation.chosen(**choice) if named else contextlib.nullcontext():
             return _pulled(operands, cotangent, live)
 
     def _pulled(operands, cotangent, live):

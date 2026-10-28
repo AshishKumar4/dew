@@ -356,7 +356,8 @@ def _norm_step(rows: int):
         return (wide * jax.lax.rsqrt(jnp.mean(wide * wide, -1, keepdims=True) + 1e-6) * scale).astype(x.dtype)
 
     def loss(x, scale):
-        y = norm_swiglu.rms_norm(x, scale, 1e-6, jnp.bfloat16, False, False, portable,
+        y = norm_swiglu.rms_norm(x, scale, 1e-6, jnp.bfloat16, offset=False, after_cast=False,
+                                 portable=portable,
                                  axes=("activation_batch", "activation_length", "activation_embed"))
         return y.astype(jnp.float32).sum()
 
@@ -372,7 +373,8 @@ def _swiglu_step(rows: int):
         def portable(gate, up):
             return (jax.nn.silu(gate.astype(jnp.float32)) * up).astype(gate.dtype)
 
-        y = norm_swiglu.swiglu(gate, up, portable, axes=("activation_batch", "activation_length", "activation_mlp"))
+        y = norm_swiglu.swiglu(gate, up, portable,
+                               axes=("activation_batch", "activation_length", "activation_mlp"))
         return y.astype(jnp.float32).sum()
 
     shaped = jax.ShapeDtypeStruct((2, rows // 2, 512), jnp.bfloat16)
@@ -384,7 +386,7 @@ def _short_conv_step(rows: int):
     from dew.nn.linear import causal_conv1d
 
     def loss(x, taps, bias):
-        return causal_conv1d(x, taps, True, bias).astype(jnp.float32).sum()
+        return causal_conv1d(x, taps, activation=True, bias=bias).astype(jnp.float32).sum()
 
     return loss, (jax.ShapeDtypeStruct((2, rows // 2, 256), jnp.bfloat16),
                   jax.ShapeDtypeStruct((256, 4), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
@@ -407,7 +409,8 @@ def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, s
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(jax.value_and_grad(loss, argnums=tuple(range(len(args))))).trace(*args).lower(
             lowering_platforms=("cuda",))
-    calls = [call for call in custom_calls(lowered) if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
+    calls = [call for call in custom_calls(lowered)
+             if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
     return calls, lowered.as_text()
 
 
