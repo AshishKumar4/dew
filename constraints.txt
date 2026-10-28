@@ -39,13 +39,15 @@
 # the device once, shared by its threads (ledger 1850), a kernel's end checking
 # every device's barriers, so a two-device interpreted kernel fails rather than
 # deadlocks; and Pallas's Mosaic GPU slicing, pointwise ops and broadcasts on a
-# unit row or column of a tiled array (ledger 1428). Every CI and development
+# unit row or column of a tiled array (ledger 1428); and Mosaic GPU's CP_ASYNC
+# copy of a head's [S, D] block of [B, S, H, D], a squeezed dimension between
+# sliced ones, under a tile transform (ledger 2078). Every CI and development
 # install takes this one build.
 # Return to a release once one ships the fixes.
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.12.0.1.post30
+jax==0.12.0.1.post31
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).
