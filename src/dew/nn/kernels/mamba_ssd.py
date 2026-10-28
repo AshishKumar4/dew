@@ -306,6 +306,16 @@ def _chunk_state_kernel(x_ref, b_ref, dt_ref, da_ref, *refs, batch: int, length:
     states_ref[...] = jax.lax.fori_loop(0, chunk // bk, step, jnp.zeros(states_ref.shape, jnp.float32))
 
 
+def _state_blocks(rows, mat, steps, groups: int, config: Tiles) -> tuple:
+    """A state launch's geometry: `rows`' `[B, T, H, P]` batch, length, heads and width, `mat`'s state
+    width, `steps`' padded length, the heads a group serves, the config's state-block rows and columns
+    `bm` and `bn`, and the state's column blocks."""
+    batch, length, heads, width = rows.shape
+    state = mat.shape[-1]
+    return (batch, length, heads, width, state, steps.shape[-1], heads // groups, config.bm, config.bn,
+            state // config.bn)
+
+
 @dataclasses.dataclass(frozen=True)
 class ChunkState(_Launch):
     """`chunk_state`'s launch (tuning.KernelOp)."""
@@ -316,12 +326,8 @@ class ChunkState(_Launch):
 
     def _fwd(self, x: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array, seq: jax.Array | None, *,
              chunk: int, groups: int, interpret: bool, config: Tiles, return_residuals: bool = False):
-        batch, length, heads, width = x.shape
-        state = b.shape[-1]
-        padded = dt.shape[-1]
-        ratio = heads // groups
-        bm, bn = config.bm, config.bn
-        columns = state // bn
+        batch, length, heads, width, state, padded, ratio, bm, bn, columns = _state_blocks(
+            x, b, dt, groups, config)
         states = pl.pallas_call(
             functools.partial(_chunk_state_kernel, batch=batch, length=length, chunk=chunk, bk=config.bk,
                               exact=interpret),
@@ -804,12 +810,8 @@ def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, 
                     config: Tiles, name: str):
     """`_state_gradient_kernel`'s launch: `B`'s gradient where the step `dt` is given, else `C`'s, and
     each head's decay-exponent gradient, the head splits' and the state blocks' workspaces summed."""
-    batch, length, heads, width = left.shape
-    state = mat.shape[-1]
-    padded = da.shape[-1]
-    ratio = heads // groups
-    bm, bn = config.bm, config.bn
-    columns = state // bn
+    batch, length, heads, width, state, padded, ratio, bm, bn, columns = _state_blocks(
+        left, mat, da, groups, config)
     splits = -(-ratio // config.heads)
     steps = [] if dt is None else [dt]
     grad, dacs = pl.pallas_call(

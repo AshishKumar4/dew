@@ -289,6 +289,36 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
                         seeds=SEEDS, truth_fn=truth)
 
 
+@pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
+def test_the_mosaic_launches_state_their_work(training):
+    """A bf16 gated delta rule's forward, or its forward and gradient, through the template, lowered for an
+    H100: every launch states its cost (`_kernel`'s, `templates.gemm.cost`), which Dew's FLOP count reads to
+    size it (`instrumentation._stated_flops`: no launch unsized, row 1895's kernel report), their products
+    together at least the model's recurrent function's (`flops.delta_flops`: the chunked form's preparation
+    and inversion are work past it)."""
+    import re
+
+    from dew.nn.flops import delta_flops
+    from dew.telemetry.instrumentation import _stated_flops
+
+    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 128
+    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+
+    def rule(*operands):
+        return mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1))[0].astype(jnp.float32).sum()
+
+    with generation.assumed("sm90"):
+        fn = jax.grad(rule, argnums=(0, 1, 2)) if training else rule
+        text = jax.jit(fn).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
+    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+    assert launches and all(_stated_flops(line) is not None for line in launches)
+    model = delta_flops(np.asarray([length] * rows), value_heads, width, width)
+    assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
+
+
 def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
     """A layer naming the template (`generation.chosen(gated_delta_rule='mosaic_gpu')`): its output on par
     from float64 with the portable rule's (the layer's own float64 forward the truth). The layer computes
