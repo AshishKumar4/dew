@@ -60,12 +60,13 @@ class KernelCall:
 
 @dataclass(frozen=True)
 class CustomCall:
-    """One custom call of a lowered program: its target and the shapes of the arrays it reads and
-    writes."""
+    """One custom call of a lowered program: its target, the shapes of the arrays it reads and writes, and
+    the element types of those it reads (MLIR's spelling, `i32`, `bf16`)."""
 
     target: str
     operands: tuple[tuple[int, ...], ...]
     results: tuple[tuple[int, ...], ...]
+    operand_types: tuple[str, ...] = ()
 
 
 def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
@@ -105,12 +106,16 @@ def operations(lowered: jax.stages.Lowered) -> list[str]:
 
 def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
     """Every custom call a lowered program makes, in program order."""
+    def ranked(values):
+        return [ir.RankedTensorType(value.type) for value in values
+                if isinstance(value.type, ir.RankedTensorType)]
+
     def shapes(values) -> tuple[tuple[int, ...], ...]:
-        return tuple(tuple(value.type.shape) for value in values
-                     if isinstance(value.type, ir.RankedTensorType))
+        return tuple(tuple(kind.shape) for kind in ranked(values))
 
     return _read_calls(lowered, lambda target, operation: CustomCall(
-        target, shapes(operation.operands), shapes(operation.results)))
+        target, shapes(operation.operands), shapes(operation.results),
+        tuple(str(kind.element_type) for kind in ranked(operation.operands))))
 
 
 def kernel_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
