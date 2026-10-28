@@ -14,7 +14,15 @@ from dew._records import JSON
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, JointLayout, Layout, Media, Noul, Schema, State, Text
 from dew.decision.head import Head, JointSchemaHead
-from dew.decision.layout import JOINT_SEGMENTS, Specials
+from dew.decision.layout import (
+    JOINT_SEGMENTS,
+    AnswerCue,
+    Instructions,
+    Labels,
+    OptionLines,
+    Specials,
+    StateFirstLayout,
+)
 from dew.registry import from_record, to_record
 
 QUESTIONS = {"pick": Choice("Which one?", ["a", "b", "c"]), "holds": Noul("Does it hold?")}
@@ -75,6 +83,31 @@ def test_a_row_holds_the_schema_once_and_the_images_at_most_once():
     with pytest.raises(ValueError):
         JointLayout(segments=(Text("STATE:\n"), State(), Schema())).rows(TOKENIZER, SPECIALS, "s", QUESTIONS,
                                                                          media=(1, 2))
+
+
+HEADERS = dict.fromkeys(("choice", "noul", "score"), "Q: {}\n")
+"""A question row's header of each kind, its instructions in its place."""
+
+
+@pytest.mark.parametrize("part", [Instructions(HEADERS), OptionLines(), AnswerCue()],
+                         ids=lambda part: type(part).__name__)
+def test_a_joint_row_refuses_a_part_it_cannot_render(part):
+    """A joint row writes its questions, their instructions and options, in its schema and reads no cue:
+    a question row's part among its segments is refused when the layout is built, never rendered as
+    nothing (row 1943)."""
+    with pytest.raises(ValueError):
+        JointLayout(segments=(Schema(), State(), part))
+
+
+@pytest.mark.parametrize("part", [Schema(), Media()], ids=lambda part: type(part).__name__)
+def test_a_question_row_refuses_a_part_it_cannot_render(part):
+    """A question row holds no schema and no images: a joint row's part among its segments is refused
+    when the layout is built, its own parts alone built (row 1943)."""
+    own = (Instructions(HEADERS), OptionLines(), State(render="state"), AnswerCue())
+    labels = Labels(variants=("{}",))
+    StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8, labels=labels, segments=own)
+    with pytest.raises(ValueError):
+        StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8, labels=labels, segments=(*own, part))
 
 
 @dataclasses.dataclass(frozen=True)

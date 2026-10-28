@@ -606,6 +606,20 @@ def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_wher
         dataclasses.replace(run, context_frozen=False, context_layers=None).prepare()
 
 
+def test_a_joint_run_refuses_a_cue_its_rows_cannot_render():
+    """A joint head's run whose segments hold an answer cue, which a joint row has no place for, is
+    refused as it is prepared, never trained on rows that dropped it (row 1943)."""
+    from dew.decision.config import JointShape
+    from dew.decision.layout import AnswerCue, Schema, State
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    run = dataclasses.replace(default, trainer=trainer, head=JointShape(), max_len=128,
+                              segments=(Schema(), State(), AnswerCue()))
+    with pytest.raises(ValueError):
+        run.prepare().train("x")
+
+
 def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
     """Gemma 4 Unified reads its vision tokens' blocks whole, as its checkpoint states: that asks no
     block of the run's rows, so a fresh joint head over it keeps the joint layout, a row of every
