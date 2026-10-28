@@ -510,6 +510,25 @@ def _masks(rows: int, columns: int) -> list:
     return [(rows, columns, jnp.int32)]
 
 
+def _product(call: _Call, lhs: tuple, rhs: tuple) -> list:
+    """The operand fragments one product `[rows, depth] @ [depth, columns]` holds at once where the family's
+    products read registers (`Family.operands_in_registers`), its left operand `lhs` `(operand, rows,
+    depth)` a step deep and its right one `rhs` `(operand, depth, columns)` a sub-step
+    (`Family.fragment_depth`), each in the warps replicating it (`lhs_copies`, `rhs_copies`): the GEMM's own
+    rule (`resources.tile_registers`); none where they read shared memory (wgmma's)."""
+    family = call.family
+    if not family.operands_in_registers:
+        return []
+    (left, rows, depth), (right, _, columns) = lhs, rhs
+    return (_held(left, rows * family.lhs_copies, depth)
+            + _held(right, family.fragment_depth(depth), columns * family.rhs_copies))
+
+
+def _widest(*tiles: list) -> list:
+    """The largest of `tiles`' live sets by their words: of products issued in turn, one's fragments."""
+    return max(tiles, key=lambda held: sum(r * c * jnp.dtype(d).itemsize for r, c, d in held))
+
+
 def _fragments(call: _Call, *tiles) -> list:
     """The operand tiles `(operand, rows, columns)` a product reads from registers where the family's
     products read them there (`Family.operands_in_registers`, mma.sync's), none where they read shared
@@ -1364,19 +1383,32 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
 
 
 def _output_held(call: _Call, bv: int) -> _Held:
-    """What `_output`'s consumer thread holds: a value block's memory and local products' fp32 sums beside
-    its values (and, where products read registers, a key block's queries and memory slice and the scores);
-    under a decay a head the first step's scores too, their sum, their pairs' decays and their masks (an
-    fp32 call's split into parts), held with the value block's tiles, the step's whole set (as its phases
-    alone, a 64-wide value block's output spilled 16 bytes a thread on an A100's at 200 stated registers);
-    under one a key dimension a key block's prefix halves and the scores in fp32."""
-    held, memories = call.held, call.memories
-    values = [_f32(CHUNK, bv)] * 2 + _held(held, CHUNK, bv) + _fragments(
-        call, (call.given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
+    """What `_output`'s consumer thread holds. Under a decay a head: a value block's phase, its output's
+    fp32 sum (the memory's and the local product's, each its own accumulator where products overlap,
+    `Family.products_overlap`), its values and one product's fragments (`_product`); and the first step's
+    scores' phase, their sum, their pairs' decays and their masks (an fp32 call's split into parts) and their
+    product's fragments. The two phases hold at once where the walk steps over value blocks (the scores'
+    branch inside its loop), or where its products overlap; apart where it takes one value block on a family
+    whose products complete in turn. So an A100's need was 232, 240, None and 216 registers at value blocks
+    16, 32, 64 and 128 wide of 128 values, and None at 128 of 256; an H100's 224, 224, 232/240 and None
+    (the 1971 gate's dump: where both phases were stated at once, 456 refused 216). Under a decay a key
+    dimension a key block's prefix halves, its decay raised from them and its queries widened, and the
+    scores in fp32 (at the halves alone an H100's compile spilled 100 bytes a thread, Kimi delta attention's
+    at 216 stated registers)."""
+    held, memories, given, family = call.held, call.memories, call.given, call.family
     if call.per_key:
-        return _Held(phases=(values + [_f32(CHUNK, call.block)] * 2 + [_f32(CHUNK, CHUNK)],))
-    return _Held(phases=(values + [_f32(CHUNK, bv)] + [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
-                         + (_held(held, CHUNK, CHUNK) if held.parts > 1 else []),))
+        values = [_f32(CHUNK, bv)] * 2 + _held(held, CHUNK, bv) + _fragments(
+            call, (given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
+        return _Held(phases=(values + [_f32(CHUNK, call.block)] * 4 + [_f32(CHUNK, CHUNK)],))
+    values = ([_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv)
+              + _widest(_product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
+                        _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv))))
+    scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
+              + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
+              + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
+    if call.value_width // bv == 1 and not family.products_overlap:
+        return _Held(phases=(values, scores))
+    return _Held(phases=(values + scores,))
 
 
 def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, scale: float, out_dtype,

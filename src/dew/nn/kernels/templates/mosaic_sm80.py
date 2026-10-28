@@ -87,6 +87,7 @@ class Mma(mosaic.Family):
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
+    products_overlap = False
     stores_through_registers = True
 
     @classmethod
