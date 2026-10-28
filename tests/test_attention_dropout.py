@@ -24,7 +24,7 @@ from test_attention_template import (
     SINKS,
     SOFTCAP,
     arguments,
-    dews_mask,
+    case_keep,
     drawing as value_drawing,
     geometry,
 )
@@ -149,10 +149,10 @@ def route_arm(case: dict):
 
 
 def reference_arm(case: dict, names: frozenset = frozenset()):
-    """`case`'s reference path over its dense mask `dews_mask(case)`, dropping at `RATE` from the call's
+    """`case`'s reference path over its dense mask `case_keep(case)`, dropping at `RATE` from the call's
     key, with the score hooks `names` (`sinks`, `softcap`); a query that sees no key reads zero, as every
     attention call reads (`attention_kernel`)."""
-    mask = np.asarray(dews_mask(case))
+    mask = np.asarray(case_keep(case))
     live = jnp.asarray(mask.any(axis=-1))[:, :, None, None]
     sinks = SINKS if "sinks" in names else None
     softcap = SOFTCAP if "softcap" in names else None

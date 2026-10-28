@@ -26,6 +26,7 @@ from dew.nn.attention import (
     chunk_mask,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
+    key_spans,
     max_attention_logits,
     reference_only,
     scaled_dot_product_attention,
@@ -45,6 +46,7 @@ from dew.nn.inputs import (
     document_reach,
 )
 from dew.nn.kernels.selection import select
+from dew.nn.kernels.templates import attention as template
 from dew.nn.kv_cache import (
     PAGED,
     PLACES,
@@ -64,7 +66,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
-from dew.nn.visibility import block_starts, visible, windowed
+from dew.nn.visibility import windowed
 
 
 def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
@@ -831,8 +833,7 @@ class CausalSelfAttention(nn.Module):
                 (mask, _), causal = self._decode_masks(positions, B, kv_len, None, history), False
             else:
                 last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
-                documents, causal, window = self._cached_call(
-                    positions, visible(last, jnp.arange(kv_len)[None, :], causal=True))
+                documents, causal, window = self._cached_call(positions, jnp.arange(kv_len)[None, :] <= last)
             # A quantized provider stashed its keys in the cache's rotation.
             rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
             if rotation is not None:
@@ -1123,24 +1124,23 @@ class CausalSelfAttention(nn.Module):
         nothing: the kernels stand in for the mask with each row's key count and that start
         (`_decode_attention`). A window at least the cache's capacity narrows nothing. A token of a block
         read whole sees its block's earlier keys past the window too, its first key the earlier of the
-        window's and the block's (`block_starts` over the groups the cache keeps, `history`), so the step
-        keeps its decode kernel.
+        window's and the block's (the call's spans over the groups the cache keeps, `history`), so the
+        step keeps its decode kernel.
         """
         window = self.ctx.sliding_window
         if window is None or window >= key_length:
             return causal_attention_mask(positions, key_length, key_valid=valid), None
-        # A decode token's first key under the window.
-        slot = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(positions))[:, 0], (rows,))
-        first = jnp.maximum(slot + 1 - window, 0)
-        if "block_groups" in history:
-            at = jnp.clip(slot, 0, key_length - 1)[:, None]
-            groups = history["block_groups"]
-            begins = jnp.take_along_axis(block_starts(groups), at, axis=1)[:, 0]
-            inside = jnp.take_along_axis(groups, at, axis=1)[:, 0] >= 0
-            first = jnp.where(inside, jnp.minimum(first, begins), first)
-        keep = jnp.arange(key_length)[None, :] >= first[:, None]
-        return (causal_attention_mask(positions, key_length, key_valid=valid) & keep[:, None, None, :],
-                first.astype(jnp.int32))
+        # The decode token's keys as the call's spans: its slot's causal window, a block holding it read
+        # whole from its start, the filled slots up to its own alone; their first key is the row's start.
+        slot = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(positions, jnp.int32))[:, :1], (rows, 1))
+        spans = key_spans(1, key_length, causal=True, sliding_window=window,
+                          key_value_seq_lengths=jnp.maximum(slot[:, 0] + 1, 0),
+                          block_groups=history.get("block_groups"), query_slots=slot, rows=rows)
+        # The filled slots ANDed after the spans, which search no ids then (`causal_attention_mask`).
+        seen = template.dense(spans)[:, None]
+        if valid is not None:
+            seen = seen & jnp.asarray(valid, bool)[:, None, None, :]
+        return seen, spans.start[:, 0]
 
     def _cached_call(self, positions, held) -> tuple[CrossDocuments, bool, int | None]:
         """A cache call of several tokens at `positions` `[B, S]` (-1 for padding) over the keys
