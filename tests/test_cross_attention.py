@@ -508,7 +508,7 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
         wrapped = np.asarray([2 ** 32 + 1], np.int64)
         with pytest.raises(ValueError):
             server.submit(dataclasses.replace(wide, conditioning={
-                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2)
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2, key=0)
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():

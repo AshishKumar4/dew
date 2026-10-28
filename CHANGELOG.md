@@ -5,6 +5,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A request names its key: `TextGeneration`, `BlockGeneration` and `MaskedGeneration` calls and
+  `Server.submit` take `key=` as a required keyword, as every native sampler does, where a call
+  without one raised `ValueError` at run time; it now raises `TypeError` at the call.
 - Liquid's LFM3 (`lfm3`, LiquidAI/LFM3-1.7B and the text backbone of LFM3-VL and d1) loads, trains, decodes
   and saves: its gated short convolution layers are a mixer of their own (`short_conv`, its last inputs
   through the decode cache), and attention gates each head by its own sigmoid (`gate_projection='head'`).
