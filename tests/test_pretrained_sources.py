@@ -451,6 +451,33 @@ def test_a_tensor_a_load_without_its_weights_holds_has_shapes_and_no_values():
             asked()
 
 
+def test_a_gpt2_release_holding_its_legacy_buffers_loads_without_its_weights(tmp_path):
+    """The original GPT-2 release stores each block's causal mask and mask sentinel, which a load checks
+    and drops: without its weights the load holds their shapes alone, so it checks those, not values
+    it was not given (a mask of fabricated zeros is no causal mask), and builds what a load with them
+    builds (ledger 1918)."""
+    import shutil
+
+    import jax
+
+    from dew.interop import Pretrained
+
+    directory = tmp_path / "gpt2"
+    shutil.copytree(Path(__file__).resolve().parent / "fixtures" / "hf" / "gpt2-tiny", directory)
+    stored = safetensors_numpy.load_file(directory / "model.safetensors")
+    positions = json.loads((directory / "config.json").read_text())["n_positions"]
+    for block in range(2):
+        stored[f"transformer.h.{block}.attn.bias"] = np.tril(np.ones((positions, positions), np.float32))[
+            None, None]
+        stored[f"transformer.h.{block}.attn.masked_bias"] = np.asarray(-1e4, np.float32)
+    safetensors_numpy.save_file(stored, directory / "model.safetensors", metadata={"format": "pt"})
+    shapes = Pretrained.load(directory, dtype="float32", weights=False)
+    loaded = Pretrained.load(directory, dtype="float32")
+    assert repr(shapes.model) == repr(loaded.model)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), loaded.variables)
+
+
 @pytest.mark.parametrize("name", WITHOUT_WEIGHTS)
 def test_a_load_without_its_weights_builds_what_a_load_with_them_builds(name):
     """A checkpoint loaded without its weights is the source a load with them reads, its config and
