@@ -39,9 +39,10 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
+from jax.sharding import PartitionSpec as P
 
 from dew.batch import Coordinates, valid_order
-from dew.mesh import MeshAxes, logical_spec, mesh_axes
+from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
 
@@ -52,7 +53,13 @@ from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .joined import joined_dense, joins
 from .kernels import generation
 from .kernels.generation import INHERENT, Refusal, triton_runs
-from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed, recurrent_delta_rule
+from .kernels.recurrence_chunk import (
+    CHUNK_SIZE,
+    chunk_gated_delta_rule,
+    entering_memory,
+    kernel_routed,
+    recurrent_delta_rule,
+)
 from .kernels.selection import Kernel, Op, Requirement, forced, select
 from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, float32_dot_general, l2norm
 from .sharding import (
@@ -66,6 +73,7 @@ from .sharding import (
     manual_map,
     rows_like,
     seen_whole,
+    sequence_shards,
 )
 
 Pieces = Sequence[tuple[int, int | None]]
@@ -160,7 +168,6 @@ def _row_split(x) -> MeshAxes | None:
 def _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, rows: MeshAxes):
     """`causal_conv1d` with each shard of `rows` convolving its own rows (`manual_map`); the taps and
     bias are whole on every shard, and their gradients sum over the shards' rows."""
-    P = jax.sharding.PartitionSpec
     row = P(rows, None, None)
     pieces = 1 if parts is None else len(tuple(parts))
 
@@ -368,6 +375,97 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
+def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
+    """`local(*tokens, *whole)` in a `manual_map` that splits the rows and the sequence of each of `tokens`
+    (`[B, S, ...]` or None) as the rule table places a `[batch, length, ...]` activation, `whole` on every
+    shard, its output placed as the tokens are: a recurrent mixer's conv and scan over its shard's slice
+    of whole training sequences (`sequence_conv`), its projections and norms token by token outside with
+    GSPMD."""
+    length = tokens[0].shape[1]
+    if length % shards:
+        raise LayoutRefused(f"the sequence of {length} tokens splits {shards} ways over the mesh's sequence "
+                            f"axis, and it does not divide")
+    spec = logical_spec(("activation_batch", "activation_length"), tokens[0].shape[:2])
+    return manual_map(local, (*(spec,) * len(tokens), *(P(),) * len(whole)), spec)(*tokens, *whole)
+
+
+def sequence_conv(mixed, taps, bias, segments, valid, *, parts=None, dtype=None):
+    """This shard's slice of `mixed` `[B, S, D]` convolved causally, inside a `shard_map` that holds the
+    sequence axis manual (`over_sequence`): each real token's conv reads the `K-1` real tokens before it in
+    its document, wherever they lie, from earlier shards too, and a segment change resets it wherever it
+    falls. With `valid` the halo is gathered from every earlier shard (`sequence_halo`), so a shard of
+    fewer real tokens than the conv reads passes on the ones before it; without, every slot is real and
+    the previous shard's last `K-1` tokens and segments come by one `ppermute` (zeros on the first).
+    `parts` and `dtype` are `causal_conv1d`'s."""
+    width = taps.shape[1] - 1
+    length = mixed.shape[1]
+    if length < width:
+        raise LayoutRefused(
+            f"each sequence shard holds {length} tokens, fewer than the {width} the "
+            f"conv reads behind its first; use fewer sequence shards or longer sequences")
+    if valid is not None:
+        halo = sequence_halo(mixed, valid, segments, width)
+        convolved, _ = held_conv1d(mixed, taps, valid, halo, bias=bias, segments=segments, parts=parts,
+                                   dtype=dtype)
+        return convolved
+    forward = [(shard, shard + 1) for shard in range(jax.lax.axis_size(SEQUENCE_AXIS) - 1)]
+    history = jax.lax.ppermute(mixed[:, length - width:], SEQUENCE_AXIS, forward)
+    owners = None
+    if segments is not None:
+        before = jax.lax.ppermute(segments[:, length - width:], SEQUENCE_AXIS, forward)
+        owners = jnp.concatenate([before, segments], axis=1)
+    stream = jnp.concatenate([history, mixed], axis=1)
+    convolved = causal_conv1d(stream, taps, bias=bias, segments=owners, parts=parts, dtype=dtype)
+    return (convolved[:, width:] if parts is None
+            else tuple(piece[:, width:] for piece in convolved))
+
+
+def sequence_halo(mixed, valid, segments, width: int):
+    """The `width` real tokens before this shard's first, `[B, width, conv_dim]`, from every earlier
+    shard of the sequence axis: each shard's last real tokens (`real_tail`) gathered, then taken in
+    order, so a shard holding fewer than `width` real tokens passes on the ones before it too. Rows of
+    another document than this shard's first real token's are zeros, where its conv starts afresh."""
+    tail, documents, count = real_tail(mixed, valid, segments, width)
+    tails, all_documents, counts = (jax.lax.all_gather(value, SEQUENCE_AXIS)
+                                    for value in (tail, documents, count))
+    here = jax.lax.axis_index(SEQUENCE_AXIS)
+    halo = jnp.zeros_like(tail)
+    halo_documents = jnp.full_like(documents, -1)
+    slots = jnp.arange(width)[None, :]
+    for shard in range(tails.shape[0]):
+        # A shard's tail holds its last `kept` real tokens at its end, zeros before them; behind them
+        # come the halo's last `width - kept`.
+        kept = jnp.minimum(counts[shard], width)[:, None]
+        behind = slots < width - kept
+        rows = jnp.minimum(kept + slots, width - 1)
+        joined = jnp.where(behind[:, :, None], jnp.take_along_axis(halo, rows[:, :, None], axis=1),
+                           tails[shard])
+        joined_documents = jnp.where(behind, jnp.take_along_axis(halo_documents, rows, axis=1),
+                                     all_documents[shard])
+        earlier = shard < here
+        halo = jnp.where(earlier, joined, halo)
+        halo_documents = jnp.where(earlier, joined_documents, halo_documents)
+    if segments is None:
+        return halo
+    first_real = jnp.argmax(jnp.asarray(valid, bool), axis=1)[:, None]
+    first = jnp.take_along_axis(jnp.asarray(segments, jnp.int32), first_real, axis=1)
+    return jnp.where((halo_documents == first)[:, :, None], halo, 0)
+
+
+def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, parts, dtype, rule):
+    """A delta-rule mixer's conv and rule over this shard's slice of whole training sequences, inside a
+    `shard_map` that holds the sequence axis manual (`over_sequence`): the conv with its halo
+    (`sequence_conv`, its `parts` the queries', keys' and values' widths, the first two l2-normalised), the
+    pieces in heads of their `widths`, and `rule(query, key, value, g, beta, state, starts)` from the
+    memory this shard's slice enters with (`entering_memory`), its output named as `held_scan`'s."""
+    query, key, value = (piece.reshape(*piece.shape[:2], -1, width) for piece, width in
+                         zip(sequence_conv(mixed, taps, None, segments, valid, parts=parts, dtype=dtype),
+                             widths, strict=True))
+    state = entering_memory(rule, query, key, value, g, beta, starts, axis=SEQUENCE_AXIS)
+    out, _ = rule(query, key, value, g, beta, state, starts)
+    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+
+
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts=None, dtype=None):
     """Convolve real tokens without advancing a paused row's history.
 
@@ -441,7 +539,6 @@ def stepped_per_shard(hooks: recurrence.Hooks, state: jax.Array, query: jax.Arra
     state."""
     active = jnp.ones(state.shape[:1], bool) if active is None else jnp.asarray(active, bool)
     rows, heads = grouped_heads((state.shape[0], 1, *value.shape[1:]), key.shape[1])
-    P = jax.sharding.PartitionSpec
     three, two, memory = P(rows, heads, None), P(rows, heads), P(rows, heads, None, None)
 
     def local(query, key, value, log_decay, beta, held, active):
@@ -734,7 +831,6 @@ class GatedDeltaNet(nn.Module):
                                 for shard in range(shards)
                                 for i, (h, w) in enumerate(zip(heads, widths, strict=True))])
         inverse = np.argsort(order)
-        P = jax.sharding.PartitionSpec
         active = jnp.ones((B,), bool) if valid is None else jnp.asarray(valid, bool)[:, 0]
 
         def token(mixed, history, held):
@@ -826,10 +922,23 @@ class GatedDeltaNet(nn.Module):
         # and keys (`l2norm`).
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
-        out = held_scan(self, mixed, self.conv1d()[0], None, scan,
-                        (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
-                        coordinates=tokens, state='recurrent_state', state_dtype=stored, conv_dtype=conv,
-                        parts=heads, dtype=operand if ported else wide, token=token)
+        shards = sequence_shards()
+        if shards > 1:
+            if decode:
+                raise LayoutRefused(f"a gated delta net under a sequence axis of {shards} runs whole "
+                                    f"training sequences; a decode step holds one state per row. Decode on "
+                                    f"a mesh with sequence=1.")
+            rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
+                                     max_segments=tokens.max_segments)
+            out = over_sequence(functools.partial(split_delta_rule, widths=widths, parts=heads,
+                                                  dtype=operand if ported else wide, rule=rule),
+                                shards, (mixed, g, beta, tokens.segments, tokens.starts, valid),
+                                (self.conv1d()[0],))
+        else:
+            out = held_scan(self, mixed, self.conv1d()[0], None, scan,
+                            (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
+                            coordinates=tokens, state='recurrent_state', state_dtype=stored, conv_dtype=conv,
+                            parts=heads, dtype=operand if ported else wide, token=token)
         if out is None:
             return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
         if token is not None:

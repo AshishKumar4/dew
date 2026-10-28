@@ -37,7 +37,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
-from dew.nn.precision import at_least_fp32, l2norm
+from dew.nn.precision import at_least_fp32, float32_einsum, l2norm
 from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
@@ -807,6 +807,37 @@ def _by_product(forward, training, *operands):
 
     rule.defvjp(ahead, back)
     return rule(*operands)
+
+
+def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, state=None):
+    """The memory this shard of a sequence the mesh axis `axis` splits enters its slice with, `[B, Hv, Dk,
+    Dv]` in at least fp32, inside a `shard_map` that holds `axis` manual: fla's context-parallel
+    summary-then-states (fla/ops/cp/chunk_delta_h.py, fla-core 0.5.2). A delta rule's slice is affine in
+    the memory it enters, `S = F S_0 + Z` (each token's transition on the left, `recurrence.update`), so
+    each shard's summary is `rule`'s final memory over its slice from `[0 | I]` with values `[v | 0]`, in
+    at least fp32 (rounding the identity block's products to the operands' dtype would round the
+    transfer): `Z` the write its last document leaves from zero, `F` its transfer, zero where that document
+    starts inside the slice. The summaries are gathered over `axis` and composed in order, `E_r = F_{r-1}
+    E_{r-1} + Z_{r-1}` from the row's `state` (zero where None) on the first shard; a slice that starts a
+    document (its first token's `starts`) enters from zero. `rule(query, key, value, g, beta, state,
+    starts)` returns `(output, final memory)`."""
+    batch, _, heads, columns = value.shape
+    width = key.shape[-1]
+    wide = at_least_fp32(value.dtype)
+    shard = jax.lax.axis_index(axis)
+    begins = (jnp.zeros((batch,), bool) if starts is None else jnp.asarray(starts[:, 0], bool)) & (shard > 0)
+    zero = rows_like(jnp.zeros((batch, heads, width, columns), wide), value)
+    identity = jnp.where(begins[:, None, None, None], 0.0, jnp.eye(width, dtype=wide))
+    widened = jnp.concatenate([value.astype(wide), jnp.zeros((*value.shape[:-1], width), wide)], axis=-1)
+    _, summary = rule(query.astype(wide), key.astype(wide), widened, g, beta.astype(wide),
+                      jnp.concatenate([zero, identity], axis=-1), starts)
+    writes, transfers = (jax.lax.all_gather(part, axis) for part in (summary[..., :columns],
+                                                                        summary[..., columns:]))
+    memory = zero if state is None else state.astype(wide)
+    for earlier in range(writes.shape[0]):
+        composed = float32_einsum('bhij,bhjv->bhiv', transfers[earlier], memory) + writes[earlier]
+        memory = jnp.where(earlier < shard, composed, memory)
+    return jnp.where(begins[:, None, None, None], 0.0, memory)
 
 
 def kernel_routed(query, key, value, g, beta, *, floor: float | None = None) -> bool:
