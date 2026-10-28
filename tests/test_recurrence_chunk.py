@@ -3,6 +3,7 @@ every hook combination it takes, a sequence over several chunks and a ragged las
 too, held to the same recurrence run a token at a time (the decode step's reference,
 `recurrence.step_reference`) under the accuracy gate (tests/reference_error.py), both from float64."""
 
+import dataclasses
 import functools
 import itertools
 
@@ -11,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact, chain_roundings, widened
 
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
@@ -189,9 +190,9 @@ def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
     """The chunked op rounds its output once, after the skip and the norm, as the decode step's reference
     does, on the portable math and on the port (the delta rule with a decay, its kernels interpreted off
     a GPU): a bf16 token whose readout `0.1` (a unit query and key, the write gate or the scale 0.1)
-    the skip `-0.10009765625` nearly cancels leaves the reference's residual, float64's exactly where the
-    reference's is (exact data) and on par with it from float64 where not, and the norm reads it, where a
-    readout rounded to bf16 first cancels to zero."""
+    the skip `-0.10009765625` nearly cancels leaves the residual, within fp32's rounding over its chain of
+    the float64 value (the oracle rule for a fixed input), and the norm reads it, where a readout rounded
+    to bf16 first cancels to zero."""
     unit = jnp.zeros((1, 1, 1, 8), jnp.bfloat16).at[..., 0].set(1.0)
     beta = jnp.full((1, 1, 1), 1.0 if hooks.delta else 0.1, jnp.float32)
     operands = Chunk(unit, unit, jnp.ones((1, 1, 1, 8), jnp.bfloat16),
@@ -199,8 +200,11 @@ def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
                      skip=jnp.full((1,), -0.10009765625, jnp.float32),
                      z=jnp.ones((1, 1, 1, 8)) if hooks.output else None,
                      weight=jnp.ones((8,)) if hooks.output else None)
-    found, _ = chunk_on('fla' if ported else 'xla', hooks, operands, dtype=jnp.float32)
-    def reference(operands, beta, dtype):
+    def op(operands):
+        return chunk_on('fla' if ported else 'xla', hooks, operands, dtype=jnp.float32)[0]
+
+    def reference(operands, beta, dtype, hooks=hooks):
+        """The decode step's reference over the token under `hooks`, in `dtype`."""
         return recurrence.step_reference(hooks, recurrence.Step(
             jnp.zeros((1, 1, 8, 8), dtype), query=operands.query[:, 0], key=operands.key[:, 0],
             value=operands.value[:, 0],
@@ -208,16 +212,19 @@ def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
             skip=operands.skip, z=None if operands.z is None else operands.z[:, 0],
             weight=operands.weight), dtype=dtype)[0]
 
-    want = reference(operands, beta, jnp.float32)
+    found = op(operands)
     with jax.enable_x64(new_val=True):
-        truth = np.asarray(reference(*widened((operands, beta)), jnp.float64))
-    if np.array_equal(np.asarray(want, np.float64), truth):
-        # Exact data (a unit query and key against a gate of 0.1 and the skip): the residual is fp32's
-        # exactly, the reference's float64 value, which the op's must be too.
-        np.testing.assert_array_equal(np.asarray(found[:, 0], np.float64), truth)
-    else:
-        assert_as_exact_as_the_reference(np.asarray(found[:, 0]), np.asarray(want), truth,
-                                         f'the output rounded once, {hooks}')
+        wide = widened((operands, beta))
+        truth = np.asarray(reference(*wide, jnp.float64))
+        residual = np.asarray(reference(*wide, jnp.float64, hooks=dataclasses.replace(hooks, output=None)))
+    # The oracle rule for a fixed input: within fp32's rounding over the op's chain of roundings of its terms'
+    # magnitude (the readout and the skip, about 0.1), times the norm's gain over the residual where it reads
+    # it; a readout rounded to bf16 first misses by the whole residual.
+    gain = float(np.max(np.abs(truth)) / np.max(np.abs(residual)))
+    bound = (chain_roundings(jax.make_jaxpr(op)(operands)) * float(np.finfo(np.float32).eps) * gain
+             * float(np.max(np.abs(np.asarray(operands.skip, np.float64)))))
+    apart = float(np.max(np.abs(np.asarray(found[:, 0], np.float64) - truth)))
+    assert apart <= bound, f'{hooks}: {apart:.3e} from float64, past its rounding bound {bound:.3e}'
     assert np.all(np.asarray(found) != 0.0)
 
 
@@ -234,48 +241,54 @@ def test_the_output_takes_the_dtype_asked_for():
                                          beta=jnp.ones((1, 1, 1))))[0].dtype == jnp.bfloat16
 
 
-def test_a_rated_decay_is_its_log_decay():
-    """A rated decay (`rate` times the write gate) steps a decode token and a chunked sequence as the same log
-    decay given whole, on the launch and on the portable math: each on par with the whole decay's from
-    float64 (the gate's one-draw rule)."""
-    rng = np.random.default_rng(0)
+RATED = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+WHOLE = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True)
+"""A rated decay (`rate` times the write gate) and the same log decay given whole."""
+
+RATED_SEEDS = 8
+"""The rated-decay site's declared seeds, sized paired by `seeds_for` on armada."""
+
+
+def rated_draw(seed: int) -> tuple:
+    """A decode token over a memory and a chunked sequence, each with its write gate in [0, 0.5), a rate a
+    head in [-2, -0.1) and a skip: `(token, sequence)`, each a dict of the step's or chunk's operands."""
+    rng = np.random.default_rng(seed)
     rows, heads, width = 2, 2, 16
-    state = jnp.asarray(rng.standard_normal((rows, heads, width, width)), jnp.float32)
+    rate = -jnp.asarray(rng.uniform(0.1, 2.0, (heads,)), jnp.float32)
+    skip = jnp.asarray(rng.standard_normal((heads,)), jnp.float32)
     token = {name: jnp.asarray(rng.standard_normal((rows, heads, width)), jnp.float32)
              for name in ('query', 'key', 'value')}
-    beta = jnp.asarray(rng.uniform(0.0, 0.5, (rows, heads)), jnp.float32)
-    rate = -jnp.asarray(rng.uniform(0.1, 2.0, (heads,)), jnp.float32)
-    rated = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
-    whole = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True)
-    skip = jnp.asarray(rng.standard_normal((heads,)), jnp.float32)
-    def stepped(step, state, token, beta, rate, skip):
-        found = step(rated, recurrence.Step(state, **token, beta=beta, rate=rate, skip=skip))
-        want = step(whole, recurrence.Step(state, **token, beta=beta, log_decay=rate[None, :] * beta,
-                                           skip=skip))
-        return found[::2], want[::2]
-
-    for step in (recurrence.step, recurrence.step_reference):
-        found, want = stepped(step, state, token, beta, rate, skip)
-        with jax.enable_x64(new_val=True):
-            _, truth = stepped(recurrence.step_reference, *widened((state, token, beta, rate, skip)))
-        for index, (mine, theirs, exact) in enumerate(zip(found, want, truth, strict=True)):
-            assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), np.asarray(exact),
-                                             f'a rated decay a token, {step.__name__} {index}')
+    token |= {'state': jnp.asarray(rng.standard_normal((rows, heads, width, width)), jnp.float32),
+              'beta': jnp.asarray(rng.uniform(0.0, 0.5, (rows, heads)), jnp.float32), 'rate': rate,
+              'skip': skip}
     sequence = {name: jnp.asarray(rng.standard_normal((rows, LENGTH, heads, width)), jnp.float32)
                 for name in ('query', 'key', 'value')}
     steps = jnp.asarray(rng.uniform(0.0, 0.5, (rows, LENGTH, heads)), jnp.float32)
-    def chunked(sequence, steps, rate, skip):
-        found = chunk_on('xla', rated, Chunk(**sequence, beta=steps, rate=rate, skip=skip), chunk_size=CHUNK)
-        want = chunk_on('xla', whole, Chunk(**sequence, beta=steps, log_decay=rate[None, None, :] * steps,
-                                            skip=skip), chunk_size=CHUNK)
-        return found, want
+    sequence |= {'beta': steps, 'rate': rate, 'skip': skip}
+    return token, sequence
 
-    found, want = chunked(sequence, steps, rate, skip)
-    with jax.enable_x64(new_val=True):
-        _, truth = chunked(*widened((sequence, steps, rate, skip)))
-    for index, (mine, theirs, exact) in enumerate(zip(found, want, truth, strict=True)):
-        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), np.asarray(exact),
-                                         f'a rated decay over a sequence {index}')
+
+def decayed(hooks, token: dict, sequence: dict) -> tuple:
+    """`hooks`' decode token on the launch and on its reference, and its chunked sequence on the portable
+    math, `rated_draw`'s operands read as `hooks` reads them: a rated decay's rate, or that rate times the
+    write gate given whole as the log decay."""
+    def operands(given: dict, leading) -> dict:
+        given = dict(given)
+        rate = given.pop('rate')
+        return given | ({'rate': rate} if hooks.rated else {'log_decay': rate[leading] * given['beta']})
+
+    stepped = [step(hooks, recurrence.Step(**operands(token, (None, slice(None)))))[::2]
+               for step in (recurrence.step, recurrence.step_reference)]
+    chunked = chunk_on('xla', hooks, Chunk(**operands(sequence, (None, None, slice(None)))), chunk_size=CHUNK)
+    return (*stepped, chunked)
+
+
+def test_a_rated_decay_is_its_log_decay():
+    """A rated decay (`rate` times the write gate) steps a decode token, on the launch and on its reference,
+    and a chunked sequence on the portable math as the same log decay given whole: on par with the whole
+    decay's from float64 over the site's seeds (check 1)."""
+    assert_as_exact(functools.partial(decayed, RATED), functools.partial(decayed, WHOLE), rated_draw,
+                    'a rated decay against its log decay', seeds=RATED_SEEDS)
 
 
 def test_the_operands_are_checked_as_the_decode_steps():

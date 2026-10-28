@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact
 from tuned import each_config, taken
 
 from dew.nn.kernels import recurrence, tuning
@@ -259,32 +259,46 @@ def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
                         truth_fn=jax.jit(functools.partial(recurrence.step_reference, one_tap)))
 
 
+SKIP_SEEDS = 8
+"""The skip's forward-mode site's declared seeds, sized paired by `seeds_for` on armada."""
+
+SKIPPED = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+
+
+def skipped(skip, value):
+    """The skip `D v` alone (`recurrence.skipped` over a zero output)."""
+    return recurrence.skipped(SKIPPED, jnp.zeros_like(value), value, {'skip': skip}, jnp.float32)
+
+
+def skip_product(skip, value):
+    """`D v` as a plain product."""
+    return skip[:, None] * value
+
+
+def skip_draw(seed: int) -> tuple:
+    """A skip `[3]` and values `[2, 7, 3, 5]`, and a direction in each, from the seed's key."""
+    keys = jax.random.split(jax.random.key(seed), 4)
+    return (jax.random.normal(keys[0], (3,)), jax.random.normal(keys[1], (2, 7, 3, 5)),
+            jax.random.normal(keys[2], (3,)), jax.random.normal(keys[3], (2, 7, 3, 5)))
+
+
+def forward_mode(fn):
+    """`fn`'s output and tangent under `jax.jvp`, and its tangent under `jax.linearize`, along a direction."""
+    def run(skip, value, d_skip, d_value):
+        output, tangent = jax.jvp(fn, (skip, value), (d_skip, d_value))
+        return output, tangent, jax.linearize(fn, skip, value)[1](d_skip, d_value)
+
+    return run
+
+
 def test_the_skip_takes_forward_and_reverse_mode():
     """The skip `D v` (`recurrence.skipped`) under `jax.jvp` and `jax.linearize` takes the product's own
-    tangent, on par with the plain product's from float64 (the gate's one-draw rule), and under `jax.grad`
-    its reverse rule's gradient in `D`, the product's summed over every token and value (a decode step's
-    reference reaches it: a custom VJP alone refused `jax.jvp`)."""
-    keys = jax.random.split(jax.random.key(5), 4)
-    skip, value = jax.random.normal(keys[0], (3,)), jax.random.normal(keys[1], (2, 7, 3, 5))
-    directions = jax.random.normal(keys[2], (3,)), jax.random.normal(keys[3], (2, 7, 3, 5))
-    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
-
-    def skipped(skip, value):
-        return recurrence.skipped(hooks, jnp.zeros_like(value), value, {'skip': skip}, jnp.float32)
-
-    def product(d, v):
-        return d[:, None] * v
-
-    found = jax.jit(lambda *a: jax.jvp(skipped, a, directions))(skip, value)
-    want = jax.jit(lambda *a: jax.jvp(product, a, directions))(skip, value)
-    with jax.enable_x64(new_val=True):
-        truth = jax.jvp(product, tuple(widened((skip, value))), tuple(widened(directions)))
-    linearized = jax.jit(lambda *a: jax.linearize(skipped, *a)[1](*directions))(skip, value)
-    for label, mine, theirs, exact in (('output', found[0], want[0], truth[0]),
-                                       ('tangent', found[1], want[1], truth[1]),
-                                       ('linearized tangent', linearized, want[1], truth[1])):
-        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), np.asarray(exact),
-                                         f"the skip's {label}")
+    tangent, on par with the plain product's from float64 over the site's seeds (check 1), and under
+    `jax.grad` its reverse rule's gradient in `D`, the product's summed over every token and value (a
+    decode step's reference reaches it: a custom VJP alone refused `jax.jvp`)."""
+    assert_as_exact(forward_mode(skipped), forward_mode(skip_product), skip_draw, "the skip's forward mode",
+                    seeds=SKIP_SEEDS)
+    skip, value, *_ = skip_draw(0)
     # Its reverse rule's gradient held to float64 by test_recurrence_stability's rated sites.
     gradient = jax.jit(jax.grad(lambda d: jnp.sum(skipped(d, value) * value)))(skip)
     assert gradient.shape == skip.shape and bool(jnp.all(jnp.isfinite(gradient)))
