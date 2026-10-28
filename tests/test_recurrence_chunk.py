@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, chain_roundings, widened
+from reference_error import assert_as_exact, assert_fp32_reduction_bound, chain_roundings, widened
 
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
@@ -217,14 +217,13 @@ def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
         wide = widened((operands, beta))
         truth = np.asarray(reference(*wide, jnp.float64))
         residual = np.asarray(reference(*wide, jnp.float64, hooks=dataclasses.replace(hooks, output=None)))
-    # The oracle rule for a fixed input: within fp32's rounding over the op's chain of roundings of its terms'
-    # magnitude (the readout and the skip, about 0.1), times the norm's gain over the residual where it reads
-    # it; a readout rounded to bf16 first misses by the whole residual.
+    # The oracle rule for a fixed input: within fp32's rounding over the op's chain of roundings of its two
+    # terms' magnitude (the readout and the skip, each about 0.1), times the norm's gain over the residual
+    # where it reads it; a readout rounded to bf16 first misses by the whole residual.
     gain = float(np.max(np.abs(truth)) / np.max(np.abs(residual)))
-    bound = (chain_roundings(jax.make_jaxpr(op)(operands)) * float(np.finfo(np.float32).eps) * gain
-             * float(np.max(np.abs(np.asarray(operands.skip, np.float64)))))
-    apart = float(np.max(np.abs(np.asarray(found[:, 0], np.float64) - truth)))
-    assert apart <= bound, f'{hooks}: {apart:.3e} from float64, past its rounding bound {bound:.3e}'
+    terms = 2 * gain * float(np.max(np.abs(np.asarray(operands.skip, np.float64))))
+    assert_fp32_reduction_bound(found[:, 0], truth, np.full(truth.shape, terms),
+                                chain_roundings(jax.make_jaxpr(op)(operands)))
     assert np.all(np.asarray(found) != 0.0)
 
 
