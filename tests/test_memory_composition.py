@@ -497,14 +497,11 @@ def test_a_served_memory_computes_the_quantized_memory_from_its_stored_w0(case):
 def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream():
     """A memory decoder served quantized (`TextGeneration.quantized`) under a spec that rounds the
     backward stochastically (`bwd_qtype`, `bwd_stochastic_rounding`) draws its inner steps' rounding from
-    its request's own key, folded with each token's place (`dew.nn.kv_cache.ROUNDING_KEYS`), apart from
-    its sampling: a request generates alike alone and served beside another, in either slot of one live
-    server, tokens, lengths, termination and likelihoods; and another key rounds apart, its likelihoods
-    moving though greedy decoding draws nothing. Without the stream the decode raised in Qwix's make_rng
-    (ledger 2020)."""
+    its request's own key (`dew.sampling.text.rounding_keys`): a task and a server generate, a request
+    again generates alike, and another key rounds apart, its likelihoods moving though greedy decoding
+    draws nothing. Without the stream the decode raised in Qwix's make_rng (ledger 2020)."""
     pytest.importorskip("qwix")
     from model_support import Digits
-    from test_serving import assert_same_generation
 
     from dew.inference import RunProcessor, TextGeneration
     from dew.inference.serving import Server
@@ -517,13 +514,44 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream():
                           sampling=Sampling(temperature=0, eos_token_ids=12))
     bound = task.quantized(Quantization(patterns=(INNER,), bwd_qtype="int8",
                                         bwd_stochastic_rounding="uniform"))
-    alone = {prompt: bound(prompt, 4, key=3) for prompt in ("12", "567")}
-    server = Server.from_task(bound, slots=2, capacity=64)
-    for prompts in (["12", "567"], ["567", "12"]):
-        for served, prompt in zip(server(prompts, 4, key=3), prompts, strict=True):
-            assert_same_generation(served, alone[prompt])
-    assert not np.array_equal(np.asarray(bound("12", 4, key=4).raw_log_probs),
-                              np.asarray(alone["12"].raw_log_probs))
+    first = bound("12", 4, key=3)
+    np.testing.assert_array_equal(np.asarray(bound("12", 4, key=3).raw_log_probs),
+                                  np.asarray(first.raw_log_probs))
+    moved = bound("12", 4, key=4)
+    assert not np.array_equal(np.asarray(moved.raw_log_probs), np.asarray(first.raw_log_probs))
+    assert len(Server.from_task(bound, slots=2, capacity=64)(["12", "567"], 4, key=3)) == 2
+
+
+def test_a_cached_memorys_rounding_is_each_rows_own():
+    """A cached memory's stochastic rounding draws from each row's key in the cache
+    (`dew.nn.kv_cache.ROUNDING_KEYS`) folded with each token's place: in one program over the same
+    tokens, a row computes alike whatever key another row holds, and its own key moves it, so a served
+    request's rounding is its key's alone, whatever batch or slot holds it (ledger 2020). Weight-only
+    serving keeps the rows' arithmetic apart, so only the stream could join them."""
+    pytest.importorskip("qwix")
+    from model_support import model_draw
+
+    from dew.nn.kv_cache import with_rounding_keys
+    from dew.quantization import Quantization, quantize_for_serving
+    from dew.sampling.text import rounding_keys
+
+    model = decoder()
+    variables, ids = model_draw(model, (2, LENGTH), 37)(0)
+    spec = Quantization(patterns=(INNER,), weight_only=True, bwd_qtype="int8",
+                        bwd_stochastic_rounding="uniform")
+    served, held = quantize_for_serving(model, variables, spec, ids)
+    empty = served.apply(held, 2, method="init_cache", mutable=["cache"])[1]["cache"]
+
+    @jax.jit
+    def decoded(rounding):
+        return served.apply({**held, "cache": with_rounding_keys(empty, rounding)}, ids, decode=True,
+                            mutable=["cache"])[0]
+
+    keys = rounding_keys(jax.random.split(jax.random.key(1), 2))
+    other = keys.at[1].set(rounding_keys(jax.random.key(2)[None])[0])
+    mine, theirs = np.asarray(decoded(keys)), np.asarray(decoded(other))
+    np.testing.assert_array_equal(mine[0], theirs[0])
+    assert not np.array_equal(mine[1], theirs[1])
 
 
 def test_a_qwix_quantized_linear_memory_leaves_the_recurrence():
