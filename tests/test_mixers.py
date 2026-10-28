@@ -365,7 +365,7 @@ POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "a
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}
 """Layer fields a kind needs to build at all, beyond the test's context."""
 
-ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory"}
+ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory", "short_conv"}
 """The registry's kinds that mix tokens without attention, whose layers' attention policies are not theirs."""
 
 
