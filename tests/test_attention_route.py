@@ -350,14 +350,21 @@ def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_refere
 def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
     groups, or key validity and counted places, documents and a window it draws over the mask its spans
-    mean, so it is the same call as one given that mask (`dews_mask`) under the same key, bitwise."""
+    mean, so it is on par (check 1) with one given that mask (`dews_mask`) under the same key, whose float64
+    run is the truth: a call that drew over other keys, or dropped others, would sit far from it."""
     case = CASES[name]
-    query, key, value, _, _ = drawing(*geometry(case), jnp.float32, sinks=False)(0)
     dropped = functools.partial(scaled_dot_product_attention, dropout_rate=0.25,
                                 dropout_rng=jax.random.key(3), deterministic=False)
-    blocked = dropped(query, key, value, **keywords(case))
-    masked = dropped(query, key, value, mask=jnp.asarray(dews_mask(case))[:, None])
-    np.testing.assert_array_equal(np.asarray(blocked), np.asarray(masked))
+
+    def blocked(query, key, value):
+        return dropped(query, key, value, **keywords(case))
+
+    def masked(query, key, value):
+        return dropped(query, key, value, mask=jnp.asarray(dews_mask(case))[:, None])
+
+    draw = drawing(*geometry(case), jnp.float32, sinks=False)
+    assert_as_exact(jax.jit(blocked), jax.jit(masked), lambda seed: draw(seed)[:3],
+                    f"dropped {name} over its spans' mask", seeds=SEEDS)
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
@@ -414,20 +421,31 @@ def test_the_accurate_form_is_one_option_away():
 
 def test_narrowed_operands_hand_back_their_gradients_unrounded():
     """A call whose key and value arrive wider than the mainloops compute them (`operand_dtype`, a sharding
-    wrapper's, so its partial gradients sum wide and round once) runs bitwise the narrow call's forward, and
-    hands back the key's and value's gradients in their own fp32, which round to the narrow call's own."""
+    wrapper's, so its partial gradients sum wide and round once) is on par with the reference path (check
+    1), its forward and its key's and value's gradients, which it hands back in their own fp32."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
-    query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)(0)
+    draw = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)
 
-    def routed(k, v, **narrowed):
-        return jax.vjp(lambda k, v: attention_route.attend(query, k, v, spans, **narrowed), k, v)
+    def pulled_over(attend, query, key, value, dout):
+        out, pull = jax.vjp(lambda k, v: attend(query, k, v), key, value)
+        return (out, *pull(dout))
 
-    narrow, pull = routed(key, value)
-    wide, pull_wide = routed(key.astype(jnp.float32), value.astype(jnp.float32), operand_dtype=jnp.bfloat16)
-    np.testing.assert_array_equal(np.asarray(wide), np.asarray(narrow))
-    for mine, theirs in zip(pull_wide(dout), pull(dout), strict=True):
-        assert mine.dtype == jnp.float32
-        np.testing.assert_array_equal(np.asarray(mine.astype(jnp.bfloat16)), np.asarray(theirs))
+    def wide(query, key, value, dout):
+        def attend(query, key, value):
+            return attention_route.attend(query, key, value, spans, operand_dtype=jnp.bfloat16)
+        return pulled_over(attend, query, key.astype(jnp.float32), value.astype(jnp.float32), dout)
+
+    def routed(query, key, value, dout):
+        def attend(query, key, value):
+            return scaled_dot_product_attention(query, key, value, causal=True, implementation="reference")
+        return pulled_over(attend, query, key, value, dout)
+
+    def drawn(seed):
+        query, key, value, _, dout = draw(seed)
+        return query, key, value, dout
+
+    assert all(leaf.dtype == jnp.float32 for leaf in jax.eval_shape(wide, *drawn(0))[1:])
+    assert_as_exact(jax.jit(wide), jax.jit(routed), drawn, "wide operands narrowed in the route", seeds=SEEDS)
 
 
 def test_the_template_reports_the_mainloop_each_pass_runs():
