@@ -331,8 +331,8 @@ print(content_version(CachedOnly(), filename, os.stat(filename).st_size))
 def test_processes_sharing_the_cache_version_their_files_at_once(tmp_path, monkeypatch):
     """Four processes sharing Dew's cache version 64 local files at once, each in its own order:
     each file's version is recorded alone, so every process reads every file's checksum, none
-    waiting on another file's record (a shared store failed one of them under load with sqlite's
-    "database is locked")."""
+    waiting on another file's record. It reads them as they come, a check of what concurrent
+    versioning returns; the load under which a shared store failed is not reproduced here."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     paths = []
     for index in range(64):
