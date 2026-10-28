@@ -664,23 +664,37 @@ class Refused(jax.errors.JaxRuntimeError):
         return self.code
 
 
-AUTOTUNED = ("All configs failed during profiling or were excluded from selection.\nFailures (2):\n"
-             "EXECUTION FAILED: {}: Out of memory while trying to allocate 7.83GiB on GPU_0_bfc.\n"
-             "EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 7.83GiB.")
+OUT_OF_MEMORY = ("EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 7.83GiB with "
+                 "allocator GPU_0_bfc on device 0. [tf-allocator-allocation-error='']")
+
+
+def autotuned(*failures: str) -> str:
+    """A GPU GEMM autotuner's NOT_FOUND message listing `failures`, as XLA's `PickBestConfig` writes it."""
+    return ("All configs failed during profiling or were excluded from selection.\n"
+            f"Failures ({len(failures)}):\n" + "\n".join(failures))
 
 
 @pytest.mark.parametrize(("code", "message", "refused"), [
     ("RESOURCE_EXHAUSTED", "XLA:TPU's temporaries past HBM", True),
-    ("NOT_FOUND", AUTOTUNED.format("RESOURCE_EXHAUSTED"), True),
-    ("NOT_FOUND", AUTOTUNED.format("INTERNAL"), False),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, OUT_OF_MEMORY), True),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "EXECUTION FAILED: INTERNAL: an illegal address"), False),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "COMPILATION FAILED: INTERNAL: ptxas exited with 255"), False),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "REDZONE CHECK FAILED: the kernel wrote past its output"), False),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "WRONG RESULTS: Output disagrees with winning cluster"), False),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "cublas_config: Backend excluded from selection (CUBLAS)"), False),
+    ("NOT_FOUND", "All configs failed during profiling or were excluded from selection.", False),
     ("NOT_FOUND", "no config for this fusion", False),
     ("INTERNAL", "a ptxas failure", False)],
-    ids=["exhausted", "autotuned-out-of-memory", "autotuned-otherwise", "not-found", "internal"])
+    ids=["exhausted", "autotuned-out-of-memory", "autotuned-executed-otherwise",
+         "autotuned-compilation-failed", "autotuned-redzone", "autotuned-wrong-results", "autotuned-excluded",
+         "autotuned-nothing-listed", "not-found", "internal"])
 def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, refused):
     """XLA's refusal for memory, which the plan reads as the rung's miss and climbs past
-    (`compiled_if_it_fits`), is RESOURCE_EXHAUSTED, or a GPU GEMM autotuner's NOT_FOUND where every config
-    it profiled ran out of memory, as an A100's did at a whole head's GEMM (node receipt
-    TL-a100-offload-1338-d); a config that failed otherwise, or any other error, is raised."""
+    (`compiled_if_it_fits`), is RESOURCE_EXHAUSTED, or a GPU GEMM autotuner's NOT_FOUND where every failure
+    it lists is a config's execution out of memory, as an A100's were at a whole head's GEMM (node receipt
+    TL-a100-offload-1338-d). One failure of another kind beside them, a config that failed to compile, its
+    redzone check or its results, or a backend excluded, and the error is raised as it came, as is any
+    other."""
     from dew.training.memory import compiled_if_it_fits
 
     error = Refused(code, message)

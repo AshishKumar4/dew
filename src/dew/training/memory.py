@@ -123,17 +123,30 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
         return None
 
 
+AUTOTUNED_FAILURES = re.compile(r"^Failures \((\d+)\):$", re.MULTILINE)
+"""The head of a GPU GEMM autotuner's list of what failed (XLA's `PickBestConfig`, config_selector.cc): every
+config's failure (`ConfigRunner::Failure::ToString`, config_runner.cc: `EXECUTION FAILED`, `COMPILATION
+FAILED`, `REDZONE CHECK FAILED` or `WRONG RESULTS`, then its status) and every excluded backend's line, one
+a line, as many as the head counts."""
+
+EXECUTED_OUT_OF_MEMORY = re.compile(r"^EXECUTION FAILED: RESOURCE_EXHAUSTED: ", re.MULTILINE)
+
+
 def refused_for_memory(code: str, message: str) -> bool:
     """Whether XLA refused a program it compiled for memory, by its error's status `code` and `message`:
     RESOURCE_EXHAUSTED, or on a GPU its GEMM autotuner finding no config it could profile (NOT_FOUND)
-    where each config it tried ran out of device memory. An A100 with 0.30 of its memory to a decoder's
-    step refused it so at the whole head's f32[65536,32000] GEMM, each config 7.83 GiB short (node
-    receipt TL-a100-offload-1338-d): the step at a rung that holds less compiles."""
+    where each of the failures it lists (`AUTOTUNED_FAILURES`) is a config's execution out of device
+    memory. One that failed to compile, failed its redzone check or gave wrong results, or a backend
+    excluded beside them, is no memory refusal, and the error is raised. An A100 with 0.30 of its memory
+    to a decoder's step refused it so at the whole head's f32[65536,32000] GEMM, each of its eight configs
+    7.83 GiB short (node receipt TL-a100-offload-1338-d): the step at a rung that holds less compiles."""
     if code == 'RESOURCE_EXHAUSTED':
         return True
-    failures = re.findall(r"^EXECUTION FAILED: (\w+):", message, flags=re.MULTILINE)
-    return (code == 'NOT_FOUND' and bool(failures)
-            and all(failure == 'RESOURCE_EXHAUSTED' for failure in failures))
+    listed = AUTOTUNED_FAILURES.search(message)
+    if code != 'NOT_FOUND' or listed is None:
+        return False
+    count = int(listed.group(1))
+    return count > 0 and len(EXECUTED_OUT_OF_MEMORY.findall(message, listed.end())) == count
 
 
 def split_share(params: Variables) -> float:
