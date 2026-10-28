@@ -42,7 +42,6 @@ from dew.batch import (
     coordinates as build_coordinates,
     merge,
     shifted_span,
-    with_firsts,
 )
 from dew.mesh import LayoutRefused
 from dew.nn.continuum import Continuum, ContinuumLevel
@@ -1795,8 +1794,7 @@ class CausalTransformer(nn.Module):
                 and context is None):
             return None
         return AttentionMetadata(
-            # The packed documents' firsts built once a step, every layer reading them (`with_firsts`).
-            coordinates=with_firsts(coordinates), image_groups=image_groups, block_groups=block_groups,
+            coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
             rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
             key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
             media=media_mask,

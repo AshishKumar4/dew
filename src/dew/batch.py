@@ -140,12 +140,12 @@ class Coordinates:
     a layer's fast path reads as a static fact. `firsts` `[B, D]` are each
     row's documents' first slots in order, the row's first slot among them,
     `S` past its last (`document_firsts`): the packed documents' coordinates
-    every varlen kernel reads (`dew.nn.inputs.cu_seqlens`), built once a
-    step, never by a layer: by `coordinates` in a traced step, and for a batch
-    a host built (whose fields stay its loader's) by the model's entry
-    (`with_firsts`); each layer's own scan over the batch's flattened tokens,
-    which a mesh splits, ran one token a loop iteration on a 2xH100 run (row
-    1897). `max_segments` bounds the documents a row holds
+    every varlen kernel reads (`dew.nn.inputs.cu_seqlens`), built with the
+    coordinates, never by a layer: by one builder wherever coordinates are
+    made, a host's batch and a traced step's alike, or their slots sliced or
+    rotated (`along_tokens`; row 1923); each layer's own scan over the
+    batch's flattened tokens, which a mesh splits, ran one token a loop
+    iteration on a 2xH100 run (row 1897). `max_segments` bounds the documents a row holds
     (the packer's static plan, else the row length) and `right_padded` says
     every row's real tokens come first.
     """
@@ -168,9 +168,12 @@ class Coordinates:
 
     def along_tokens(self, transform: Callable[[jax.Array], jax.Array]) -> Coordinates:
         """`transform` applied along the tokens to each token-aligned field (`TOKEN_ALIGNED`): a slice or a
-        rotation of the slots. The documents' firsts, which index the slots, go, their reader rebuilding
-        them from the moved starts (`with_firsts`, `dew.nn.inputs.cu_seqlens`)."""
-        return replace(self, firsts=None, **{name: transform(value) for name, value in self.tokens().items()})
+        rotation of the slots. The documents' firsts, which index the slots, are built again from the
+        moved starts (`document_firsts`), as every `Coordinates` builds them."""
+        moved = replace(self, **{name: transform(value) for name, value in self.tokens().items()})
+        if moved.starts is None:
+            return moved
+        return replace(moved, firsts=document_firsts(moved.starts, moved.max_segments + 1))
 
     def places(self) -> jax.Array | None:
         """Each token's logical place in an uncached call: the given `positions`, else its rank among
@@ -217,18 +220,10 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
         positions = xp.where(real, document_ranks(real, starts, xp=xp), 0)
     positions = None if positions is None else xp.asarray(positions, np.int32)
     max_segments = (1 if segments is None else length) if max_segments is None else max_segments
-    # The documents' firsts in a traced step; a host's batch keeps its loader's fields (`with_firsts`).
-    firsts = None if starts is None or xp is np else document_firsts(starts, max_segments + 1)
+    # The documents' firsts, by the one builder a host's batch and a traced step's alike take.
+    firsts = None if starts is None else document_firsts(starts, max_segments + 1, xp=xp)
     return Coordinates(positions, segments, valid, starts, firsts, max_segments=max_segments,
                        right_padded=right_padded)
-
-
-def with_firsts(tokens: Coordinates | None) -> Coordinates | None:
-    """`tokens` with their documents' firsts (`Coordinates.firsts`), built from their starts where a host
-    built them without: a model's entry calls it once a step, its layers reading them."""
-    if tokens is None or tokens.starts is None or tokens.firsts is not None:
-        return tokens
-    return replace(tokens, firsts=document_firsts(jnp.asarray(tokens.starts), tokens.max_segments + 1))
 
 
 def document_firsts(starts, documents: int, *, xp=jnp):
