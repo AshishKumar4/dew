@@ -122,14 +122,19 @@ def test_the_training_sigmas_are_nvlabs(regime, site):
     assert_certified(schedule.sigmas, draw, f"{site} sigmas", seeds=8)
 
 
+def assert_on_par_with_nvlabs(site: str, loss) -> None:
+    """Dew's `loss` on par with `site`'s recording of NVlabs' own over its declared seeds (check 1)."""
+    draw, recorded, truth, seeds = recorded_site(site)
+    compiled = jax.jit(loss)
+    assert_as_exact(lambda index, inputs: compiled(inputs), recorded, draw, f"{site} loss", seeds=seeds,
+                    truth_fn=truth)
+
+
 def test_the_pixel_loss_and_its_gradient_are_edmloss():
     """NVlabs/edm's EDMLoss at its defaults (P_mean -1.2, P_std 1.2,
     sigma_data 0.5) through EDMPrecond, against `EDM(regime="pixel")`, over
     the recorded seeds (check 1)."""
-    draw, recorded, truth, seeds = recorded_site("edm")
-    compiled = jax.jit(edm_loss)
-    assert_as_exact(lambda index, inputs: compiled(inputs), recorded, draw, "EDM loss", seeds=seeds,
-                    truth_fn=truth)
+    assert_on_par_with_nvlabs("edm", edm_loss)
 
 
 def test_the_latent_loss_with_learned_uncertainty_and_its_gradient_are_edm2loss():
@@ -138,7 +143,4 @@ def test_the_latent_loss_with_learned_uncertainty_and_its_gradient_are_edm2loss(
     `EDM(regime="latent")` with `dew.nn.mp.Uncertainty` holding the same
     Fourier features and weight, over the recorded seeds (check 1). The
     gradient reaches the head's weight as it reaches the network's."""
-    draw, recorded, truth, seeds = recorded_site("edm2")
-    compiled = jax.jit(edm2_loss)
-    assert_as_exact(lambda index, inputs: compiled(inputs), recorded, draw, "EDM2 loss", seeds=seeds,
-                    truth_fn=truth)
+    assert_on_par_with_nvlabs("edm2", edm2_loss)
