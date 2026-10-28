@@ -471,8 +471,7 @@ def entering(span: Span, axis: str, initial=None, issue: Issue = portable) -> ja
     shards, index = jax.lax.axis_size(axis), jax.lax.axis_index(axis)
 
     def shifted(value, shift: int):
-        pairs = [(r, r + shift) for r in range(shards - shift)]
-        return jax.tree.map(lambda x: jax.lax.ppermute(x, axis, pairs), value)
+        return jax.lax.ppermute(value, axis, [(r, r + shift) for r in range(shards - shift)])
 
     span, shift = Span(*span), 1
     while shift < shards:

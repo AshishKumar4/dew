@@ -43,6 +43,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import inspect
 import math
 from collections.abc import Callable, Sequence
 
@@ -585,6 +586,28 @@ _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned"
 """Where `planned` collects its launches; None where they run."""
 
 
+STATIC = ("call", "tiles", "scale", "keeps", "out_dtype")
+"""A launch's static arguments, by name (`_lowered_once`): its call's geometry, bundle and target, its tiles
+and its constants; its every other argument an array or None."""
+
+
+def _lowered_once(launch: Callable) -> Callable:
+    """`launch` jitted, its static arguments (`STATIC`) those of its signature: each call site of a
+    configuration traces the same program, which JAX lowers once a program (its lowering caches a jaxpr's
+    function), however many layers, passes and recomputations call it. A launch's program closes over its
+    call, so each call traced its own and each kernel was lowered and serialized again a call: a hybrid
+    model's step lowered its layers' identical kernels one by one. Planning (`planned`) traces every call,
+    each launch recording itself (`_kernel`)."""
+    parameters = inspect.signature(launch).parameters
+    jitted = jax.jit(launch, static_argnames=tuple(name for name in STATIC if name in parameters))
+
+    @functools.wraps(launch)
+    def called(*args, **kwargs):
+        return launch(*args, **kwargs) if _PLANNED.get() is not None else jitted(*args, **kwargs)
+
+    return called
+
+
 def _scope(*allocations, reduces: bool = True, after: tuple = ()) -> resources.Scope:
     """A program's allocations by lifetime (`resources.Scope`, whose bytes `resources.shared_bytes` counts as
     Mosaic GPU's resource estimate does): a pipelined family's streams (`mosaic_sm80.Pipeline`, which
@@ -825,6 +848,7 @@ def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callab
     family.roles(1, consumer, lambda: family.stream(streams, views, 0, steps))
 
 
+@_lowered_once
 def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     """`(a [R, HV * C], w [R, HV * Dk], u [R, HV * Dv])` as `call.held` of each chunk and value head under a
     decay a head, fla's kkt_solve and recompute_w_u in one program (FlashQLA's first kernel): the keys'
@@ -931,6 +955,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     return solved if keeps else (None, *solved)
 
 
+@_lowered_once
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     """`((I + A)^-1, Aqk)` of each chunk and value head under a decay a key dimension, `[R, HV * C]` each as
     `call.held`: the chunk's scores and its keys' system, each pair's decay factored over the chunk's
@@ -1024,6 +1049,7 @@ def _pairing(call: _Call) -> list:
     return [_staging(_pairing_operand(call), (CHUNK, call.block))[0] for _ in range(2)]
 
 
+@_lowered_once
 def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     """`(w [R, HV * Dk], u [R, HV * Dv])` as `call.held` (`algebra.weighted`): the inverse against the decayed
     write-gated keys and against the write-gated values; under a decay a key dimension, also the keys decayed
@@ -1270,6 +1296,7 @@ def _states_held(call: _Call, values: _Operand, keys: _Operand, bv: int) -> _Hel
         + _fragments(call, (held, CHUNK, call.block), (keys, CHUNK, call.block)),))
 
 
+@_lowered_once
 def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Tiles):
     """`(h [chunks * HV * Dk, Dv], corrected [R, HV * Dv], final [B * HV * Dk, Dv])`: the memory each chunk
     enters and the corrected values as `call.held`, and each row's final memory, fp32, each sequence's chunks
@@ -1441,6 +1468,7 @@ def _output_held(call: _Call, bv: int) -> _Held:
     return _Held(phases=(values + scores,))
 
 
+@_lowered_once
 def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, scale: float, out_dtype,
             scores=None):
     """Each chunk's output `[R, HV * Dv]` in `out_dtype`, a program a chunk and value head and a step each
@@ -1888,6 +1916,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
 # XLA adds.
 
 
+@_lowered_once
 def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     """`[R, HV * Dv]` as `call.held`: the corrected values' gradient from each chunk's own output
     (`algebra.local_gradient`, fla's chunk_bwd_dv_local), rounded as fla's, a program a chunk and value head
@@ -1951,6 +1980,7 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
         q, k, do, hi, lo, hi, lo, taken)
 
 
+@_lowered_once
 def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Tiles, *, scale: float):
     """`(dh [chunks * HV * Dk, Dv], dv [R, HV * Dv], dh0 [B * HV * Dk, Dv])`: the gradient of the memory each
     chunk leaves as `call.memories`, the corrected values' gradient as `call.held` (their own output's,
@@ -2119,6 +2149,7 @@ def _query_key_held(call: _Call) -> _Held:
                                                                                       call.block)),))
 
 
+@_lowered_once
 def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *, scale: float):
     """`(dq, dk [R, H * Dk] fp32, dw [R, HV * Dk] as call.held, after, leaving [blocks, HV, R], memory
     [blocks, HV, chunks * block] fp32)`: each chunk's and key block's queries', keys' and weights' gradients
@@ -2209,6 +2240,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken)
 
 
+@_lowered_once
 def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: float):
     """`(ds [R, HV * C] as call.held, decay [HV, R] fp32)`: each chunk and value head's scores' gradient and
     the decay's gradient from its pair terms (`algebra.scores_gradient`, `algebra.summed_pairs`), fla's
@@ -2272,6 +2304,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
                    persistent=True)(q, k, corrected, do, hi, lo, hi, lo, taken)
 
 
+@_lowered_once
 def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
     """`dL [R, HV * C]` as `call.held`: the WY representation's backward's system part a chunk and value head
     at a time (fla's prepare_wy_repr_bwd's, `algebra.system_gradient`) from `w`'s and `u`'s gradients `dw`,
@@ -2331,6 +2364,7 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
                                                                    taken)
 
 
+@_lowered_once
 def _values_back(a, v, du, beta, taken, call: _Call):
     """`dv [R, HV * Dv]` as `call.held` and `dbeta [HV, R]` fp32: the WY representation's backward's values'
     part a chunk and value head at a time (`algebra.values_gradient`): the values' gradient and beta's
@@ -2376,6 +2410,7 @@ def _values_back(a, v, du, beta, taken, call: _Call):
                    landing={"block": held.landing(CHUNK, call.block)})(a, v, du, beta, taken)
 
 
+@_lowered_once
 def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: _Call):
     """`dk [R, HV * Dk]` as `call.held` and `(dbeta, after, decay [HV, R])` fp32: the WY representation's
     backward's keys' part a chunk and value head at a time (`algebra.keys_gradient`), given the system's
