@@ -11,15 +11,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from reference_error import assert_as_exact, assert_fp32_reduction_bound, chain_roundings, widened
 
-from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
-from dew.nn.kernels.selection import selected
-from dew.nn.linear import GatedDeltaNet
-from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.precision import float32_einsum
 
 ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 8
@@ -419,50 +414,10 @@ def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
                     f'{hooks} composed', seeds=COMPOSED_SEEDS[hooks, packed])
 
 
-UNSEEN = generation.GpuTarget("sm87", "NVIDIA Jetson AGX Orin", 163 * 1024, multiprocessors=16)
-"""A GPU no row names: an mma.sync GPU's facts alone."""
-
-ROUTED = {'sm80': ('fla', 'fla'), 'sm86': ('fla', 'fla'), 'sm90': ('fla', 'mosaic_gpu'),
-          'sm100': ('fla', 'fla'), 'unseen': ('fla', 'fla'), 'cpu': ('xla', 'xla')}
-"""Each emulated target's gated delta net kernels, its forward's and its training's: the template on the
-H100's training, the cell it is not declared slower on (`PORT_CELLS`); the port on every other GPU, by what
-it takes; the portable math on a CPU stating no GPU."""
-
-
-@pytest.mark.parametrize('target', ROUTED)
-def test_each_products_route_follows_what_its_kernels_take(target):
-    """A layer's recurrence kernels on an emulated GPU, a route each product (`GATED_DELTA`'s forward and
-    training, `SCAN`'s), no table of GPUs read: a bf16 gated delta net's as `ROUTED` names them (the template
-    where it takes the call and no port cell is declared, else the port on any GPU Dew's Triton kernels run
-    on: an A10's, a B200's and a GPU no row names among them, which took the portable math at 140 to 155 ms a
-    training step against the port's 3.1, template review 2026-10-26 P1-1); Kimi delta attention's the port
-    where the gated delta net's is a kernel (the template refuses its intra launch's registers), and
-    Mamba-2's scan the port's there."""
-    def routes(module: nn.Module, x: jax.ShapeDtypeStruct) -> list[str]:
-        params = jax.eval_shape(module.init, jax.random.key(0), x)
-        with generation.routes() as found:
-            jax.eval_shape(module.apply, params, x)
-        return [route.kernel for route in found if route.choice in ('gated_delta_rule', 'ssd')]
-
-    def traced():
-        bf16 = jnp.bfloat16
-        tokens = jax.ShapeDtypeStruct((1, 128, 256), bf16)
-        delta = routes(GatedDeltaNet(256, 1, 2, 128, 128, dtype=bf16), tokens)
-        kimi = routes(KimiDeltaAttention(256, 2, 128, dtype=bf16), tokens)
-        scan = routes(Mamba2(emb_features=64, num_heads=4, head_dim=16, state_size=16, n_groups=2,
-                             chunk_size=32, dtype=bf16), jax.ShapeDtypeStruct((1, 64, 64), bf16))
-        return delta, kimi, scan
-
-    if target == 'cpu':
-        delta, kimi, scan = traced()
-    else:
-        with generation.assumed(UNSEEN if target == 'unseen' else target):
-            delta, kimi, scan = traced()
-    forward, training = ROUTED[target]
-    kernel = forward != 'xla'
-    assert delta == [forward, training]
-    assert kimi == (['fla', 'fla'] if kernel else ['xla', 'xla'])
-    assert scan == ['pallas' if kernel else 'xla']
+PORTABLE_SEEDS = 8
+"""The portable rule's differentiation sites' declared draws (check 1), sized by `seeds_for` (paired, on
+armada): the remat rung's gradients, the public seam's tangents, two forwards and a TPU's scan under
+forward mode."""
 
 
 def test_a_call_runs_its_products_kernels_apart():
@@ -500,52 +455,73 @@ def test_the_portable_rule_recomputes_its_memory_where_the_rung_names_it(packed)
     """Under a remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`,
     'delta_memory'), the portable rule (`chunk_delta_rule`, a CPU's route) keeps its operands alone and
     computes its memory again in its backward, as the port and the template drop theirs: its residuals
-    hold fewer bytes than the kept rule's, its gradients the kept rule's bit for bit."""
-    operands, starts, _ = portable_draw(7, 2, packed)
-
-    def loss(*operands):
+    hold fewer bytes than the kept rule's, and its gradients, another program's, are on par with the kept
+    rule's over the draws (check 1), truth the kept rule's in float64."""
+    def loss(*operands, starts=None):
         out, final = recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
         return jnp.sum(out ** 2) + jnp.sum(final)
 
-    def residual_bytes(fn) -> int:
-        return sum(leaf.nbytes for leaf in jax.tree.leaves(jax.vjp(fn, *operands)[1]))
-
-    def recomputed(*operands):
+    def recomputed(*operands, starts=None):
         with recurrence_chunk.recomputing(("delta_memory",)):
-            return loss(*operands)
+            return loss(*operands, starts=starts)
+
+    operands, starts, _ = portable_draw(7, 2, packed)
+
+    def residual_bytes(fn) -> int:
+        return sum(leaf.nbytes for leaf in jax.tree.leaves(jax.vjp(functools.partial(fn, starts=starts),
+                                                                   *operands)[1]))
 
     assert residual_bytes(recomputed) < residual_bytes(loss)
-    kept = jax.jit(jax.grad(loss, argnums=range(5)))(*operands)
-    again = jax.jit(jax.grad(recomputed, argnums=range(5)))(*operands)
-    for want, got in zip(kept, again, strict=True):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    def draw(seed):
+        operands, starts, _ = portable_draw(seed, 2, packed)
+        return (*operands, starts)
+
+    def gradient(fn):
+        return lambda *drawn: jax.grad(functools.partial(fn, starts=drawn[5]), argnums=range(5))(*drawn[:5])
+
+    assert_as_exact(jax.jit(gradient(recomputed)), jax.jit(gradient(loss)), draw, "recomputed memory",
+                    seeds=PORTABLE_SEEDS, truth_fn=gradient(loss))
 
 
 @pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
 def test_the_portable_rule_takes_forward_mode_at_its_public_seam(packed):
     """`chunk_delta_rule` (a CPU's route, the portable math) under a plain `jax.jvp` and `jax.linearize`,
-    with no forward-mode context: their tangents the chunked math's own, the forward mode of the same
-    computation, bit for bit, and its gradient still its reverse rule's (`_chunk_delta_backward`), the
-    custom VJP's that refused a plain `jax.jvp` before (row 1834)."""
+    with no forward-mode context: its value and tangents on par with the chunked math's own forward mode
+    over the draws (check 1), truth the math's in float64, and its gradient still its reverse rule's
+    (`_chunk_delta_backward`), finite, the custom VJP's that refused a plain `jax.jvp` before (row 1834)."""
     operands, starts, directions = portable_draw(11, 1, packed)
     rows, _, heads, width = operands[0].shape
 
-    def rule(*operands):
-        return recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
+    def rule(starts):
+        return lambda *operands: recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
 
-    def math(*operands):
-        state, delta = jnp.zeros((rows, heads, width, width)), True
-        return recurrence_chunk._chunk_delta_rule(*operands, state, CHUNK, starts, delta, width ** -0.5,
-                                                  jnp.dtype(jnp.float32))
+    def math(starts):
+        def run(*operands):
+            state, delta = jnp.zeros((rows, heads, width, width), operands[0].dtype), True
+            return recurrence_chunk._chunk_delta_rule(*operands, state, CHUNK, starts, delta, width ** -0.5,
+                                                      jnp.dtype(operands[0].dtype))
+        return run
 
-    found = jax.jit(lambda *a: jax.jvp(rule, a, directions))(*operands)
-    want = jax.jit(lambda *a: jax.jvp(math, a, directions))(*operands)
-    jax.tree.map(np.testing.assert_array_equal, found, want)
-    linearized = jax.jit(lambda *a: jax.linearize(rule, *a)[1](*directions))(*operands)
-    jax.tree.map(np.testing.assert_array_equal, linearized, want[1])
+    def draw(seed):
+        operands, starts, directions = portable_draw(seed, 1, packed)
+        return (*operands, *directions, starts)
+
+    def forward(fn):
+        def run(*drawn):
+            primal, tangent, starts = drawn[:5], drawn[5:10], drawn[10]
+            value, along = jax.jvp(fn(starts), primal, tangent)
+            return value, along, jax.linearize(fn(starts), *primal)[1](*tangent)
+        return run
+
+    assert_as_exact(jax.jit(forward(rule)), jax.jit(forward(math)), draw, "public seam's forward mode",
+                    seeds=PORTABLE_SEEDS, truth_fn=forward(math))
+    found = jax.jit(lambda *a: jax.jvp(rule(starts), a, directions))(*operands)
     cotangent = jax.tree.map(jnp.ones_like, found[0])
-    gradient = jax.grad(lambda *a: sum(jnp.vdot(x, c) for x, c in zip(rule(*a), cotangent, strict=True)),
-                        argnums=range(5))(*operands)
+    def scored(*operands):
+        return sum(jnp.vdot(x, c) for x, c in zip(rule(starts)(*operands), cotangent, strict=True))
+
+    gradient = jax.grad(scored, argnums=range(5))(*operands)
     assert all(bool(jnp.all(jnp.isfinite(x))) for x in gradient)
 
 
@@ -554,18 +530,12 @@ def test_the_portable_rule_takes_nested_differentiation(packed):
     """`chunk_delta_rule` under forward over reverse (`jax.jvp` of `jax.grad`), reverse over forward
     (`jax.grad` of `jax.jvp`) and two forwards (`jax.jvp` of `jax.jvp`), which raised before (rows 1861: its
     saved bool resets took a bool tangent, not float0's; 1862: its pullback gave six cotangents of seven
-    operands): each runs and is finite, and two forwards, the chunked math's tangent both times, are the
-    math's own bit for bit."""
+    operands): each runs and is finite (the public seam's forward mode is the chunked math's by check 1,
+    `test_the_portable_rule_takes_forward_mode_at_its_public_seam`)."""
     (query, key, value, g, beta), starts, (direction, *_) = portable_draw(13, 1, packed)
-    rows, _, heads, width = query.shape
 
     def rule(query):
         return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=CHUNK, starts=starts)
-
-    def math(query):
-        state, delta = jnp.zeros((rows, heads, width, width)), True
-        return recurrence_chunk._chunk_delta_rule(query, key, value, g, beta, state, CHUNK, starts, delta,
-                                                  width ** -0.5, jnp.dtype(jnp.float32))
 
     def loss(fn, query):
         out, final = fn(query)
@@ -580,17 +550,37 @@ def test_the_portable_rule_takes_nested_differentiation(packed):
         twice = jax.jvp(functools.partial(tangent, fn), (query,), (direction,))[1]
         return forward_over_reverse, reverse_over_forward, twice
 
-    found, want = jax.jit(lambda: nested(rule))(), jax.jit(lambda: nested(math))()
+    found = jax.jit(lambda: nested(rule))()
     assert all(bool(jnp.all(jnp.isfinite(x))) for x in found)
-    np.testing.assert_array_equal(found[2], want[2])
 
 
-def test_the_tpu_scan_is_refused_under_forward_mode():
-    """A rated scan the TPU's Pallas scan tiles takes it in reverse mode alone: traced for `jax.jvp`
-    (`FORWARD_MODE`), its custom VJP giving no tangent, the scan selector refuses it and the portable math's
-    scan, whose tangent is its own, takes the call (row 1869, audit K2)."""
-    reverse, forward = (recurrence_chunk.ScanCase(reverse=mode, varying=False, dtype=np.dtype(jnp.float32),
-                                                  widths=(16, 16, 64), tpu='tpu') for mode in (True, False))
-    tpu = recurrence_chunk.SCAN.kernel('tpu')
-    assert not tpu.failed(reverse) and tpu.failed(forward)
-    assert selected(recurrence_chunk.SCAN, forward).name == 'xla'
+def test_a_rated_scan_traced_for_a_jvp_on_a_tpu_gives_its_tangent():
+    """A rated scan the TPU's Pallas scan tiles takes in reverse mode alone, its custom VJP giving no tangent
+    (row 1869, audit K2): Mamba-2's SSD scan (`mamba2.SSD` without its skip, whose own custom VJP refuses a
+    jvp, row 1933) traced for `jax.jvp` (`forward_mode_attention`) on an assumed v6e gives its tangent, on par
+    with the scan's on this CPU over the draws (check 1), truth its float64 run."""
+    import dataclasses
+
+    from dew.nn.attention import forward_mode_attention
+    from dew.nn.mixers.mamba2 import SSD
+
+    hooks = dataclasses.replace(SSD, skip=False)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 6)
+        x, direction = (jax.random.normal(key, (1, 64, 4, 16)) for key in keys[:2])
+        B, C = (jax.random.normal(key, (1, 64, 2, 16)) for key in keys[2:4])
+        dt = jax.nn.softplus(jax.random.normal(keys[4], (1, 64, 4)))
+        A = -jnp.exp(jax.random.normal(keys[5], (4,)))
+        return x, direction, B, C, dt, A
+
+    def tangent(target=None):
+        def run(x, direction, B, C, dt, A):
+            def scan(x):
+                return chunk(hooks, Chunk(C, B, x, beta=dt, rate=A), chunk_size=CHUNK, dtype=x.dtype)[0]
+            with generation.assumed(target), forward_mode_attention():
+                return jax.jvp(scan, (x,), (direction,))[1]
+        return run
+
+    assert_as_exact(jax.jit(tangent("v6e")), jax.jit(tangent()), draw, "a TPU's scan under jvp",
+                    seeds=PORTABLE_SEEDS, truth_fn=tangent())

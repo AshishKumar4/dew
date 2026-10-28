@@ -29,7 +29,7 @@ import logging
 import re
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jax
 from jax.extend.mlir import ir
@@ -68,16 +68,15 @@ class CustomCall:
     results: tuple[tuple[int, ...], ...]
 
 
-def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
-    """What `read` makes of each custom call a lowered program makes, given its target and its
-    operation, in program order: the calls it makes something of."""
+def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each operation of a lowered program's StableHLO module, in program order: the
+    operations it makes something of."""
     found: list[T] = []
 
     def visit(operation: ir.Operation) -> ir.WalkResult:
-        if operation.name == "stablehlo.custom_call":
-            made = read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
-            if made is not None:
-                found.append(made)
+        made = read(operation)
+        if made is not None:
+            found.append(made)
         return ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir(dialect="stablehlo")
@@ -85,6 +84,23 @@ def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operatio
     with module.context:
         module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
     return found
+
+
+def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each custom call a lowered program makes, given its target and its
+    operation, in program order: the calls it makes something of."""
+    def call(operation: ir.Operation) -> T | None:
+        if operation.name != "stablehlo.custom_call":
+            return None
+        return read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
+
+    return _read(lowered, call)
+
+
+def operations(lowered: jax.stages.Lowered) -> list[str]:
+    """The name of every operation a lowered program's StableHLO module holds, in program order (a
+    collective a `shard_map` body issues among them, `stablehlo.all_gather`)."""
+    return _read(lowered, lambda operation: operation.name)
 
 
 def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
@@ -197,8 +213,10 @@ class KernelReport:
 
 
 def kernel_report(routes, lowered: jax.stages.Lowered) -> KernelReport:
-    """The `KernelReport` of a step whose trace reported `routes` and lowered to `lowered`."""
-    return KernelReport(tuple(routes), tuple(kernel_calls(lowered)))
+    """The `KernelReport` of a step whose trace reported `routes` and lowered to `lowered`, its calls without
+    their kernels' IR, which nothing that reads a report reads: a run keeps the report after it releases
+    the program (`planning.Planned.released`, TightLynx)."""
+    return KernelReport(tuple(routes), tuple(replace(call, ir=b"") for call in kernel_calls(lowered)))
 
 
 def routed[*Arguments](lower: Callable[[*Arguments], jax.stages.Lowered],

@@ -205,7 +205,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
     own copy of the optimizer given to the trainer and steps only on its own
     updates (`optimizer`). The EMA averages only the student's updates, and
     its decay reads the student's own update count (`averages`); with
-    `ema_decay=dew.training.posthoc.power_decay(0.1)` it is rCM's power EMA at
+    `ema_decay=dew.averaging.power_decay(0.1)` it is rCM's power EMA at
     rate 0.1. The student's DMD2 sample takes 1 to `max_simulation_steps`
     steps, cycling with the step count. Training times are rCM's log-normals
     in rf time: `student_times` for sCM, and `critic_times` for DMD2 and the

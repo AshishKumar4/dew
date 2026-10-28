@@ -15,6 +15,7 @@ from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
+    PACKED_DOCUMENTS,
     SEEDS,
     SHAPES,
     draw,
@@ -77,11 +78,14 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     itself)."""
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
 
+    # Packed documents bounded as a layer bounds them (`PACKED_DOCUMENTS`).
+    bound = {'max_segments': PACKED_DOCUMENTS} if SHAPES[case].get('packed') else {}
+
     # Plain functions: the gate compiles both arms alike (`reference_error._arms`).
     def compiled(fn):
         def traced(*arguments):
             with recomputing(REMATS[remat]):
-                return with_gradients(restarted(fn, case))(*arguments)
+                return with_gradients(restarted(functools.partial(fn, **bound), case))(*arguments)
 
         return traced
 

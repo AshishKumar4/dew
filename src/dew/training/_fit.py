@@ -8,6 +8,7 @@ import dataclasses
 import datetime
 import math
 import time
+import types
 from collections.abc import Iterator, Mapping, Sequence
 
 import jax
@@ -19,19 +20,19 @@ from dew._coordination import agreed_next
 from dew._records import JSON
 from dew.batch import Batch
 from dew.checkpoints import Checkpoints
-from dew.data.dataset import DataPartition, Loader, PhasedStream, Reader
+from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
 from dew.distributed.placement import MeshSpec, Placement
-from dew.objectives.base import Initializer, Metric, TrainingScalar
+from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig
 from dew.state import TrainState
 from dew.telemetry.profile import region
-from dew.training.budget import Plateau, every_step, recorded
+from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Tokens
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, Taken
+from dew.training.interval import Interval, Taken, TokenClock
 from dew.training.observe import Observe
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
@@ -129,10 +130,27 @@ class FitPlan:
         """Whether this fit has nothing left to train: its budget reached, or its pause."""
         return self.finished(step, real) or self.paused(step, real)
 
-    def real(self, interval: Interval) -> int:
-        """The run's real tokens where a token budget reads them, else 0: the count is read from the
-        devices, which a run without one need not wait on."""
-        return interval.real_tokens if self.tokens is not None else 0
+    def horizon(self, real: int) -> int | None:
+        """The least count of committed tokens past `real` at which something this plan reads of the
+        clock changes: its budget, its pause, the next multiple of each cadence of tokens, a cooldown
+        branch's tokens, or the end of a schedule's stage. None where nothing it reads does."""
+        cadences = (self.log_every, self.eval_every, self.checkpoint_every, self.local_every,
+                    *(suite.every for suite in self.suites.values()))
+        nexts = [(real // every.every + 1) * every.every for every in cadences if isinstance(every, Tokens)]
+        branches = [branch.at.every for branch in self.branches if isinstance(branch.at, Tokens)]
+        ends = (self.tokens, self.pause[1], *(self.dataset.token_ends or ()), *nexts, *branches)
+        return min((end for end in ends if end is not None and end > real), default=None)
+
+    def committed(self, interval: Interval, clock: TokenClock, state: TrainState) -> int:
+        """The run's committed tokens after its latest step, as this plan reads them: read off the
+        devices, with the tokens `state`'s open window holds, where the clock's bound reaches the next
+        count the plan reads (`horizon`), and otherwise the count of its last read, which falls on no
+        budget, cadence or stage the latest step's count could not, so the loop does not wait on that
+        step."""
+        horizon, bound = self.horizon(clock.read), clock.bound
+        if horizon is not None and (bound is None or bound >= horizon):
+            clock.reread(*interval.clocked(state.accumulation))
+        return clock.read
 
     @property
     def scored(self) -> tuple[Metric, ...]:
@@ -262,8 +280,8 @@ class FitRun:
     checkpoint_due: bool = False
     local_due: bool = False
     """Whether the local checkpoint cadence falls on the run's latest step (`FitPlan.local_every`)."""
-    committed: int = 0
-    """The run's committed tokens after its last step, where a token budget reads them (`FitPlan.real`)."""
+    clock: TokenClock = dataclasses.field(default_factory=TokenClock)
+    """The run's committed tokens as its budget, cadences and schedule read them (`FitPlan.committed`)."""
     stop_control: dict = dataclasses.field(default_factory=dict)
     last_local_saved: int | None = None
     stopped: bool = False
@@ -347,6 +365,75 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     return batch
 
 
+def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, stop, scored,
+                                 checkpoint_every, *, steps: int | None, tokens: int | None,
+                                 accumulation: int, checkpointed: bool):
+    """A fit's best selection and its stop policy over `objective`: a `Plateau` with its metric bound
+    to the objective, or the step and tokens a `Pause` of a run of `steps` and `tokens`, updates of
+    `accumulation`, ends it at (`Pause.at`), which needs the run `checkpointed` to resume from."""
+    if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
+        raise ValueError("checkpoint_every duration must be positive")
+    if isinstance(stop, Pause) and not checkpointed:
+        raise ValueError("a Pause ends a run its checkpoint resumes, and this trainer has no "
+                         "checkpointer; pass Checkpoints(directory)")
+    pause = stop.at(steps, tokens, accumulation) if isinstance(stop, Pause) else (None, None)
+    plateau = stop if isinstance(stop, Plateau) else None
+    raw = (
+        ()
+        if best is None
+        else tuple(best)
+        if isinstance(best, Sequence) and not isinstance(best, str)
+        else (best,)
+    )
+
+    def owned(choice):
+        if isinstance(choice, types.MethodType):
+            if choice.__name__ == 'loss' and choice.__self__ is objective:
+                return objective.scalars.loss
+            raise TypeError("a training selector must be this objective's loss or declared scalar")
+        if isinstance(choice, TrainingScalar) and choice.owner is not objective:
+            raise ValueError("training scalar belongs to a different objective")
+        if isinstance(choice, Best):
+            source = choice._source
+            if source is None and (choice.metric.startswith('train/') or choice.split == 'train'):
+                source = objective.scalars[choice.metric.removeprefix('train/')]
+            return dataclasses.replace(choice, _source=owned(source) if source is not None else None)
+        return choice
+
+    selection = tuple(
+        (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(scored)
+        for chosen in (owned(Best(choice) if isinstance(choice, str) else choice) for choice in raw)
+    )
+    labels = [(choice.split, choice.metric) for choice in selection
+              if isinstance(choice._source, (Metric, TrainingScalar))]
+    if len(labels) != len(set(labels)):
+        raise ValueError("select each metric once; one Best.top already keeps all its winners")
+    if plateau is not None:
+        metric = owned(plateau.metric)
+        if not isinstance(metric, (Metric, TrainingScalar, Summary)):
+            raise TypeError(
+                "Plateau selects a declared metric object or summary, not a Best policy or score function"
+            )
+        stopping = Best(metric, mode=plateau.mode, split=plateau.split).resolved(scored)
+        plateau = dataclasses.replace(plateau, metric=metric, mode=stopping.mode, split=stopping.split)
+    return selection, plateau, pause
+
+
+def first_batch(loader: Loader, mesh: Mesh) -> Batch:
+    """The first batch `loader`'s training stream gives this process's share of `mesh`, the stream then
+    closed: what an objective that names its input alone reads the shape off (`Trainer._declare_input`), once,
+    before the run opens its stream where it starts."""
+    stream = loader.train(DataPartition.of(mesh))
+    try:
+        batch = next(iter(stream), None)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    if batch is None:
+        raise ValueError("the training data holds no batch to read the model's input shape off")
+    return batch
+
+
 def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bool, seeded: bool,
                      mesh: MeshSpec | Mesh | None, given: Mapping[str, object]) -> list[str]:
     """Why a run's record cannot rebuild a trainer's run on `dataset`, each a part a
@@ -370,20 +457,20 @@ def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bo
     return reasons
 
 
-def stage_reached(plan: FitPlan, run: FitRun, interval: Interval) -> tuple[PhasedStream, bytes, int] | None:
+def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int] | None:
     """Where the run's commits reached the tokens of the schedule's stage it stands in
     (`dew.data.pipeline.schedule`), on every process alike, as the committed tokens are the pool's: its
     stream opened again where the step that reached them left it, the stages that step's commit passed
     ended there, reading nothing, and the stage it now reads; what the prefetch worker read ahead of
     the end is dropped untrained. The last stage's tokens, where they end the data, are the run's token
-    budget (`dew.training.budget.run_tokens`). None before a stage's end, which the devices' count is
-    read for before each step while it lies ahead, as a token budget's is."""
+    budget (`dew.training.budget.run_tokens`). None before a stage's end, which the run's clock reads
+    off the devices where its steps may have reached it (`FitPlan.committed`), as a token budget's."""
     ends = plan.dataset.token_ends
     state = None if run.train is None else run.train.source_state
     if ends is None or state is None:
         return None
     stage = len(position.read(state).completed)
-    if stage >= len(ends) - 1 or (committed := interval.real_tokens) < (end := ends[stage] or 0):
+    if stage >= len(ends) - 1 or (committed := run.clock.read) < (end := ends[stage] or 0):
         return None
     assert run.train is not None and run.partition is not None
     run.train.close()

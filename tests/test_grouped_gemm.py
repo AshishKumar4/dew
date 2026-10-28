@@ -358,9 +358,10 @@ def test_a_frozen_matrix_forms_no_kernel_gradient():
 @runs("sm80")
 def test_the_kernels_forward_mode_keeps_the_projections_law():
     """An expert projection's tangent through the template (its launches interpreted, as an A100 runs
-    them) is the XLA projection's, bit for bit: `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents
-    unrounded, where a cast's own tangent would round an fp32 input's to bf16 first (two products of an
-    fp32 1 + 2^-8 and 1.5 sum to 3.015625, rounded first 3)."""
+    them), and the XLA projection's, each keep the projection's law `dx @ Q(kernel) + Q(x) @ dkernel` with
+    the tangents unrounded, where a cast's own tangent would round an fp32 input's to bf16 first: two
+    products of an fp32 1 + 2^-8 and 1.5 sum to 3.01171875, which bf16 rounds to 3.015625 (rounded first,
+    3), every value exact."""
     sizes = jnp.asarray([1, 2], jnp.int32)
     x, w = jnp.zeros((3, 2), jnp.float32), jnp.full((2, 2, 2), 1.5, jnp.float32)
     dx, dw = jnp.full((3, 2), 1 + 2.0 ** -8, jnp.float32), jnp.full((2, 2, 2), 2.0 ** -9, jnp.float32)
@@ -371,7 +372,8 @@ def test_the_kernels_forward_mode_keeps_the_projections_law():
 
     with generation.assumed("sm80"):
         kernels = tangent("pallas")
-    np.testing.assert_array_equal(np.asarray(kernels, np.float32), np.asarray(tangent("xla"), np.float32))
+    for found in (kernels, tangent("xla")):
+        np.testing.assert_array_equal(np.asarray(found, np.float32), np.full((3, 2), 3.015625, np.float32))
 
 
 @runs("sm80")
@@ -489,21 +491,32 @@ def twice(acc, bias):
 
 def test_a_cooperative_tile_stores_each_of_several_outputs():
     """A cooperative tile's consumers stage every output at once: a two-output epilogue's outputs, each its
-    own staging buffer, are bit for bit those of the same tile asked for each output alone."""
-    x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16)
-    x, w = jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
+    own staging buffer, on par with the plain program's two over the draws (check 1), truth the product
+    and its epilogue in float64 (eagerly: the interpreter's ordered callbacks)."""
     bias = jnp.asarray(np.linspace(-1, 1, WIDTH), jnp.float32)
     sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
     tiles = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2)
 
-    def run(epilogue, out_dtypes=None):
-        return mosaic_gpu.gmm(x, w, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
-                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED, epilogue=epilogue,
-                              epilogue_operands=(bias,), epilogue_axes=(("columns",),), out_dtypes=out_dtypes)
+    def draw(seed):
+        x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)
+        return jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
 
-    first, second = run(doubled_halves, (jnp.bfloat16, jnp.bfloat16))
-    np.testing.assert_array_equal(np.asarray(first, np.float32), np.asarray(run(twice), np.float32))
-    np.testing.assert_array_equal(np.asarray(second, np.float32), np.asarray(run(halved), np.float32))
+    def run(x, w):
+        return mosaic_gpu.gmm(x, w, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
+                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED,
+                              epilogue=doubled_halves, epilogue_operands=(bias,),
+                              epilogue_axes=(("columns",),), out_dtypes=(jnp.bfloat16, jnp.bfloat16))
+
+    def plain(x, w):
+        acc = jax.lax.ragged_dot(x, w, sizes, preferred_element_type=jnp.float32)
+        return twice(acc, bias), halved(acc, bias)
+
+    def truth(x, w):
+        acc = jax.lax.ragged_dot(x, w, sizes, preferred_element_type=x.dtype)
+        return acc * 2, acc + bias[None, :]
+
+    assert_as_exact(run, jax.jit(plain), draw, "a cooperative tile's two outputs", seeds=SEEDS,
+                    truth_fn=truth)
 
 
 def test_each_groups_row_tiles_start_at_its_first_row():

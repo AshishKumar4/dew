@@ -113,6 +113,13 @@ def geometry(case: str) -> dict:
             **INTERPRETED_HEADS.get(case, {})}
 
 
+PACKED_DOCUMENTS = 5
+"""The most documents a row of a packed draw holds (`draw`'s starts: its first row's five), the bound a
+packed call takes as a layer passes its batch's (`max_segments`): the template lays its launches for that
+many sequences a row, where unbounded it lays a row's every token (row 1850: the interpreted gradient's
+template arm 60 s a seed unbounded, 35 bounded)."""
+
+
 def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_heads: int, key_width: int,
          value_width: int, packed: bool = False, per_key: bool = False) -> tuple[Chunk]:
     """A draw's operands from `seed`, its keys' and values' dimensions each permuted by an order the seed
@@ -203,9 +210,10 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
         if max(launch.shared for launch in launches) > generation.shared_budget(template.Mosaic.launched()):
             return None
 
-    def rule(given: Chunk):
+    def rule(given: Chunk, max_segments: int | None = None):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
-                           tiles=narrowest, starts=given.starts, scale=hooks.scale, floor=hooks.floor)
+                           tiles=narrowest, starts=given.starts, max_segments=max_segments, scale=hooks.scale,
+                           floor=hooks.floor)
 
     return rule
 

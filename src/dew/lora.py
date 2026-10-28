@@ -671,32 +671,30 @@ def _counted_adapter(model: nn.Module, branch: _Branch) -> type[nn.Module]:
 
     class LogitsAdapter(CountedAdapter):
         @nn.nowrap
-        def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
+        def _prediction(self, lengths, prediction_lengths):
+            """The unadapted model's prediction counts, `(forward, parameter)`, and the adapter's forward
+            over the prediction matrices' usage, which each prediction count adds."""
             original = unadapted(self)
             if not isinstance(original, CountedPredictionParameters):
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
-            forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
             usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
-            return forward + self._adapter_forward(lengths, usage=usage)
+            return (original.prediction_flops(lengths, prediction_lengths=prediction_lengths),
+                    original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths),
+                    self._adapter_forward(lengths, usage=usage))
+
+        @nn.nowrap
+        def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
+            forward, _, adapter = self._prediction(lengths, prediction_lengths)
+            return forward + adapter
 
         @nn.nowrap
         def prediction_parameter_flops(self, lengths, *, prediction_lengths=None) -> float:
-            original = unadapted(self)
-            if not isinstance(original, CountedPredictionParameters):
-                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
-            learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
-            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
-            return learned + self._adapter_forward(lengths, usage=usage)
+            _, learned, adapter = self._prediction(lengths, prediction_lengths)
+            return learned + adapter
 
         @nn.nowrap
         def prediction_training_flops(self, lengths, *, prediction_lengths=None) -> float:
-            original = unadapted(self)
-            if not isinstance(original, CountedPredictionParameters):
-                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
-            forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
-            learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
-            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
-            return frozen_training_flops(forward, learned, self._adapter_forward(lengths, usage=usage))
+            return frozen_training_flops(*self._prediction(lengths, prediction_lengths))
 
         @nn.nowrap
         def logits_flops(self, lengths) -> float:
