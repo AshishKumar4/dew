@@ -1789,13 +1789,13 @@ class Seen:
         return {"id": np.int64(self.corpus * 1000 + index)}
 
 
-def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_corpora_it_draws():
-    """A mix of 300 corpora, each shuffled, repeated and filtered as a run's sources are, read with
-    Loading's 16 threads and 16-batch read-ahead: its reader holds no more threads than one read of
-    them all,
-    and reads only the corpora it draws, here the two that carry its weight. Before, each corpus read
-    with the whole budget and the mix read every corpus's first row before its first: 300 thread
-    pools and every corpus read (row 2016)."""
+@pytest.mark.parametrize("members", [300, 4])
+def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_corpora_it_draws(members):
+    """A mix of 300 corpora, or of 4 each with threads of its own, each shuffled, repeated and filtered
+    as a run's sources are, read with Loading's 16 threads and 16-batch read-ahead: its reader holds
+    no more threads than one read of them all, and opens and reads only the corpora it draws, here
+    the two that carry its weight. Before, each corpus read with the whole budget and the mix read
+    every corpus's first row before its first: 300 thread pools and every corpus read (row 2016)."""
     import threading
 
     touched: set[int] = set()
@@ -1804,8 +1804,8 @@ def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_co
     # Grain stores, each read by index as a run's files are: one held in memory is scanned for the
     # records it holds before it is read (`_Present`).
     corpora = [Pipeline(from_grain(pygrain.MapDataset.source(Seen(64, corpus, touched)), f"seen-{corpus}"))
-               .shuffle(corpus).repeat().filter(Kept()) for corpus in range(300)]
-    weights = [1.0, 1.0] + [1e-9] * 298
+               .shuffle(corpus).repeat().filter(Kept()) for corpus in range(members)]
+    weights = [1.0, 1.0] + [1e-9] * (members - 2)
     data = compile(mix(corpora, weights).batch(8), read="indexed", seed=0,
                    loading=Loading(workers=0, threads=16, read_buffer=16, cache=False))
     before = threading.active_count()

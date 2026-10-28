@@ -80,7 +80,6 @@ from dew.data.mixing import (
     ProportionalSelection,
     Proportions,
     TokenDeficit,
-    primed_maps,
     rewound,
     token_weights,
 )
@@ -1371,9 +1370,8 @@ class _Build:
                    for build, child in zip(builds, source.pipelines, strict=True)]
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
-            checked = primed_maps(mapped)
-            selection = ProportionalSelection([len(parent) for parent in checked], _weights(source))
-            return pygrain.MapDataset.select_from_datasets(checked, selection)
+            selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source))
+            return pygrain.MapDataset.select_from_datasets(mapped, selection)
         streams = [
             Accepted(_as_iter(parent, build.loading), _name(child), _label(child))
             for parent, build, child in zip(parents, builds, source.pipelines, strict=True)

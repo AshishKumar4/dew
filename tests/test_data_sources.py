@@ -1143,6 +1143,25 @@ def arrayrecord_paths(tmp_path):
     return paths
 
 
+def test_arrayrecord_sources_hold_their_readers_open_within_one_bound_together(arrayrecord_paths):
+    """A run of more ArrayRecord sources than Loading's read threads, one file each, as a mixture of
+    hundreds reads them: each read in turn, the process holds at most as many files open as one
+    source may, the least recent closed as another opens (row 2016). Before, each source kept its own
+    readers, every file it had read held open."""
+    from dew.data.sources.records import ArrayRecords
+
+    real = {os.path.realpath(path) for path in arrayrecord_paths}
+    sources = [ArrayRecords((path,), counts=(8,)) for path in arrayrecord_paths]
+    try:
+        for source in sources:
+            assert source[0] is not None
+        held = [opened for opened in psutil.Process().open_files() if opened.path in real]
+        assert len(held) <= Loading().threads < len(sources)
+    finally:
+        for source in sources:
+            source.close()
+
+
 def test_arrayrecords_threaded_reads_overlap(arrayrecord_paths, monkeypatch):
     import grain.python as grain
 

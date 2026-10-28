@@ -70,20 +70,21 @@ class ShardReaders[K]:
                         opened_shard.reader.close()
                     self._lock.notify_all()
 
-    def close(self) -> None:
-        """Close every idle reader, retiring busy ones until their reads drain."""
+    def close(self, held: Callable[[K], bool] = lambda key: True) -> None:
+        """Close every idle reader of a key `held` names, retiring busy ones until their reads drain."""
         with self._lock:
-            for opened in self._opened.values():
+            for key in [key for key in self._opened if held(key)]:
+                opened = self._opened.pop(key)
                 if opened.reads:
                     self._retired.append(opened)
                 else:
                     opened.reader.close()
-            self._opened.clear()
             self._lock.notify_all()
 
 
 class ArrayRecords:
-    """Read shards concurrently, retaining as many readers as default read threads (`ShardReaders`).
+    """Read shards concurrently, the readers every source of the process holds open bounded together
+    (`_OPEN_SHARDS`): a mixture of hundreds of sources holds the readers one source does.
 
     Shuffled indexed reads reuse the LRU across Loading's in-flight read width.
     Non-native shards need a mirror with room for that many physical shards.
@@ -106,7 +107,6 @@ class ArrayRecords:
         ):
             raise ValueError("ArrayRecord counts must name every physical shard with a nonnegative row count")
         self._pins = []
-        self._shards = ShardReaders(self._shard)
 
     def _shard(self, shard: int) -> ArrayRecords:
         """Physical shard `shard`'s own reader, checked against its producer's row count."""
@@ -153,7 +153,7 @@ class ArrayRecords:
             raise IndexError(index)
         if self.counts is not None:
             shard, row = self.ranges.locate(index)
-            return self._shards.read(shard, row)
+            return _OPEN_SHARDS.read((self, shard), row)
         payload = self.reader[index]
         if not self.record_codec:
             return payload
@@ -173,11 +173,16 @@ class ArrayRecords:
     def __setstate__(self, state: Mapping[str, object]) -> None:
         self.__dict__.update(state)
         self._pins = []
-        self._shards = ShardReaders(self._shard)
 
     def close(self) -> None:
-        self._shards.close()
+        _OPEN_SHARDS.close(lambda key: key[0] is self)
         self.__dict__.pop("reader", None)
         for pin in self._pins:
             pin.close()
         self._pins.clear()
+
+
+_OPEN_SHARDS: ShardReaders[tuple[ArrayRecords, int]] = ShardReaders(lambda key: key[0]._shard(key[1]))
+"""The ArrayRecord shard readers this process holds open, of every source it reads, keyed by source
+and shard: at most Loading's default read threads (`_MAX_OPEN_SHARDS`), however many sources a run
+mixes."""
