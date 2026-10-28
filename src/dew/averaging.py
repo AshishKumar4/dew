@@ -1,4 +1,11 @@
-"""Post-hoc EMA: weight averages of any length, reconstructed after training.
+"""Weight averages: the EMA's update, and post-hoc EMA's averages of any length, reconstructed after
+training.
+
+The math the optimizer's averages (`dew.optim.power_profiles`), the training step's EMA
+(`dew.training.transaction`) and a checkpoint's reconstruction (`Checkpoints.posthoc_ema`) share,
+below all three, so that none imports another for it.
+
+Post-hoc EMA
 
 This follows Karras et al., "Analyzing and Improving the Training Dynamics
 of Diffusion Models" (CVPR 2024, arXiv:2312.02696), Section 3 and Appendix
@@ -21,10 +28,14 @@ profiles. `coefficients` solves for those weights (Algorithm 3), and
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import overload
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+
+from dew.batch import Variables
 
 
 def exponent(std: float) -> float:
@@ -94,4 +105,44 @@ def coefficients(snapshots: Sequence[tuple[int, float]], updates: int, std: floa
     return weights / weights.sum()
 
 
-__all__ = ["coefficients", "exponent", "power_decay"]
+@overload
+def ema_update(ema: Variables, params: Variables, decay: jax.typing.ArrayLike) -> Variables: ...
+
+
+@overload
+def ema_update(ema: optax.Params, params: optax.Params, decay: jax.typing.ArrayLike) -> optax.Params: ...
+
+
+def ema_update(ema, params, decay):
+    """Update the EMA leaves toward `params`, keeping each leaf's storage dtype.
+
+    Each leaf of `ema` becomes `decay * average + (1 - decay) * live`, and a
+    leaf the step left as it was keeps its average bit for bit wherever that
+    sum is finite, however a program fuses it (a select, not a difference
+    that finite leaves of opposite signs overflow; a NaN decay stays NaN);
+    the live value is the leaf of `params` at the same path; leaves that
+    `ema` does not hold are not averaged. The arithmetic runs in fp32 or
+    wider, so fp64 leaves keep fp64 precision. A decay of 1 or more returns
+    the average leaf as it was, even when it holds nonfinite values, as a
+    frozen reference can.
+    """
+    def step(average, live):
+        dtype = jnp.result_type(average.dtype, live.dtype, decay, jnp.float32)
+        if average.dtype != dtype or live.dtype != dtype:
+            average, live = jax.lax.optimization_barrier((average, live))
+        weight = jnp.asarray(decay, dtype)
+        wide, moved = average.astype(dtype), live.astype(dtype)
+        weighted = weight * wide + (1 - weight) * moved
+        updated = jnp.where((moved == wide) & jnp.isfinite(weighted), wide, weighted)
+        stored = updated.astype(average.dtype)
+        return jnp.where(jnp.asarray(decay) >= 1.0, average, stored)
+    return jax.tree.map(step, ema, _project(params, ema))
+
+
+def _project(tree: optax.Params, like: optax.Params) -> optax.Params:
+    """The leaves of tree at the key paths like holds, in like's containers."""
+    leaves = dict(jax.tree_util.tree_flatten_with_path(tree)[0])
+    return jax.tree_util.tree_map_with_path(lambda path, _: leaves[path], like)
+
+
+__all__ = ["coefficients", "ema_update", "exponent", "power_decay", "powered_decay"]

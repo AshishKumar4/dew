@@ -30,7 +30,6 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_mosaic_program,
     attention_triton,
-    mosaic_sm90,
 )
 
 pytestmark = pytest.mark.kernel
@@ -418,12 +417,9 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
 UNSEEN = {
     "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
                                          multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12),
-    "ampere-class": generation.GpuTarget("sm80", "Unmeasured Ampere-class GPU", shared_limit=99 * 1024,
-                                         multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12),
 }
-"""GPUs no row measured, one of each family (`test_grouped_gemm.UNSEEN`'s): a Hopper-class part with fewer
-multiprocessors, a smaller block and another L2 bandwidth than an H100's, and an Ampere-class one with an
-sm86's block, whose family this mainloop is not qualified on (`attention_mosaic_program.QUALIFIED`)."""
+"""A GPU no row measured of this mainloop's family (`test_grouped_gemm.UNSEEN`'s Hopper-class one): fewer
+multiprocessors, a smaller block and another L2 bandwidth than an H100's."""
 
 
 def _bound(op, *arrays, **options):
@@ -452,13 +448,12 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
     """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
     block (`generation.shared_budget`) and a consumer's registers (`register_budget`), whatever the widths,
     the training forward's too (its anchored walk keeps no value row): no table's tile, which at heads 256
-    wide staged 320 KiB against its 227 (ledger 1582); and the op is eligible exactly where one is derived."""
+    wide staged 320 KiB against its 227 (ledger 1582)."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
         derived = op.derived(ba, target)
         assert derived is not None
-        assert op.eligible(ba, target)
         assert op.legal(ba, derived, target)
         assert op.staged_bytes(ba, derived, target) <= generation.shared_budget(target)
         assert op.registers(ba, derived) <= op.register_budget(derived)
@@ -617,21 +612,11 @@ def test_a_guarded_launch_walks_its_own_key_tiles(tiles):
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     """On a GPU no row measured the forward's and the backward's tiles come from the family's facts and the
     call's extents and fit the GPU's block, and the forward, the training forward and the backward at the
-    tiles derived from its facts alone are on par interpreted; on a family without this
-    mainloop's bundle neither op is eligible, so the route takes another mainloop
-    (`attention_mosaic.backward_takes`)."""
+    tiles derived from its facts alone are on par interpreted."""
     target = UNSEEN[unseen]
     shape = (1, 160, 2, 1)
     with generation.assumed(target):
         op, ba = _forward_call(shape, 128, 128, residuals=True)
-        if unseen == "ampere-class":
-            assert not op.eligible(ba, target)
-            query, key, value, dout = _drawn(shape, jnp.bfloat16)(0)
-            spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-            residuals = attention_triton.forward(query, key, value, spans, residuals=True, interpret=True)[1:]
-            assert not attention_mosaic.backward_takes(query, key, value, spans, None, dout,
-                                                      residuals=residuals)
-            return
         derived = op.derived(ba, target)
         assert derived is not None and derived.family == "wgmma"
         assert op.staged_bytes(ba, derived, target) <= 180 * 1024
@@ -651,17 +636,11 @@ def test_the_backward_is_on_par_from_the_triton_mainloops_residuals_interpreted(
 
 def test_a_hook_that_forms_a_unit_axis_is_refused():
     """The hook indexed off the query's coordinates' column (`q_pos[:, :1]`) forms a `[bq, 1]` array, which
-    Mosaic GPU's layout inference takes no operation on: the mainloop refuses it before any launch, the
-    legality rule the route's chooser reads (ledger row 1428), where a pointwise hook lowers."""
+    Mosaic GPU's layout inference takes no operation on: the mainloop, called on it, refuses it before any
+    launch rather than compute it (ledger row 1428)."""
     queries, keys = core_geometry(CASES["causal"])
     spans = template.spans(queries, keys, ROWS, causal=True)
     query, key, value, _ = _drawn((ROWS, queries, 4, 2), jnp.bfloat16, width=64, keys=keys)(0)
-    for names, refused in ((("indexed",), True), (("softcap", "alibi"), False)):
-        score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, 64)
-        params, initial = draw_hooks(0)
-        hooks = template.Hooks(score_mod, tuple(template.Param(param, kind)
-                                                for param, kind in zip(params, kinds, strict=True)), initial)
-        assert (attention_mosaic_program.unlowered(hooks, (64, 64), 64) is not None) == refused, names
     with pytest.raises(NotImplementedError), _device(interpret=True):
         attention_mosaic.forward(query, key, value, spans,
                                  template.Hooks(score_hooks(("indexed",), queries, keys, 64)[0]),
@@ -670,9 +649,8 @@ def test_a_hook_that_forms_a_unit_axis_is_refused():
 
 @INTERPRETS
 def test_a_hook_shaped_to_the_launchs_tile_is_taken():
-    """An output hook that reshapes its gate to the value width, legal on the launch's `[64, 128]` output
-    tile as on the reference's rows: the legality rule traces it at the tile and value width the launch
-    runs (`attention_mosaic.refused`), and the forward is on par under it."""
+    """An output hook that reshapes its gate to the value width, on the launch's `[64, 128]` output tile as
+    on the reference's rows: the forward is on par under it."""
     queries = 128
     spans = template.spans(queries, queries, 1, causal=True)
     draw_operands = _drawn((1, queries, 2, 1), jnp.bfloat16, width=128, keys=queries)
@@ -685,9 +663,6 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
     def hooked(gate):
         return template.Hooks(output_mod=lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, 128))),
                               output_params=(template.Param(gate, template.Kind.OUTPUT),))
-
-    assert attention_mosaic.refused(jnp.bfloat16, 128, 128, hooked(draw(0)[3]), backward=False,
-                                    family=mosaic_sm90.WGMMA) is None
 
     def ours(query, key, value, gate):
         with _device(interpret=True):

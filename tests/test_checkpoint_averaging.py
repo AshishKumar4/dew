@@ -168,3 +168,20 @@ def test_a_narrow_floating_leaf_averages_in_fp32(dtype):
     one, other = (_on_host(jnp.asarray(values, dtype)) for values in ([1, 3], [3, 6]))
     assert one.dtype == np.float32
     assert _taken(one, other, 2, "run", "first").tolist() == [2.0, 4.5]
+
+
+def test_a_complex_leaf_averages_each_component_and_stays_complex():
+    """A complex leaf, as a model of complex parameters keeps, averages its real and imaginary parts
+    each as a real leaf does, and stays complex: two runs holding 1+2j average to 1+2j, not 1, and
+    1+2j with 3-4j to 2-1j (row 1870, AT-02)."""
+    from dew.checkpoints import _on_host, _taken
+
+    one, other = (_on_host(np.asarray(values, np.complex64))
+                  for values in ([1 + 2j, 1 + 2j], [1 + 2j, 3 - 4j]))
+    assert one.dtype == np.complex64
+    averaged_leaf = _taken(one, other, 2, "run", "first")
+    assert averaged_leaf.dtype == np.complex64
+    assert averaged_leaf.tolist() == [1 + 2j, 2 - 1j]
+    # A complex scalar keeps its shape.
+    scalar = _taken(_on_host(np.complex64(1 + 2j)), _on_host(np.complex64(3 - 4j)), 2, "run", "first")
+    assert scalar.shape == () and complex(scalar) == 2 - 1j
