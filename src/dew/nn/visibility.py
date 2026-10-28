@@ -5,7 +5,7 @@ coordinates are whatever the caller's layout counts, slots, places in a document
 caller keeps its layout and builds no global mask to ask. An asymmetric window (Gemma's audio blocks)
 states its own sides."""
 
-from typing import Literal
+from typing import Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -54,7 +54,15 @@ def visible(query, key, *, causal: bool, window: int | None = None):
     return keep if window is None else keep & windowed(query, key, window, causal=causal)
 
 
-def chunk_of(places, chunk: int) -> jax.Array:
+@overload
+def chunk_of(places: jax.Array, chunk: int) -> jax.Array: ...
+
+
+@overload
+def chunk_of(places: np.ndarray | int, chunk: int) -> np.ndarray: ...
+
+
+def chunk_of(places: jax.Array | np.ndarray | int, chunk: int) -> jax.Array | np.ndarray:
     """Each place's chunk number of `chunk` places, in the places' own dtype: `place // chunk`, a chunk wider
     than the dtype holds every place of one sign. The template's spans (`dew.nn.kernels.templates.attention
     .spans`) and `same_chunk` count chunks by it; NumPy places stay NumPy's, as `windowed`'s do."""

@@ -193,7 +193,7 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     block holding it; a negative slot (padding) sees no key. Lengths, starts and slots are int32 token
     coordinates; places and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
-    from dew.nn.visibility import window_sides
+    from dew.nn.visibility import chunk_of, window_sides
 
     index = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
     place = index
@@ -245,8 +245,6 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     # run, and each query's least and greatest it keeps (`_within_runs`).
     by_places = []
     if chunk is not None:
-        from dew.nn.visibility import chunk_of
-
         # Without places a chunk counts a query by its own key's index (`slots`, a cross call's aligned
         # place, else its own index).
         query_places, key_places = (
