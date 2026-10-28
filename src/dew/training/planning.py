@@ -14,7 +14,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-import os
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -348,20 +347,6 @@ def step_seconds(step: Callable, state: TrainState, batch: Batch) -> list[float]
     return samples(stepped, warmup=TIMED_WARMUP, repeats=TIMED_REPEATS, calls=TIMED_STEPS)
 
 
-UNTIMED_FRONTIER = "DEW_UNTIMED_FRONTIER"
-"""The environment variable that, set to 1, has a process keep a frontier's first plan untimed: Dew's
-tests' setting (tests/lane_environment.py), never the library's. A frontier's choice follows its
-clock, so two runs timed apart may train different programs, by design; a test whose property is a
-resume's, two pools a run and its resume, would read that choice as its own, where no record pins a
-pool's plan (`dew.training.rungs.recorded_rung`). The choice itself stays tested through `Trainer.compile`'s
-own timer."""
-
-
-def untimed_frontier() -> bool:
-    """Whether this process keeps a frontier's first plan untimed (`UNTIMED_FRONTIER`)."""
-    return os.environ.get(UNTIMED_FRONTIER) == "1"
-
-
 def faster(timings: Sequence[Sequence[float]]) -> int:
     """The plan of a frontier's `timings` (each plan's samples, `step_seconds`) that runs faster: a later
     one only where its slowest sample beats every sample of the first's, the first otherwise. A choice
@@ -377,7 +362,7 @@ def faster(timings: Sequence[Sequence[float]]) -> int:
 @dataclasses.dataclass
 class Trials:
     """Trial runs of a plan's steps on `batch` from `state`, each on a copy of the state as it stood
-    (`run`): an offline frontier's timing (`seconds`), where `frontier` asks for it, and AutoPGLE's
+    (`run`): an offline frontier's timing (`seconds`), explicitly called by its tool, and AutoPGLE's
     profile of the plan admitted (`profiled`). Live compilation never invokes `seconds`. A state the
     trials own (`owned`, `fit`'s) is stepped by the first trial
     and deleted, each later trial stepping a fresh copy from the host, so the devices hold one state at a
@@ -387,7 +372,6 @@ class Trials:
     state: TrainState
     batch: Batch
     owned: bool = True
-    frontier: bool = True
     restored: Callable[[], TrainState] | None = None
     """The moving state as it stood, copied to the host at the first trial (`snapshot`)."""
 

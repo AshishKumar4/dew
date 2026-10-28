@@ -44,7 +44,7 @@ from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
 from dew.training.memory import climb_to, recompute_more, rung_record
-from dew.training.planning import TIMED_REPEATS, UNTIMED_FRONTIER, Trials, planned, splits
+from dew.training.planning import TIMED_REPEATS, Trials, planned, splits
 
 ROWS, SEQ = 32, 16
 BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64, jnp.int32)}
@@ -635,7 +635,6 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
 def test_a_resumed_run_continues_its_admitted_plan_without_timing(tmp_path, monkeypatch):
     """A run over two devices keeps its admitted plan, and a checkpoint resumed from it continues
     that plan without compiling or timing optional alternatives."""
-    monkeypatch.delenv(UNTIMED_FRONTIER)
     corpus = token_files(tmp_path)
 
     def run(split):
@@ -673,7 +672,7 @@ def test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling(monkey
 @pytest.mark.parametrize("trials_given", [False, True], ids=["without-trials", "with-trials"])
 def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, remat, trials_given):
     """Over two devices, an admitted policy compiles once, whether default, explicitly nonterminal,
-    or explicitly terminal, and whether or not the caller supplies frontier-enabled Trials."""
+    or explicitly terminal, and whether or not supplied Trials would time another plan faster."""
     free(monkeypatch, LIMIT)
     policy = None if remat is None else REMAT_POLICIES[remat]
     trainer = lm(remat=policy)
@@ -693,7 +692,7 @@ def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, r
 def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeypatch, remat):
     """A real fit over two devices keeps its nonterminal or terminal explicit policy once admitted.
     No optional compile or timing is hidden in fit's internally created Trials (row 2153)."""
-    monkeypatch.setenv(UNTIMED_FRONTIER, "0")
+    monkeypatch.setenv("DEW_UNTIMED_FRONTIER", "0")
     free(monkeypatch, LIMIT)
     corpus = token_files(tmp_path)
     trainer = windowed(tmp_path, 1, remat=REMAT_POLICIES[remat])
@@ -821,7 +820,6 @@ def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
 
 def test_a_run_trains_only_its_requested_steps_without_timing_a_frontier(monkeypatch, tmp_path):
     """A fit trains its requested steps without spending extra updates on a speed comparison."""
-    monkeypatch.delenv(UNTIMED_FRONTIER)
     corpus, whole = token_files(tmp_path), windowed(tmp_path / "whole", 1)
     free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
                                                                   checkpoint_every=None)) - 1)

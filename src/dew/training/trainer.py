@@ -1050,7 +1050,7 @@ class Trainer(Generic[Loss, Effects]):
         self._ahead = search.ahead
         planned = plans[0]
         if runs := pgle_runs():
-            trials = Trials(state, batch, owned=False, frontier=False) if trials is None else trials
+            trials = Trials(state, batch, owned=False) if trials is None else trials
             planned = planned.guided(trials.profiled(self._runner(planned, mesh), planned, mesh, runs), runs,
                                      mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
@@ -2196,7 +2196,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         state = self._staged(state, run.current)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
-        trials = Trials(state, batch, frontier=False)
+        trials = Trials(state, batch)
         signature = batch_signature(batch)
         if signature not in compiled:
             self._read_taken(run)
