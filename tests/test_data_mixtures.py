@@ -1204,9 +1204,9 @@ def test_a_schedules_completed_stage_cannot_move_under_a_resumed_run_and_its_lat
     assert trained.checkpoints is not None
     _, saved = trained.checkpoints.restore(share=DataPartition())
     assert saved is not None and position.read(saved).thresholds == (50,)
+    moved = schedule([(first, 500), (second, 10_000), (third, None)]).batch(8)
     with pytest.raises(ValueError):
-        token_trainer(tmp_path / "run").fit(schedule([(first, 500), (second, 10_000), (third, None)]).batch(8),
-                                           steps=10)
+        token_trainer(tmp_path / "run").fit(moved, steps=10)
     fourth = Pipeline(Memory(Indexed(4, 64))).shuffle(3).repeat()
     state = token_trainer(tmp_path / "run").fit(
         schedule([(first, 50), (second, 10_000), (fourth, None)]).batch(8), steps=10)
