@@ -107,7 +107,9 @@ def vp_process():
 
 
 def karras_process():
-    schedule = KarrasVENoiseScheduler(sigma_max=80, rho=7, sigma_data=0.5)
+    # rho a float, as FlaxDiff's KarrasVENoiseScheduler and Dew's default hold it: an int lowers the
+    # power to repeated products, an ulp off its grid (row 2061).
+    schedule = KarrasVENoiseScheduler(sigma_max=80, rho=7.0, sigma_data=0.5)
     return Process(schedule, KarrasPredictionTransform(sigma_data=0.5)), KarrasOracle()
 
 
@@ -350,14 +352,14 @@ def flaxdiff_walk(solver, x_T, times):
     return jnp.stack(latents)
 
 
-def assert_on_par_with_flaxdiff(site: str, dew) -> None:
-    """`dew(inputs)`, Dew's leaves on a draw (its float64 truth too, run widened), on par with `site`'s
-    recording of FlaxDiff's own float32 run over its declared seeds (check 1), the recording's
-    float64 sketch holding the truth to FlaxDiff's float64 twin (`indexed_recording`)."""
+def assert_on_par_with_flaxdiff(site: str, dew, truth_fn=None) -> None:
+    """`dew(inputs)`, Dew's leaves on a draw, on par with `site`'s recording of FlaxDiff's own float32
+    run over its declared seeds (check 1). The truth is `truth_fn(inputs)`, `dew` unless given, run
+    widened, held to the recording's float64 sketch of FlaxDiff's float64 twin (`indexed_recording`)."""
     seeds = declared_seeds(FLAXDIFF)[site]
     draw, recorded, truth = indexed_recording(recording(FLAXDIFF), site, seeds,
                                               inputs_of=writer("flaxdiff_solver_reference").draw,
-                                              truth_fn=dew)
+                                              truth_fn=dew if truth_fn is None else truth_fn)
     compiled = jax.jit(dew)
     assert_as_exact(lambda index, inputs: compiled(inputs), recorded, draw, site, seeds=seeds,
                     truth_fn=truth)
@@ -374,17 +376,27 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     is held as it is and through the clip to [-1, 1] that FlaxDiff's
     `post_process` applies as the pipeline's output step: the stand-in's
     clean predictions reach |x| = 3, so the clip moves most entries and the
-    unclipped comparison is the one that reads the walk."""
+    unclipped comparison is the one that reads the walk. The truth is Dew's
+    walk in float64 interval by interval (`flaxdiff_walk`), closed with the
+    clean prediction at the last time: `sample`'s own float64 scan refuses
+    MultiStepDPM's float32 history (row 2063)."""
     process, _ = karras_process()
     times = np.asarray(process.times(12))
 
-    def closing(inputs):
-        x_T = jnp.asarray(inputs["x_T"])
-        closed = sample(StandIn(process), x_T, solver=solver, key=jax.random.key(0),
-                        times=times.astype(x_T.dtype))
+    def outputs(closed):
         return {"closed": closed, "clipped": jnp.clip(closed, -1, 1)}
 
-    assert_on_par_with_flaxdiff(f"{name} closed", closing)
+    def closing(inputs):
+        x_T = jnp.asarray(inputs["x_T"])
+        return outputs(sample(StandIn(process), x_T, solver=solver, key=jax.random.key(0),
+                              times=times.astype(x_T.dtype)))
+
+    def walked_and_closed(inputs):
+        x_T = jnp.asarray(inputs["x_T"])
+        last = flaxdiff_walk(solver, x_T, times)[-1]
+        return outputs(StandIn(process)(last, jnp.full((x_T.shape[0],), times[-1].astype(x_T.dtype)))[0])
+
+    assert_on_par_with_flaxdiff(f"{name} closed", closing, walked_and_closed)
     assert float(jnp.abs(closing(writer("flaxdiff_solver_reference").draw(0))["closed"]).max()) > 2
 
 
