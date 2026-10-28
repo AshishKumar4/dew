@@ -740,7 +740,8 @@ def test_a_two_sided_window_keeps_its_neighbours_and_no_wrapped_distance(dtype, 
 def test_key_spans_of_no_rows_broadcast_a_single_rows_coordinates():
     """`key_spans` over coordinates of no rows beside one row's slots holds no rows: a batch broadcasts,
     one row against none being none."""
-    spans = key_spans(1, 3, True, None, key_valid=jnp.ones((0, 3), bool), query_slots=jnp.asarray([[0]]))
+    spans = key_spans(1, 3, causal=True, sliding_window=None, key_valid=jnp.ones((0, 3), bool),
+                      query_slots=jnp.asarray([[0]]))
     assert spans.start.shape == (0, 1)
 
 

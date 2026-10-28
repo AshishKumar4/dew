@@ -28,7 +28,7 @@ def windowed(query, key, window: int, *, causal: bool):
     ahead = query >= key
     within_before = _distance(query, key, xp) <= before
     if causal:
-        return xp.where(ahead, within_before, True)
+        return ~ahead | within_before
     return xp.where(ahead, within_before, _distance(key, query, xp) <= after)
 
 
