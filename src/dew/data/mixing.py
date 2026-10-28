@@ -458,17 +458,17 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
 class _MixReads:
     """Every corpus of a mix, each opened and read only as the mix draws from it: a corpus the mix has
     not drawn holds no iterator, so no reader's threads, buffers or files, and no position but its
-    start and its counts (`state`). A mix captures every corpus's position for each record it gives
-    (a packer captures it before each record), and only the corpus it read moved, so a corpus's
-    position is captured again only after the mix reads it or it is restored."""
+    start and the counts it carries there (`state`). A mix captures every corpus's position for each
+    record it gives (a packer captures it before each record), and only the corpus it read moved, so
+    a corpus's position is captured again only after the mix reads it or it is restored."""
 
     def __init__(self, corpora: Sequence[pygrain.IterDataset[Batch]]):
         self.corpora = tuple(corpora)
         self.opened: dict[int, pygrain.DatasetIterator[Batch]] = {}
         # Each opened corpus's captured position, until a read or a restore moves it.
         self.states: dict[int, Mapping[str, object]] = {}
-        # The counts of a corpus back at its start, unopened, which it takes on as it opens: a pass a
-        # repeat reads again goes on counting each corpus (`rewound`).
+        # A position whose counters a corpus back at its start, unopened, takes on as it opens, every
+        # counter its stages keep (`rewound`): a pass a repeat reads again goes on counting each corpus.
         self.counted: dict[int, Mapping[str, object]] = {}
 
     def parent(self, index: int) -> pygrain.DatasetIterator[Batch]:
@@ -478,7 +478,7 @@ class _MixReads:
         if index not in self.opened:
             opened = iter(self.corpora[index])
             if index in self.counted:
-                opened.set_state({**opened.get_state(), _COUNTER: self.counted.pop(index)})
+                opened.set_state(rewound(opened.get_state(), self.counted.pop(index)))
             self.opened[index] = opened
         return self.opened[index]
 
@@ -486,25 +486,33 @@ class _MixReads:
         self.states.pop(index, None)
         return next(self.parent(index))
 
-    def state(self, index: int) -> Mapping[str, object]:
-        """The position of corpus `index`: its parent's, or, unopened, its counts alone (None before
-        it counted anything), which a repeat's rewind carries on (`rewound`)."""
+    def state(self, index: int) -> Mapping[str, object] | None:
+        """The position of corpus `index`, None where it is unopened (`counts`)."""
         if index not in self.opened:
-            return {_COUNTER: self.counted.get(index)}
+            return None
         if index not in self.states:
             self.states[index] = self.opened[index].get_state()
         return self.states[index]
 
+    def counts(self, index: int) -> Mapping[str, object] | None:
+        """The position whose counters corpus `index`, unopened, carries (None before it counted)."""
+        return self.counted.get(index)
+
     def restore(self, index: int, state: Mapping[str, object]) -> None:
-        """Corpus `index` at `state`, or back at its start, unopened, where it holds its counts alone."""
+        """Corpus `index` at `state`."""
         self.states.pop(index, None)
-        if set(state) <= {_COUNTER}:
-            self.close(index)
-            counts = state.get(_COUNTER)
-            if counts is not None:
-                self.counted[index] = record(counts, "corpus counter")
-        else:
-            self.parent(index).set_state(state)
+        self.parent(index).set_state(state)
+
+    def started(self, index: int, counted: Mapping[str, object] | None) -> None:
+        """Corpus `index` back at its start, unopened, carrying the counters of `counted`; where it is
+        open and none are given, its own: a repeat rewinds a mix to where it opened none, and its
+        corpora go on counting (`rewound`)."""
+        self.states.pop(index, None)
+        if counted is None and index in self.opened:
+            counted = self.opened[index].get_state()
+        self.close(index)
+        if counted is not None:
+            self.counted[index] = counted
 
     def close(self, index: int) -> None:
         self.counted.pop(index, None)
@@ -514,10 +522,10 @@ class _MixReads:
 
 
 class _MixRead(pygrain.DatasetIterator[Batch]):
-    """One corpus of a mix (`_MixReads`), its position its parent's, its counts alone before the mix
-    opened it. A position a mix saved while it read each corpus's first row ahead holds the corpus
-    before that row, which a restore reads next, and one saved before it opened corpora as drawn
-    has none of its unopened members."""
+    """One corpus of a mix (`_MixReads`): its parent's position, or, unopened, the counters it carries
+    (`"unopened"`). A position a mix saved while it read each corpus's first row ahead holds the
+    corpus before that row, which a restore reads next; one that held a corpus's counts alone in its
+    parent's place is a corpus at its start carrying them."""
 
     def __init__(self, group: _MixReads, index: int):
         super().__init__()
@@ -527,11 +535,21 @@ class _MixRead(pygrain.DatasetIterator[Batch]):
         return self._group.read(self._index)
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._group.state(self._index)}
+        state = self._group.state(self._index)
+        if state is None:
+            return {"unopened": self._group.counts(self._index)}
+        return {"parent": state}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        parent = state.get("parent")
-        self._group.restore(self._index, {} if parent is None else record(parent, "mixed corpus"))
+        if "unopened" in state:
+            counted = state["unopened"]
+            self._group.started(self._index, None if counted is None else record(counted, "mixed corpus"))
+            return
+        parent = record(state["parent"], "mixed corpus")
+        if set(parent) <= {_COUNTER}:
+            self._group.started(self._index, parent if parent.get(_COUNTER) is not None else None)
+        else:
+            self._group.restore(self._index, parent)
 
     def close(self) -> None:
         self._group.close(self._index)

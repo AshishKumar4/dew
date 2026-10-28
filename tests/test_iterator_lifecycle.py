@@ -873,8 +873,11 @@ def test_a_source_with_no_deadline_of_its_own_closes_when_its_finalization_ends(
 def test_a_mix_repeated_whole_goes_on_counting_each_corpus_on_its_second_pass():
     """Two finite corpora mixed, each rejecting a third of its records, the mix repeated whole: the
     second pass rewinds each corpus to its start, where the mix had not yet opened it, and its counts
-    go on from the first pass's, so each corpus counts the rows of both passes (row 2016's review)."""
+    go on from the first pass's, so each corpus counts the rows and rejections of both passes, every
+    counter its stages keep (rows 2016 and 2045)."""
     chain = mix([from_grain(grain.MapDataset.source([{"i": np.int32(index)} for index in range(6)]), name)
                  .filter_map(reject_thirds) for name in ("a", "b")]).repeat(2)
     metrics = chain.stats(records=16)
     assert (metrics["data/rows/a"], metrics["data/rows/b"]) == (8, 8)
+    # Every counter its stages keep goes on, the filter's rejections as the rows it delivered.
+    assert (metrics["data/rejected/a/third"], metrics["data/rejected/b/third"]) == (4, 4)

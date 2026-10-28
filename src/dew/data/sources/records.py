@@ -111,25 +111,38 @@ class ShardReaders[K]:
     @classmethod
     def _trim(cls) -> None:
         """Close the least recently read idle readers of every source in the process past the bound
-        one source keeps (`_MAX_OPEN_SHARDS`), as a read leaves more idle than that. It holds one
-        source's lock at a time, never while it waits for another's, so no read waits on a source it
-        does not read."""
-        with cls._trimming:
+        one source keeps (`_MAX_OPEN_SHARDS`), as a read leaves more idle than that. It waits on no
+        lock: where another read is trimming, that one trims, and a source whose lock is held, a read
+        opening one of its shards say, is passed over, its idle readers trimmed as one of its reads
+        drains. So no read waits on a source it does not read."""
+        if not cls._trimming.acquire(blocking=False):
+            return
+        try:
             with cls._registry:
                 live = list(cls._live)
             idle = []
             for readers in live:
-                with readers._lock:
+                if not readers._lock.acquire(blocking=False):
+                    continue
+                try:
                     idle.extend((opened.used, id(readers), key, readers)
                                 for key, opened in readers._opened.items() if not opened.reads)
+                finally:
+                    readers._lock.release()
             idle.sort(key=lambda entry: entry[:2])
             for _, _, key, readers in idle[:max(0, len(idle) - _MAX_OPEN_SHARDS)]:
-                with readers._lock:
+                if not readers._lock.acquire(blocking=False):
+                    continue
+                try:
                     opened = readers._opened.get(key)
                     if opened is not None and not opened.reads:
                         readers._opened.pop(key).reader.close()
                         cls._idled(-1)
                         readers._lock.notify_all()
+                finally:
+                    readers._lock.release()
+        finally:
+            cls._trimming.release()
 
     def close(self) -> None:
         """Close every idle reader, retiring busy ones until their reads drain."""

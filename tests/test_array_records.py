@@ -335,3 +335,42 @@ def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arra
             assert overflow.result(timeout=5) == f"{width}:0".encode()
     finally:
         source.close()
+
+
+def test_a_read_past_the_bound_never_waits_on_another_source_opening_a_shard(arrayrecord_paths, monkeypatch):
+    """A source opening a shard holds its own lock while it opens (a remote shard downloads). A read
+    of another source that leaves the process past its idle bound trims without waiting on it: it
+    passes the opening source over and returns, and the bound holds once that source's read drains
+    (row 2046). Before, the trim took every source's lock in turn and waited on the open."""
+    from dew.data.sources.records import ArrayRecords
+
+    real = {os.path.realpath(path) for path in arrayrecord_paths}
+    opening, released = threading.Event(), threading.Event()
+    slow = os.path.realpath(arrayrecord_paths[-1])
+    underlying_open = ArrayRecords._shard
+
+    def slow_open(self, shard):
+        if os.path.realpath(self.urls[shard]) == slow:
+            opening.set()
+            assert released.wait(timeout=60)
+        return underlying_open(self, shard)
+
+    monkeypatch.setattr(ArrayRecords, "_shard", slow_open)
+    held = [ArrayRecords((path,), counts=(8,)) for path in arrayrecord_paths[:-1]]
+    late = ArrayRecords((arrayrecord_paths[-1],), counts=(8,))
+    again = ArrayRecords((arrayrecord_paths[0],), counts=(8,))
+    try:
+        for source in held:
+            assert source[0] is not None
+        with ThreadPoolExecutor(2) as pool:
+            pending = pool.submit(late.__getitem__, 0)
+            assert opening.wait(timeout=60)
+            assert pool.submit(again.__getitem__, 1).result(timeout=60) is not None
+            assert not pending.done()
+            released.set()
+            assert pending.result(timeout=60) is not None
+        assert sum(opened.path in real for opened in psutil.Process().open_files()) <= Loading().threads
+    finally:
+        released.set()
+        for source in (*held, late, again):
+            source.close()
