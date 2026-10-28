@@ -1036,15 +1036,18 @@ class Judge:
         while len(self._ahead) > 2 * self.AHEAD:
             self._ahead.pop(min(self._ahead))
 
-    def reference(self, seed: int) -> Drawn:
+    def _from_ahead(self, seed: int, anchor: bool) -> Drawn:
+        """Draw `seed`'s reference, or its anchor where `anchor`: ahead (`ahead`) where it runs there,
+        else drawn here."""
         if seed in self._ahead:
-            return self._ahead[seed].result()[0]
-        return self._drawn_reference(seed)
+            return self._ahead[seed].result()[anchor]
+        return self._drawn_anchor(seed) if anchor else self._drawn_reference(seed)
+
+    def reference(self, seed: int) -> Drawn:
+        return self._from_ahead(seed, anchor=False)
 
     def anchor(self, seed: int) -> Drawn:
-        if seed in self._ahead:
-            return self._ahead[seed].result()[1]
-        return self._drawn_anchor(seed)
+        return self._from_ahead(seed, anchor=True)
 
     def _drawn_reference(self, seed: int) -> Drawn:
         chosen = self.batch_seed(seed)
@@ -1380,13 +1383,7 @@ def floored(model: str, layout: str, *, dtype: str, devices: int | None = None) 
         row.update(compiled, losses=losses, **floor_judged(
             leaf_errors(ref_gradient, gradient, dtype), floors, abs(losses[0] - ref_losses[0]),
             loss_floor, ref_losses[0], contracted_terms(batch)))
-        if compiled["flops_per_device"] and reference_flops:
-            # Above one when devices compute what one device need not.
-            size = math.prod(compiled["mesh"].values())
-            row["flops_ratio"] = compiled["flops_per_device"] * size / reference_flops
-            row["flops_bound"] = flops_bound(LAYOUTS[layout], compiled["replicated"])
-            if row["status"] == "works" and row["flops_ratio"] > row["flops_bound"]:
-                row["status"] = "REDUNDANT"
+        count_flops(row, compiled, LAYOUTS[layout], reference_flops)
     except LayoutRefused as refusal:
         row.update(status="refused", reason=str(refusal))
     except Exception as error:  # a failing layout is a row of the matrix
@@ -1560,6 +1557,19 @@ def flops_bound(fields: Mapping[str, int], replicated: float = 0.0) -> float:
     return ((1 - replicated) * (microbatches + stages - 1) / microbatches + replicated * stages) * FLOPS_SLACK
 
 
+def count_flops(row: dict[str, Any], compiled: Mapping[str, Any], fields: Mapping[str, int],
+                reference_flops: float | None) -> None:
+    """`row` takes its layout's FLOPs against one device's: its devices' together over the
+    reference's `reference_flops`, held to `flops_bound`, REDUNDANT past it where the row works."""
+    if not (compiled["flops_per_device"] and reference_flops):
+        return
+    # Above one when devices compute what one device need not.
+    ratio = compiled["flops_per_device"] * math.prod(compiled["mesh"].values()) / reference_flops
+    row.update(flops_ratio=ratio, flops_bound=flops_bound(fields, compiled["replicated"]))
+    if row["status"] == "works" and ratio > row["flops_bound"]:
+        row["status"] = "REDUNDANT"
+
+
 def judged_orders(reference: Mapping[str, Sequence[float]], layout: Mapping[str, Sequence[float]]) -> dict:
     """K-order RMS distances to fp64, held to the shared reference rule per leaf.
 
@@ -1713,12 +1723,8 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
                    "invariance_max": max(invariance),
                    "reference_distances": ref_distances, "layout_distances": layout_distances[name],
                    **compiled, **judged_orders(ref_distances, layout_distances[name])}
-            if compiled['flops_per_device'] and ref_compiled['flops_per_device']:
-                row['flops_ratio'] = (compiled['flops_per_device'] * math.prod(compiled['mesh'].values())
-                                      / ref_compiled['flops_per_device'])
-                row['flops_bound'] = flops_bound(LAYOUTS[name], compiled['replicated'])
-                if row['status'] == 'works' and row['flops_ratio'] > row['flops_bound']:
-                    row['status'] = 'REDUNDANT'
+            if compiled['flops_per_device']:
+                count_flops(row, compiled, LAYOUTS[name], ref_compiled['flops_per_device'])
             rows.append(row)
             speak(f'[{model}/{name}] {row["status"]} K-order ratio {row["worst_ratio"]:.3f} '
                   f'at {row["worst_leaf"]}')
@@ -1845,13 +1851,8 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, seeds: int
                 row.update(arm.compiled, **agreed(f"{model} on {name}, its draws", lambda: (
                     ran(model, name, arm, judge, first) if count == 0
                     else judged(model, name, arm, judge, count, window))))
-                if arm.compiled["flops_per_device"] and judge.flops_per_device:
-                    # Above one when devices compute what one device need not.
-                    size = math.prod(arm.compiled["mesh"].values())
-                    row["flops_ratio"] = arm.compiled["flops_per_device"] * size / judge.flops_per_device
-                    row["flops_bound"] = flops_bound(LAYOUTS[name], arm.compiled["replicated"])
-                    if row["status"] == "works" and row["flops_ratio"] > row["flops_bound"]:
-                        row["status"] = "REDUNDANT"
+                if arm.compiled["flops_per_device"]:
+                    count_flops(row, arm.compiled, LAYOUTS[name], judge.flops_per_device)
             except LayoutRefused as refusal:
                 row.update(status="refused", reason=str(refusal))
             except Exception as error:  # a failing layout is a row of the matrix
