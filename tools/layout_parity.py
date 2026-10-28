@@ -948,6 +948,8 @@ class Judge:
         self._records: dict[int, Witnessed] = {}
         self._batches: dict[int, int] = {}
         self._selections: tuple[Any, Callable] | None = None
+        self._ahead: dict[int, Any] = {}
+        self._pool: Any = None
 
     def batch_seed(self, seed: int) -> int:
         """The seed of the batch the gate's draw `seed` takes: itself, or for a selecting model the
@@ -1007,16 +1009,52 @@ class Judge:
         so a run of prepared draws compiles no reference."""
         return self.references.noted("flops", self.case, lambda: self.arm.compiled["flops_per_device"])
 
+    AHEAD = 8
+    """How many draws past the one read the reference and the anchor run ahead (`ahead`)."""
+
+    def ahead(self, seed: int) -> None:
+        """Draw `seed`'s reference and float64 anchor, and the `AHEAD` draws' after it, on two threads
+        beside the caller, which runs a layout's draw meanwhile: each of a draw's three programs keeps
+        about half of a CI task's four cores busy, so the three together run in about half the time.
+        The draws ahead are held until read, the oldest dropped past twice `AHEAD` (a later read takes
+        them from `references`, or computes them again)."""
+        import concurrent.futures
+
+        import jax
+
+        if self._pool is None:
+            self._pool = concurrent.futures.ThreadPoolExecutor(2)
+
+        def both(at: int) -> tuple[Drawn, Drawn]:
+            with jax.enable_x64(new_val=True):
+                return self._drawn_reference(at), self._drawn_anchor(at)
+
+        for at in range(seed, seed + self.AHEAD + 1):
+            if at not in self._ahead:
+                self._ahead[at] = self._pool.submit(both, at)
+        while len(self._ahead) > 2 * self.AHEAD:
+            self._ahead.pop(min(self._ahead))
+
     def reference(self, seed: int) -> Drawn:
+        if seed in self._ahead:
+            return self._ahead[seed].result()[0]
+        return self._drawn_reference(seed)
+
+    def anchor(self, seed: int) -> Drawn:
+        if seed in self._ahead:
+            return self._ahead[seed].result()[1]
+        return self._drawn_anchor(seed)
+
+    def _drawn_reference(self, seed: int) -> Drawn:
         chosen = self.batch_seed(seed)
         drawn = self.references.held("reference", self.case, chosen, lambda: self.arm(chosen))
         self._records[chosen] = drawn.record
         return drawn
 
-    def anchor(self, seed: int) -> Drawn:
+    def _drawn_anchor(self, seed: int) -> Drawn:
         chosen = self.batch_seed(seed)
 
-        witnessed = self._records[chosen] if chosen in self._records else self.reference(seed).record
+        witnessed = self._records[chosen] if chosen in self._records else self._drawn_reference(seed).record
 
         def computed():
             if self._anchor is None:
@@ -1199,6 +1237,7 @@ def judged(model: str, name: str, arm: Arm, judge: Judge, seeds: int, window: in
 
     @dew_programs
     def layout(seed):
+        judge.ahead(int(seed))
         drawn = arm(judge.batch_seed(int(seed)))
         coupled(judge.reference(int(seed)).record, drawn.record, f"{label}, draw {int(seed)}")
         return drawn.leaves()
@@ -1212,9 +1251,16 @@ def judged(model: str, name: str, arm: Arm, judge: Judge, seeds: int, window: in
             return ((np.asarray(seed),) if window == 1
                     else (np.arange(seed * window, (seed + 1) * window),))
 
-        reference = dew_programs(lambda seed: judge.reference(int(seed)).leaves())
+        def read(drawn):
+            # Whichever arm check 1 reads first starts the draws ahead (`Judge.ahead`).
+            def of(seed):
+                judge.ahead(int(seed))
+                return drawn(int(seed)).leaves()
+            return of
+
+        reference = dew_programs(read(judge.reference))
         assert_as_exact(windowed(layout), windowed(reference), draw, label, seeds=seeds,
-                        truth_fn=windowed(as_given(lambda seed: judge.anchor(int(seed)).leaves())))
+                        truth_fn=windowed(as_given(read(judge.anchor))))
     except ReferenceRefused as refusal:
         return {"status": "INCONCLUSIVE", "reason": f"the model's reference is refused: {refusal}"[:2000]}
     except CouplingRefused as refusal:
