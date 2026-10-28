@@ -1765,6 +1765,16 @@ def test_a_finite_mixture_resumed_after_a_member_ends_reads_what_the_uninterrupt
 
 
 
+@dataclasses.dataclass(frozen=True)
+class Kept:
+    """A filter that keeps every record."""
+
+    identity = "kept@1"
+
+    def __call__(self, row) -> bool:
+        return True
+
+
 class Seen:
     """`rows` records of a corpus that marks itself in `touched` whenever one of them is read."""
 
@@ -1780,20 +1790,21 @@ class Seen:
 
 
 def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_corpora_it_draws():
-    """A mix of 300 corpora, each shuffled and repeated as a run's sources are, in a run bounded by
-    its examples, read with Loading's 16 threads and 16-batch read-ahead: its reader holds no more
-    threads than one read of them all,
+    """A mix of 300 corpora, each shuffled, repeated and filtered as a run's sources are, read with
+    Loading's 16 threads and 16-batch read-ahead: its reader holds no more threads than one read of
+    them all,
     and reads only the corpora it draws, here the two that carry its weight. Before, each corpus read
     with the whole budget and the mix read every corpus's first row before its first: 300 thread
     pools and every corpus read (row 2016)."""
     import threading
 
     touched: set[int] = set()
+    # Each corpus filters its records, as a run's sources drop what they reject, so the mix reads each
+    # as a stream of its own share (as a token-budget batch reads them too).
     corpora = [Pipeline(Memory(Seen(64, corpus, touched), identity=f"seen-{corpus}")).shuffle(corpus).repeat()
-               for corpus in range(300)]
+               .filter(Kept()) for corpus in range(300)]
     weights = [1.0, 1.0] + [1e-9] * 298
-    # A run bounded by its examples counts each corpus's (`compile`'s `examples`), so each is a stream.
-    data = compile(mix(corpora, weights).batch(8), read="indexed", seed=0, examples=4000,
+    data = compile(mix(corpora, weights).batch(8), read="indexed", seed=0,
                    loading=Loading(workers=0, threads=16, read_buffer=16, cache=False))
     before = threading.active_count()
     touched.clear()
