@@ -1540,3 +1540,168 @@ def test_a_leaf_summary_reads_the_same_with_its_truths_rows_read_once():
         one, other = getattr(alone, field.name), getattr(shared, field.name)
         assert np.array_equal(one, other) if isinstance(one, np.ndarray) else one == other, field.name
 
+
+
+def _bits(value):
+    """`value` as its type and bits: a float held to its bits (a NaN's and a zero's sign included), an
+    array to its dtype, shape and bytes, a summary field by field."""
+    import dataclasses
+
+    from reference_error import RecordedLeaf
+
+    if isinstance(value, RecordedLeaf):
+        return [(field.name, _bits(getattr(value, field.name))) for field in dataclasses.fields(value)]
+    if isinstance(value, (tuple, list)):
+        return [_bits(item) for item in value]
+    if value is None or isinstance(value, (bool, str)):
+        return type(value).__name__, value
+    array = np.asarray(value)
+    return type(value).__name__, array.dtype.str, array.shape, array.tobytes()
+
+
+def _evidence_leaf_by_leaf(dew, reference, truth, their_truth) -> list[tuple]:
+    """`_evidence`'s rows as it read them before it read a draw at once: each arm's `leaf_summary` of
+    each leaf alone, paired (`_paired`) where the truths are the same values, an empty leaf exact."""
+    from reference_error import LOG_ZERO, NO_ZERO_ROWS, RecordedLeaf, _paired, leaf_summary
+
+    row = []
+    for (path, leaf), their_leaf, true, their_true in zip(
+            jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
+            jax.tree.leaves(their_truth), strict=True):
+        recorded = isinstance(their_leaf, RecordedLeaf)
+        their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
+        if not np.size(leaf):
+            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True))
+            continue
+        paired = recorded or their_truth is truth or np.array_equal(np.asarray(true), np.asarray(their_true))
+        row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
+    return row
+
+
+
+class _RandomLeaves:
+    """Random leaves of a draw for check 1's evidence: shapes of every kind it reads, each truth with rows
+    of float64 zero, values not finite and scales near float64's range, and arms in four dtypes, laid out
+    C-ordered, F-ordered and strided."""
+
+    WIDTHS = (1, 2, 3, 7, 8, 9, 16, 33, 129)
+
+    def __init__(self, seed: int):
+        self.rng = np.random.default_rng(seed)
+
+    def shape(self) -> tuple:
+        """A scalar's, a vector's, an empty leaf's, rows past NumPy's 8,192-entry buffer, or rows."""
+        rng, kind = self.rng, self.rng.integers(12)
+        if kind == 0:
+            return ()
+        if kind == 1:
+            return (int(rng.integers(1, 40)),)
+        if kind == 2:
+            return [(0,), (3, 0), (0, 5)][rng.integers(3)]
+        if kind == 3:
+            return [(70, 129), (2, 9000)][rng.integers(2)]
+        if kind <= 5:
+            return int(rng.integers(1, 6)), int(rng.integers(1, 5)), int(rng.choice(self.WIDTHS))
+        return int(rng.integers(1, 12)), int(rng.choice(self.WIDTHS))
+
+    def laid_out(self, array):
+        """`array` as it is, or F-ordered, or every other entry of a row twice as wide."""
+        kind = self.rng.integers(5)
+        if kind == 0 and array.ndim >= 2:
+            return np.asfortranarray(array)
+        if kind == 1 and array.ndim >= 1:
+            wide = np.zeros((*array.shape[:-1], 2 * array.shape[-1]), array.dtype)
+            wide[..., ::2] = array
+            return wide[..., ::2]
+        return array
+
+    def truth(self, shape):
+        """A float64 truth of `shape`: a few rows zero or 1e-30 of the rest, one in 20 a value not finite."""
+        rng = self.rng
+        scale = 10.0 ** (rng.uniform(-3, 3) if rng.random() < 0.8 else rng.choice([-300, -160, 154, 300]))
+        truth = rng.standard_normal(shape) * scale
+        if truth.ndim >= 2 and truth.size:
+            rows = truth.reshape(-1, shape[-1])
+            for row in rng.choice(len(rows), min(len(rows), int(rng.integers(0, 3))), replace=False):
+                rows[row] *= rng.choice([0.0, 1e-30])
+        if truth.size and rng.random() < 0.05:
+            truth.reshape(-1)[rng.integers(truth.size)] = rng.choice([np.inf, -np.inf, np.nan])
+        return truth
+
+    def arm(self, truth, dtype):
+        """An arm of `truth` in `dtype`: exact, or off it relatively and at times absolutely too (so a
+        row of zero has a residue), at times exactly zero on a row or not finite at a value."""
+        rng = self.rng
+        if rng.random() < 0.1:
+            return self.laid_out(truth.copy())
+        arm = truth * (1 + 2.0 ** -20 * rng.standard_normal(truth.shape))
+        if rng.random() < 0.5:
+            largest = np.max(np.abs(truth), initial=0.0, where=np.isfinite(truth))
+            arm = arm + 1e-9 * largest * rng.standard_normal(truth.shape)
+        arm = np.asarray(arm.astype(dtype))
+        if arm.ndim >= 2 and arm.size and rng.random() < 0.3:
+            arm.reshape(-1, arm.shape[-1])[rng.integers(arm.size // arm.shape[-1])] = 0
+        if arm.size and rng.random() < 0.05:
+            arm.reshape(-1)[rng.integers(arm.size)] = rng.choice([np.inf, np.nan])
+        return self.laid_out(arm)
+
+    def draw(self) -> tuple[dict, dict, dict, dict]:
+        """One draw's Dew, reference, truth and the reference's truth: one in five references recorded,
+        and three in ten held to truths of their own, each the same object, the same values in another
+        array, or another draw's."""
+        rng = self.rng
+        pool = [self.shape() for _ in range(rng.integers(2, 8))]
+        names = [f"leaf{index:02d}" for index in range(rng.integers(4, 24))]
+        shapes = {name: pool[rng.integers(len(pool))] for name in names}
+        dtypes = {name: (np.float16, jnp.bfloat16, np.float32, np.float64)[rng.integers(4)] for name in names}
+        truth = {name: self.truth(shapes[name]) for name in names}
+        truth = {name: self.laid_out(value) if rng.random() < 0.1 else value for name, value in truth.items()}
+        their_truth = truth
+        if rng.random() < 0.3:
+            their_truth = {name: [truth[name], self.laid_out(np.array(truth[name])),
+                                  self.truth(shapes[name])][rng.integers(3)] for name in names}
+        dew = {name: self.arm(truth[name], dtypes[name]) for name in names}
+        if rng.random() < 0.2:
+            dew[names[0]] = jnp.asarray(dew[names[0]])
+        reference = {name: self.arm(their_truth[name], dtypes[name]) for name in names}
+        if rng.random() < 0.2:
+            import dataclasses
+
+            from reference_error import leaf_summary
+
+            reference = {name: dataclasses.replace(leaf_summary(reference[name], their_truth[name]),
+                                                   zero_sizes=None, worst_log=None) for name in names}
+        return dew, reference, truth, their_truth
+
+
+def test_a_draws_evidence_read_at_once_is_each_leafs_read_alone_bit_for_bit():
+    """A draw's summaries read at once (`_summaries`) are `leaf_summary`'s of each leaf alone, and
+    `_evidence`'s rows the rows it paired from those (`_evidence_leaf_by_leaf`), bit for bit, over 160
+    random draws (`_RandomLeaves`): scalars, vectors, empty leaves and rows of widths 1 to 9,000, one
+    shape repeated (a run laid as one matrix), in float16, bfloat16, float32 and float64, C-ordered,
+    F-ordered and strided, with rows of float64 zero, an arm exactly zero on a row, values not finite or
+    near float64's range, a recorded reference, and a reference held to truths of its own."""
+    from reference_error import _evidence, _LaidTruths, _summaries, leaf_summary
+
+    def outcome(fn, *arguments):
+        try:
+            return _bits(fn(*arguments))
+        except AssertionError as error:
+            return "raises", str(error)
+
+    random, read, leaves = _RandomLeaves(1848), 0, 0
+    with np.errstate(all="ignore"):
+        for draw in range(160):
+            trees = random.draw()
+            assert outcome(_evidence, *trees) == outcome(_evidence_leaf_by_leaf, *trees), draw
+            dew, _, truth, _ = trees
+            arms, truths = list(jax.device_get(dew).values()), list(truth.values())
+            arms[::3] = [None] * len(arms[::3])
+            held = _LaidTruths.of(truths)
+            for name, arm, true, summary in zip(dew, arms, truths, _summaries(arms, held), strict=True):
+                assert _bits(summary) == _bits(None if arm is None else leaf_summary(arm, true)), (draw, name)
+            leaves += len(arms)
+            read += sum(arms[at] is not None and np.asarray(arms[at], np.float64).flags.c_contiguous
+                        for at in held.laid)
+    # Most leaves are read at once, not alone.
+    assert read > leaves / 3, (read, leaves)
