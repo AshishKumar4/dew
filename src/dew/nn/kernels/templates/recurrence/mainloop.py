@@ -632,6 +632,15 @@ def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, 
     return _planned_launch(call, scope, registers, floor=stages, most=stages), tiles
 
 
+def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
+    """A launch's work over its `tiles` as it states it to XLA and to Dew's FLOP count
+    (`templates.gemm.cost`): the model's products (an fp32 call's parts aside), its exponentials, and its
+    operands' and outputs' bytes once (row 1895's kernel report: unstated, the recurrence made MFU a lower
+    bound)."""
+    stated = cost(int(work.flops * tiles), *arrays, *jax.tree.leaves(out_type))
+    return dataclasses.replace(stated, transcendentals=int(work.exponentials * tiles))
+
+
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
             landing: dict | None = None, persistent: bool = False, reduces: bool = True,
@@ -743,15 +752,10 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     entry.__name__ = name
 
     def launched(*arrays):
-        # Its work as it states it to XLA and to Dew's FLOP count (`templates.gemm.cost`): the model's
-        # products over its tiles (an fp32 call's parts aside), its exponentials, and its operands' and
-        # outputs' bytes once (row 1895's kernel report: unstated, the recurrence made MFU a lower bound).
-        stated = dataclasses.replace(cost(work.flops * tiles, *arrays, *jax.tree.leaves(out_type)),
-                                     transcendentals=int(work.exponentials * tiles))
         laid = ({"grid": (programs,), "grid_names": ("programs",)} if persistent
                 else {"grid": grid, "grid_names": grid_names})
         return family.kernel(entry, out_type=out_type, **laid, consumers=1, interpret=call.interpret,
-                             name=name, cost=stated)(*arrays)
+                             name=name, cost=_stated(work, tiles, arrays, out_type))(*arrays)
 
     return launched
 
