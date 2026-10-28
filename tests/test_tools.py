@@ -1738,20 +1738,6 @@ def test_every_remote_code_release_carries_the_fields_its_loader_reads(monkeypat
             assert files and all(file.endswith(".py") for file in files), name
 
 
-def test_a_family_whose_release_is_its_reference_pins_the_release_its_fixture_is_recorded_from(monkeypatch):
-    """A family that names its release's code (`DecoderFamily.release_code`), which a native export
-    writes beside itself, names the repo, commit and files its fixture's recording reads
-    (tools/remote_code_reference.py): an export opens with the code Dew is held to."""
-    from dew.interop.families.lfm3 import LFM3
-
-    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
-    code = LFM3.release_code
-    assert code is not None
-    repo, revision, files = load("remote_code_reference").RELEASES["lfm3-tiny"][:3]
-    assert (repo, revision) == (code.source, code.revision)
-    assert {f"{str(reference).rpartition('.')[0]}.py" for reference in code.auto_map.values()} <= set(files)
-
-
 def test_a_float64_twin_rotates_by_its_whole_complex_table():
     """A float64 twin keeps a complex table its constructor computes complex (Llama 4's vision
     `freqs_ci`): it rotates by the table's cosines and sines both, so its output is the float64

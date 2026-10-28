@@ -57,6 +57,10 @@ from torch_precision import float64, float64_twin
 from transformers import AutoConfig
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
+_PINNED = json.loads((Path(__file__).resolve().parents[1] / "src" / "dew" / "interop" / "families"
+                      / "release_code.json").read_text())
+"""The releases whose own code is a Dew family's reference, which the family exports with too."""
+
 RELEASES = {
     "llada-tiny": ("GSAI-ML/LLaDA-8B-Base", "0f2787f2d87eac5eed8a087d5ecd24277e6255b2",
                    ("configuration_llada.py", "modeling_llada.py"), "AutoModel"),
@@ -65,8 +69,9 @@ RELEASES = {
                    "AutoModel"),
     "mimo-v2-tiny": ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
                      ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM"),
-    # modeling_lfm3.py imports its Triton conv from lfm3_conv.py, which its CPU run passes by.
-    "lfm3-tiny": ("LiquidAI/LFM3-1.7B", "40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd",
+    # The family's own pin (src/dew/interop/families/release_code.json). modeling_lfm3.py imports its
+    # Triton conv from lfm3_conv.py, which its CPU run passes by.
+    "lfm3-tiny": (_PINNED["lfm3"]["repo"], _PINNED["lfm3"]["revision"],
                   ("configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"), "AutoModelForCausalLM"),
 }
 """Each fixture's release: the Hub repo, the commit its code is read at, the

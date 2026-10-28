@@ -18,7 +18,7 @@ import logging
 import os
 from collections.abc import Collection
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 import jax
@@ -202,11 +202,16 @@ def code_modules(code: SourceCode) -> dict[str, Path]:
     local = os.path.isdir(code.source)
 
     def located(file: str) -> Path:
+        # A module named by a config or an import is a path inside the source, as a subfolder is.
+        if PurePosixPath(file).is_absolute() or {"", ".", ".."} & set(PurePosixPath(file).parts):
+            raise ValueError(f"{file!r} is no module inside the source: its code may not name a path "
+                             "outside it")
         if local:
             return Path(code.source) / file
         from huggingface_hub import hf_hub_download
 
-        return Path(hf_hub_download(str(code.source), file, revision=code.revision))
+        return Path(hf_hub_download(str(code.source), f"{code.folder}/{file}" if code.folder else file,
+                                    revision=code.revision))
 
     references = [reference for value in code.auto_map.values()
                   for reference in (value if isinstance(value, list) else [value])

@@ -608,13 +608,14 @@ class Pretrained:
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
         destination = Path(directory)
-        # Either half may refuse the bundle, each before it writes a file.
+        # Either half may refuse the bundle, each before it writes a file, as may the source's code.
         tensors = self.export(values)
+        modules = {} if self.code is None else sources.code_modules(self.code)
         decoders.save_export_assets(destination,
                                     tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config),
                                     named=self.names_tokenizer)
-        for name, module in sorted(({} if self.code is None else sources.code_modules(self.code)).items()):
+        for name, module in sorted(modules.items()):
             written = destination / name
             written.parent.mkdir(parents=True, exist_ok=True)
             written.write_bytes(module.read_bytes())
@@ -1246,16 +1247,19 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
 
 
 def _kept_code(route: SourceRoute, remote: Path | None, config: Mapping[str, object],
-               name_or_dir: str | Path, directory: Path) -> decoder_parts.SourceCode | None:
+               reference: sources.SourceReference, root: Path) -> decoder_parts.SourceCode | None:
     """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config names it
     (`auto_map`): in the snapshot a verification from parts ran it from, or, of a natively mapped
-    source, at the snapshot's commit, never run."""
+    source, beside the config the load read (`reference`, its component folder), at the metadata
+    snapshot's commit (`root`), never run."""
     auto_map = config.get("auto_map")
     if not isinstance(auto_map, Mapping):
         return None
     if isinstance(route, VerifiedRoute) and route.verified.source is not None and remote is not None:
         return decoder_parts.SourceCode(remote, None, auto_map)
-    return decoder_parts.SourceCode(name_or_dir, directory.name, auto_map)
+    if Path(reference.name).is_dir():
+        return decoder_parts.SourceCode(reference.directory(root), None, auto_map)
+    return decoder_parts.SourceCode(reference.name, root.name, auto_map, folder=reference.subfolder)
 
 
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
@@ -1943,11 +1947,13 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     name_or_dir, commit = source.name, source.revision
     directory = source.directory(root)
     gguf_path = None if gguf_file is None else source.file(root, gguf_file)
+    # The config's own folder, where a source keeps the code it names (`_kept_code`).
+    configured = source if component is None else source.component(component.config_folder)
     if component is None:
         config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
     else:
         config = component.config
-        directory = source.component(component.config_folder).directory(root)
+        directory = configured.directory(root)
     mamba_ssm = mamba2.is_mamba_ssm(config)
     config = _native_config(config, overrides)
     family = config.get("model_type")
@@ -1999,7 +2005,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                     # The weights' commit: a pickle repo's may be its conversion's.
                     revision=resolved_commit,
                     tokenizer="byte" if named == "byte" else None,
-                    code=_kept_code(route, remote, config, name_or_dir, directory))
+                    code=_kept_code(route, remote, config, configured, root))
 
     if family == "diffusion_gemma":
         return bundle(PretrainedBlockDecoder), False

@@ -1812,6 +1812,9 @@ class SourceCode:
     source: str | Path
     revision: str | None
     auto_map: Mapping[str, object]
+    folder: str | None = None
+    """The component folder within a Hub repo the code sits in beside its config, as a load selects it
+    (`SourceReference.subfolder`); a directory source is that folder already."""
 
 
 @dataclass(frozen=True)

@@ -222,6 +222,31 @@ def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_pa
         assert (tmp_path / 'saved' / file).read_text() == text
 
 
+def test_a_component_keeps_the_code_beside_its_config_and_none_outside_its_source(tmp_path):
+    """A release loaded from a component folder (`subfolder`) keeps the code beside that folder's config,
+    not the source root's; a module whose relative import names a path outside the source refuses the
+    save, which writes none of it (ledger 2038)."""
+    import shutil
+
+    code = LFM3.release_code
+    component = tmp_path / 'release' / 'decoder'
+    shutil.copytree(TINY, component)
+    config = json.loads((component / 'config.json').read_text())
+    (component / 'config.json').write_text(json.dumps({**config, 'auto_map': dict(code.auto_map)}))
+    for file, text in RELEASED.items():
+        (component / file).write_text(text)
+    (tmp_path / 'release' / 'modeling_lfm3.py').write_text('raise ImportError\n')
+    loaded = Pretrained.load(tmp_path / 'release', subfolder='decoder', dtype='float32',
+                             attention_impl='reference')
+    loaded.save(tmp_path / 'saved')
+    assert {path.name: path.read_text() for path in (tmp_path / 'saved').glob('*.py')} == RELEASED
+    (component / 'lfm3_conv.py').write_text('from .../victim import conv\n')
+    (tmp_path / 'victim.py').write_text('conv = None\n')
+    with pytest.raises(ValueError):
+        loaded.save(tmp_path / 'escaped' / 'saved')
+    assert not (tmp_path / 'escaped' / 'victim.py').exists()
+
+
 def test_a_native_export_writes_its_familys_release_code_beside_itself(tmp_path, release_cache):
     """A model built in Dew of a family whose reference is a release's own code (`release_code`) exports
     with that release's auto_map and the modules it names and imports, at the commit Dew is held to,

@@ -12,7 +12,9 @@ the sliding layers whole at theirs. Sandwich norms wrap each mixer and feed-forw
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from pathlib import Path
 
 from dew import _records
 from dew.interop.config_records import native_fields
@@ -38,6 +40,10 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers.short_conv import ShortConvMixer
 
 _KINDS = ('conv', 'full_attention', 'sliding_attention')
+
+_RELEASE = json.loads(Path(__file__).with_name('release_code.json').read_text())['lfm3']
+"""The release whose own code is LFM3's reference, its commit and its auto_map, which an export writes
+(`DecoderFamily.release_code`) and tools/remote_code_reference.py records the fixture from."""
 
 _FEED_FORWARD: Renames = (
     ('feed_forward.w1', 'mlp.gate_proj'), ('feed_forward.w3', 'mlp.up_proj'),
@@ -204,10 +210,7 @@ LFM3 = DecoderFamily(
     preserve_source_layout=True,
     padding_idx=True,
     aliases={'norm_eps': 'rms_norm_eps'},
-    release_code=SourceCode(
-        'LiquidAI/LFM3-1.7B', '40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd',
-        {'AutoConfig': 'configuration_lfm3.Lfm3Config', 'AutoModel': 'modeling_lfm3.Lfm3Model',
-         'AutoModelForCausalLM': 'modeling_lfm3.Lfm3ForCausalLM'}),
+    release_code=SourceCode(_RELEASE['repo'], _RELEASE['revision'], _RELEASE['auto_map']),
     # Lfm3Config's defaults for the fields its decoder reads (configuration_lfm3.py).
     defaults={'conv_L_cache': 7, 'conv_bias': False, 'use_sandwich_norm': True, 'sliding_window': 256,
               'tie_word_embeddings': True, 'max_position_embeddings': 128000, 'rms_norm_eps': 1e-5,
