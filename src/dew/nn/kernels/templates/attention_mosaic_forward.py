@@ -307,7 +307,8 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     slots.release("keys")
     k_first = index * tiles.block_k
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
-    coords = _coords(family, spans, row, first, k_first, shape)
+    coords = _coords(family, spans, row, first, k_first, shape,
+                     draw=None if hooked.drop is None else hooked.drop.draw(row, head))
     params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
                    for ref, param in zip(hooked.score, hooks.score_params, strict=True))
     logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))

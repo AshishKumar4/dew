@@ -15,7 +15,16 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
-from dew.nn.kernels.templates.attention import DKV_GRADS, DQ_GRADS, Hooks, Kind, PaddedCall, Param, by_power
+from dew.nn.kernels.templates.attention import (
+    DKV_GRADS,
+    DQ_GRADS,
+    Dropout,
+    Hooks,
+    Kind,
+    PaddedCall,
+    Param,
+    by_power,
+)
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     _columns,
@@ -139,8 +148,12 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     inverse_total = coords.queries(algebra.inverse(total), s)
     exponentials, weights = algebra.normalized(logits, coords.queries(peak, s), inverse_total, how)
     at_anchor = coords.k_pos == coords.queries(chosen, coords.k_pos)
+    multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     cotangents = algebra.grad_scores(exponentials, dp, coords.queries(anchor, s), coords.queries(delta, s),
-                                     seen, at_anchor, inverse_total)
+                                     seen, at_anchor, inverse_total, multiplier=multiplier)
+    if multiplier is not None:
+        # dV's weights the dropped ones (`algebra.value_operands`).
+        exponentials, weights = exponentials * multiplier, weights * multiplier
     return exponentials, weights, cotangents, slopes, seen
 
 
@@ -202,7 +215,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
 
 
 def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, spans: _Spans | None,
-               score_params: tuple, *, walk: _Backward):
+               score_params: tuple, drop: Dropout | None, *, walk: _Backward):
     """The dQ program's sums over its key tiles (`algebra.dq_issued`), unfinished: dQ's and, in the accurate
     form, the keys' product with the weights (`DqSums.keyed`), `[B, Qp, H, D]` fp32 each; and the rows
     `[4 + 2n, B, H, Qp]` fp32 (n the dQ parameters, `walk.summed`): the cotangents' and weights' row sums, the
@@ -217,12 +230,12 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     pair = consumers * block_q
     summed = walk.summed
     rows_count = 4 + 2 * sum(summed)
-    leaves, treedef = jax.tree.flatten((spans, score_params))
+    leaves, treedef = jax.tree.flatten((spans, score_params, drop))
 
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, peak_ref, prior_ref, anchor_ref, delta_ref, index_ref), refs = (
             refs[:9], refs[9:])
-        (spans_of, score_refs), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
+        (spans_of, score_refs, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, refs = refs[0], refs[1:]
         keyed_ref, refs = (refs[0], refs[1:]) if walk.accurate else (None, refs)
         rows_ref, (q_smem, do_smem, out_smem, row_smem, q_loaded, do_loaded) = refs[0], refs[1:]
@@ -245,7 +258,8 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
             operands = family.held(q_smem.at[index]), family.held(do_smem.at[index])
             shape = (block_q, block_k)
             # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
-            coords_of = functools.partial(_coords, family, spans_of, row, first, shape=shape)
+            coords_of = functools.partial(_coords, family, spans_of, row, first, shape=shape,
+                                          draw=None if drop_of is None else drop_of.draw(row, head))
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head, first)
             step = functools.partial(_dq_step, walk, operands, stats, coords_of, params_of, whole)
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
@@ -326,10 +340,11 @@ def _dkv_step(walk: _Backward, resident: tuple, powered, rows_of, staged, coords
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
-    exponentials, weights, cotangents, slopes, seen = _scores(walk, coords_of(q_first), params, s, dp,
-                                                             *rows_of(q_first), masked=True)
+    coords = coords_of(q_first)
+    exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, params, s, dp, *rows_of(q_first),
+                                                             masked=True)
     logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
-    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
+    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype, coords.drop is not None)
     dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_slot, walk.interpret)
     scaled = logits * walk.grad_scale
     if add_dq is None:
@@ -412,7 +427,7 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
 
 
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
-                score_params: tuple, *, walk: _Backward) -> tuple[jax.Array, ...]:
+                score_params: tuple, drop: Dropout | None, *, walk: _Backward) -> tuple[jax.Array, ...]:
     """The dK/dV program under the dQ program's softmax: each consumer's `block_k` keys of a query head,
     resident, walked by the query tiles that see them, streamed with their output cotangents through a ring
     each; a tile's weights and score cotangents (the algebra's, rows the keys, `_dkv_step`) the transposed
@@ -432,11 +447,11 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     stages = min(program.tiles.stages, q_steps)
     graded = [kind for kind in kinds if kind in DKV_GRADS]
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
-    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds)))
+    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop))
 
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
-        (spans_of, score_refs), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
+        (spans_of, score_refs, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, refs = (refs[0], refs[1:]) if walk.fused else (None, refs)
         dk_ref, dv_ref, *refs = refs
         grad_refs, refs = refs[:len(graded)], refs[len(graded):]
@@ -479,7 +494,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             family.passed(streams, streamed[0], lo, first=streamed[0])
             adds = None if dq_ref is None else functools.partial(add_dq, dq_ref, index)
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first,
-                                          shape=(block_k, block_q), keys_first=True)
+                                          shape=(block_k, block_q), keys_first=True,
+                                          draw=None if drop_of is None else drop_of.draw(row, head))
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[index], v_smem.at[index]
@@ -531,7 +547,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
                      score_params, *, score_mod, score_kinds, score_dtypes, scale: float, prescale: float,
                      spec: algebra.Forward, accurate: bool, tiles: BackwardTiles, family: mosaic.Family,
-                     interpret: bool):
+                     interpret: bool, drop: Dropout | None = None):
     """`gradients`' launch on this mainloop: D from the forward's split sums, each query's anchor key as the
     first pass chose it. Two launches: the dQ program's sums, their finish (`algebra.dq_finish`) and the dK/dV
     program under its refined D, whose cotangents sum to 0 where the first pass's do not (a small weight on a
@@ -569,13 +585,13 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
     if walk.fused:
         dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                 spans, score_params, walk=walk)
+                                 spans, score_params, drop, walk=walk)
         mass = algebra.split_mass(own, others_total, forward_total, shift)
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])
     # The dQ program reads its queries for their logits alone.
     dq_sum, keyed, rows = _dq_launch(by_power(query, prescale), key, value, dout, maximum, forward_total,
-                                     anchor, delta, chosen, spans, score_params, walk=walk)
+                                     anchor, delta, chosen, spans, score_params, drop, walk=walk)
     count = sum(walk.summed)
     dq_swapped = jnp.swapaxes(dq_sum, 1, 2)
     # The fast form's keyed sums are never read (`dq_finish`): a placeholder there.
@@ -586,7 +602,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                                                                   (total0, initial_term), maximum, anchor,
                                                                   delta, accurate=accurate)
     dk, dv, *key_tile = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen,
-                                    spans, score_params, walk=walk)
+                                    spans, score_params, drop, walk=walk)
     summed_kinds = [kind for kind in score_kinds if kind in DQ_GRADS]
     head_query = tuple(grad.sum(axis=-1)[None, :, :, None] if kind == Kind.HEAD else grad
                        for grad, kind in zip(dq_grads, summed_kinds, strict=True))

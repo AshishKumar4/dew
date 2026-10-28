@@ -18,6 +18,8 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
 from dew.nn.kernels.templates.attention import (
+    Draw,
+    Dropout,
     Hooks,
     KeySpans,
     Kind,
@@ -120,9 +122,9 @@ def _parts(accurate: bool, dtype) -> int:
     return len(jax.eval_shape(lambda c: algebra.cotangent_parts(c, dtype, accurate=accurate), tile))
 
 
-DROPPING = ("the Mosaic mainloop takes no probability dropout yet (the route runs a dropping call on the "
-            "reference path, ledger row 1521)")
-"""Why this mainloop refuses a dropping call (`refused`): its ops carry no draw."""
+DROPPING = ("the Mosaic mainloop draws dropout at its own places; a sequence exchange's slice draws at its "
+            "global places, a table gather a tile (`DropPlaces`)")
+"""Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 
 
 def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
@@ -154,7 +156,7 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     suite read."""
     hooks = Hooks() if hooks is None else hooks
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
-    if hooks.drop is not None:
+    if hooks.drop is not None and (hooks.drop.queries is not None or hooks.drop.keys is not None):
         return DROPPING
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
         return f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}"
@@ -285,11 +287,13 @@ class _Hooked(NamedTuple):
     """A call's hooks as its programs read them: the score hook's parameters and the output hook's, as their
     kinds lay them out (`Hooks.score_params`', `[H]`, `[B, H, Qp]`, `[B, H, Kp]`, `[B, H, Qp, Kp]` or
     `[B, Qp, H, Dv]`), and the softmax's initial state, its maximum and denominator `[B, H, Qp]` and sums
-    `[B, H, Qp, Dv]` (None where it starts from none)."""
+    `[B, H, Qp, Dv]` (None where it starts from none), and probability dropout's draws (`Dropout`, None where
+    the call drops nothing)."""
 
     score: tuple[jax.Array, ...]
     output: tuple[jax.Array, ...]
     initial: tuple[jax.Array, jax.Array, jax.Array] | None
+    drop: Dropout | None = None
 
 
 def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
@@ -303,7 +307,7 @@ def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
         initial = call.rows(state.m, -jnp.inf), call.rows(state.total), _columns(acc, unit)
     output = tuple(_columns(value, unit) if param.kind == Kind.OUTPUT else value
                    for value, param in zip(call.output_params, hooks.output_params, strict=True))
-    return _Hooked(call.score_params, output, initial)
+    return _Hooked(call.score_params, output, initial, hooks.drop)
 
 
 class _Guard(NamedTuple):
@@ -519,12 +523,14 @@ def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
 
 
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
-            q_pos=None, columns=None, *, keys_first: bool = False) -> algebra.Coords:
+            q_pos=None, columns=None, *, keys_first: bool = False,
+            draw: Draw | None = None) -> algebra.Coords:
     """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`, the
     tile's entries in the accumulator's layout (`q_pos` the query places and `columns` the tile's key
     offsets, where the caller holds them; a hook reads them so, `_param`), and a spans call's queries'
-    intervals and, with documents, both blocks' ids. A tile whose rows are its keys (`keys_first`, `shape`
-    `[bk, bq]`) holds its queries' vectors in a column's layout and its keys' in a row's."""
+    intervals and, with documents, both blocks' ids, and a dropping call's `draw`. A tile whose rows are its
+    keys (`keys_first`, `shape` `[bk, bq]`) holds its queries' vectors in a column's layout and its keys' in
+    a row's."""
     query_axis, key_axis = (1, 0) if keys_first else (0, 1)
     q_pos = first + family.iota(shape, query_axis) if q_pos is None else q_pos
     if keys_first:
@@ -534,7 +540,8 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     else:
         k_pos = k_first + (family.iota(shape, key_axis) if columns is None else columns)
     if spans is None:
-        return algebra.Coords(q_pos, k_pos, keys_first=keys_first)
+        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, q_rows=_query_rows(
+            family, first, shape, draw, keys_first))
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
     of_queries, of_keys = ((family.columns_of, family.rows_of) if keys_first
                            else (family.rows_of, family.columns_of))
@@ -548,7 +555,15 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     ids = None
     if spans.query_ids is not None and spans.key_ids is not None:
         ids = of_queries(spans.query_ids.at[row, rows]), of_keys(spans.key_ids.at[row, keys])
-    return algebra.Coords(q_pos, k_pos, bounds, ids, keys_first=keys_first)
+    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first,
+                          q_rows=_query_rows(family, first, shape, draw, keys_first))
+
+
+def _query_rows(family: mosaic.Family, first, shape: tuple[int, int], draw: Draw | None,
+                keys_first: bool) -> jax.Array | None:
+    """A query-rows tile's queries' places as a row's vector, where a dropping call's anchor draws at them
+    (`algebra.Coords.query_places`); None elsewhere."""
+    return None if draw is None or keys_first else first + family.iota((shape[0],), 0)
 
 
 def _rows(family: mosaic.Family, ref, row, head, first, count: int):
