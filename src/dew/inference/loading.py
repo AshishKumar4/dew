@@ -38,10 +38,6 @@ if TYPE_CHECKING:
     from dew.distributed.placement import Layout, MeshSpec
 
 
-WANDB = "wandb:"
-"""The prefix of a `pipeline` source published to W&B."""
-
-
 def pipeline(
     source: str,
     *,
@@ -57,11 +53,7 @@ def pipeline(
     """Load the inference task for `source`, with its weights placed once.
 
     `source` is a run directory, a source checkpoint directory or a Hub
-    repository holding either, or a run published to W&B (`dew.io.publish`): `wandb:` and an artifact's
-    path with its version, an alias or `best`, the best version its records rank
-    (`wandb:wandb-registry-model/name:best`, `dew.io.best_version`), or a run's
-    (`wandb:entity/project/run_id`), its newest model artifact, downloaded where W&B keeps artifacts
-    (`dew.io.downloaded`). A run loads as the task its recorded objective declares
+    repository holding either. A run loads as the task its recorded objective declares
     (`Objective.saved_task`), including a plugin objective's own task.
     `mesh` places the weights on that mesh under `layout`, or under the
     trainer's default layout when `layout` is None. Without `mesh`, data
@@ -86,12 +78,6 @@ def pipeline(
     persist_compilations()
     dtype = dtype_name(dtype)
     param_dtype = "auto" if param_dtype == "auto" else dtype_name(param_dtype)
-    if source.startswith(WANDB):
-        if revision is not None:
-            raise ValueError("revision pins a Hub source; a W&B source names its version after its colon")
-        from dew.io import downloaded
-
-        source = downloaded(source.removeprefix(WANDB))
     root = epath.Path(source)
     if not root.is_dir():
         # A Hub source is read at the commit its metadata resolved; one holding
