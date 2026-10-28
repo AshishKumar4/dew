@@ -45,7 +45,8 @@ from dew.nn.kernels.templates import (
 
 PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
         attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2)}
-"""The Triton mainloop's tiles: every family is a block or less, so one tile walks it."""
+"""The Triton mainloop's tiles: a family is a block or less, so one tile walks it, but the equal-weight ones
+over 64 and 256 keys, which walk two and eight."""
 
 INTERPRETED = jax.default_backend() == "cpu"
 """Whether the frozen Triton mainloop runs interpreted, in a CPU process, or compiled, on a GPU: the A100's
@@ -106,6 +107,7 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "ties at scale 1/4, cotangents near 2**125": 64, "a logit near fp32's largest": 8,
          "a logit near fp32's largest at scale 1/4": 8, "values near fp32's largest over 2 equal keys": 8,
          "values near fp32's largest over 64 equal keys": 8,
+         "values near fp32's largest over 256 equal keys": 8,
          "values near fp32's largest over 2 equal keys, bfloat16": 8, "one key": 8, "a sink and one key": 64,
          "a sink near fp32's largest and one key": 8, "a sink and one key, its logit near fp32's largest": 8,
          "a sink near fp32's largest at scale 1/4": 8, "logits near 1e4": 32, "logits near 1e30": 8,
@@ -508,6 +510,11 @@ def _families() -> dict[str, Family]:
                                                                overflows=True),
         "values near fp32's largest over 64 equal keys": Family(_large_values(64), _kept(1, 64),
                                                                 folded=False, overflows=True),
+        # Eight key tiles of 32 (`PINS`, a decode step's `BLOCK`): a walk's chain of its tiles' sums errs past
+        # the reference's, which sums a row whole, unless the walk keeps their additions' roundings
+        # (`algebra.compensates`).
+        "values near fp32's largest over 256 equal keys": Family(_large_values(256), _kept(1, 256),
+                                                                 folded=False, overflows=True),
         "values near fp32's largest over 2 equal keys, bfloat16": Family(
             _large_values(2, top=3.3e38), _kept(1, 2), folded=False, overflows=True, dtype="bfloat16"),
         # A key at its row's maximum weighs 1 exactly in the accurate form; the fold's contracted weight is
