@@ -115,7 +115,7 @@ def write_recording(modeling) -> None:
     record_logits(directory, model, truth,
                   'PYTHONPATH=/tmp/tf456:src:tools .venv-3.12/bin/python tools/ouro_reference.py --recording',
                   reference='OuroForCausalLM (remote code)', revision=f'{REPO}@{REVISION}',
-                  license='Apache-2.0', transformers=transformers.__version__,
+                  license='Apache-2.0', transformers=transformers.__version__, planned=False,
                   padded={'attention_mask': mask, 'position_ids': np.maximum(np.cumsum(mask, -1) - 1, 0)})
 
 

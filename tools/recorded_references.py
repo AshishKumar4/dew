@@ -151,7 +151,7 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
 
 
 def record_logits(directory: Path, model, wide, command: str, *, reference: str, revision: str, license: str,
-                  padded: Mapping[str, np.ndarray] | None = None, **details) -> Path:
+                  padded: Mapping[str, np.ndarray] | None = None, planned: bool = True, **details) -> Path:
     """The tiny decoder at `directory` recorded over check 1's seeds where the test cannot run its
     reference (a release's remote code, a release apart from the suite's): each seed's ids
     (tests/interop_support.py `fixture_ids`), the torch causal LM `model`'s fp32 eager logits on the CPU
@@ -159,7 +159,9 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
     as the leaf `logits`; and with `padded`, the fields the reference's padded rows take
     (`attention_mask` and its `position_ids`), the leaf `padded_logits` too: its logits over the ids
     padded with 0 where the mask is false, at the mask's valid places. The count is planned on Dew's own
-    load of the fixture, its padded rows under the mask alone, and confirmed on the reference; the
+    load of the fixture, its padded rows under the mask alone, or, not `planned`, where Dew cannot load
+    beside the reference's release (Ouro's transformers 4.56.2 pins a huggingface_hub older than Dew's
+    interop imports), on the reference alone (`record_case`), and confirmed on the reference; the
     reference's evidence alone is kept with its truth's sketch (`record_case`'s summary), which the
     test's float64 run of Dew's model is held to, saved as recorded_logits.npz beside the fixture with
     its provenance, `reference` at `revision` under `license`, and `details`. Returns the file written."""
@@ -167,9 +169,6 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
     from interop_support import fixture_ids
     from torch_precision import float64
 
-    from dew.interop import Pretrained
-
-    native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     mask = None if padded is None else np.asarray(padded["attention_mask"], bool)
     fields = {name: torch.from_numpy(np.asarray(value, np.int64 if name == "position_ids" else bool))
               for name, value in (padded or {}).items()}
@@ -199,11 +198,16 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
             return out
         return run
 
-    with jax.enable_x64(new_val=True):
+    proxy = truth_proxy = None
+    if planned:
+        from dew.interop import Pretrained
+
+        native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+        proxy = ours(native.model, native.variables)
         truth_proxy = ours(native.model.clone(dtype=jnp.float64), widened(native.variables))
-        recording = record_case("logits", lambda seed: {"input_ids": ids_of(seed)[0]}, evaluate,
-                                ours(native.model, native.variables), truth_proxy=truth_proxy,
-                                store_inputs=False, summary=True)
+    with jax.enable_x64(new_val=True):
+        recording = record_case("logits", lambda seed: {"input_ids": ids_of(seed)[0]}, evaluate, proxy,
+                                truth_proxy=truth_proxy, store_inputs=False, summary=True)
     record = provenance(reference, revision, "cpu", command, torch=torch.__version__, dtype="float32",
                         attention="eager", **details)
     return save(directory / "recorded_logits.npz", {**recording, "logits.provenance": record},
