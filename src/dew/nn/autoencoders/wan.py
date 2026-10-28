@@ -226,8 +226,11 @@ class _Upsample(nn.Module):
                 later = later.reshape(batch, frames, height, width, 2, channels)
                 later = later.transpose(0, 1, 4, 2, 3, 5).reshape(batch, 2 * frames, height, width, channels)
                 x = jnp.concatenate([first, later], axis=1)
-        # Each frame doubled by nearest resize and convolved to half the channels (`blocks.Upsample`).
-        return _frames(Upsample(self.features // 2, 2, dtype=self.dtype, name="resample_1"), x)
+        # Each frame doubled by nearest resize and convolved to half the channels (`blocks.Upsample`), its
+        # convolution this module's `resample_1`, as the published Wan VAE names it.
+        upsample = Upsample(self.features // 2, 2, dtype=self.dtype, conv="resample_1")
+        nn.share_scope(upsample, self)
+        return _frames(upsample, x)
 
 
 class _Encoder(nn.Module):
@@ -429,9 +432,6 @@ def wan_vae_path(name: str, ndim: int) -> tuple[str, ...]:
     if ndim not in _LEAF_RANK[leaf]:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, _LEAF_RANK[leaf]))}")
     path = indexed_path("attention_out" if part == "proj" else part for part in parts)
-    if parts[-4:-2] == ["upsamplers", "0"] and parts[-2:] == ["resample", "1"]:
-        # An upsampler's spatial conv is the shared upsampling's (`blocks.Upsample`), its conv `Conv_0`.
-        path = (*path, "Conv_0")
     return (*path, "kernel" if leaf == "weight" else leaf)
 
 
