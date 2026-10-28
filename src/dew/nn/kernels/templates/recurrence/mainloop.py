@@ -212,6 +212,24 @@ class _Issuer:
         family = self.call.family
         return tuple(family.staged(value, buffer) for value, buffer in zip(values, buffers, strict=True))
 
+    def summed(self, products: list) -> jax.Array:
+        """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
+        accumulator in place (`Family.summed`): one accumulator held where each its own held two (Kimi delta
+        attention's output, `algebra.key_decayed_output`)."""
+        operands = [(self._operand(lhs, name, rhs), self._operand(rhs, name, lhs))
+                    for name, lhs, rhs in products]
+        shape = (products[0][1].shape[0], products[0][2].shape[1])
+        family, interpret = self.call.family, self.call.interpret
+
+        def issued(acc):
+            for left, right in operands:
+                count = max(len(left), len(right))
+                for i, j in ((i, j) for i in range(len(left)) for j in range(len(right)) if i + j < count):
+                    acc = family.products(acc, left[i], right[j], interpret)
+            return acc
+
+        return family.summed(shape, issued, interpret)
+
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
         left = self._operand(lhs, name, rhs)
         right = self._operand(rhs, name, lhs)
@@ -508,6 +526,25 @@ def _masks(rows: int, columns: int) -> list:
     """The int32 tile a tile's masks compare, its rows' lag behind its columns (`algebra._lags`); the
     inverse's doubling compares its rows and columns apart, two (`_masks(...) * 2`)."""
     return [(rows, columns, jnp.int32)]
+
+
+def _product(call: _Call, lhs: tuple, rhs: tuple) -> list:
+    """The operand fragments one product `[rows, depth] @ [depth, columns]` holds at once where the family's
+    products read registers (`Family.operands_in_registers`), its left operand `lhs` `(operand, rows,
+    depth)` a step deep and its right one `rhs` `(operand, depth, columns)` a sub-step
+    (`Family.fragment_depth`), each in the warps replicating it (`lhs_copies`, `rhs_copies`): the GEMM's own
+    rule (`resources.tile_registers`); none where they read shared memory (wgmma's)."""
+    family = call.family
+    if not family.operands_in_registers:
+        return []
+    (left, rows, depth), (right, _, columns) = lhs, rhs
+    return (_held(left, rows * family.lhs_copies, depth)
+            + _held(right, family.fragment_depth(depth), columns * family.rhs_copies))
+
+
+def _widest(*tiles: list) -> list:
+    """The largest of `tiles`' live sets by their words: of products issued in turn, one's fragments."""
+    return max(tiles, key=lambda held: sum(r * c * jnp.dtype(d).itemsize for r, c, d in held))
 
 
 def _fragments(call: _Call, *tiles) -> list:
@@ -1361,7 +1398,9 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
     if call.per_key:
         given = {"gates": ((CHUNK, width), gates), "lows": ((CHUNK, width), gates),
                  "scores": ((CHUNK, CHUNK), held)}
-        staging = _staging(held, (CHUNK, call.block))
+        # The local product's staged scores, then each key block's gated queries.
+        staging = (_staging(held, (CHUNK, CHUNK)) + _staging(call.given, *[(CHUNK, call.block)]
+                                                             * (width // call.block)),)
     else:
         given = {"keys": ((CHUNK, width), call.given)}
         staging = _staging(held, (CHUNK, CHUNK))
@@ -1371,19 +1410,35 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
 
 
 def _output_held(call: _Call, bv: int) -> _Held:
-    """What `_output`'s consumer thread holds: a value block's memory and local products' fp32 sums beside
-    its values (and, where products read registers, a key block's queries and memory slice and the scores);
-    under a decay a head the first step's scores too, their sum, their pairs' decays and their masks (an
-    fp32 call's split into parts), held with the value block's tiles, the step's whole set (as its phases
-    alone, a 64-wide value block's output spilled 16 bytes a thread on an A100's at 200 stated registers);
-    under one a key dimension a key block's prefix halves and the scores in fp32."""
-    held, memories = call.held, call.memories
-    values = [_f32(CHUNK, bv)] * 2 + _held(held, CHUNK, bv) + _fragments(
-        call, (call.given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
+    """What `_output`'s consumer thread holds. Under a decay a head: a value block's phase, its output's
+    fp32 sum (the memory's and the local product's, each its own accumulator where products overlap,
+    `Family.products_overlap`), its values and one product's fragments (`_product`); and the first step's
+    scores' phase, their sum, their pairs' decays and their masks (an fp32 call's split into parts) and their
+    product's fragments. The two phases hold at once where the walk steps over value blocks (the scores'
+    branch inside its loop), or where its products overlap; apart where it takes one value block on a family
+    whose products complete in turn. So an A100's need was 232, 240, None and 216 registers at value blocks
+    16, 32, 64 and 128 wide of 128 values, and None at 128 of 256; an H100's 224, 224, 232/240 and None
+    (the 1971 gate's dump: where both phases were stated at once, 456 refused 216). Under a decay a key
+    dimension the value block's phase, and apart from it the first step's: a key block's prefix halves, its
+    decay raised from them and its queries widened, staged for every step (`algebra.key_gated`)."""
+    held, memories, given, family = call.held, call.memories, call.given, call.family
+    products = _widest(_product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
+                       _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv)))
     if call.per_key:
-        return _Held(phases=(values + [_f32(CHUNK, call.block)] * 2 + [_f32(CHUNK, CHUNK)],))
-    return _Held(phases=(values + [_f32(CHUNK, bv)] + [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
-                         + (_held(held, CHUNK, CHUNK) if held.parts > 1 else []),))
+        # One accumulator for every product (`_Issuer.summed`) beside the values, the intra launch's scores
+        # in fp32 and their masked narrow form; apart from it, at the first step, the key blocks' gated
+        # queries, staged before any product (an A100's held 64- and 128-wide value blocks at 247 registers,
+        # an H100's 128-wide at 248).
+        values = [_f32(CHUNK, bv), *_held(held, CHUNK, bv), _f32(CHUNK, CHUNK), *_held(held, CHUNK, CHUNK),
+                  *products]
+        return _Held(phases=(values, [_f32(CHUNK, call.block)] * 4))
+    values = [_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv) + products
+    scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
+              + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
+              + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
+    if call.value_width // bv == 1 and not family.products_overlap:
+        return _Held(phases=(values, scores))
+    return _Held(phases=(values + scores,))
 
 
 def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, scale: float, out_dtype,
@@ -1429,13 +1484,24 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
             entered = functools.partial(block, "entered", memories, along_rows=True)
             value = _tile(slots, "values", held)
             if call.per_key:
-                def decays(c):
-                    return tuple(block(name, gates, c).value() for name in ("gates", "lows"))
+                local, *gated = staged
+                # The tiles taken before the first step's branch: a slot is the stream's, every step's.
+                queries, halves = ([block(name, operand, c) for c in range(width // call.block)]
+                                   for name, operand in (("queries", call.given), ("gates", gates)))
+                lows = [block("lows", gates, c) for c in range(width // call.block)]
+
+                # Each key block's gated queries staged once, at the first step, for every value block's
+                # product: computed each step, they were live across the walk's steps beside each one's sum.
+                @pl.when(index == 0)
+                def _():
+                    for c, tile in enumerate(gated):
+                        decays = (halves[c].value(), lows[c].value())
+                        family.staged(algebra.key_gated(queries[c].value(), decays, scale), tile[0])
 
                 out = algebra.key_decayed_output(
-                    lambda c: block("queries", call.given, c).value(), decays, entered, width // call.block,
-                    _tile(slots, "scores", held).value().astype(jnp.float32), value, scale,
-                    _Issuer(call, {"memory": staged, "local": staged}))
+                    lambda c: _Parts(gated[c], call.given.dtype), entered, width // call.block,
+                    _tile(slots, "scores", held).value().astype(jnp.float32), value,
+                    _Issuer(call, {"local": local}).summed)
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
                 (gate, low), laid = loaded
@@ -1870,10 +1936,14 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     tiles |= _vector_blocks(call, "gate", "low", "column_gate", "column_low")
     # The local scores, then their product with the output's gradient.
     work = Work(2 * CHUNK * CHUNK * (width + value_width), exponentials=CHUNK * CHUNK)
-    # The local scores, their decays and masks and their narrow form, and their product and its cast.
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK) + _held(held, CHUNK, CHUNK)
-                               + [_f32(CHUNK, value_width)] + _held(held, CHUNK, value_width)
-                               + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
+    # The local scores, their decays and masks; then their narrow form's product with the output's gradient
+    # and its cast (`algebra.local_gradient`: the scores are narrowed before the product): as one phase, an
+    # H100's model stated 248 registers where ptxas needed 136, an A100's 280 against 160.
+    held_tiles = _Held(phases=(
+        [_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK)
+        + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),
+        [*_held(held, CHUNK, CHUNK), _f32(CHUNK, value_width), *_held(held, CHUNK, value_width),
+         *_fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, value_width))]))
     return _kernel(program, call, out_type=held.shape(call.heads * value_width),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
                    live=_taken(7), work=work, held=held_tiles, staging=_staging(held, (CHUNK, CHUNK)),
@@ -2192,8 +2262,9 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
     # The scores' gradient, the scores and the pairs' sums.
     work = Work(2 * CHUNK * CHUNK * (value_width + width + CHUNK), exponentials=CHUNK * CHUNK)
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
-    # the pairs' sum's product.
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 5 + _held(held, CHUNK, CHUNK) + _masks(CHUNK, CHUNK)
+    # the pairs' sum's product: four fp32 tiles at once, the decays taken before the scores' product
+    # (`algebra.scores_gradient`); five stated an A100's 280 registers where ptxas needed 240.
+    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 4 + _held(held, CHUNK, CHUNK) + _masks(CHUNK, CHUNK)
                                + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(8), work=work,
