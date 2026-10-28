@@ -5,6 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `NodePerturbation`, mixed into an objective, trains its model without backpropagation, by node
+  perturbation of every Dense, DenseGeneral and Embed output as Dust does, the rest by weight-space
+  evolution strategies, pooled over a split or accumulated update as its gradient is;
+  `Objective.scored_units` states the units it credits.
+- `Residuals` objectives train on the mean square of their residuals, by the gradient or by damped
+  Gauss-Newton; `dew.nn.fourier.FourierPyramid` is a multi-resolution Fourier feature pyramid;
+  `examples/pinn_burgers.py` solves the self-similar Burgers profile in float64.
 - `Trainer.fit(resume=)` makes resuming explicit: `"auto"` continues the latest checkpoint where there
   is one, as before; `"require"` refuses a directory with none, for a job that must not start afresh;
   `"never"` refuses one that already holds a run (`Checkpoints.resumed`). A run configuration takes it

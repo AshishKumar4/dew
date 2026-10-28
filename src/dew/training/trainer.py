@@ -766,7 +766,7 @@ class Trainer(Generic[Loss, Effects]):
             aval.shape, aval.dtype, sharding=aval.sharding if aval.sharding.mesh.explicit_axes else None,
             weak_type=aval.weak_type), jax.jit(self._model_batch).trace(batch).out_avals)
 
-    def _loss_shape(self, state: TrainState, batch: Batch):
+    def _loss_shape(self, state: TrainState, batch: Batch, window: int):
         batch = self._model_shapes(batch)
         # Shapes and dtypes only: a resident frozen leaf sits in another memory space than the moving ones,
         # and the loss the realization runs reads a snapshot in one space. The step's key is drawn inside the
@@ -774,9 +774,9 @@ class Trainer(Generic[Loss, Effects]):
         params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
         def loss(params, batch, microstep, key, step, ema):
-            return self.objective._loss(params, batch, Step(microstep, jax.random.fold_in(key, step),
-                                                            with_ema(params, ema),
-                                                            qk_stats=clips_qk(state.opt_state)))
+            return self.objective._loss(params, batch, Step(
+                microstep, jax.random.fold_in(key, step), with_ema(params, ema),
+                qk_stats=clips_qk(state.opt_state), example_count=window * rows_of(batch) or None))
 
         return jax.eval_shape(loss, params, batch, state.microstep, state.key, state.step, state.ema)
 
@@ -1077,7 +1077,7 @@ class Trainer(Generic[Loss, Effects]):
         """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
         with the accumulation of a `window` of microbatches and the copies the step builds, as the
         step traces them over microbatches of `batch`'s shapes, none where `narrow` (the trainer's) is off."""
-        shapes = None if self.step is not None else self._loss_shape(state, batch)
+        shapes = None if self.step is not None else self._loss_shape(state, batch, window)
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
@@ -1187,7 +1187,7 @@ class Trainer(Generic[Loss, Effects]):
                                   stack_sites(self.objective, state.variables), device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
-            shapes = self._loss_shape(state, cpu_batch)
+            shapes = self._loss_shape(state, cpu_batch, self.accumulation)
             self._refuse_unpipelined(schedule)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, window=self.accumulation,
                                                      shape_only=True)
@@ -2361,8 +2361,7 @@ class Trainer(Generic[Loss, Effects]):
         the split (`Evaluation.run`'s `warm`) and reports nothing.
 
         A CPU-owned run evaluates on the accelerator, over the same snapshot
-        a step realizes, so validation reads the weights where the loss
-        does."""
+        a step realizes, so validation reads the weights where the loss does."""
         paused = time.perf_counter()
         if not warm:
             self._display.status("evaluating")

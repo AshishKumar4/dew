@@ -785,6 +785,16 @@ class Objective(ABC, Generic[Loss, Effects]):
             lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
             else leaf, batch))) for index in range(rows)], np.int64)
 
+    def scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None:
+        """The statistics `loss` returns for `batch`, without its `Aux`, by the loss's own path (its
+        configured terms, its mode and its model's draws under `step`), with each unit's share of their
+        first leaf (a `Ratio`'s total, a routed decoder's prediction total): `[B]` for an example's,
+        `[B, T]` for a token's, the shares summing to that leaf. A method that credits each unit by its
+        own loss reads them (`dew.objectives.perturbation`). None, the default, where the objective states
+        no units, whose whole statistics credit every unit; the model's other collections are left as they
+        are."""
+        return None
+
     def row_tokens(self, batch: Batch) -> int | None:
         """The tokens each of `batch`'s rows holds, read from its shapes alone, so a placed batch
         answers without a wait: the most a row's `scored_tokens` counts, and what a device steps of
