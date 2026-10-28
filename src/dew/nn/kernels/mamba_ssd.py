@@ -832,7 +832,7 @@ def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, 
     """`_state_gradient_kernel`'s launch: `B`'s gradient where the step `dt` is given, else `C`'s, and
     each head's decay-exponent gradient, the head splits' and the state blocks' workspaces summed."""
     batch, length, heads, width, state, padded, ratio, bm, bn, columns = _state_blocks(
-        left, mat, da, groups, config)
+        left, mat, da[0], groups, config)
     splits = -(-ratio // config.heads)
     steps = [] if dt is None else [dt]
     grad, dacs = pl.pallas_call(
