@@ -250,3 +250,66 @@ def test_a_captures_kernels_are_filed_under_the_programs_that_ran_them(tmp_path)
     assert [row["kernel_name"] for row in found[""]] == ["d"]
     with pytest.raises(FileNotFoundError):
         program_kernels(tmp_path / "capture-y", ["step"])
+
+
+def test_a_profile_counts_overlapped_collectives_once_and_the_gaps_as_idle():
+    """Two steps, each 10 ms of compute with an all-reduce over the same 10 ms, 5 ms apart, on each of two
+    devices: the window runs 25 ms, 12.5 ms a step, of which 10 ms is compute, 10 ms communication, none of
+    it exposed, and 2.5 ms the gap no kernel ran in: the overlap counted once (row 1853, where summed self
+    times made 20 ms of device time a step and so no idle). The report's lines say the same."""
+    from dew.training.profiling import ProfileReport, device_figures
+
+    step = [("gemm_fusion_dot", 0, 10_000_000), ("ncclDevKernel_AllReduce_Sum_f32_RING_LL", 0, 10_000_000)]
+    later = [(name, start + 15_000_000, end + 15_000_000) for name, start, end in step]
+    figures = device_figures([step + later, later + step], steps=2)
+    assert figures == {"device_window_ms": 12.5, "compute_ms": 10.0, "communication_ms": 10.0,
+                       "exposed_communication_ms": 0.0, "device_idle_ms": 2.5}
+    report = ProfileReport("profile", 2, 2, (2, 3), "capture", 15.0, 1.0, 3.0, **figures, flops=None,
+                           mfu=None, hfu=None, tokens_per_s=None, device=None)
+    # The lines carry the figures: the idle gap, and compute's share of a step, the largest.
+    text = report.text()
+    assert "2.50 ms" in text and "67%" in text
+    assert device_figures([[], []], steps=2)["device_idle_ms"] is None
+
+
+def test_a_capture_that_holds_less_than_its_run_says_why():
+    """A capture's status comes from what its trace holds (row 1893): a local device with no kernel track, or
+    as many GPU activity events as CUPTI's cap (within the buffer CUPTI drops whole), is a partial capture
+    with its reason; a full one has none. A CPU run, with no device track to hold, is never partial."""
+    from dew.telemetry.profile import held_back, missing_tracks
+
+    assert missing_tracks({"/device:GPU:0": 19160, "/device:GPU:1": 18800}, 2, 2_097_152) == []
+    [untracked] = missing_tracks({"/device:GPU:0": 7451}, 2, 2_097_152)
+    assert "1 of 2" in untracked
+    # No device plane at all: the device profiler's whole contribution was lost (a 2 GB XSpace).
+    [lost] = missing_tracks({}, 2, 2_097_152)
+    assert "2 GB" in lost
+    # The cap's boundary: within 1% of it is reached (CUPTI drops whole buffers), below that is whole.
+    [capped] = missing_tracks({"/device:GPU:0": 1987}, 1, 2000)
+    assert "2000" in capped and "1987" in capped
+    assert missing_tracks({"/device:GPU:0": 1979}, 1, 2000) == []
+    # XLA's no-limit cap (-1) drops nothing, however many events the capture holds.
+    assert missing_tracks({"/device:GPU:0": 19160}, 1, -1) == []
+    assert held_back(Path("absent"), {"backend": "cpu", "device_kinds": ["cpu"]}) == []
+
+
+@pytest.mark.gpu(reason="CUPTI's activity cap, which a GPU capture alone has")
+def test_a_gpu_window_past_cuptis_cap_reports_no_device_figure_its_kernels_cannot_establish(tmp_path):
+    """A window whose kernels pass CUPTI's activity cap keeps only the events before it: its capture is
+    partial, the cap its reason, and the report gives no device figure the surviving kernels cannot
+    establish, its host figures kept; with no cap (-1) the capture is whole and its device figures measured
+    (row 1893: a capped H100 capture reported 0% duty cycle as measured)."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import autoencoder_experiment
+
+    from dew.cli.main import main
+
+    # A cap of one event: a step's few launches (XLA runs its kernels as command buffers) pass it.
+    for cap, partial in ((1, True), (-1, False)):
+        out = tmp_path / f"cap{cap}"
+        assert main(["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out",
+                     str(out), "--activity-cap", str(cap)]) == 0
+        report = json.loads((out / "report.json").read_text())
+        manifest = json.loads((Path(report["capture"]) / "manifest.json").read_text())
+        assert (manifest["capture_status"] == "partial") == partial, manifest
+        assert (report["device_window_ms"] is None) == partial and report["step_ms"] > 0

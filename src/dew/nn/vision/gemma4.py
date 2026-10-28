@@ -11,13 +11,13 @@ from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, Initializer, PrecisionLike
 
 from dew import _records
 from dew._model_types import SANDWICH_NORMS
 from dew.batch import Variables, coordinates
+from dew.interop.unread import Stored
 from dew.interop.weights import native_layouts, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
@@ -386,7 +386,7 @@ def gemma4_projector_layouts(params: Variables) -> tuple[WeightLayout, ...]:
 
 
 def translate_gemma4_projector_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
 ) -> tuple[Variables, tuple[WeightLayout, ...]]:
     """A Gemma 4 embedder's map into its parameter tree, with the layouts that write it back.
 

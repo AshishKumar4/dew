@@ -129,7 +129,9 @@ def profiled(report_file: Path) -> dict:
     assert traced_steps(Path(report["capture"])) == (2, 3) and tuple(report["traced"]) == (2, 3)
     assert (report["steps"], report["warmup"]) == (2, 2)
     assert report["step_ms"] > 0 and report["input_wait_ms"] >= 0 and report["compile_s"] > 0
-    assert (report["device_ms"] is None) == (report["attribution"] is not None)
+    # Device figures where the capture holds every device's track, else unknown, None, never 0, and why.
+    measured = [report[name] for name in ("device_window_ms", "compute_ms", "device_idle_ms")]
+    assert (report["device"] is None) == all(value is not None and value >= 0 for value in measured)
     assert (Path(report["capture"]) / "reports").is_dir()
     return report
 
@@ -154,6 +156,22 @@ def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_
     assert Checkpoints(str(out / "autoencoder_experiment")).latest is None
     with pytest.raises(ValueError):
         main(command)
+
+
+def test_dew_profiles_capture_options_reach_the_capture(tmp_path):
+    """`dew profile --host-tracer-level 1 --python-tracer-level 1` captures with those options: the window
+    owns them (`ProfileWindow`), the command only maps its flags onto it, and the capture's manifest records
+    what it ran with (row 1894)."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import autoencoder_experiment
+
+    from dew.cli.main import main
+
+    out = tmp_path / "profile"
+    assert main(["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out",
+                 str(out), "--host-tracer-level", "1", "--python-tracer-level", "1"]) == 0
+    manifest = json.loads((Path(profiled(out / "report.json")["capture"]) / "manifest.json").read_text())
+    assert (manifest["options"]["host_tracer_level"], manifest["options"]["python_tracer_level"]) == (1, 1)
 
 
 def test_dew_profile_with_no_output_prepares_its_process_before_naming_its_directory(tmp_path):
