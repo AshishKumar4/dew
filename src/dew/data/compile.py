@@ -67,6 +67,8 @@ from dew.data.dataset import (
     PhasedStream,
     Reader,
     Records,
+    rows_of,
+    take_batch,
 )
 from dew.data.facts import merge_facts
 from dew.data.lowering import (
@@ -1247,9 +1249,83 @@ def iterate(
     return _as_iter(rows, loading)
 
 
+type Handed = pygrain.MapDataset | pygrain.IterDataset | Mapping[str, np.ndarray]
+"""Data handed to `fit` as it is, which a run steps on as given (`native`): a Grain dataset's
+elements, or arrays whole."""
+
+
+class _Shared:
+    """The `partition`'s share of each batch `batches` yields (`DataPartition`: rows `index :: count`),
+    its position the stream's own where it keeps one."""
+
+    def __init__(self, batches: Iterator[Batch], partition: DataPartition):
+        self.batches, self.partition = batches, partition
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        batch = next(self.batches)
+        if self.partition.count == 1:
+            return batch
+        return take_batch(batch, np.arange(self.partition.index, rows_of(batch), self.partition.count))
+
+    def get_state(self):
+        return self.batches.get_state()
+
+    def set_state(self, state) -> None:
+        self.batches.set_state(state)
+
+
+class _Whole:
+    """The same batch every step, the arrays a run was handed whole; its position the steps read."""
+
+    def __init__(self, batch: Batch):
+        self.batch, self.read = batch, 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        self.read += 1
+        return self.batch
+
+    def get_state(self) -> bytes:
+        return str(self.read).encode()
+
+    def set_state(self, state: bytes) -> None:
+        self.read = int(state)
+
+
+def native(handed: Handed, *, training: bool) -> Reader:
+    """A reader of the data handed to `fit` as it is, each element a batch the run steps on, never
+    batched again: a Grain dataset's elements (batched by Grain, `MapDataset.batch`), a map dataset's
+    read endlessly where it trains, or a mapping of arrays read whole, every step the same batch (a
+    full-batch run; a run of minibatches states them, `Memory(arrays).batch(size)`)."""
+    if isinstance(handed, Mapping):
+        batch = {name: np.asarray(column) for name, column in handed.items()}
+        if training:
+            return lambda partition: _Shared(_Whole(batch), partition)
+        return lambda partition: _Shared(iter((batch,)), partition)
+    endless = handed.repeat() if training and isinstance(handed, pygrain.MapDataset) else handed
+    return lambda partition: _Shared(iter(endless), partition)
+
+
+def native_loader(handed: Handed) -> Loader:
+    """The data handed to `fit` as it is (`native`) as the loader the run reads, its global batch
+    its first element's rows."""
+    first = handed[0] if isinstance(handed, pygrain.MapDataset) else (
+        next(iter(handed)) if isinstance(handed, pygrain.IterDataset) else {
+            name: np.asarray(column) for name, column in handed.items()})
+    batch = rows_of(first)
+    records = (len(handed) * batch if isinstance(handed, pygrain.MapDataset)
+               else batch if isinstance(handed, Mapping) else None)
+    return Loader(train=native(handed, training=True), val=None, records=records, batch=batch)
+
+
 def fitted[Entry](
-    dataset: Dataset | Loader,
-    validation: Dataset | Mapping[str, Dataset | Entry] | None,
+    dataset: Dataset | Loader | Handed,
+    validation: Dataset | Handed | Mapping[str, Dataset | Handed | Entry] | None,
     *,
     objective: ObjectiveData,
     seed: int = 0,
@@ -1257,8 +1333,9 @@ def fitted[Entry](
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
-    their stores provisioned. A training dataset without a repeat repeats
-    before its batch, so a run's length is its steps, epochs or tokens, or
+    their stores provisioned, or read as handed (`native`). A training
+    dataset without a repeat repeats before its batch, so a run's length is
+    its steps, epochs or tokens, or
     with `examples` reads that many records before they are packed and ends
     (`compile`'s `examples`); a validation dataset without a batch takes the
     training batch, and is read and loaded as it asks. A Loader is already
@@ -1268,13 +1345,27 @@ def fitted[Entry](
         chain = dataset._chain()
         loader = compile(chain if examples is not None else _endless(chain), objective=objective,
                          provision=True, seed=seed, examples=examples)
-    else:
+    elif isinstance(dataset, Loader):
         loader = dataset
-    named = {"val": validation} if isinstance(validation, Dataset) else validation
+    elif examples is not None:
+        raise ValueError("examples= counts a Dataset chain's source examples, and data handed as it is "
+                         "has none: read it as a chain (dew.data.Grain, dew.data.Memory), or set steps=")
+    else:
+        loader = native_loader(dataset)
+    one = isinstance(validation, Dataset | pygrain.MapDataset | pygrain.IterDataset) or (
+        isinstance(validation, Mapping) and all(isinstance(column, np.ndarray)
+                                                for column in validation.values()))
+    named = {"val": validation} if one else validation
     if named is None:
         return loader, None
-    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed)
-                    if isinstance(entry, Dataset) else entry for name, entry in named.items()}
+
+    def admitted(entry):
+        if isinstance(entry, Dataset):
+            return held(entry, objective=objective, batch=loader.batch, seed=seed)
+        if isinstance(entry, pygrain.MapDataset | pygrain.IterDataset | Mapping):
+            return native(entry, training=False)
+        return entry
+    return loader, {name: admitted(entry) for name, entry in named.items()}
 
 
 def _endless(chain: Pipeline) -> Pipeline:

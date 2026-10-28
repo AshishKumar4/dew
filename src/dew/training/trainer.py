@@ -44,7 +44,7 @@ from dew._records import JSON, boolean, json_value, record
 from dew.batch import FROZEN, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking, Resume
 from dew.cleanup import attempted
-from dew.data.compile import fitted
+from dew.data.compile import Handed, fitted
 from dew.data.dataset import (
     Closeable,
     DataPartition,
@@ -1275,7 +1275,7 @@ class Trainer(Generic[Loss, Effects]):
     @ruled
     def fit(
         self,
-        dataset: Dataset | Loader,
+        dataset: Dataset | Loader | Handed,
         *,
         steps: int | None = None,
         epochs: int | None = None,
@@ -1289,7 +1289,7 @@ class Trainer(Generic[Loss, Effects]):
         preview: bool = False,
         best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
         stop: Plateau | Pause | None = None,
-        validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None = None,
+        validation: Dataset | Handed | Mapping[str, Dataset | Handed | Reader | EvalSuite] | None = None,
         summaries: Sequence[Summary] = (),
         restore_best: bool = False,
         state: TrainState | None = None,

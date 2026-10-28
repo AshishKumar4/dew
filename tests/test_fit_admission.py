@@ -122,3 +122,29 @@ def test_a_validation_split_of_undeclared_inputs_is_refused_before_the_run_train
     with pytest.raises(ValueError):
         Trainer(objective, optax.sgd(0.1), key=0).fit(data, steps=40, log_every=1, eval_every=eval_every)
     assert stream.position < 10
+
+
+def regression_rows(rows: int, seed: int) -> dict:
+    x = np.random.default_rng(seed).normal(size=(rows, 3)).astype(np.float32)
+    return {"x": x, "y": x[:, :2]}
+
+
+@pytest.mark.parametrize("handed", ["grain", "arrays"])
+def test_data_handed_as_it_is_steps_as_given(handed):
+    """A run takes a Grain dataset batched by Grain, its elements the batches it steps on, and NumPy
+    arrays, one batch every step, each never batched again: the objective's three-wide declaration
+    holds for each step's batch, a batch of batches would not, and the run takes its steps and its
+    validation from them (AT-07). Before, fit took either for a loader and failed on what it lacked."""
+    import grain.python as grain
+
+    objective = Supervised(Pooled(), lambda outputs, batch: (outputs - batch["y"]) ** 2,
+                           inputs=InputSpec(Field("x", (3,))))
+    if handed == "grain":
+        columns = regression_rows(32, 0)
+        records = [{name: column[row] for name, column in columns.items()} for row in range(32)]
+        data = grain.MapDataset.source(records).batch(8)
+        validation = grain.MapDataset.source(records[:16]).batch(8)
+    else:
+        data, validation = regression_rows(8, 0), regression_rows(8, 1)
+    state = Trainer(objective, optax.sgd(0.1), key=0).fit(data, validation=validation, steps=6, log_every=1)
+    assert int(state.step) == 6
