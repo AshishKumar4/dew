@@ -128,7 +128,7 @@ def build(args: argparse.Namespace) -> Run:
     from dew.objectives.routing import ExpertBalance
     from dew.optim import Cosine, OptimConfig, ParamGroup
     from dew.training import MeshSpec, Trainer
-    from dew.training.planning import Timer
+    from dew.training.planning import Trials
 
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]
@@ -191,9 +191,9 @@ def build(args: argparse.Namespace) -> Run:
 
     compile_start = time.perf_counter()
     # As `fit` plans: a frontier the plan opens is timed, and the run goes on from the state it timed.
-    timer = Timer(state, batch(0))
-    step = trainer.compile(state, batch(0), timer)
-    return Run(trainer, timer.state, step, batch, schedule.schedule(schedule_steps), windows, seq, total,
+    trials = Trials(state, batch(0))
+    step = trainer.compile(state, batch(0), trials)
+    return Run(trainer, trials.state, step, batch, schedule.schedule(schedule_steps), windows, seq, total,
                schedule_steps, time.perf_counter() - compile_start, work)
 
 

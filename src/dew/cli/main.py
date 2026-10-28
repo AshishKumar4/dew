@@ -15,13 +15,16 @@ import sys
 import types
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import tyro
 
 from dew.cli import tpu
 from dew.cli.gcloud import emit
 from dew.cli.launch import Launch
+
+if TYPE_CHECKING:
+    from dew.config import RunConfig
 
 CONFIG = tpu.CONFIG
 Positional = tyro.conf.Positional
@@ -171,6 +174,27 @@ class DataPublish:
         return 0
 
 
+def run_named(named: str, trust: tuple[str, ...]) -> RunConfig:
+    """The run `named` names: a Python file's `run` (a run config or a function returning one), under
+    the file's own name where it names none, or a `run.json`. What trains is what the record reads
+    back as, so its run.json trains the same run; a chain the record cannot describe trains as Python
+    built it, and its run.json says why it can't be rebuilt (`RunConfig.unrecorded`)."""
+    from dew.config import RunConfig
+
+    path = Path(named)
+    if path.suffix == ".json":
+        return RunConfig.load(str(path), trust=trust)
+    # The file imports as the module its name names, so a record names what it defines by that
+    # module, which the run trusts: `dew train run.json --trust <name>`.
+    built = user_module(path).run
+    built = built() if callable(built) else built
+    if not isinstance(built, RunConfig):
+        raise TypeError(f"{named}'s run is {built!r}, not a run config")
+    if built.trainer.name is None:
+        built = dataclasses.replace(built, trainer=dataclasses.replace(built.trainer, name=path.stem))
+    return built if built.unrecorded() else RunConfig.read(built.record(), trust=(*trust, path.stem))
+
+
 @dataclasses.dataclass(frozen=True)
 class Train:
     """Train a run: the one a Python file builds, or the one a run's `run.json` records."""
@@ -184,31 +208,38 @@ class Train:
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        from dew.config import RunConfig
-
-        path = Path(self.run)
-        if path.suffix == ".json":
-            run = RunConfig.load(str(path), trust=self.trust)
-        else:
-            # The file imports as the module its name names, so a record names
-            # what it defines by that module, which the run trusts:
-            # `dew train run.json --trust <name>`.
-            built = user_module(path).run
-            built = built() if callable(built) else built
-            if not isinstance(built, RunConfig):
-                raise TypeError(f"{self.run}'s run is {built!r}, not a run config")
-            if built.trainer.name is None:
-                built = dataclasses.replace(built, trainer=dataclasses.replace(built.trainer, name=path.stem))
-            # What trains is what the record reads back as, so its run.json trains the same run; a chain
-            # the record cannot describe trains as Python built it, and its run.json says why it can't
-            # be rebuilt (`RunConfig.unrecorded`).
-            run = (built if built.unrecorded()
-                   else RunConfig.read(built.record(), trust=(*self.trust, path.stem)))
-        run.assigned(self.set).run()
+        run_named(self.run, self.trust).assigned(self.set).run()
         return 0
 
 
-COMMANDS = {"export": Export, "launch": Launch, "train": Train}
+@dataclasses.dataclass(frozen=True)
+class Profile:
+    """Profile a run: train it afresh for `warmup` steps and a window of `steps` more, traced, with no
+    checkpoint or validation, and print where the window's steps spent their time (`RunConfig.profile`),
+    its report also in `report.json` beside XProf's own reports."""
+
+    run: Positional[str]
+    """A Python file whose `run` is a run config or a function returning one, or a `run.json`."""
+    warmup: int = 20
+    """The steps before the window, the step's compile among them, rounded up to whole windows."""
+    steps: int = 10
+    """The steps the window traces."""
+    out: str | None = None
+    """Where the profile goes; unset writes profiles/<the run's name>/<the time it starts>."""
+    set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
+    """`path=value`, once a field, as `dew train` reads it."""
+    trust: tuple[str, ...] = ()
+    """Packages outside Dew whose modules a `run.json` may import."""
+
+    def run_command(self) -> int:
+        report = run_named(self.run, self.trust).assigned(self.set).profile(self.out, warmup=self.warmup,
+                                                                            steps=self.steps)
+        if report is not None:
+            emit(report.text())
+        return 0
+
+
+COMMANDS = {"export": Export, "launch": Launch, "profile": Profile, "train": Train}
 DATA_COMMANDS = {"export": DataExport, "provision": DataProvision, "publish": DataPublish}
 
 

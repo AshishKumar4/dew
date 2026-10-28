@@ -5,6 +5,26 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `Trainer.fit(resume=)` makes resuming explicit: `"auto"` continues the latest checkpoint where there
+  is one, as before; `"require"` refuses a directory with none, for a job that must not start afresh;
+  `"never"` refuses one that already holds a run (`Checkpoints.resumed`). A run configuration takes it
+  as `trainer.resume` and refuses before writing its record over the directory's.
+- `dew profile run.py --warmup 20 --steps 10` (`RunConfig.profile`) trains a run afresh in a directory of
+  its own, traces a window of steps and prints where they spent their time (`ProfileReport`): step,
+  input wait, compile, device time in collectives and the rest, analytic work and MFU.
+  `Supervised(work=)` declares a batch's training FLOPs for a model Dew holds no count for.
+- `Supervised(model, loss, inputs="x")` names the input field alone; the run reads its shape off its
+  first batch as the model reads it, after the loader's device steps (`Objective.named_inputs`). An
+  explicit `InputSpec` still states it.
+- Under JAX's AutoPGLE (`JAX_ENABLE_PGLE=1`) the trainer guides its ahead-compiled step by a profile of
+  its first runs, which JAX's jit never did for it, and records the profile in the step's plan.
+- A token budget, a cadence of tokens and a schedule's stages read the committed-token count off the
+  devices only where the steps since the last read could have reached what they read next
+  (`Objective.row_tokens`), so the steps between dispatch without waiting on the one before.
+- A schedule's stages each train at the row length their chain lays out, up to the model's
+  `max_seq_len`, so a context-extension schedule (8k-token rows, then 64k) trains its later stage
+  where the objective's one row length refused it.
+
 - A tiled LM head's backward carries the state gradient over its vocabulary tiles as a compensated
   pair on every backend (`dew.nn.precision.paired_sum`), so its error is the tile products' own: on an
   H100 XLA took the plain sum's addition into each GEMM, which could then not split its sum, and the

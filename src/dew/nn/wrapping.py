@@ -64,6 +64,10 @@ class DecoderWrapper(nn.Module):
         return self._decoder.max_seq_len
 
     @property
+    def position_capacity(self) -> int | None:
+        return self._decoder.position_capacity
+
+    @property
     def emb_features(self) -> int:
         return self._decoder.emb_features
 

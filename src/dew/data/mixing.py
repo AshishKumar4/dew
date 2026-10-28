@@ -29,8 +29,9 @@ _log = logging.getLogger(__name__)
 class CorpusCounts:
     """What one corpus's read counted, under its identity (`name`, which plans and saved positions
     key it by) and the short name its metrics go by (`label`). `accepted` counts the rows it
-    delivered and `truncated` those of them cut short; a rejection counts what the step that drops
-    it reads, a record or a piece or window a step made of one. `attempted` counts what its last
+    delivered and `truncated` those of them cut short, its source examples where an objective makes
+    several rows of each, counted before it does (`FlatMap.examples`); a rejection counts what the step
+    that drops it reads, a record or a piece or window a step made of one. `attempted` counts what its last
     filter read, for its own warning; it describes no one unit of the corpus, so no metric shows it."""
 
     name: str

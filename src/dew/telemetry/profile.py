@@ -98,6 +98,12 @@ COMMAND_BUFFERS = (
     "XLA_FLAGS=--xla_gpu_enable_command_buffer= for op-level reports, and time runs without it")
 
 
+def process_directory(directory: Path) -> Path:
+    """Where this process's captures under `directory` go: `directory` itself, or in a pool of processes
+    `process-<rank>` within it, since each process captures its own devices."""
+    return directory if jax.process_count() == 1 else directory / f"process-{jax.process_index()}"
+
+
 def report_table(path: Path, index: int = 0) -> tuple[list[str], list[dict[str, JSON]]]:
     """The `index`-th DataTable of an exported XProf report (`reports/hlo_stats.json`,
     `framework_op_stats.json`, ...): its column ids, and its rows as values by column.
@@ -309,10 +315,8 @@ class Profiler:
             if self._directory is None:
                 self._directory = Path(tempfile.mkdtemp(prefix="dew-profile-"))
             self._directory = self._directory.expanduser().resolve()
-            root = self._directory
+            root = process_directory(self._directory)
             count, rank = jax.process_count(), jax.process_index()
-            if count > 1:
-                root = root / f"process-{rank}"
             root.mkdir(parents=True, exist_ok=True)
             capture = Path(tempfile.mkdtemp(prefix="capture-", dir=root))
             metadata: dict[str, JSON] = {

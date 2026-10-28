@@ -94,10 +94,11 @@ class DecisionModel(HeadedModel):
             assert inputs.context_lengths is not None, "a row's context comes with its length"
             # The context's own pass where it holds the schema, whose spans the head pools from that
             # same pass, else as the model encodes it.
+            # A window's rows each read their own context (`DecisionInputs.context_segments`).
             conditioning = encode_context(
                 self.backbone, part(variables, "backbone"), inputs.context, inputs.context_lengths,
                 encoder="backbone" if inputs.spans_in_context else self.context_encoder, train=train,
-                rngs=rngs)
+                rngs=rngs, segments=inputs.context_segments, max_segments=inputs.max_segments)
             spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
             if inputs.slots is not None:
