@@ -282,15 +282,17 @@ def test_the_skip_takes_forward_and_reverse_mode():
     assert gradient.shape == skip.shape and bool(jnp.all(jnp.isfinite(gradient)))
 
 
-def test_a_step_without_the_delta_rule_reads_its_updated_state():
-    """Without the delta rule a token's output is `q^T S'` of the updated state (`recurrence.update`): finite
-    where the one-pass form's `(q . k) (write v)` overflowed, fp32 keys and queries of 2^80 over 32 state
-    channels against a write of 2^-80 from a zero state (row 1859), and on par with the float64 recurrence."""
+@pytest.mark.parametrize('delta', [False, True], ids=['no delta rule', 'the delta rule'])
+def test_a_step_reads_its_updated_state(delta):
+    """A token's output is `q^T S'` of the updated state (`recurrence.update`), with the delta rule and
+    without: finite where the one-pass form's `(q . k) (write v)` overflowed, an fp32 key and query of 2^80
+    on one state channel against a write of 2^-80 and a value of 1 from a zero state with no decay, whose
+    updated state is 1 there and its readout exactly 2^80 (rows 1859 and 1962)."""
     channels, width = 32, 4
-    query = key = jnp.full((1, channels), 2.0 ** 80, jnp.float32)
-    value = jnp.full((1, width), 2.0 ** -80, jnp.float32)
+    query = key = jnp.zeros((1, channels), jnp.float32).at[0, 0].set(2.0 ** 80)
+    value = jnp.ones((1, width), jnp.float32)
     state = jnp.zeros((1, channels, width), jnp.float32)
-    decay, write = jnp.full((1, channels), jnp.exp(-1.0), jnp.float32), jnp.ones((1, 1), jnp.float32)
-    out, updated = recurrence.update(state, query, key, value, decay, write, delta=False)
-    assert bool(jnp.all(jnp.isfinite(out))) and bool(jnp.all(jnp.isfinite(updated)))
-    np.testing.assert_array_equal(out, jnp.full((1, width), channels * 2.0 ** 80, jnp.float32))
+    decay, write = jnp.ones((1, channels), jnp.float32), jnp.full((1, 1), 2.0 ** -80, jnp.float32)
+    out, updated = recurrence.update(state, query, key, value, decay, write, delta=delta)
+    np.testing.assert_array_equal(updated, state.at[0, 0].set(1.0))
+    np.testing.assert_array_equal(out, jnp.full((1, width), 2.0 ** 80, jnp.float32))
