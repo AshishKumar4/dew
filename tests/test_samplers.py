@@ -334,15 +334,23 @@ class StandIn:
         return x_0, (x - x_0) / sigma
 
 
-def flaxdiff_walk(solver, x_T, times):
-    """Every interval of `times`, Dew's twelve-point grid on the host (a multistep solver checks its
-    gaps there), from `x_T` in its precision, with the reference's stand-in denoiser read through the
-    Karras schedule's own sigma."""
+def flaxdiff_start(solver, x_T):
+    """`solver`'s state before its first step, built on Dew's twelve-point grid on the host, where a
+    multistep solver checks its gaps: what `sample` takes beside a traced grid (`initial`). A draw's
+    grid is that grid moved within a hundredth of a spacing (the writer's JITTER), which these solvers'
+    states start no different on."""
     process, _ = karras_process()
-    times = times.astype(x_T.dtype)
+    return solver.init(x_T, np.asarray(process.times(12)), process, key=jax.random.key(0))
+
+
+def flaxdiff_walk(solver, x_T, times):
+    """Every interval of `times`, a draw's grid, from `x_T` in its precision, with the reference's
+    stand-in denoiser read through the Karras schedule's own sigma."""
+    process, _ = karras_process()
+    times = jnp.asarray(times, x_T.dtype)
     denoise = StandIn(process)
 
-    x, state = x_T, solver.init(x_T, times, process, key=jax.random.PRNGKey(0))
+    x, state = x_T, flaxdiff_start(solver, x_T)
     latents = []
     for i in range(times.shape[0] - 1):
         t, t_next = jnp.full((x.shape[0],), times[i]), jnp.full((x.shape[0],), times[i + 1])
@@ -371,8 +379,9 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     """`sample` with its default `final_denoise` against FlaxDiff's own
     `generate_samples` (AshishKumar4/FlaxDiff@15c55b0, run as published by
     tools/flaxdiff_solver_reference.py) from the same x_T over the same
-    twelve-point grid: eleven solver intervals, then the clean prediction
-    at the grid's last point, over the recorded seeds (check 1). The output
+    twelve-point grid, each draw's its own (the writer's JITTER): eleven
+    solver intervals, then the clean prediction at the grid's last point,
+    over the recorded seeds (check 1). The output
     is held as it is and through the clip to [-1, 1] that FlaxDiff's
     `post_process` applies as the pipeline's output step: the stand-in's
     clean predictions reach |x| = 3, so the clip moves most entries and the
@@ -381,7 +390,6 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     clean prediction at the last time: `sample`'s own float64 scan refuses
     MultiStepDPM's float32 history (row 2063)."""
     process, _ = karras_process()
-    times = np.asarray(process.times(12))
 
     def outputs(closed):
         return {"closed": closed, "clipped": jnp.clip(closed, -1, 1)}
@@ -389,12 +397,14 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     def closing(inputs):
         x_T = jnp.asarray(inputs["x_T"])
         return outputs(sample(StandIn(process), x_T, solver=solver, key=jax.random.key(0),
-                              times=times.astype(x_T.dtype)))
+                              times=jnp.asarray(inputs["times"], x_T.dtype),
+                              initial=flaxdiff_start(solver, x_T)))
 
     def walked_and_closed(inputs):
         x_T = jnp.asarray(inputs["x_T"])
+        times = jnp.asarray(inputs["times"], x_T.dtype)
         last = flaxdiff_walk(solver, x_T, times)[-1]
-        return outputs(StandIn(process)(last, jnp.full((x_T.shape[0],), times[-1].astype(x_T.dtype)))[0])
+        return outputs(StandIn(process)(last, jnp.full((x_T.shape[0],), times[-1]))[0])
 
     assert_on_par_with_flaxdiff(f"{name} closed", closing, walked_and_closed)
     assert float(jnp.abs(closing(writer("flaxdiff_solver_reference").draw(0))["closed"]).max()) > 2
@@ -406,17 +416,18 @@ def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver):
     """`RK4` and `MultiStepDPM` are FlaxDiff's `RK4Sampler` and
     `MultiStepDPM` (AshishKumar4/FlaxDiff@15c55b0, run as published by
     tools/flaxdiff_solver_reference.py): from the same x_T over FlaxDiff's
-    twelve-point grid on a rho-7 Karras schedule, with a denoiser nonlinear
+    twelve-point grid on a rho-7 Karras schedule, each draw's moved within a
+    hundredth of a spacing (the writer's JITTER), with a denoiser nonlinear
     in x, the latent after every interval, so every RK4 stage and each of the
     multistep's first, second and third order updates, and the gradient of
-    the last one through the walk, held to FlaxDiff's float64 run by the
-    float64 rule. The grid is Dew's own `times(12)`."""
+    the last one through the walk, on par with FlaxDiff's float32 run over
+    the recorded seeds (check 1). FlaxDiff's grid is Dew's own `times(12)`."""
     process, _ = karras_process()
-    times = np.asarray(process.times(12))
-    np.testing.assert_array_equal(times, recording(FLAXDIFF)["times"])
+    np.testing.assert_array_equal(process.times(12), recording(FLAXDIFF)["times"])
 
     def walked(inputs):
         x_T = jnp.asarray(inputs["x_T"])
+        times = inputs["times"]
         latents = flaxdiff_walk(solver, x_T, times)
         cotangent = jnp.asarray(inputs["cotangent"])
         (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x, times)[-1], x_T)[1](cotangent)
