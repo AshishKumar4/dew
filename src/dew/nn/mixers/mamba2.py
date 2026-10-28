@@ -60,7 +60,6 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused
 from dew.nn.attention_masks import repeat_kv_heads
-from dew.nn.norms import unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
