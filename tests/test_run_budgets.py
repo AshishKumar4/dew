@@ -3,7 +3,9 @@ runs out before its length."""
 
 import collections
 import dataclasses
+import itertools
 
+import grain.python as grain
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -144,6 +146,115 @@ def test_an_examples_budget_counts_documents_before_they_are_packed():
     read = ids_read(loader, loader.example_steps(13), "text")
     reached = collections.Counter(1 + index % 5 for index in range(13))
     assert read == {token: count * token for token, count in reached.items()}
+
+
+class Questioned:
+    """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
+    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`)."""
+
+    def flat_map(self, element):
+        return tuple({"id": element["id"], "question": np.int32(question)}
+                     for question in range(int(element["id"]) % 3 + 1))
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["step", "configured"])
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+@pytest.mark.parametrize("examples", [7, 23])
+def test_an_examples_budget_counts_examples_before_the_objective_expands_them(examples, read, configured):
+    """An objective that makes each record several rows (a question a row) is bounded by its examples,
+    not its rows: the read bounded to `examples` records holds every row of each example the bound
+    reaches, as many times as it reaches it, and ends, whatever number of rows each example makes, in a
+    memory read and a streamed one alike, the expansion given as a step or as a configured one that
+    binds to it from the source's facts (`Configured`)."""
+    from dew.data.pipeline import Configured, ObjectiveData
+
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
+    expansion = Configured(lambda facts: Questioned(), needs=(), expands=True) if configured else Questioned()
+    loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
+                     objective=ObjectiveData(train=(expansion,)), examples=examples)
+    read = ids_read(loader, loader.example_steps(examples), "id")
+    passes, rest = divmod(examples, RECORDS)
+    assert sum(count / (record % 3 + 1) for record, count in read.items()) == examples
+    assert all(count % (record % 3 + 1) == 0 for record, count in read.items())
+    assert sorted(count // (record % 3 + 1) for record, count in read.items()) == sorted(
+        [passes + 1] * rest + [passes] * (RECORDS - rest) if passes else [1] * rest)
+
+
+class Evens(grain.MapTransform):
+    """An objective's filter of the odd records, which it states it drops (`rejects`)."""
+
+    rejects = True
+
+    def map(self, element):
+        from dew.data.pipeline import Rejected
+
+        return element if int(element["id"]) % 2 == 0 else Rejected("odd")
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_an_examples_budget_counts_the_examples_an_objectives_filter_keeps_given_or_configured(read):
+    """A run bounded to `examples` reads that many examples an objective's filter keeps, the filter
+    given as a step or as a configured one that binds to it alike: its kept examples, each even, the
+    bound reaching past the five a pass keeps."""
+    from dew.data.pipeline import Configured, ObjectiveData
+
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
+
+    def kept(step) -> collections.Counter:
+        loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
+                         objective=ObjectiveData(train=(step,)), examples=7)
+        return ids_read(loader, loader.example_steps(7), "id")
+
+    given = kept(Evens())
+    assert sum(given.values()) == 7 and all(record % 2 == 0 for record in given)
+    assert kept(Configured(lambda facts: Evens(), needs=())) == given
+
+
+def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_its_rows():
+    """Two corpora mixed, whose examples the objective makes one row and three rows each: the bound
+    counts examples before the objective makes rows of them, so the rows it reads are exactly as many
+    examples' rows as it is bounded to, each example's rows whole."""
+    from dew.data import mix
+    from dew.data.pipeline import ObjectiveData
+
+    one = Pipeline(Memory({"id": np.full(RECORDS, 3, np.int32)})).repeat()
+    three = Pipeline(Memory({"id": np.full(RECORDS, 2, np.int32)})).repeat()
+    loader = compile(mix([one, three], weights=[0.5, 0.5]).batch(BATCH),
+                     objective=ObjectiveData(train=(Questioned(),)), examples=EXAMPLES)
+    read = ids_read(loader, loader.example_steps(EXAMPLES), "id")
+    assert read[2] % 3 == 0
+    assert read[3] + read[2] // 3 == EXAMPLES
+
+
+@pytest.mark.parametrize("shuffled", [True, False], ids=["shuffled", "in-order"])
+def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_rows_each_makes(shuffled):
+    """A decision objective lays an example out as a row a question: an examples budget over examples
+    of two questions each reads exactly that many source examples, two rows each, its windows holding
+    twice as many rows as the budget's examples, in the memory read decision rows take, whose objective
+    steps start eagerly over the store: shuffled, and in order, where the bound stands before every
+    objective step a memory read would run over the store first."""
+    from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
+
+    from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
+
+    layout = StateFirstLayout(max_len=128)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=128), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout)
+    asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}
+    answers = {"first": "true", "second": "false"}
+    records = [{"example": Example(f"state {index}", asked, answers)} for index in range(RECORDS)]
+    chain = Pipeline(Memory(records)).pipe(decisions)
+    # In order, no stage stands between the chain's records and the objective's eager steps.
+    chain = chain.shuffle(3) if shuffled else chain
+    loader = compile(chain.batch(BATCH), read="memory", objective=objective.data(), examples=EXAMPLES)
+    rows = 0
+    for batch in itertools.islice(loader.train(DataPartition()), loader.example_steps(EXAMPLES)):
+        # A short last batch is filled with windows it marks as no rows of its own (`VALID_ROWS`).
+        real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["segments"]), bool)), bool)
+        rows += sum(len(set(window[window > 0].tolist())) for window in np.asarray(batch["segments"])[real])
+    assert rows == 2 * EXAMPLES
 
 
 def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_sizes():

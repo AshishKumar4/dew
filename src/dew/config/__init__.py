@@ -401,8 +401,10 @@ class TrainerConfig:
     rate or a schedule with its own explicit step horizon.
     """
     examples: int | None = None
-    """The run length as the first this many records of the data, each read once, counted before
-    they are packed (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
+    """The run length as the first this many source examples of the data, each read once with every
+    row it makes: the records the chain makes in its own order, counted before they are packed and
+    before an objective makes several rows of one (a decision layout's row a question)
+    (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
     stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
     (`Pause`): `--trainer.stop.fraction 0.5`."""

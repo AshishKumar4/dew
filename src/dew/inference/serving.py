@@ -900,7 +900,7 @@ class Server:
         assert self.cross is not None
         cross, features, dtype = self.cross
         # Checked where it is, on the host: admission places the batch (`_admit`), never the request.
-        given, counts = CrossContext.checked({CONTEXT: embeddings, **(
+        given, counts, _ = CrossContext.checked({CONTEXT: embeddings, **(
             {} if lengths is None else {CONTEXT_LENGTHS: lengths})}, np)
         tokens = np.asarray(given, dtype)
         # The count as given, before the cache's int32 holds it, where a wider one would wrap.
