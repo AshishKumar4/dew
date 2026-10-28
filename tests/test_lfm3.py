@@ -130,6 +130,8 @@ def test_an_lfm3_vl_wrappers_language_model_loads_alone_and_its_unported_tower_r
     of: `text_only` loads the decoder, computing the decoder's own logits bit for bit, and a multimodal
     load refuses the tower by name. d1's checkpoint of it (LiquidAI/d1-2B), whose full-attention layers
     train under a visibility of their own (`d1_attention`), refuses that by name."""
+    from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
+
     ids = jnp.asarray(fixture('input_ids'), jnp.int32)
     alone = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
     source = wrapped(tmp_path / 'wrapper')
@@ -138,8 +140,23 @@ def test_an_lfm3_vl_wrappers_language_model_loads_alone_and_its_unported_tower_r
                                   np.asarray(alone.model.apply(alone.variables, ids)))
     with pytest.raises(ValueError):
         Pretrained.load(source, dtype='float32', attention_impl='reference')
+    config = json.loads((source / 'config.json').read_text())
+    with pytest.raises(ValueError):
+        translate_wrapper_weights(load_file(source / 'model.safetensors'), translate_wrapper_config(config))
     with pytest.raises(ValueError):
         Pretrained.load(wrapped(tmp_path / 'd1', d1_attention='set', d1_set_size=16), text_only=True)
+    # Lfm3VlConfig types its text_config as lfm3 and places its images at 125030 where a config is silent.
+    bare = wrapped(tmp_path / 'bare')
+    stated = json.loads((bare / 'config.json').read_text())
+    stated['text_config'].pop('model_type')
+    stated.pop('image_token_id')
+    (bare / 'config.json').write_text(json.dumps(stated))
+    record = translate_wrapper_config(stated)
+    assert (record['text_model_type'], record['image_token_id'], record['video_token_id']) == ('lfm3', 125030,
+                                                                                               125029)
+    reread = Pretrained.load(bare, dtype='float32', attention_impl='reference', text_only=True)
+    np.testing.assert_array_equal(np.asarray(reread.model.apply(reread.variables, ids)),
+                                  np.asarray(alone.model.apply(alone.variables, ids)))
 
 
 @pytest.mark.network
