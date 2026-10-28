@@ -39,6 +39,7 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     kept_dtype,
     kernel_dot,
+    launch_arguments,
     padded_call,
     prescaled,
     within,
@@ -100,6 +101,18 @@ def refused(spans: KeySpans, hooks: Hooks | None = None) -> str | None:
         return ("the Triton mainloop is frozen and takes no probability dropout (the route runs a dropping "
                 "call on the reference path, ledger row 1521)")
     return None
+
+
+def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+             *, scale: float | None = None, natural: bool = NATURAL, residuals: bool = False) -> str | None:
+    """Why no config of `forward`'s launch, bound as it binds this call (`_forward_call`), fits the GPU: its
+    own fitting (`Template.fits`: its padding, the configs dividing it, the registers they hold and the
+    shared memory they stage), or None. The route then takes another mainloop rather than a launch that
+    cannot run (`attention_route._mainloop`); the backward's own launches hold the same tiles' operands."""
+    op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    if op.fits(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target()):
+        return None
+    return "no config of the Triton mainloop's forward fits the GPU's block and registers"
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
@@ -428,14 +441,29 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `interpret` runs it on the CPU. A call over runs or under dropout is refused (`refused`)."""
     if reason := refused(spans, hooks):
         raise NotImplementedError(reason)
+    op, args, queries = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    value_width = value.shape[-1]
+    out = op(*args, residuals=residuals, interpret=interpret)
+    if not residuals:
+        return out[:, :queries, :, :value_width]
+    out, peak, total, anchors, others, own, others_total, shift = out
+    return (out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries],
+            anchors[:, :, :queries],
+            Split(others[:, :, :queries, :value_width], own[:, :, :queries], others_total[:, :, :queries],
+                  shift[:, :, :queries]))
+
+
+def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
+                  *, scale: float | None, natural: bool) -> tuple[TritonForward, tuple, int]:
+    """`forward`'s launch, its padded operands (`padded_call`) and the call's queries before padding."""
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, BLOCK)
-    queries, value_width = call.queries, value.shape[-1]
     initial = hooks.initial
     m0 = total0 = acc0 = None
     if initial is not None:
         m0, total0 = call.rows(initial.m, -jnp.inf), call.rows(initial.total)
-        acc0 = jnp.pad(call.rows(initial.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),))
+        acc0 = jnp.pad(call.rows(initial.acc),
+                       ((0, 0),) * 3 + ((0, call.value.shape[-1] - value.shape[-1]),))
     op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
@@ -444,16 +472,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                        output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
                        keys=spans.keys, natural=natural)
-    out = op(call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
-             call.score_params, call.output_params, m0, total0, acc0, residuals=residuals,
-             interpret=interpret)
-    if not residuals:
-        return out[:, :queries, :, :value_width]
-    out, peak, total, anchors, others, own, others_total, shift = out
-    return (out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries],
-            anchors[:, :, :queries],
-            Split(others[:, :, :queries, :value_width], own[:, :, :queries], others_total[:, :, :queries],
-                  shift[:, :, :queries]))
+    return op, (call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
+                call.score_params, call.output_params, m0, total0, acc0), call.queries
 
 
 def _key_param(ref, kind: Kind, head, rows):
@@ -725,14 +745,17 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
         dQ program its query and output-gradient tiles and the key and value tiles of every stage but the
         one in use; a dK/dV program its key and value tiles and the query and output-gradient tiles of
         every stage but the one in use; and two `block_q` by `block_k` tiles on their way between
-        products. A bound fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21: at or
-        above them on every config it refused, within the budget on all but two of the A10's compiled
-        ones)."""
+        products. fp32 operands, which Triton's products take as tf32, stage the one in use too. A bound
+        fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21, 16-bit: at or above them on
+        every config it refused, within the budget on all but two of the A10's compiled ones; fp32 at 64-
+        and 128-wide heads on every config of the space compiled for an A100, 2026-10-28: at or above them,
+        where the 16-bit count fell up to 19968 bytes short)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
-        rows = max(config.block_q + (config.dq_stages - 1) * config.block_k,
-                   config.block_k + (config.dkv_stages - 1) * config.block_q)
+        held = 1 if size >= 4 else 0
+        rows = max(config.block_q + (config.dq_stages - 1 + held) * config.block_k,
+                   config.block_k + (config.dkv_stages - 1 + held) * config.block_q)
         return (rows * (width + value_width) + 2 * config.block_q * config.block_k) * size
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
@@ -905,16 +928,37 @@ def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) ->
             raise ValueError("an output hook's parameter has no score tile")
 
 
-def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
-            prescale: float, split: bool, natural: bool, accurate: bool, initial: bool, interpret: bool):
+def _backward_op(*, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
+                 prescale: float, split: bool, natural: bool, accurate: bool,
+                 initial: bool) -> TritonBackward:
     """The Triton mainloop's two launches under one tuning decision (`TritonBackward`), recomputing the
     weights as a forward of the call's form computed them (`algebra.recompute`), from the call's own query
     taken by `prescale` (`attention.prescale`) for its logits alone."""
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
                                             natural=natural, initial=initial, prescale=prescale))
-    op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale, score_dtypes=score_dtypes,
-                        split=split, how=how, accurate=accurate, prescale=prescale)
-    return op(*arrays, interpret=interpret)
+    return TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale,
+                          score_dtypes=score_dtypes, split=split, how=how, accurate=accurate,
+                          prescale=prescale)
+
+
+def _launch(*arrays, interpret: bool, **params):
+    """`_backward_op`'s launches on `gradients`' arrays."""
+    return _backward_op(**params)(*arrays, interpret=interpret)
+
+
+def backward_unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                      hooks: Hooks | None, dout: jax.Array, *, residuals: tuple, scale: float | None = None,
+                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> str | None:
+    """Why no config of `backward`'s launches, bound as `gradients` binds this call (`launch_arguments`),
+    fits the GPU (`Template.fits`), or None: the route then takes another mainloop (`attention_route`)."""
+    hooks = Hooks() if hooks is None else hooks
+    arrays, params, _ = launch_arguments(query, key, value, spans, hooks, dout, residuals, block=BLOCK,
+                                         scale=scale)
+    op = _backward_op(**params, split=True, natural=natural, accurate=accurate,
+                      initial=hooks.initial is not None)
+    if op.fits(op.bind(*arrays, interpret=False), generation.gpu_target()):
+        return None
+    return "no config of the Triton mainloop's backward fits the GPU's block and registers"
 
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
