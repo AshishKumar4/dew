@@ -263,8 +263,6 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
             query_places, key_places = _widened(positions)
             by_places.append((key_places, _moved(query_places, -before), _moved(query_places, after)))
         start, end = _within_runs(jnp.asarray(runs, jnp.int32), start, end, keys, by_places)
-        if start.shape[-1] == 1:
-            start, end = start[..., 0], end[..., 0]
     blocks = True if causal and (block_groups is not None or image_groups is not None) else None
     narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
@@ -298,10 +296,11 @@ def _chunk_of(places, chunk: int) -> jax.Array:
 
 def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
                  by_places: list[tuple[jax.Array, jax.Array, jax.Array]]) -> tuple[jax.Array, jax.Array]:
-    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, `[B, Q, R]` each, and
-    each run's keys within each narrowing by places (`by_places`: its keys' values `[B, K]`, a window's
-    places or a chunk's numbers, and each query's least and greatest it keeps `[B, Q]`), searched in the run
-    alone, along which a run's places never decrease where the call's may restart between runs."""
+    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, `[B, Q, R]` each (one
+    run a query `[B, Q]`, the one interval every mainloop walks), and each run's keys within each narrowing
+    by places (`by_places`: its keys' values `[B, K]`, a window's places or a chunk's numbers, and each
+    query's least and greatest it keeps `[B, Q]`), searched in the run alone, along which a run's places
+    never decrease where the call's may restart between runs."""
     lo = jnp.maximum(jnp.clip(runs[..., 0], 0, keys), start[..., None])
     hi = jnp.maximum(jnp.minimum(jnp.clip(runs[..., 1], 0, keys), end[..., None]), lo)
     batch, _, count = lo.shape
@@ -310,7 +309,7 @@ def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
         first = _searched(values, flat_lo, flat_hi, jnp.repeat(least, count, axis=1), "left")
         last = _searched(values, flat_lo, flat_hi, jnp.repeat(greatest, count, axis=1), "right")
         lo, hi = first.reshape(lo.shape), jnp.maximum(last, first).reshape(hi.shape)
-    return lo, hi
+    return (lo[..., 0], hi[..., 0]) if count == 1 else (lo, hi)
 
 
 def _valid_ids(query_ids: jax.Array | None, key_ids: jax.Array | None, valid: jax.Array, batch: int,
