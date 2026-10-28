@@ -1138,6 +1138,31 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
                         seeds=SEEDS, truth_fn=_side_plain(truth=True))
 
 
+@INTERPRETS
+@pytest.mark.parametrize("splits", [2, 3, 5])
+def test_a_split_kernel_gradient_holds_check_1(splits):
+    """Interpreted, a kernel gradient whose contraction splits into runs of whole steps (`Tiles.splits`:
+    each group's rows shared out in 64-row blocks, each run's fp32 partial summed) at groups whose rows fill
+    no whole step, an empty group among them and one of a row, with more runs than some groups have blocks:
+    each group's gradient on par with XLA's over the draws (check 1), truth float64's."""
+    sizes = jnp.asarray(SIZES)
+    tiles = mosaic_gpu.Tiles(64, 64, 64, 2, 1, splits=splits)
+
+    def split(x, dy):
+        return mosaic_gpu.tgmm(x, dy, sizes, tiles=tiles, out_dtype=jnp.float32, multiprocessors=1,
+                               interpret=grouped_matmul.INTERPRETED)
+
+    def plain(x, dy, truth=False):
+        wide = jnp.float64 if truth else jnp.float32
+        # The rows past the groups' belong to none.
+        groups = np.concatenate([np.repeat(np.arange(len(SIZES)), SIZES), np.full(ROWS - sum(SIZES), -1)])
+        one_hot = jnp.asarray(groups[:, None] == np.arange(len(SIZES))[None, :], wide)
+        return jnp.einsum("rg,rd,rw->gdw", one_hot, x.astype(wide), dy.astype(wide))
+
+    assert_as_exact(split, jax.jit(plain), _gradient_rows_draw, f"{splits}-way split kernel gradient",
+                    seeds=SEEDS, truth_fn=functools.partial(plain, truth=True))
+
+
 def _gradient_rows_draw(seed):
     """Rows and a cotangent for a kernel gradient, both bf16."""
     rng = np.random.default_rng(seed + 4)

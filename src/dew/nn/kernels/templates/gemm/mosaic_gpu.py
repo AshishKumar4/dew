@@ -79,7 +79,9 @@ class Tiles:
     and the instruction family's bundle that runs it (`family`: Hopper's warpgroup MMA, or Ampere's
     mma.sync, one warpgroup whose loads `emit_pipeline` issues, the plain product alone); and the programs
     a multiprocessor runs at once (`programs`, at most its family's, `mosaic.Family.programs`), each in its
-    share of the multiprocessor's shared memory (`resources.program_shared`)."""
+    share of the multiprocessor's shared memory (`resources.program_shared`); and the slices a kernel
+    gradient's contraction splits into (`splits`, `tgmm`: each group's rows in that many runs of whole steps,
+    each run's fp32 partial summed after), where its output tiles underfill a wave (`split_count`)."""
     block_m: int
     block_n: int
     block_k: int
@@ -89,6 +91,7 @@ class Tiles:
     cluster: int = 1
     family: str = 'wgmma'
     programs: int = 1
+    splits: int = 1
 
     def __post_init__(self):
         paired = self.cluster == 2 and self.warpgroups == 1
@@ -597,8 +600,16 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
                               for side, axes in zip(prologue_operands, prologue_axes, strict=True))
 
     group_sizes = group_sizes.astype(jnp.int32)
-    group_starts, group_ends, group_num_blocks, group_block_starts = _group_blocks(group_sizes, block_k)
     out_dtype = jnp.dtype(out_dtype)
+    if tiles.splits > 1:
+        # Each group's rows in `splits` runs of whole steps from the group's first block, the first and last
+        # clipped to its rows: each run a group of its own, its fp32 partial summed after.
+        sliced = _sliced(group_sizes, block_k, tiles.splits)
+        partials = tgmm(lhs, rhs, sliced, tiles=dataclasses.replace(tiles, splits=1), out_dtype=jnp.float32,
+                        multiprocessors=multiprocessors, interpret=interpret, prologue=prologue,
+                        prologue_operands=prologue_operands, prologue_axes=prologue_axes)
+        return partials.reshape(g, tiles.splits, m, n).sum(axis=1).astype(out_dtype)
+    group_starts, group_ends, group_num_blocks, group_block_starts = _group_blocks(group_sizes, block_k)
     return _tgmm_streamed(
         (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts),
         (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=multiprocessors,
@@ -790,6 +801,43 @@ def _zero_neighbours_of(family: mosaic.Family, refs: list, step, start, end, ste
     pl.when(first)(lambda: zero(lambda rows: rows >= lax.rem(start, block_k)))
     pl.when(last)(lambda: zero(lambda rows: rows <= lax.rem(end - 1, block_k)))
     return first | last
+
+
+def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, multiprocessors: int,
+                step_seconds: float | None, bandwidth: float | None) -> int:
+    """Dew: the slices a kernel gradient's contraction splits into at `tiles` (`Tiles.splits`, `tgmm`),
+    from the call's extents and the device's facts. Over a wave (`multiprocessors` x `tiles.programs`)
+    and `rows` in steps a group (on average), the busiest program walks ceil(tiles x s / wave) output
+    tiles of ceil(steps / s) steps at s slices. The split is the least s whose walk, with the time its
+    fp32 partials take written and read back (2s + 1 passes over the output at `bandwidth`, in steps of
+    `step_seconds`), is shorter than the unsplit walk, each slice keeping at least the ring's stages and
+    one more; one where none is, or where the device states no rate. A bounded comparison over the
+    facts, no table, no timing: Key's 2560 x 1024 gradient over 24,576 rows on an H100 splits in three,
+    2 x 128 steps against 384."""
+    if step_seconds is None or bandwidth is None:
+        return 1
+    wave = multiprocessors * tiles.programs
+    output = groups * (depth // tiles.block_m) * (width // tiles.block_n)
+    steps = -(-rows // max(groups, 1) // tiles.block_k)
+
+    def walk(splits: int) -> float:
+        passes = 0 if splits == 1 else 2 * splits + 1
+        partials = passes * groups * depth * width * 4 / bandwidth / step_seconds
+        return -(-output * splits // wave) * -(-steps // splits) + partials
+
+    return next((splits for splits in range(2, steps // (tiles.stages + 1) + 1) if walk(splits) < walk(1)), 1)
+
+
+def _sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
+    """Dew: each group's rows as `splits` consecutive runs (group-major, a run's size each): the group's
+    `block_k`-row blocks, from its first row's block, shared out in whole blocks as evenly as they divide, the
+    first run starting at the group's first row and the last ending at its last; a run of a group with
+    fewer blocks than runs is empty."""
+    starts, ends, blocks, block_starts = _group_blocks(group_sizes, block_k)
+    shares = jnp.arange(1, splits)[None, :] * blocks[:, None] // splits
+    inner = jnp.clip(block_starts[:, None] + shares * block_k, starts[:, None], ends[:, None])
+    bounds = jnp.concatenate([starts[:, None], inner, ends[:, None]], axis=1)
+    return jnp.diff(bounds, axis=1).reshape(-1).astype(jnp.int32)
 
 
 def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:

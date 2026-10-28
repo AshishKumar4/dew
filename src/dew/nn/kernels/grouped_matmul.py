@@ -866,6 +866,22 @@ class MosaicTgmm(_Mosaic):
         # steps (`mosaic_gpu.tgmm`).
         return ba.arguments['tokens'].shape[1], None, ba.arguments['cotangent'].shape[1]
 
+    def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
+        # The derived tile, its contraction split where its output tiles underfill a wave
+        # (`mosaic_gpu.split_count`); an exact sum's order is its contract, so it takes no split.
+        tile = super().derived(ba, target)
+        if tile is None or ba.arguments['exact_sums']:
+            return tile
+        depth, _, width = self._generated_extents(ba)
+        peak, multiprocessors = target.bf16_peak, _multiprocessors(target)
+        flops = 2 * tile.block_m * tile.block_n * tile.block_k
+        step = None if peak is None else flops / (peak / multiprocessors)
+        splits = mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0],
+                                        rows=ba.arguments['tokens'].shape[0], depth=depth, width=width,
+                                        multiprocessors=multiprocessors, step_seconds=step,
+                                        bandwidth=target.memory_bandwidth)
+        return dataclasses.replace(tile, splits=splits)
+
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
         rows, _, width = self._generated_extents(ba)
         return rows % config.block_m == 0 and width % config.block_n == 0
