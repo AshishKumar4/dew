@@ -878,6 +878,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
+                     # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
+                     **{key: cells for key, cells in counts.get(name, {}).items() if key == "whole_suite"},
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:
@@ -1338,6 +1340,35 @@ def pythons(*, check: bool) -> int:
     return 1 if problems else 0
 
 
+def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> list[dict]:
+    """Each test of `verdict`'s rows (`armada verdict <sha> --json`) whose own seconds pass `target`, the
+    group target, slowest first: no cut brings its group within the target. A whole_suite cell is one too,
+    reported as running on the whole suite alone (`whole_suite`, as pytest marked it in its row:
+    executed.py), which train CI never runs (bible §7: every test past the target is reported). With `base`
+    (main's durations record), only the tests it lacks: a new slow test (owner, 2026-10-28), a cell newly
+    marked whole_suite too."""
+    found = []
+    for row_ in verdict["rows"]:
+        cells = set(row_.get("whole_suite", []))
+        for test, seconds in (row_.get("tests") or {}).items():
+            if seconds <= target or (base is not None and test in base):
+                continue
+            found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
+                          "target": target, **({"whole_suite": True} if test in cells else {})})
+    return sorted(found, key=lambda item: (-item["seconds"], item["test"]))
+
+
+def flagged(verdict: Path, new: Path | None) -> int:
+    """`slow` on the verdict at `verdict` and this checkout's group target, each test a line of JSON; with
+    `new` (a durations record), 1 where any test that record lacks passes the target."""
+    target = json.loads(Path(".armada.json").read_text())["target"]
+    base = json.loads(new.read_text()) if new is not None else None
+    found = slow(json.loads(verdict.read_text()), target, base)
+    for item in found:
+        print(json.dumps(item))
+    return 1 if found and base is not None else 0
+
+
 def task_arguments(running: argparse.ArgumentParser) -> None:
     """The `task` operation's arguments, which armada's task command fills from a plan entry."""
     running.add_argument("--python", choices=PYTHONS, required=True)
@@ -1395,6 +1426,11 @@ def main() -> int:
     versions = operations.add_parser("pythons")
     versions.add_argument("--check", action="store_true",
                           help="refuse a .python-version other than the oldest, or a smoke of other versions")
+    flagging = operations.add_parser(
+        "slow", help="each test of a verdict past the group target, a JSON line each; --new: exit 1 on any")
+    flagging.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
+    flagging.add_argument("--new", type=Path, default=None,
+                          help="the durations record the change is measured against: only the tests it lacks")
     recording = operations.add_parser("durations")
     recording.add_argument("verdict", type=Path, help="main's CI verdict: armada verdict <sha> --json")
     args = parser.parse_args()
@@ -1403,6 +1439,8 @@ def main() -> int:
     if args.operation == "gangs":
         print(json.dumps(gangs()))
         return 0
+    if args.operation == "slow":
+        return flagged(args.verdict, args.new)
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
         before = durations_record()
