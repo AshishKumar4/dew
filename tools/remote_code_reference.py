@@ -107,13 +107,31 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.1)
-        save_file({key: value.contiguous() for key, value in model.state_dict().items()},
-                  str(FIXTURES / name / "model.safetensors"))
+        save_file(_stored_once(model.state_dict()), str(FIXTURES / name / "model.safetensors"))
         vocabulary = json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"]
         ids = torch.randint(0, vocabulary, (2, 16)).numpy().astype(np.int32)
         np.save(FIXTURES / name / "input_ids.npy", ids)
-    model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")), strict=True)
+    state = model.state_dict()
+    missing, unexpected = model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")),
+                                                strict=False)
+    # A tied head is its embedding's tensor, which the file stores once (`_stored_once`).
+    shared = set(state) - set(_stored_once(state))
+    if unexpected or set(missing) != shared:
+        raise ValueError(f"{name}: the file's tensors differ from the model's: missing {missing}, "
+                         f"unexpected {unexpected}")
     return model.eval()
+
+
+def _stored_once(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """`state` with each tensor once, under its first name, as `save_pretrained` writes a tied head:
+    the embedding's alone."""
+    kept: dict[str, torch.Tensor] = {}
+    seen = set()
+    for key, value in state.items():
+        if value.data_ptr() not in seen:
+            seen.add(value.data_ptr())
+            kept[key] = value.contiguous()
+    return kept
 
 
 def main() -> None:
