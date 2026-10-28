@@ -41,7 +41,7 @@ from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
 from .generation import INHERENT, triton_runs
-from .selection import Kernel, Op, Requirement, select, selected
+from .selection import Kernel, KernelRefused, Op, Requirement, select, selected
 from .ssd import ssd_chunk_scan, ssd_kernel_platform
 from .templates import base
 
@@ -568,12 +568,25 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, chunk_size, work)
     else:
-        decayed = hooks.delta and hooks.decay != 'none'
-        kernels = [(port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                                scale=scale, wide=epilogue, floor=hooks.floor, product=product)
-                    if decayed else 'xla') for product in ('forward', 'training')]
+        # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
+        # over to the portable math there, reported as the call's route.
+        def product_kernel(product: str) -> str | KernelRefused:
+            try:
+                return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
+                                   scale=scale, wide=epilogue, floor=hooks.floor, product=product,
+                                   delta=hooks.delta, decayed=hooks.decay != 'none')
+            except KernelRefused as refused:
+                # A kernel named for the call that runs its forward but not its gradient (the template's
+                # fast backward) refuses where a gradient is traced, not a forward alone.
+                if product == 'forward':
+                    raise
+                return refused
+
+        kernels = [product_kernel(product) for product in ('forward', 'training')]
 
         def run(kernel, query, key, value, g, beta, state, starts, firsts):
+            if isinstance(kernel, KernelRefused):
+                raise kernel
             if kernel == 'mosaic_gpu':
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
                                      max_segments=max_segments, scale=scale, wide=epilogue, floor=hooks.floor)
@@ -609,7 +622,8 @@ class PortCase:
     (`call`, `templates.base.Call`; None where the caller asks of the port alone), the
     instruction family of the device it runs on (`family`, `generation.family`; None off a GPU), and the
     product it is selected for (`product`: 'forward' where no gradient is taken, 'training' where one is,
-    `_by_product`)."""
+    `_by_product`), and the recurrence's form: whether it is the delta rule (`delta`) and decays
+    (`decayed`)."""
 
     reverse: bool
     varying: bool
@@ -618,6 +632,8 @@ class PortCase:
     call: base.Call | None = None
     family: str | None = None
     product: str = 'forward'
+    delta: bool = True
+    decayed: bool = True
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -635,6 +651,11 @@ _VARYING = ("a shard_map that checks varying axes holds the operands, and a Pall
             "type for its results")
 
 PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
+    Requirement('gated', lambda case: case.delta and case.decayed,
+                "a recurrence other than the gated delta rule, which the rule's kernels run (fla's "
+                "chunk_gated_delta_rule and chunk_kda, the template's delta-rule mainloop): no delta rule (a "
+                "gated linear attention, a rated scan with its keys normed or scaled) or no decay (the plain "
+                "delta rule), which the portable math runs", row=INHERENT, kind='handoff'),
     Requirement('forward_mode', lambda case: case.reverse,
                 "forward_mode_attention traces for jax.jvp, which the port's custom VJP gives no tangent",
                 row=INHERENT),
@@ -648,15 +669,15 @@ PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
                 "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
                 "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
 )
-"""What the port (`fla_rule`) needs of a rule's call: a GPU Dew's Triton kernels run on, any of them (no
-target's row names it: a GPU no row named took the portable math, 140 to 155 ms a training step where the
-port took 3.1, template review 2026-10-26 P1-1), and every shape, dtype, chunk size and mesh, except
-inside `jax.jvp`'s traces, which the port's custom VJP gives no tangent; inside a caller's `shard_map`
-that checks varying axes over operands that vary, where a Pallas call, which states no varying type for
-its results, cannot run; float64 operands, whose rule is the reference math itself; and keys wider than
-the port takes in their dtype. Packed documents take the port at any bound: it stores the memories by
-where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
-(`chunked_launch.Sequences`)."""
+"""What the port (`fla_rule`) needs of a rule's call: the gated delta rule, a decay with the delta rule (the
+other forms hand over to the portable math, the call's route reporting it); a GPU Dew's Triton kernels run on,
+any of them (no target's row names it: a GPU no row named took the portable math, 140 to 155 ms a training
+step where the port took 3.1, template review 2026-10-26 P1-1), and every shape, dtype, chunk size and mesh,
+except inside `jax.jvp`'s traces, which the port's custom VJP gives no tangent; inside a caller's `shard_map`
+that checks varying axes over operands that vary, where a Pallas call, which states no varying type for its
+results, cannot run; float64 operands, whose rule is the reference math itself; and keys wider than the port
+takes in their dtype. Packed documents take the port at any bound: it stores the memories by where they pass,
+as many as the tokens' chunks, a row's and one, whatever the bound (`chunked_launch.Sequences`)."""
 
 PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('wgmma', 'forward'): ('fla', "on an H100 80GB HBM3, 16-bit, the port's forward 0.440 ms against the "
@@ -678,18 +699,35 @@ shrinks as the template wins its cells, and no cell is picked or ranked at run t
 the template's: its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff; 2.56
 against 3.14 on an H100 PCIe, SE-family-h100-e0de17766)."""
 
+def _trains(call: base.Call | None) -> bool:
+    """Whether the recurrence template's gradient runs the call (`Mosaic.trains`)."""
+    from .templates.recurrence import template
+
+    if call is None or not call.eligible('mosaic_gpu'):
+        return False
+    implementation, bound = call.bound['mosaic_gpu']
+    assert isinstance(implementation, template.Mosaic)
+    return implementation.trains(bound, call.target)
+
+
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
-    *PORT_SUPPORTS[:2],
+    *PORT_SUPPORTS[:3],
     Requirement('launch', lambda case: case.call is not None and case.call.eligible('mosaic_gpu'),
                 "the recurrence template's launches take no call of these dtypes or widths, or no config "
                 "fits this device, or no Mosaic bundle claims its instruction family", row='ledger 1294'),
     Requirement('device', lambda case: case.family is not None,
                 "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
                 row=INHERENT, kind='measured'),
+    Requirement('backward', lambda case: case.product != 'training' or _trains(case.call),
+                "a gradient the template's fast backward does not take: fp32 operands, a decay a key "
+                "dimension, or launches past the device's registers or shared memory at the call's tiles "
+                "(`mainloop.backward_holds`)", row='ledger 1294'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
-call: the port's trace and placement (its custom VJP, a Pallas call's results), its own launches' call
-(`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that fits), and a GPU.
+call: the port's form, trace and placement (the gated delta rule, its custom VJP, a Pallas call's results),
+its own launches' call (`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that
+fits), a GPU, and for a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no
+other, row 1926).
 A declared port cell runs the port first (`PORT_CELLS`, `GATED_DELTA`'s declared cells)."""
 
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
@@ -706,20 +744,24 @@ portable math."""
 
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
                 scale: float | None = None, wide: bool = False, floor: float | None = None,
-                product: str = 'forward', report: bool = True) -> str:
+                product: str = 'forward', report: bool = True, delta: bool = True,
+                decayed: bool = True) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
-    ('forward', 'training'), the template's implementations bound to it, on the target (`generation`'s, an
-    assumed one's within `assumed`): reported as its route, or not where not `report` (`selected`). A
-    kernel a call names (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over
-    varying operands)."""
+    ('forward', 'training'), of the form `delta` and `decayed` state (`PortCase`), the template's
+    implementations bound to it, on the target (`generation`'s, an assumed one's within `assumed`):
+    reported as its route, or not where not `report` (`selected`). A kernel a call names
+    (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over varying operands),
+    but for a form the rule's kernels do not run, which the portable math takes."""
     from .templates.recurrence import template
 
-    call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts, max_segments=max_segments,
-                     scale=scale, delta=True, wide=wide, floor=floor)
+    call = None
+    if delta and decayed:
+        call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
+                         max_segments=max_segments, scale=scale, delta=True, wide=wide, floor=floor)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
-                    family=family, product=product)
+                    family=family, product=product, delta=delta, decayed=decayed)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
@@ -850,14 +892,13 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     instruction family (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's
     interpreter, `mainloop.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the
     mainloop (`mainloop.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
-    (`mainloop.backward_holds`); on a GPU, a 16-bit delta rule's call the port takes (`PORT_SUPPORTS`) the
-    port's gradient where they do not (`fla_rule`'s custom VJP, its forward computed again there); every other
-    call's the portable math's (`chunk_delta_rule`'s, the recurrence's own adjoint), its forward recomputed
-    there. Its states and output
-    launches take `tiles` (`mainloop.Tiles`, the template's config, `templates.recurrence.template`); a
-    `family` given is the bundle it issues by, interpreted off a GPU of that family (a CPU's). A decay a key
-    dimension takes the layer's declared `floor`, which the mainloop's intra launch reads
-    (`mainloop.per_key_refusal`)."""
+    (`mainloop.backward_holds`); it takes no other call's, which raises NotImplementedError as the gradient
+    is traced: the delta rule's selector gives a training call it refuses another kernel
+    (`MOSAIC_SUPPORTS`' 'backward', `Mosaic.trains`), and a call that names the mainloop insists on it
+    (ledger 1926: no kernel falls back inside itself). Its states and output launches take `tiles`
+    (`mainloop.Tiles`, the template's config, `templates.recurrence.template`); a `family` given is the bundle
+    it issues by, interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's
+    declared `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`)."""
     from .templates.recurrence import mainloop, template
 
     dtype = jnp.result_type(query, key, value)
@@ -870,22 +911,12 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                   f"{generation.family(generation.device_generation())!r} family")
     run = {"family": family or device or mainloop.INTERPRETED, "interpret": interpret, "tiles": tiles,
            "floor": floor}
-    # The fast backward where its launches hold on the device (a derived launch spills nothing), else the
-    # portable math's.
+    # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
     fast = (delta and g.ndim == 3 and dtype != jnp.float32
             and mainloop.backward_holds(query, key, value, g, beta, state, tiles=tiles, family=run["family"],
                                         shared=generation.shared_budget(template.Mosaic.launched()),
                                         starts=starts, max_segments=max_segments))
     run_back = {name: value for name, value in run.items() if name != "floor"}
-    # Where the fast backward's launches do not hold, a 16-bit call's gradient the port's where the port takes
-    # the call (its forward computed again inside its own custom VJP), else the portable math's: the portable
-    # adjoint on a GPU took 140 to 155 ms where the port's training step took 3.1 (SE-family-h100-1342a8963).
-    # An fp32 call's stays the portable math's: the port's put its gradient 1.6 to 3.3 times the fp32
-    # recurrence's distance from float64 (SE-family-h100-be7214123).
-    case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
-                    dtype=jnp.dtype(dtype), key_width=key.shape[-1])
-    ported = (not fast and delta and not interpret and dtype != jnp.float32
-              and all(requirement.holds(case) for requirement in PORT_SUPPORTS))
 
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
     # tracer).
@@ -909,32 +940,17 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         operands, (inverse, kept) = saved
         out_grad, final_grad = grads
         query, key, value, g, beta, state, starts, firsts = operands
-        if fast:
-            grads = mainloop.gradients(query, key, value, g, beta, state, out_grad, final_grad, starts=starts,
-                                       firsts=firsts, max_segments=max_segments, scale=scale,
-                                       inverse=inverse, kept=kept, **run_back)
-            return (*grads[:5], None if state is None else grads[5], None, None)
-
-        if ported:
-            def port(query, key, value, g, beta, state):
-                return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                scale=scale, wide=wide, firsts=firsts)
-
-            _, pull = jax.vjp(port, query, key, value, g, beta, state)
-            return (*pull((out_grad, final_grad)), None, None)
-
-        def portable(query, key, value, g, beta, state):
-            group = value.shape[2] // key.shape[2]
-            if group > 1:
-                query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
-            out, final = chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state,
-                                          held_chunk(CHUNK_SIZE, key.shape[-1]) if delta else CHUNK_SIZE,
-                                          starts=starts, delta=delta, scale=scale,
-                                          dtype=jnp.float32 if wide else None)
-            return out, final
-
-        _, pull = jax.vjp(portable, query, key, value, g, beta, state)
-        return (*pull((out_grad, final_grad)), None, None)
+        if not fast:
+            form = (f"{dtype.name}, {'the delta rule' if delta else 'no delta rule'}, a decay a "
+                    f"{'head' if g.ndim == 3 else 'key dimension'}")
+            raise NotImplementedError(
+                f"the recurrence template's fast backward takes no gradient of this call ({form}, or its "
+                "launches past the device's at these tiles): the delta rule's selector gives a training call "
+                "it refuses the port or the portable math (`MOSAIC_SUPPORTS`' 'backward')")
+        grads = mainloop.gradients(query, key, value, g, beta, state, out_grad, final_grad, starts=starts,
+                                   firsts=firsts, max_segments=max_segments, scale=scale, inverse=inverse,
+                                   kept=kept, **run_back)
+        return (*grads[:5], None if state is None else grads[5], None, None)
 
     rule.defvjp(forward, backward)
     return rule(query, key, value, g, beta, state, starts, firsts)

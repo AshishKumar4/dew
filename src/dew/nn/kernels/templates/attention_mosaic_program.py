@@ -340,6 +340,34 @@ class _Spans(NamedTuple):
     key_doc: jax.Array | None = None
 
 
+def reached(spec: algebra.Forward, queries: int) -> int | None:
+    """The query and key pairs a call of `queries` queries (unpadded) reaches, by its form: every pair of a
+    full call; a causal call's, each query's keys up to its diagonal aligned to the last key (`algebra.seen`);
+    None for a spans call, whose pairs its arrays decide, which no launch states before it runs."""
+    if spec.form == "full":
+        return queries * spec.keys
+    if spec.form == "causal":
+        offset = spec.keys - queries
+        return sum(min(spec.keys, max(0, row + 1 + offset)) for row in range(queries))
+    return None
+
+
+def stated(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int, *arrays
+           ) -> pl.CostEstimate | None:
+    """A launch's cost as it states it to XLA and to Dew's FLOP count (`dew.telemetry.instrumentation`):
+    a multiply-add a reached pair (`reached`), head and row for each of `widths` product columns, the
+    model's products the launch owns (the forward's `Q K^T` and `P V`, the backward's two transposes of
+    each, as the library's fused attention counts them: a recomputed product is the hardware's alone), a
+    transcendental a reached pair, and the bytes of each of `arrays` once; None for a spans call, whose
+    pairs no launch knows (`reached`): its FLOPs count as unsized, never as 0."""
+    pairs = reached(spec, queries)
+    if pairs is None:
+        return None
+    return pl.CostEstimate(flops=2 * batch * heads * pairs * widths, transcendentals=batch * heads * pairs,
+                           bytes_accessed=sum(math.prod(array.shape) * jnp.dtype(array.dtype).itemsize
+                                              for array in arrays))
+
+
 def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: int) -> _Spans | None:
     """A spans call's `_Spans` at `block_q` by `block_k` tiles over its padded keys (None for a full or
     causal call, whose programs take their tiles from their places). A call's runs (`KeySpans`) lie run by

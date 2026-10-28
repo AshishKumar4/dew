@@ -403,12 +403,14 @@ def _axes(consumer, values, acc) -> tuple | generation.Refusal:
 
 def _pulled(function, specs, *args):
     """`function`'s block specs pulled back from `specs` at `args` (`fuser.pull_block_spec`), or the refusal
-    where the fuser has no rule to tile one of its equations (a reduction over the tile's own axes, an
-    unsupported primitive), which it raises as one of these errors: XLA runs it whole, reported."""
+    where the fuser has no rule to tile one of its equations (an unsupported primitive, strides), which it
+    states by NotImplementedError alone, naming the primitive (its public API has no query): XLA runs it
+    whole, reported. Any other error the fuser raises is a fault, and propagates."""
     try:
         return fuser.pull_block_spec(function, specs, grid_len=2)(*args)
-    except (NotImplementedError, ValueError, AssertionError) as error:
-        return generation.Refusal('untileable', f"the fuser tiles no block of it: {type(error).__name__}")
+    except NotImplementedError as error:
+        what = error.args[0] if error.args else "one of its equations"
+        return generation.Refusal('untileable', f"the fuser has no rule to tile {what}")
 
 
 def _specs(consumer, values, acc, block: tuple):
