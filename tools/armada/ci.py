@@ -1342,18 +1342,19 @@ def pythons(*, check: bool) -> int:
 
 def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> list[dict]:
     """Each test of `verdict`'s rows (`armada verdict <sha> --json`) whose own seconds pass `target`, the
-    group target, slowest first: no cut brings its group within the target. A whole_suite cell is none, as it
-    runs on the whole suite alone (`selected`): its row names it, as pytest marked it (executed.py). With
-    `base` (the durations record a change is measured against), only the tests it lacks: a new slow test
-    (owner, 2026-10-28)."""
+    group target, slowest first: no cut brings its group within the target. A whole_suite cell is one too,
+    reported as running on the whole suite alone (`whole_suite`, as pytest marked it in its row:
+    executed.py), which train CI never runs (bible §7: every test past the target is reported). With `base`
+    (main's durations record), only the tests it lacks: a new slow test (owner, 2026-10-28), a cell newly
+    marked whole_suite too."""
     found = []
     for row_ in verdict["rows"]:
         cells = set(row_.get("whole_suite", []))
         for test, seconds in (row_.get("tests") or {}).items():
-            if seconds <= target or test in cells or (base is not None and test in base):
+            if seconds <= target or (base is not None and test in base):
                 continue
             found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
-                          "target": target})
+                          "target": target, **({"whole_suite": True} if test in cells else {})})
     return sorted(found, key=lambda item: (-item["seconds"], item["test"]))
 
 
