@@ -151,12 +151,15 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
 
 
 def record_logits(directory: Path, model, wide, command: str, *, reference: str, revision: str, license: str,
-                  padded: Mapping[str, np.ndarray] | None = None, planned: bool = True, **details) -> Path:
-    """The tiny decoder at `directory` recorded over check 1's seeds where the test cannot run its
-    reference (a release's remote code, a release apart from the suite's): each seed's ids
-    (tests/interop_support.py `fixture_ids`), the torch causal LM `model`'s fp32 eager logits on the CPU
-    and `wide`'s, its float64 twin's (`torch_precision.float64_twin`), inside `torch_precision.float64`,
-    as the leaf `logits`; and with `padded`, the fields the reference's padded rows take
+                  draw=None, padded: Mapping[str, np.ndarray] | None = None, planned: bool = True,
+                  **details) -> Path:
+    """The tiny decoder at `directory`'s reference recorded over check 1's seeds, which its test reads in
+    the reference's place (a release's remote code or a release apart from the suite's, which the test
+    cannot run; hf_reference.py `write_logits_recording`'s): each seed's ids, `draw(seed)` (`{"input_ids":
+    ids}`, by default tests/interop_support.py `fixture_ids`' in the fixture's shape), the torch causal LM
+    `model`'s fp32 eager logits on the CPU and `wide`'s, its float64 twin's
+    (`torch_precision.float64_twin`), inside `torch_precision.float64`, as the leaf `logits`; and with
+    `padded`, the fields the reference's padded rows take
     (`attention_mask` and its `position_ids`), the leaf `padded_logits` too: its logits over the ids
     padded with 0 where the mask is false, at the mask's valid places. The count is planned on Dew's own
     load of the fixture, its padded rows under the mask alone, or, not `planned`, where Dew cannot load
@@ -172,7 +175,11 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
     mask = None if padded is None else np.asarray(padded["attention_mask"], bool)
     fields = {name: torch.from_numpy(np.asarray(value, np.int64 if name == "position_ids" else bool))
               for name, value in (padded or {}).items()}
-    ids_of = fixture_ids(directory)
+    if draw is None:
+        ids_of = fixture_ids(directory)
+
+        def draw(seed):
+            return {"input_ids": ids_of(seed)[0]}
 
     def logits(network, ids):
         tokens = torch.from_numpy(ids.astype(np.int64))
@@ -206,8 +213,8 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
         proxy = ours(native.model, native.variables)
         truth_proxy = ours(native.model.clone(dtype=jnp.float64), widened(native.variables))
     with jax.enable_x64(new_val=True):
-        recording = record_case("logits", lambda seed: {"input_ids": ids_of(seed)[0]}, evaluate, proxy,
-                                truth_proxy=truth_proxy, store_inputs=False, summary=True)
+        recording = record_case("logits", draw, evaluate, proxy, truth_proxy=truth_proxy, store_inputs=False,
+                                summary=True)
     record = provenance(reference, revision, "cpu", command, torch=torch.__version__, dtype="float32",
                         attention="eager", **details)
     return save(directory / "recorded_logits.npz", {**recording, "logits.provenance": record},
