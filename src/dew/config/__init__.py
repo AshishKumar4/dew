@@ -948,7 +948,7 @@ class RunConfig:
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
                                                    "trainer.cooldowns": "cooldowns",
-                                                   "trainer.compile_ahead": "ahead"}
+                                                   "trainer.compile-ahead": "ahead"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
     RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
