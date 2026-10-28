@@ -34,8 +34,8 @@ import pytest
 from reference_error import assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, chunk_on, draw, token_by_token
 
-from dew.nn.kernels import recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk
+from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5),
          'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5),
@@ -370,3 +370,62 @@ def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
             assert np.all(np.isfinite(np.asarray(ours))[finite]), f'leaf {index}: not finite, seed {seed}'
     assert_as_exact(dew, reference, draws, f"the portable math's gradient, {name} under {regime}",
                     seeds=GRADIENT_SEEDS[name, regime])
+
+
+def ssd_port(hooks, *args, **kwargs):
+    """`chunk` with its rated scan on mamba_ssm's kernels (`recurrence_chunk.SCAN`'s 'pallas', the SSD
+    port), interpreted off a GPU as the CPU suite runs a port a call names."""
+    with generation.chosen(ssd="pallas"):
+        return chunk(hooks, *args, **kwargs)
+
+
+PORT_SEEDS = dict.fromkeys(REGIMES, 8)
+"""Each regime's declared seeds for the SSD port's output and gradient (check 1), sized by `seeds_for`
+paired with the port on a GPU, where the port compiles (a CPU's interpretation of a kernel judges its host's
+arithmetic, not the kernel's)."""
+
+PORT = pytest.mark.gpu(reason="the SSD port compiled, as a GPU runs it")
+
+
+@PORT
+@pytest.mark.parametrize('regime', REGIMES)
+def test_the_ssd_port_stays_finite_and_exact_where_chunked_forms_break(regime):
+    """The rated scan on the SSD port (row 1341: the suite held the portable math alone): its output and
+    final memory finite wherever the float64 reference's are on every declared seed, and on par with the
+    token-by-token recurrence's from float64 (check 1), as the portable math's are."""
+    hooks = SITES['rated']
+    dew = functools.partial(ssd_port, hooks, chunk_size=CHUNK)
+    reference = functools.partial(token_by_token, hooks)
+    draws = functools.partial(stressed, hooks, regime)
+    for seed in range(PORT_SEEDS[regime]):
+        operands = draws(seed)
+        mine = jax.jit(dew)(*operands)
+        with jax.enable_x64(new_val=True):
+            truth = jax.jit(reference)(*widened(operands))
+        for leaf, ours, exact in zip(('output', 'final memory'), mine, truth, strict=True):
+            finite = np.isfinite(np.asarray(exact))
+            assert np.all(np.isfinite(np.asarray(ours))[finite]), (
+                f'{leaf}: not finite where float64 is, seed {seed}')
+    assert_as_exact(dew, reference, draws, f'the SSD port under {regime}', seeds=PORT_SEEDS[regime])
+
+
+@PORT
+@pytest.mark.parametrize('regime', REGIMES)
+def test_the_ssd_ports_gradient_is_as_exact_as_the_recurrences(regime):
+    """The SSD port's gradient (its custom VJP's) finite wherever the reference's in float64 is, and on par
+    with the token-by-token recurrence's from float64 (check 1) over the regime's declared seeds."""
+    hooks = SITES['rated']
+    dew = with_gradients(restarting(functools.partial(ssd_port, hooks, chunk_size=CHUNK), regime))
+    reference = with_gradients(restarting(functools.partial(token_by_token, hooks), regime))
+    draws = functools.partial(cotangents, hooks, regime)
+    for seed in range(2):
+        drawn = draws(seed)
+        mine = jax.jit(dew)(*drawn)
+        with jax.enable_x64(new_val=True):
+            truth = jax.jit(reference)(*widened(drawn))
+        leaves = zip(jax.tree.leaves(mine), jax.tree.leaves(truth), strict=True)
+        for index, (ours, exact) in enumerate(leaves):
+            finite = np.isfinite(np.asarray(exact))
+            assert np.all(np.isfinite(np.asarray(ours))[finite]), f'leaf {index}: not finite, seed {seed}'
+    assert_as_exact(dew, reference, draws, f"the SSD port's gradient under {regime}",
+                    seeds=PORT_SEEDS[regime])
