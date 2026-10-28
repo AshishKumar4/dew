@@ -64,8 +64,9 @@ def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
     assert jnp.array_equal(generated, argmax_walk(model, params, prompt, 2))
 
 
-DRAWN_SEEDS = 8
-"""The drawn tokens' log probabilities' declared draws of prompts against a full forward (check 1)."""
+DRAWN_SEEDS = 16
+"""The drawn tokens' log probabilities' declared draws of prompts against a full forward (check 1), sized
+by `seeds_for` paired with the decode on the CPU."""
 
 
 def test_drawn_tokens_continue_the_prompts_positions_as_its_response_does(rng):
