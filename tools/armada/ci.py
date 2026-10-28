@@ -208,7 +208,9 @@ def shared(python: str) -> str:
     digest = hashlib.sha256(python.encode())
     for top in ("tests", "src"):
         for path in sorted(Path(top).rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts or path == session.DURATIONS:
+            # A fetched payload is its manifest's (`contents`), which the walk reads in its place.
+            if (not path.is_file() or built(path) or path == session.DURATIONS
+                    or path.with_name(path.name + FETCHED).is_file()):
                 continue
             if path.suffix == ".py" and (top == "src" or path.name.startswith("test_")):
                 continue
@@ -227,15 +229,30 @@ def lane_inputs(python: str) -> str:
     return hashlib.sha256((shared(python) + contents(__file__).hex()).encode()).hexdigest()
 
 
+FETCHED = ".fetched.json"
+"""A fetched fixture's manifest's suffix, beside the payload it pins (tools/fetched_fixtures.py)."""
+
+
+def built(path: Path) -> bool:
+    """Whether `path` is a build's output, never an input: compiled bytecode, or an editable install's
+    metadata (setuptools' <name>.egg-info), which a task's environment writes into its checkout and a
+    planner's lacks."""
+    return "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts)
+
+
 def contents(name: str) -> bytes:
-    """The hash of file `name`'s bytes, of directory `name`'s entries' names but its hidden ones and
-    compiled bytecode's (a run's own leftovers), or b"missing"."""
+    """The hash of file `name`'s bytes, of directory `name`'s entries' names but its hidden ones and a
+    build's (`built`), or b"missing". A fetched fixture's payload is the digest its manifest pins, whether
+    it is downloaded here or not, so a planner that never fetches it keys it as a task does."""
     path = Path(name)
+    manifest = path.with_name(path.name + FETCHED)
+    if manifest.is_file():
+        return bytes.fromhex(json.loads(manifest.read_text())["sha256"])
     if path.is_file():
         return hashlib.sha256(path.read_bytes()).digest()
     if path.is_dir():
         entries = sorted(entry.name for entry in path.iterdir()
-                         if not entry.name.startswith(".") and entry.name != "__pycache__")
+                         if not entry.name.startswith(".") and not built(entry))
         return hashlib.sha256("\n".join(entries).encode()).digest()
     return b"missing"
 
