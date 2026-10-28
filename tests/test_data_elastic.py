@@ -274,10 +274,13 @@ def test_an_elastic_expansion_reads_one_readers_pieces_in_or_out_of_workers(work
 
 
 class Inline(futures.Executor):
-    """Runs each task as it is submitted, so a prefetch's reads ahead are made before the read that
-    asked for them returns: what a read holds ahead is counted where its source is read, not raced."""
+    """Grain's prefetch thread pool, which runs each read as the prefetch submits it, so the reads
+    it asks for ahead are made before the read that asked returns. The pool is where reads leave the
+    reading thread: with its threads, what a prefetch holds ahead is seen only by waiting for reads
+    that should not come, and Grain names no other place to count them. A read asked for is counted
+    as made, so the count is the prefetch's reads in flight and buffered together."""
 
-    def __init__(self, *_, **__):
+    def __init__(self, max_workers: int, *, thread_name_prefix: str = ""):
         super().__init__()
 
     def submit(self, fn, /, *args, **kwargs):
@@ -304,12 +307,13 @@ class CountedImages:
 
 
 def test_automatic_loading_reads_an_elastic_read_ahead_by_the_groups_it_reads(monkeypatch):
-    """An elastic read by index reads a batch's count of inputs a group, so automatic loading sizes
-    its read-ahead by groups: eight 64 KiB images make a 512 KiB group, so 2 MiB holds four of them
-    ahead, where sized by the record it held sixteen, 8 MiB. Counted at the source as the first
-    batch is read, its prefetch's reads made as they are asked for (`Inline`), the read reads four
-    whole groups, 32 images, past what a read that holds nothing ahead reads (row 1930). Before,
-    only its log said so, which a read holding record-sized reads ahead would say as well."""
+    """An elastic read by index reads its inputs in groups of a batch's count, so automatic loading
+    sizes its read-ahead in groups: eight 64 KiB images make a 512 KiB group, and 2 MiB holds four
+    of them ahead, where sized by the record it would hold sixteen, 8 MiB. Counted at the source
+    from the reader's open through its first batch, Grain's prefetch filling its four places, handing
+    one on and filling it again, the read reads four whole groups, 32 images, more than one that
+    holds nothing ahead; the reads both make at open, a scan of every image, cancel out."""
+    # Grain's prefetch reads the pool's class from `concurrent.futures` as it builds the pool.
     monkeypatch.setattr(futures, "ThreadPoolExecutor", Inline)
 
     def first_batch_reads(loading: Loading) -> int:
