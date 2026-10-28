@@ -437,7 +437,8 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 _EARLIER_PROJECTORS = ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector")
-_DECODER = "dew.nn.backbones.causal_transformer:CausalTransformer"
+_DECODER = ("dew.nn.backbones.causal_transformer:CausalTransformer", "causal_transformer")
+"""The decoder's import path and its registry alias, either of which a record names it by."""
 
 
 def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -452,19 +453,24 @@ def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
         if not isinstance(value, Mapping):
             return value
         component = {key: current(field) for key, field in value.items()}
-        name, fields = component.get("class"), component.get("fields")
+        # A component record names its class; the run's model record (`ModelConfig`) names it too, and
+        # holds the fields it defaulted beside the ones it was given.
+        name, fields = component.get("class", component.get("name")), component.get("fields")
         if not isinstance(fields, dict):
             return component
         if name in _EARLIER_PROJECTORS and "vision_width" in fields:
             width, merge = fields.pop("vision_width"), fields.pop("merge_size")
             component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
                                    "width": width * merge ** 2, "bias": name == _EARLIER_PROJECTORS[0]}
-        elif name == _DECODER:
+        elif name in _DECODER:
             kinds = fields.get("kinds")
             component["fields"] = {**_one_scaling(fields), **({"kinds": {
                 kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
                        else _one_scaling(held)) if isinstance(held, Mapping) else held
                 for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {})}
+            defaults = component.get("defaults")
+            if isinstance(defaults, Mapping):
+                component["defaults"] = _one_scaling(defaults)
         return component
 
     return {**record, "model": current(record["model"])}
