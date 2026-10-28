@@ -63,31 +63,51 @@ _CONV_LEAVES: Leaves = {
 `[D, 1, K]` taps."""
 
 
-def _renames(config: Mapping[str, object]) -> Renames:
-    """The renames of a model's fields record, with sandwich norms (`use_sandwich_norm`) or none."""
-    return _SANDWICH if config.get('sandwich_norms') else _PLAIN
-
-
 def lfm3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    return renamed_path(_renames(config), name, config, layer_leaves=_CONV_LEAVES)
+    """A source tensor's path, by the model's fields record (its `sandwich_norms`)."""
+    return renamed_path(_SANDWICH if config.get('sandwich_norms') else _PLAIN, name, config,
+                        layer_leaves=_CONV_LEAVES)
 
 
 def lfm3_export_path(name: str, config: Mapping[str, object]) -> str | None:
-    return renamed_name(_renames(config), name, config, layer_leaves=_CONV_LEAVES,
-                        sandwich_norms=bool(config.get('sandwich_norms')))
+    """A leaf's source name, by the source config it exports beside (its `use_sandwich_norm`, true
+    where it is omitted, as Lfm3Config's default)."""
+    sandwich = bool(config.get('use_sandwich_norm', True))
+    return renamed_name(_SANDWICH if sandwich else _PLAIN, name, config, layer_leaves=_CONV_LEAVES,
+                        sandwich_norms=sandwich)
 
 
-def _lfm3_rope(hf_config: Mapping[str, object]) -> tuple[Ropes, float]:
+_ROPE = {'full_attention': {'rope_type': 'default', 'rope_theta': 1_000_000.0, 'partial_rotary_factor': 0.5},
+         'sliding_attention': {'rope_type': 'default', 'rope_theta': 10_000.0}}
+"""Lfm3Config's rotary where a config states none (configuration_lfm3.py:88-93)."""
+
+
+def _layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
+    """The config's `layer_types`, else Lfm3Config's own: full attention at every fourth layer from the
+    third, sliding at every fourth from the fifth, convolutions between (configuration_lfm3.py:94-98)."""
+    if hf_config.get('layer_types') is not None:
+        return specified_layer_types(hf_config, used)
+    count = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    return tuple('full_attention' if index % 4 == 2 else 'sliding_attention' if index % 4 == 0 and index
+                 else 'conv' for index in range(count))
+
+
+def _lfm3_rope(hf_config: Mapping[str, object], layer_types: tuple[str, ...]) -> tuple[Ropes, float]:
     """The rotary of each layer type and the full layers' partial factor: LFM3's
     `rope_parameters` holds one plain record a type (`compute_default_rope_parameters`), whose
     full record turns its first `partial_rotary_factor` of each head; a sliding layer turns all of
-    its own."""
-    stated = _records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
+    its own. A config that states none takes Lfm3Config's (`_ROPE`); one that does names a record
+    for each attention type its layers hold."""
+    stated = _records.record(hf_config.get('rope_parameters') or _ROPE, 'rope_parameters')
     unknown = sorted(set(stated) - {'full_attention', 'sliding_attention'})
     if unknown:
         refuse(f"rope_parameters {unknown}", "LFM3 keeps one rotary record a layer type")
-    full = dict(_records.record(stated.get('full_attention') or {}, 'rope_parameters.full_attention'))
-    sliding = dict(_records.record(stated.get('sliding_attention') or {},
+    missing = sorted({'full_attention', 'sliding_attention'} & set(layer_types) - set(stated))
+    if missing:
+        refuse(f"rope_parameters without {missing}", "each attention layer type reads its own record")
+    full = dict(_records.record(stated.get('full_attention') or _ROPE['full_attention'],
+                                'rope_parameters.full_attention'))
+    sliding = dict(_records.record(stated.get('sliding_attention') or _ROPE['sliding_attention'],
                                    'rope_parameters.sliding_attention'))
     if sliding.get('partial_rotary_factor', 1.0) not in (1, 1.0):
         refuse("rope_parameters.sliding_attention partial_rotary_factor",
@@ -95,19 +115,26 @@ def _lfm3_rope(hf_config: Mapping[str, object]) -> tuple[Ropes, float]:
     sliding.pop('partial_rotary_factor', None)
     partial = _records.number(full.pop('partial_rotary_factor', 1.0),
                               'rope_parameters.full_attention partial_rotary_factor')
-    theta = read_rope_theta(full, 'rope_parameters.full_attention') or 10000.0
-    local = read_rope_theta(sliding, 'rope_parameters.sliding_attention') or 10000.0
+    theta = read_rope_theta(full, 'rope_parameters.full_attention') or 1_000_000.0
+    local = read_rope_theta(sliding, 'rope_parameters.sliding_attention') or 10_000.0
     return Ropes(theta, None, None if local == theta else local), partial
 
 
 def lfm3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    layer_types = specified_layer_types(hf_config, used)
+    layer_types = _layer_types(hf_config, used)
     unknown = sorted(set(layer_types) - set(_KINDS))
     if unknown:
         refuse(f"layer_types {unknown}", f"an LFM3 layer is one of {list(_KINDS)}")
-    ropes, partial = _lfm3_rope(hf_config)
+    # Lfm3MLP is SwiGLU whatever a config names (modeling_lfm3.py:151-160).
+    activation = hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu'))
+    if activation != 'silu':
+        refuse(f"hidden_act {activation!r}",
+               "LFM3's feed-forward gates by silu, which it reads from no field")
+    ropes, partial = _lfm3_rope(hf_config, layer_types)
+    # Every projection of its attention is unbiased (modeling_lfm3.py:224-229): attention_bias is unread.
     config = base_config(hf_config, used, rope=ropes, layer_types=layer_types, qk_norm=True,
-                         tie_embeddings=True)
+                         tie_embeddings=True, reads=frozenset({'sliding_window'}))
+    config['layer_types'] = layer_types
     used.update(('rope_parameters', 'conv_L_cache', 'conv_bias', 'use_sandwich_norm'))
     kinds = dict(kinds_of(config))
     attention = {'class': 'attention', 'fields': {'gate_projection': 'head'}}
@@ -125,8 +152,10 @@ def lfm3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderField
         sandwich_norms=bool(hf_config['use_sandwich_norm']),
         output_gate=True,
         # Lfm3RotaryEmbedding zeroes the tail's frequencies: the first pairs at the whole head's
-        # progression, the rest unrotated (`partial_rotary_type='proportional'`).
+        # progression, the rest unrotated (`partial_rotary_type='proportional'`). Its cos and sin are
+        # the activations' dtype (modeling_lfm3.py:119-125).
         partial_rotary_type='proportional',
+        narrow_rotary_tables=True,
         kinds=kinds,
     )
     return config
@@ -146,7 +175,7 @@ def _export(model: CausalTransformer) -> Mapping[str, object]:
         rope['sliding_attention'] = {'rope_type': 'default',
                                      'rope_theta': sliding.rope_theta or model.rope_theta}
     return {'model_type': 'lfm3', 'norm_eps': model.norm_eps, 'rms_norm_eps': None,
-            'rope_parameters': rope, 'rope_theta': None,
+            'rope_parameters': rope, 'rope_theta': None, 'rope_local_base_freq': None,
             'use_sandwich_norm': bool(model.sandwich_norms),
             'conv_L_cache': None if conv is None else conv.conv_L_cache,
             'conv_bias': False if conv is None else conv.conv_bias,
@@ -169,6 +198,6 @@ LFM3 = DecoderFamily(
     aliases={'norm_eps': 'rms_norm_eps'},
     # Lfm3Config's defaults for the fields its decoder reads (configuration_lfm3.py).
     defaults={'conv_L_cache': 7, 'conv_bias': False, 'use_sandwich_norm': True, 'sliding_window': 256,
-              'tie_word_embeddings': True, 'max_position_embeddings': 128000, 'norm_eps': 1e-5,
+              'tie_word_embeddings': True, 'max_position_embeddings': 128000, 'rms_norm_eps': 1e-5,
               'pad_token_id': 124893},
 )

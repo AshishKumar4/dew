@@ -2,10 +2,13 @@
 tools/remote_code_reference.py writes tests/fixtures/hf/lfm3-tiny, its six layers gated short
 convolutions between full and sliding attention layers."""
 
+import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from model_support import decode_steps
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
@@ -55,3 +58,48 @@ def test_a_saved_decoder_writes_the_releases_tensors_back(tmp_path):
     assert sorted(written) == sorted(stored)
     for name, tensor in stored.items():
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+
+
+@pytest.mark.parametrize('sandwich', [True, False], ids=['sandwich', 'plain'])
+def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, sandwich):
+    """A model built in Dew (`PretrainedDecoder.from_model`) is an LFM3 by its convolution kind, ahead of
+    the families that match its gated attention or its sliding layers, and saves a config and tensors
+    that load back to it, its logits bit for bit, with sandwich norms or without and with its full and
+    sliding layers at their own bases."""
+    from dew.interop import PretrainedDecoder
+
+    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    model, variables = loaded.model, loaded.variables
+    if not sandwich:
+        config = json.loads((TINY / 'config.json').read_text())
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+        (plain / 'config.json').write_text(json.dumps({**config, 'use_sandwich_norm': False}))
+        model = Pretrained.load(plain, dtype='float32', attention_impl='reference', weights=False).model
+        variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    ids = jnp.asarray(fixture('input_ids'), jnp.int32)
+    expected = np.asarray(model.apply(variables, ids))
+    PretrainedDecoder.from_model(model, variables).save(tmp_path / 'saved')
+    assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['model_type'] == 'lfm3'
+    restored = Pretrained.load(tmp_path / 'saved', dtype='float32', attention_impl='reference')
+    np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)), expected)
+
+
+def test_a_config_that_omits_its_pattern_and_rotary_reads_lfm3s_own():
+    """A config that states no layer_types, rope_parameters or norm_eps reads Lfm3Config's: full
+    attention at every fourth layer from the third, sliding from the fifth, convolutions between; the
+    full layers turning half of each head at 1e6 and the sliding ones all of theirs at 1e4; an epsilon
+    of 1e-5. One naming another activation than silu is refused."""
+    from dew.interop.hf_decoders import translate_config
+
+    config = json.loads((TINY / 'config.json').read_text())
+    for field in ('layer_types', 'rope_parameters', 'norm_eps'):
+        config.pop(field)
+    fields = translate_config({**config, 'num_hidden_layers': 9})
+    assert fields['layer_types'] == ('conv', 'conv', 'full_attention', 'conv', 'sliding_attention', 'conv',
+                                     'full_attention', 'conv', 'sliding_attention')
+    assert fields['rope_theta'] == 1e6 and fields['norm_eps'] == 1e-5
+    assert fields['kinds']['full_attention']['partial_rotary_factor'] == 0.5
+    assert fields['kinds']['sliding_attention']['rope_theta'] == 1e4
+    with pytest.raises(ValueError, match='hidden_act'):
+        translate_config({**config, 'hidden_act': 'gelu'})

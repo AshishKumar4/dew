@@ -56,6 +56,9 @@ from dew.interop.families.starcoder2 import STARCODER2
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 ENTRIES = (
+    # Its convolution kind first: its gated attention and sliding layers are matched broadly below
+    # (Qwen 3.5's output gate, Ministral's sliding layers).
+    LFM3,
     DORY,
     OURO,
     BLOOM,
@@ -124,8 +127,6 @@ ENTRIES = (
         tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
     ),
     K2_HORIZON,
-    # Before Ministral, which takes any config with sliding layers.
-    LFM3,
     DecoderFamily(
         ("ministral",),
         ministral_config,
