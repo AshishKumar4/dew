@@ -191,6 +191,7 @@ from dew.training.planning import (
     FitSearch,
     Planned,
     Trials,
+    cheaper_rung,
     faster,
     read_whole,
     settled,
@@ -1049,7 +1050,7 @@ class Trainer(Generic[Loss, Effects]):
                                      mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
-        cheaper = self._cheaper(search, planned, recorded, resumed)
+        cheaper = cheaper_rung(search, planned, recorded, resumed)
         self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
@@ -1063,23 +1064,6 @@ class Trainer(Generic[Loss, Effects]):
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned.released(), flops
-
-    @staticmethod
-    def _cheaper(search: FitSearch, planned: Planned, recorded: JSON,
-                 resumed: JSON) -> dict[str, JSON] | None:
-        """The cheaper remat rung the run is told of (`FitSearch.cheaper`): none for a resumed run, which
-        continues its checkpoint's rung; the one a recorded plan's run measured, where the run took that
-        plan, its split and rung, and none where the search moved off it; else measured now."""
-        if resumed is not None:
-            return None
-        if recorded is not None:
-            kept = record(recorded, 'recorded plan')
-            told = json_value(kept.get('cheaper'), 'recorded cheaper rung')
-            plan = {**planned.rung, 'split': planned.split}
-            taken = all(kept.get(field) == value for field, value in plan.items())
-            return told if taken and isinstance(told, dict) else None
-        probe = search.cheaper(planned)
-        return None if probe is None else probe.record()
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int, narrow: bool, launches: str | None) -> Candidate:

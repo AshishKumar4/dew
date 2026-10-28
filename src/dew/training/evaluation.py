@@ -32,7 +32,7 @@ from dew.data.pipeline import Dataset
 from dew.distributed.batches import row_origins, shard_batch, shared_host_fields, split_fields, with_host
 from dew.distributed.placement import MeshSpec
 from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
-from dew.training.cadence import Tokens
+from dew.training.cadence import Examples, Tokens
 from dew.training.tracker import write_artifact
 
 
@@ -47,7 +47,7 @@ class EvalSuite:
 
     data: Reader
     metrics: Sequence[Metric] = ()
-    every: int | str | Tokens | None = None
+    every: int | str | Tokens | Examples | None = None
 
 
 @dataclass(frozen=True)

@@ -27,7 +27,7 @@ from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._records import JSON
+from dew._records import JSON, json_value, record
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
@@ -506,6 +506,23 @@ def opens_frontier(split: int, whole: int, mesh: Mesh) -> bool:
     'minimal'; Qwen3.5-9B by fsdp over two A100-80s left 168 of 169 ms of collectives exposed, 15 under
     'minimal'."""
     return split != whole or mesh.devices.size > 1
+
+
+def cheaper_rung(search: FitSearch, planned: Planned, recorded: JSON, resumed: JSON
+                 ) -> dict[str, JSON] | None:
+    """The cheaper remat rung the run is told of (`FitSearch.cheaper`): none for a resumed run, which
+    continues its checkpoint's rung; the one a recorded plan's run measured, where the run took that
+    plan, its split and rung, and none where the search moved off it; else measured now."""
+    if resumed is not None:
+        return None
+    if recorded is not None:
+        kept = record(recorded, 'recorded plan')
+        told = json_value(kept.get('cheaper'), 'recorded cheaper rung')
+        plan = {**planned.rung, 'split': planned.split}
+        taken = all(kept.get(field) == value for field, value in plan.items())
+        return told if taken and isinstance(told, dict) else None
+    probe = search.cheaper(planned)
+    return None if probe is None else probe.record()
 
 
 @dataclasses.dataclass

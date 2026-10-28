@@ -90,7 +90,7 @@ class FitPlan:
 
     dataset: Loader
     steps: int | None
-    log_every: int | Tokens
+    log_every: int | Tokens | Examples
     eval_every: Cadence
     tokens: int | None
     checkpoint_every: Cadence | datetime.timedelta
@@ -201,7 +201,8 @@ class FitPlan:
                  metrics: Sequence[Metric], steps: int | None, tokens: int | None, accumulation: int,
                  written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
                  checkpoints: Checkpoints | None = None, examples: int | None = None) -> tuple[
-                     int | Tokens, Cadence, Cadence | datetime.timedelta, Cadence, dict[str, EvalSuite]]:
+                     int | Tokens | Examples, Cadence, Cadence | datetime.timedelta, Cadence,
+                     dict[str, EvalSuite]]:
         """`fit`'s log, validation and checkpoint cadences, its `checkpoints`' local one
         (`Checkpoints.local_every`), and its suites' (`validation_suites`), each
         written as steps, a duration or a share of the run such as "5%", resolved once against its planned
