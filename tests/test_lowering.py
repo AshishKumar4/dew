@@ -1,11 +1,8 @@
 """A training step lowered for a CUDA GPU on a host without one (`dew.training._lowering`)."""
 
 import json
-import logging
 import os
-import subprocess
 import sys
-import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
