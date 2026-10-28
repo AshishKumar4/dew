@@ -595,7 +595,8 @@ configs:
   data_dir: fr
 - config_name: clean
   data_files:
-    train: processed/clean-*.parquet
+  - split: train
+    path: processed/clean-*.parquet
 ---
 # rows
 """
