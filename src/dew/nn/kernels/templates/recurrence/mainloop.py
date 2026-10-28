@@ -1313,17 +1313,20 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
 def _output_held(call: _Call, bv: int) -> _Held:
     """What `_output`'s consumer thread holds: a value block's memory and local products' fp32 sums beside
     its values (and, where products read registers, a key block's queries and memory slice and the scores);
-    under a decay a head the first step's scores too, their sum, their pairs' decays and their masks (an
-    fp32 call's split into parts), held with the value block's tiles, the step's whole set (as its phases
-    alone, a 64-wide value block's output spilled 16 bytes a thread on an A100's at 200 stated registers);
-    under one a key dimension a key block's prefix halves and the scores in fp32."""
+    under a decay a head, apart from them, the first step's scores, their sum, their pairs' decays and their
+    masks (an fp32 call's split into parts), staged in shared memory before any value block's products
+    (`chunk_scores`): ptxas's need stays 216-255 registers a thread from a 16-wide value block to a 128-wide
+    one, on an H100 and an A100 (row 1971's gate, Qwen3.5-4B's heads), which the two phases hold apart and
+    one phase of both counted at 392 and 456; under one a key dimension a key block's prefix halves and the
+    scores in fp32."""
     held, memories = call.held, call.memories
     values = [_f32(CHUNK, bv)] * 2 + _held(held, CHUNK, bv) + _fragments(
         call, (call.given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
     if call.per_key:
         return _Held(phases=(values + [_f32(CHUNK, call.block)] * 2 + [_f32(CHUNK, CHUNK)],))
-    return _Held(phases=(values + [_f32(CHUNK, bv)] + [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
-                         + (_held(held, CHUNK, CHUNK) if held.parts > 1 else []),))
+    scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK) + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
+              + _fragments(call, (call.given, CHUNK, call.block), (call.given, CHUNK, call.block)))
+    return _Held(phases=(values, scores))
 
 
 def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, scale: float, out_dtype,
