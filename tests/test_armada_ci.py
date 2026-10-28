@@ -1047,7 +1047,7 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
     ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
     ({"tools/armada/session.py": "# the session\n"}, "off"),
-    ({"tools/armada/executed.py": "# the recorder\n"}, "on"),
+    ({"tools/armada/executed.py": "# the recorder\n"}, "off"),
     ({".github/workflows/ci.yml": "on: []\n"}, "on"),
     ({"Makefile": "all:\n"}, "off"),
     ({"CHANGELOG.md": "# Changes\n\n- an entry\n"}, "on"),
@@ -1061,10 +1061,10 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
     place what changed, a tool and a workflow among them, and every file runs ('off') for a change to what
     every test process runs or reads, or to a file the records do not place. .armada.json's pool decides
-    where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file); the recorder
-    (executed.py, followed.py, watched.py) observes a run and changes none of its outcomes, a change to what
-    it records bumping RECORD_FORMAT instead (Main, 2026-10-28: 5 of 10 trains ran with the cache off, a
-    workflow or the recorder changed, and 0.75% of rows were reused)."""
+    where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file), and a workflow
+    is an input of the files that read it alone (Main, 2026-10-28: 5 of 10 trains ran with the cache off, and
+    0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every file's input:
+    an old record may lack a dependency a new recorder finds."""
     armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
                        "locks/cpu.txt": "jax==1\n", ".armada.json": armada}.items():
@@ -1171,7 +1171,7 @@ def commit(root: Path, message: str) -> str:
     return git(root, "rev-parse", "HEAD").strip()
 
 
-def test_a_changed_workflow_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
+def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
     """A change under .github/ reruns the files whose runs read the changed file, which the records place as
     any of the checkout's files, and reuses every other file's green row, under the policy CI computes for
     the change from main (Main, 2026-10-28: a workflow change turned the cache off for the whole suite)."""
@@ -1189,8 +1189,8 @@ def test_a_changed_workflow_runs_again_only_the_files_that_read_it(ci, tmp_path,
     verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
     base = commit(tmp_path, "base")
 
-    def run() -> list[int]:
-        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    def run(policy: str | None = None) -> list[int]:
+        rows = armada_task(ci, monkeypatch, verdict, policy or ci.policy(base))
         assert [row["exitCode"] for row in rows] == [0, 0]
         return [len((tmp_path / f"runs-{name}").read_text()) for name in ("reader", "other")]
 
@@ -1199,6 +1199,14 @@ def test_a_changed_workflow_runs_again_only_the_files_that_read_it(ci, tmp_path,
     commit(tmp_path, "the workflow changes")
     assert ci.policy(base) == "on"
     assert run() == [2, 1]
+    # A change to the recorder keys every file anew, the cache on though it is: a record it took before may lack
+    # a dependency it now finds, so no old record is reused.
+    (tmp_path / "tools/armada").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tools/armada/executed.py").write_text("# the recorder, as it records now\n")
+    git(tmp_path, "add", "tools/armada/executed.py")
+    commit(tmp_path, "the recorder changes")
+    assert ci.policy(base) == "off"
+    assert run("on") == [3, 2]
 
 
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
