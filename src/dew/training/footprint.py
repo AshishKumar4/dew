@@ -60,6 +60,13 @@ class Footprint:
                 "resident": dict(self.resident), "workspace": None, "admission": "unknown"}
 
 
+def device_bytes(tree) -> int:
+    """The placed leaves in device memory alone: an offloaded optimizer or EMA is host storage,
+    not resident HBM. Each device leaf carries the sharding that `placed_bytes` reads."""
+    return placed_bytes([leaf for leaf in jax.tree.leaves(tree)
+                         if jax.typeof(leaf).memory_space == jax.memory.Space.Device])
+
+
 def residual_bytes(loss: Callable, params, arguments: Sequence) -> int:
     """The device bytes the pullback of `loss(params, *arguments)` in `params` keeps, a device's share:
     each value its traced program (`jax.make_jaxpr` of `jax.vjp`'s pullback) closes over, once,
@@ -130,7 +137,7 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
         return loss({**variables, "params": params}, batch, *rest)
 
     residuals = residual_bytes(trained, variables["params"], (variables, micro, *rest))
-    resident = {name: placed_bytes(value) for name, value in {
+    resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
-    return Footprint(residuals, placed_bytes(prepared.variables["params"]), held, resident)
+    return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident)

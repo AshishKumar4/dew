@@ -2,8 +2,20 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.training.footprint import residual_bytes
+from dew.training.footprint import device_bytes, residual_bytes
+
+
+def test_resident_device_bytes_do_not_include_host_state():
+    """A state leaf placed on pinned host memory is not HBM, even though it has the same global
+    shape and partition as a device leaf. Counting the two as resident would charge offload twice."""
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("data",))
+    sharding = NamedSharding(mesh, P())
+    device = jax.ShapeDtypeStruct((8, 16), jnp.float32, sharding=sharding)
+    host = jax.ShapeDtypeStruct((8, 16), jnp.float32, sharding=sharding.with_memory_kind("pinned_host"))
+    assert device_bytes({"params": device, "optimizer": host}) == 8 * 16 * 4
 
 
 def test_a_pullback_counts_new_residuals_not_input_storage():
