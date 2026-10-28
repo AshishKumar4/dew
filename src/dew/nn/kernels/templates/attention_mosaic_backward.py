@@ -37,12 +37,14 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
                     stages: int) -> tuple[list, dict]:
     """The dQ program's allocations as `Family.scoped` takes them, in `_dq_launch`'s order: its consumers'
-    query and output-cotangent stages, their dQ output stage (fp32) and their rows' stage, the two loads'
-    barriers, and its key and value streams in `stages` slots (`Family.streams`)."""
+    query and output-cotangent stages, their dQ output stage (fp32, a share of its columns where the
+    config's `columns` split the dK/dV program's widths too, the sums stored a share at a time) and their
+    rows' stage, the two loads' barriers, and its key and value streams in `stages` slots
+    (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     scoped = [plgpu.SMEM((consumers, block_q, width), dtype),
               plgpu.SMEM((consumers, block_q, value_width), dtype),
-              plgpu.SMEM((consumers, block_q, width), jnp.float32),
+              plgpu.SMEM((consumers, block_q, width // config.columns), jnp.float32),
               plgpu.SMEM((consumers, block_q), jnp.float32),
               plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
@@ -259,9 +261,11 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
             # The tiles past this block's last (a causal block whose diagonal ends first) its partner reads.
             family.passed(streams, hi, streamed[1], first=streamed[0])
             dq, *keyed = accumulated
-            written = [(dq, dq_ref.at[rows])]
-            if keyed_ref is not None:
-                written.append((keyed[0], keyed_ref.at[rows]))
+            # Each sum through the output stage a share of its columns at a time (`_dq_allocations`).
+            share = out_smem.shape[-1]
+            sums = [(dq, dq_ref)] + ([(keyed[0], keyed_ref)] if keyed_ref is not None else [])
+            written = [(total[:, column:column + share], ref.at[(*rows, pl.ds(column, share))])
+                       for total, ref in sums for column in range(0, width, share)]
             family.stored(*zip(*written, strict=True), smem=out_smem.at[index])
             # Each row in a row's layout whatever its own (a call without a hook's keyed mass is a constant).
             summed_grads = tuple(part for part, on in zip(grads, summed, strict=True) if on)
