@@ -1152,12 +1152,51 @@ def test_arrayrecord_sources_hold_their_readers_open_within_one_bound_together(a
 
     real = {os.path.realpath(path) for path in arrayrecord_paths}
     sources = [ArrayRecords((path,), counts=(8,)) for path in arrayrecord_paths]
+
+    def held() -> int:
+        return sum(opened.path in real for opened in psutil.Process().open_files())
     try:
         for source in sources:
             assert source[0] is not None
-        held = [opened for opened in psutil.Process().open_files() if opened.path in real]
-        assert len(held) <= Loading().threads < len(sources)
+        assert held() <= Loading().threads < len(sources)
     finally:
+        for source in sources:
+            source.close()
+
+
+def test_a_reader_falling_idle_past_the_bound_is_closed_as_its_read_drains(arrayrecord_paths, monkeypatch):
+    """A read in flight on the first of more sources than Loading's read threads while every other is
+    read in turn: the others' readers fill the bound idle, and as the first's read drains its reader
+    is the one past it, closed then, not held until another source opens (row 2016)."""
+    import grain.python as grain
+
+    from dew.data.sources.records import ArrayRecords
+
+    real = {os.path.realpath(path) for path in arrayrecord_paths}
+    sources = [ArrayRecords((path,), counts=(8,)) for path in arrayrecord_paths]
+    entered, released = threading.Event(), threading.Event()
+    underlying_read = grain.ArrayRecordDataSource.__getitem__
+    first = os.path.realpath(arrayrecord_paths[0])
+
+    def blocked_read(reader, index):
+        if index == 1 and any(os.path.realpath(path) == first for path in reader._paths):
+            entered.set()
+            assert released.wait(timeout=30)
+        return underlying_read(reader, index)
+
+    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", blocked_read)
+    try:
+        assert sources[0][0] is not None
+        with ThreadPoolExecutor(1) as pool:
+            pending = pool.submit(sources[0].__getitem__, 1)
+            assert entered.wait(timeout=30)
+            for source in sources[1:]:
+                assert source[0] is not None
+            released.set()
+            assert pending.result(timeout=30) is not None
+        assert sum(opened.path in real for opened in psutil.Process().open_files()) <= Loading().threads
+    finally:
+        released.set()
         for source in sources:
             source.close()
 

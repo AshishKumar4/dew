@@ -458,67 +458,81 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
 class _MixReads:
     """Every corpus of a mix, each opened and read only as the mix draws from it: a corpus the mix has
     not drawn holds no iterator, so no reader's threads, buffers or files, and no position but its
-    start. A mix captures every corpus's position for each record it gives (a packer captures it
-    before each record), and only the corpus it read moved, so a corpus's position is captured again
-    only after the mix reads it or it is restored (`state`)."""
+    start and its counts (`state`). A mix captures every corpus's position for each record it gives
+    (a packer captures it before each record), and only the corpus it read moved, so a corpus's
+    position is captured again only after the mix reads it or it is restored."""
 
     def __init__(self, corpora: Sequence[pygrain.IterDataset[Batch]]):
         self.corpora = tuple(corpora)
         self.opened: dict[int, pygrain.DatasetIterator[Batch]] = {}
         # Each opened corpus's captured position, until a read or a restore moves it.
         self.states: dict[int, Mapping[str, object]] = {}
+        # The counts of a corpus back at its start, unopened, which it takes on as it opens: a pass a
+        # repeat reads again goes on counting each corpus (`rewound`).
+        self.counted: dict[int, Mapping[str, object]] = {}
 
-    def parent(self, index: int) -> pygrain.DatasetIterator[Batch]:
-        """Corpus `index`'s iterator, opened as the mix first draws from or restores it."""
+    def parent(self, index: int, reader: _MixRead) -> pygrain.DatasetIterator[Batch]:
+        """Corpus `index`'s iterator, opened as the mix first draws from or restores it, under the
+        options of the mix's iterator (`reader`), as Grain's interleave opens its iterators."""
         if index not in self.opened:
-            self.opened[index] = iter(self.corpora[index])
+            opened = iter(self.corpora[index])
+            opened._ctx.dataset_options = reader._ctx.dataset_options.merge(opened._ctx.dataset_options)
+            reader._stats._parents = [opened._stats]
+            if index in self.counted:
+                opened.set_state({**opened.get_state(), _COUNTER: self.counted.pop(index)})
+            self.opened[index] = opened
         return self.opened[index]
 
-    def read(self, index: int) -> Batch:
+    def read(self, index: int, reader: _MixRead) -> Batch:
         self.states.pop(index, None)
-        return next(self.parent(index))
+        return next(self.parent(index, reader))
 
-    def state(self, index: int) -> Mapping[str, object] | None:
-        """The position of corpus `index`, None where the mix has not opened it: its start."""
+    def state(self, index: int) -> Mapping[str, object]:
+        """The position of corpus `index`: its parent's, or, unopened, its counts alone (None before
+        it counted anything), which a repeat's rewind carries on (`rewound`)."""
         if index not in self.opened:
-            return None
+            return {_COUNTER: self.counted.get(index)}
         if index not in self.states:
             self.states[index] = self.opened[index].get_state()
         return self.states[index]
 
-    def restore(self, index: int, state: Mapping[str, object] | None) -> None:
-        """Corpus `index` at `state`, or back at its start, unopened, where it is None."""
+    def restore(self, index: int, state: Mapping[str, object], reader: _MixRead) -> None:
+        """Corpus `index` at `state`, or back at its start, unopened, where it holds its counts alone."""
         self.states.pop(index, None)
-        if state is None:
+        if set(state) <= {_COUNTER}:
             self.close(index)
+            counts = state.get(_COUNTER)
+            if counts is not None:
+                self.counted[index] = record(counts, "corpus counter")
         else:
-            self.parent(index).set_state(state)
+            self.parent(index, reader).set_state(state)
 
     def close(self, index: int) -> None:
+        self.counted.pop(index, None)
         opened = self.opened.pop(index, None)
         if opened is not None:
             opened.close()
 
 
 class _MixRead(pygrain.DatasetIterator[Batch]):
-    """One corpus of a mix (`_MixReads`), its position its parent's, absent before the mix opened it.
-    A position a mix saved while it read each corpus's first row ahead holds the corpus before that
-    row, which a restore reads next."""
+    """One corpus of a mix (`_MixReads`), its position its parent's, its counts alone before the mix
+    opened it. A position a mix saved while it read each corpus's first row ahead holds the corpus
+    before that row, which a restore reads next, and one saved before it opened corpora as drawn
+    has none of its unopened members."""
 
     def __init__(self, group: _MixReads, index: int):
         super().__init__()
         self._group, self._index = group, index
 
     def __next__(self) -> Batch:
-        return self._group.read(self._index)
+        return self._group.read(self._index, self)
 
     def get_state(self) -> Mapping[str, object]:
-        state = self._group.state(self._index)
-        return {} if state is None else {"parent": state}
+        return {"parent": self._group.state(self._index)}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         parent = state.get("parent")
-        self._group.restore(self._index, None if parent is None else record(parent, "mixed corpus"))
+        self._group.restore(self._index, {} if parent is None else record(parent, "mixed corpus"), self)
 
     def close(self) -> None:
         self._group.close(self._index)

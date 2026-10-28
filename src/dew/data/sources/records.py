@@ -44,15 +44,30 @@ class ShardReaders[K]:
     read closed as others are read, while each source's own reads never wait on another's."""
 
     _live: weakref.WeakSet[ShardReaders] = weakref.WeakSet()
+    # Guards `_live`'s membership, held for no more than an add or a copy.
+    _registry = threading.Lock()
     _clock = itertools.count()
     _trimming = threading.Lock()
+    # The idle readers every source holds open together, which `_trim` brings back to the bound:
+    # counted as each falls idle, is read again or closes, so a read that leaves the process within
+    # it scans nothing.
+    _idle = 0
 
     def __init__(self, open: Callable[[K], ArrayRecords], limit: int = _MAX_OPEN_SHARDS):
         self.open, self.limit = open, limit
         self._opened: OrderedDict[K, _OpenedShard] = OrderedDict()
         self._retired: list[_OpenedShard] = []
         self._lock = threading.Condition(threading.Lock())
-        ShardReaders._live.add(self)
+        with ShardReaders._registry:
+            ShardReaders._live.add(self)
+
+    @classmethod
+    def _idled(cls, change: int) -> bool:
+        """Count `change` readers fallen idle (read again or closed where negative) in the process;
+        whether it then holds more idle than the bound."""
+        with cls._registry:
+            cls._idle += change
+            return cls._idle > _MAX_OPEN_SHARDS
 
     def read(self, key: K, row: int) -> Batch | bytes | None:
         """Row `row` of shard `key`'s reader, opened for it where none is."""
@@ -68,9 +83,12 @@ class ShardReaders[K]:
                 if len(self._opened) + len(self._retired) >= self.limit:
                     idle = next(held for held, opened in self._opened.items() if not opened.reads)
                     self._opened.pop(idle).reader.close()
+                    ShardReaders._idled(-1)
                 self._opened[key] = _OpenedShard(self.open(key))
             self._opened.move_to_end(key)
             opened_shard = self._opened[key]
+            if not opening and not opened_shard.reads:
+                ShardReaders._idled(-1)
             opened_shard.reads += 1
             opened_shard.used = next(ShardReaders._clock)
         try:
@@ -79,23 +97,28 @@ class ShardReaders[K]:
             with self._lock:
                 opened_shard.reads -= 1
                 # A reopened shard owns a different reader from an evicted in-flight read.
+                over = False
                 if not opened_shard.reads:
                     if self._opened.get(key) is not opened_shard:
                         self._retired.remove(opened_shard)
                         opened_shard.reader.close()
+                    else:
+                        over = ShardReaders._idled(1)
                     self._lock.notify_all()
-            if opening:
+            if over:
                 ShardReaders._trim()
 
     @classmethod
     def _trim(cls) -> None:
         """Close the least recently read idle readers of every source in the process past the bound
-        one source keeps (`_MAX_OPEN_SHARDS`), as a read opens another: the idle readers then number
-        at most that and the reads in flight. It holds one source's lock at a time, never while it
-        waits for another's, so no read waits on a source it does not read."""
+        one source keeps (`_MAX_OPEN_SHARDS`), as a read leaves more idle than that. It holds one
+        source's lock at a time, never while it waits for another's, so no read waits on a source it
+        does not read."""
         with cls._trimming:
+            with cls._registry:
+                live = list(cls._live)
             idle = []
-            for readers in list(cls._live):
+            for readers in live:
                 with readers._lock:
                     idle.extend((opened.used, id(readers), key, readers)
                                 for key, opened in readers._opened.items() if not opened.reads)
@@ -105,6 +128,7 @@ class ShardReaders[K]:
                     opened = readers._opened.get(key)
                     if opened is not None and not opened.reads:
                         readers._opened.pop(key).reader.close()
+                        cls._idled(-1)
                         readers._lock.notify_all()
 
     def close(self) -> None:
@@ -115,6 +139,7 @@ class ShardReaders[K]:
                     self._retired.append(opened)
                 else:
                     opened.reader.close()
+                    ShardReaders._idled(-1)
             self._opened.clear()
             self._lock.notify_all()
 
