@@ -96,7 +96,7 @@ def batch_consumed(batch: Batch) -> jax.Array:
     wherever its rows lie, int32; none where it carries no count."""
     if EXAMPLES_CONSUMED not in batch:
         return jnp.zeros((), jnp.int32)
-    return jnp.sum(jnp.asarray(batch[EXAMPLES_CONSUMED], jnp.int32))
+    return jnp.sum(jnp.asarray(batch[EXAMPLES_CONSUMED], jnp.int32), dtype=jnp.int32)
 
 
 def model_batch(batch: Batch) -> Batch:

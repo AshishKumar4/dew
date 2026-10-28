@@ -124,7 +124,7 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     if aux.record is not None:
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
-    clock = None if current.consumed is None else current.consumed + consumed
+    clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
     return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
             jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
 
