@@ -54,10 +54,22 @@ def visible(query, key, *, causal: bool, window: int | None = None):
     return keep if window is None else keep & windowed(query, key, window, causal=causal)
 
 
+def chunk_of(places, chunk: int) -> jax.Array:
+    """Each place's chunk number of `chunk` places, in the places' own dtype: `place // chunk`, a chunk wider
+    than the dtype holds every place of one sign. The template's spans (`dew.nn.kernels.templates.attention
+    .spans`) and `same_chunk` count chunks by it; NumPy places stay NumPy's, as `windowed`'s do."""
+    xp = jnp if isinstance(places, jax.Array) else np
+    places = xp.asarray(places)
+    if chunk > xp.iinfo(places.dtype).max:
+        return xp.where(places >= 0, 0, -1).astype(places.dtype)
+    return places // chunk
+
+
 def same_chunk(query, key, chunk_size: int):
     """Whether a key falls in the query's chunk of `chunk_size` (broadcast), both counted from the
-    sequence start: transformers' `chunked_overlay`, `kv // chunk == q // chunk`."""
-    return query // chunk_size == key // chunk_size
+    sequence start (`chunk_of`): transformers' `chunked_overlay`, `kv // chunk == q // chunk`. The scalar
+    form of the template's spans' chunks, for coordinates no span holds."""
+    return chunk_of(query, chunk_size) == chunk_of(key, chunk_size)
 
 
 def same_group(query_groups, key_groups):

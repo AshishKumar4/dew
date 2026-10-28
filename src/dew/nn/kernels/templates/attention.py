@@ -245,13 +245,15 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     # run, and each query's least and greatest it keeps (`_within_runs`).
     by_places = []
     if chunk is not None:
+        from dew.nn.visibility import chunk_of
+
         # Without places a chunk counts a query by its own key's index (`slots`, a cross call's aligned
         # place, else its own index).
         query_places, key_places = (
             (place, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else positions)
-        wanted = _chunk_of(query_places, chunk)
-        by_places.append((_chunk_of(key_places, chunk), wanted, wanted))
+        wanted = chunk_of(query_places, chunk)
+        by_places.append((chunk_of(key_places, chunk), wanted, wanted))
         if runs is None:
             # The query's document's keys of its chunk run together in document order, since their places
             # never decrease along it, and their first and last key indices bound the span.
@@ -310,15 +312,6 @@ def _narrowed(start: jax.Array, end: jax.Array, order: jax.Array, run_lo: jax.Ar
     held = inside_hi > inside_lo
     return (jnp.maximum(start, jnp.where(inside_lo < run_hi, _indexed(order, inside_lo, 0), values.shape[1])),
             jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0))
-
-
-def _chunk_of(places, chunk: int) -> jax.Array:
-    """Each place's chunk number in the places' own dtype; a chunk wider than it holds every place of one
-    sign."""
-    places = jnp.asarray(places)
-    if chunk > jnp.iinfo(places.dtype).max:
-        return jnp.where(places >= 0, 0, -1).astype(places.dtype)
-    return places // chunk
 
 
 def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
