@@ -1338,6 +1338,68 @@ def pythons(*, check: bool) -> int:
     return 1 if problems else 0
 
 
+def whole_suite_tests(name: str) -> set[str]:
+    """The tests of test file `name` marked whole_suite, read from its source: a function or its class
+    decorated with the mark, every test of a module whose `pytestmark` holds it ("*"), and a parameter set
+    marked with it (`pytest.param(..., marks=...)`) by its id, as `<function>[<id>` (its node's prefix)."""
+    try:
+        tree = ast.parse(Path(name).read_text())
+    except (OSError, SyntaxError):
+        return set()
+    marked = {"*"} if any(isinstance(node, ast.Assign) and any(getattr(target, "id", "") == "pytestmark"
+                                                                for target in node.targets)
+                          and "whole_suite" in ast.unparse(node.value) for node in tree.body) else set()
+
+    def visit(scope: list[ast.stmt], outer: str, inherited: bool) -> None:
+        for node in scope:
+            if isinstance(node, ast.ClassDef):
+                visit(node.body, f"{outer}{node.name}::",
+                      inherited or any("whole_suite" in ast.unparse(item) for item in node.decorator_list))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                if inherited or any("whole_suite" in ast.unparse(item) for item in node.decorator_list):
+                    marked.add(f"{outer}{node.name}")
+                for call in ast.walk(ast.Module(body=node.decorator_list, type_ignores=[])):
+                    if (isinstance(call, ast.Call) and ast.unparse(call.func).endswith("param")
+                            and any(word.arg == "marks" and "whole_suite" in ast.unparse(word.value)
+                                    for word in call.keywords)):
+                        ident = next((word.value.value for word in call.keywords if word.arg == "id"
+                                      and isinstance(word.value, ast.Constant)), None)
+                        if ident is not None:
+                            marked.add(f"{outer}{node.name}[{ident}")
+
+    visit(tree.body, "", inherited=False)
+    return marked
+
+
+def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> list[dict]:
+    """Each test of `verdict`'s rows (`armada verdict <sha> --json`) whose own seconds pass `target`, the
+    group target, slowest first: no cut brings its group within the target. A whole_suite cell is none, as it
+    runs on the whole suite alone (`selected`). With `base` (the durations record a change is measured
+    against), only the tests it lacks: a new slow test (owner, 2026-10-28)."""
+    found, marks = [], {}
+    for row_ in verdict["rows"]:
+        for test, seconds in (row_.get("tests") or {}).items():
+            name, _, rest = test.partition("::")
+            if seconds <= target or (base is not None and test in base):
+                continue
+            whole = marks.setdefault(name, whole_suite_tests(name))
+            if "*" in whole or any(rest == cell or ("[" in cell and rest.startswith(cell)) for cell in whole):
+                continue
+            found.append({"test": test, "file": name, "seconds": round(seconds, 1), "target": target})
+    return sorted(found, key=lambda item: (-item["seconds"], item["test"]))
+
+
+def flagged(verdict: Path, new: Path | None) -> int:
+    """`slow` on the verdict at `verdict` and this checkout's group target, each test a line of JSON; with
+    `new` (a durations record), 1 where any test that record lacks passes the target."""
+    target = json.loads(Path(".armada.json").read_text())["target"]
+    base = json.loads(new.read_text()) if new is not None else None
+    found = slow(json.loads(verdict.read_text()), target, base)
+    for item in found:
+        print(json.dumps(item))
+    return 1 if found and base is not None else 0
+
+
 def task_arguments(running: argparse.ArgumentParser) -> None:
     """The `task` operation's arguments, which armada's task command fills from a plan entry."""
     running.add_argument("--python", choices=PYTHONS, required=True)
@@ -1395,6 +1457,11 @@ def main() -> int:
     versions = operations.add_parser("pythons")
     versions.add_argument("--check", action="store_true",
                           help="refuse a .python-version other than the oldest, or a smoke of other versions")
+    flagging = operations.add_parser(
+        "slow", help="each test of a verdict past the group target, a JSON line each; --new: exit 1 on any")
+    flagging.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
+    flagging.add_argument("--new", type=Path, default=None,
+                          help="the durations record the change is measured against: only the tests it lacks")
     recording = operations.add_parser("durations")
     recording.add_argument("verdict", type=Path, help="main's CI verdict: armada verdict <sha> --json")
     args = parser.parse_args()
@@ -1403,6 +1470,8 @@ def main() -> int:
     if args.operation == "gangs":
         print(json.dumps(gangs()))
         return 0
+    if args.operation == "slow":
+        return flagged(args.verdict, args.new)
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
         before = durations_record()
