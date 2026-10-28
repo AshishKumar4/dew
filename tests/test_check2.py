@@ -483,15 +483,34 @@ def test_an_exp_past_its_range_is_held_at_its_neighbours_however_far():
 
 
 def _truncating_sum(values: np.ndarray) -> np.float32:
-    """`values` summed in fp32 in their order, each add truncated toward zero, as a tensor core adds."""
+    """`values` summed in fp32 in their order, each add truncated toward zero, as a tensor core adds: the
+    exact sum as TwoSum's high and low parts, its nearest fp32 value stepped toward zero wherever that
+    overshoots the exact sum, low part included."""
     total = np.float32(0)
     for value in values:
-        exact = np.float64(total) + np.float64(value)
-        stepped = np.float32(exact)
-        if abs(np.float64(stepped)) > abs(exact):
+        high, low = oc.two_sum(np.float64(total), np.float64(value))
+        stepped = np.float32(high)
+        # The nearest value less the exact sum is (stepped - high) - low, its first difference exact.
+        beyond = np.float64(stepped) - high
+        if (high > 0 and beyond > low) or (high < 0 and beyond < low):
             stepped = np.nextafter(stepped, np.float32(0))
         total = stepped
     return total
+
+
+def test_the_truncating_model_keeps_the_low_part_of_an_add():
+    """1 less 2^-80, both exact bf16 products, truncates to fp32's value below one, which a float64 add
+    of them, rounding to one, would hide."""
+    assert _truncating_sum(np.asarray([1.0, -2.0 ** -80])) == np.nextafter(np.float32(1), np.float32(0))
+
+
+def test_a_native_dot_holds_products_that_truncate_away_below_the_normal_range():
+    """128 products of 1.5 * 2^-75 and 2^-75, each a subnormal fp32 sum truncates to zero: the output zero
+    holds, as a truncating add below the normal range loses up to a whole subnormal unit."""
+    products = np.full((1, 128), 1.5 * 2.0 ** -150)
+    native = np.asarray([_truncating_sum(products[0])], np.float64)
+    assert native[0] == 0
+    assert np.all(ct.native_dot_holds(native, products, oc.FLOAT32, flushes=False))
 
 
 def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_product_or_a_narrow_partial():

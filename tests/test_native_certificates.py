@@ -85,7 +85,8 @@ def input_gradient_of(x, w, dy, sizes) -> np.ndarray:
 def test_the_grouped_gemm_templates_forward_and_input_gradient_certify_natively(generation_name, signed):
     """Every element of the native forward and input gradient is a value its exact products admit
     (`native_dot_holds`), the forward's in bf16 and in fp32: the null of row 2084's link 1."""
-    with generation.assumed(generation_name):
+    # The Mosaic template itself, refusing rather than falling back to another route.
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
         for seed in range(SEEDS):
             x, w, dy = draw(seed, signed)
             products = forward_products(x, w, SIZES)
@@ -105,7 +106,8 @@ def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narro
     in an fp32 output, whose grid shows it, a partial sum over half the depth rounded to bf16 before the
     rest is added, refused wherever that rounding outweighs the sum's own (about six elements in seven on
     Gaussian draws)."""
-    with generation.assumed(generation_name):
+    # The Mosaic template itself, refusing rather than falling back to another route.
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
         x, w, _ = draw(0, signed=True)
         products = forward_products(x, w, SIZES)
         rows = groups(SIZES) == 3

@@ -340,7 +340,8 @@ def native_dot_holds(native, products, out: Format, flushes: bool) -> np.ndarray
     count = products.shape[-1]
     exact = exact_sum(products, -1)
     accumulator = FORMATS["float32"]
-    underflow = 2.0 ** accumulator.emin if flushes else 2.0 ** (accumulator.emin - accumulator.precision)
+    # A truncating add below the normal range loses up to a whole subnormal unit, not half of one.
+    underflow = 2.0 ** accumulator.emin if flushes else 2.0 ** (accumulator.emin - accumulator.precision + 1)
     allowance = (gamma(count, TRUNCATING["float32"]) + 2.0 ** -52) * magnitude_sum(products, -1) + \
         count * underflow
     zero = np.zeros_like(exact)
