@@ -17,6 +17,7 @@ from flax.core import freeze, unfreeze
 from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
+    float64_forward,
     float64_terms,
     torch_with_gradients,
     widened,
@@ -305,6 +306,28 @@ def test_a_scan_order_is_a_permutation_joint_attention_cannot_see(rng, architect
     assert float(jnp.max(jnp.abs(out_hilbert))) > 0.1, "the perturbed weights produce no signal"
     # The two orders sum the same softmax in a different order: 2e-6 observed.
     assert float(jnp.max(jnp.abs(out_hilbert - out_zigzag))) < 1e-5
+
+
+def test_a_hilbert_uvit_computes_the_raster_uvits_image(rng):
+    """UViT's learned patch positions follow their patches into the scan
+    order (`scan_ordered`), as the patches' tokens do, so on the same weights
+    a Hilbert-ordered UViT computes the raster one's image, as exact as the
+    raster model computes it (`assert_as_exact_as_the_reference`, the truth
+    the raster model in float64), where positions added in raster order give
+    each moved patch another's (audit NN-A3). The grid is non-square, which a
+    transposed permutation fails on."""
+    x = jax.random.normal(rng, (2, 16, 32, 3))
+    temb = jnp.ones((2,))
+    context = text(tokens=8, features=32)
+    config = {"patch_size": 4, "emb_features": 64, "num_layers": 2, "num_heads": 2, "mlp_ratio": 2,
+              "image_size": 32, "text_tokens": 8}
+    raster = models.build("uvit", **config)
+    hilbert = models.build("uvit", scan_order="hilbert", **config)
+    params = jax.tree.map(lambda p: p + 0.05 * jax.random.normal(rng, p.shape),
+                          raster.init(rng, x, temb, context))
+    truth, terms = float64_forward(raster, params, x, temb, context)
+    scanned, rastered = (model.apply(params, x, temb, context) for model in (hilbert, raster))
+    assert_as_exact_as_the_reference(scanned, rastered, truth, "a Hilbert UViT's image", terms=terms)
 
 
 @pytest.mark.parametrize("scan_order", ["hilbert", "zigzag"])

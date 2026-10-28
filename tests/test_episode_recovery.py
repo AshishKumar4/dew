@@ -16,6 +16,7 @@ import pytest
 from episode_support import (
     CALL_THREE,
     EOS,
+    GROUPS,
     IDENTITY,
     NINE,
     START,
@@ -23,6 +24,7 @@ from episode_support import (
     SquareSession,
     action,
     build,
+    cohort_snapshot,
     collect,
     environment,
 )
@@ -41,6 +43,24 @@ def test_journal_refuses_a_different_policy_at_identical_clocks(tmp_path):
     changed = replace(state, variables=jax.tree.map(lambda value: value + .001, state.variables))
     with pytest.raises(ValueError):
         collect(collector, changed)
+
+
+def test_a_cooldown_branchs_cohorts_are_its_own_beside_the_runs_at_the_same_clocks(tmp_path):
+    """A cooldown branch draws at the run's steps and keys under its own weights: its cohorts are its
+    own (`Snapshot.branch`), so the run, drawing at those clocks after it, is not refused as another
+    policy, and a resumed branch reads its own turns back."""
+    from dew.objectives.rl.sessions import Task
+
+    trainer, collector = build(environment(), journal=EpisodeJournal(str(tmp_path)))
+    state = trainer.initial_state()
+    decayed = replace(state, variables=jax.tree.map(lambda value: value + .001, state.variables))
+    snapshot = cohort_snapshot(decayed, 23)
+    branch = collector.episodes(replace(snapshot, branch="cooldown-4"), [Task("31")], GROUPS)
+    assert collector.episodes(replace(snapshot, branch="cooldown-4"), [Task("31")], GROUPS) == branch
+    run = collect(collector, state)
+    assert collect(collector, state) == run
+    with pytest.raises(ValueError):
+        collect(collector, decayed)
 
 
 def test_journal_tells_apart_policies_whose_weights_are_equal_bytes_of_another_dtype():

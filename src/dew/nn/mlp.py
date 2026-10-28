@@ -5,10 +5,10 @@ placement, remat names, activation rounding and work count."""
 import functools
 import math
 from collections.abc import Callable
-from statistics import NormalDist
 
 import jax.numpy as jnp
 import numpy as np
+import scipy.special
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
@@ -66,21 +66,15 @@ def gaussian_cutoff(x, sparsity: float):
             f"within (0, 1), got {sparsity}")
     wide = np.dtype(at_least_fp32(x.dtype)).type
     argument = wide(2) * wide(sparsity) - wide(1)
-    quantile = wide(_erfinv(float(argument)))
+    # SciPy's float64 erfinv over the closed [-1, 1], infinite at its ends as torch's is: a sparsity
+    # whose fp32 argument rounds to an end takes an infinite cutoff, as the reference's gate does.
+    quantile = wide(scipy.special.erfinv(float(argument)))
     multiplier = jnp.asarray(quantile * wide(math.sqrt(2)), x.dtype)
     mean = jnp.mean(x, axis=-1, keepdims=True)
     # A constant row (a padded row of zeros) has deviation zero, which takes a
     # zero gradient, as torch's std backward gives it.
     std = sqrt_or_zero(jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True))
     return mean + std * multiplier
-
-
-def _erfinv(value: float) -> float:
-    """erfinv in float64 over the closed [-1, 1], infinite at its ends as torch's is: a sparsity whose
-    fp32 argument rounds to an end takes an infinite cutoff, as the reference's gate does."""
-    if abs(value) == 1:
-        return math.copysign(math.inf, value)
-    return NormalDist().inv_cdf((1 + value) / 2) / math.sqrt(2)
 
 
 @logical_axes({

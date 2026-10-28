@@ -39,11 +39,13 @@ class Holder(nn.Module):
 
     layout: KVCache
     dtype: jnp.dtype = jnp.float32
+    keys_as_values: bool = False
 
     @nn.compact
     def __call__(self, key, value):
         rows, tokens, heads, width = key.shape
-        store = KVStore.open(self, self.layout, rows, tokens, heads, width, self.dtype)
+        store = KVStore.open(self, self.layout, rows, tokens, heads, width, self.dtype,
+                             keys_as_values=self.keys_as_values)
         if self.has_variable("cache", "written"):
             store.write(key, value, jnp.broadcast_to(jnp.arange(tokens), (rows, tokens)))
         self.variable("cache", "written", lambda: True)
@@ -56,6 +58,29 @@ def stored(layout, keys, values=None, dtype=jnp.float32):
     holder = Holder(layout, dtype)
     cache = holder.init(jax.random.key(0), keys, values)["cache"]
     return holder.apply({"cache": cache}, keys, values, mutable=["cache"])[0]
+
+
+@pytest.mark.parametrize(("layout", "once"), [(KVCache(), True), (KVCache(page_size=4), True),
+                                             (KVCache(quantized="float8_e4m3fn"), True),
+                                             (KVCache(quantized="int8"), False)],
+                         ids=["dense", "paged", "float8", "int8"])
+def test_a_head_that_serves_as_keys_and_values_is_kept_once_where_its_layout_stores_it_as_given(layout, once):
+    """A store whose values are its keys (DeepSeek V4's window head and its drafter's context,
+    `keys_as_values`) reads back what a store holding the head twice reads, keys and values alike, and
+    holds fewer bytes where its layout stores keys as given, full precision or float8, where both were
+    allocated and written (ledger 1921); int8's keys are rotated, not the values' layout, so it keeps
+    both (`KVCache.key_rotation`)."""
+    keys = jax.random.normal(jax.random.key(0), (2, 8, 1, 16))
+
+    def kept(holder):
+        cache = holder.init(jax.random.key(0), keys, keys)["cache"]
+        read, written = holder.apply({"cache": cache}, keys, keys, mutable=["cache"])
+        return read, sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(written))
+
+    (shared, shared_bytes), (separate, separate_bytes) = (kept(Holder(layout, keys_as_values=flag))
+                                                         for flag in (True, False))
+    jax.tree.map(np.testing.assert_array_equal, shared, separate)
+    assert (shared_bytes < separate_bytes) == once and shared_bytes <= separate_bytes
 
 
 def outlier_keys(seed=0):
@@ -469,3 +494,21 @@ def test_a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(
     assert taken and set(taken) == {("triton", "triton")}
     assert_as_exact(paged, decoded(KVCache(), "bfloat16"), draw, "softcapped paged decode",
                     seeds=SOFTCAP_PAGED_SEEDS, truth_fn=decoded(KVCache(), "float64", "reference"))
+
+
+@pytest.mark.parametrize("quantized", ["float8_e4m3fn", "int8"])
+def test_a_vector_below_the_formats_scale_quantizes_finitely(quantized):
+    """A vector of normal float32 values whose absmax over the format's largest is no normal float32
+    (2**-124 or 2**-120 over 448 or 127: subnormal, which a device flushing subnormals reads as zero)
+    keeps scale one and dequantizes to the format's rounding of its values, zeros, never a nonfinite
+    code, whether or not the device flushes (ledger 1874); a vector at a normal scale keeps its own."""
+    from dew.nn.kv_cache import dequantize
+
+    values = jnp.asarray([[2.0 ** -124, 0.0, -(2.0 ** -124), 0.0], [2.0 ** -120, 0.0, 0.0, 0.0],
+                          [1.0, -0.5, 0.25, 0.0]], jnp.float32)
+    stored, scale = quantize(values, quantized)
+    restored = np.asarray(dequantize(stored, scale, jnp.float32))
+    assert np.isfinite(np.asarray(stored, np.float32)).all() and np.isfinite(restored).all()
+    np.testing.assert_array_equal(np.asarray(scale)[:2], [1.0, 1.0])
+    np.testing.assert_array_equal(restored[:2], 0.0)
+    assert np.asarray(scale)[2] != 1.0

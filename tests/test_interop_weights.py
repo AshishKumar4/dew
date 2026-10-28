@@ -106,3 +106,22 @@ def test_a_numeric_token_joins_the_indexed_token_before_it(name, indexed, path):
 
 def test_no_tokens_fold_to_no_path():
     assert indexed_path(()) == ()
+
+
+def test_a_host_leafs_export_transposes_on_the_host():
+    """A host leaf's transposed export (an export gathered home, a NumPy bfloat16 kernel) transposes
+    where it is, moving nothing to a device and back, which would need it to fit there (ledger 1875);
+    a device leaf's transposes on its device, as before, the same values either way."""
+    import jax
+    import ml_dtypes
+    import numpy as np
+
+    from dew.interop.streaming import WeightLayout
+
+    layout = WeightLayout("proj.weight", (("params", "kernel"),), (3, 2), transpose=(1, 0))
+    kernel = np.arange(6, dtype=np.float32).reshape(2, 3).astype(ml_dtypes.bfloat16)
+    with jax.transfer_guard("disallow_explicit"):
+        exported = layout.export({"params": {"kernel": kernel}})
+    np.testing.assert_array_equal(exported, kernel.T)
+    on_device = layout.export({"params": {"kernel": jax.device_put(kernel)}})
+    np.testing.assert_array_equal(on_device, kernel.T)

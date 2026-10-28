@@ -343,6 +343,15 @@ class SourceOptions:
         """The `modeling_overrides` these options state, None where they state none."""
         return None if self.attention is None else {"attention": dict(self.attention)}
 
+    def keywords(self) -> "SourceOptionsKeywords":
+        """`Pretrained.load`'s keywords for what a run builds of its source. With `weights=False` beside
+        them a load is the run's base as the run builds it, its config and its variables' shapes, read
+        from the source's config and safetensors headers alone, no weight downloaded (a release of
+        PyTorch pickles alone, whose shapes no header states, is read whole): a check that a base
+        loads under a run's options, on a disk too small for its weights."""
+        return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
+                "modeling_overrides": self.overrides()}
+
 
 class SourcePlacement(TypedDict, total=False):
     """Where a run reads the source it starts from: `Pretrained.load`'s keywords
@@ -391,8 +400,10 @@ class TrainerConfig:
     rate or a schedule with its own explicit step horizon.
     """
     examples: int | None = None
-    """The run length as the first this many records of the data, each read once, counted before
-    they are packed (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
+    """The run length as the first this many source examples of the data, each read once with every
+    row it makes: the records the chain makes in its own order, counted before they are packed and
+    before an objective makes several rows of one (a decision layout's row a question)
+    (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
     stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
     (`Pause`): `--trainer.stop.fraction 0.5`."""
@@ -1084,8 +1095,7 @@ class RunConfig:
         """`Pretrained.load`'s keywords for the source the run starts from: what it builds of it
         (`source`) and where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
         keeps the source as it is). Every run kind that starts from a source loads it with these."""
-        return {"text_only": self.source.text_only, "prediction_depths": self.source.prediction_depths,
-                "modeling_overrides": self.source.overrides(), **self.trainer.source_placement(frozen=frozen)}
+        return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen)}
 
     def check_resume(self, saved: Mapping[str, object]) -> None:
         """Refuse to resume the run whose record is `saved` as this one where they train different

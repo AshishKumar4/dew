@@ -74,15 +74,12 @@ class GaussianTransition:
         if value.shape != mean.shape:
             raise ValueError("a transition density scores one next state per mean")
         safe_variance = jnp.where(variance > 0, variance, 1)
-        error = jnp.square(value - mean).sum(axis=tuple(range(1, value.ndim)))
         dimensions = math.prod(value.shape[1:])
         # The form of JAX's isotropic `multivariate_normal.logpdf` (a scalar covariance): log(2 pi) and
         # the log variance summed apart, so a variance near float32's largest does not overflow 2 pi
         # times it. Each row has its own variance, which that function would take one row at a time.
-        # Halved after the sum, the density itself: a draw's error over its own variance is its
-        # chi-squared count, which no transition's draw takes near float32's largest.
-        log_prob = -0.5 * (error / safe_variance
-                           + dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
+        log_prob = -(_half_mahalanobis(value, mean, safe_variance)
+                     + 0.5 * dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
         return jnp.where(variance > 0, log_prob, jnp.nan)
 
     def kl(self, reference_mean: ArrayLike) -> jax.Array:
@@ -266,6 +263,47 @@ def _kl_pullback(saved, operands, cotangent):
 def _measured(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> tuple[jax.Array, tuple]:
     """`_divergence`, with nothing its reverse mode keeps (`linear_tangent`'s `forward`)."""
     return _divergence(mean, reference, variance), ()
+
+
+@jax.custom_jvp
+def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
+    """`|value - mean|**2 / (2 variance)` per row, the density's quadratic term, as the KL forms it
+    (`_divergence`): the plain float32 formula bit for bit wherever it stays in range, and finite
+    wherever the term is (a residual of 2**64 under a variance of 2**126; a value of 2**127 beside a
+    mean of -2**127). Its derivatives are the plain formula's at every order (`_half_mahalanobis_jvp`)."""
+    return _divergence(value, mean, variance)
+
+
+@_half_mahalanobis.defjvp
+def _half_mahalanobis_jvp(primals, tangents):
+    """The plain formula's tangent, `sum((value - mean) * (t_value - t_mean)) / variance - term * t_variance
+    / variance`, formed from the residual and the term as they are held, shifted to range
+    (`_divergence_parts`), and restored once: finite wherever the derivative is. It is linear in the
+    tangents, so reverse mode transposes it, and its coefficients are functions of the primals, so it
+    differentiates again."""
+    value, mean, variance = primals
+    along_value, along_mean, along_variance = tangents
+    difference, shift, (quotient, power) = _divergence_parts(value, mean, variance)
+    # Each term's power of two restored half before the tangent's product and half after, so neither a
+    # tangent of zero meets a coefficient past float32's largest (inf * 0) nor reverse mode a cotangent
+    # taken below its least normal: `sum(residual * tangent) / variance` and `-term * t_variance /
+    # variance`, the plain formula's in range, bit for bit, the powers of two exact.
+    level, spread = _split(variance)
+    axes = tuple(range(1, value.ndim))
+    widest = jnp.max(shift, axis=axes)
+    residual_power = widest - spread
+    before = _half(residual_power)
+    products = _scaled(difference, shift - expand(widest - before, shift)) * (along_value - along_mean)
+    moved = _scaled(products.sum(axis=axes) / level, residual_power - before)
+    stretch_power = power - spread
+    stretched = _scaled(-quotient, _half(stretch_power)) * along_variance / level
+    return (_half_mahalanobis(value, mean, variance),
+            moved + _scaled(stretched, stretch_power - _half(stretch_power)))
+
+
+def _half(power: jax.Array) -> jax.Array:
+    """Half an integer power of two's exponent, rounded toward zero, the rest restored apart."""
+    return (power.astype(jnp.float32) * 0.5).astype(jnp.int32)
 
 
 _gaussian_kl = linear_tangent(_measured, _kl_pullback, _directional)

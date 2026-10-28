@@ -36,7 +36,14 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
-from dew.batch import Coordinates, Variables, coordinates as build_coordinates, merge, shifted_span
+from dew.batch import (
+    Coordinates,
+    Variables,
+    coordinates as build_coordinates,
+    merge,
+    shifted_span,
+    with_firsts,
+)
 from dew.mesh import LayoutRefused
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
@@ -71,7 +78,7 @@ from ..inputs import (
     coordinates_of,
     numbered_blocks,
 )
-from ..kv_cache import KVCache
+from ..kv_cache import DecodeCursor, KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
@@ -148,7 +155,7 @@ class CausalTransformer(nn.Module):
     fields and needs no subclass. The field comments name the family that sets
     each one. A classic GPT block is `norm_type='layer'`, `norm_bias`, an
     ungated `mlp`, `mlp_bias` and learned positions; the learned positions
-    advance from each decode row's cache cursor.
+    advance from each decode row's count of its real tokens (`DecodeCursor`).
 
     `layer_types` is the pattern, one kind per layer, and `kinds` says what
     each kind does. `kv_shared_layers` lists the layers that share by index: a
@@ -231,6 +238,11 @@ class CausalTransformer(nn.Module):
     epsilon or a weight of a norm's own."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
+    embedding_norm_reads: Literal['inputs', 'lookup'] = 'inputs'
+    """What `embedding_norm` normalizes: every input embedding, a caller's own and a media encoder's
+    among them, as BLOOM's and ModernBERT's embedding norms read their `inputs_embeds` ('inputs'); or
+    the table's lookup alone, before media take their slots, as Muse Glimmer's normed embedding module
+    does (`scaled_embeddings`, 'lookup')."""
     first_attention_norm: bool = True
     """Whether the first block norms its attention input. ModernBERT's first
     block reads the embedding norm's output as it is (modeling_modernbert.py,
@@ -526,16 +538,19 @@ class CausalTransformer(nn.Module):
         return tuple(self.layer_types)
 
     def kind_of(self, layer_type: str) -> "ResolvedKind":
-        """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset."""
+        """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset.
+        A rope scaling is one setting, YaRN's record or a Llama 3.1 or LongRoPE ramp: a kind that gives
+        either takes it in place of the model's, never beside it (`MixerContext.rotary_scaling`)."""
         kind = (self.kinds or {}).get(layer_type, LayerKind())
+        scaled = kind.rope_scaling is not None or kind.yarn is not None
         return ResolvedKind(
             window=kind.window,
             bidirectional_window=kind.bidirectional_window,
             chunk=kind.chunk,
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
-            rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
-            yarn=self.yarn if kind.yarn is None else kind.yarn,
+            rope_scaling=kind.rope_scaling if scaled else self.rope_scaling,
+            yarn=kind.yarn if scaled else self.yarn,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
@@ -900,6 +915,7 @@ class CausalTransformer(nn.Module):
                 features=self.emb_features, dtype=self.dtype, name='embed_positions',
                 embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                                 else nn.initializers.normal(self.initializer_range)))
+            self.decode_cursor = DecodeCursor()
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
@@ -1303,6 +1319,16 @@ class CausalTransformer(nn.Module):
         """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
         return self.continuum is not None
 
+    def affine_head(self) -> bool:
+        """Whether the head past the continuum level (`head_logits`) is affine in its states, read from
+        the bound model: a table's product and a bias, with no transform, logit softcap, nGPT gains or
+        quantizer of the head's own input (`SteppedInContext`); a checkpoint's quantizer of the trunk's
+        modules alone leaves it affine, and a tied head reads its table with none."""
+        quantized = (isinstance(self, QuantizesInputs) and not self.tie_embeddings
+                     and self.input_quantizer(self.lm_head) is not None)
+        return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
+                and not quantized)
+
     @nn.nowrap
     def in_context_level(self, variables):
         """The continuum level's parameters in `variables`, None without a level (`SteppedInContext`)."""
@@ -1450,8 +1476,10 @@ class CausalTransformer(nn.Module):
     def scaled_embeddings(self, x):
         """Return the token embeddings `x` scaled the way the first layer reads them.
 
-        `x` is multiplied by sqrt(emb_features) when `embedding_scale` is set
-        (Gemma), then by `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
+        `x` is normalized first where the norm reads the lookup alone
+        (`embedding_norm_reads`, Muse Glimmer), multiplied by
+        sqrt(emb_features) when `embedding_scale` is set (Gemma), then by
+        `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
         The decoder, the multimodal wrapper and the Qwen-Image conditioner all
         scale here.
 
@@ -1462,6 +1490,8 @@ class CausalTransformer(nn.Module):
         """
         # Gemma's cast: modeling_gemma3.py:117. lm-engine's fp32 opmath:
         # mixins/dense/base.py at 45b6b57b.
+        if self.embedding_norm and self.embedding_norm_reads == 'lookup':
+            x = self.embedding_layernorm(x)
         if self.embedding_scale:
             x = (x * jnp.asarray(math.sqrt(self.emb_features),
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
@@ -1643,18 +1673,16 @@ class CausalTransformer(nn.Module):
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
             # The tokens' places as every layer reads them (`Coordinates`), whichever fields the
-            # caller gave them in; a cached call's continue from its cache's cursor.
+            # caller gave them in; a cached call's continue from the model's own count of each row's
+            # real tokens (`DecodeCursor`), whatever mixer its first layer runs.
             tokens_at = coordinates_of(attention_metadata, *tokens.shape)
-            places = tokens_at.positions
-            if places is None:
-                valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
-                places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
-                # A first cached call finds no cursor yet: its tokens start the row.
-                start = self.layers[0].self_attn.get_variable('cache', 'cache_index') if decode else None
-                if start is not None:
-                    places = places + start[:, None]
+            valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
+            # Every cached call counts its real tokens, those at given places too, so a later call
+            # without places continues after them.
+            counted = self.decode_cursor(valid) if decode else jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
+            places = counted if tokens_at.positions is None else tokens_at.positions
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
-        if self.embedding_norm:
+        if self.embedding_norm and self.embedding_norm_reads == 'inputs':
             x = self.embedding_layernorm(x)
         if self.embedding_dropout_rate:
             x = self.embedding_dropout(x, deterministic=not train)
@@ -1716,7 +1744,7 @@ class CausalTransformer(nn.Module):
         if context is not None:
             # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
             # a standalone call, and a cached and a full one, project the same values.
-            context = CrossContext(context.embeddings.astype(self.context_dtype), context.lengths)
+            context = dataclasses.replace(context, embeddings=context.embeddings.astype(self.context_dtype))
         # A layer whose mixer reads no pairwise mask or key runs refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None and key_runs is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask or "
@@ -1737,6 +1765,12 @@ class CausalTransformer(nn.Module):
         engram_ids = (None if self.engram is None else self.engram_hashes(
             tokens, None if coordinates is None else coordinates.valid,
             None if coordinates is None else coordinates.positions, decode, media_mask))
+        if context is not None and context.segments is not None:
+            # A context of several documents is read by the call's tokens of each document alone.
+            if coordinates is None or coordinates.segments is None:
+                raise ValueError("a context of several documents is read by packed rows, which name "
+                                 "their tokens' documents (segment_ids or coordinates)")
+            context = dataclasses.replace(context, queries=coordinates.segments)
         # A block router's blocks are numbered once for every routed layer.
         block = None if self.mixture is None else self.mixture.routing_block
         blocks = None if block is None else numbered_blocks(
@@ -1749,7 +1783,8 @@ class CausalTransformer(nn.Module):
                 and context is None):
             return None
         return AttentionMetadata(
-            coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
+            # The packed documents' firsts built once a step, every layer reading them (`with_firsts`).
+            coordinates=with_firsts(coordinates), image_groups=image_groups, block_groups=block_groups,
             rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
             key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
             media=media_mask,
@@ -1780,7 +1815,7 @@ class CausalTransformer(nn.Module):
         injected = x
         shared = SharedPassView() if loop.shared_cache else None
         first_pass = run_block if shared is None else nn.map_variables(
-            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.first_out,
+            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.outside,
             mutable=True)
         x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
         for step in range(1, loop.steps):
@@ -2253,7 +2288,8 @@ class CausalTransformer(nn.Module):
     def recompute_more(self) -> Self | None:
         """One rung up `DECODER_REMAT`, past any rung that keeps nothing more of the names
         these layers mark than the rung above it (`MixerBase.marks`), whose step would
-        compile the same; None at the top or off the ladder."""
+        compile the same; None at the top, off the ladder, or where the top keeps what
+        this rung keeps, so no rung above holds less."""
         if self.remat not in DECODER_REMAT[:-1]:
             return None
         marked = self.marked_residuals()
@@ -2270,6 +2306,8 @@ class CausalTransformer(nn.Module):
         while (index < len(DECODER_REMAT) - 1
                and kept(DECODER_REMAT[index]) in (kept(self.remat), kept(DECODER_REMAT[index + 1]))):
             index += 1
+        if kept(DECODER_REMAT[index]) == kept(self.remat):
+            return None
         return self.clone(remat=DECODER_REMAT[index])
 
     @nn.nowrap
@@ -2284,14 +2322,20 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:
         """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
-        (`MixerBase.marks`, every name where a kind does not say) and the MLP's."""
+        (`MixerBase.marks`, every name where a kind does not say) and, where a layer, its
+        gated cross-attention, a prediction depth or the drafter has a feed-forward, its
+        (`MLP_RESIDUALS`, the dense MLP's and the experts' alike)."""
         types = self.per_layer_types
-        mixers = [kind.mixer or self.mixer for kind in self.layer_kinds(types).values()]
+        kinds = self.layer_kinds(types)
+        mixers = [kind.mixer or self.mixer for kind in kinds.values()]
         if any(mixer is not None and mixer.marks() is None for mixer in mixers):
             return frozenset(RESIDUALS)
         default = AttentionMixer.residuals or ()
-        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.marks() or ()
-                                                for mixer in mixers))
+        feeds = (any(spec.routed or spec.width or spec.cross
+                     for spec in self._layer_specs(types, kinds, self.layer_mixer))
+                 or self.num_nextn_predict_layers or self.dspark is not None)
+        marked = (default if mixer is None else mixer.marks() or () for mixer in mixers)
+        return frozenset(MLP_RESIDUALS if feeds else ()).union(*marked)
 
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
@@ -2317,8 +2361,17 @@ class CausalTransformer(nn.Module):
 
     @property
     def cache_rebuild_position(self) -> int | None:
-        scaling = self.rope_scaling
-        return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
+        """Where LongRoPE's factors switch from short to long, past which cached keys go stale: the
+        original length of every trunk layer's LongRoPE, its kind's or the model's (`kind_of`), None
+        where no layer takes LongRoPE. Kinds that switch at different lengths are refused, since a cache
+        rebuilds at one."""
+        originals = {kind.rope_scaling.original_max_position_embeddings
+                     for kind in map(self.kind_of, set(self.per_layer_types))
+                     if isinstance(kind.rope_scaling, LongRopeScaling)}
+        if len(originals) > 1:
+            raise ValueError(f"layer kinds switch LongRoPE's factors at {sorted(originals)} tokens; a cache "
+                             "rebuilds its keys at one")
+        return next(iter(originals), None)
 
     @nn.nowrap
     def block_chunks(self) -> tuple[int | None, ...]:

@@ -455,6 +455,29 @@ def test_a_masked_response_continues_the_prompts_fields_and_keeps_its_media():
         DiscreteProcess(LogLinear(), mask_id=15).generate(model, variables, unruled, 3, key=0)
 
 
+def test_a_prompt_laid_out_by_its_coordinates_generates_as_its_fields_do(rng):
+    """A request's `Coordinates` continue into its masked response as every other
+    extension continues them (`ModelInputs.extended`): a left-padded prompt at
+    given positions generates, token for token, what the same prompt as a
+    validity and a positions field does, its response's positions read from and
+    written to its `Coordinates` (audit AT-04)."""
+    from dew.batch import COORDINATES_FIELD, coordinates
+    from dew.nn.inputs import ModelInputs
+
+    model = transformer(causal=False)
+    tokens = jnp.array([[0, 1, 3], [2, 4, 5]])
+    valid = jnp.array([[False, True, True], [True, True, True]])
+    positions = jnp.array([[0, 2, 3], [0, 1, 2]])
+    fields = ModelInputs(tokens, {"attention_mask": valid, "positions": positions})
+    laid = ModelInputs(tokens, {COORDINATES_FIELD: coordinates((2, 3), valid=valid, positions=positions)})
+    variables = model.init(rng, tokens)
+    process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    expected = process.generate(model, variables, fields, 3, key=0, steps=4)
+    generated = process.generate(model, variables, laid, 3, key=0, steps=4)
+    np.testing.assert_array_equal(generated.tokens, expected.tokens)
+    np.testing.assert_array_equal(generated.lengths, expected.lengths)
+
+
 def test_a_packed_prompt_continues_its_last_document_as_if_alone():
     """A packed prompt numbers its documents from 1 and its padding 0
     (`dew.batch.real_slots`), and its tokens sit at their places in their

@@ -41,7 +41,14 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from dew.mesh import logical_spec, mesh_axes
-from dew.nn.categorical import label_derivative, label_entry, rescaled, segment_log_partition, target_loss
+from dew.nn.categorical import (
+    label_derivative,
+    label_entry,
+    partition,
+    rescaled,
+    segment_log_partition,
+    target_loss,
+)
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     added_to,
@@ -1023,18 +1030,6 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     return losses, jnp.argmax(logits, axis=-1) if predict else None, log_z
 
 
-def _whole_partition(logits):
-    """Each row's maximum, the sum of its exponentials scaled to it, and those exponentials.
-
-    The maximum is finite, as `jax.nn.logsumexp` takes one: an infinite maximum shifts by 0, so a row
-    holding +inf scores +inf, and an all -inf row's partition is -inf, never inf - inf.
-    """
-    largest = jnp.max(logits, axis=-1)
-    peak = jnp.where(jnp.isfinite(largest), largest, 0)
-    shifted = jnp.exp(logits - peak[..., None])
-    return peak, jnp.sum(shifted, axis=-1), shifted
-
-
 @jax.custom_jvp
 def _whole_losses(logits, targets):
     """Each row's cross entropy and log partition of whole logits, differentiated by `_whole_losses_tangent`.
@@ -1042,7 +1037,7 @@ def _whole_losses(logits, targets):
     Not `_row_terms`: its variadic `jax.lax.reduce` has no derivative, and these losses are differentiated
     (a distilled student's prediction, a whole-logit model).
     """
-    peak, mass, _ = _whole_partition(logits)
+    peak, mass, _ = partition(logits)
     return target_loss(peak, mass, _target_logits(logits, targets)), peak + jnp.log(mass)
 
 
@@ -1052,7 +1047,7 @@ def _whole_losses_tangent(primals, tangents):
     arXiv:2610.31642's eq. 7), and of its log partition, the row's probabilities."""
     logits, targets = primals
     losses, log_z = _whole_losses(logits, targets)
-    _, mass, shifted = _whole_partition(logits)
+    _, mass, shifted = partition(logits)
     probability = shifted / mass[..., None]
     d_losses = jnp.sum(label_derivative(probability, targets) * tangents[0], axis=-1)
     d_log_z = jnp.sum(probability * tangents[0], axis=-1)

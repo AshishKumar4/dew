@@ -25,6 +25,7 @@ import jax
 import numpy as np
 
 from dew.nn.kernels.generation import gpu_target
+from dew.telemetry.trace import collective
 
 _cache_counts = {'/jax/compilation_cache/cache_hits': 0, '/jax/compilation_cache/cache_misses': 0}
 _cache_lock = threading.Lock()
@@ -149,16 +150,6 @@ _GROUPED = re.compile(r"(?:replica_groups|source_target_pairs)=(\{\}|\{\{[\d,{}]
 _NUMBERS = re.compile(r'\d+')
 _SIZED = re.compile(r"'([^']+)'=(\d+)")
 _QUOTED = re.compile(r"'([^']+)'")
-COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
-"""The HLO ops that move data between devices. XLA runs some as an async
-pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
-computation that holds the op itself."""
-
-
-def collective(op: str) -> str | None:
-    """The collective (`COLLECTIVES`) HLO op `op` is, or runs half of; None for any other."""
-    kind = op.removesuffix('-start').removesuffix('-done')
-    return kind if kind in COLLECTIVES else None
 
 
 def _groups(attributes: str) -> tuple[tuple[int, ...], ...]:
@@ -516,6 +507,10 @@ class HloInstruction:
     groups: tuple[tuple[int, ...], ...]
     """A collective's device groups, each the positions in the module's device assignment that
     take part together; empty where every device does, and for any other op (`_groups`)."""
+    element: str
+    """Its result's element type as HLO names it (`f32`, `bf16`); empty where its result is a tuple."""
+    dims: tuple[int, ...]
+    """Its result's dimensions: a tuple's first array's."""
 
 
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
@@ -569,7 +564,8 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
                                          reads, flops, weights.get(called_as, 0.0), instruction.buffers,
-                                         instruction.shapes, instruction.groups)
+                                         instruction.shapes, instruction.groups, computation.elements[name],
+                                         instruction.dims)
     computations.clear()
     return found
 
