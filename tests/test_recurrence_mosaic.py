@@ -436,16 +436,11 @@ RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kd
 key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
 
 
-def _model(launch: mainloop.Launch, family: mosaic.Family) -> dict:
-    """A launch's register model as the compile gate decides on it (`kernel_compile.decisions`): its stated
-    registers (`Launch.registers`) against its family's budget at its consumer roles (`Launch.consumers`, a
-    walk's `Tiles.walkers`), and the producer's beside them where the family streams from a role of its
-    own."""
-    roles = launch.consumers
-    producer = family.warpgroups(roles) > roles
-    return {"registers": launch.registers, "budget": family.registers(roles), "consumers": roles,
-            "most": family.programs(roles), "register_step": family.register_step,
-            "producer": resources.producer_registers(roles) if producer else 0}
+def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.RegisterModel:
+    """A launch's register model as the compile gate decides on it (`resources.register_model`,
+    `kernel_compile.decisions`): its stated registers (`Launch.registers`) at its consumer roles
+    (`Launch.consumers`, a walk's `Tiles.walkers`)."""
+    return resources.register_model(family, launch.consumers, launch.registers)
 
 
 class Unbudgeted(template.Mosaic):

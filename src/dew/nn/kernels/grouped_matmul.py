@@ -717,7 +717,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if steps is not None:
             # A ring deeper than its contraction's steps holds no more of them.
             most = min(most, max(2, steps))
-        return resources.Launch(scope, config.warpgroups, self.registers(ba, config), most=most)
+        return resources.Launch(scope, config.warpgroups, self.registers(ba, config), most=most, tile=config)
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` is a tile of the call on `target` apart from its resources: of the launch's
@@ -921,7 +921,7 @@ class MosaicTgmm(_Mosaic):
 
     def launch_of(self, ba, config: mosaic_gpu.Tiles) -> resources.Launch:
         ran, tile = self._ran(ba, config)
-        return super().launch_of(ran, tile)
+        return dataclasses.replace(super().launch_of(ran, tile), tile=config)
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`)."""
