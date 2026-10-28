@@ -21,7 +21,8 @@ import tyro
 from dew._records import number, record
 from dew.batch import Variables, merge
 from dew.checkpoints import Checkpoints
-from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig, media_field
+from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
+from dew.config.media import media_field
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
