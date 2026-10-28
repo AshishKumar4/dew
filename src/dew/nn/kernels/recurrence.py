@@ -554,12 +554,14 @@ COLUMNS = Launch(32, 8)
 
 def _operands_named(fwd):
     """`fwd` (`StepLaunch._fwd`) with its operands, `Step`'s fields (`OPERANDS`), named in its signature as
-    keyword arguments, which a launch's arguments bind to by name (`tuning`'s keys and stored launches)."""
+    keyword arguments, which a launch's arguments bind to by name (`tuning`'s keys and stored launches), each
+    an array or None as tokamax serializes a launch it describes."""
     parameter = inspect.Parameter
     given = inspect.signature(fwd).parameters.values()
     fwd.__signature__ = inspect.Signature([
         *(each for each in given if each.kind is parameter.POSITIONAL_OR_KEYWORD),
-        *(parameter(name, parameter.KEYWORD_ONLY, default=None) for name in OPERANDS),
+        *(parameter(name, parameter.KEYWORD_ONLY, default=None, annotation=jax.Array | None)
+          for name in OPERANDS),
         *(each for each in given if each.kind is parameter.KEYWORD_ONLY)])
     return fwd
 
