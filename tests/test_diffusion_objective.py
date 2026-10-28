@@ -593,8 +593,8 @@ def test_a_fit_validates_on_an_unbatched_dataset_in_trainings_batches_its_captio
         # Records as a source holds them: an image and its caption, which the objective encodes a batch at a
         # time (`EncodeCaptions`).
         images = np.random.default_rng(count).integers(0, 256, (count, RES, RES, 3), dtype=np.uint8)
-        return {"image": images, "caption": np.asarray(["a bird", "cat", "two dogs", "x", "zz"] * 2)[:count]}
+        return {"image": images, "caption": np.asarray(["a bird", "cat", "two dogs", "x"] * (count // 4))}
 
     state = Trainer(make_objective(guidance=None), optax.sgd(0.0), key=0).fit(
-        Memory(captioned(8)).batch(4), validation=Memory(captioned(5)), steps=1, eval_every=1, log_every=1)
+        Memory(captioned(8)).batch(8), validation=Memory(captioned(16)), steps=1, eval_every=1, log_every=1)
     assert int(state.step) == 1
