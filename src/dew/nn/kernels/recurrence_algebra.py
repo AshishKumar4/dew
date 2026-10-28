@@ -694,17 +694,21 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     sub-chunk and key block ('pairs'): fla_kda's sub-chunk factoring, its diagonal sub-chunks' too, which a
     declared floor bounds (`factored_range`). An exponent is its halves' difference summed, within a
     sub-chunk's range of zero down the rows (and up the keys); past it every pair's true value underflows."""
-    total = jnp.zeros((chunk, chunk), jnp.float32)
-    for place in range(0, chunk, sub):
+    def summed(step, total):
+        place = step * sub
         for c in range(columns):
             # Each tile read where it is used, a sub-chunk and key block at a time: few live at once.
             gate, low = gates(c)
-            start_gate, start_low = reference(place // sub, c)
+            start_gate, start_low = reference(step, c)
             exponent = (gate - start_gate[None, :]) + (low - start_low[None, :])
             index, _ = _grid(exponent.shape)
             down = jnp.where((index >= place) & (index < place + sub), rows(c) * jnp.exp2(exponent), 0.0)
             up = jnp.where(index < place + sub, keys(c) * jnp.exp2(-exponent), 0.0)
             total = total + issue("pairs", down, Transposed(up))
+        return total
+
+    # The sub-chunks in a loop, not unrolled: each one's tiles live within its own step.
+    total = jax.lax.fori_loop(0, chunk // sub, summed, jnp.zeros((chunk, chunk), jnp.float32))
     lag = _lags(total.shape)
     return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
 
