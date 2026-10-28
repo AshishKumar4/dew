@@ -129,12 +129,15 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool, dtyp
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and in
     either form whether a row's sums of `dtype` values need a guard (`algebra.headroom`) and keep their
-    additions' rounding (`algebra.compensates`). A decode
+    additions' rounding (`algebra.compensates`). fp32 keeps natural logits even in the default form:
+    rounding an edge logit's base-2 conversion before exp2 moves its normal weight by several ppm,
+    which a large value carries into the output (ledger 2151). Lower-precision operands keep their
+    existing form. A decode
     block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(capped, softcap),
-                           natural=natural, headroom=algebra.headroom(dtype),
+                           natural=natural or jnp.dtype(dtype) == jnp.float32, headroom=algebra.headroom(dtype),
                            initial=sinks, compensated=algebra.compensates(dtype), prescale=power)
 
 
