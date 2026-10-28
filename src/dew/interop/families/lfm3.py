@@ -98,13 +98,16 @@ def _lfm3_rope(hf_config: Mapping[str, object], layer_types: tuple[str, ...]) ->
     full record turns its first `partial_rotary_factor` of each head; a sliding layer turns all of
     its own. A config that states none takes Lfm3Config's (`_ROPE`); one that does names a record
     for each attention type its layers hold."""
-    stated = _records.record(hf_config.get('rope_parameters') or _ROPE, 'rope_parameters')
+    given = hf_config.get('rope_parameters')
+    stated = _records.record(_ROPE if given is None else given, 'rope_parameters')
     unknown = sorted(set(stated) - {'full_attention', 'sliding_attention'})
     if unknown:
         refuse(f"rope_parameters {unknown}", "LFM3 keeps one rotary record a layer type")
-    missing = sorted({'full_attention', 'sliding_attention'} & set(layer_types) - set(stated))
+    missing = sorted(kind for kind in ('full_attention', 'sliding_attention')
+                     if kind in layer_types and not stated.get(kind))
     if missing:
         refuse(f"rope_parameters without {missing}", "each attention layer type reads its own record")
+    # A type no layer holds reads no record (Lfm3RotaryEmbedding builds its layers' types alone).
     full = dict(_records.record(stated.get('full_attention') or _ROPE['full_attention'],
                                 'rope_parameters.full_attention'))
     sliding = dict(_records.record(stated.get('sliding_attention') or _ROPE['sliding_attention'],
