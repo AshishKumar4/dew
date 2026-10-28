@@ -526,7 +526,8 @@ def test_the_mla_kind_rotates_by_the_models_rope_scaling(scaling):
 
 
 LLAMA3_SCALED_SEEDS = 8
-"""The llama3-scaled DeepSeek V3's declared draws of ids against transformers' eager forward (check 1)."""
+"""The llama3-scaled DeepSeek V3's declared draws of ids against transformers' eager forward (check 1), sized by `seeds_for`
+paired with Dew's logits on the CPU."""
 
 
 def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by_it(tmp_path):
