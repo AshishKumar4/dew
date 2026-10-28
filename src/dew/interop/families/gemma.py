@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from flax.traverse_util import flatten_dict
 
 from dew import _records
+from dew.batch import LAYER_SCALAR_COLLECTIONS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
@@ -42,7 +43,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS, Mixture
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.gemma3n import AltUp
 from dew.nn.mixers import AttentionMixer

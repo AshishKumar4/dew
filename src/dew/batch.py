@@ -46,6 +46,11 @@ def merge(tree: Variables, overlay: Variables) -> Variables:
     return merged
 
 
+LAYER_SCALAR_COLLECTIONS = {"trainable": "params", "frozen": "constants"}
+"""The collection a decoder block keeps its layer scalar in, by mode (`BlockWiring.layer_scalar`):
+Google's release makes it a parameter, and Transformers a buffer, which Dew keeps as a constant."""
+
+
 FROZEN = "frozen"
 """The name of the collection where a partially trained run keeps its frozen weights.
 

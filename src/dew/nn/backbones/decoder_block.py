@@ -16,6 +16,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
+from dew.batch import LAYER_SCALAR_COLLECTIONS
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
@@ -300,11 +301,6 @@ class Mixture:
                 RMSNorm, epsilon=norm_eps, scale_offset=scale_offset, scale_after_cast=scale_after_cast,
                 dtype=dtype) if self.latent_norm else None,
             dtype=dtype, precision=precision)
-
-
-LAYER_SCALAR_COLLECTIONS = {"trainable": "params", "frozen": "constants"}
-"""The collection a block keeps its layer scalar in, by mode (`BlockWiring.layer_scalar`): Google's
-release makes it a parameter, and Transformers a buffer, which Dew keeps as a constant."""
 
 
 def layer_scalar_mode(variables: Mapping[str, object], path: tuple[str, ...]) -> str | None:
