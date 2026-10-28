@@ -8,6 +8,7 @@ import io
 import itertools
 import json
 import math
+import os
 import posixpath
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -32,7 +33,17 @@ from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
-from dew.data.storage import Readable, Store, commit_export, content_version, in_memory, local, on_gcs
+from dew.data.storage import (
+    CommittedRead,
+    Readable,
+    Store,
+    commit_export,
+    content_version,
+    in_memory,
+    local,
+    on_gcs,
+    store_version,
+)
 
 from .base import Read, Shard, ShardManifest, preparing, url_label
 from .index import ArrayIndex
@@ -229,6 +240,10 @@ _SCAN_BYTES = 1 << 20
 """The bytes a search for a line start reads at a time (`_line_start`), so a record of any length is
 passed over in bounded memory."""
 
+_COMMITTED: dict[tuple[int, str, str | None], CommittedRead] = {}
+"""Each process's committed read of each file it opened (`Files._read_place`), by the process, the file's
+URL and its committed entry: checked once a process, and a mirrored copy pinned for the process."""
+
 
 def _line_start(file: BinaryIO, offset: int, stop: int | None = None) -> int:
     """Where the first line that starts at `offset` or after it starts in `file`, its end where none
@@ -302,6 +317,17 @@ class Files(Dataset):
         return {
             Store(str(self.url), self.storage_options).child(entry["path"]).url: entry for entry in entries
         }
+
+    def _read_place(self, url: str) -> Readable:
+        """Where this process reads the file at `url`: as its committed entry names it
+        (`Store.committed`), checked when this process first opens it, and its mirrored copy, where it
+        reads one, held for the process (`_COMMITTED`)."""
+        entry = self.declared.get(url)
+        key = (os.getpid(), url, None if entry is None else json.dumps(entry, sort_keys=True, default=str))
+        held = _COMMITTED.get(key)
+        if held is None:
+            held = _COMMITTED.setdefault(key, Store(url, self.storage_options).committed(entry))
+        return held.readable
 
     def _header(self, url: str) -> Mapping[str, object]:
         if url in self.declared:
@@ -594,12 +620,14 @@ class Files(Dataset):
                         digest = hashlib.file_digest(local, "sha256").hexdigest()
             finally:
                 opened.close()
+            version = store_version(filesystem.info(path))
             files.append(
                 {
                     "path": path[len(directory) :].lstrip("/"),
                     "rows": count,
                     "bytes": filesystem.size(path),
                     "sha256": digest,
+                    **({"version": version} if version else {}),
                 }
             )
         commit_export(root, format="array_record", codec=None, rows=sum(entry["rows"] for entry in files),
@@ -634,6 +662,7 @@ class Files(Dataset):
                 self.storage_options,
                 record_codec=committed is not None and committed.get("codec") == 1,
                 counts=counts,
+                committed=self.declared,
             )
         else:
             rows = _IndexedLines(self)
@@ -655,7 +684,7 @@ class Files(Dataset):
         partitions are discovered under, so a copy's location adds none: a Hub dataset's files
         read from huggingface_hub's cache where it holds every one, and from the Hub otherwise."""
         stores = [Store(url, self.storage_options) for url in self.paths]
-        located = [store.readable() for store in stores]
+        located = [self._read_place(url) for url in self.paths]
         # Some of a Hub dataset's files in huggingface_hub's cache, on this host's disk, and some not.
         if len({local(place.fs) for place in located}) > 1:
             located = [Readable(*store.resolve(), None) for store in stores]
@@ -752,7 +781,7 @@ class Files(Dataset):
             if not planned:
                 break
             for number in planned:
-                fs, path, _ = Store(self.paths[number], self.storage_options).readable()
+                fs, path, _ = self._read_place(self.paths[number])
                 with _open_lines(fs, path) as file:
                     starts[number] = _record_starts(file, sizes[number], parts[number], self.kind)
                 if len(starts[number]) < parts[number]:
@@ -784,12 +813,13 @@ class Files(Dataset):
                     (shard.uri,),
                     self.storage_options,
                     record_codec=self.committed is not None and self.committed.get("codec") == 1,
+                    committed=self.declared,
                 )
             ).to_iter_dataset()
         if self.kind == "webdataset":
             from .webdataset import TarRows
 
-            return TarRows(shard.uri, self.storage_options)
+            return TarRows(shard.uri, self.storage_options, self.declared.get(shard.uri))
         if self.kind == "files":
             return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset()
         return _Lines(self, shard)
@@ -994,7 +1024,7 @@ class _IndexedLines:
     def fieldnames(self) -> tuple[tuple[str, ...], ...]:
         headers = []
         for url in self.source.paths:
-            fs, path, _ = Store(url, self.source.storage_options).readable()
+            fs, path, _ = self.source._read_place(url)
             with _open_lines(fs, path) as file:
                 headers.append(_header(file))
         return tuple(headers)
@@ -1006,7 +1036,7 @@ class _IndexedLines:
         group, row = self.ranges.locate(index)
         entry = self.tables[group][row]
         shard = int(entry["shard"]) if self.source.index else group
-        fs, path, _ = Store(self.source.paths[shard], self.source.storage_options).readable()
+        fs, path, _ = self.source._read_place(self.source.paths[shard])
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
         offset = int(entry["offset"])
         compression = infer_compression(path.lower())
@@ -1089,7 +1119,7 @@ class _LineIterator(grain.DatasetIterator):
     def __init__(self, source: Files, shard: Shard):
         super().__init__()
         self.source, self.shard = source, shard
-        self.fs, self.path, _ = Store(shard.uri, source.storage_options).readable()
+        self.fs, self.path, _ = source._read_place(shard.uri)
         self.compression = infer_compression(self.path.lower())
         self.file = _open_lines(self.fs, self.path)
         self._opened = True

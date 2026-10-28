@@ -87,6 +87,9 @@ class ArrayRecords:
 
     Shuffled indexed reads reuse the LRU across Loading's in-flight read width.
     Non-native shards need a mirror with room for that many physical shards.
+    `committed` holds each shard's committed entry where a manifest names it, read as it committed it
+    (`Store.committed`): checked against the store's version as it opens, or mirrored and checked whole
+    against its sha256 alone.
     """
 
     def __init__(
@@ -96,8 +99,10 @@ class ArrayRecords:
         *,
         record_codec: bool = False,
         counts: Sequence[int] | None = None,
+        committed: Mapping[str, Mapping[str, object]] | None = None,
     ):
         self.urls = tuple(urls)
+        self.committed = dict(committed or {})
         self.storage_options = storage_options
         self.record_codec = record_codec
         self.counts = None if counts is None else tuple(counts)
@@ -111,7 +116,8 @@ class ArrayRecords:
     def _shard(self, shard: int) -> ArrayRecords:
         """Physical shard `shard`'s own reader, checked against its producer's row count."""
         assert self.counts is not None
-        opened = ArrayRecords((self.urls[shard],), self.storage_options, record_codec=self.record_codec)
+        opened = ArrayRecords((self.urls[shard],), self.storage_options, record_codec=self.record_codec,
+                              committed=self.committed)
         if len(opened) != self.counts[shard]:
             opened.close()
             raise ValueError(f"ArrayRecord {self.urls[shard]} differs from its producer's row count")
@@ -125,9 +131,16 @@ class ArrayRecords:
     def reader(self):
         paths = []
         for url in self.urls:
-            fs, path = Store(url, self.storage_options).resolve()
+            store = Store(url, self.storage_options)
+            fs, path = store.resolve()
             if local(fs):
                 paths.append(path)
+                continue
+            # A committed version checked as the shard opens; a sha256 alone, its checked mirrored copy.
+            read = store.committed(self.committed.get(url))
+            if read.pin is not None:
+                self._pins.append(read.pin)
+                paths.append(read.readable.path)
             elif on_gcs(fs):
                 paths.append("gs://" + path)
             else:

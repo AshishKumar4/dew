@@ -396,9 +396,9 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
         server.shutdown()
         server.server_close()
     assert isinstance(fetched, Rejected) and not fetched.permanent
-    # Its deadline, set after `began`, has passed (asyncio runs a timer up to its clock's resolution
-    # early); the response, six seconds long, has not ended.
-    assert waited >= 1.0 - time.get_clock_info("monotonic").resolution and unsent > 0
+    # Its deadline, set after `began` by at least the hop onto the IO loop, longer than the clock's
+    # resolution a timer may fire early by, has passed; the response, six seconds long, has not ended.
+    assert waited >= 1.0 and unsent > 0
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():

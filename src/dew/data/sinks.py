@@ -26,7 +26,7 @@ from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import Format, _arrow_filesystem, declared_format
 from dew.data.steps.text import count_rules, stated_rules
-from dew.data.storage import ObjectRef, Store, commit_export
+from dew.data.storage import ObjectRef, Store, commit_export, store_version
 
 if TYPE_CHECKING:
     from dew.data.pipeline import Dataset, Pipeline
@@ -188,7 +188,9 @@ def _streamed(chunks: Iterator[list[Batch | bytes | None]]) -> pa.RecordBatchRea
 
 def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:
     """The files a writer left under `target`, each by its path under the export, `prefix` and its
-    path under `target`, its bytes and digest; the names Spark, Hadoop and Arrow pass over as hidden
+    path under `target`, its bytes and digest, and the store's version of it where the store states one
+    (`store_version`), which a reader checks it is still at; the names Spark, Hadoop and Arrow pass over
+    as hidden
     (a part starting with `_` or `.`, as a `_SUCCESS` or a checksum's) left out, as their readers
     leave them out."""
     fs, directory = target.resolve()
@@ -198,8 +200,10 @@ def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:
         if any(part.startswith(("_", ".")) for part in PurePosixPath(relative).parts):
             continue
         payload = fs.cat_file(path)
+        version = store_version(fs.info(path))
         files.append({"path": f"{prefix}/{relative}", "bytes": len(payload),
-                      "sha256": hashlib.sha256(payload).hexdigest()})
+                      "sha256": hashlib.sha256(payload).hexdigest(),
+                      **({"version": version} if version else {})})
     return files
 
 

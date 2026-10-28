@@ -69,6 +69,18 @@ def object_info(payload: bytes | io.BufferedReader) -> ObjectInfo:
     return {"bytes": size, "sha256": digest.hexdigest()}
 
 
+def store_version(metadata: Mapping[str, object]) -> str | None:
+    """The version a store states for an object in its metadata (`fs.info`), named by what it is: GCS's
+    generation, an S3 version id, else an S3 or HTTP server's ETag; None where it states none, as this
+    host's disk and memory do. A writer records it beside a file's digest, and a reader checks the
+    object it opens is still at it (`Store.committed`)."""
+    for key in ("generation", "VersionId", "ETag", "etag"):
+        value = metadata.get(key)
+        if value not in (None, ""):
+            return f"{key.lower()}:{str(value).strip(chr(34))}"
+    return None
+
+
 def matching(found: ObjectInfo, expected: Mapping[str, object], url: str) -> None:
     """Refuse an object at `url` whose size and digest, `found`, are not what was committed for it."""
     if found["bytes"] != expected["bytes"] or found["sha256"] != expected["sha256"]:
@@ -417,6 +429,14 @@ class Readable(NamedTuple):
     root: str | None
 
 
+class CommittedRead(NamedTuple):
+    """Where a committed object's bytes are read (`Store.committed`), and the pin that holds its copy in
+    the transport's mirror while they are, None where it is read in place."""
+
+    readable: Readable
+    pin: BinaryIO | None
+
+
 @dataclass(frozen=True)
 class Store:
     """An object URL with compare-and-swap publication and verified uploads.
@@ -462,6 +482,48 @@ class Store:
                     depth = len(PurePosixPath(uri.path_in_repo).parts)
                     return Readable(LocalFileSystem(), held, str(Path(held).parents[depth - 1]))
         return Readable(fs, path, None)
+
+    def committed(self, entry: Mapping[str, object] | None) -> CommittedRead:
+        """Where this object's bytes are read as `entry` committed them (an export's manifest entry: its
+        bytes, its sha256, and the store's version where its writer read one, `store_version`): in place
+        where it is this host's disk or a Hub commit's file, which no store replaces, or where `entry`
+        states nothing; in place, checked at this open against the store's version it was committed
+        at, where `entry` holds one; its copy in the transport's mirror, checked whole against the
+        sha256 as it downloads (`BoundedFileCache`), where `entry` holds a sha256 alone, and refused
+        where the mirror cannot hold it, since a stream read unchecked could read an object replaced
+        since it was committed."""
+        place = self.readable()
+        if entry is None or local(place.fs) or self._immutable(place):
+            return CommittedRead(place, None)
+        version = entry.get("version")
+        if isinstance(version, str):
+            live = store_version(place.fs.info(place.path))
+            if live != version:
+                raise OSError(f"{self.url} changed since it was committed: the store states its version "
+                              f"is {live}, committed {version}")
+            return CommittedRead(place, None)
+        digest = entry.get("sha256")
+        if not isinstance(digest, str):
+            return CommittedRead(place, None)
+        fs, path = self.cached().resolve()
+        pin = fs.open(path, "rb", source_snapshot={"sha256": digest, "size": entry["bytes"]})
+        if not isinstance(pin, io.BufferedReader) or not isinstance(pin.name, str):
+            pin.close()
+            raise OSError(f"{self.url} is committed by its sha256 alone, which only its whole copy in the "
+                          "transport's mirror checks, and the mirror has no room for it: raise the mirror's "
+                          "max_bytes (the dewcache storage option, Cache's mirror_bytes), or export it again "
+                          "through Dew, which records the store's version")
+        return CommittedRead(Readable(LocalFileSystem(), pin.name, None), pin)
+
+    @staticmethod
+    def _immutable(place: Readable) -> bool:
+        """Whether `place` is a Hub repository's file at a commit, whose bytes no store replaces."""
+        if place.root is not None:
+            return True
+        if not isinstance(place.fs, HfFileSystem):
+            return False
+        revision = parse_hf_uri(f"hf://{place.path}").revision
+        return revision is not None and bool(REGEX_COMMIT_HASH.fullmatch(revision))
 
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):

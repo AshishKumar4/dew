@@ -12,9 +12,13 @@ from dew.data.storage import Store
 
 
 class TarRows(grain.IterDataset):
-    def __init__(self, url: str, storage_options: Mapping[str, object] | None = None):
+    """A tar shard's samples, read from the bytes its committed entry names where a manifest commits it
+    (`Store.committed`)."""
+
+    def __init__(self, url: str, storage_options: Mapping[str, object] | None = None,
+                 committed: Mapping[str, object] | None = None):
         super().__init__()
-        self.url, self.storage_options = url, storage_options
+        self.url, self.storage_options, self.committed = url, storage_options, committed
 
     def __iter__(self) -> grain.DatasetIterator:
         return _TarIterator(self)
@@ -26,9 +30,11 @@ class _TarIterator(grain.DatasetIterator):
         self.source = source
         self.position = 0
         self.pending: tuple[str, str, bytes] | None = None
-        fs, path = Store(source.url, source.storage_options).resolve()
+        read = Store(source.url, source.storage_options).committed(source.committed)
         self.opened = ExitStack()
-        self.file = self.opened.enter_context(fs.open(path, "rb"))
+        if read.pin is not None:
+            self.opened.enter_context(read.pin)
+        self.file = self.opened.enter_context(read.readable.fs.open(read.readable.path, "rb"))
         self.archive = self.opened.enter_context(tarfile.TarFile.open(fileobj=self.file, mode="r|*"))
         self.members = iter(self.archive)
 
