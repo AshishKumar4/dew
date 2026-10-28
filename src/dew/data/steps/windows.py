@@ -72,6 +72,12 @@ class WindowSource(View[TokenFiles]):
     def describe(self) -> str:
         return f"{self.source.describe()} causal windows={self.length},stride={self.stride}"
 
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, which a token budget divides into rows
+        (`dew.data.pipeline.TokenGeometry`)."""
+        return self.length
+
     def fingerprint(self) -> Mapping[str, object]:
         return {**self.source.fingerprint(), "window": self.length, "stride": self.stride}
 

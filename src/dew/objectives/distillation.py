@@ -152,6 +152,10 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         """The targets the student scores of the batch it reads."""
         return self.student.scored_tokens(batch)
 
+    def row_tokens(self, batch: Batch) -> int | None:
+        """The tokens each row of the batch the student reads holds."""
+        return self.student.row_tokens(batch)
+
     def inference_record(self) -> JSON:
         """The student's record: a saved distillation loads as the student it trained, on the
         student's own tree, the teacher and the projections left unread (`UNREAD`)."""

@@ -154,7 +154,17 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         passes = self.schema_in_context or self.model.context_encoder == "backbone"
         if not passes or "context_lengths" not in batch:
             return None
-        return np.asarray(batch["context_lengths"])
+        return self._row_contexts(batch)
+
+    def _row_contexts(self, batch: Batch) -> np.ndarray:
+        """Each packed row's own context length, in the order `real_lengths` counts the rows: its tokens
+        of the window's context (`context_segments`), or a window of one row's whole context."""
+        if "context_segments" not in batch:
+            return np.asarray(batch["context_lengths"])
+        segments = np.asarray(batch["segments"])
+        contexts = np.asarray(batch["context_segments"])
+        return np.concatenate([np.bincount(owned, minlength=int(window.max()) + 1)[1:]
+                               for window, owned in zip(segments, contexts, strict=True)])
 
     def _context_flops(self, model, batch: Batch) -> float:
         """The backbone's forward over each row's context, where it reads one in a pass of its own."""
@@ -162,13 +172,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         return 0.0 if lengths is None else counted_flops(model.backbone, lengths)
 
     def _cross_flops(self, model, batch: Batch) -> float:
-        """The backbone's cross-attention work over each window row's context: none where rows carry
-        none. A conditioned window holds one row (`bounds`), so its rows are the windows."""
+        """The backbone's cross-attention work over each packed row's own context (`_row_contexts`):
+        none where rows carry none."""
         if "context_lengths" not in batch:
             return 0.0
         backbone = model.backbone
         assert isinstance(backbone, CrossAttending)
-        return backbone.cross_flops(self.real_lengths(batch), np.asarray(batch["context_lengths"]))
+        return backbone.cross_flops(self.real_lengths(batch), self._row_contexts(batch))
 
     def _head_flops(self, model, batch: Batch) -> float:
         """Forward and training work read the same layout geometry and head capability."""
@@ -251,8 +261,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
         if isinstance(layout, QuestionLayout) and layout.labels is not None:
-            # A head that reads labels and was drawn with none reads the layout's, by this tokenizer.
-            head = head.labelled(layout.labels, tokenizer)
+            # A head that reads labels and was drawn with none reads the layout's, by this tokenizer, the
+            # one its rows are laid out by, which names them where the layout names none.
+            head, labels = head.labelled(layout.labels, tokenizer)
+            layout = dataclasses.replace(layout, labels=labels)
         self.model = DecisionModel(module, head, context_encoder or "table")
         if layout is None:
             if not isinstance(module, TokenModel):
@@ -319,10 +331,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     @functools.cached_property
     def bounds(self) -> Bounds:
         """The most rows, questions and options a window packs (`Layout.bounds`),
-        at most `segments` rows, and one where rows carry a context: a backbone's
-        cross-attention reads one context a window row, the row's own."""
+        at most `segments` rows; rows that carry a context pack as any do, each reading its own
+        (`DecisionInputs.context_segments`)."""
         bounds = self.layout.bounds(self.tokenizer, self.specials, self.context_length)
-        most = 1 if self.context_length is not None else self.segments
+        most = self.segments
         if most is None:
             return bounds
         return dataclasses.replace(bounds, segments=min(most, bounds.segments))
