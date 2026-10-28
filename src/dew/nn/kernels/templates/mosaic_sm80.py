@@ -207,7 +207,8 @@ class Mma(mosaic.Family):
                 # Unoptimized, as `copied`'s transfers: JAX 0.12 takes an unflagged store as optimized-only,
                 # which its layout inference searched to exhaustion beside the ladder's copies (ns-gate3).
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
-                mosaic.store_rows(smem, ref, *place, copy=mosaic.copied)
+                mosaic.store_rows(smem, ref, *place, copy=mosaic.copied,
+                                  widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
             @plgpu.nd_loop(tiles, collective_axes=axis)
             def _(loop: plgpu.NDLoopInfo):
@@ -281,7 +282,8 @@ class Mma(mosaic.Family):
                 mosaic.copied(smem, view)
                 continue
             rows = smem.shape[0]
-            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.copied)
+            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.copied,
+                              widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
         # Element-wise atomic adds into global memory (`red.global`; no TMA reduction before Hopper), so

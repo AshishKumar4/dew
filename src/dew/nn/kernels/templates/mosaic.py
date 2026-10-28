@@ -183,11 +183,22 @@ def stored(parts, views, *, smem, wait: bool = True) -> None:
 
 
 def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
-               copy: Callable = plgpu.copy_smem_to_gmem) -> None:
+               copy: Callable = plgpu.copy_smem_to_gmem, widest: int | None = None) -> None:
     """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a
     power-of-two ladder of static-size `copy`s (a TMA store's descriptor has static extents; `copied`
-    moves the rows through registers where a GPU has no TMA), the largest `most` rows'."""
+    moves the rows through registers where a GPU has no TMA), the largest `most` rows'; with `widest`, in
+    copies of at most `widest` rows, whole ones first (a copy through registers holds its rows:
+    `resources.copied_rows`)."""
     start, size = first, most
+    if widest is not None and widest < most:
+        for whole in range(most // widest):
+            @pl.when(stored // widest > whole)
+            def _(whole=whole):
+                copy(o_smem.at[pl.ds(first + whole * widest, widest)],
+                     o_gmem.at[pl.ds(row_start + first + whole * widest, widest),
+                               pl.ds(column, o_smem.shape[1])])
+
+        start, size = first + stored // widest * widest, widest - 1
     while size:
         rung = 1 << int(math.log2(size))
         size //= 2
