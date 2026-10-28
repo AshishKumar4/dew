@@ -733,9 +733,11 @@ class DeepseekV4Attention(FakeQuantizing):
         cache = None
         append = None
         if decode:
-            # The window's shared key head is the attention cache's keys and its values, one head.
+            # The window's shared key head is the attention cache's keys and its values, one head, kept once
+            # where the layout stores it as given (`keys_as_values`).
             shape = jax.ShapeDtypeStruct((batch, length, 1, self.head_dim), x.dtype)
-            slots, append = open_kv_cache(self, shape, self.max_seq_len, valid=valid, layout=self.kv_cache)
+            slots, append = open_kv_cache(self, shape, self.max_seq_len, valid=valid, layout=self.kv_cache,
+                                          keys_as_values=True)
             cache = (slots, self.max_seq_len, append.allocated)
             if positions is None:
                 positions = slots
@@ -856,9 +858,11 @@ class DSparkAttention(DeepseekV4Attention):
         main = store.get(DRAFT_CONTEXT)
         batch = x.shape[0]
         if decode:
-            # The target's context in the window cache's layout, one shared head as its keys and values;
-            # a call without context reads it and writes nothing.
-            held = KVStore.open(self, self.kv_cache, batch, self.max_seq_len, 1, self.head_dim, x.dtype)
+            # The target's context in the window cache's layout, one shared head as its keys and values,
+            # kept once where the layout stores it as given; a call without context reads it and writes
+            # nothing.
+            held = KVStore.open(self, self.kv_cache, batch, self.max_seq_len, 1, self.head_dim, x.dtype,
+                                keys_as_values=True)
             if main is not None:
                 slots, allocated = cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
                 if allocated:
