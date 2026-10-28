@@ -13,7 +13,6 @@ import logging
 import math
 import re
 from collections.abc import Mapping, Sequence
-from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -78,7 +77,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     and 4 x 32 run faster merged. The boundary includes 128, so no step runs
     slower than XLA's default, and 1 x 128 gives up the 1.6 ms it would gain apart.
 
-    Only an LM objective gives the tokens per row, its `seq_len`, so any other
+    Only an objective whose rows hold tokens gives them (`Objective.row_tokens`), so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
     `gpu_target().kernels['xla_triton_gemm']` measured a win and no module the step runs
     keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
@@ -166,11 +165,6 @@ def split_share(params: Variables) -> float:
     return split / total if total else 0.0
 
 
-@runtime_checkable
-class _TokenRows(Protocol):
-    seq_len: int | None
-
-
 def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: Batch, variables: Variables,
                                   mesh: Mesh) -> jax.stages.CompilerOptions | None:
     """The options a step over microbatches of `micro` on `mesh` compiles with
@@ -182,12 +176,10 @@ def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: 
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:
-    """The tokens one device steps of `batch`, split over `shards` row shards,
-    or infinity. An `Objective` declares no tokens in a row, since images and
-    pairs have no context, so the trainer reads it at this boundary: LM
-    objectives name theirs `seq_len`. Rows are counted only then, so another
-    objective's batch, one that holds no rows among them, is never asked."""
-    per_row = objective.seq_len if isinstance(objective, _TokenRows) else None
+    """The tokens one device steps of `batch`, split over `shards` row shards, or infinity where its
+    rows hold no token geometry (`Objective.row_tokens`), an image's. Rows are counted only then, so
+    another objective's batch, one that holds no rows among them, is never asked."""
+    per_row = objective.row_tokens(batch)
     return math.inf if per_row is None else rows_of(batch) // shards * per_row
 
 

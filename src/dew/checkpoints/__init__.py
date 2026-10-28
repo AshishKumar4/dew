@@ -107,6 +107,9 @@ if TYPE_CHECKING:
 type StateLeaf = (jax.Array | np.ndarray | Variables | optax.OptState
                   | DynamicScale | Accumulation | None)
 
+Resume = Literal["auto", "require", "never"]
+"""Whether a run continues its directory's latest checkpoint (`Checkpoints.resumed`)."""
+
 FROZEN_STORE = "frozen"
 """The directory beside the steps that holds every variables collection but
 `params` once, under the digest of its content (`_digest`). A step records
@@ -1483,6 +1486,20 @@ class Checkpoints:
         if persistent is None or local is None:
             return local if persistent is None else persistent
         return max(persistent, local)
+
+    def resumed(self, resume: Resume = "auto") -> int | None:
+        """The step a run continues under `resume`, the `latest`, or None where it starts afresh:
+        "auto" continues one where the directory holds it; "require" refuses a directory with none,
+        so a job that must continue never trains from scratch; "never" refuses one that holds a run,
+        which a run started afresh would write beside."""
+        latest = self.latest
+        if resume == "require" and latest is None:
+            raise ValueError(f"resume='require' continues a run, and {self.directory} holds no checkpoint "
+                             "to continue")
+        if resume == "never" and latest is not None:
+            raise ValueError(f"resume='never' starts a run afresh, and {self.directory} holds one at step "
+                             f"{latest}; give the new run a directory of its own")
+        return latest
 
     @property
     def best(self) -> int | None:

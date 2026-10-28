@@ -259,6 +259,12 @@ class PackedSource(View[Source]):
     def describe(self) -> str:
         return f"{self.source.describe()} {self.plan.kind} packing={self.plan.pack!r}"
 
+    @property
+    def max_length(self) -> int:
+        """The inputs each window of the pack holds (`Pack.max_length`), which a token budget divides
+        into rows (`dew.data.pipeline.TokenGeometry`)."""
+        return self.plan.pack.max_length
+
     def consumed(self, read: Read) -> PackedSource:
         documents = _consumed(self.source, "indexed" if read == "streamed" else read)
         plan = dataclasses.replace(self.plan, source=documents) if isinstance(self.plan, _Held) else self.plan

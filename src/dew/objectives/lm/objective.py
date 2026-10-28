@@ -1,9 +1,10 @@
 """The autoregressive language-modelling objective.
 
 It trains next-token prediction over packed token ids. A batch row holds
-`seq_len + 1` ids; the model sees all but the last, and the targets are the
-same row shifted by one. The causal mask is in the backbone, so this module
-does not need to know how the model hides the future from a prediction.
+`seq_len + 1` ids, or as many as its chain lays out within the model's context;
+the model sees all but the last, and the targets are the same row shifted by
+one. The causal mask is in the backbone, so this module does not need to know
+how the model hides the future from a prediction.
 
 Cross entropy is computed in float32 even when the model runs in bfloat16,
 because a bf16 logsumexp over a large vocabulary loses enough precision to
@@ -27,6 +28,7 @@ prompt once per event.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
@@ -69,6 +71,7 @@ from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import (
+    Bounded,
     CountedLogits,
     CountedLogitsTraining,
     CountedPredictions,
@@ -77,6 +80,7 @@ from dew.nn.protocols import (
     DecoderTraining,
     Lacks,
     LayerStates,
+    PositionCapacity,
     SteppedInContext,
     TokenModel,
     head_table,
@@ -441,9 +445,9 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
     It holds the decoder (`model`, a loaded source among them, with
     `variables` and `processor` overriding its own through
-    `Objective.bind_model`), the row length `seq_len`, and how the head is
-    scored: `head_chunks` and `head_tile`, the head policy every token objective takes
-    (`dew.objectives.lm.head`; `LMObjective` describes each).
+    `Objective.bind_model`), the row length `seq_len`, which a batch's rows may exceed up to the
+    model's own context (`context`), and how the head is scored: `head_chunks` and `head_tile`, the
+    head policy every token objective takes (`dew.objectives.lm.head`; `LMObjective` describes each).
     `samples` draws previews. `balance` trains the routers of a mixture as
     `ExpertBalance` describes (`dew.objectives.routing`), which every scorer
     composes. A loss built on it keeps no average unless it sets `ema`;
@@ -499,10 +503,18 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         _check_reads(model)
         self.model = model
         self.seq_len = seq_len
+        # A row longer than its positions cover would read past a learned table, which clamps silently.
+        capacity = model.position_capacity if isinstance(model, PositionCapacity) else None
+        if capacity is not None and seq_len > capacity:
+            raise ValueError(f"{seq_len}-token rows read past the {capacity} places {type(model).__name__}'s "
+                             "positions cover")
+        # A schedule's later stage may read longer rows, up to what the model declares it holds.
+        declared = model.max_seq_len if isinstance(model, Bounded) else None
+        self.context = seq_len if declared is None else max(seq_len, declared)
         self.use_head(head_chunks, head_tile)
         self.samples = samples
         self.balance = balance
-        self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
+        self.inputs = InputSpec(sample=Field(TEXT_KEY, (self.context + 1,), variable_axes=(0,)))
         if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
 
@@ -546,6 +558,14 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def scored_tokens(self, batch: Batch) -> np.ndarray:
         """Each row's targets the loss scores (`scored_targets`), its `loss_role`'s alone."""
         return self._prediction_lengths(batch)
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """Each row's targets, of the ids under the field the scorer reads (`inputs`): every sequence a
+        row holds (a preference pair's two) has one fewer than its ids."""
+        if self.inputs is None:
+            return None
+        *sequences, ids = self.inputs.sample.held(batch)
+        return math.prod(sequences) * (ids - 1)
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real input lengths, each packed document its own attention square.
@@ -972,11 +992,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return real.astype(dtype)
 
     def _rows(self, tokens) -> tuple[jax.Array, jax.Array]:
-        """Split a `[B, seq_len + 1]` batch into its inputs and shifted targets."""
-        if tokens.shape[-1] != self.seq_len + 1:
+        """Split a `[B, n + 1]` batch into its `n` inputs and their shifted targets, each batch at its
+        own row length, as a schedule's stages lay theirs out, up to the objective's `context`."""
+        if tokens.shape[-1] > self.context + 1:
             raise ValueError(
-                f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
-                f"so the targets can be the shifted input, got {tokens.shape[-1]}")
+                f"rows of {tokens.shape[-1]} ids hold {tokens.shape[-1] - 1} inputs, more than the "
+                f"{self.context}-token context of the objective's seq_len and the model's max_seq_len")
         return tokens[:, :-1], tokens[:, 1:]
 
     def preview(self, params, batch, step: Step, *, scored=None):
@@ -1014,7 +1035,9 @@ def _steps_in_context(model) -> bool:
 class LMObjective(TokenScorer):
     """Trains a next-token model with shifted cross entropy, teacher-forced scoring and optional previews.
 
-    `LMObjective(model, seq_len, ...)` scores `seq_len`-token rows. Every
+    `LMObjective(model, seq_len, ...)` scores `seq_len`-token rows, and the rows a chain lays out
+    itself at another length up to the model's `max_seq_len`, as the stages of a context-extension
+    schedule do (8k-token rows, then 64k), each length compiled once. Every
     auxiliary term below is off until its argument is set; the other options
     trade memory for time.
 
@@ -1224,11 +1247,11 @@ class LMObjective(TokenScorer):
         elif self.prefix is not None:
             blocks = (Blocks(prefix=self.prefix, fills=True),)
         if self.loss_role is None and self.pad_id is None and self.prefix is None:
-            return ObjectiveData(train=(geometry,), evaluate=(geometry,))
+            return ObjectiveData(geometry=geometry)
         counted = CountTargets(
             role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id
         )
-        return ObjectiveData(train=(*blocks, counted, geometry), evaluate=(*blocks, counted, geometry))
+        return ObjectiveData(train=(*blocks, counted), evaluate=(*blocks, counted), geometry=geometry)
 
     def _indexer_term(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[jax.Array, jax.Array]:
         """Sum the batch's indexer KL over the layers that sowed one, with
