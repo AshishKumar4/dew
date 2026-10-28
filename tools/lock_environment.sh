@@ -13,7 +13,8 @@ set -eu
 RESOLVED=2026-10-12T00:00:00Z
 # Dew's own FlashAttention wheels resolve as they stood when 0.3.6 was published, past the pins the
 # locks hold (-P); nothing else moves. jax itself, which constraints.txt pins to one build of Dew's package
-# index, takes no date: that index's static pages give no upload times, which a date would need.
+# index, and qwix, which the quantization extra pins to another, take no date: that index's static pages give
+# no upload times, which a date would need.
 FLASH=2026-10-27T07:29:32Z
 # jaxlib and its CUDA plugins resolve as they stood when 0.12.0.1 was published, which the jax build Dew
 # carries its patches on pins exactly; nothing else moves.
@@ -30,7 +31,8 @@ lock() {
   uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
     --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
-    --exclude-newer-package jax=false --exclude-newer-package "certifi=$CERTIFI" -P certifi --emit-index-url \
+    --exclude-newer-package jax=false --exclude-newer-package qwix=false \
+    --exclude-newer-package "certifi=$CERTIFI" -P certifi --emit-index-url \
     $(for package in jaxlib jax-cuda12-plugin jax-cuda12-pjrt jax-cuda13-plugin jax-cuda13-pjrt libtpu; do
       echo --exclude-newer-package "$package=$JAXLIB" -P "$package"; done) \
     $(for package in openenv daytona daytona-api-client daytona-api-client-async daytona-toolbox-api-client \
