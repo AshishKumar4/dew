@@ -143,7 +143,7 @@ def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
             if name not in (*CALLS, "custom_jvp_call", "custom_vjp_call") or not all(
                     _axis_free(inner, shape) for inner in nested):
                 return False
-        elif name not in ENTRYWISE and not (name == "broadcast_in_dim" and eqn.invars[0].aval.shape == ()):
+        elif name not in ENTRYWISE and not (name == "broadcast_in_dim" and _rank(eqn.invars[0]) == 0):
             return False
     return True
 
