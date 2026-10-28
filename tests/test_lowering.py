@@ -509,9 +509,9 @@ def _squeezed(shape) -> tuple[int, ...]:
 
 
 def _template_launches(policy) -> int:
-    """The recurrence template's Mosaic GPU calls in a bf16 gated delta net's forward and gradient, lowered for
-    an assumed H100 (whose training cell the template takes), the loss under the remat rung `policy`
-    (`decoder_block.RematPolicy`; None, none)."""
+    """The recurrence template's Mosaic GPU calls in a bf16 gated delta net's forward and gradient,
+    lowered for an assumed H100 (whose training cell the template takes), the loss under the remat rung
+    `policy` (`decoder_block.RematPolicy`; None, none)."""
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.linear import GatedDeltaNet
 
