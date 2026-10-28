@@ -17,6 +17,7 @@ import dataclasses
 import datetime
 import functools
 import logging
+import os
 import sys
 import time
 import types
@@ -44,7 +45,7 @@ from dew._records import JSON, boolean, json_value, record
 from dew.batch import FROZEN, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking, Resume
 from dew.cleanup import attempted
-from dew.data.compile import Handed, fitted
+from dew.data.compile import Handed
 from dew.data.dataset import (
     Closeable,
     DataPartition,
@@ -109,7 +110,7 @@ from dew.objectives.base import (
 from dew.optim import clips_qk, held_rates, learning_rate, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts, count_compilation_cache
+from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
     AxisLink,
@@ -134,7 +135,7 @@ from dew.training._fit import (
     waited_read,
 )
 from dew.training._lowering import Lowered, Routed, routed
-from dew.training.budget import Pause, Plateau, run_length, run_steps, run_tokens
+from dew.training.budget import Pause, Plateau
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
@@ -195,6 +196,7 @@ from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
+from dew.training.startup import Startup, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     COMMIT_FIELDS,
@@ -1244,6 +1246,7 @@ class Trainer(Generic[Loss, Effects]):
         checkpoint_final: bool = True,
         metrics: Sequence[Metric] = (),
         preview: bool = False,
+        scored_to: str | os.PathLike[str] | None = None,
         best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
         stop: Plateau | Pause | None = None,
         validation: HandedSplits | None = None,
@@ -1293,32 +1296,25 @@ class Trainer(Generic[Loss, Effects]):
         the program with status 143 unless caught. Run it again and fit resumes from there.
 
         Previews are generated only when `preview=True` and a tracker receives them; scalar reporting never
-        triggers preview work. `observe` takes values of the state at a cadence of its own while the run
-        trains (`Observe`). `device_prefetch` training batches are placed on the devices ahead of the step,
-        which the step's memory plan holds room for. The process is readied first
+        triggers preview work. `scored_to`, a directory, takes every validation batch's scoring artifacts at
+        each evaluation, `<scored_to>/step-<step>/<split>-<batch>.npz` (`Evaluation.run`). `observe` takes
+        values of the state at a cadence of its own while the run trains (`Observe`). `device_prefetch`
+        training batches are placed on the devices ahead of the step, which the step's memory plan holds
+        room for. The process is readied first
         (`dew.training.runtime.ready_process`), as `prepare_process` readies it: a program that never called
         that gets Dew's log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
-        # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
-        run_length(steps, epochs, tokens, examples, required=False)
-        ready_process()
-        loader, validation = fitted(dataset, handed_splits(validation), objective=self.objective.data(),
-                                    examples=examples)
-        tokens = run_tokens(loader, tokens, counts_tokens=self.objective.counts_tokens)
+        self._startup = Startup()
+        loader, held, tokens, steps = run_data(
+            self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
+            examples=examples, accumulation=self.accumulation, startup=self._startup)
         self._device, self._prefetch = loader.device, device_prefetch
-        steps = run_steps(loader, steps, epochs, tokens, self.accumulation, examples)
-        count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
-        written = log_every, eval_every, checkpoint_every
-        logged, evaluated, saved, local, suites = FitPlan.cadences(
-            loader, validation, metrics, steps, tokens, self.accumulation, written, self.checkpoints)
-        declared = declarations(suites, metrics, summaries, loss=self.objective.defines_validation_loss)
-        selection, plateau, pause = fit_policies(self.objective, best, stop, declared, saved, steps=steps,
-                                                 tokens=tokens, accumulation=self.accumulation,
-                                                 checkpointed=self.checkpoints is not None)
-        self._preflight(loader, plateau, suites, preview=preview, stated=dataset,
-                        loss=(self.checkpoints is not None or restore_best) and not selection)
-        preview = preview and self.tracker is not None
+        plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
+                          written=(log_every, eval_every, checkpoint_every),
+                          checkpoint_final=checkpoint_final, metrics=metrics, preview=preview,
+                          scored_to=scored_to, best=best, stop=stop, summaries=summaries,
+                          restore_best=restore_best, observe=observe, cooldowns=cooldowns)
         run = FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
         self._display = TrainingDisplay()
@@ -1327,14 +1323,6 @@ class Trainer(Generic[Loss, Effects]):
         # owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
-            plan = FitPlan(
-                dataset=loader, steps=steps, log_every=logged, eval_every=evaluated, tokens=tokens,
-                checkpoint_every=saved, checkpoint_final=checkpoint_final, local_every=local,
-                metrics=metrics, preview=preview, best=selection, stop=plateau, suites=suites, pause=pause,
-                held_best=restore_best and checkpoints is None, observe=observe, summaries=tuple(summaries),
-                declared=declared, branches=() if cooldowns is None else cooldowns.branches(
-                    steps, tokens, self.accumulation),
-            )
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state, resume)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
             trained = dataclasses.replace(trained, compute=None)
@@ -1350,6 +1338,35 @@ class Trainer(Generic[Loss, Effects]):
         if run.preempted is not None:
             raise Preempted(run.preempted)
         return trained
+
+    def _plan(self, loader: Loader, held: Mapping[str, Reader | EvalSuite] | None,
+              dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
+              written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
+              checkpoint_final: bool, metrics: Sequence[Metric], preview: bool,
+              scored_to: str | os.PathLike[str] | None,
+              best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None,
+              stop: Plateau | Pause | None, summaries: Sequence[Summary], restore_best: bool,
+              observe: Observe | None, cooldowns: Cooldowns | None) -> FitPlan:
+        """What `fit` was asked for over its compiled data: its cadences resolved against the run's
+        length (`FitPlan.cadences`), its scores declared, its best and stop policies, and its refusals
+        made before anything is placed (`_preflight`)."""
+        logged, evaluated, saved, local, suites = FitPlan.cadences(
+            loader, held, metrics, steps, tokens, self.accumulation, written, self.checkpoints)
+        declared = declarations(suites, metrics, summaries, loss=self.objective.defines_validation_loss)
+        selection, plateau, pause = fit_policies(self.objective, best, stop, declared, saved, steps=steps,
+                                                 tokens=tokens, accumulation=self.accumulation,
+                                                 checkpointed=self.checkpoints is not None)
+        self._preflight(loader, plateau, suites, preview=preview, stated=dataset,
+                        loss=(self.checkpoints is not None or restore_best) and not selection)
+        return FitPlan(
+            dataset=loader, steps=steps, log_every=logged, eval_every=evaluated, tokens=tokens,
+            checkpoint_every=saved, checkpoint_final=checkpoint_final, local_every=local,
+            metrics=metrics, preview=preview and self.tracker is not None, best=selection, stop=plateau,
+            suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
+            held_best=restore_best and self.checkpoints is None, observe=observe, summaries=tuple(summaries),
+            declared=declared,
+            branches=() if cooldowns is None else cooldowns.branches(steps, tokens, self.accumulation),
+        )
 
     def _schedule(self, updates: int | None) -> None:
         """The configured optimizer, built for `updates` updates; its state holds the rate it logs."""
@@ -1414,13 +1431,15 @@ class Trainer(Generic[Loss, Effects]):
                         checked = self._model_shapes(device) if self._device else device
                     agreed("training input declaration", functools.partial(inputs.check, checked))
                 known, began = len(compiled), time.perf_counter()
-                train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
+                with self._startup.phase("compile", "compiling the step", when=not known):
+                    train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
                     signature = batch_signature(device)
                     run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
                 if len(compiled) > known:
-                    self._warm_evaluations(plan, state, shardings, first=not known)
+                    with self._startup.phase("warm", "warming the evaluations", when=not known):
+                        self._warm_evaluations(plan, state, shardings, first=not known)
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
@@ -2063,7 +2082,8 @@ class Trainer(Generic[Loss, Effects]):
             loss = ((ranks or self.objective.defines_validation_loss)
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
-                                              loss=loss, split=split, training=reports, warm=warm))
+                                              loss=loss, split=split, training=reports, warm=warm,
+                                              scored_to=plan.scored_to))
         scores = {**(joined or {}),
                   **{name: value for report in evaluations for name, value in report.scores.items()}}
         # Each summary is formed once a step, here, by the evaluation that completes the splits it weighs.
@@ -2294,6 +2314,7 @@ class Trainer(Generic[Loss, Effects]):
                 scalars["train/rollout_seconds"] = counts.rollout_seconds
                 scalars.update({f"rollout/{name}": float(value) for name, value in read.rollout.items()})
             scalars.update(read.statistics)
+            scalars.update(self._startup.scalars())
             self._display.interval(taken.step, scalars)
             if self.tracker is not None:
                 self.tracker.log(scalars, taken.step)
@@ -2322,7 +2343,8 @@ class Trainer(Generic[Loss, Effects]):
             def report_goodput() -> None:
                 if jax.process_index() == 0:
                     wall = time.perf_counter() - run.started
-                    scalars = goodput(wall, run.first_step, run.other)
+                    # A run that logged no step reports its start here (`Startup.scalars`).
+                    scalars = {**goodput(wall, run.first_step, run.other), **self._startup.scalars()}
                     self._display.summary(run.current, wall, scalars,
                                           None if run.loss is None else float(jax.device_get(run.loss)))
                     if self.tracker is not None:
@@ -2376,6 +2398,7 @@ class Trainer(Generic[Loss, Effects]):
         split: str = "val",
         training: Mapping[str, jax.Array] | None = None,
         warm: bool = False,
+        scored_to: str | None = None,
     ) -> Evaluation:
         """Score the validation split with this state's variables and report
         it, returning the seconds it took: the run's, but not its steps',
@@ -2407,7 +2430,8 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, params, reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep * self.accumulation // state.window_size,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
-                warm=warm, updates=state.updates)
+                warm=warm, updates=state.updates,
+                scored_to=None if scored_to is None else os.path.join(scored_to, f"step-{int(state.step)}"))
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.

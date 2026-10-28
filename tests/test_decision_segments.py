@@ -118,9 +118,9 @@ def test_a_question_row_refuses_a_part_it_cannot_render(part):
     when the layout is built, its own parts alone built (row 1943)."""
     own = (Instructions(HEADERS), OptionLines(), State(render="state"), AnswerCue())
     labels = Labels(variants=("{}",))
-    StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8, labels=labels, segments=own)
+    StateFirstLayout(max_len=256, labels=labels, segments=own)
     with pytest.raises(ValueError):
-        StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8, labels=labels, segments=(*own, part))
+        StateFirstLayout(max_len=256, labels=labels, segments=(*own, part))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -206,6 +206,44 @@ def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_be
                                   today(EXAMPLES[0].state, asked)["team"].probabilities)
     with pytest.raises(ValueError):
         Decide.from_run(str(tmp_path / "unread"))
+
+
+def test_an_earlier_record_of_a_segmented_question_layout_loads_without_the_budgets_it_ignored(tmp_path):
+    """A run of a lettered question layout of segments, saved as an earlier Dew saved it, its record
+    holding the question budgets it wrote at their defaults (192 and 48) and its rows ignored, loads
+    through the pinned run boundary (`earlier_shapes`) and answers as the run of today's record does,
+    where a layout of segments now refuses a budget it would not apply (row 2006)."""
+    import numpy as np
+    import optax
+    from decision_support import decision_rows
+    from test_decision_objective import EXAMPLES, INTENT, tiny_backbone
+
+    from dew.checkpoints import Checkpoints
+    from dew.decision import Decide, DecisionObjective
+    from dew.decision.head import LabelReadout
+    from dew.training import Trainer
+
+    labels = Labels(names=("A", "B", "C"), variants=("{}",))
+    segments = (Instructions(HEADERS), OptionLines(), State(render="state"), AnswerCue())
+    layout = StateFirstLayout(max_len=256, labels=labels, segments=segments)
+    head = LabelReadout(32, labels.ids(TOKENIZER, 3))
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, head=head)
+    state = Trainer(objective, optax.adam(1e-3), key=0).fit(
+        decision_rows(EXAMPLES, 8, objective=objective.data()), steps=1, log_every=100)
+    record = objective.inference_record()
+    assert isinstance(record, dict)
+    written = {**record["layout"]["fields"], "head_max_len": 192, "option_tokens": 48}
+    earlier = {**record, "layout": {**record["layout"], "fields": written}}
+    for name, artifact in (("today", record), ("earlier", earlier)):
+        with Checkpoints(str(tmp_path / name)) as checkpoints:
+            checkpoints.save(1, state, artifact=artifact)
+            checkpoints.wait()
+    today, loaded = (Decide.from_run(str(tmp_path / name)) for name in ("today", "earlier"))
+    assert loaded.layout == today.layout
+    asked = {"team": INTENT}
+    np.testing.assert_array_equal(loaded(EXAMPLES[0].state, asked)["team"].probabilities,
+                                  today(EXAMPLES[0].state, asked)["team"].probabilities)
 
 
 def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():

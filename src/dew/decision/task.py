@@ -23,6 +23,8 @@ from dew._records import JSON, json_value, record
 from dew.batch import Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
+from dew.data.mixing import CorpusCounts
+from dew.data.pipeline import Refused, cut_counts, cut_unit
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import (
     BUCKET_MINIMUM,
@@ -115,26 +117,30 @@ class Weights:
 
 @dataclass(frozen=True)
 class Usage:
-    """What a request cost: the tokens every question row read, and how much of the state the rows kept.
-
-    The kept share is the smallest any question kept. `trimmed` says whether a
-    row shortened a question's instructions or options to fit.
-    """
+    """What a request cost: the tokens every question row read, how much of the state the rows kept,
+    the smallest share any question kept, and each cut by what it cut, the rows it shortened and the
+    tokens it removed, as training counts a row's cuts (`cut_counts`)."""
 
     input_tokens: int
     state_tokens: int
     state_kept: int
-    trimmed: bool = False
+    cut: Mapping[str, tuple[int, int]] = field(default_factory=dict)
 
     @property
     def truncated(self) -> bool:
         return self.state_kept < self.state_tokens
 
+    @property
+    def trimmed(self) -> bool:
+        """Whether a row's declared budgets cut a question's instructions or options."""
+        return "instructions" in self.cut or "options" in self.cut
+
 
 def usage_of(rows: Sequence[Encoded]) -> Usage:
-    """What a request's `rows` cost: their tokens, the state's, and the least of it any row kept."""
+    """What a request's `rows` cost: their tokens, the state's, the least of it any row kept, and each
+    cut's rows and tokens."""
     return Usage(sum(len(row.tokens) for row in rows), max((row.state_tokens for row in rows), default=0),
-                 min((row.state_kept for row in rows), default=0), any(row.trimmed for row in rows))
+                 min((row.state_kept for row in rows), default=0), cut_counts(row.cuts for row in rows))
 
 
 @dataclass(frozen=True)
@@ -500,9 +506,11 @@ class Decide(SavedRunTask):
         rows = with_context(self.layout.rows(self.tokenizer, self.specials, state, questions, media=media),
                             self.tokenizer, context, self.context_length)
         for row in rows:
+            # A row whose declared budgets cut its options alike is answered as its release answers it,
+            # the cut in its usage; training leaves such a row out (`Layout.refusal`).
             if not self.layout.fits(row):
-                raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
-                                 f"the maximum context length, max_len={self.layout.max_len}")
+                raise Refused("unfit", f"the question needs {len(row.tokens)} tokens besides the state, more "
+                                       f"than the maximum context length, max_len={self.layout.max_len}")
         self.model.head.validate_rows(rows)
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
@@ -798,7 +806,9 @@ class Decide(SavedRunTask):
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
         if details:
             reported.update(state_tokens=usage.state_tokens, state_kept=usage.state_kept,
-                            truncated=usage.truncated)
+                            truncated=usage.truncated,
+                            cut={kind: {"rows": rows, "removed": removed, "unit": cut_unit(kind)}
+                                 for kind, (rows, removed) in usage.cut.items()})
         return {"model": self.name,
                 "answers": {name: _wire(questions[name], answer, details=details, gated=gated)
                             for name, answer in answers.items()},
@@ -840,20 +850,31 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
     details: bool = False
     strict: bool = False
     whole: bool = False
+    counts: CorpusCounts = field(default_factory=lambda: CorpusCounts("served", "served"), compare=False)
+    """What the task admitted and refused, as a run's data counters count its rows (`CorpusCounts`):
+    each request it answers, cut short where any row's state was, and each cut's rows and tokens;
+    each it refuses under its reason (`Refused`), `unfit`, `options_alike`, or `cut` under `whole`. A
+    server reads them as a run reads its own (`CorpusCounts.metrics`)."""
 
     def admit(self, request: Mapping[str, object]) -> scoring.Scored[_Row, _Admitted]:
         decide = self.decide
         state, questions, images, context = decide._read_wire(request, strict=self.strict)
-        if images:
-            row, media = decide._shown(state, questions, images, context)
-            rows = (_Row(row, media),)
-        else:
-            rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
+        try:
+            if images:
+                row, media = decide._shown(state, questions, images, context)
+                rows = (_Row(row, media),)
+            else:
+                rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
+        except Refused as refused:
+            self.counts.rejected[refused.reason] += 1
+            raise
         usage = usage_of([row.encoded for row in rows])
         if self.whole and (usage.truncated or usage.trimmed):
+            self.counts.rejected["cut"] += 1
             cut = "state" if usage.truncated else "instructions or options"
-            raise ValueError(f"the request does not fit the maximum context length, max_len="
-                             f"{decide.layout.max_len} tokens, without cutting its {cut}")
+            raise Refused("cut", f"the request does not fit the maximum context length, max_len="
+                                 f"{decide.layout.max_len} tokens, without cutting its {cut}")
+        self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
         return scoring.Scored(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
 
     def fits(self, rows: Sequence[_Row]) -> bool:

@@ -2,15 +2,17 @@
 (`Fit`), encoded with their augmentations (`Encoding`), packed into windows (`PackedRows`), and the
 fields a row carries (`TRAINING_FIELDS`); `DecisionObjective.data` assembles them."""
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+import collections
+import hashlib
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 
 import grain.python as pygrain
 import numpy as np
 
 from dew._records import integer, record
 from dew.batch import Batch
-from dew.data.pipeline import Pack, Rejected
+from dew.data.pipeline import Pack, Rejected, composed, cut_counts
 from dew.data.text import Tokenizer
 from dew.decision.data import Example, GroupedExamples
 from dew.decision.head import Head
@@ -24,6 +26,7 @@ from dew.decision.layout import (
     QuestionLayout,
     Specials,
     compacted,
+    context_tokens,
     labelled_rows,
     question_fields,
     question_owners,
@@ -70,8 +73,27 @@ class Encoding:
     """Whether each row carries its questions' consistency groups (`_grouped`), an objective with a
     consistency term's rows; every row then carries them, an example of none with none in each."""
 
+    def _rows(self, example: Example, asked: Mapping[str, Question], rng: np.random.Generator | None,
+              tokens: np.ndarray | None) -> list[Encoded]:
+        """The rows of `asked` as this read lays them out, a choice's options in a fresh order where it
+        shuffles them."""
+        orders = (
+            {
+                name: [int(slot) for slot in rng.permutation(len(question.options))]
+                for name, question in asked.items()
+                if isinstance(question, Choice)
+            }
+            if rng is not None and self.shuffle
+            else None
+        )
+        return self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
+                                tokens=None if tokens is None else tokens.tolist())
+
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
                  tokens: np.ndarray | None = None, group_of: "GroupOf | None" = None) -> Batch:
+        """The row of `example`'s questions `names` as this read lays it out: a "none of the above" this
+        read draws stands where its row is one a run trains on (`Layout.refusal`), and a draw that
+        would leave its row unfit, or its options alike, lays the questions out as Fit admitted them."""
         labels = example.labels()
         if rng is not None and self.shuffle and self.layout.joint:
             names = [names[int(index)] for index in rng.permutation(len(names))]
@@ -98,17 +120,14 @@ class Encoding:
             asked[name] = question
             if gold is not None:
                 golds[name] = gold
-        orders = (
-            {
-                name: [int(slot) for slot in rng.permutation(len(question.options))]
-                for name, question in asked.items()
-                if isinstance(question, Choice)
-            }
-            if rng is not None and self.shuffle
-            else None
-        )
-        rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
-                                tokens=None if tokens is None else tokens.tolist())
+        rows = self._rows(example, asked, rng, tokens)
+        if dropped and any(self.layout.refusal(row) is not None for row in rows):
+            # The added option made a row no run trains on (`Layout.refusal`: unfit, or options a
+            # declared budget left alike): this read lays the questions out as Fit admitted them.
+            asked = {name: example.questions[name] for name in names}
+            golds = {name: example.distribution(name) for name in names if name in labels}
+            dropped = {}
+            rows = self._rows(example, asked, rng, tokens)
         # A run over a backbone that reads no context leaves an example's own context unread.
         rows = with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
                             self.context_length)
@@ -143,6 +162,8 @@ class Encoding:
             row["unit_rows"] = np.zeros(1, np.int32)
         for slot, laid in enumerate(encoded.questions):
             count = len(laid.options)
+            keys = asked[laid.name].options
+            row["classes"][slot, :count] = [class_id(laid.name, keys[option]) for option in laid.order]
             if laid.name in golds:
                 shown = golds[laid.name][list(laid.order)]
                 row["targets"][slot, :count] = shown
@@ -160,6 +181,14 @@ class Encoding:
                 row["context_row"] = np.zeros(len(row["context"]), np.int32)
         return row
 
+
+
+def class_id(question: str, option: str) -> tuple[int, int]:
+    """The class an option of a question is, as two int32 lanes of a 64-bit hash of the question's name
+    and the option's key: the same class in every row and split that asks it, whatever slot it fills."""
+    digest = hashlib.blake2b(f"{question}\x1f{option}".encode(), digest_size=8).digest()
+    high, low = np.frombuffer(digest, np.int32)
+    return int(high), int(low)
 
 
 type GroupOf = Callable[[str], tuple[int, Mapping[str, str]] | None]
@@ -227,6 +256,24 @@ class FittedRow:
     tokens: np.ndarray
     """The state's tokens, which the encoding lays out again, as int32: a read
     held in memory keeps them for every example."""
+    cuts: Mapping[str, int] = field(default_factory=dict)
+    """The tokens each cut removed from the row, by what it cut (`Encoded.cuts`)."""
+    declined: str | None = None
+    """Why the layout refuses the row with a "none of the above" beside each of its answered choices
+    (`Layout.refusal`), so a training read that draws the option for it lays it out as it was
+    admitted (`Encoding`); None where the layout admits it or no read draws one (`Fit._declined`)."""
+
+
+def _cuts(rows: Iterable[FittedRow]) -> dict[str, tuple[int, int]]:
+    """The cuts of `rows`, by what each cut: the rows it shortened and the tokens it removed
+    (`cut_counts`)."""
+    return cut_counts(row.cuts for row in rows)
+
+
+def _declined(rows: Iterable[FittedRow]) -> dict[str, int]:
+    """The rows of `rows` whose "none of the above" a training read declines, by the reason the layout
+    refuses it (`FittedRow.declined`), as a corpus counts them (`_dew_declined`)."""
+    return dict(collections.Counter(row.declined for row in rows if row.declined is not None))
 
 
 @dataclass(frozen=True)
@@ -249,9 +296,22 @@ class Fit(pygrain.MapTransform):
     none_of_the_above: float = 0.0
     """The rate the training encoding adds a "none of the above" at (`Encoding`), for which a unit's
     rows are budgeted at their longest."""
+    scored: bool = False
+    """Whether the rows are scored, as a validation pass or a server reads them, not trained on: a row
+    whose declared budgets cut its options alike is laid out as its release answers it, counted
+    (`options_alike` in its cut record), where training leaves it out (`Layout.refusal`)."""
     rejects = True
 
     def map(self, element: Batch) -> Batch | Rejected:
+        fitted = self._fitted(element)
+        # A cut an earlier step made of the record stands beside the rows' own (`composed`).
+        earlier = element.get("_dew_cut")
+        if earlier and not isinstance(fitted, Rejected):
+            return {**fitted, "_dew_cut": composed(earlier, fitted.get("_dew_cut", {})),
+                    "_dew_truncated": True}
+        return fitted
+
+    def _fitted(self, element: Batch) -> Batch | Rejected:
         held = element.get("example", element)
         if isinstance(held, GroupedExamples) or (isinstance(held, Mapping) and "examples" in held):
             grouped = GroupedExamples.of(held)
@@ -273,6 +333,8 @@ class Fit(pygrain.MapTransform):
                 "decision": fitted[0],
                 "_dew_length": fitted[0].length,
                 "_dew_truncated": fitted[0].truncated,
+                "_dew_cut": _cuts(fitted),
+                "_dew_declined": _declined(fitted),
                 "_dew_bounds": {
                     "slots": {
                         "questions": len(asked),
@@ -282,42 +344,77 @@ class Fit(pygrain.MapTransform):
             }
             if self.layout.joint
             # The example is truncated where any of its rows is: the counts go by source examples.
-            else {"decision_rows": fitted, "_dew_truncated": any(row.truncated for row in fitted)}
+            else {"decision_rows": fitted, "_dew_truncated": any(row.truncated for row in fitted),
+                  "_dew_cut": _cuts(fitted), "_dew_declined": _declined(fitted)}
         )
 
     def _rows(self, example: Example, asked: Mapping[str, Question]) -> tuple[FittedRow, ...] | Rejected:
         """`example`'s rows of the questions `asked`, as the layout lays them out, or why none fit."""
         state = self.layout.state(self.tokenizer, self.specials, example.state)
         laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
-        if not all(map(self.layout.fits, laid)):
-            return Rejected("unfit")
+        # Counted under its reason, as a server counts the request it refuses (`Layout.refusal`); a
+        # scored row whose options a declared cut left alike is answered as a server answers it.
+        refusals = [self.layout.refusal(row) for row in laid]
+        refused = next((reason for reason in refusals
+                        if reason is not None and not (self.scored and reason == "options_alike")), None)
+        if refused is not None:
+            return Rejected(refused)
+        unread: dict[str, int] = {}
         if self.context_length is not None:
             with_context(laid, self.tokenizer, example.context, self.context_length)
+        elif example.context is not None and (lost := len(context_tokens(self.tokenizer, example.context,
+                                                                           None))):
+            # A backbone that reads no context leaves the example's unread, counted as a cut of it.
+            unread["context"] = lost
         self.head.validate_rows(laid)
         tokens = np.asarray(state, np.int32)
         return tuple(FittedRow(example, tuple(question.name for question in row.questions), len(row.tokens),
-                               row.state_kept < row.state_tokens, tokens) for row in laid)
+                               row.state_kept < row.state_tokens, tokens, {**row.cuts, **unread},
+                               self._declined(example, row, state))
+                     for row in laid)
+
+    def _declined(self, example: Example, row: Encoded, state: Sequence[int]) -> str | None:
+        """Why the layout refuses `row` with a "none of the above" beside each of its answered choices,
+        the longest a training read's draw makes it (`Encoding`; in place of a right option, the
+        option shortens it), which the read then declines (`FittedRow.declined`); None where the
+        layout admits it, where no read draws one, or where its questions take none."""
+        if not self.none_of_the_above or self.scored:
+            return None
+        labels = example.labels()
+        asked: dict[str, Question] = {}
+        for laid in row.questions:
+            question = example.questions[laid.name]
+            if laid.name in example.answers and isinstance(question, Choice):
+                question = _none_of_the_above(question, labels[laid.name], drop=False)[0]
+            asked[laid.name] = question
+        if all(asked[laid.name].options == example.questions[laid.name].options for laid in row.questions):
+            return None
+        [augmented] = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
+        return self.layout.refusal(augmented)
 
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
         """Grouped examples' labelled rows, each as an example of its own lays it out (`QuestionRows`
         spreads them), where no consistency term reads their groups: an example that does not fit is
-        left out as it would be alone, its siblings kept."""
-        rows, reasons = [], set()
+        left out as it would be alone, its siblings kept, and counted under its reason
+        (`_dew_rejected`)."""
+        rows, reasons = [], collections.Counter()
         for example in grouped.examples:
             labels = example.labels()
             if not labels:
-                reasons.add("unlabelled")
+                reasons["unlabelled"] += 1
                 continue
             asked = (example.questions if self.layout.joint
                      else {name: example.questions[name] for name in labels})
             fitted = self._rows(example, asked)
             if isinstance(fitted, Rejected):
-                reasons.add(fitted.reason)
+                reasons[fitted.reason] += 1
                 continue
             rows.extend(fitted)
         if rows:
-            return {"decision_rows": tuple(rows), "_dew_truncated": any(row.truncated for row in rows)}
-        return Rejected("unfit" if "unfit" in reasons else "unlabelled")
+            return {"decision_rows": tuple(rows), "_dew_truncated": any(row.truncated for row in rows),
+                    "_dew_cut": _cuts(rows), "_dew_declined": _declined(rows), "_dew_rejected": dict(reasons)}
+        return Rejected(next((reason for reason in ("unfit", "options_alike") if reason in reasons),
+                             "unlabelled"))
 
     def _longest(self, row: FittedRow) -> int:
         """The most tokens `row` encodes to where the training encoding may give each answered choice a
@@ -375,6 +472,7 @@ class Fit(pygrain.MapTransform):
                       for index, row in rows for name in row.names)
         return {"decision_unit": FittedUnit(grouped, tuple(rows)), "_dew_length": length,
                 "_dew_truncated": any(row.truncated for _, row in rows),
+                "_dew_cut": _cuts(row for _, row in rows), "_dew_declined": _declined(row for _, row in rows),
                 "_dew_bounds": {"slots": {"questions": questions, "options": options}}}
 
 
@@ -422,7 +520,8 @@ class QuestionRows:
             # A joint layout's row, or a unit of rows the packer places whole.
             return (element,)
         return tuple(
-            {"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated}
+            {"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated,
+             "_dew_cut": _cuts((row,)), "_dew_declined": _declined((row,))}
             | {
                 "_dew_bounds": {
                     "slots": {
@@ -488,11 +587,13 @@ class ConfigureLayout:
 TRAINING_FIELDS = (QuestionField("labels", (), np.int32, when="trained"),
                    QuestionField("scored", (), np.bool_, when="trained"),
                    QuestionField("targets", (OPTIONS,), np.float32, when="trained"),
+                   QuestionField("classes", (OPTIONS, 2), np.int32, when="trained"),
                    QuestionField("groups", (), np.int32, fill=-1, when="grouped"),
                    QuestionField("canonical", (OPTIONS,), np.int32, fill=-1, when="grouped"),
                    QuestionField("question_row", (), np.int32, when="grouped"))
 """The fields along a training row's questions beside the model's (`QUESTION_FIELDS`): each question's
-gold `labels`, whether it is `scored`, its soft `targets` over its option slots, and, where its
+gold `labels`, whether it is `scored`, its soft `targets` over its option slots, each option slot's class
+(`class_id`, its question's name and its option's key, which a per-class metric reads), and, where its
 questions stand in consistency groups (`Example.groups`, `GroupedExamples`), each one's group and each
 option slot's `canonical` option, -1 for none, and its row in its unit of rows (`question_row`, `_unit`)."""
 
