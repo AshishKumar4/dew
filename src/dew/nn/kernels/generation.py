@@ -35,7 +35,7 @@ ASSUMED_TARGET: contextvars.ContextVar[GpuTarget | None] = contextvars.ContextVa
 def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     """Within the block, choose kernels as on a device of `generation` ('sm80'), whatever device this
     process has: `device_generation`, `bf16_dot_runs` and `triton_runs` answer for it, so every
-    `KERNELS` choice and kernel refusal acts as on that GPU while a step traces and lowers for one on
+    kernel choice and refusal acts as on that GPU while a step traces and lowers for one on
     a CPU (`dew.training._lowering`). Given a target's facts (a GPU no row names, its multiprocessors,
     shared memory, clock and bandwidth its own), `gpu_target` answers with them, so every launch is sized
     and costed by them alone. None assumes nothing. JAX keys its trace and compile caches on the device
@@ -73,8 +73,7 @@ CHOICES = frozenset({'attention', 'attention_form', 'attention_mainloop', 'decod
                       'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
                       'grouped_matmul', 'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm',
                       'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
-"""The choices `measured_kernel` answers, and so the ones `chosen` may name and a dispatch reports
-(`route`). A choice no generation's row names runs its site's own best kernel."""
+"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`)."""
 
 
 def _named(choices: Iterable[str]) -> None:
@@ -86,8 +85,8 @@ def _named(choices: Iterable[str]) -> None:
 
 @contextlib.contextmanager
 def chosen(**kernels: str) -> Iterator[None]:
-    """Within the block, a choice named in `kernels` runs that kernel whatever the generation's row
-    measured, for an A/B of two kernels or a test of a kernel this device's row does not name.
+    """Within the block, a choice named in `kernels` runs that kernel whatever its selector would
+    take, for an A/B of two kernels or a test of a kernel the selector does not take on this device.
     Nested blocks keep the outer block's other choices and restore its choices on exit. JAX keys its
     trace and compile caches on the choices (`dew.cache.KERNEL_CHOICES`), so a function jitted
     outside the block traces again within it."""
@@ -99,7 +98,7 @@ def chosen(**kernels: str) -> Iterator[None]:
 
 
 PALLAS_CHOICES = frozenset({'pallas', 'fla'})
-"""The `KERNELS` values that run Dew's Pallas or Triton kernels, which lower through JAX's Pallas
+"""The kernel names that run Dew's Pallas or Triton kernels, which lower through JAX's Pallas
 Triton backend for a GPU only: what the CPU dry run lowers (`dew.training._lowering`) and the kernel
 lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 
@@ -209,8 +208,6 @@ class GpuTarget:
     for. Empty resources remain unknown. The standard-library-only table can
     also be read by a Torch reference's environment without importing JAX.
 
-    `head_tile` is the chunked LM head's `(tokens, columns)` tile where one was
-    measured to beat the default (`dew.objectives.lm.chunked.chunked_tile`).
     `multiprocessors` is the canonical device's streaming multiprocessors, a real
     device's own where it reports them (`gpu_target`), which a launch sizes its
     programs by (`dew.nn.kernels.decode_attention`). `clock_hz` and
@@ -230,10 +227,8 @@ class GpuTarget:
     generation: str
     device_kind: str
     shared_limit: int | None = None
-    kernels: Mapping[str, str] = dataclasses.field(default_factory=dict)
     dense_peaks: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict)
     aliases: tuple[str, ...] = ()
-    head_tile: tuple[int, int] | None = None
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
@@ -241,6 +236,10 @@ class GpuTarget:
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
     `dew.nn.kernels.options.compiler_options`)."""
+    triton_gemm_fusions: bool = True
+    """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
+    where a step measured cuBLAS's GEMMs faster with them off, an A100's (a2f56db61), an L4's
+    (7b6180b7b) and an H100's (bc24c332f), unless a module the step runs keeps them (`TritonGemm`)."""
 
     @property
     def architecture(self) -> Architecture:
@@ -379,27 +378,23 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
-              {'xla_triton_gemm': 'off', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined',
-               'delta_gates': 'joined'},
-              {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
-              multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9),
-    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {},
+              {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
+              memory_bandwidth=2039e9, triton_gemm_fusions=False),
+    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
-              {'xla_triton_gemm': 'off'},
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
-               'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
-              multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9),
-    GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
-              {'xla_triton_gemm': 'off', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'delta_gates': 'joined'}, {
+               'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), multiprocessors=58,
+              clock_hz=2040e6, memory_bandwidth=300e9, triton_gemm_fusions=False),
+    GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA GH200': {'bf16': 989e12, 'fp8': 1979e12}}, multiprocessors=132,
-              clock_hz=1830e6, memory_bandwidth=3350e9),
+              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
@@ -592,7 +587,7 @@ def device_generation() -> str:
     TPU v6e, and the platform's name otherwise; within `assumed`, the one it
     names. A call placed off the process's default backend (`placed_platform`),
     as a host-layout run's on a GPU host's CPU, takes its platform's name, so
-    every choice a target row measures (`measured_kernel`) follows it there.
+    every choice keyed on the target follows it there.
     """
     import jax
     generation = ASSUMED.get()
@@ -610,15 +605,13 @@ def device_generation() -> str:
     return device.platform
 
 
-def measured_kernel(choice: str, default: str, *, fastest: str | None = None) -> str:
-    """The kernel `chosen` names for `choice`, else `fastest`, the site's own measurement of a call
-    no row measured (an fp32 SiLU product), else `KERNELS` on this generation, else `default`."""
+def chosen_kernel(choice: str, default: str) -> str:
+    """The kernel `chosen` names for `choice` within its block, else `default`: a choice a site decides
+    without a selector (the attention template's form, a step's narrow copies)."""
     from dew import cache
 
     _named((choice,))
-    if (kernel := dict(cache.KERNEL_CHOICES.value).get(choice)) is not None:
-        return kernel
-    return fastest or gpu_target(device_generation()).kernels.get(choice, default)
+    return dict(cache.KERNEL_CHOICES.value).get(choice, default)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -646,8 +639,8 @@ INHERENT = 'inherent'
 class Route:
     """One dispatch's decision, made from the target's facts (`device_generation`, the call's shapes
     and dtypes, the binary's architectures), never the host's placement: `kernel` is what the target
-    runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (the
-    generation's row, `chosen`, or the site's own best), `refusal` why `preferred` did not take the
+    runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (`chosen`,
+    or its selector's preference), `refusal` why `preferred` did not take the
     call, and `ran` what this host executed, `kernel` but where the host cannot run it (cuDNN within
     `assumed` on a CPU). A route is generic exactly where `kernel != preferred`."""
 
@@ -696,25 +689,22 @@ _logged: set[tuple[str, str, str]] = set()
 def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
           ran: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
-    decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` or the
-    generation's row names, else `kernel`; `ran` is what this host executes, `kernel` by default.
-    Every `routes` block open records it. A call off the measured kernel is the dispatch's own choice,
-    logged once a process for each kernel and refusal at INFO, naming both; one that runs the
-    preferred kernel, or a choice no row names, logs nothing."""
+    decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
+    `kernel`; `ran` is what this host executes, `kernel` by default. Every `routes` block open records it.
+    A call off its preferred kernel is logged once a process for each kernel and refusal at INFO, naming
+    both and the refusal's reason; one that runs the preferred kernel logs nothing."""
     from dew import cache
 
     _named((choice,))
     generation = device_generation()
-    picked = None if preferred else dict(cache.KERNEL_CHOICES.value).get(choice)
-    measured = preferred or picked or gpu_target(generation).kernels.get(choice)
-    found = Route(choice, kernel, measured or kernel, refusal, ran or kernel, generation, _site())
+    preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
+    found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site())
     for collected in cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail
-    if measured not in (None, kernel) and (choice, kernel, detail) not in _logged:
+    if preferred != kernel and (choice, kernel, detail) not in _logged:
         _logged.add((choice, kernel, detail))
-        named = "the kernel `chosen` names" if picked else f"the kernel measured fastest on {generation}"
-        _log.info("%s runs %r, not %r, %s: %s", choice, kernel, measured, named, detail)
+        _log.info("%s runs %r, not %r, on %s: %s", choice, kernel, preferred, generation, detail)
     return found
 
 

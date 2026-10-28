@@ -10,22 +10,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from episode_support import (
-    GROUPS,
-    PROMPT,
-    RESPONSE,
-    SAMPLING,
-    TURNS,
-    VOCAB,
-    Harness,
-    ToolPolicy,
-    collect,
-    per_call,
-    verify,
-)
+from episode_support import SAMPLING, Harness, collect, per_call, verify
 from flax import linen as nn
 from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from rl_support import clipped_surrogate, token_mean
+from tool_policy import GROUPS, PROMPT, RESPONSE, TURNS, VOCAB, ToolPolicy
 
 from dew.batch import part
 from dew.data.dataset import Loader

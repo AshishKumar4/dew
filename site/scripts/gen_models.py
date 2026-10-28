@@ -74,6 +74,7 @@ DECODERS = {
     "nemotron_h": ("Nemotron-H", "Hybrid and linear attention"),
     "glm5_next_text": ("GLM-5.3-Flash, text", "Hybrid and linear attention"),
     "kimi_linear": ("Kimi Linear", "Hybrid and linear attention"),
+    "lfm3": ("LFM3", "Hybrid and linear attention"),
     "kimi_k3": ("Kimi K3, text", "Hybrid and linear attention"),
     "mamba": ("Mamba", "Hybrid and linear attention"),
     "mamba2": ("Mamba-2", "Hybrid and linear attention"),
@@ -95,6 +96,7 @@ WRAPPERS = {
     "llama4": ("Llama 4", "Images"),
     "deepseek_v41": ("DeepSeek V4.1", "Images"),
     "muse_glimmer": ("Muse Glimmer", "Images"),
+    "lfm3_vl": ("LFM3-VL", "None yet: its language model alone (`text_only`)"),
 }
 PIPELINES = {
     "StableDiffusionPipeline": ("Stable Diffusion", "Text to image"),
@@ -219,7 +221,8 @@ def main() -> None:
         sections += [f"## {group}", "", table(["Family", "`model_type`", "Architecture", "Checked with"], rows), ""]
     sections += ["## Multimodal checkpoints", "",
                  "These load the whole checkpoint: the text decoder listed above, the media towers and the "
-                 "checkpoint's own processor.", "",
+                 "checkpoint's own processor, but where the media column says the language model alone, "
+                 "whose towers have no port yet.", "",
                  table(["Family", "`model_type`", "Media"],
                        [[WRAPPERS[t][0], f"`{t}`", WRAPPERS[t][1]] for t in wrapped]), ""]
     by_family: dict[str, list[tuple[str, str]]] = {}

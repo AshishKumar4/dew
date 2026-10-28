@@ -115,3 +115,40 @@ def test_flags_written_into_the_environment_after_the_backend_opened_do_not_hold
                           cwd=ROOT, check=False)
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout.strip().splitlines()[-1]) == "refused"
+
+
+OPENED_ON = """
+import json, os, sys
+import dew
+import jax
+from dew.devices import flags_hold
+from dew.training import prepare_process
+
+imported, opened = sys.argv[1], sys.argv[2]
+os.environ["XLA_FLAGS"] = opened
+jax.devices()
+os.environ["XLA_FLAGS"] = imported
+held = [flags_hold(opened), flags_hold(imported)]
+try:
+    prepare_process(xla_flags=opened)
+except ValueError:
+    held.append("refused")
+else:
+    held.append("prepared")
+print(json.dumps(held))
+"""
+"""A fresh process imported under one XLA_FLAGS whose backend opens under others, written between
+Dew's import and the opening, the first written back after it."""
+
+
+def test_flags_hold_as_the_backend_read_them_when_it_opened():
+    """The backend reads XLA_FLAGS as it opens: flags written after Dew's import and before the
+    opening hold, and preparing with them is no refusal; those Dew's import saw, written back after
+    the opening, do not (row 1984's review). Before, Dew judged by what it had last seen itself."""
+    imported, opened = "--xla_dump_hlo_pass_re=imported", "--xla_dump_hlo_pass_re=opened"
+    env = {**os.environ, "XLA_FLAGS": imported,
+           "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
+    done = subprocess.run([sys.executable, "-c", OPENED_ON, imported, opened], capture_output=True, text=True,
+                          env=env, cwd=ROOT, check=False)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == [True, False, "prepared"]

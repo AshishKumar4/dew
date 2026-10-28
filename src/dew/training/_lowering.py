@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -47,9 +46,10 @@ class KernelCall:
     kernel's compiler, 'triton', 'mosaic_gpu' or 'mosaic_tpu', a library's 'gemm', 'convolution' or
     'attention', or None for a call nothing sizes), its kernel's `name` (Triton's config names it, a
     Mosaic TPU call's `kernel_name`, a Mosaic GPU call's location, the name-stack entry its `mpmd_map`
-    lowers under; any other call's target), a Pallas kernel's IR as Pallas serialized it (Triton IR,
-    or Mosaic's module bytecode), its `config` (Triton's warps and stages, a Mosaic GPU kernel's hash),
-    and the FLOPs its kernel states (its cost estimate), None where it states none."""
+    lowers under, its kernel's hash where its location names none; any other call's target), a Pallas
+    kernel's IR as Pallas serialized it (Triton IR, or Mosaic's module bytecode), its `config` (Triton's
+    warps and stages, a Mosaic GPU kernel's hash), and the FLOPs its kernel states (its cost estimate), None
+    where it states none."""
 
     kind: str | None
     name: str
@@ -142,8 +142,10 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         config = ir.DictAttr(attributes["mhlo.backend_config"])
         stated = (json.loads(ir.StringAttr(config["cost_estimate_json"]).value)
                   if "cost_estimate_json" in config else {})
-        return KernelCall(kind, _kernel_name(operation.location), ir.StringAttr(config["module"]).value_bytes,
-                          ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16], stated.get("flops"))
+        hashed = ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16]
+        # A call whose location names no kernel is named by its kernel's hash, apart from every other.
+        return KernelCall(kind, _kernel_name(operation.location) or hashed,
+                          ir.StringAttr(config["module"]).value_bytes, hashed, stated.get("flops"))
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
@@ -151,11 +153,25 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
     return KernelCall(kind, target, b"", "", None)
 
 
-def _kernel_name(location: ir.Location) -> str:
-    """A Mosaic GPU call's kernel name: its location's name stack ends `<kernel>/mpmd_map`."""
-    found = re.match(r'loc\("([^"]+)"', str(location))
-    stack = found.group(1).split("/") if found else ["?"]
+def _kernel_name(location: ir.Location) -> str | None:
+    """A Mosaic GPU call's kernel name: its location's name stack (`_named`) ends `<kernel>/mpmd_map`; None
+    where its location carries no name."""
+    named = _named(location)
+    if named is None:
+        return None
+    stack = named.split("/")
     return stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
+
+
+def _named(location: ir.Location) -> str | None:
+    """The name a location carries, as JAX lowers an equation's (`mlir._source_info_to_location`): a name
+    location's own (its name stack), or a call site's callee's (a traceback without a name stack); None
+    where it carries none."""
+    if location.typeid == ir.NameLoc.static_typeid:
+        return ir.NameLoc(location).name_str
+    if location.typeid == ir.CallSiteLoc.static_typeid:
+        return _named(ir.CallSiteLoc(location).callee)
+    return None
 
 
 def triton_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:

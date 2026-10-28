@@ -124,6 +124,24 @@ print(json.dumps(sorted(training)))
     assert json.loads(run.stdout.splitlines()[-1]) == []
 
 
+@pytest.mark.parametrize("module", ["dew.config", "dew.training.budget"])
+def test_a_config_or_a_package_imports_no_trainer_until_a_run_trains(module):
+    """A run's configuration reads its dataclasses' types and none of the trainer, which a run reads
+    where it trains (`RunConfig.train`), and a module of the training layer reads that module, its
+    package's names imported as they are used: each imports in a fresh interpreter without
+    `dew.training.trainer`."""
+    script = f"""
+import json
+import sys
+import {module}
+print(json.dumps("dew.training.trainer" in sys.modules))
+"""
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[-1]) is False
+
+
 def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
     """Only `dew.rl` and `dew.objectives.rl` import `dew.rl`, and `dew.rl` imports nothing of
     `dew.training` (docs/design/architecture.md). The test reads every module's imports, absolute

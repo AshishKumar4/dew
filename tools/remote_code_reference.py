@@ -65,6 +65,9 @@ RELEASES = {
                    "AutoModel"),
     "mimo-v2-tiny": ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
                      ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM"),
+    # modeling_lfm3.py imports its Triton conv from lfm3_conv.py, which its CPU run passes by.
+    "lfm3-tiny": ("LiquidAI/LFM3-1.7B", "40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd",
+                  ("configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"), "AutoModelForCausalLM"),
 }
 """Each fixture's release: the Hub repo, the commit its code is read at, the
 files that code is, and the auto class its language model registers as. Each
@@ -104,13 +107,31 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.1)
-        save_file({key: value.contiguous() for key, value in model.state_dict().items()},
-                  str(FIXTURES / name / "model.safetensors"))
+        save_file(_stored_once(model.state_dict()), str(FIXTURES / name / "model.safetensors"))
         vocabulary = json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"]
         ids = torch.randint(0, vocabulary, (2, 16)).numpy().astype(np.int32)
         np.save(FIXTURES / name / "input_ids.npy", ids)
-    model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")), strict=True)
+    state = model.state_dict()
+    missing, unexpected = model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")),
+                                                strict=False)
+    # A tied head is its embedding's tensor, which the file stores once (`_stored_once`).
+    shared = set(state) - set(_stored_once(state))
+    if unexpected or set(missing) != shared:
+        raise ValueError(f"{name}: the file's tensors differ from the model's: missing {missing}, "
+                         f"unexpected {unexpected}")
     return model.eval()
+
+
+def _stored_once(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """`state` with each tensor once, under its first name, as `save_pretrained` writes a tied head:
+    the embedding's alone."""
+    kept: dict[str, torch.Tensor] = {}
+    seen = set()
+    for key, value in state.items():
+        if value.data_ptr() not in seen:
+            seen.add(value.data_ptr())
+            kept[key] = value.contiguous()
+    return kept
 
 
 def main() -> None:

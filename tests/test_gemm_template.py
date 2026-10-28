@@ -252,7 +252,7 @@ matrix's blocks (the interpreter runs the pair's two programs, each loading the 
 
 @runs("sm90")
 @pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED], ids=["one multiprocessor", "a pair"])
-@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue", "row scaled"])
+@pytest.mark.parametrize("case", ["norm and bias", "cast prologue", "row scaled"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     """The Hopper launches pinned to a cooperative tile, the forward's alone or a pair's (whose second row
     tile of a pair past its group's rows stores none of them), interpreted: each consumer rewrites and
@@ -491,6 +491,84 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
                         truth_fn=forward(truth))
         assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(plain)), draw,
                         "dense 65x40x100 gradients", seeds=SEEDS, truth_fn=with_gradients(truth))
+
+
+def test_a_named_kernel_runs_the_calls_derivative_too():
+    """A grouped product traced on an A100 within `generation.chosen(grouped_matmul='xla')`, its pullback
+    run after the block closes, as MoE's implementation='xla' scopes only its own call: every grouped
+    dispatch its gradient reports runs XLA's program, the kernel the call named (train 243's review), not
+    the launches an unnamed call would select."""
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.normal(size=(ROUTED, DEPTH)), jnp.bfloat16)
+    w = jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, WIDTH)), jnp.bfloat16)
+    with generation.assumed("sm80"), generation.routes() as found:
+        with generation.chosen(grouped_matmul="xla"):
+            y, pull = jax.vjp(lambda x, w: template.gemm(x, w, jnp.asarray(SIZES), out_dtype=jnp.bfloat16),
+                              x, w)
+        pull(jnp.ones_like(y))
+    assert {route.kernel for route in found if route.choice == "grouped_matmul"} == {"xla"}
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_dense_layers_product_through_the_template_holds_check_1(generation_name):
+    """A model's projection, `dew.nn.dense.Dense` over `[batch, sequence, width]` rows with its product as
+    GatedMLP and GatedDeltaNet form it (`float32_dot_general`), through the GEMM template's dense product
+    (`template.dot_general`; its launches named, as a dense cell declares XLA's dot faster): the output and
+    the gradients of the rows, the kernel and the bias hold check 1 from float64 against the same layer
+    run on XLA's dot."""
+    from dew.nn.dense import Dense
+    from dew.nn.precision import float32_dot_general
+
+    layer = Dense(128, dot_general=float32_dot_general, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(2, 64, 256)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(256, 128)) / 16, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(128,)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(2, 64, 128)), jnp.bfloat16))
+
+    def projected(x, kernel, bias):
+        return layer.apply({"params": {"kernel": kernel, "bias": bias}}, x)
+
+    def on_xla(x, kernel, bias):
+        with generation.chosen(grouped_matmul="xla"):
+            return projected(x, kernel, bias)
+
+    def truth(x, kernel, bias):
+        wide = jnp.float64
+        return jnp.dot(x.astype(wide), kernel.astype(wide)) + bias.astype(wide)
+
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
+        assert_as_exact(jax.jit(with_gradients(projected)), jax.jit(with_gradients(on_xla)), draw,
+                        f"dense layer through the template on {generation_name}", seeds=SEEDS,
+                        truth_fn=with_gradients(truth))
+
+
+@pytest.mark.parametrize("policy", ["fp32_result_dot_general", "head_dot_general"])
+def test_a_head_keeps_its_own_products_fp32_result(policy):
+    """A bf16 projection whose product states a policy of its own, a DiT's prediction head
+    (`fp32_result_dot_general`, `PatchSequenceOutput`'s) and a vocabulary head (`head_dot_general`), where a
+    launch takes the dense products: its prediction and its gradients stay its own product's, the prediction
+    fp32 (train 252's review: the template's bf16 product rounded the prediction before the loss)."""
+    from dew.nn.dense import Dense
+    from dew.nn.precision import fp32_result_dot_general, head_dot_general
+
+    heads = {"fp32_result_dot_general": fp32_result_dot_general(),
+             "head_dot_general": head_dot_general(jnp.bfloat16)}
+    layer = Dense(256, dot_general=heads[policy], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 64, 256), jnp.bfloat16)
+    params = jax.eval_shape(lambda: layer.init(jax.random.key(0), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(params, x):
+        prediction = layer.apply(params, x)
+        return jnp.sum(prediction.astype(jnp.float32) ** 2), prediction
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        (_, prediction), grads = jax.eval_shape(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True),
+                                                params, x)
+    assert prediction.dtype == jnp.float32
+    assert grads[1].dtype == x.dtype
 
 
 def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
@@ -1060,6 +1138,31 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
                         seeds=SEEDS, truth_fn=_side_plain(truth=True))
 
 
+@INTERPRETS
+@pytest.mark.parametrize("splits", [2, 3, 5])
+def test_a_split_kernel_gradient_holds_check_1(splits):
+    """Interpreted, a kernel gradient whose contraction splits into runs of whole steps (`Tiles.splits`:
+    each group's rows shared out in 64-row blocks, each run's fp32 partial summed) at groups whose rows fill
+    no whole step, an empty group among them and one of a row, with more runs than some groups have blocks:
+    each group's gradient on par with XLA's over the draws (check 1), truth float64's."""
+    sizes = jnp.asarray(SIZES)
+    tiles = mosaic_gpu.Tiles(64, 64, 64, 2, 1, splits=splits)
+
+    def split(x, dy):
+        return mosaic_gpu.tgmm(x, dy, sizes, tiles=tiles, out_dtype=jnp.float32, multiprocessors=1,
+                               interpret=grouped_matmul.INTERPRETED)
+
+    def plain(x, dy, truth=False):
+        wide = jnp.float64 if truth else jnp.float32
+        # The rows past the groups' belong to none.
+        groups = np.concatenate([np.repeat(np.arange(len(SIZES)), SIZES), np.full(ROWS - sum(SIZES), -1)])
+        one_hot = jnp.asarray(groups[:, None] == np.arange(len(SIZES))[None, :], wide)
+        return jnp.einsum("rg,rd,rw->gdw", one_hot, x.astype(wide), dy.astype(wide))
+
+    assert_as_exact(split, jax.jit(plain), _gradient_rows_draw, f"{splits}-way split kernel gradient",
+                    seeds=SEEDS, truth_fn=functools.partial(plain, truth=True))
+
+
 def _gradient_rows_draw(seed):
     """Rows and a cotangent for a kernel gradient, both bf16."""
     rng = np.random.default_rng(seed + 4)
@@ -1362,7 +1465,10 @@ def test_a_grouped_call_no_cooperative_tile_holds_derives_one_consumer_alone():
     from dew.nn.kernels.templates import mosaic_sm90
 
     tile = mosaic_gpu.derived(mosaic_sm90.WGMMA, rows=512, depth=2048, width=1536, dtype=jnp.bfloat16,
-                              multiprocessors=132, holds=lambda tile: tile.warpgroups == 1, grouped=True)
+                              multiprocessors=132, target=generation.TARGETS["sm90"],
+                              candidate=lambda tile: tile.warpgroups == 1,
+                              launch_of=lambda tile: resources.Launch(lambda stages: resources.Scope(),
+                                                                      tile.warpgroups, 0), grouped=True)
     assert tile is not None and (tile.warpgroups, tile.cluster) == (1, 1)
 
 

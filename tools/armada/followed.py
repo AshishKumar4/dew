@@ -34,7 +34,13 @@ checkout's code or hold the GPU."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
 """Audit events of a process start; a multiprocessing child's is executed.py's `CHILD_START`'s."""
+HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes")
+"""The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings), each
+the input of the files that read it alone; any other hidden entry (.git, an environment, a cache) is none."""
 READS = {"open", "os.listdir", "os.scandir"}
+LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
+"""The cgroup files that set a process's execution limits, by the input a run that read one keys: host.py's
+`LIMITS`, which this module cannot import (it runs inside every test process, before the checkout's tools)."""
 """Audit events of a read: a file opened, a directory listed."""
 IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
 """The import system's frozen modules, which list the directories it imports from."""
@@ -96,19 +102,26 @@ def read(event: str, args: tuple, root: str) -> str | None:
             return None
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
-    return placed(os.path.abspath(os.fsdecode(path if path is not None else ".")), root)
+    name = os.path.abspath(os.fsdecode(path if path is not None else "."))
+    # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
+    cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
+    if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
+        return LIMITS[os.path.basename(name)]
+    return placed(name, root)
 
 
 def placed(name: str, root: str) -> str | None:
     """Absolute path `name` relative to the checkout at `root`, its own directory as `.`, or None
-    where it is not the checkout's or is never an input (a hidden directory, compiled bytecode, the
-    environment's packages)."""
+    where it is not the checkout's or is never an input (a hidden entry but `HIDDEN_INPUTS`, compiled
+    bytecode, the environment's packages)."""
     if name == root.removesuffix(os.sep):
         return "."
     if not name.startswith(root):
         return None
     relative = name[len(root):]
-    if relative.split(os.sep)[0].startswith(".") or "__pycache__" in relative or "site-packages" in relative:
+    top = relative.split(os.sep)[0]
+    hidden = top.startswith(".") and top not in HIDDEN_INPUTS
+    if hidden or "__pycache__" in relative or "site-packages" in relative:
         return None
     return relative
 

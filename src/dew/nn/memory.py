@@ -756,18 +756,21 @@ class InContextMemory(nn.Module):
         """A cached call's steps at their places in the row's document, counted from the real tokens of
         it the cache has seen (`COUNT`): the call's first document continues the row's, one that starts
         in the call counts from 0; and the count's update past this call's tokens, which the caller runs
-        once its read is done, and which an allocating call leaves. The steps' `stochastic_rounding`
-        stream is the row's key in the cache (`ROUNDING_KEYS`) folded with each token's place and head
-        (`_rounding_keys`), where the call brings none of its own."""
+        once its read is done, and which an allocating call leaves. Where the call's quantization rounds a
+        head's gradients stochastically (`dew.quantization.quantized_products`), the steps'
+        `stochastic_rounding` stream is the row's key in the cache (`ROUNDING_KEYS`) folded with each
+        token's place and head (`_rounding_keys`), unless the call brings its own; a memory that rounds
+        deterministically keeps no key, so its state is its tokens' alone."""
         allocated = self.has_variable("cache", COUNT)
         seen = self.variable("cache", COUNT, lambda: jnp.zeros_like(steps.real, jnp.int32)[:, 0])
-        default = jax.random.key_data(jax.random.key(0))
-        rounding = self.variable("cache", ROUNDING_KEYS, lambda: rows_like(
-            jnp.zeros((steps.real.shape[0], *default.shape), default.dtype), steps.real))
         places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
         keys = dict(steps.keys or {})
-        if not any(name == "stochastic_rounding" for name, _ in keys):
-            keys.update(_rounding_keys(rounding.value, places, self.heads))
+        if any(quantized_products(self, f"head_{head}").stochastic for head in range(self.heads)):
+            default = jax.random.key_data(jax.random.key(0))
+            rounding = self.variable("cache", ROUNDING_KEYS, lambda: rows_like(
+                jnp.zeros((steps.real.shape[0], *default.shape), default.dtype), steps.real))
+            if not any(name == "stochastic_rounding" for name, _ in keys):
+                keys.update(_rounding_keys(rounding.value, places, self.heads))
 
         def counted() -> None:
             if allocated:

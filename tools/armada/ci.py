@@ -87,6 +87,7 @@ refused (`report`), its coverage partial. A target well under CI's keeps tasks s
 import argparse
 import ast
 import concurrent.futures
+import functools
 import hashlib
 import heapq
 import importlib.util
@@ -99,6 +100,7 @@ import sys
 import threading
 import time
 import tomllib
+import types
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
@@ -117,6 +119,7 @@ def _beside(name: str):
 child_groups = _beside("child_groups")
 session = _beside("session")
 r2 = _beside("r2")
+watched = _beside("watched")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
@@ -165,16 +168,32 @@ COLLECT_TASKS = 4
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
-SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/session.py",
-          "tools/armada/child_groups.py", "tools/armada/split.py", "tools/armada/executed.py",
-          "tools/armada/followed.py")
-"""The files every test file's key covers whole, beside tests/ and src/'s data, every lock (a GPU node
-builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
-names (`environment_files`): what every test process runs or reads, the session it runs in, the
-process group it runs as and the plugins loaded into it among them. The plan's own code (this file)
-runs outside the tests, so a change to it reruns none of them; nor does the durations record
-(`session.DURATIONS`), which only a split file's groups are cut from, so a group's key covers its own
-file's entries alone (`cache_key`)."""
+SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
+          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
+          "tools/armada/watched.py")
+"""The files every test file's key covers whole, beside every lock (a GPU node builds its environment
+from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
+and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
+the session it runs in, the process group it runs as and the plugins loaded into it among them. The
+plan's own code (this file) runs outside the tests, so a change to it reruns none of them; nor does
+the durations record (`session.DURATIONS`), which only a split file's groups are cut from, so a
+group's key covers its own file's entries alone (`cache_key`); nor does a fixture or a package's data,
+which is the input of the files whose runs opened it, however they opened it (executed.py's `Opens`)."""
+ARMADA_SEEN = ("environment", "environments", "env")
+""".armada.json's parts a test process runs in, beside its task's command and secrets (`armada_seen`):
+its pool, size, target, plan and the task's deadline and mode decide where and when tasks run, never
+what a test sees (owner, 2026-10-27: a pool change reran every file)."""
+
+
+def armada_seen(text: str | None) -> str:
+    """The parts of .armada.json (`text`, or None where there is none) a test process sees: its
+    environments, their variables (`ARMADA_SEEN`), and its task's command and secrets, as one text."""
+    if text is None:
+        return "missing"
+    config = json.loads(text)
+    task = config.get("task", {})
+    return json.dumps({**{part: config.get(part) for part in ARMADA_SEEN},
+                       "command": task.get("command"), "secrets": task.get("secrets")}, sort_keys=True)
 
 
 def environment_files() -> list[str]:
@@ -198,25 +217,20 @@ CACHE_PREFIX = f"testcache/format-{RECORD_FORMAT}"
 
 
 def shared(python: str) -> str:
-    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, every
-    non-Python file under tests/ and src/ (a fixture, a package's data), and the names of the Python
-    files under tests/ but its test modules and of src/'s own entries, whose arrival can change what an
-    import finds (a conftest.py, a helper or a top-level package that shadows another), which a record
-    does not see. A module within a package under src/ is its importers' input alone, with its
-    package's other modules (`inputs`), and a test module is no other file's: so a train that loses a
-    head runs again only what that head's modules reached."""
+    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
+    .armada.json's parts a test process sees (`armada_seen`), and the names of the Python files under
+    tests/ but its test modules and of src/'s own entries, whose arrival can change what an import finds
+    (a conftest.py, a helper or a top-level package that shadows another), which a record does not see. A
+    module within a package under src/ is its importers' input alone, with its package's other modules
+    (`inputs`), a test module is no other file's, and a fixture or a package's data is its openers'
+    (executed.py's `Opens`): so a train that loses a head runs again only what that head's files reached
+    (owner, 2026-10-27: 8 fixtures changed reran all 485 tasks of train 222's second round)."""
     digest = hashlib.sha256(python.encode())
-    for top in ("tests", "src"):
-        for path in sorted(Path(top).rglob("*")):
-            # A fetched payload is its manifest's (`contents`), which the walk reads in its place.
-            if (not path.is_file() or built(path) or path == session.DURATIONS
-                    or (path.parent / (path.name + FETCHED)).is_file()):
-                continue
-            if path.suffix == ".py" and (top == "src" or path.name.startswith("test_")):
-                continue
+    for path in sorted(Path("tests").rglob("*.py")):
+        if "__pycache__" not in path.parts and not path.name.startswith("test_"):
             digest.update(str(path).encode())
-            if path.suffix != ".py":
-                digest.update(hashlib.sha256(path.read_bytes()).digest())
+    armada = Path(".armada.json")
+    digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
@@ -243,7 +257,12 @@ def built(path: Path) -> bool:
 def contents(name: str) -> bytes:
     """The hash of file `name`'s bytes, of directory `name`'s entries' names but its hidden ones and a
     build's (`built`), or b"missing". A fetched fixture's payload is the digest its manifest pins, whether
-    it is downloaded here or not, so a planner that never fetches it keys it as a task does."""
+    it is downloaded here or not, so a planner that never fetches it keys it as a task does. An execution
+    limit a run read (followed.py's `LIMITS`: "limit:cpu", "limit:memory") is the one binding this process
+    (host.py's `limit`): a row green on 4 vCPUs is not reused on 8, nor on a planner, which reads its own (row
+    1998, Main 2026-10-28)."""
+    if name.startswith("limit:"):
+        return hashlib.sha256(host().limit(name).encode()).digest()
     path = Path(name)
     manifest = path.parent / (path.name + FETCHED)
     if path.name and manifest.is_file():
@@ -286,15 +305,20 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     return sorted({name, *depends, *packages})
 
 
-def cpu_class() -> str:
-    """This host's CPU microarchitecture, the one class the records, the tests' compilation cache and
-    the shared XLA bundles key it by (host.py beside this file, loaded by its path, as this file puts
-    nothing on sys.path)."""
+@functools.cache
+def host() -> types.ModuleType:
+    """host.py beside this file, loaded by its path, as this file puts nothing on sys.path."""
     spec = importlib.util.spec_from_file_location("dew_host", Path(__file__).with_name("host.py"))
     assert spec is not None and spec.loader is not None
-    host = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(host)
-    return host.cpu_class()
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cpu_class() -> str:
+    """This host's CPU microarchitecture, the one class the records, the tests' compilation cache and
+    the shared XLA bundles key it by (`host`)."""
+    return host().cpu_class()
 
 
 def device_class(network: bool = False) -> str:
@@ -541,10 +565,11 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
     return [(held, sorted(names)) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])]
 
 
-PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/")
-"""Where a changed file is placed by the records (executed.py): a Python file a test ran, a page or a
-notebook it read, a fixture every key covers (`shared`). A change elsewhere is placed by none, and runs
-the whole suite (`policy`)."""
+PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/", ".github/")
+"""Where a changed file is placed by the records (executed.py): a Python file a test ran, a page, a
+notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A change
+elsewhere is placed by none, and runs the whole suite (`policy`): a workflow change reran every file while
+no record placed it (Main, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows reused)."""
 PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
 """The checkout's own files at its root that tests read as a page is read, and the changelog, which
 no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
@@ -561,7 +586,15 @@ def policy(base: str) -> str:
     no pulled head had touched, under a policy that reran every file that read any tool)."""
     changed = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], check=True,
                              capture_output=True, text=True).stdout.split()
-    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".python-version"}
+    if ".armada.json" in changed:
+        before = subprocess.run(["git", "show", f"{base}:.armada.json"], capture_output=True, text=True,
+                                check=False)
+        armada = Path(".armada.json")
+        if armada_seen(before.stdout if before.returncode == 0 else None) == armada_seen(
+                armada.read_text() if armada.is_file() else None):
+            changed.remove(".armada.json")  # where and when tasks run, never what a test sees
+    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".armada.json",
+             ".python-version"}
     if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
         return "off"
     return "on"
@@ -745,6 +778,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               "DEW_COLLECTED": str(collection)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
+    # Every data file the task's processes open, held from before pytest starts until its group stopped
+    # (`watched`): each is the input of every file the task runs.
+    opens = watched.Opens(os.getcwd())
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
 
@@ -765,6 +801,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
+    # A process of the group still running may yet open a file: no record of this task keeps a key.
+    closed = opens.closed()
+    opened = None if left else closed
     reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
@@ -819,16 +858,17 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:
         # A traced run's rows, timed under tracing, are no rows to reuse.
-        record(python, ran, executed_report, common, network)
+        record(python, ran, executed_report, common, network, opened)
     return 0
 
 
-def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False) -> None:
-    """Keep each row a task ran with the files its tests executed, where they read the backend and
-    its peak memory on a GPU and its children's pools: `gpu_tier` reads the reads, `gpu_needs` the
-    memory. A green row keeps
-    its key too, which `reused` reads it back by; a red row has none, so a later run never reuses
-    an earlier green row of its file."""
+def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False,
+           opened: set[str] | None = None) -> None:
+    """Keep each row a task ran with the files its tests executed and read, every data file the task's
+    processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
+    they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
+    reads, `gpu_needs` the memory. A green row keeps its key too, which `reused` reads it back by; a red
+    row has none, so a later run never reuses an earlier green row of its file."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return
@@ -838,6 +878,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
+        if ran["depends"] is not None:
+            ran = {**ran, "depends": None if opened is None else sorted({*ran["depends"], *opened})}
         if row_["exitCode"] == 0 and name not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None

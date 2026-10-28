@@ -26,12 +26,13 @@ import pytest
 from flax.traverse_util import unflatten_dict
 from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
 
+from dew.batch import TEXT_KEY
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import DistillationObjective
 from dew.objectives.base import Step
 from dew.objectives.distillation import PROJECTIONS, TEACHER
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 

@@ -121,11 +121,19 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     return translate_config(_text_config(hf_config))
 
 
+_TEXT_TYPES = {"lfm3_vl": "lfm3"}
+"""A wrapper's text model type where its config class builds another than `<wrapper>_text`: Lfm3VlConfig
+defaults its text_config to Lfm3Config (configuration_lfm3_vl.py, `__post_init__`)."""
+
+
 def _typed(hf_config: Mapping[str, object], nested: Mapping[str, object], part: str) -> Mapping[str, object]:
     """A wrapper's nested `part` config (text, vision or audio), typed as its wrapper declares it where it
-    names no type: `<wrapper model_type>_<part>`, the class the wrapper config builds from a raw dict
-    (its `sub_configs`), so a checkpoint's copy need not repeat the tag. A stated type stays."""
-    return {"model_type": f"{_records.text(hf_config['model_type'], 'model_type')}_{part}", **nested}
+    names no type: `<wrapper model_type>_<part>` (a text config `_TEXT_TYPES`' type), the class the
+    wrapper config builds from a raw dict (its `sub_configs`), so a checkpoint's copy need not repeat the
+    tag. A stated type stays."""
+    wrapper = _records.text(hf_config['model_type'], 'model_type')
+    default = _TEXT_TYPES.get(wrapper, f"{wrapper}_text") if part == "text" else f"{wrapper}_{part}"
+    return {"model_type": default, **nested}
 
 
 def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -336,6 +344,33 @@ def _muse_glimmer_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
     return _wrapper_fields("muse_glimmer", used, text, tower, projector, image, None, video=video)
 
 
+def _lfm3_vl_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read an LFM3-VL wrapper (LiquidAI/LFM3-VL-2B): its LFM3 decoder under text_config. Its vision tower
+    (`lfm3_vl_vision`, convolutions between attention over patches) and its projector have no Dew port,
+    so a load reads its language model alone (`text_only`; `WrapperFields.unported`). d1's checkpoints
+    of it (LiquidAI/d1-2B) train their full-attention layers under a visibility of their own
+    (`d1_attention`), which no Dew layout reads: a load refuses it, the language model's function being
+    that visibility's."""
+    attention = hf_config.get("d1_attention")
+    if attention is not None:
+        refuse(f"d1_attention {attention!r}",
+               "d1 trains its full-attention layers to see across a state and its questions as no Dew "
+               "decision layout reads yet")
+    text = _wrapper_text(hf_config, used)
+    used.update(("downsample_factor", "projector_bias", "projector_hidden_act", "projector_hidden_size",
+                 "projector_layer_norm_eps", "video_token_id", "vision_start_token_id", "vision_end_token_id",
+                 "auto_map", "bos_token_id", "eos_token_id", "pad_token_id", "dtype"))
+    # Lfm3VlConfig's placeholders where a config leaves them out (configuration_lfm3_vl.py).
+    image = _defaulted_token_id(hf_config, used, "image_token_id", 125030)
+    video = _defaulted_token_id(hf_config, used, "video_token_id", 125029)
+    fields = _wrapper_fields("lfm3_vl", used, text, None, None, image, None, video=video)
+    fields["text_model_type"] = _records.text(_text_config(hf_config)["model_type"], "text_config.model_type")
+    fields["unported"] = {
+        "vision_tower.": "LFM3-VL's vision tower (lfm3_vl_vision) has no Dew port",
+        "multi_modal_projector.": "LFM3-VL's projector reads its vision tower, which has no Dew port"}
+    return fields
+
+
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Read a Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
@@ -357,7 +392,7 @@ _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
     **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
-    "muse_glimmer": _muse_glimmer_wrapper}
+    "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
@@ -406,6 +441,9 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     audio = record.get("audio_projector") is not None
     bundled = _bundled(record["model_type"])
     bare = name.removeprefix("model.")
+    for prefix in record.get("unported", {}):
+        if bare.startswith(prefix):
+            return "unported", bare
     if bare.startswith("language_model."):
         tail = bare[len("language_model."):]
         return "language_model", tail if tail.startswith(
@@ -453,16 +491,29 @@ def _equal(read: Callable[[str], Stored], first: str, second: str, checked: Chec
     return second in checked.get(first, frozenset()) or equal(read(first), read(second))
 
 
+def refuse_unported(record: WrapperFields) -> None:
+    """Refuse a whole load of a wrapper whose media components Dew has no port of (`WrapperFields.unported`),
+    naming each and the language model alone a load takes (`text_only`)."""
+    unported = record.get("unported", {})
+    if unported:
+        refuse(f"{record['model_type']}'s {', '.join(sorted(unported))}",
+               f"{'; '.join(unported[prefix] for prefix in sorted(unported))}; text_only=True loads its "
+               "language model alone")
+
+
 def _wrapper_sources(names: Collection[str], read: Callable[[str], Stored], record,
                      checked: Checked = NOTHING_CHECKED):
     """Route source names once, checking any names that claim one local leaf.
-    The table retains names, not decoded arrays, so read can be a codec accessor.
+    The table retains names, not decoded arrays, so read can be a codec accessor. A name of a component
+    Dew has no port of refuses the whole load (`refuse_unported`).
     """
     sources: dict[str, dict[str, str]] = {name: {} for name in (
         "language_model", "tower", "projector", "audio_tower", "audio_projector")}
     aliases: list[tuple[str, str]] = []
     for name in names:
         group, local = wrapper_route(name, record)
+        if group == "unported":
+            refuse_unported(record)
         previous = sources[group].get(local)
         if previous is not None:
             if not _equal(read, previous, name, checked):
