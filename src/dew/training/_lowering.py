@@ -29,7 +29,7 @@ import logging
 import re
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jax
 from jax.extend.mlir import ir
@@ -197,8 +197,10 @@ class KernelReport:
 
 
 def kernel_report(routes, lowered: jax.stages.Lowered) -> KernelReport:
-    """The `KernelReport` of a step whose trace reported `routes` and lowered to `lowered`."""
-    return KernelReport(tuple(routes), tuple(kernel_calls(lowered)))
+    """The `KernelReport` of a step whose trace reported `routes` and lowered to `lowered`, its calls without
+    their kernels' IR, which nothing that reads a report reads: a run keeps the report after it releases
+    the program (`planning.Planned.released`, TightLynx)."""
+    return KernelReport(tuple(routes), tuple(replace(call, ir=b"") for call in kernel_calls(lowered)))
 
 
 def routed[*Arguments](lower: Callable[[*Arguments], jax.stages.Lowered],
