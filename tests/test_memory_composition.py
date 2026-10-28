@@ -500,9 +500,10 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
     backward stochastically (`bwd_qtype`, `bwd_stochastic_rounding`) draws its inner steps' rounding
     from its request's own key (`dew.sampling.text.rounding_keys`), Titans' MLP and a linear memory
     whose cache holds the recurrence's state alike: a task call and one live server each repeat a
-    request alike, another key moves its likelihoods though greedy decoding draws nothing, and the
-    server answers the request alike in its second slot beside another, weight-only serving keeping
-    the rows' arithmetic apart. Without the stream the decode raised in Qwix's make_rng (ledger 2020)."""
+    request alike, and another key moves its likelihoods though greedy decoding draws nothing. A row's
+    stream is its own (`test_a_cached_memorys_rounding_is_each_rows_own`); a batch-mate's values still
+    enter through the quantization's scales (ledger 2032). Without the stream the decode raised in
+    Qwix's make_rng (ledger 2020)."""
     pytest.importorskip("qwix")
     from model_support import Digits
 
@@ -515,7 +516,7 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     task = TextGeneration(model, params, RunProcessor(Digits()),
                           sampling=Sampling(temperature=0, eos_token_ids=12))
-    bound = task.quantized(Quantization(patterns=(INNER,), weight_only=True, bwd_qtype="int8",
+    bound = task.quantized(Quantization(patterns=(INNER,), bwd_qtype="int8",
                                         bwd_stochastic_rounding="uniform"))
     server = Server.from_task(bound, slots=2, capacity=64)
 
@@ -527,8 +528,6 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
         (first,), (again,), (moved,) = generate(["12"], 3), generate(["12"], 3), generate(["12"], 4)
         np.testing.assert_array_equal(likelihoods(again), likelihoods(first))
         assert not np.array_equal(likelihoods(moved), likelihoods(first))
-    alone = server(["12"], 4, key=3)[0]
-    np.testing.assert_array_equal(likelihoods(server(["99", "12"], 4, key=3)[1]), likelihoods(alone))
 
 
 def test_a_cached_memorys_rounding_is_each_rows_own():
