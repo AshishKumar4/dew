@@ -67,7 +67,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend, linear_map
-from dew.nn.precision import accumulated, bf16_dot_general, correctly_rounded_divide
+from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -1163,9 +1163,10 @@ def _grouped_convolution_gradient() -> type:
         grouped convolution everywhere.
 
         An ungrouped convolution with quantized activations quantizes its
-        float32 operands and returns the input's dtype, so Qwix scales its
-        8-bit product in float32 as `GroupScaledConvolution` does a grouped
-        one's. From bf16 operands Qwix scaled it in bf16, and XLA:GPU, which
+        operands in at least float32 (`at_least_fp32`, float64 for float64
+        ones) and returns the input's dtype, so Qwix scales its 8-bit product
+        in float32 as `GroupScaledConvolution` does a grouped one's, and a
+        float64 run keeps float64 throughout. From bf16 operands Qwix scaled it in bf16, and XLA:GPU, which
         lowers an int8 convolution only with a float32 result, failed to
         compile a bf16 int8 convolution (`UNIMPLEMENTED: Can't lower one or
         more integer convolutions`, the RTX 4080)."""
@@ -1194,8 +1195,9 @@ def _grouped_convolution_gradient() -> type:
                         "Qwix 0.1.8's quantized gradients of a convolution (bwd_qtype) convolve two int8 "
                         "operands into an int32 accumulator, which XLA:GPU cannot run (UNIMPLEMENTED on "
                         "an A100); leave bwd_qtype unset, whose float gradients Dew computes")
+                wide = at_least_fp32(jnp.result_type(lhs, rhs))
                 return super().conv_general_dilated(
-                    lhs.astype(jnp.float32), rhs.astype(jnp.float32), window_strides, padding, lhs_dilation,
+                    lhs.astype(wide), rhs.astype(wide), window_strides, padding, lhs_dilation,
                     rhs_dilation, dimension_numbers, feature_group_count, batch_group_count, precision,
                     preferred_element_type, out_sharding).astype(lhs.dtype)
             if feature_group_count > 1 and rule.bwd_qtype is not None:
@@ -1208,9 +1210,10 @@ def _grouped_convolution_gradient() -> type:
                 raise ValueError("subchannel is not supported for conv_general_dilated.")
             rule, op_id = self._get_current_rule_and_op_id("conv_general_dilated")
             if feature_group_count == 1:
-                # Quantized from float32 and returned in the input's dtype, so the 8-bit product is
-                # scaled in float32 (the class docstring).
-                lhs, rhs, dtype = lhs.astype(jnp.float32), rhs.astype(jnp.float32), lhs.dtype
+                # Quantized from at least float32 and returned in the input's dtype, so the 8-bit product
+                # is scaled in at least float32 (the class docstring), float64 where the operands are.
+                wide = at_least_fp32(jnp.result_type(lhs, rhs))
+                lhs, rhs, dtype = lhs.astype(wide), rhs.astype(wide), lhs.dtype
             else:
                 dtype = None
             config = self._create_conv_general_qt_config(rule, op_id, lhs, rhs)
