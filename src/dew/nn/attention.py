@@ -70,7 +70,7 @@ from .sharding import (
     sequence_shards,
     split_positions,
 )
-from .visibility import same_chunk, visible, window_sides, windowed
+from .visibility import same_chunk, window_sides, windowed
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu", "template"]
 """Names which kernel an attention call runs.
@@ -131,8 +131,8 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     unfilled slots; a window retains the query and its preceding W-1 keys.
     """
     positions = jnp.atleast_2d(jnp.asarray(query_positions, jnp.int32))
-    return visibility_mask(positions.shape[1], kv_len, True, sliding_window, key_valid=key_valid,
-                           query_slots=positions)
+    return visibility_mask(positions.shape[1], kv_len, causal=True, sliding_window=sliding_window,
+                           key_valid=key_valid, query_slots=positions)
 
 
 def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
@@ -288,7 +288,8 @@ def with_key_lengths(mask: jax.Array | None, lengths: jax.Array, key_length: int
     """`mask` narrowed to each row's first `lengths[b]` keys, `[B, 1, 1, K]`
     where there was no mask. This is the mask a `key_value_seq_lengths`
     call means on the paths whose kernel takes no lengths."""
-    return visibility_mask(1, key_length, False, None, mask=mask, key_value_seq_lengths=lengths)
+    return visibility_mask(1, key_length, causal=False, sliding_window=None, mask=mask,
+                           key_value_seq_lengths=lengths)
 
 
 def with_key_starts(mask: jax.Array | None, starts: jax.Array | None, key_length: int) -> jax.Array | None:
@@ -297,7 +298,8 @@ def with_key_starts(mask: jax.Array | None, starts: jax.Array | None, key_length
     starts leave `mask` as it is."""
     if starts is None:
         return mask
-    return visibility_mask(1, key_length, False, None, mask=mask, key_value_seq_starts=starts)
+    return visibility_mask(1, key_length, causal=False, sliding_window=None, mask=mask,
+                           key_value_seq_starts=starts)
 
 
 def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = False,

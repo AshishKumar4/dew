@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 
 
-
 class CrossDocuments(NamedTuple):
     """The packed documents of a call whose keys are not its queries
     (cross-attention): `query` `[B, Q]` and `key` `[B, K]` ids, each query
