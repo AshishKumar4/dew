@@ -35,7 +35,7 @@ from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, row_step
-from dew.sampling.text import decode_ops, prefill_state, rounding_keys
+from dew.sampling.text import decode_ops, prefill_state, rounding_keys, rounding_rngs
 
 
 @struct.dataclass
@@ -230,7 +230,9 @@ class Paged:
         scattered back to the rows' slots.
         """
         rows = admission.cursors.shape[0]
-        allocated = model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"]
+        rounding = rounding_keys(jax.random.wrap_key_data(admission.keys))
+        allocated = model.apply(params, rows, method="init_cache", mutable=["cache"],
+                                rngs=rounding_rngs(rounding))[1]["cache"]
         continues = admission.cursors > 0
 
         def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:
@@ -247,8 +249,7 @@ class Paged:
 
         cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
         fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, None),
-                                    cache=cache,
-                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys)))
+                                    cache=cache, rounding=rounding)
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:
