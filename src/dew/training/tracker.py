@@ -470,11 +470,8 @@ def _arrays(prefix: Path, **arrays) -> list[Path]:
 
 @_write_preview.register
 def _(value: Decisions, prefix: Path) -> list[Path]:
-    path = prefix.with_suffix('.npz')
-    np.savez(path, probabilities=_home(value.probabilities), options=_home(value.options),
-             labels=_home(value.labels), targets=_home(value.targets), ordinal=_home(value.ordinal),
-             scored=_home(value.scored))
-    return [path]
+    return _arrays(prefix, probabilities=value.probabilities, options=value.options, labels=value.labels,
+                   targets=value.targets, ordinal=value.ordinal, scored=value.scored)
 
 
 MLFLOW_NAME = re.compile(r"[/\w.\- ]{0,250}")

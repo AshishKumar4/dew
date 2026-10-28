@@ -1094,16 +1094,7 @@ def delivered(corpora, role, read, batches=24):
     A mix by tokens keeps each corpus within one of its own rows of its share, so the two differ by
     at most one row of each."""
     mixed = mix([corpus.repeat() for corpus in corpora], by="tokens")
-    data = compile(mixed.map(Scored(role)).batch(8), read=read, loading=READ)
-    stream = data.train(DataPartition())
-    targets = [0, 0]
-    try:
-        for batch in itertools.islice(stream, batches):
-            for source, count in zip(batch["source"], batch["targets"], strict=True):
-                targets[int(source)] += int(count)
-    finally:
-        stream.close()
-    return targets
+    return delivered_targets(compile(mixed.map(Scored(role)).batch(8), read=read, loading=READ), batches)
 
 
 @pytest.mark.parametrize("role", [None, 1])
