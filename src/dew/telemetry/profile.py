@@ -63,7 +63,12 @@ def held_back(capture: Path, metadata: dict) -> list[str]:
     """Why a capture that stopped cleanly holds less than its run did, from what it holds (`capture_status`
     "partial"), empty where nothing is missing: on an accelerator, a local device with no kernel track in
     the trace; on GPU, as many activity events as CUPTI's cap (`ACTIVITY_CAP`, the options' own), past which
-    CUPTI drops whole buffers and says so only in a C++ log. A CPU run's trace holds no device track."""
+    CUPTI drops whole buffers and says so only in a C++ log. A CPU run's trace holds no device track.
+
+    A trace with no device plane at all lost the device profiler's whole contribution, its kernels and the
+    HLO alike: XProf drops an XSpace past protobuf's 2 GB limit whole, saying so only in a C++ log (row
+    1893: a 2xH100 capture of three 21-40 s steps of a 4.2B model, 2,176,305,421 bytes, kept its host
+    planes alone)."""
     if metadata.get("backend") not in ("gpu", "tpu"):
         return []
     from dew.telemetry.trace import device_events
@@ -84,7 +89,11 @@ def missing_tracks(events: dict[str, int], devices: int, cap: int | None) -> lis
     kept 1987 kernel events of an H100 step's 19160)."""
     reasons = []
     tracked = sum(1 for count in events.values() if count)
-    if tracked < devices:
+    if devices and not events:
+        reasons.append(f"none of {devices} local devices has a plane in the trace: the device profiler's "
+                       "data, kernels and HLO alike, was dropped whole, as XProf drops an XSpace past "
+                       "protobuf's 2 GB limit (trace fewer steps, or lower `activity_cap`)")
+    elif tracked < devices:
         reasons.append(f"{devices - tracked} of {devices} local devices have no kernel track in the trace")
     total = sum(events.values())
     if cap is not None and cap >= 0 and total >= cap * 0.99:
