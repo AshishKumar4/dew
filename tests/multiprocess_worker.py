@@ -1342,17 +1342,19 @@ def mode_evaluation_kept(args) -> dict:
     from dew.objectives.base import Aux, Objective
     from dew.training import Trainer
 
-    class Rows(Objective):
+    class Kept(Objective):
+        """A loss of the rows' distance from a centre, scoring each batch's rows as artifacts."""
+
         def fresh_variables(self, key, held):
-            return {"params": {"offset": jnp.zeros(())}}
+            return {"params": {"centre": jnp.zeros(())}}
 
         def loss(self, variables, batch, step):
-            return jnp.mean((batch["x"] + variables["params"]["offset"]) ** 2), Aux({})
+            return self.row_mean(jnp.abs(batch["x"] - variables["params"]["centre"]), batch), Aux({})
 
         def evaluate(self, params, batch, step):
             return Representations(features=batch["x"], labels=batch["x"][:, 0])
 
-    trainer = Trainer(Rows(), optax.sgd(.01), key=jax.random.key(0))
+    trainer = Trainer(Kept(), optax.sgd(.01), key=jax.random.key(0))
     state, _, _ = trainer.place()
     batch = {"x": np.arange(4, dtype=np.float32)[:, None]}
     data = Loader(train=lambda partition: iter([batch]), val=lambda partition: iter([batch, batch]),
@@ -2427,6 +2429,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
+         "evaluation_kept": mode_evaluation_kept,
          "evaluation_clocks": mode_evaluation_clocks,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
          "fp8_sites": mode_fp8_sites}
