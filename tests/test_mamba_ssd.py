@@ -18,7 +18,6 @@ from reference_error import (
     as_given,
     assert_as_exact,
     declared_seeds,
-    dew_programs,
     indexed_recording,
     recording,
     widened,
@@ -142,17 +141,22 @@ def test_the_port_is_as_exact_as_mamba_ssm(case):
     rows, state = min(64, chunk), min(32, inputs["B"].shape[-1])
 
     def pinned(heads):
-        """`run` with its summing kernels taking `heads` a program, or their own where None."""
+        """`run` with its summing kernels taking `heads` a program, or their own where None, pinned as it
+        traces."""
         pins = {} if heads is None else {
             mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
             mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
             mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
-        with tuning.pinned(pins):
-            return jax.jit(run).lower(*draw(0)).compile()
+
+        def form(index, arrays):
+            with tuning.pinned(pins):
+                return run(index, arrays)
+
+        return form
 
     forms = [pinned(heads) for heads in CASES[case]]
     count = len(forms)
-    assert_as_exact(dew_programs(lambda *args: tuple(form(*args) for form in forms)),
+    assert_as_exact(jax.jit(lambda index, arrays: tuple(form(index, arrays) for form in forms)),
                     as_given(lambda *args: (reference(*args),) * count), draw,
                     f"mamba_ssm {case}, heads {CASES[case]}", seeds=seeds,
                     truth_fn=lambda *args: (truth(*args),) * count)

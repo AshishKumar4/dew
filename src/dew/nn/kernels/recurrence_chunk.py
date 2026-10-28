@@ -571,23 +571,12 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     else:
         # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
         # over to the portable math there, reported as the call's route.
-        def product_kernel(product: str) -> str | KernelRefused:
-            try:
-                return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                                   scale=scale, wide=epilogue, floor=hooks.floor, product=product,
-                                   delta=hooks.delta, decayed=hooks.decay != 'none')
-            except KernelRefused as refused:
-                # A kernel named for the call that runs its forward but not its gradient (the template's
-                # fast backward) refuses where a gradient is traced, not a forward alone.
-                if product == 'forward':
-                    raise
-                return refused
-
-        kernels = [product_kernel(product) for product in ('forward', 'training')]
+        def product_kernel(product: str) -> str:
+            return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
+                               scale=scale, wide=epilogue, floor=hooks.floor, product=product,
+                               delta=hooks.delta, decayed=hooks.decay != 'none')
 
         def run(kernel, query, key, value, g, beta, state, starts, firsts):
-            if isinstance(kernel, KernelRefused):
-                raise kernel
             if kernel == 'mosaic_gpu':
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
                                      max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
@@ -603,13 +592,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             return chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state, size,
                                     starts=starts, delta=hooks.delta, scale=scale, dtype=work)
 
-        arrays = (query, key, value, g, beta, state, starts, firsts)
-        if kernels[0] == kernels[1]:
-            out, final = run(kernels[0], *arrays)
-        else:
-            # The cell's forward and its training take different kernels (`PORT_CELLS`).
-            out, final = _by_product(functools.partial(run, kernels[0]), functools.partial(run, kernels[1]),
-                                     *arrays)
+        out, final = _per_product(product_kernel, run, query, key, value, g, beta, state, starts, firsts)
         out = recurrence.skipped(hooks, out.astype(work), value, given, work)
     # The epilogue in the working precision, and the output rounded once.
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
@@ -782,6 +765,25 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
                     family=family, product=product, delta=delta, decayed=decayed)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
+
+
+def _per_product(kernel_of: Callable[[str], str], run, *operands):
+    """`run(kernel, *operands)` on the kernel a selector gives each product (`kernel_of('forward')`,
+    `kernel_of('training')`): one run where both take the same kernel, else each product its own
+    (`_by_product`: a cell whose forward and training differ, `PORT_CELLS`, `SCAN_CELLS`, or a template that
+    trains no such call). A kernel named for the call that runs its forward but not its gradient refuses
+    where a gradient is traced, not a forward alone."""
+    forward = kernel_of('forward')
+    try:
+        training = kernel_of('training')
+    except KernelRefused as refused:
+        def refusing(*operands):
+            raise refused
+
+        return _by_product(functools.partial(run, forward), refusing, *operands)
+    if forward == training:
+        return run(forward, *operands)
+    return _by_product(functools.partial(run, forward), functools.partial(run, training), *operands)
 
 
 def _by_product(forward, training, *operands):
@@ -1096,20 +1098,11 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
 
-    def product_kernel(product: str) -> str | KernelRefused:
-        try:
-            return scan_kernel(query, key, value, g, beta, state, starts, chunk_size=chunk_size,
-                               max_segments=max_segments, product=product)
-        except KernelRefused as refused:
-            # A kernel named for the call that runs its forward but not its gradient (the template's) refuses
-            # where a gradient is traced, not a forward alone.
-            if product == 'forward':
-                raise
-            return refused
+    def product_kernel(product: str) -> str:
+        return scan_kernel(query, key, value, g, beta, state, starts, chunk_size=chunk_size,
+                           max_segments=max_segments, product=product)
 
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
-        if isinstance(kernel, KernelRefused):
-            raise kernel
         if kernel == 'mosaic_gpu':
             out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
                                        max_segments=max_segments, scale=1.0, delta=False, wide=True)
@@ -1140,12 +1133,7 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
                                       delta=False, scale=1.0, dtype=work)
         return recurrence.skipped(hooks, out, value, {'skip': skip}, work), final
 
-    kernels = [product_kernel(product) for product in ('forward', 'training')]
-    arrays = (query, key, value, g, beta, rate, skip, state, starts, firsts)
-    if kernels[0] == kernels[1]:
-        return run(kernels[0], *arrays)
-    # The cell's forward and its training take different kernels (`SCAN`: the template trains no rated scan).
-    return _by_product(functools.partial(run, kernels[0]), functools.partial(run, kernels[1]), *arrays)
+    return _per_product(product_kernel, run, query, key, value, g, beta, rate, skip, state, starts, firsts)
 
 
 def _scan_widths(width: int) -> int:
