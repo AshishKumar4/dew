@@ -36,6 +36,15 @@ JOINED_SEEDS = {("gate_up", jnp.float32, False): 8, ("gate_up", jnp.float32, Tru
 with the joined row on the CPU and an A100."""
 
 
+def drawing(params, shape, dtype):
+    """A joined row's draw: `params` beside an input and its output's cotangent of `shape` in `dtype`, from
+    the seed's key."""
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed))
+        return (params, *(jax.random.normal(drawn, shape).astype(dtype) for drawn in keys))
+    return draw
+
+
 def assert_joined_as_exact(choice: str, run, draw, wide_run, label: str, *, seeds: int):
     """`run` with `choice` joined, every leaf of the same dtype as the run with it apart and on par with
     it from `wide_run`, the apart run in float64, over `draw`'s inputs (check 1)."""
@@ -66,9 +75,7 @@ def test_gate_and_up_joined_are_as_exact_as_apart_from_float64(dtype, bias):
     params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
                           layer.init(jax.random.key(4), jnp.zeros((2, 33, 64), dtype)))
 
-    def draw(seed):
-        keys = jax.random.split(jax.random.key(seed))
-        return (params, *(jax.random.normal(drawn, (2, 33, 64)).astype(dtype) for drawn in keys))
+    draw = drawing(params, (2, 33, 64), dtype)
 
     x = draw(0)[1]
     with row_joins("gate_up", joins=False):
@@ -216,9 +223,7 @@ def test_a_delta_nets_gates_joined_are_as_exact_as_apart_from_float64(dtype):
                           dtype=dtype)
     params = layer.init(jax.random.key(9), jnp.zeros((2, 40, 64), dtype))
 
-    def draw(seed):
-        keys = jax.random.split(jax.random.key(seed))
-        return (params, *(jax.random.normal(drawn, (2, 40, 64)).astype(dtype) for drawn in keys))
+    draw = drawing(params, (2, 40, 64), dtype)
 
     x = draw(0)[1]
     with row_joins("delta_gates", joins=False):
