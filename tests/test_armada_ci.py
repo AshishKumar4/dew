@@ -1260,12 +1260,7 @@ def test_a_fixture_reruns_its_readers_alone_though_a_native_reader_reads_it(
         "test_b_other.py": "from pathlib import Path\n"
                            "def test_other():\n"
                            "    with Path('runs-other').open('a') as runs: runs.write('x')\n"})
-    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
-
-    def run() -> list[int]:
-        rows = armada_task(ci, monkeypatch, verdict)
-        assert [row["exitCode"] for row in rows] == [0, 0]
-        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("native", "other")]
+    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("native", "other"))
 
     assert run() == [1, 1]
     assert run() == [1, 1]
@@ -1273,6 +1268,21 @@ def test_a_fixture_reruns_its_readers_alone_though_a_native_reader_reads_it(
     assert run() == [2, 1]
     (tmp_path / "tests/fixtures/unread.json").write_text("[]\n")
     assert run() == [2, 1]
+
+
+def counted_runs(ci, root: Path, monkeypatch, cache_worker,
+                 names: tuple[str, ...]) -> Callable[[], list[int]]:
+    """The checkout's 3.12 tasks, run green on one CPU class against the shared test cache as armada starts
+    them (`cached_checkout`): each call, how many times each test file named in `names` has run, which it
+    counts in runs-<name>."""
+    verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
+
+    def run() -> list[int]:
+        rows = armada_task(ci, monkeypatch, verdict)
+        assert [row["exitCode"] for row in rows] == [0] * len(names)
+        return [len((root / f"runs-{name}").read_text()) for name in names]
+
+    return run
 
 
 def packed(root: Path, names: list[str]) -> None:
@@ -1298,12 +1308,7 @@ def test_a_reader_files_share_in_one_process_is_every_such_files_input(
             "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n")
     written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
     packed(tmp_path, ["test_a.py", "test_b.py"])
-    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
-
-    def run() -> list[int]:
-        rows = armada_task(ci, monkeypatch, verdict)
-        assert [row["exitCode"] for row in rows] == [0, 0]
-        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b")]
+    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("a", "b"))
 
     assert run() == [1, 1]
     assert run() == [1, 1]

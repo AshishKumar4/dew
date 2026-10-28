@@ -17,6 +17,7 @@ blind: what was opened then is not known, and no record keeps a key (owner, 2026
 
 import ctypes
 import os
+import select
 import struct
 import threading
 
@@ -66,11 +67,9 @@ class Opens:
 
     def drain(self) -> None:
         """The events the kernel holds, read: each data file's open kept (`opened`), a lost watch blind."""
-        while self.fd >= 0:
-            try:
-                data = os.read(self.fd, 1 << 16)
-            except BlockingIOError:
-                return
+        # Read while the kernel holds events (select's readiness), so no read waits or finds none.
+        while self.fd >= 0 and select.select([self.fd], [], [], 0)[0]:
+            data = os.read(self.fd, 1 << 16)
             at = 0
             while at < len(data):
                 watch, mask, _, length = EVENT.unpack_from(data, at)
