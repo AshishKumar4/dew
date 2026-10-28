@@ -150,7 +150,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import EvalSuite, Evaluation, Summary
+from dew.training.evaluation import EvalSuite, Evaluation, Summary, admit_split
 from dew.training.interval import Interval, TokenClock, held, throughput
 from dew.training.memory import (
     climb_to,
@@ -420,12 +420,14 @@ class Trainer(Generic[Loss, Effects]):
 
     @property
     def key(self) -> jax.Array:
-        """The run's PRNG key: the one it was given, or its seed's, made when first read, which `fit`
-        does after it readies the process (`ready_process`), so constructing a trainer opens no
-        backend before the process's flags and compilation cache are set."""
+        """The run's PRNG key: the one it was given, or its seed's, made when first read, which every
+        path that builds state does, after readying the process (`ready_process`) and outside any
+        trace: constructing a trainer opens no backend before its flags and cache are set."""
         if self._key is None:
             from dew.nn.inputs import request_key
-            self._key = request_key(self._given_key)
+            ready_process()
+            with jax.ensure_compile_time_eval():
+                self._key = request_key(self._given_key)
         return self._key
 
     @functools.cached_property
@@ -2079,9 +2081,6 @@ class Trainer(Generic[Loss, Effects]):
             with region("evaluate"):
                 self._evaluation(plan, state, shardings, {}, warm=True)
         elif first:
-            # A split scored only at the end is read once here, so its undeclared inputs are refused
-            # before an update; its programs compile where it is scored.
-            from dew.training.evaluation import admit_split
             for split, suite in plan.suites.items():
                 admit_split(self.objective, suite.data, self.device_mesh, split)
 

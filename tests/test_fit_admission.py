@@ -14,14 +14,17 @@ import pytest
 from affine_run import Replaying
 from objective_cases import IMAGES
 
+from dew.batch import VALID_ROWS
 from dew.config import TrainerConfig
 from dew.config.jepa import JepaRunConfig
 from dew.data import TFDS, Loading, presets
-from dew.data.dataset import Loader
+from dew.data.compile import native
+from dew.data.dataset import DataPartition, Loader, rows_of
 from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
 from dew.training import Trainer
+from dew.training.observe import Observe
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -55,6 +58,7 @@ from dew.devices import backend_open
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Trainer
+from dew.training.observe import Observe
 
 model = models.build("causal_transformer", vocab_size=16, emb_features=8, num_layers=1, num_heads=2,
                      mlp_features=16, max_seq_len=8)
@@ -107,9 +111,9 @@ def test_a_batch_of_a_shape_the_run_has_not_stepped_is_checked_against_its_decla
 def test_a_validation_split_of_undeclared_inputs_is_refused_before_the_run_trains(eval_every):
     """A model that reads any width trains on the three-wide inputs its objective declares, and its
     validation split is five wide: the split is read before the run updates, whether it is scored
-    every five steps or only at the end, and the run is refused there, its training stream read no
-    further than its first batches. Before, only training batches were checked, and an end-only split
-    was first read after training (AT-03)."""
+    every five steps or only at the end, and the run is refused there, before it completes a step.
+    Before, only training batches were checked, and an end-only split was first read after training
+    (AT-03)."""
     def batch(width: int, seed: int) -> dict:
         x = np.random.default_rng(seed).normal(size=(8, width)).astype(np.float32)
         return {"x": x, "y": x[:, :2]}
@@ -118,11 +122,12 @@ def test_a_validation_split_of_undeclared_inputs_is_refused_before_the_run_train
     objective = Supervised(Pooled(), lambda outputs, batch: (outputs - batch["y"]) ** 2,
                            inputs=InputSpec(Field("x", (3,))))
     data = Loader(train=lambda partition: stream, val=None, batch=8, records=None)
-    held = {"held": lambda partition: [batch(5, 0), batch(5, 1)]}
+    held = {"held": lambda partition: iter([batch(5, 0), batch(5, 1)])}
+    stepped = Observe(1, lambda state: int(state.step))
     with pytest.raises(ValueError):
         Trainer(objective, optax.sgd(0.1), key=0).fit(data, validation=held, steps=40, log_every=1,
-                                                      eval_every=eval_every)
-    assert stream.position < 10
+                                                      eval_every=eval_every, observe=stepped)
+    assert stepped.values == []
 
 
 def regression_rows(rows: int, seed: int) -> dict:
@@ -149,3 +154,24 @@ def test_data_handed_as_it_is_steps_as_given(handed):
         data, validation = regression_rows(8, 0), regression_rows(8, 1)
     state = Trainer(objective, optax.sgd(0.1), key=0).fit(data, validation=validation, steps=6, log_every=1)
     assert int(state.step) == 6
+
+
+def test_a_handed_validation_batch_is_shared_alike_by_every_reader():
+    """Five rows of handed arrays read by two shares: each reads three, the one short filled with a
+    repeat its `VALID_ROWS` marks, so the shares make one global batch and every real row scores once."""
+    columns = regression_rows(5, 0)
+    read = native(columns, training=False)
+    shares = [next(read(DataPartition(index=index, count=2))) for index in range(2)]
+    assert [rows_of(share) for share in shares] == [3, 3]
+    assert sum(int(np.sum(share[VALID_ROWS])) for share in shares) == 5
+
+
+def test_a_trainer_validated_before_it_fits_trains_from_its_seed():
+    """Validation traces the trainer's state, its key among it: the key it makes there is concrete, and
+    the fit after it trains from it (`Trainer.key`)."""
+    objective = Supervised(Pooled(), lambda outputs, batch: (outputs - batch["y"]) ** 2,
+                           inputs=InputSpec(Field("x", (3,))))
+    trainer = Trainer(objective, optax.sgd(0.1), key=3)
+    trainer.validate(steps=2)
+    state = trainer.fit(regression_rows(8, 0), steps=2, log_every=1)
+    assert int(state.step) == 2

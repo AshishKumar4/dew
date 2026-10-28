@@ -468,9 +468,11 @@ def admit_split(objective: Objective[Loss, Effects], batches: Reader, mesh: Mesh
 
         agreed(f"{split} iterator construction", open_source)
         assert iterator is not None
-        held, _ = _next_batch(iterator, 0)
-        if held is not None:
-            _admitted(objective, held, set())
+        # The phases `_score_split` walks for its first batch, so every rank meets its peers.
+        held, available = _next_batch(iterator, 0)
+        if available:
+            _, _, batch = _covered(mesh, held, None, 0)
+            _admitted(objective, batch, set())
     finally:
         _close_source(iterator if iterator is not None else source)
 

@@ -60,6 +60,8 @@ from dew.data.compilation import compiling, within
 from dew.data.dataset import (
     Closeable,
     DataPartition,
+    FilledBatch,
+    Forwarding,
     GlobalReader,
     GlobalStream,
     Loader,
@@ -1274,30 +1276,37 @@ class _Whole:
         self.read = int(state)
 
 
-def _share(batch: Batch, partition: DataPartition) -> Batch:
-    """`partition`'s share of `batch` (`DataPartition`: rows `index :: count`)."""
+def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
+    """`partition`'s share of `batch` (`DataPartition`: rows `index :: count`); `held`, a validation
+    share, filled out to every share's rows and its repeats marked (`DataPartition.held`,
+    `FilledBatch`), so every share reads a batch where any does and every real row scores once."""
     if partition.count == 1:
         return batch
-    return take_batch(batch, np.arange(partition.index, rows_of(batch), partition.count))
+    rows = rows_of(batch)
+    if not held:
+        return take_batch(batch, np.arange(rows)[partition.cut()])
+    mine, real = partition.held(rows)
+    return FilledBatch(-(-rows // partition.count), real=real).map(take_batch(batch, np.arange(rows)[mine]))
 
 
-class _Shared:
-    """The `partition`'s share of each batch `batches` yields (`_share`), its position the stream's."""
+class _Shared(Forwarding):
+    """The `partition`'s share of each batch a stream yields (`_share`), its position, stop and close
+    the stream's."""
 
-    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition):
-        self.batches, self.partition = batches, partition
+    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool):
+        self._source, self.partition, self.held = batches, partition, held
 
     def __iter__(self):
         return self
 
     def __next__(self) -> Batch:
-        return _share(next(self.batches), self.partition)
+        return _share(next(self._source), self.partition, held=self.held)
 
     def get_state(self):
-        return self.batches.get_state()
+        return self._source.get_state()
 
     def set_state(self, state) -> None:
-        self.batches.set_state(state)
+        self._source.set_state(state)
 
 
 def native(handed: Handed, *, training: bool) -> Reader:
@@ -1308,20 +1317,27 @@ def native(handed: Handed, *, training: bool) -> Reader:
     if isinstance(handed, Mapping):
         batch = {name: np.asarray(column) for name, column in handed.items()}
         if training:
-            return lambda partition: _Shared(_Whole(batch), partition)
-        return lambda partition: iter([_share(batch, partition)])
+            return lambda partition: _Shared(_Whole(batch), partition, held=False)
+        return lambda partition: iter([_share(batch, partition, held=True)])
     stream = handed
     if isinstance(handed, pygrain.MapDataset):
         stream = (handed.repeat() if training else handed).to_iter_dataset()
-    return lambda partition: _Shared(iter(stream), partition)
+    return lambda partition: _Shared(iter(stream), partition, held=not training)
 
 
 def native_loader(handed: Handed) -> Loader:
     """The data handed to `fit` as it is (`native`) as the loader the run reads, its global batch
     its first element's rows."""
-    first = handed[0] if isinstance(handed, pygrain.MapDataset) else (
-        next(iter(handed)) if isinstance(handed, pygrain.IterDataset) else {
-            name: np.asarray(column) for name, column in handed.items()})
+    if isinstance(handed, pygrain.IterDataset):
+        probe = iter(handed)
+        try:
+            first = next(probe)
+        finally:
+            if isinstance(probe, Closeable):
+                probe.close()
+    else:
+        first = handed[0] if isinstance(handed, pygrain.MapDataset) else {
+            name: np.asarray(column) for name, column in handed.items()}
     batch = rows_of(first)
     records = (len(handed) * batch if isinstance(handed, pygrain.MapDataset)
                else batch if isinstance(handed, Mapping) else None)
