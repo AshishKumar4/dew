@@ -571,16 +571,6 @@ def _iota(params):
                            shape)
 
 
-def _barrier(params, operands, result, fmt):
-    """An optimization barrier's results are its operands, unchanged: each result one of them, bit for bit
-    (`_held` hands a contract each result alone)."""
-    result = np.asarray(result)
-    same = [np.asarray(value) for value in operands
-            if np.shape(value) == result.shape and np.asarray(value).dtype == result.dtype]
-    held = any(np.array_equal(_bits(value), _bits(result)) for value in same)
-    return np.full(result.shape, held)
-
-
 def _gathered(params, operand, indices):
     """lax.gather's result, by XLA's semantics: each output index's batch coordinates pick a start vector
     from `indices` (its last axis the index vector), placed on the operand's `start_index_map` axes and
@@ -604,15 +594,17 @@ def _gathered(params, operand, indices):
     for dim, size in zip(batch_dims, indices.shape[:-1], strict=True):
         out_shape[dim] = size
     result = np.empty(out_shape, operand.dtype)
-    if params.get("fill_value") is not None:
-        filler = params["fill_value"]
-    elif np.issubdtype(operand.dtype, np.inexact):
-        filler = np.nan
-    elif np.issubdtype(operand.dtype, np.bool_):
-        filler = True
-    else:
-        filler = np.iinfo(operand.dtype).min if np.issubdtype(operand.dtype, np.signedinteger) else \
-            np.iinfo(operand.dtype).max
+    filler = None
+    if mode == fill:
+        if params.get("fill_value") is not None:
+            filler = params["fill_value"]
+        elif jax.dtypes.issubdtype(operand.dtype, np.inexact):
+            filler = np.nan
+        elif operand.dtype == np.bool_:
+            filler = True
+        else:
+            filler = np.iinfo(operand.dtype).min if np.issubdtype(operand.dtype, np.signedinteger) else \
+                np.iinfo(operand.dtype).max
     for out in np.ndindex(*out_shape):
         batch = tuple(out[dim] for dim in batch_dims)
         vector = indices[batch]
@@ -821,7 +813,7 @@ CONTRACTS = {
     "concatenate": _moved(lambda params, *parts: np.concatenate(parts, axis=params["dimension"])),
     "copy": _moved(lambda params, a: a),
     "copy_p": _moved(lambda params, a: a),
-    "optimization_barrier": _barrier,
+    "optimization_barrier": _moved(lambda params, a: a),
     "pad": _moved(_padded),
     "iota": _moved(_iota),
     "gather": _moved(_gathered),
@@ -838,6 +830,9 @@ operation wrapped to its width; or a result with no rounding at all, bit for bit
 sign operation, a comparison), every operand read as the lane reads it (`Lane.flushes`). A primitive
 missing here cannot be certified, which fails the site's coverage, as does an integer result of a
 primitive with no integer form (`div`, `sqrt`, a transcendental)."""
+POSITIONAL = {"optimization_barrier"}
+"""The primitives whose each result is the operand in its own position, so their contract reads that
+operand alone (`_held`)."""
 
 
 def certified(fn, *arguments) -> tuple:
@@ -927,10 +922,12 @@ def _held(eqn, operands, results, findings, at) -> None:
         if dtype is not None and not keyed and _inexact(dtype) and _format(dtype) is None:
             findings.append(f"{at}: uncertifiable, no format for {dtype}")
             return
-    for result in results:
+    for index, result in enumerate(results):
         fmt = _format(getattr(_host(result), "dtype", np.float32))
+        # An optimization barrier's i-th result is its i-th operand: its contract reads that one alone.
+        given = [hosted[index]] if name in POSITIONAL else hosted
         try:
-            ok = np.asarray(CONTRACTS[name](eqn.params, hosted, _host(result), fmt))
+            ok = np.asarray(CONTRACTS[name](eqn.params, given, _host(result), fmt))
         except TypeError:
             findings.append(f"{at}: uncertifiable, {name} of these operands has no contract")
             return

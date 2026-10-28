@@ -313,10 +313,15 @@ def _off_by_one_element(result):
      [np.float32(np.arange(20).reshape(5, 4)), np.int32([1, 7, -1, 4])]),
     ("gather", lambda a, i: jax.vmap(lambda row, at: row[at])(a, i),
      [np.float32(np.arange(20).reshape(5, 4)), np.int32([3, 0, 1, 2, 3])]),
+    ("gather", lambda a, i: jnp.take_along_axis(a, i, axis=1, mode="clip"),
+     [np.arange(20).reshape(5, 4).astype(ml_dtypes.bfloat16), np.int32([[0, 9], [3, -2], [1, 1], [2, 0], [3, 3]])]),
+    ("gather", lambda a, i: a[i],
+     [np.arange(20).reshape(5, 4).astype(ml_dtypes.bfloat16), np.int32([[4], [0], [2]])]),
     ("stack", lambda a, b: jnp.stack([a, b], axis=1), [np.float32([1, 2, 3]), np.float32([4, 5, 6])]),
     ("optimization_barrier", lambda a, b: jax.lax.optimization_barrier((a, b)),
      [np.float32([1, 2]), np.float32([[3, 4, 5]])]),
-], ids=["pad", "iota", "gather", "gather clipped", "gather filled", "gather batched", "stack", "barrier"])
+], ids=["pad", "iota", "gather", "gather clipped", "gather filled", "gather batched", "gather clipped bf16",
+        "gather bf16", "stack", "barrier"])
 def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn, operands):
     """Every move check 2 certifies by a numpy oracle of XLA's semantics (`CONTRACTS`), padding with
     interior and negative edges, an iota, a gather in each mode and batched, a stack and an optimization
@@ -329,6 +334,20 @@ def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn,
         native = np.asarray(result)
         assert np.all(contract(params, given, native, None)), name
         assert not np.all(contract(params, given, _off_by_one_element(native), None)), name
+
+
+def test_a_barrier_holds_each_result_to_its_own_operand():
+    """An optimization barrier of two operands of one shape: its results in place hold, the two swapped
+    break, though each is one of its operands."""
+    a, b = np.float32([1, 2]), np.float32([3, 4])
+    _, given, results = _first_equation(lambda a, b: jax.lax.optimization_barrier((a, b)), [a, b],
+                                        "optimization_barrier")
+    eqn = jax.make_jaxpr(lambda a, b: jax.lax.optimization_barrier((a, b)))(a, b).jaxpr.eqns[0]
+    findings = []
+    ct._held(eqn, given, results, findings, "barrier")
+    assert findings == []
+    ct._held(eqn, given, results[::-1], findings, "barrier")
+    assert len(findings) == 2, findings
 
 
 def test_a_scan_is_certified_a_step_at_a_time_and_a_steps_finding_named_by_it():
@@ -356,6 +375,13 @@ def test_a_scan_is_certified_a_step_at_a_time_and_a_steps_finding_named_by_it():
         assert findings == []
         for found, native in zip(jax.tree.leaves(outputs), jax.tree.leaves(stepped(reverse)), strict=True):
             np.testing.assert_array_equal(np.asarray(found), np.asarray(native))
+    # No steps, and steps over no inputs: the carry passes through, the outputs are empty or stacked.
+    empty, findings = ct.certified(lambda x: jax.lax.scan(lambda c, row: (c + row, c * row), x[0], x[:0]), x)
+    assert findings == [] and np.asarray(empty[1]).shape == (0, 3)
+    np.testing.assert_array_equal(np.asarray(empty[0]), x[0])
+    counted, findings = ct.certified(lambda c: jax.lax.scan(lambda c, _: (c * np.float32(2), c), c, None,
+                                                            length=3), x[0])
+    assert findings == [] and np.asarray(counted[1]).shape == (3, 3)
     _, findings = ct.certified(lambda x: jax.lax.scan(lambda c, row: (c + jnp.sin(row), None),
                                                       np.float32(np.zeros(3)), x), x)
     assert len(findings) == 4 and all("scan#" in finding and f"/{step}/sin" in finding
