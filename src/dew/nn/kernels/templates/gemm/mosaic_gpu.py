@@ -556,7 +556,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 values = accs if epilogue is None else epilogue(*accs, *(smem[wg] for smem in side_smems))
                 values = values if isinstance(values, tuple) else (values,)
                 for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
-                    store(output, value, o_gmem, (part_row, first, stored, column, min(part[0], m)))
+                    store(output, value, o_gmem, (part_row, first, stored, column, min(part[0], m),
+                                                  TMA_ROWS if dense else 1))
 
             family.persist(streams, (grid[0] * grid[1],), schedule, consumer, consumers=consumers,
                            axis="programs", outputs=allocations.outputs,

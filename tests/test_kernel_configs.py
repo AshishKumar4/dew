@@ -376,9 +376,9 @@ def _derived_and_refused(launch, ba, target) -> tuple:
 def _emitted_forms(family, shape: str | None = None) -> set[str]:
     """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`): none without a bundle, the
     hooked and exactly summed ones where its register model counts what they hold (`Family.counts_hooks`);
-    at a projection `shape`, each whose output's width
-    steps by the family's column unit and whose contraction by its narrowest depth (`Family.column_unit`,
-    `Family.depths`: mma.sync stores a row over a role's 128 threads, so no output 64 wide)."""
+    at a projection `shape`, each whose output's width steps by the family's column unit, whose stores take
+    it (`Family.stores_columns`: a grouped product's rows ragged to one, a kernel gradient's whole role's)
+    and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
     forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ())}
@@ -391,7 +391,9 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
         # An input gradient's output is the depth wide, contracting the width; every other form's output
         # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
         columns, contracted = (depth, width) if "input gradient" in form else (width, depth)
-        return columns % unit == 0 and ("kernel gradient" in form or contracted % step == 0)
+        stored = family.role_rows if "kernel gradient" in form else 1
+        return (columns % unit == 0 and family.stores_columns(columns, stored)
+                and ("kernel gradient" in form or contracted % step == 0))
 
     return {form for form in forms if takes(form)}
 

@@ -185,13 +185,14 @@ def stored(parts, views, *, smem, wait: bool = True) -> None:
             plgpu.wait_smem_to_gmem(0)
 
 
-def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
+def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, least: int = 1,
                copy: Callable = plgpu.copy_smem_to_gmem, widest: int | None = None) -> None:
     """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a
     power-of-two ladder of static-size `copy`s (a TMA store's descriptor has static extents; `copied`
-    moves the rows through registers where a GPU has no TMA), the largest `most` rows'; with `widest`, in
-    copies of at most `widest` rows, whole ones first (a copy through registers holds its rows:
-    `resources.copied_rows`)."""
+    moves the rows through registers where a GPU has no TMA), the largest `most` rows', the smallest
+    `least` (`stored` a multiple of it: a rung below it is never taken, and none is emitted); with
+    `widest`, in copies of at most `widest` rows, whole ones first (a copy through registers holds its
+    rows: `resources.copied_rows`)."""
     start, size = first, most
     if widest is not None and widest < most:
         for whole in range(most // widest):
@@ -202,7 +203,7 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
                                pl.ds(column, o_smem.shape[1])])
 
         start, size = first + stored // widest * widest, widest - 1
-    while size:
+    while size >= least:
         rung = 1 << int(math.log2(size))
         size //= 2
 
@@ -483,6 +484,14 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """The columns a tile's width steps by for operands of `dtype`: the swizzle a block's rows are
         staged in, or the row its stores lay over a role's threads."""
 
+    def stores_columns(self, columns: int, rows: int) -> bool:
+        """Whether its stores take an output tile `columns` wide (a multiple of `column_unit`) whose stored
+        rows come in multiples of `rows` (a grouped call's, ragged to a row: 1; a dense call's, whole
+        `TMA_ROWS`): any, unless its stores reload rows through registers laid over a role's threads
+        (`Mma`)."""
+        del columns, rows
+        return True
+
     @abc.abstractmethod
     def depths(self, dtype) -> tuple[int, ...]:
         """The depths a step may take for operands of `dtype`, widest first: the swizzles its products
@@ -589,9 +598,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         as `walk` does, a step's index the tile's own (where not active it takes none, its accumulators as
         they start), and `store(output, value, ref, place)` stores a consumer's `value` of output `output`
         (`outputs`' `(shape, dtype)`) to `ref` at `place`, `store_rows`' `(row_start, first, stored,
-        column, most)`. The family owns the loads, the step counter across tiles, the streams' drain, the
-        outputs' staging and the stores' completion. A cluster's programs run the same tiles: where a stream
-        is multicast (`streams`), `schedule` gives each of them the same `active`, `steps` and view of it."""
+        column, most)` and, where the stored rows come in whole multiples, `least`. The family owns the
+        loads, the step counter across tiles, the streams' drain, the outputs' staging and the stores'
+        completion. A cluster's programs run the same tiles: where a stream is multicast (`streams`),
+        `schedule` gives each of them the same `active`, `steps` and view of it."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -896,7 +906,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             def store(output, value, ref, place):
                 smem = smems[output].at[index]
                 buffers, width = smem.shape[0], smem.shape[-1]
-                row_start, first, stored, column, most = place
+                row_start, first, stored, column, *ladder = place
                 for chunk in range(value.shape[1] // width):
                     if chunk == 0 or chunk >= buffers:
                         # The buffer's last store (the last tile's, at its first chunk) has read it.
@@ -904,7 +914,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                     buffer = smem.at[chunk % buffers]
                     buffer[...] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
                     plgpu.commit_smem()
-                    store_rows(buffer, ref, row_start, first, stored, column + chunk * width, most)
+                    store_rows(buffer, ref, row_start, first, stored, column + chunk * width, *ladder)
 
             @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
             def ended(loop: plgpu.NDLoopInfo, carry):
