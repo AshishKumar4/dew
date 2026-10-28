@@ -61,6 +61,22 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert saved.plan == ahead.plan and saved.program == ahead.program
 
 
+def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_path, monkeypatch):
+    """An absent GPU with less memory than even the arguments gets no executable to run. Its
+    refusal keeps every candidate's compile evidence, so the offline gate can check refusals too."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.planning import PlanRefused
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
+    with pytest.raises(PlanRefused) as refused:
+        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=1024)
+    probes = refused.value.probes
+    assert probes and all(not probe.fits for probe in probes)
+    assert all(probe.compile_seconds > 0 for probe in probes)
+    assert any(probe.headroom is not None and probe.headroom < 0 for probe in probes)
+
+
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("spec", [MeshSpec(fsdp=8), MeshSpec(), MeshSpec(fsdp=4, tensor=2)],
                          ids=["fsdp8", "data8", "fsdp4_tensor2"])

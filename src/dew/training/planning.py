@@ -263,6 +263,15 @@ def unplanned(probes: Sequence[Probe]) -> str:
             "(fsdp), train fewer parameters or shorter rows, or use a device with more memory")
 
 
+class PlanRefused(RuntimeError):
+    """No candidate fits. `probes` holds every program the search compiled, including refusals, so
+    an offline gate reads failed admission evidence as objects rather than parsing the message."""
+
+    def __init__(self, probes: Sequence[Probe]):
+        self.probes = tuple(probes)
+        super().__init__(unplanned(self.probes))
+
+
 @dataclasses.dataclass(frozen=True)
 class Planned:
     """A plan `FitSearch` found: the step reading its batch in `split`
@@ -575,7 +584,7 @@ class FitSearch[LossT, EffectsT]:
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
         if split is None or self.fitted is None:
-            raise RuntimeError(unplanned(self.probes)) from (self.refusals[-1] if self.refusals else None)
+            raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         plans = [self.found(split)]
         if (frontier and opens_frontier(split, candidates[0], self.mesh)
               and self.onward(lambda: remat_more(self.objective))):
