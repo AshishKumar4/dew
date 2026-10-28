@@ -247,6 +247,10 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+        # The test cache's read-only token, for the plan armada runs here (.armada.json's local plan): the files
+        # whose rows the cache holds for exactly these inputs share one task (tools/armada/ci.py `reusable`).
+        # It reads records and never writes them; a fork's pull request receives no repository secret.
+        DEW_XLA_CACHE_READ_TOKEN: ${{ secrets.DEW_XLA_CACHE_READ_TOKEN }}
         DEW_TEST_CACHE: ${{ needs.scope.outputs.policy }}
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
@@ -264,8 +268,15 @@ jobs:
         case "$GITHUB_REF_NAME" in ci/base-*|base/kernels|ci/full-whole-*) gangless=1 ;; *) gangless= ;; esac
         # A train's jobs (ci/batch-*, ci/fix-*), its gangs and its suite alike, start before any other while the
         # fleet is full, and lanes' runs at a head (verdict.sh, at -10) end their newest containers to let them in
-        # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers.
-        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; *) priority= ;; esac
+        # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers. A push to
+        # base/kernels, a base/<producer> promote and the background whole suite run at a lane's whole-suite priority
+        # (-10, verdict.sh's) within their pool of 48, so they never take containers from a train, a precheck or a
+        # lane's targeted run (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger).
+        case "$GITHUB_REF_NAME" in
+          ci/batch-*|ci/fix-*) priority=--priority=10 ;;
+          ci/base-*|base/kernels|ci/full-whole-*) priority=--priority=-10 ;;
+          *) priority= ;;
+        esac
         if [ -z "$PROVEN" ] && [ -z "$gangless" ]; then
           # A gang member lost before the start fails it within 300 s (armada#22).
           items=$(python3 tools/armada/ci.py gangs)
