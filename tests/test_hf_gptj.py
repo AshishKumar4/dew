@@ -13,7 +13,7 @@ from dew.interop import Pretrained
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 DIRECTORY = ROOT / 'gptj-tiny'
 
-LIKELIHOOD_SEEDS = 0
+LIKELIHOOD_SEEDS = 8
 """The affine head's declared draws of ids against transformers' cross entropy over its logits (check 1),
 sized by `seeds_for` paired with Dew's token scores on the CPU."""
 

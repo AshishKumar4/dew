@@ -17,7 +17,7 @@ def _fixture(name: str) -> np.ndarray:
     return np.load(DIRECTORY / f'{name}.npy')
 
 
-LOGITS_SEEDS = 0
+LOGITS_SEEDS = 8
 """The masked LM's declared draws of ids against ModernBertForMaskedLM's logits (check 1), sized by
 `seeds_for` paired with Dew's logits on the CPU."""
 
@@ -36,7 +36,7 @@ def test_modernbert_masked_lm_logits_match_the_reference():
                                   reference(ids).argmax(-1))
 
 
-STATES_SEEDS = {'reference': 0, 'xla': 0}
+STATES_SEEDS = {'reference': 8, 'xla': 8}
 """The encoder states' declared draws of ids against ModernBertModel's (check 1), on each attention path,
 sized by `seeds_for` paired with Dew's states on the CPU."""
 

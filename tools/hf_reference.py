@@ -486,6 +486,36 @@ def write_minimax_m2_fp8(config: dict, weights: dict, ids: torch.Tensor) -> None
     (directory / 'model.safetensors').chmod(0o644)
 
 
+def write_minimax_m2_recordings() -> None:
+    """minimax-m2-tiny's and minimax-m2-fp8-tiny's logits recorded over check 1's seeds
+    (`recorded_references.record_logits`) on the release with MiniMax-M2's rotary fix, which the suite's
+    pinned release predates: the first's left-padded rows too, under padded.npz's mask and positions, and
+    the second through transformers' CPU dequantization of its FP8 storage, each as recorded_logits.npz
+    in its directory, which tests/test_hf_decoder_moe.py reads."""
+    from recorded_references import record_logits
+    from reference_releases import require
+    from torch_precision import float64_twin
+    from transformers import FineGrainedFP8Config, MiniMaxM2ForCausalLM
+
+    release = require("minimax-m2")["transformers"]
+    dequantized = {'quantization_config': FineGrainedFP8Config(dequantize=True)}
+    for name, options in (('minimax-m2-tiny', {}), ('minimax-m2-fp8-tiny', dequantized)):
+        directory = FIXTURES / name
+        model = MiniMaxM2ForCausalLM.from_pretrained(str(directory), dtype=torch.float32, **options)
+        model.set_experts_implementation('eager')
+        model.set_attn_implementation('eager')
+        model.eval()
+        padded = None
+        if name == 'minimax-m2-tiny':
+            with np.load(directory / 'padded.npz') as arrays:
+                padded = {'attention_mask': arrays['attention_mask'], 'position_ids': arrays['position_ids']}
+        record_logits(directory, model, float64_twin(model),
+                      f'uv pip install --target /tmp/tf518 --no-deps transformers=={release}; '
+                      f'PYTHONPATH=/tmp/tf518:src:tools python tools/hf_reference.py --minimax-m2-recording',
+                      reference='transformers MiniMaxM2ForCausalLM', revision=release, license='Apache-2.0',
+                      padded=padded)
+
+
 def write_qwen2_moe() -> None:
     """Three mixed-window layers, two routed layers and a gated shared expert."""
     from transformers import Qwen2MoeConfig, Qwen2MoeForCausalLM
@@ -1765,6 +1795,8 @@ def main() -> None:
                         help='only this classic decoder fixture and its pinned released configs')
     parser.add_argument('--minimax-m2-only', action='store_true',
                         help='only MiniMax-M2 with transformers 5.18.0 and its pinned configs')
+    parser.add_argument('--minimax-m2-recording', action='store_true',
+                        help="only MiniMax-M2's logits over check 1's seeds, with transformers 5.18.0")
     parser.add_argument('--qwen2-moe-only', action='store_true',
                         help='only Qwen2-MoE and its pinned released config')
     parser.add_argument('--granitemoe-only', action='store_true',
@@ -1779,6 +1811,9 @@ def main() -> None:
         return
     if args.minimax_m2_only:
         write_minimax_m2()
+        return
+    if args.minimax_m2_recording:
+        write_minimax_m2_recordings()
         return
     if args.qwen2_moe_only:
         write_qwen2_moe()

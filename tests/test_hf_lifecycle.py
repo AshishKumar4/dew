@@ -85,9 +85,12 @@ EXPORTS = (
 )
 
 
-EXPORT_SEEDS = {'gpt-bigcode-tiny': 0, 'gpt-bigcode-mha-tiny': 0, 'starcoder2-tiny': 0, 'falcon-tiny': 0, 'falcon-mha-tiny': 0, 'gptj-tiny': 0, 'phi-tiny': 0, 'phi3-tiny': 0, 'bloom-tiny': 0, 'gpt2-tiny': 0, 'gpt-neox-tiny': 0, 'opt-tiny': 0, 'gpt-neo-tiny': 0, 'mimo-v2-flash-tiny': 0, 'mamba-tiny': 0, 'modernbert-tiny': 0, 'gpt-bigcode-tiny-saved': 0, 'gpt-bigcode-mha-tiny-saved': 0, 'starcoder2-tiny-saved': 0, 'falcon-tiny-saved': 0, 'falcon-mha-tiny-saved': 0, 'gptj-tiny-saved': 0, 'phi-tiny-saved': 0, 'phi3-tiny-saved': 0, 'mamba-tiny-saved': 0}
-"""Each export's declared draws of ids against transformers' read of it (check 1), by its label, sized by
+EXPORT_SEEDS = 8
+"""Each export's declared draws of ids against transformers' read of it (check 1), but Phi-3's, sized by
 `seeds_for` paired with Dew's logits on the CPU."""
+
+LONGROPE_EXPORT_SEEDS = 16
+"""Phi-3's export's, whose LongRoPE rows read the long factors, sized alike."""
 
 
 @pytest.mark.parametrize('case', EXPORTS, ids=lambda case: case.label)
@@ -107,8 +110,9 @@ def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case,
     reference, truth = transformers_arms(transformers_model(tmp_path, masked=case.masked),
                                          lambda model, ids: model(ids, **fields).logits)
     draw = fixture_ids(directory)
+    seeds = LONGROPE_EXPORT_SEEDS if case.fixture == 'phi3-tiny' else EXPORT_SEEDS
     assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, draw,
-                    f'{case.fixture} export', seeds=EXPORT_SEEDS[case.label], truth_fn=truth)
+                    f'{case.fixture} export', seeds=seeds, truth_fn=truth)
 
     if case.writes is None:
         assert_same_stored_tensors(load_shards(tmp_path), load_shards(directory))

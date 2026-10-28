@@ -12,7 +12,7 @@ from dew.interop import Pretrained
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'bloom-tiny'
 RELEASE = Path(__file__).parent / 'fixtures' / 'hf' / 'bloom-560m'
 
-CACHED_SEEDS = 0
+CACHED_SEEDS = 8
 """The cached padded rows' declared draws of ids against transformers' uncached forward (check 1), sized by
 `seeds_for` paired with Dew's prefill on the CPU."""
 

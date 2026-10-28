@@ -18,7 +18,7 @@ ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 DIRECTORY = ROOT / 'phi3-tiny'
 
 
-LOGITS_SEEDS = {False: 0, True: 0}
+LOGITS_SEEDS = {False: 16, True: 16}
 """The long and short logits' declared draws of ids against transformers' (check 1), unpadded and
 left-padded, sized by `seeds_for` paired with Dew's logits on the CPU."""
 
@@ -67,7 +67,7 @@ def test_phi3_cached_greedy_crosses_the_longrope_boundary():
     np.testing.assert_array_equal(generated.tokens, np.load(DIRECTORY / 'generated.npy'))
 
 
-CROSSING_SEEDS = 0
+CROSSING_SEEDS = 128
 """The cached walk's declared draws of ids against transformers' uncached forward at each step (check 1),
 sized by `seeds_for` paired with Dew's walk on the CPU."""
 
