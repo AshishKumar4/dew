@@ -500,11 +500,17 @@ CERTIFIED_SEEDS = 2
 
 @pytest.mark.parametrize("decay", ["gated", "none"])
 @pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
-def test_the_chunk_ops_certify_element_by_element(packed, decay):
+def test_the_chunk_ops_certify_element_by_element(packed, decay, monkeypatch):
     """The portable delta rule's chunk ops (`chunk_delta_rule`: the decay's prefix, the chunks' WY
     inverse and memories, the scan over chunks and the outputs), with a decay a head and with none, over
     one sequence and packed documents: run one primitive at a time, every element of every operation,
-    each step of the scan included, within its own operation's certified bound (check 2, row 1340)."""
+    each step of the scan included, within its own operation's certified bound (check 2, row 1340). The
+    program certified is the library's own, which every platform runs: without the test lane's wide CPU
+    arithmetic (`precision.WIDE_CPU_ARITHMETIC`, which only makes a CPU's float32 sums check 1's
+    references round once), each of its float32 sums certified as the sum it is."""
+    from dew.nn import precision
+
+    monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "0")
     def draw(seed):
         operands, starts, _ = portable_draw(seed, 1, packed)
         query, key, value, g, beta = operands

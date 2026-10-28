@@ -323,11 +323,18 @@ def test_a_scan_is_certified_a_step_at_a_time_and_a_steps_finding_named_by_it():
                                 reverse=reverse)
         return run
 
+    def stepped(reverse):
+        # The body's own operations, eagerly, a step at a time: the lane's, unfused.
+        carry, ys = np.float32(np.ones(3)), []
+        for row in (x[::-1] if reverse else x):
+            ys.append(jnp.subtract(carry, row))
+            carry = jnp.add(jnp.multiply(carry, row), np.float32(1))
+        return carry, jnp.stack(ys[::-1] if reverse else ys)
+
     for reverse in (False, True):
         outputs, findings = ct.certified(cumulative(reverse), x)
         assert findings == []
-        for found, native in zip(jax.tree.leaves(outputs), jax.tree.leaves(jax.jit(cumulative(reverse))(x)),
-                                 strict=True):
+        for found, native in zip(jax.tree.leaves(outputs), jax.tree.leaves(stepped(reverse)), strict=True):
             np.testing.assert_array_equal(np.asarray(found), np.asarray(native))
     _, findings = ct.certified(lambda x: jax.lax.scan(lambda c, row: (c + jnp.sin(row), None),
                                                       np.float32(np.zeros(3)), x), x)
