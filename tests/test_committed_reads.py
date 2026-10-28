@@ -42,7 +42,8 @@ def test_a_remote_export_is_read_at_the_version_it_committed_and_a_replaced_shar
         root = f"s3://{bucket}/export"
         export(Memory([{"id": index} for index in range(6)]), root, storage_options=options)
         manifest = json.loads(fsspec.filesystem("s3", **options).cat(f"{bucket}/export/_dew_manifest.json"))
-        assert all(entry["version"].startswith("etag:") for entry in manifest["files"])
+        shards = [entry for entry in manifest["files"] if entry["path"].endswith(".parquet")]
+        assert shards and all(entry["version"].startswith("etag:") for entry in shards)
         assert sorted(int(row["id"]) for row in iterate(Pipeline(Files(root, storage_options=options)),
                                                         read="streamed")) == list(range(6))
         _replaced_shard(fsspec.filesystem("s3", **options), f"{bucket}/export", range(100, 106))
@@ -67,8 +68,9 @@ def test_a_remote_file_committed_by_its_digest_alone_is_read_from_its_checked_mi
         export(Memory([{"id": index} for index in range(6)]), root, storage_options=options)
         manifest_path = f"{bucket}/export/_dew_manifest.json"
         manifest = json.loads(remote.cat(manifest_path))
+        # A manifest of digests alone, as one written before stores' versions were recorded is.
         for entry in manifest["files"]:
-            del entry["version"]
+            entry.pop("version", None)
         remote.pipe(manifest_path, json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode())
         mirrored = {**options, "dewcache": {"cache_storage": str(tmp_path / "mirror")}}
         if replaced:
