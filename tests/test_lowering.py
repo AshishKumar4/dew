@@ -565,7 +565,8 @@ def test_a_mamba2_forward_runs_its_template_scan_on_each_devices_own_rows(genera
         return [(operands, results) for name, target, operands, results in operations
                 if name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")]
 
-    assert mosaic(sharded) and mosaic(sharded) == mosaic(_operations(_ssd_forward(generation, rows=1, devices=1)))
+    local = _operations(_ssd_forward(generation, rows=1, devices=1))
+    assert mosaic(sharded) and mosaic(sharded) == mosaic(local)
     assert not [name for name, *_ in sharded if _collective(name)]
 
 

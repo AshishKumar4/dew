@@ -532,8 +532,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     Packed documents (`starts`, at most `max_segments` a row) each compute as they would alone. A conv
     runs before the op: it takes the conv's output. The operands the hooks read are checked as the
     decode step's (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction.
-    `mainloop` 'mosaic' runs the rule on the recurrence template's Mosaic GPU mainloop (`mosaic_rule`), every decay with
-    or without the delta rule, a route no target's row takes yet: only a caller naming it runs it."""
+    `mainloop` 'mosaic' runs the rule on the recurrence template's Mosaic GPU mainloop (`mosaic_rule`),
+    every decay with or without the delta rule."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
     given = recurrence.read(hooks, operands, optional=('state',))
@@ -734,9 +734,9 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
                 row=INHERENT, kind='measured'),
     Requirement('backward', lambda case: case.product != 'training' or _trains(case.call),
-                "a gradient the template's fast backward does not take: fp32 operands, no delta rule, a decay "
-                "a key dimension, or launches past the device's registers or shared memory at the call's "
-                "tiles (`mainloop.backward_holds`)", row='ledger 1294'),
+                "a gradient the template's fast backward does not take: fp32 operands, no delta rule, a "
+                "decay a key dimension, or launches past the device's registers or shared memory at the "
+                "call's tiles (`mainloop.backward_holds`)", row='ledger 1294'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,
@@ -1120,11 +1120,12 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
             wide_x, wide_B, wide_C = _padded(x, 3, columns), _padded(B, 3, rows), _padded(C, 3, rows)
             wide_state = _padded(_padded(carried, 2, columns), 3, rows)
             if kernel == 'pallas':
-                out, final = _ssd_ported(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size, starts)
+                out, final = _ssd_ported(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
+                                         starts)
                 out, final = out.astype(work), final.astype(work)
             else:
-                out, final = _ssd_tpu(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size, starts,
-                                      scan_case(x, B, chunk_size, padded=True).tpu, work)
+                out, final = _ssd_tpu(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
+                                      starts, scan_case(x, B, chunk_size, padded=True).tpu, work)
             return out[..., :head_dim], jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
         group = heads // key.shape[2]
         if group > 1:
@@ -1275,12 +1276,14 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
 
 
 SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('wgmma', 'forward'): ('pallas', "on an H100 PCIe, the port's forward 0.840 ms against the template's 0.954 on "
-                                     "Nemotron-H 4B's SSD (chunk 256) and 0.329 against 0.377 on Nemotron-H 30B's "
-                                     "(chunk 128), each the same `chunk(SSD, ...)` call (SE-1964-h100-5e6e356e0)"),
-    ('mma.sync', 'forward'): ('pallas', "on an A100 SXM4 40GB, the port's forward 1.486 ms against the template's "
-                                        "1.821 on Nemotron-H 4B's SSD and 0.529 against 0.769 on 30B's, each the "
-                                        "same `chunk(SSD, ...)` call (SE-1964-a100-5e6e356e0)"),
+    ('wgmma', 'forward'): (
+        'pallas', "on an H100 PCIe, the port's forward 0.840 ms against the template's 0.954 on "
+                  "Nemotron-H 4B's SSD (chunk 256) and 0.329 against 0.377 on Nemotron-H 30B's (chunk 128), "
+                  "each the same `chunk(SSD, ...)` call (SE-1964-h100-5e6e356e0)"),
+    ('mma.sync', 'forward'): (
+        'pallas', "on an A100 SXM4 40GB, the port's forward 1.486 ms against the template's 1.821 on "
+                  "Nemotron-H 4B's SSD and 0.529 against 0.769 on 30B's, each the same `chunk(SSD, ...)` "
+                  "call (SE-1964-a100-5e6e356e0)"),
 }
 """The cells, each an instruction family and a product (`ScanCase.cell`), where a receipt timing the same
 product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows the port of
