@@ -34,7 +34,7 @@ from typing_extensions import TypeVar
 
 from dew._hashing import array_fingerprint
 from dew._records import finite
-from dew.batch import Variables, real_slots, token_positions, valid_order, with_validity
+from dew.batch import Variables, prefix_sum, real_slots, token_positions, valid_order, with_validity
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
@@ -411,7 +411,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
             raise ValueError("LongRoPE cache rebuilding recomputes the trunk's prefix alone, not a "
                              "prediction depth's or a block drafter's cache, so it decodes without drafting")
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
-        slots = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1, -1)
+        slots = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1, -1)
         history = write_cache(jnp.zeros((batch, model.max_seq_len), inputs.tokens.dtype),
                               inputs.tokens, slots)
         state = dataclasses.replace(state, tokens=history, lengths=lengths)
@@ -532,7 +532,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
         history, lengths = state.tokens, state.lengths
         original = rebuild_position(model)
         if original is not None and history is not None and lengths is not None:
-            slots = lengths[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+            slots = lengths[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
             history = write_cache(history, tokens, jnp.where(valid, slots, -1))
             following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
             crossing = (lengths <= original) & (following > original)

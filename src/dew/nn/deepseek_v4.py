@@ -49,7 +49,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.batch import real_places, valid_order
+from dew.batch import prefix_sum, real_places, valid_order
 from dew.mesh import LogicalAxes
 from dew.nn.attention import (
     RMSNorm,
@@ -884,7 +884,7 @@ class DSparkAttention(DeepseekV4Attention):
             # cached call writes it (`cache_positions`), and the block drafts after the last.
             real = store.get(DRAFT_VALID)
             places = (jnp.arange(main.shape[1])[None] if real is None
-                      else jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1)
+                      else prefix_sum(real, dtype=jnp.int32) - 1)
             main_keys = self._window_keys(main, *rotary_freqs(places, self.rope_dim, self.rope_theta,
                                                               rope_scaling=self.rope_scaling,
                                                               dtype=at_least_fp32(main.dtype)),
