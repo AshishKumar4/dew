@@ -20,7 +20,7 @@ import pytest
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, with_gradients
-from sharded import assert_runs_per_shard
+from sharded import MOVES, assert_runs_per_shard
 from test_attention_template import (
     DTYPES,
     KEYS,
@@ -474,27 +474,28 @@ def test_a_dropping_call_traces_for_an_assumed_gpu():
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("axes, dimension, local", [({"data": 2}, 0, 2), ({"tensor": 2}, 2, 2)],
+@pytest.mark.parametrize("axes, whole, local", [({"data": 2}, 6, 3), ({"tensor": 2}, 14, 7)],
                          ids=["rows", "heads"])
-def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, dimension, local):
-    """A causal bf16 call over four rows of four heads that names the template, its forward and backward
-    lowered for an H100 on a mesh splitting its rows or its heads in two (`generation.gpu_mesh`): every
-    Mosaic launch takes each shard's own rows or heads, half the call's (`attention._per_shard`), so no
-    device runs the global batch, and no gather brings another shard's queries, keys or values to it (bible
+def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, whole, local):
+    """A causal bf16 call over six rows of fourteen heads that names the template, its forward and backward
+    lowered for an H100 on a mesh splitting its rows or its heads in two (`generation.gpu_mesh`): every array
+    of every Mosaic launch holds each shard's own rows or heads, half the call's (`attention._per_shard`),
+    never the call's whole count, so no device runs the global batch; and the program moves no operand
+    between devices (`sharded.MOVES`): no gather brings another shard's queries, keys or values to it (bible
     §7: a new accelerator route qualifies through its real target lowering on a multi-device mesh)."""
     import math
-    import re
 
     from jax.sharding import AxisType, NamedSharding
 
-    from dew.nn.attention import scaled_dot_product_attention
+    from dew.training._lowering import custom_calls, operations
 
     devices = jax.make_mesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
                             devices=jax.devices()[:math.prod(axes.values())])
     mesh = generation.gpu_mesh(devices, "sm90")
-    shape = jax.ShapeDtypeStruct((4, 128, 4, 64), jnp.bfloat16)
-    split = PartitionSpec("data") if "data" in axes else PartitionSpec(None, None, "tensor")
-    placed = jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=NamedSharding(mesh, split))
+    # Counts no other axis of a launch's arrays takes, so each array's rows or heads read apart.
+    shape = jax.ShapeDtypeStruct((6, 128, 14, 64), jnp.bfloat16)
+    spec = PartitionSpec("data") if "data" in axes else PartitionSpec(None, None, "tensor")
+    placed = jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=NamedSharding(mesh, spec))
 
     def loss(query, key, value):
         out = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
@@ -503,14 +504,15 @@ def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, dime
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2))).trace(placed, placed, placed).lower(
             lowering_platforms=("cuda",))
-    text = lowered.as_text(debug_info=False)
-    launches = re.findall(r'custom_call @mosaic_gpu_v2\(.*?\) .*?: \((tensor<[^>]*>)', text)
+    launches = [call for call in custom_calls(lowered) if call.target == "mosaic_gpu_v2"]
     assert launches, "the template lowers no Mosaic launch"
-    for operand in launches:
-        extents = [int(extent) for extent in operand.removeprefix("tensor<").split("x")[:-1]]
-        if len(extents) == 4:
-            assert extents[dimension] == local, operand
-    assert "all_gather" not in text and "all_to_all" not in text
+    for call in launches:
+        arrays = (*call.operands, *call.results)
+        assert all(whole not in array for array in arrays), call
+        assert any(local in array for array in arrays if len(array) >= 3), call
+    moved = [name for name in operations(lowered)
+             if name.removeprefix("stablehlo.").replace("_", "-") in MOVES]
+    assert not moved, moved
 
 
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():
