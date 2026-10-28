@@ -1030,11 +1030,13 @@ class Trainer(Generic[Loss, Effects]):
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
                                                    mesh, self.step, capacity)
+        if self._ahead is not None and self._ahead.plan is not None:
+            recorded = self._ahead.plan
         before = self._rung()
         self._climb_to(recorded)
         self._resumed_rung = None
         if self._rung() != before:
-            _log.warning("taking an earlier run's plan; delete %s to decide again", record_path)
+            _log.warning("taking the saved plan, from the ahead step or %s", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
         search = FitSearch(
             lower, lambda candidate: step_options(self.objective, candidate.micro,
