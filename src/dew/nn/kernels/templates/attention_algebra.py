@@ -252,8 +252,8 @@ class Low(NamedTuple):
 
     acc: jax.Array
     total: jax.Array
-    plain: Any = None
-    plain_total: Any = None
+    plain: jax.Array | None = None
+    plain_total: jax.Array | None = None
 
 
 class Partial(NamedTuple):
@@ -631,7 +631,7 @@ def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, produ
     # The unshifted sums beside them: finite in every column the plain walk kept finite (`finish`).
     plain, plain_total = rescale(held.before.plain, held.alpha), held.alpha * held.before.plain_total
     plain_sums, plain_weights = times(held.plain), (held.plain.sum(axis=-1),)
-    if kept is None or low is None:
+    if kept is None or low is None or low.plain is None or low.plain_total is None:
         plain, plain_total = in_turn(plain, plain_sums), in_turn(plain_total, plain_weights)
     else:
         plain, plain_low = kept_in_turn(plain, rescale(low.plain, held.alpha), plain_sums)
@@ -680,7 +680,7 @@ def settled(state: Partial) -> Partial:
         return total + jnp.where(finite(dropped), dropped, 0.0)
 
     guard = state.guard
-    if guard is not None:
+    if guard is not None and low.plain is not None and low.plain_total is not None:
         guard = guard._replace(plain=joined(guard.plain, low.plain),
                                plain_total=joined(guard.plain_total, low.plain_total))
     return Partial(joined(state.acc, low.acc), state.m, joined(state.total, low.total), guard)
