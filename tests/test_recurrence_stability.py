@@ -381,12 +381,14 @@ def ssd_port(hooks, *args, **kwargs):
 
 PORT_SEEDS = {
     'decays near one': 16, 'decays near zero': 8, 'the decay bound': 32, 'aligned keys': 32,
-    'resets on chunk edges': 8, 'saturated gates': 8, 'spread gates': 8, 'a long sequence': 16,
+    'resets on chunk edges': 32, 'saturated gates': 8, 'spread gates': 128, 'a long sequence': 16,
     'a fading memory': 16, 'steep then mild': 128,
 }
 """Each regime's declared seeds for the SSD port's output and final memory (check 1), sized by `seeds_for`
 paired with the port on an A100, where the port compiles (a CPU's interpretation of a kernel judges its
-host's arithmetic, not the kernel's; receipt tmp/Gate/gpu/ssd-port/receipts/gate-1341-ssd-port-sizing)."""
+host's arithmetic, not the kernel's; receipt tmp/Gate/gpu/ssd-port/receipts/gate-1341-ssd-port-sizing),
+and LAST_WRITE's by their output alone (receipt
+tmp/Gate/gpu/ssd-port2/receipts/gate-1341-ssd-port-sizing-2)."""
 
 PORT_GRADIENT_SEEDS = {
     'decays near one': 16, 'decays near zero': 256, 'the decay bound': 512, 'aligned keys': 32,
