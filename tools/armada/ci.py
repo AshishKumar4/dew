@@ -878,6 +878,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
+                     # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
+                     **({"whole_suite": counts[name]["whole_suite"]} if "whole_suite" in counts.get(name, {})
+                        else {}),
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:
@@ -1338,54 +1341,20 @@ def pythons(*, check: bool) -> int:
     return 1 if problems else 0
 
 
-def whole_suite_tests(name: str) -> set[str]:
-    """The tests of test file `name` marked whole_suite, read from its source: a function or its class
-    decorated with the mark, every test of a module whose `pytestmark` holds it ("*"), and a parameter set
-    marked with it (`pytest.param(..., marks=...)`) by its id, as `<function>[<id>` (its node's prefix)."""
-    try:
-        tree = ast.parse(Path(name).read_text())
-    except (OSError, SyntaxError):
-        return set()
-    marked = {"*"} if any(isinstance(node, ast.Assign) and any(getattr(target, "id", "") == "pytestmark"
-                                                                for target in node.targets)
-                          and "whole_suite" in ast.unparse(node.value) for node in tree.body) else set()
-
-    def visit(scope: list[ast.stmt], outer: str, inherited: bool) -> None:
-        for node in scope:
-            if isinstance(node, ast.ClassDef):
-                visit(node.body, f"{outer}{node.name}::",
-                      inherited or any("whole_suite" in ast.unparse(item) for item in node.decorator_list))
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-                if inherited or any("whole_suite" in ast.unparse(item) for item in node.decorator_list):
-                    marked.add(f"{outer}{node.name}")
-                for call in ast.walk(ast.Module(body=node.decorator_list, type_ignores=[])):
-                    if (isinstance(call, ast.Call) and ast.unparse(call.func).endswith("param")
-                            and any(word.arg == "marks" and "whole_suite" in ast.unparse(word.value)
-                                    for word in call.keywords)):
-                        ident = next((word.value.value for word in call.keywords if word.arg == "id"
-                                      and isinstance(word.value, ast.Constant)), None)
-                        if ident is not None:
-                            marked.add(f"{outer}{node.name}[{ident}")
-
-    visit(tree.body, "", inherited=False)
-    return marked
-
-
 def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> list[dict]:
     """Each test of `verdict`'s rows (`armada verdict <sha> --json`) whose own seconds pass `target`, the
     group target, slowest first: no cut brings its group within the target. A whole_suite cell is none, as it
-    runs on the whole suite alone (`selected`). With `base` (the durations record a change is measured
-    against), only the tests it lacks: a new slow test (owner, 2026-10-28)."""
-    found, marks = [], {}
+    runs on the whole suite alone (`selected`): its row names it, as pytest marked it (executed.py). With
+    `base` (the durations record a change is measured against), only the tests it lacks: a new slow test
+    (owner, 2026-10-28)."""
+    found = []
     for row_ in verdict["rows"]:
+        cells = set(row_.get("whole_suite", []))
         for test, seconds in (row_.get("tests") or {}).items():
-            name, _, rest = test.partition("::")
-            if seconds <= target or (base is not None and test in base):
+            if seconds <= target or test in cells or (base is not None and test in base):
                 continue
-            whole = marks.setdefault(name, whole_suite_tests(name))
-            if "*" in whole or any(rest == cell or ("[" in cell and rest.startswith(cell)) for cell in whole):
-                continue
-            found.append({"test": test, "file": name, "seconds": round(seconds, 1), "target": target})
+            found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
+                          "target": target})
     return sorted(found, key=lambda item: (-item["seconds"], item["test"]))
 
 
