@@ -137,7 +137,7 @@ class FirstFit:
             raise ValueError(f"a document of {list(sizes)} entries is longer than the windows of "
                              f"{list(self.rooms)} it packs into; cut it first")
         for window, (free, held) in enumerate(zip(self.free, self.held, strict=True)):
-            if (self.segments is None or held < self.segments) and all(
+            if (self.segments is None or held <= self.segments) and all(
                     size <= room for size, room in zip(sizes, free, strict=True)):
                 self.free[window] = [room - size for size, room in zip(sizes, free, strict=True)]
                 self.held[window] += 1
