@@ -242,10 +242,14 @@ class SteppedInContext(Protocol):
     variables, None without a level; the tree with others in their place; and the two halves of the
     head the steps run between, the level on final states (`continuum_states`) and the head past it
     (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
-    `in_context` says whether the model holds a level."""
+    `in_context` says whether the model holds a level, and `affine_head`, read from the bound model,
+    whether `head_logits` is affine in its states, which a damped step's curvature bound needs
+    (`ChunkAdaptation.damped`)."""
 
     @property
     def in_context(self) -> bool: ...
+
+    def affine_head(self) -> bool: ...
 
     def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
 
