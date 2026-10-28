@@ -1061,7 +1061,6 @@ class Trainer(Generic[Loss, Effects]):
                                      mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
-        cheaper = search.advice(planned, recorded, resumed)
         self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
@@ -1069,9 +1068,8 @@ class Trainer(Generic[Loss, Effects]):
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches,
-                                         'cheaper': cheaper})
-        self.plan = settled(planned, plans, seconds, probes, cheaper)
+            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
+        self.plan = settled(planned, plans, seconds, probes)
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned.released(), flops

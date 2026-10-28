@@ -27,7 +27,7 @@ from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._records import JSON, json_value, record
+from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
@@ -45,7 +45,6 @@ from dew.training.memory import (
     head_tile_of,
     recompute_more,
     recompute_record,
-    remat_below,
     remat_half,
     remat_more,
     rung_record,
@@ -480,22 +479,14 @@ class Forecast:
 
 
 def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[Sequence[float]],
-            probes: Sequence[Probe], cheaper: dict[str, JSON] | None = None) -> dict[str, JSON]:
+            probes: Sequence[Probe]) -> dict[str, JSON]:
     """The record of `planned`, of `plans` a frontier timed at `seconds` a
     step (none where one plan fit first): every compile the search made,
-    `probes`, each timed plan's split, rows, rung and seconds, the planned
+    `probes`, each timed plan's split, rows, rung and seconds, and the planned
     step's kernels (`KernelReport.record`: each dispatch's route and each
-    kernel's lowered launches), which the run log states, and the cheapest
-    remat rung below the run's own that fits too (`FitSearch.cheaper`, its
-    `Probe.record`, measured now or by the run that recorded the plan), which
-    the run is told of."""
+    kernel's lowered launches), which the run log states."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
-    if cheaper is not None:
-        _log.warning("the run sets remat %r, and remat %r fits its plan of %s x %s rows too, with %s "
-                     "bytes to spare on the tightest device of the process that measured it, recomputing "
-                     "less: set remat to it to train faster", planned.rung["remat"], cheaper["remat"],
-                     cheaper["split"], cheaper["rows"], cheaper["headroom"])
-    return {**planned.record(), "kernels": planned.candidate.kernels.record(), "cheaper": cheaper,
+    return {**planned.record(), "kernels": planned.candidate.kernels.record(),
             "probes": [probe.record() for probe in probes],
             "timed": [{**plan.record(), "seconds": min(took)}
                       for plan, took in zip(plans, seconds, strict=True)] if seconds else None}
@@ -558,7 +549,6 @@ class FitSearch[LossT, EffectsT]:
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
-        self.started = self.remat_rung()
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
         self.required = compiler_options(*self.objective.towers()) or None
 
@@ -648,48 +638,6 @@ class FitSearch[LossT, EffectsT]:
                          "here the resumed run computes otherwise than the run it continues", self.resumed)
             self.resumed = None
         return False
-
-    def cheaper(self, admitted: Planned) -> Probe | None:
-        """The cheapest remat rung below the `admitted` plan's that fits its split too, measured at each
-        rung below from the cheapest (`remat_below`) with the plan's head, copies and options, until one
-        fits; None where the search climbed from the remat the run set itself, which it then kept. The
-        objective is left as it was. A run that sets its remat keeps it, as the search starts there and
-        only climbs (`planned`); this tells it what a cheaper one costs in memory instead (row 2026)."""
-        if json.dumps(admitted.rung["remat"], sort_keys=True) != self.started:
-            return None
-        held = [entry.module for entry in self.objective.program_key()]
-        tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
-        defaults, narrow = self.xla_defaults, self.narrow
-        try:
-            # The admitted plan's modules, as a frontier asked past it leaves the objective a rung up.
-            self.objective.substitute(list(admitted.modules))
-            self.objective.restore_head(admitted.tile, fused=admitted.fused)
-            self.xla_defaults, self.narrow = admitted.xla_defaults, admitted.narrow
-            for modules in remat_below(self.objective):
-                self.objective.substitute(modules)
-                _, _, probe = self.measured(admitted.split, self.lower(admitted.split, admitted.narrow))
-                if probe.fits:
-                    return probe
-            return None
-        finally:
-            self.objective.substitute(held)
-            self.objective.restore_head(tile, fused=fused)
-            self.xla_defaults, self.narrow = defaults, narrow
-
-    def advice(self, planned: Planned, recorded: JSON, resumed: JSON) -> dict[str, JSON] | None:
-        """The cheaper remat rung the run is told of (`cheaper`): none for a resumed run, which
-        continues its checkpoint's rung; the one a recorded plan's run measured, where the run took that
-        plan, its split and rung, and none where the search moved off it; else measured now."""
-        if resumed is not None:
-            return None
-        if recorded is not None:
-            kept = record(recorded, 'recorded plan')
-            told = json_value(kept.get('cheaper'), 'recorded cheaper rung')
-            plan = {**planned.rung, 'split': planned.split}
-            taken = all(kept.get(field) == value for field, value in plan.items())
-            return told if taken and isinstance(told, dict) else None
-        probe = self.cheaper(planned)
-        return None if probe is None else probe.record()
 
     def climb(self) -> bool:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.

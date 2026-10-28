@@ -28,6 +28,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     approximate,
+    reducing,
     stated,
 )
 
@@ -82,7 +83,8 @@ class _Backward:
     fused: bool
     kinds: tuple[Kind, ...]
     approx_math: bool
-    """Whether its launches take the hardware's approximate transcendentals (`approximate`)."""
+    """Whether its launches take the hardware's approximate transcendentals (`approximate`): never in the
+    accurate form."""
 
     @property
     def how(self) -> algebra.Recompute:
@@ -278,6 +280,7 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
         interpret=walk.interpret, approx_math=walk.approx_math, name="attention_dq",
+        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # dQ's product, the model's this launch owns (`stated`): its `S` and `dP` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, width, query, key, value, dout))(
             query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
@@ -463,6 +466,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         grid=(heads, keys_padded // pair, batch), grid_names=("heads", "k_tiles", "batch"),
         consumers=consumers, interpret=walk.interpret, approx_math=walk.approx_math,
         name="attention_dkv_fused" if walk.fused else "attention_dkv",
+        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # The model's products this launch owns (`stated`): dK's, dV's and dP's, and dQ's where it adds it;
         # its `S` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
@@ -509,7 +513,10 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
                        spec.queries)
     hooks = Hooks(score_mod, tuple(map(Param, score_params, score_kinds)))
-    approx_math = approximate(hooks, (tiles.block_q, tiles.block_k), value_width, differentiated=True)
+    # The accurate form's exponentials exact: the hardware's ex2.approx flushes a subnormal weight to zero,
+    # whose product with a large score cotangent the reference keeps (row 2022, ET-SUBFIX2-h100).
+    approx_math = not accurate and approximate(hooks, (tiles.block_q, tiles.block_k), value_width,
+                                               differentiated=True)
     walk = _Backward(program, spec, accurate, tiles.consumers, interpret, tiles.fused, score_kinds,
                      approx_math)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)

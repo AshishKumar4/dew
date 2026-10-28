@@ -1745,10 +1745,10 @@ def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, m
 
 
 def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):
-    """A test marked whole_suite runs where nothing is reused (the cache's policy off: the daily run, a
-    pushed full-* branch, a train's change to what every test reads) and is set aside where the policy is on
-    (a train's or a lane's run of what changed), as a whole-suite cell needs no rerun for a change it does
-    not read (owner, 2026-10-27, via OrganicMouse: G03's parallelism matrix marks 11 such cells)."""
+    """A test marked whole_suite runs on the whole suite alone (DEW_WHOLE_SUITE, every fifth publish's
+    ci/full-whole-* run), and is set aside on every other run, a train's whatever the cache's policy: a
+    policy-off train runs every file, but not a whole-suite cell (Main, 2026-10-28, via Models: train
+    250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_matrix.py": "import pytest\nfrom pathlib import Path\n"
                        "@pytest.mark.whole_suite\ndef test_cell():\n"
@@ -1758,14 +1758,16 @@ def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypa
     (tmp_path / ".verdict").mkdir()
     out = tmp_path / ".verdict/verdict.json"
 
-    def ran(policy: str) -> list[int]:
+    def ran(policy: str, whole: str = "") -> list[int]:
+        monkeypatch.setenv("DEW_WHOLE_SUITE", whole)
         rows = armada_task(ci, monkeypatch, out, policy)
         assert [row["exitCode"] for row in rows] == [0]
         return [len(path.read_text()) if path.exists() else 0
                 for path in (tmp_path / "runs-cell", tmp_path / "runs-contract")]
 
     assert ran("on") == [0, 1]
-    assert ran("off") == [1, 2]
+    assert ran("off") == [0, 2]
+    assert ran("off", "1") == [1, 3]
 
 
 
@@ -1917,15 +1919,28 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
     assert deadline("off") == ["--deadline=5400"] and deadline("on") == ["--deadline=2700"]
 
 
+def run_options(tmp_path: Path, ref: str, policy: str, option: str) -> list[str]:
+    """The armada run's `option` words CI's suite step gives a push of `ref` under `policy` (`suite_step`)."""
+    calls = suite_step(tmp_path / ref.replace("/", "-"), ref, "", policy, 2)
+    [run] = [call for call in calls if call[0] == "run"]
+    return [word for word in run if word.startswith(option)]
+
+
+def test_a_staged_trains_suite_asks_no_more_than_its_lease(tmp_path):
+    """A train staged on the testing train's tip runs its suite on the pool its branch names
+    (ci/stage-...-p<N>, the share of its lease the queue's promote.sh leaves the suite), never the whole
+    pool, so it asks armada no more than it leased (Main, 2026-10-28); a train on main asks the whole pool."""
+    assert run_options(tmp_path, "ci/stage-abc-1-p120", "on", "--pool") == ["--pool=120"]
+    assert run_options(tmp_path, "ci/batch-abc-1", "on", "--pool") == []
+
+
 def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
     """A push to base/kernels, a base/<producer> promote and the background whole suite run their suite
     at a lane's whole-suite priority, -10 as verdict.sh's, so they never take containers from a train (10)
     or a lane's precheck or targeted run (0); a train's runs at 10, and a lane's branch at the default
     (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger)."""
     def priority(ref: str) -> list[str]:
-        calls = suite_step(tmp_path / ref.replace("/", "-"), ref, "", "off", 2)
-        [run] = [call for call in calls if call[0] == "run"]
-        return [word for word in run if word.startswith("--priority")]
+        return run_options(tmp_path, ref, "off", "--priority")
 
     for ref in ("base/kernels", "ci/base-abc-1", "ci/full-whole-1"):
         assert priority(ref) == ["--priority=-10"], ref
@@ -1933,3 +1948,43 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     # A train staged on the testing train's tip runs beside it, below it (owner and Main, 2026-10-28).
     assert priority("ci/stage-abc-1") == ["--priority=5"]
     assert priority("fix/lane") == []
+
+
+def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
+    """A test whose own seconds in a task's run pass the group target (.armada.json's `target`) is flagged
+    from the verdict's rows, as no cut can bring its group within the target; a whole_suite cell is flagged
+    too, marked as running on the whole suite alone, however pytest comes to mark it (its own mark, its
+    class's, a parameter set's, a mark held in a name), which the run records in its row (bible §7: every
+    test past the target is reported); and with main's durations record, a test it lacks fails the check, a
+    cell newly marked whole_suite too, while one main holds already passes (owner, 2026-10-28: a new slow test
+    fails its lane's check; row 2073's cell ran 1,540 s)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_slow.py": "import time\nimport pytest\ncell = pytest.mark.whole_suite\n"
+                       "def test_old(): time.sleep(0.4)\n"
+                       "def test_new(): time.sleep(0.6)\n"
+                       "def test_quick(): pass\n"
+                       "@pytest.mark.whole_suite\ndef test_cell(): time.sleep(0.4)\n"
+                       "@cell\ndef test_named(): time.sleep(0.4)\n"
+                       "class TestHeld:\n    pytestmark = cell\n    def test_inside(self): time.sleep(0.4)\n"
+                       "@pytest.mark.parametrize('n', [1, pytest.param(2, marks=cell, id='big')])\n"
+                       "def test_sized(n): time.sleep(0.3 * n)\n"})
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
+    # The whole suite's run, which runs the cells too.
+    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
+    verdict = tmp_path / "verdict.json"
+    verdict.write_text(json.dumps({"rows": armada_task(ci, monkeypatch, out, "off")}))
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 0.2}))
+    base = tmp_path / "base.json"
+    held = ("test_old", "test_sized[1]", "test_cell", "test_named", "TestHeld::test_inside")
+    base.write_text(json.dumps({f"tests/test_slow.py::{name}": 0.4 for name in held}))
+
+    def slow(*options: str) -> tuple[int, dict[str, bool]]:
+        monkeypatch.setattr(sys, "argv", ["ci.py", "slow", str(verdict), *options])
+        code = ci.main()
+        printed = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+        return code, {item["test"].partition("::")[2]: item.get("whole_suite", False) for item in printed}
+
+    assert slow() == (0, {"test_new": False, "test_old": False, "test_sized[1]": False, "test_cell": True,
+                          "test_named": True, "TestHeld::test_inside": True, "test_sized[big]": True})
+    assert slow("--new", str(base)) == (1, {"test_new": False, "test_sized[big]": True})

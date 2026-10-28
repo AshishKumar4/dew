@@ -472,7 +472,7 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
     its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`TrainerConfig.lower_for`;
-    the kernel lab's oracle; tests/kernel_compile.py). Its devices state their compute capability, which
+    the kernel benchmark's oracle; tests/kernel_compile.py). Its devices state their compute capability, which
     Mosaic GPU lowers for (its `utils._infer_arch`; a device that states none it takes for sm90's, and an
     sm80 kernel's cp.async waits do not lower), but an sm90's, which Mosaic's default already is: stated,
     its `9.0` sends a warpgroup-MMA kernel's ptxas a lower default SM than the sm_90a its PTX targets
