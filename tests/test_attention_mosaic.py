@@ -202,7 +202,8 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
 INTERPRETED_HOOK_SITES = {"none": ((1, 2, 1), 8), "alibi": ((1, 2, 1), 128), "key-bias": ((1, 2, 1), 16),
                           "custom-vjp": ((1, 2, 1), 8), "softcap": ((1, 2, 1), 8), "sinks": ((1, 4, 2), 16),
                           "temperature": ((1, 2, 1), 8), "tile-bias": ((1, 2, 1), 8),
-                          "resumed": ((1, 2, 1), 128), "softcap-sinks-alibi": ((2, 2, 1), 128)}
+                          "resumed": ((1, 2, 1), 128), "softcap-sinks-alibi": ((2, 2, 1), 128),
+                          "row-indexed": ((1, 2, 1), 8)}
 """The interpreted hooked backward's site under each hook: its rows, query heads and key heads, and its
 seeds, sized by `seeds_for` at that shape (the reference against itself), never the compiled site's. The
 claim interpreted is the hooked backward lowering and computing the template's gradients, so each site
