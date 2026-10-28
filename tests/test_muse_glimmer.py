@@ -198,6 +198,7 @@ def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
     with transformers' float32 ones from its float64 ones (check 1); its language model alone
     (`text_only`) computes the wrapper's text logits bit for bit on ids without placeholders (ledger
     1883)."""
+    import jax
     import jax.numpy as jnp
     from reference_error import as_given, assert_as_exact
 
@@ -225,15 +226,18 @@ def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
         ids[0, 5:9] = ids[0, 11:15] = IMAGE_TOKEN + 1
         return ids, None, rng.random((1, FRAMES, 3, IMAGE_SIDE, IMAGE_SIDE)).astype(np.float32)
 
+    # The wrapper's forward compiled, one program a media's shapes, as a served wrapper runs it.
+    forward = jax.jit(loaded.model.apply)
+
     @as_given
     def ours(ids, image=None, video=None):
         if image is None and video is None:
-            return {"logits": loaded.model.apply(loaded.variables, jnp.asarray(ids))}
+            return {"logits": forward(loaded.variables, jnp.asarray(ids))}
         # The processor's packing, read by the source's processor (`Processor.from_hf`).
         packed = packed_image(image) if video is None else packed_video(video)
         batch = loaded.processor.from_hf({"input_ids": np.asarray(ids), "attention_mask": np.ones(
             np.shape(ids), bool), **packed})
-        return {"logits": loaded.model.apply(loaded.variables, batch.tokens, **batch.kwargs())}
+        return {"logits": forward(loaded.variables, batch.tokens, **batch.kwargs())}
 
     for media in ("text", "image", "video"):
         assert_as_exact(ours, as_given(lambda *inputs: wrapper_logits(reference, *inputs)),
