@@ -3,8 +3,8 @@ delta rule's selector's 'mosaic_gpu' kernel (`recurrence_chunk.GATED_DELTA`).
 
 Its config is the forward's tiles (`mainloop.Tiles`), derived from the call's shape and the device's and
 its bundle's facts (`Mosaic.derived`): the widest value block whose carried memory and step tiles a thread's
-registers hold (`mosaic.live_registers`) and whose states launch fills the device's multiprocessors, with as
-many chunks in flight as every launch's shared memory
+registers hold (`resources.live_registers`) and whose states launch fills the device's multiprocessors,
+with as many chunks in flight as every launch's shared memory
 allows a block of the device (`staged_bytes`: each launch's streams and staging tiles as its bundle declares
 them, `mainloop.planned`, the fast backward's with the forward's where a call takes it). Nothing is
 measured, tabled, swept or ranked: a GPU no row names derives its tiles from its own facts, and a measured
@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import tokamax
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, bundles, cost, mosaic
+from dew.nn.kernels.templates import base, bundles, cost, mosaic, resources
 from dew.nn.kernels.templates.recurrence import mainloop
 
 INTERPRETED_GENERATION = "sm90"
@@ -94,9 +94,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
     @staticmethod
     def launched() -> generation.GpuTarget:
         """The target a call's launches run for: this device's where a bundle claims its family, else the
-        interpreted bundle's generation's (`INTERPRETED_GENERATION`)."""
+        interpreted bundle's generation's (`INTERPRETED_GENERATION`), its multiprocessors unstated: an
+        interpreter runs a launch's programs one after another, no wave of them to fill, so the derivation
+        takes the widest tiles that hold (`derived`; packed documents' interpreted gradient took 21 s a draw
+        at the one-wave rule's 16-wide value block and 14 at 32, row 1850)."""
         target = generation.gpu_target()
-        return target if bundle(target) is not None else generation.gpu_target(INTERPRETED_GENERATION)
+        if bundle(target) is not None:
+            return target
+        return dataclasses.replace(generation.gpu_target(INTERPRETED_GENERATION), multiprocessors=None)
 
     def _launches(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, target: generation.GpuTarget, *,
                   backward: bool) -> tuple[mainloop.Launch, ...]:
@@ -118,9 +123,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def registers(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> int | None:
         """The most registers a consumer thread of any of the forward's launches holds (`Launch.registers`,
-        each launch's stated tiles, `mosaic.live_registers`): a legal config's launches spill nothing. The
+        each launch's stated tiles, `resources.live_registers`): a legal config's launches spill nothing. The
         fast backward's launches are held to the same budget where its rule takes them
-        (`mainloop.backward_holds`), the portable math's gradient where they are not."""
+        (`mainloop.backward_holds`), and a call they do not hold takes no gradient of it (`trains`)."""
         target = self.launched()
         if bundle(target) is None:
             return None
@@ -129,6 +134,17 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def register_budget(self, config: mainloop.Tiles) -> int:
         family = bundle(self.launched())
         return cost.THREAD_REGISTERS if family is None else family.registers(1)
+
+    def _held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> bool:
+        """Whether every forward launch's consumer threads hold their registers at its own roles' budget
+        (`Family.registers` at `Launch.consumers`: a walk of `Tiles.walkers` roles holds less a role than a
+        launch of one)."""
+        target = self.launched()
+        family = bundle(target, _dtype(ba))
+        if family is None:
+            return super()._held(ba, config)
+        return all(launch.registers <= family.registers(launch.consumers)
+                   for launch in self._launches(ba, config, target, backward=False))
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
@@ -139,13 +155,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
           call's fast backward holds where it holds at any (`_backward_holds`: its launches take the states
           launch's block, an H100's reverse launch 328 registers 64 wide), the narrowest whose states
           launch, a program a value block, sequence and value head walking its sequence's chunks in turn,
-          runs in the fewest waves of the programs the device's multiprocessors hold at once
-          (`states_held`): a wave's time is its walk's, whose steps wait on their loads, about as long a
-          program 16 wide as 32 (an H100's 114 us a wave 16 wide against 95 32 wide, the 27B's and
-          Qwen3-Next's, SE-family-h100-b0980aaff), so the fewest waves and the most programs in them (fla's
-          chunk_fwd_h runs the 27B gated delta net's 192 programs a 32-wide block on an A100's 108, where
-          64 wide its 96 left twelve idle the whole walk, SE-rx-ncu-b106b18d8); the widest where the
-          device's multiprocessors are unknown;
+          runs in one wave of the programs the device's multiprocessors hold at once (`states_held`), else
+          the widest: a wave's time is its walk's, whose steps wait on their loads, about as long a program
+          16 wide as 32 (an H100's 114 us a wave 16 wide against 95 32 wide, the 27B's and Qwen3-Next's,
+          SE-family-h100-b0980aaff), so one wave of the most programs (fla's chunk_fwd_h runs the 27B
+          gated delta net's 192 programs a 32-wide block on an A100's 108, where 64 wide its 96 left
+          twelve idle the whole walk, SE-rx-ncu-b106b18d8), and past one wave the fewest programs; the
+          widest where the device's multiprocessors are unknown;
         - output block: the widest legal beside it (`_staged`), the output launch's registers apart from the
           states launch's: on an A100 the output launch holds 264 registers 32 wide, where the states
           launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
@@ -169,12 +185,57 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return legal[0]
         multiprocessors = target.multiprocessors
 
-        def waves(tiles: mainloop.Tiles) -> int:
+        def one_wave(tiles: mainloop.Tiles) -> bool:
             programs = columns // tiles.block_v * sequences * heads
-            return -(-programs // (multiprocessors * self.states_held(ba, tiles, target)))
+            return programs <= multiprocessors * self.states_held(ba, tiles, target)
 
-        fewest = min(map(waves, legal))
-        return [tiles for tiles in legal if waves(tiles) == fewest][-1]
+        # `legal` runs widest first: the last of those in one wave is the narrowest.
+        chosen = next((tiles for tiles in reversed(legal) if one_wave(tiles)), legal[0])
+        if one_wave(chosen):
+            return chosen
+        programs = columns // chosen.block_v * sequences * heads
+        return self._walked(ba, chosen, target, programs // (multiprocessors * self.states_held(ba, chosen,
+                                                                                                  target)))
+
+    def _walked(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
+                waves: int) -> mainloop.Tiles:
+        """`tiles` with the value blocks of one sequence and head a walk program takes (`Tiles.walkers`),
+        one a consumer role beside one producer, where its states launch's programs fill `waves` waves of
+        the device's: the most roles the family's program takes (`Family.consumers`) that divide the head's
+        value blocks, no more than its waves (a grouped grid still fills a wave), whose launches hold their
+        registers at that many roles' budget (`Family.registers`) and their shared memory, at its stage
+        rule (`_staged`); one role else. A walk's chain waits a chunk on its products: the states launch
+        took 1.04 ms over 66 waves of programs of about 6.6 chunks in a Qwen3.5-4B training step at 4x6,144
+        tokens a device on an H100, one 256-thread program a multiprocessor (two roles hold its 128
+        registers' need and the reverse launch's 184 within their 232, and read the head's keys once for
+        both)."""
+        family = bundle(target, _dtype(ba))
+        assert family is not None
+        _, columns, _ = _widths(ba, family)
+        blocks = columns // tiles.block_v
+        for walkers in range(min(family.consumers, waves), 1, -1):
+            if blocks % walkers:
+                continue
+            grouped = self._staged(ba, tiles.block_v, target, walkers=walkers,
+                                   wide=tiles.block_o or tiles.block_v)
+            if grouped is not None and self._backward_holds(ba, grouped, target) == self._backward_holds(
+                    ba, tiles, target):
+                return grouped
+        return tiles
+
+    def trains(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        """Whether the call's gradient runs on `target`: its fast backward takes it (the delta rule, a decay a
+        head, 16-bit operands) and its launches hold at the call's derived tiles (`_backward_holds`), the
+        rule's gradient (`mosaic_rule`) refusing every other call."""
+        if generation.backend() == "cpu" and bundle(target) is None:
+            target = self.launched()
+        arguments = ba.arguments
+        dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
+        sixteen = dtype in (jnp.bfloat16, jnp.float16)
+        if not (arguments.get("delta", True) and arguments["g"].ndim == 3 and sixteen):
+            return False
+        fits = self.fits(ba, target)
+        return bool(fits) and self._backward_holds(ba, fits[0], target)
 
     def _backward_holds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
                         target: generation.GpuTarget) -> bool:
@@ -189,11 +250,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def states_held(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                     ) -> int:
         """The programs of the states launch at `tiles` a multiprocessor of `target` holds at once
-        (`mainloop.held_programs`, as its persistent launches')."""
-        states = self._states(ba, tiles, target)
-        family = bundle(target, _dtype(ba))
-        assert family is not None
-        return mainloop.held_programs(family, target, states.shared)
+        (`resources.plan`, as its persistent launches')."""
+        return self._states(ba, tiles, target).resident
 
     def _states(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                 ) -> mainloop.Launch:
@@ -208,23 +266,26 @@ class Mosaic(base.Template[mainloop.Tiles]):
         unit = family.narrowest_columns(jnp.bfloat16)
         return [block for block in range(columns - columns % unit, 0, -unit) if columns % block == 0]
 
-    def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget
-                ) -> mainloop.Tiles | None:
-        """`block`'s tiles with the widest output block legal beside it (`Tiles.block_o`), at the deepest
-        ring of the states launch's steps of which a multiprocessor holds as many programs as one stage's
-        (`states_held`; `mosaic.deepest`, within `Family.most_shared` over a step's bytes), else one stage;
-        None where no output block is legal beside it. The ring deepest alone held an A100's states launch
-        to one program a multiprocessor, where its registers held three (SE-family-a100-8c5b5b16a)."""
+    def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget, *,
+                walkers: int = 1, wide: int | None = None) -> mainloop.Tiles | None:
+        """`block`'s tiles at `walkers` walk roles (`Tiles.walkers`) with the widest output block legal beside
+        it (`Tiles.block_o`; `wide` where given), at the deepest ring of the states launch's steps of which
+        a multiprocessor holds as many programs as one stage's (`states_held`; `resources.deepest`, within
+        `Family.most_shared` over a step's bytes), else one stage; None where no output block is legal
+        beside it. The ring deepest alone held an A100's states launch to one program a multiprocessor,
+        where its registers held three (SE-family-a100-8c5b5b16a)."""
         family = bundle(target, _dtype(ba))
         assert family is not None
-        shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if wide == block else wide)
-                                               for wide in self._blocks(ba, family))
+        widths = self._blocks(ba, family) if wide is None else [wide]
+        shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if width == block else width,
+                                                              walkers)
+                                               for width in widths)
                            if self.legal(ba, tiles, target)), None)
         if shallowest is None:
             return None
         programs = self.states_held(ba, shallowest, target)
         step = self._states(ba, shallowest, target).step_bytes
-        deepest = mosaic.deepest(lambda stages: dataclasses.replace(shallowest, stages=stages),
+        deepest = resources.deepest(lambda stages: dataclasses.replace(shallowest, stages=stages),
                                  lambda tiles: (self.legal(ba, tiles, target)
                                                 and self.states_held(ba, tiles, target) >= programs),
                                  family.most_shared // max(step, 1))

@@ -15,9 +15,10 @@ from dew.nn.kernels.templates import mosaic
 
 class Wgmma(mosaic.RingFamily):
     """wgmma's bundle: a warpgroup's 64 rows, TMA rings fed by a producer warpgroup (`mosaic.RingFamily`),
-    products from shared memory or registers into a warpgroup accumulator in the WGMMA layout, asynchronous
-    until waited for. Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a warpgroup MMA:
-    interpreted, such a product is the dot it would compute."""
+    multicast across a pair of multiprocessors where a cluster shares a ring's blocks, products from shared
+    memory or registers into a warpgroup accumulator in the WGMMA layout, asynchronous until waited for.
+    Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a warpgroup MMA: interpreted, such a
+    product is the dot it would compute."""
 
     name = "wgmma"
     takes_tf32 = True
@@ -26,6 +27,7 @@ class Wgmma(mosaic.RingFamily):
     role_rows = 64
     widest_product = 256
     most_shared = 227 * 1024  # sm90's (and sm100's) opt-in block
+    cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
 
     @property
     def layout(self):

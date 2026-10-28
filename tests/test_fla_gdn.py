@@ -272,18 +272,9 @@ def test_a_tokens_decay_gradient_sums_only_the_terms_through_it():
 
 
 def wy_math(k, v, beta, g, chunk=64):
-    """`(w, u, inverse)` from `(k, v, beta, g)` through the inverse of `I + tril(beta k k^T
-    exp2(g_s - g_t), -1)`, per chunk and head: the WY representation in whatever dtype it is given."""
-    batch, length, heads = k.shape[:3]
-
-    def chunks(x):
-        return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, heads, *x.shape[3:]), 3, 2)
-
-    kc, vc, bc, gc = chunks(k), chunks(v), chunks(beta), chunks(g)
-    decay = jnp.exp2(gc[..., :, None] - gc[..., None, :])
-    lower = jnp.tril(jnp.einsum('bnhsk,bnhtk->bnhst', kc, kc) * decay * bc[..., :, None], -1)
-    inverse = jnp.linalg.inv(jnp.eye(chunk, dtype=k.dtype) + lower)
-    return inverse @ (kc * (bc * jnp.exp2(gc))[..., None]), inverse @ (vc * bc[..., None]), inverse
+    """`(w, u, inverse)` from `(k, v, beta, g)` per chunk and head (`support.wy`): the WY representation in
+    whatever dtype it is given."""
+    return support.wy(*(support.head_chunks(x, chunk) for x in (k, v, beta, g)))
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 2e-2)])
@@ -376,15 +367,8 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
     against the token recurrence in float64: within fp32 rounding of the chunked algebra for fp32
     operands, and within bf16 storage's rounding for bf16, fla's numerics."""
     batch, length, heads, width = 1, 128, 2, 64
-    keys = jax.random.split(jax.random.key(13), 8)
-    q = l2norm(jax.random.normal(keys[0], (batch, length, heads, width))).astype(dtype)
-    k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width))).astype(dtype)
-    v = jax.random.normal(keys[2], (batch, length, heads, width)).astype(dtype)
-    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads))).astype(dtype)
-    h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
-    do = jax.random.normal(keys[6], (batch, length, heads, width)).astype(dtype)
-    dht = 0.1 * jax.random.normal(keys[7], (batch, heads, width, width))
+    q, k, v, g, beta, h0, do, dht = support.delta_operands(13, batch, length, heads, heads, width, width,
+                                                           dtype)
     scale = width ** -0.5
 
     def ported(*args):
@@ -434,15 +418,9 @@ def test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory(per_key
     `fla_gdn._summed_back`, and Kimi's `fla_kda.first_decay_grad`). From a nonzero initial
     memory it is that memory's inner product with its gradient, which is not zero."""
     batch, length, heads, width = 2, 80, 2, 64
-    keys = jax.random.split(jax.random.key(17), 8)
-    q, k = (l2norm(jax.random.normal(key, (batch, length, heads, width))) for key in keys[:2])
-    v = jax.random.normal(keys[2], (batch, length, heads, width))
-    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, *((width,) if per_key else ()))) - 3.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
-    h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
+    q, k, v, g, beta, h0, do, dht = support.delta_operands(17, batch, length, heads, heads, width, width,
+                                                           per_key=per_key)
     h0 = h0.at[0].set(0.0)
-    do = jax.random.normal(keys[6], v.shape)
-    dht = 0.1 * jax.random.normal(keys[7], h0.shape)
     cuts = jnp.asarray([0, 30, 80, 130, 160], jnp.int32)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
 
@@ -508,15 +486,8 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
     the port's distance against fla's own at the training shapes is the GPU tier's float64 gate.
     (Its decay gradient, fla's base-2 sum, sits 2.0x the portable IEEE math's distance here, so the
     math is no budget for it.)"""
-    keys = jax.random.split(jax.random.key(17), 8)
-    q = l2norm(jax.random.normal(keys[0], (1, length, key_heads, width)))
-    k = l2norm(jax.random.normal(keys[1], (1, length, key_heads, width)))
-    v = jax.random.normal(keys[2], (1, length, value_heads, columns))
-    g = -jnp.exp(jax.random.normal(keys[3], (1, length, value_heads)) - 3.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, value_heads)))
-    h0 = 0.1 * jax.random.normal(keys[5], (1, value_heads, width, columns))
-    do = jax.random.normal(keys[6], (1, length, value_heads, columns))
-    dht = 0.1 * jax.random.normal(keys[7], (1, value_heads, width, columns))
+    q, k, v, g, beta, h0, do, dht = support.delta_operands(17, 1, length, key_heads, value_heads, width,
+                                                           columns)
 
     port = through(fla_rule, do, dht)(q, k, v, g, beta, h0)
     assert port[0].shape == v.shape and port[1].shape == h0.shape and port[1].dtype == jnp.float32
@@ -539,15 +510,8 @@ def test_packed_documents_on_the_port_are_as_exact_as_flas_own_sequences(dtype):
     chunk, in fp32 too, whose products the port takes in TF32x3 and fla in one TF32. test_fla_kda's
     packed case holds Kimi's decay per key dimension alike."""
     length, key_heads, value_heads, width, cuts = 4096, 8, 8, 128, (0, 1000, 1037, 2500)
-    keys = jax.random.split(jax.random.key(61), 8)
-    q = l2norm(jax.random.normal(keys[0], (1, length, key_heads, width))).astype(dtype)
-    k = l2norm(jax.random.normal(keys[1], (1, length, key_heads, width))).astype(dtype)
-    v = jax.random.normal(keys[2], (1, length, value_heads, width)).astype(dtype)
-    g = -jnp.exp(jax.random.normal(keys[3], (1, length, value_heads)) - 2.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, value_heads))).astype(dtype)
-    h0 = 0.1 * jax.random.normal(keys[5], (1, value_heads, width, width))
-    do = jax.random.normal(keys[6], (1, length, value_heads, width)).astype(dtype)
-    dht = 0.1 * jax.random.normal(keys[7], (1, value_heads, width, width))
+    q, k, v, g, beta, h0, do, dht = support.delta_operands(61, 1, length, key_heads, value_heads, width,
+                                                           width, dtype, decay_shift=2.0)
     starts = np.zeros((1, length), bool)
     starts[0, list(cuts[1:])] = True
     packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=len(cuts))
@@ -577,15 +541,8 @@ def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key, beg
     for row, begins in enumerate(cuts):
         starts[row, list(begins[1:])] = True
     starts[1, 0] = begun
-    keys = jax.random.split(jax.random.key(19), 8)
-    q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width)))
-    k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width)))
-    v = jax.random.normal(keys[2], (batch, length, value_heads, width))
-    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads, *(width,) * per_key)) - 3.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, value_heads)))
-    h0 = 0.1 * jax.random.normal(keys[5], (batch, value_heads, width, width))
-    do = jax.random.normal(keys[6], v.shape)
-    dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+    q, k, v, g, beta, h0, do, dht = support.delta_operands(19, batch, length, key_heads, value_heads, width,
+                                                           width, per_key=per_key)
 
     packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=max(map(len, cuts)))
     port = through(packed, do, dht)(q, k, v, g, beta, h0)
@@ -1016,20 +973,22 @@ def _lowered_dot(product, default: str) -> list:
     with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh), jax.default_matmul_precision(default):
         lowered = jax.jit(call).trace(operand, operand).lower(lowering_platforms=("cuda",))
 
-    def operations(operation):
-        yield operation
-        for region in operation.regions:
-            for block in region.blocks:
-                for inner in block.operations:
-                    yield from operations(inner.operation)
+    precisions = []
 
-    # Triton IR parses only in a context with Triton's dialect, which JAX's own MLIR bindings register.
+    def visit(operation):
+        if operation.name == "tt.dot":
+            precision = ir.IntegerAttr(operation.attributes["inputPrecision"]).value
+            precisions.append(dialect.InputPrecision(precision))
+        return ir.WalkResult.ADVANCE
+
+    # Triton IR parses only in a context with Triton's dialect, which JAX's own MLIR bindings register; its
+    # operations walked as `dew.training._lowering` walks a program's (MLIR's `Operation.walk`).
     context = mlir.make_ir_context()
     dialect.register_dialect(context)
     with context:
-        return [dialect.InputPrecision(ir.IntegerAttr(operation.attributes["inputPrecision"]).value)
-                for call in triton_calls(lowered)
-                for operation in operations(ir.Module.parse(call.ir).operation) if operation.name == "tt.dot"]
+        for call in triton_calls(lowered):
+            ir.Module.parse(call.ir).operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    return precisions
 
 
 def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():

@@ -26,6 +26,11 @@ from dew.nn.protocols import (
     label_logits,
 )
 
+__all__ = [
+    "DecoderWrapper",
+    "HeadedModel",
+]
+
 if TYPE_CHECKING:
     from dew._records import JSON
     from dew.nn.backbones.causal_transformer import CausalTransformer

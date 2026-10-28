@@ -45,6 +45,7 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
+from dew.data.pipeline import cut_unit
 from dew.logging import display_console
 from dew.mesh import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 from dew.objectives.base import Shown
@@ -284,9 +285,11 @@ def data_line(counters: Mapping[str, float]) -> Text | None:
     (`data/rows/<label>`), as they are, since a chain's labels count different stages (a mixture's
     corpora the rows they fed it, the mixture those a later step kept) and no sum of them is the
     run's; the records rejected, summed over the labels, with each reason only where something was
-    rejected for it (`data/rejected/<label>/<reason>`); and the share of the rows truncated where
-    any was (`data/truncated/<label>`, each label's share of its own rows). None where the run
-    reports no rows."""
+    rejected for it (`data/rejected/<label>/<reason>`); the share of the rows truncated where
+    any was (`data/truncated/<label>`, each label's share of its own rows); and each cut by what it
+    cut, the rows it shortened and the tokens it removed, summed over the labels, where any was
+    (`data/cut/<label>/<kind>`, `data/cut_removed/<label>/<kind>`). None where the run reports no
+    rows."""
     rows = {name.removeprefix("data/rows/"): value for name, value in counters.items()
             if name.startswith("data/rows/")}
     if not rows:
@@ -307,6 +310,19 @@ def data_line(counters: Mapping[str, float]) -> Text | None:
     weight = sum(rows[label] for label in shares)
     if weight and (truncated := sum(share * rows[label] for label, share in shares.items())):
         line.append("  ·  ", LABEL).append(f"{truncated / weight:.1%}", "bold").append(" truncated", LABEL)
+    cut: collections.Counter[str] = collections.Counter()
+    removed: collections.Counter[str] = collections.Counter()
+    for name, value in counters.items():
+        if name.startswith("data/cut/"):
+            cut[name.rpartition("/")[2]] += int(value)
+        elif name.startswith("data/cut_removed/"):
+            removed[name.rpartition("/")[2]] += int(value)
+    for kind, count in cut.items():
+        if count:
+            line.append("  ·  ", LABEL).append(f"{count:,}", "bold").append(f" {kind} cut", LABEL)
+            unit = cut_unit(kind)
+            if unit is not None:
+                line.append(f" ({removed[kind]:,} {unit})", LABEL)
     return line
 
 

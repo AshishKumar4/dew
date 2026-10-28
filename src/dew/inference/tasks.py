@@ -81,6 +81,19 @@ media or multi-axis positions also keeps its own shapes.
 """
 
 
+SCORING_RUNGS = 4
+"""How many lengths a task that scores whole requests pads its passes to (`length_ladder`)."""
+
+
+def length_ladder(top: int, smallest: int, rungs: int = SCORING_RUNGS) -> tuple[int, ...]:
+    """The lengths a task that scores whole requests compiles its passes at, shortest first: `top`, the
+    layout's window, so a request at the training window reads training's shape, and its halvings, `rungs`
+    of them at most and none shorter than `smallest`, the shortest row the layout lays out. Each length is
+    one program, which the task compiles once, up front, rather than one per power of two of every
+    request's length, rows and options (`dew.decision.task.Decide.pass_shapes`)."""
+    return tuple(sorted({max(min(smallest, top), top >> step) for step in range(rungs)}))
+
+
 class Processor(Protocol):
     """Interface for a loaded source's host processor, which prepares requests and decodes tokens.
 
@@ -373,9 +386,10 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     built-in autoencoder's by its name with its module's bare fields (`_EARLIER_AUTOENCODERS`), a
     decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
     and refused where it holds more than its name and fields (ledger 1239),
-    a processor's source as its encoded string (ledger 1641), and a Qwen or MiMo projector's earlier
-    fields (`_earlier_projectors`, ledger 1622). A record in today's shapes passes as it is. Carried to
-    1.0, when it is deleted (ledger 1552)."""
+    a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
+    fields (`_earlier_projectors`, ledger 1622), and a row of segments' question budgets, which it
+    ignored and an earlier record wrote at their defaults (row 2006). A record in today's shapes passes
+    as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     for key in ("head", "layout"):
         held = record.get(key)
@@ -400,6 +414,15 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     if isinstance(layout, Mapping) and "name" in layout and "class" not in layout:
         current["layout"] = {"class": f"dew.decision.layout:{named(layout['name'], 'layout.name')}",
                              "fields": named_fields(layout.get("fields", {}), "layout.fields")}
+    laid = current.get("layout")
+    fields = laid.get("fields") if isinstance(laid, Mapping) else None
+    if isinstance(laid, Mapping) and isinstance(fields, Mapping) and fields.get("segments") is not None and (
+            "order" not in fields) and (
+            fields.get("head_max_len") is not None or fields.get("option_tokens") is not None):
+        # A row of segments kept its question whole and ignored the question budgets an earlier record
+        # wrote at their defaults (192 and 48) (row 2006). A record that states the row's order (2007)
+        # was written since a row of segments takes its budgets, so it keeps them.
+        current["layout"] = {**laid, "fields": {**fields, "head_max_len": None, "option_tokens": None}}
     processor = record.get("processor")
     if isinstance(processor, str):
         # A source's identity was an encoded string before typed component references (ledger 1641).

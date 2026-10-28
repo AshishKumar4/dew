@@ -352,8 +352,11 @@ class _DecisionSource(View[Source]):
 
     def stated(self) -> Mapping[str, object]:
         """What the store states of its records (`Dataset.facts`), with a mixture's weights and the
-        manifest it was made by."""
-        return {**store_facts(self.source), **self.mixture}
+        manifest it was made by, and the slots its rows need where they are known without reading
+        them: given, or a table's one question over the options it names."""
+        options = None if self.table is None else self.table.options
+        slots = self.slots or ({"questions": 1, "options": len(options)} if options else None)
+        return {**store_facts(self.source), **self.mixture, **({"slots": dict(slots)} if slots else {})}
 
     def consumed(self, read: Read) -> "_DecisionSource":
         consumed = dataclasses.replace(self, source=_consumed(self.source, read))

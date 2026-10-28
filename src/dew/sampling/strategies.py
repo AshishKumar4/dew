@@ -26,7 +26,7 @@ from dew._distributions import row_draw, wellformed
 from dew.batch import Variables
 from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
-from dew.nn.scatter import DROPPED
+from dew.nn.scatter import DROPPED, gather_positions
 from dew.objectives.base import token_log_probs
 from dew.sampling import decoding
 from dew.sampling.decoding import Finish, StepState
@@ -381,12 +381,6 @@ class Beam:
         return _beam_search(state, start, ops, transform, stopping, budget, n, self)
 
 
-def _pick(leaf, index):
-    """`leaf[:, index]` per prompt, over a `[prompts, count, ...]` leaf."""
-    return jnp.take_along_axis(leaf, index.reshape(index.shape + (1,) * (leaf.ndim - 2)),
-                               axis=1)
-
-
 def _beam_rows(parent, prompts: int, width: int):
     """Cache rows of a `[prompts, count]` parent-beam index."""
     return (parent + jnp.arange(prompts)[:, None] * width).reshape(-1)
@@ -396,8 +390,8 @@ def _beam_continue(state: DecoderState, beams: StepState, ops: DecodeOps, parent
                    forward, real, prompts: int, width: int):
     """The `width` beams the step carries on with, each parent's decode state
     gathered onto its child's row before the child's token is committed."""
-    parents = _pick(parent, forward)
-    selected = _pick(token, forward).reshape(-1)
+    parents = gather_positions(parent, forward)
+    selected = gather_positions(token, forward).reshape(-1)
     state = ops.reindex(state, _beam_rows(parents, prompts, width))
     beams = jax.tree.map(lambda leaf: jnp.take(leaf, _beam_rows(parents, prompts, width), axis=0),
                          beams)
@@ -422,8 +416,8 @@ def _completed(done: Completed, search: Beam, top, extending, position: int, *,
     order = lax.top_k(merged, width)[1]
     return Completed(
         score=jnp.take_along_axis(merged, order, axis=1),
-        tokens=_pick(jnp.concatenate([done.tokens, tokens], axis=1), order),
-        raw=_pick(jnp.concatenate([done.raw, raw], axis=1), order),
+        tokens=gather_positions(jnp.concatenate([done.tokens, tokens], axis=1), order),
+        raw=gather_positions(jnp.concatenate([done.raw, raw], axis=1), order),
         flag=jnp.take_along_axis(jnp.concatenate([done.flag, hit & top], axis=1), order, axis=1),
         length=jnp.take_along_axis(
             jnp.concatenate([done.length,
@@ -489,7 +483,7 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         done = _completed(carry.done, search, top, carry.extending & (position < limit), position,
                           best=best, hit=hit, ended=ended, tokens=grown, raw=traced)
 
-        live = _pick(alive, forward)
+        live = gather_positions(alive, forward)
         # `never` estimates the best score still reachable from the whole
         # budget where the penalty rewards length; otherwise from here.
         reach = limit.astype(jnp.float32) if never and penalty > 0 else (position + 1.0)
@@ -497,8 +491,8 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         extending = carry.extending & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
                                 axis=-1, keepdims=True)
         state = ops.advance(state, selected, real)
-        drawn = _pick(grown, forward).reshape(prompts * width, budget)
-        scored = _pick(traced, forward).reshape(prompts * width, budget)
+        drawn = gather_positions(grown, forward).reshape(prompts * width, budget)
+        scored = gather_positions(traced, forward).reshape(prompts * width, budget)
         return _BeamCarry(state, beams, live, drawn, scored, extending, done), None
 
     initial = _beam_start(state, start, ops, prompts, width, budget)

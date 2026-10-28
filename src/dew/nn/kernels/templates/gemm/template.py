@@ -37,7 +37,7 @@ import numpy as np
 from flax.typing import PrecisionLike
 from jax.extend import core as jax_core
 
-from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates.product import declared
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import seen_whole
@@ -92,8 +92,18 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     def forward(*operands):
         return value(*operands), ()
 
+    # A kernel the call names (`generation.chosen`, MoE's implementation='xla') runs its derivative's products
+    # too, wherever the pullback runs: a reverse pass traced outside the call's block would otherwise select
+    # them afresh.
+    named = selection.forced(grouped_matmul.GROUPED.choice)
+
     def backward(saved, operands, cotangent, live):
-        del saved
+        if named is None:
+            return _pulled(operands, cotangent, live)
+        with generation.chosen(**{grouped_matmul.GROUPED.choice: named}):
+            return _pulled(operands, cotangent, live)
+
+    def _pulled(operands, cotangent, live):
         lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays = operands
         # The operands a reverse pass differentiates, by their place among the operands' leaves: a frozen
         # matrix's kernel gradient, or an operand no reverse pass reaches, is never formed.
@@ -184,13 +194,68 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
             lhs = prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         lhs = jnp.where(routed[:, None], lhs, 0)
         wide = at_least_fp32(lhs.dtype)  # an fp64 product's sum in fp64
-        matrix = jnp.zeros((group_sizes.shape[0], lhs.shape[1], rhs.shape[1]), wide)
-        _, pullback = jax.vjp(lambda matrix: grouped_matmul.xla_ragged_dot(
-            lhs, matrix, group_sizes, precision=precision, preferred_element_type=wide), matrix)
-        return pullback(rhs.astype(lhs.dtype).astype(wide))[0].astype(out_dtype)
+        # Each group's rows contracted, XLA's ragged dot's own weight gradient (its transpose's form) on the
+        # operands as they are: a pullback from a matrix made here would hand a vmapped call (a pipeline
+        # stage's) an unbatched operand, which ragged_dot's batching rule refuses.
+        return jax.lax.ragged_dot_general(
+            lhs.astype(wide), rhs.astype(lhs.dtype).astype(wide), group_sizes, _CONTRACTED_ROWS,
+            precision=precision, preferred_element_type=wide).astype(out_dtype)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)
 
+
+def dot_general(xla):
+    """`xla`, a layer's product (a `jax.lax.dot_general`, as flax's `Dense` takes one), through the
+    template's dense product (`gemm` of one group) where the call is a matrix product (`lhs`'s last axis
+    against a matrix's first, no batch axes, both of one dtype) and a launch takes any of its products: the
+    forward, the input gradient or the kernel gradient (`_launched`). A call no launch takes is `xla`'s own
+    program, differentiated by JAX, each of its products' routes reported with the reason no launch takes
+    it (a declared cell's old route, a mesh axis splitting the operands, a CPU), so a layer runs as it ran
+    before wherever the template declares XLA faster; every other product is `xla`'s."""
+    def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
+        (contracted, against), batch = dimension_numbers
+        plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
+                 and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
+                 and tuple(map(tuple, batch)) == ((), ()))
+        if plain:
+            rows = lhs.reshape(-1, lhs.shape[-1])
+            out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
+            if _launched(rows, rhs, out_dtype, precision):
+                product = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
+                return product.reshape(*lhs.shape[:-1], rhs.shape[1])
+        return xla(lhs, rhs, dimension_numbers, precision=precision,
+                   preferred_element_type=preferred_element_type, **kwargs)
+
+    return product
+
+
+def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:
+    """Whether a launch takes any of the dense product `rows @ matrix`'s products on the call's target
+    (`grouped_matmul.GROUPED`): its forward, its input gradient or its kernel gradient, as `gemm` and
+    its reverse mode make them. Where none does, each one's route is reported, as XLA runs them."""
+    product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
+    whole = seen_whole(rows) and seen_whole(matrix)
+    width = matrix.shape[1]
+    abstract = functools.partial(jax.ShapeDtypeStruct, dtype=rows.dtype)
+    matrices, sizes = abstract((1, *matrix.shape)), jax.ShapeDtypeStruct((1,), jnp.int32)
+    calls = (grouped_matmul.gmm_call(rows, matrices, sizes, out_dtype=out_dtype, trans_rhs=False,
+                                     interpret=False, promoted=product.promoted, dense=True),
+             grouped_matmul.gmm_call(abstract((rows.shape[0], width)), matrices, sizes, out_dtype=rows.dtype,
+                                     trans_rhs=True, interpret=False, promoted=product.promoted, dense=True),
+             grouped_matmul.tgmm_call(rows, abstract((rows.shape[0], width)), sizes, out_dtype=matrix.dtype,
+                                      interpret=False, promoted=product.promoted, dense=True))
+    cases = [grouped_matmul.grouped_case(*call, product=product, whole=whole) for call in calls]
+    if any(selection.selected(grouped_matmul.GROUPED, case).name != 'xla' for case in cases):
+        return True
+    for case in cases:
+        selection.select(grouped_matmul.GROUPED, case)
+    return False
+
+
+_CONTRACTED_ROWS = jax.lax.RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(([0], [0]), ([], [])), lhs_ragged_dimensions=[0], rhs_group_dimensions=[])
+"""A ragged dot over its rows, each group's rows of both operands contracted into the group's matrix: a
+grouped GEMM's weight gradient, `[rows, depth]` and `[rows, width]` to `[groups, depth, width]`."""
 
 _ACCUMULATOR = jax.ShapeDtypeStruct((), jnp.float32)
 """An epilogue's tile: the fp32 accumulator's."""
@@ -399,6 +464,19 @@ def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:
 
 def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
-    (`grouped_matmul._on_platform`)."""
+    (`grouped_matmul._on_platform`). Evaluated eagerly, `platform_dependent` knows its platform and runs
+    its branch alone, so a CPU's would skip the selection the kernel's branch makes (its routes, a named
+    kernel's refusal): an eager call is first traced abstractly as a jit traces it, every branch
+    selecting, then runs its platform's branch eagerly, op by op as any eager call does: run under a jit
+    of its own (83d19a780), a quantized block's reload no longer computed its logits bit for bit
+    (test_wrapped_runs)."""
     branches, default = grouped_matmul._on_platform(kernel, portable, interpret_on_cpu)
-    return jax.lax.platform_dependent(*operands, default=default, **branches)
+
+    def dispatched(*operands):
+        return jax.lax.platform_dependent(*operands, default=default, **branches)
+
+    from jax.core import Tracer
+
+    if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
+        jax.eval_shape(dispatched, *operands)
+    return dispatched(*operands)

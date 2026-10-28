@@ -11,7 +11,9 @@ the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 import contextlib
 import dataclasses
 import functools
+import os
 
+import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -470,6 +472,23 @@ def _backward_call(shape, width: int, accurate: bool):
                                 stats))
     op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=accurate)
     return op, _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
+
+
+@pytest.mark.parametrize("call, fused", [("fast", True), ("accurate", False), ("deterministic", False)])
+def test_the_fast_forms_backward_is_one_launch_and_deterministic_mode_two(call, fused, monkeypatch):
+    """The backward derived on an H100 is one launch, the dK/dV program adding each tile's dQ atomically, for
+    a hookless fast-form call (FUSEDFORM-h100's speed, FUSEDSTAB-h100's check 1 and finiteness); the accurate
+    form and deterministic mode take two, the dQ launch then the dK/dV one, in a fixed order."""
+    flags = lane_environment.without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
+    if call == "deterministic":
+        flags = f"{flags} --xla_gpu_deterministic_ops=true"
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        op, ba = _backward_call((2, 4096, 32, 8), 128, accurate=call == "accurate")
+        derived = op.derived(ba, target)
+        assert derived is not None and derived.fused == fused
+        assert op.legal(ba, derived, target)
 
 
 def _softcapped(s, q_pos, k_pos):
@@ -968,3 +987,49 @@ def test_the_backward_is_on_par_on_an_h100(call, form):
 def test_the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     """The backward in both forms under each score hook compiled on an H100."""
     _check_hooked_backward(hooks, form=form, interpret=False)
+
+
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+def test_the_mosaic_launches_state_the_models_attention_flops(causal):
+    """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
+    for an H100: every launch states its cost (`attention_mosaic_program.stated`), which Dew's FLOP count
+    reads to size it (`instrumentation._stated_flops`: no launch unsized), and together they state the
+    library's fused attention's own count, a multiply-add a reached pair, head and product column: the
+    forward's two products, the training forward's two and the backward's four
+    (`instrumentation._fused_attention_flops`), a rerun (the guarded launch, the fold's natural walk) adding
+    none. The launches' own statements are read: the training forward's overflowed rows rerun the plain-JAX
+    walk in a conditional, whose products the count bounds apart."""
+    import re
+
+    from dew.telemetry.instrumentation import _stated_flops
+
+    rows, tokens, heads, kv_heads, width = 1, 256, 4, 2, 64
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+    spans = template.spans(tokens, tokens, rows, causal=causal)
+    pairs = tokens * (tokens + 1) // 2 if causal else tokens * tokens
+    forward = 2 * rows * heads * pairs * (width + width)
+
+    # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
+    # of its own.
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+
+    def counted(fn, *arrays):
+        with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+            text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
+        launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+        assert launches and all(_stated_flops(line) is not None for line in launches)
+        return sum(_stated_flops(line) or 0.0 for line in launches)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, residuals=True)
+
+    with generation.assumed("sm90"):
+        residuals = jax.eval_shape(trained, query, key, key)[1:]
+
+    def backward(query, key, value, dout, residuals):
+        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals)
+
+    assert counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key) == forward
+    assert counted(trained, query, key, key) == forward
+    assert counted(backward, query, key, key, query, residuals) == 2 * forward

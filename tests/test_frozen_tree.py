@@ -14,10 +14,10 @@ import optax
 import pytest
 from flax.core import freeze
 
-from dew.batch import FROZEN
+from dew.batch import FROZEN, TEXT_KEY
 from dew.interop import Pretrained
 from dew.lora import LoRA
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
 
 LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"

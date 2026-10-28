@@ -22,7 +22,7 @@ def ci(tmp_path, monkeypatch):
     module = load("ci", "tools/armada")
     monkeypatch.chdir(tmp_path)
     # CI's own environment names the shared test cache; these runs of the tools must not read or write it.
-    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_TEST_CACHE"):
+    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
         monkeypatch.delenv(name, raising=False)
     (tmp_path / "tests").mkdir()
     return module
@@ -997,20 +997,21 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     assert run("GenuineIntel-6-143", policy="off") == 7
     monkeypatch.delenv("EXIT")
     assert run("GenuineIntel-6-143") == 8
-    # Another commit's run between a commit's run and its retry: a fixture's change is every file's input.
-    fixture = tmp_path / "tests/fixture.json"
-    fixture.write_text("{}")
+    # Another commit's run between a commit's run and its retry: a file every test process reads
+    # (`SHARED`) differs between them, so each has a record of its own.
+    shared = tmp_path / "constraints.txt"
+    shared.write_text("")
     assert run("GenuineIntel-6-143") == 9
-    fixture.write_text('{"changed": true}')
+    shared.write_text("a-package==1\n")
     assert run("GenuineIntel-6-143") == 10
-    fixture.write_text("{}")
+    shared.write_text("")
     assert run("GenuineIntel-6-143") == 10
     monkeypatch.setenv("FAIL", "1")
     assert run("GenuineIntel-6-143", policy="off") == 11
     monkeypatch.delenv("FAIL")
-    fixture.write_text('{"changed": true}')
+    shared.write_text("a-package==1\n")
     assert run("GenuineIntel-6-143") == 11
-    fixture.write_text("{}")
+    shared.write_text("")
     assert run("GenuineIntel-6-143") == 12
 
 
@@ -1046,18 +1047,27 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
     ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
     ({"tools/armada/session.py": "# the session\n"}, "off"),
-    ({".github/workflows/ci.yml": "on: []\n"}, "off"),
+    ({"tools/armada/executed.py": "# the recorder\n"}, "off"),
+    ({".github/workflows/ci.yml": "on: []\n"}, "on"),
     ({"Makefile": "all:\n"}, "off"),
     ({"CHANGELOG.md": "# Changes\n\n- an entry\n"}, "on"),
+    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
+    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "off"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
-        "the test session", "a workflow", "a file no record places", "the changelog"])
+        "the test session", "the recorder", "a workflow", "a file no record places", "the changelog",
+        "the pool", "the environment's variables"])
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
-    place what changed, a tool among them, and every file runs ('off') for a change to what every test
-    process runs or reads, or to a file the records do not place."""
+    place what changed, a tool and a workflow among them, and every file runs ('off') for a change to what
+    every test process runs or reads, or to a file the records do not place. .armada.json's pool decides
+    where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file), and a workflow
+    is an input of the files that read it alone (Main, 2026-10-28: 5 of 10 trains ran with the cache off, and
+    0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every file's input:
+    an old record may lack a dependency a new recorder finds."""
+    armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
-                       "locks/cpu.txt": "jax==1\n"}.items():
+                       "locks/cpu.txt": "jax==1\n", ".armada.json": armada}.items():
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text(text)
     git(tmp_path, "init", "-q", "-b", "main")
@@ -1106,19 +1116,23 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
 
 
-def test_a_durations_change_reruns_only_the_groups_cut_from_it(ci, tmp_path, monkeypatch, cache_worker):
+def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
     """The durations record is no file's input but a split file's groups', which are cut from that file's
-    own entries: a change to another file's entries reuses every row, and one to the split file's reruns
-    its groups alone, under the policy CI computes for the change from main (a refresh reran the whole
-    suite while the record was every file's input)."""
-    for name in ("heavy", "light"):
+    own entries: a change to another file's entries reuses every row, and so does one to the split file's
+    seconds that leaves each of its tests in its group, as a group's key holds the tests it runs, not their
+    timings; one that moves a test to another group reruns the groups (a refresh reran the whole suite while
+    the record was every file's input; Main, 2026-10-28: each train's fold of main's durations re-keyed every
+    split file, row 2000)."""
+    count = {"heavy": 3, "light": 2}
+    for name, tests in count.items():
         (tmp_path / f"tests/test_{name}.py").write_text(
             "from pathlib import Path\n"
             + "".join(f"def test_{name}_{index}():\n"
                       f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
-                      for index in range(2)))
-    record = {"tests/test_heavy.py::test_heavy_0": 200.0, "tests/test_heavy.py::test_heavy_1": 200.0,
-              "tests/test_light.py::test_light_0": 1.0, "tests/test_light.py::test_light_1": 1.0}
+                      for index in range(tests)))
+    heavy = {f"tests/test_heavy.py::test_heavy_{index}": seconds
+             for index, seconds in enumerate((300.0, 1.0, 1.0))}
+    record = {**heavy, "tests/test_light.py::test_light_0": 1.0, "tests/test_light.py::test_light_1": 1.0}
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(record))
     verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
     base = commit(tmp_path, "base")
@@ -1129,15 +1143,29 @@ def test_a_durations_change_reruns_only_the_groups_cut_from_it(ci, tmp_path, mon
             "3.12:tests/test_heavy.py#1/2", "3.12:tests/test_heavy.py#2/2", "3.12:tests/test_light.py"]
         return {name: len((tmp_path / f"runs-{name}").read_text()) for name in ("heavy", "light")}
 
-    assert run() == {"heavy": 2, "light": 2}
+    assert run() == {"heavy": 3, "light": 2}
     (tmp_path / "tests/test_durations.json").write_text(
         json.dumps({**record, "tests/test_light.py::test_light_0": 2.0}))
     commit(tmp_path, "the light file's entry moves")
-    assert run() == {"heavy": 2, "light": 2}
+    assert run() == {"heavy": 3, "light": 2}
+    # The heavy file's seconds change, each test kept in its group: the first alone, the other two together.
+    (tmp_path / "tests/test_durations.json").write_text(
+        json.dumps({**record, "tests/test_heavy.py::test_heavy_0": 301.0}))
+    commit(tmp_path, "the heavy file's entries move, its groups as they were")
+    assert run() == {"heavy": 3, "light": 2}
+    # Its last test turns heavy: the cut moves, and both groups run again.
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {**record, "tests/test_heavy.py::test_heavy_0": 201.0, "tests/test_heavy.py::test_heavy_1": 201.0}))
-    commit(tmp_path, "the heavy file's entries move")
-    assert run() == {"heavy": 4, "light": 2}
+        {**record, "tests/test_heavy.py::test_heavy_0": 1.0, "tests/test_heavy.py::test_heavy_2": 300.0}))
+    commit(tmp_path, "the heavy file's cut moves")
+    assert run() == {"heavy": 6, "light": 2}
+
+
+def green_runs(ci, monkeypatch, root: Path, verdict, policy: str, names: tuple[str, ...]) -> list[int]:
+    """One armada task of the checkout at `root` under `policy`, every row green: how many times each of
+    `names`' tests has run so far (its runs-NAME file, a mark per run)."""
+    rows = armada_task(ci, monkeypatch, verdict, policy)
+    assert [row["exitCode"] for row in rows] == [0] * len(names)
+    return [len((root / f"runs-{name}").read_text()) for name in names]
 
 
 def commit(root: Path, message: str) -> str:
@@ -1149,6 +1177,95 @@ def commit(root: Path, message: str) -> str:
         git(root, "add", "-A")
     git(root, "commit", "-qm" if first else "-qam", message)
     return git(root, "rev-parse", "HEAD").strip()
+
+
+def test_a_watch_the_kernel_cannot_hold_whole_is_blind_and_keys_nothing(tmp_path):
+    """A tree with more directories than inotify will watch (fs.inotify.max_user_watches; here a user
+    namespace's own limit, lowered to 2) leaves the open watch blind: closing it gives no opened files, so
+    no record keeps a key, and nothing raises (Main, 2026-10-28: a failed watch left the reader unset, and
+    its close crashed)."""
+    for name in ("a", "b", "c"):
+        (tmp_path / "tests" / name).mkdir(parents=True)
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from pathlib import Path\n"
+        "Path('/proc/sys/user/max_inotify_watches').write_text('2')\n"
+        "import watched\n"
+        "print(watched.Opens(sys.argv[2]).closed())\n")
+    ran = subprocess.run(["unshare", "--user", "--map-root-user", sys.executable, "-c", script,
+                          str(ROOT / "tools/armada"), str(tmp_path)],
+                         capture_output=True, text=True, timeout=60)
+    assert (ran.returncode, ran.stdout.strip()) == (0, "None"), ran.stderr
+
+
+def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
+    """A change under .github/ reruns the files whose runs read the changed file, which the records place as
+    any of the checkout's files, and reuses every other file's green row, under the policy CI computes for
+    the change from main (Main, 2026-10-28: a workflow change turned the cache off for the whole suite)."""
+    (tmp_path / ".github/workflows").mkdir(parents=True)
+    (tmp_path / ".github/workflows/ci.yml").write_text("name: CI\n")
+    (tmp_path / "tests/test_reader.py").write_text(
+        "from pathlib import Path\n"
+        "def test_reader():\n"
+        "    with Path('runs-reader').open('a') as runs: runs.write('x')\n"
+        "    assert Path('.github/workflows/ci.yml').read_text().startswith('name')\n")
+    (tmp_path / "tests/test_other.py").write_text(
+        "from pathlib import Path\n"
+        "def test_other():\n"
+        "    with Path('runs-other').open('a') as runs: runs.write('x')\n")
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+
+    def run(policy: str | None = None) -> list[int]:
+        return green_runs(ci, monkeypatch, tmp_path, verdict, policy or ci.policy(base), ("reader", "other"))
+
+    assert run() == [1, 1]
+    (tmp_path / ".github/workflows/ci.yml").write_text("name: CI, again\n")
+    commit(tmp_path, "the workflow changes")
+    assert ci.policy(base) == "on"
+    assert run() == [2, 1]
+    # A change to the recorder keys every file anew, the cache on though it is: a record it took before may
+    # lack a dependency it now finds, so no old record is reused.
+    (tmp_path / "tools/armada").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tools/armada/executed.py").write_text("# the recorder, as it records now\n")
+    git(tmp_path, "add", "tools/armada/executed.py")
+    commit(tmp_path, "the recorder changes")
+    assert ci.policy(base) == "off"
+    assert run("on") == [3, 2]
+
+
+def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, monkeypatch, cache_worker):
+    """A test whose run read its cgroup's CPU or memory limit (dew.data's `Host.current` sizes loading by
+    them) keys those limits: on a container of other limits its row is not reused though nothing else
+    changed, and a file that read none is reused (row 1998; Main, 2026-10-28: a row green on 4 vCPUs was
+    reused on 8)."""
+    cgroup = tmp_path.parent / f"{tmp_path.name}-cgroup"
+    cgroup.mkdir()
+    (cgroup / "cpu.max").write_text("400000 100000\n")
+    (cgroup / "memory.max").write_text("17179869184\n")
+    monkeypatch.setenv("DEW_CGROUP_ROOT", str(cgroup))
+    (tmp_path / "tests/test_sized.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def test_sized():\n"
+        "    with Path('runs-sized').open('a') as runs: runs.write('x')\n"
+        "    assert Path(os.environ['DEW_CGROUP_ROOT'], 'cpu.max').read_text().split()[1] == '100000'\n")
+    (tmp_path / "tests/test_plain.py").write_text(
+        "from pathlib import Path\n"
+        "def test_plain():\n"
+        "    with Path('runs-plain').open('a') as runs: runs.write('x')\n")
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+
+    def run() -> list[int]:
+        return green_runs(ci, monkeypatch, tmp_path, verdict, ci.policy(base), ("plain", "sized"))
+
+    assert run() == [1, 1]
+    assert run() == [1, 1]
+    # The same checkout on a container of 8 vCPUs, not 4.
+    (cgroup / "cpu.max").write_text("800000 100000\n")
+    assert run() == [1, 2]
 
 
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
@@ -1169,9 +1286,7 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
     base = commit(tmp_path, "base")
 
     def run() -> list[int]:
-        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
-        assert [row["exitCode"] for row in rows] == [0, 0]
-        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("first", "second")]
+        return green_runs(ci, monkeypatch, tmp_path, verdict, ci.policy(base), ("first", "second"))
 
     assert run() == [1, 1]
     (tmp_path / "tools/first.py").write_text("VALUE = 2\n")
@@ -1204,9 +1319,10 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
-    runs outside every test process), or another test module; it runs again once what its test process
-    runs or reads changes: a plugin loaded into it, a fixture, a Python file added that can change what an
-    import finds (a conftest.py, a top-level package under src/), or the process group it runs as."""
+    runs outside every test process), another test module, or a fixture it never opens (its openers'
+    input alone); it runs again once what its test process runs or reads changes: a plugin loaded into
+    it, a Python file added that can change what an import finds (a conftest.py, a top-level package
+    under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -1218,15 +1334,146 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
-               ("tests/fixtures/data.json", "{}\n", 3), ("tests/conftest.py", "VALUE = 1\n", 4),
-               ("src/package/__init__.py", "", 5), ("tests/more/test_added.py", "VALUE = 2\n", 5),
-               ("tools/armada/child_groups.py", "# its process group\n", 6)]
+               ("tests/fixtures/data.json", "{}\n", 2), ("tests/conftest.py", "VALUE = 1\n", 3),
+               ("src/package/__init__.py", "", 4), ("tests/more/test_added.py", "VALUE = 2\n", 4),
+               ("tools/armada/child_groups.py", "# its process group\n", 5)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
             with (tmp_path / path).open("a") as file:
                 file.write(text)
         assert run() == runs, path
+
+
+def test_a_fixture_reruns_its_readers_alone_though_a_native_reader_reads_it(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A fixture is the input of the files that open it, whatever opens it: a tokenizer's JSON that Rust's
+    `Tokenizer.from_file` reads, which raises no audit event, runs its test again once changed (tests/
+    test_text_data.py reads one so), and no other file; a fixture no test opens runs none (owner,
+    2026-10-27: one fixture re-recorded reran all 1,300 rows)."""
+    tokenizers = pytest.importorskip("tokenizers")
+
+    def tokenizer(vocabulary: dict[str, int]) -> None:
+        model = tokenizers.models.WordLevel({**vocabulary, "[UNK]": len(vocabulary)}, unk_token="[UNK]")
+        tokenizers.Tokenizer(model).save(str(tmp_path / "tests/fixtures/tok/tokenizer.json"))
+
+    (tmp_path / "tests/fixtures/tok").mkdir(parents=True)
+    tokenizer({"a": 0})
+    (tmp_path / "tests/fixtures/unread.json").write_text("{}\n")
+    written(tmp_path, {
+        "test_a_native.py": "from pathlib import Path\nfrom tokenizers import Tokenizer\n"
+                            "def test_native():\n"
+                            "    with Path('runs-native').open('a') as runs: runs.write('x')\n"
+                            "    loaded = Tokenizer.from_file('tests/fixtures/tok/tokenizer.json')\n"
+                            "    assert loaded.get_vocab_size()\n",
+        "test_b_other.py": "from pathlib import Path\n"
+                           "def test_other():\n"
+                           "    with Path('runs-other').open('a') as runs: runs.write('x')\n"})
+    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("native", "other"))
+
+    assert run() == [1, 1]
+    assert run() == [1, 1]
+    tokenizer({"a": 0, "b": 1})
+    assert run() == [2, 1]
+    (tmp_path / "tests/fixtures/unread.json").write_text("[]\n")
+    assert run() == [2, 1]
+
+
+def counted_runs(ci, root: Path, monkeypatch, cache_worker,
+                 names: tuple[str, ...]) -> Callable[[], list[int]]:
+    """The checkout's 3.12 tasks, run green on one CPU class against the shared test cache as armada starts
+    them (`cached_checkout`): each call, how many times each test file named in `names` has run, which it
+    counts in runs-<name>."""
+    verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
+
+    def run() -> list[int]:
+        rows = armada_task(ci, monkeypatch, verdict)
+        assert [row["exitCode"] for row in rows] == [0] * len(names)
+        return [len((root / f"runs-{name}").read_text()) for name in names]
+
+    return run
+
+
+def packed(root: Path, names: list[str]) -> None:
+    """The durations record timing each of `names` (tests/<name>) at a second, so the plan packs them into one
+    task, as CI packs small files."""
+    (root / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/{name}::{name[len('test_'):-len('.py')]}": 1.0 for name in names}))
+
+
+def test_a_reader_files_share_in_one_process_is_every_such_files_input(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A data file a reader opens is the input of every test file its pytest process ran, not only the
+    one that opened it: a session fixture's lazy reader, or a process-lived cache (dew.data.text's
+    load_tokenizer), opened under one file serves the next without reopening it, so a change to the data
+    reruns both (train 239's review, row 1987)."""
+    (tmp_path / "tests/fixtures").mkdir(parents=True)
+    (tmp_path / "tests/fixtures/shared.json").write_text("[1]\n")
+    (tmp_path / "tests/conftest.py").write_text(
+        "import functools, pytest\nfrom pathlib import Path\n"
+        "@pytest.fixture(scope='session')\ndef vocabulary():\n"
+        "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text())\n")
+    body = ("from pathlib import Path\ndef test_{0}(vocabulary):\n"
+            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n")
+    written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
+    packed(tmp_path, ["test_a.py", "test_b.py"])
+    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("a", "b"))
+
+    assert run() == [1, 1]
+    assert run() == [1, 1]
+    (tmp_path / "tests/fixtures/shared.json").write_text("[2]\n")
+    assert run() == [2, 2]
+
+
+def test_an_open_after_the_tests_ended_is_the_records_input(ci, tmp_path, monkeypatch, cache_worker):
+    """A data file opened after the last test ended, by a later session-finish hook, at exit or by a
+    thread, is the task's input as well: the task's supervisor reads the watch once pytest and its process
+    group stopped, so a change to it reruns the files (train 239's review, row 1988)."""
+    (tmp_path / "tests/fixtures").mkdir(parents=True)
+    (tmp_path / "tests/fixtures/verdict.txt").write_text("ok\n")
+    (tmp_path / "tests/conftest.py").write_text(
+        "import pytest\nfrom pathlib import Path\n"
+        "@pytest.hookimpl(trylast=True)\ndef pytest_sessionfinish(session):\n"
+        "    Path('tests/fixtures/verdict.txt').read_text()\n")
+    written(tmp_path, {"test_late.py": "from pathlib import Path\ndef test_late():\n"
+                                       "    with Path('runs').open('a') as runs: runs.write('x')\n"})
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    assert [run(), run()] == [1, 1]
+    (tmp_path / "tests/fixtures/verdict.txt").write_text("no\n")
+    assert run() == 2
+
+
+def test_a_watched_directory_lost_mid_run_keeps_no_row(ci, tmp_path, monkeypatch, cache_worker):
+    """A directory under tests/ or src/ deleted (or moved, or unmounted) while the task runs takes its
+    watch with it, and what is opened in it, or in one made again in its place, is not seen: the task's
+    records keep no key, so its rows run every time (train 239's review, row 1989)."""
+    (tmp_path / "tests/fixtures/scratch").mkdir(parents=True)
+    written(tmp_path, {"test_lost.py": "import shutil\nfrom pathlib import Path\ndef test_lost():\n"
+                                       "    with Path('runs').open('a') as runs: runs.write('x')\n"
+                                       "    shutil.rmtree('tests/fixtures/scratch')\n"
+                                       "    Path('tests/fixtures/scratch').mkdir()\n"})
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    assert [run(), run()] == [1, 2]
+
+
+def test_a_pool_change_reruns_no_file_and_the_environments_variables_every_file(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """.armada.json's pool decides where tasks run, so a change to it reruns no file; a change to the
+    variables its environment sets, which every test process sees, reruns every file (owner, 2026-10-27:
+    a pool change reran all 1,300 rows)."""
+    armada = {"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}
+    (tmp_path / ".armada.json").write_text(json.dumps(armada))
+    (tmp_path / "tests/test_kept.py").write_text(
+        "from pathlib import Path\n"
+        "def test_kept():\n"
+        "    with Path('runs').open('a') as runs: runs.write('x')\n")
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    changes = [(None, 1), ({**armada, "pool": 400}, 1),
+               ({**armada, "pool": 400, "env": {"MODE": "2"}}, 2)]
+    for config, runs in changes:
+        if config:
+            (tmp_path / ".armada.json").write_text(json.dumps(config))
+        assert run() == runs, config
 
 
 def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_list_changes(
@@ -1394,6 +1641,84 @@ def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
         "not (layouts and dense) and not (layouts and moe) and not (layouts and hybrid)"]
 
 
+def planned_checkout(ci, root: Path, monkeypatch, cache_worker,
+                     pinned: str) -> tuple[Path, Callable[[], list[str]]]:
+    """Three 3.12 test files, each weighing about a task of its own, run green on CPU class
+    GenuineIntel-6-143 against the shared test cache (`cached_checkout`), in a checkout whose .armada.json
+    pins its tasks to `pinned` (vendor-family-model), with the cache's read token: where their verdict is
+    written, and the plan's 3.12 entries' files, each entry's sorted."""
+    verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
+    vendor, family, model = pinned.split("-")
+    config = json.loads((ROOT / ".armada.json").read_text())
+    config["task"]["cpu"] = {"vendor": vendor, "family": int(family), "model": int(model)}
+    (root / ".armada.json").write_text(json.dumps(config))
+    names = ("a", "b", "c")
+    written(root, {f"test_{name}.py": "from pathlib import Path\n"
+                                     f"def test_{name}():\n"
+                                     f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
+                   for name in names})
+    (root / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_{name}.py::test_{name}": 250.0 for name in names}))
+    monkeypatch.setenv("DEW_XLA_CACHE_READ_TOKEN", "token")
+
+    def planned() -> list[str]:
+        return sorted(" ".join(sorted(entry["tests"].split())) for entry in ci.plan(300.0, {})
+                      if entry["python"] == "3.12")
+
+    return verdict, planned
+
+
+def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_every_file(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The plan reads the test cache with its read token: the files whose rows ran green on exactly these
+    inputs, on the class .armada.json pins the tasks to, share one task, which looks each row up again in
+    its container, and only a changed file plans a task of its own, so containers scale with the change;
+    the verdict still names every file, the unchanged ones' rows reused (Main, 2026-10-28: a lane run with
+    most files unchanged booted a container a task, each exiting after a lookup)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+    rows = armada_task(ci, monkeypatch, verdict)
+    assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
+    rows = armada_task(ci, monkeypatch, verdict)
+    assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",
+                                                   "3.12:tests/test_c.py"]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b", "c")] == [1, 1, 2]
+
+
+def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recorded_with_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The plan's checkout, clean, keys rows as the task's checkout does, though the task's holds an editable
+    install's metadata under src/ (setuptools' dewml.egg-info) and the fetched fixtures' payloads, which the
+    planner never downloads: a build's output is no input, and a fetched payload is keyed by the digest its
+    manifest pins (Main, 2026-10-28: a one-file change planned 493 tasks, as the planner's src/ listing and
+    walk lacked them)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    payload = tmp_path / "tests/fixtures/model.npz"
+    payload.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests/fixtures/model.npz.fetched.json").write_text(json.dumps({"sha256": "ab" * 32}))
+    built = tmp_path / "src/dewml.egg-info"
+    built.mkdir(parents=True)
+    (built / "PKG-INFO").write_text("Name: dewml\n")
+    payload.write_bytes(b"payload")
+    armada_task(ci, monkeypatch, verdict)
+    payload.unlink()
+    (built / "PKG-INFO").unlink()
+    built.rmdir()
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
+
+
+def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, monkeypatch, cache_worker):
+    """The plan looks records up under the class .armada.json pins the tasks to, never its own host's: rows
+    recorded on another class plan every file a task of its own, as before."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17")
+    armada_task(ci, monkeypatch, verdict)
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+
+
 def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):
     """A test marked whole_suite runs where nothing is reused (the cache's policy off: the daily run, a
     pushed full-* branch, a train's change to what every test reads) and is set aside where the policy is on
@@ -1456,10 +1781,10 @@ def test_a_tip_the_land_queue_graded_green_is_proven_for_mains_push_alone(tmp_pa
     assert proven_step(tmp_path / "run", "refs/heads/fix/lane", "77\n", "") == "77"
 
 
-def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int) -> list[str]:
+def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int) -> list[list[str]]:
     """The armada commands ci.yml's suite step gives, its own script run in bash for a push of `ref` with
     the proven job's output `proven` and the cache's `policy`, beside an armada whose stored verdict at the
-    commit exits `verdict` (0 green, 1 red, 2 none): each call's command and first argument."""
+    commit exits `verdict` (0 green, 1 red, 2 none): each call's words, a call a list."""
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
@@ -1469,14 +1794,19 @@ def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(parents=True)
     calls = tmp_path / "calls"
-    (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$1" >> {calls}\n'
+    (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" >> {calls}\n'
                                     f'[ "$1" = verdict ] && exit {verdict}\nexit 0\n')
     (bin_dir / "armada").chmod(0o755)
     subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=120,
                    env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "PROVEN": proven,
                         "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref, "BACKGROUND_POOL": "",
                         "RUNNER_TEMP": str(tmp_path), "ARMADA_URL": "http://127.0.0.1:9", "ARMADA_TOKEN": ""})
-    return calls.read_text().split() if calls.exists() else []
+    return [line.split() for line in calls.read_text().splitlines()] if calls.exists() else []
+
+
+def commands(calls: list[list[str]]) -> list[str]:
+    """Each armada call's command (`suite_step`)."""
+    return [call[0] for call in calls]
 
 
 def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
@@ -1485,7 +1815,70 @@ def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
     policy (a train that changed what every test reads runs main's push with the cache off); the background
     whole suite (ci/full-whole-*), whose commit main's push proved, runs it as ever, and an unproven push
     with a red verdict too (train 237's review, P1: the proof skipped the gangs alone)."""
-    assert "run" not in suite_step(tmp_path / "main", "main", "4242", "on", 1)
-    assert "run" not in suite_step(tmp_path / "main-off", "main", "4242", "off", 1)
-    assert "run" in suite_step(tmp_path / "whole", "ci/full-whole-1", "4242", "off", 0)
-    assert "run" in suite_step(tmp_path / "lane", "fix/lane", "", "on", 1)
+    def ran(ref: str, proven: str, policy: str, verdict: int) -> bool:
+        calls = suite_step(tmp_path / ref.replace("/", "-") / policy, ref, proven, policy, verdict)
+        return "run" in commands(calls)
+
+    assert not ran("main", "4242", "on", 1) and not ran("main", "4242", "off", 1)
+    assert ran("ci/full-whole-1", "4242", "off", 0) and ran("fix/lane", "", "on", 1)
+
+
+def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path):
+    """CI's lint job runs each gate of tools/check_gates on an armada container of its own, given the commit's
+    merge-base with main as BASE, so the job lasts as long as its slowest gate rather than their sum on the
+    runner (Main, 2026-10-28: the lint job set trains' wall at 35-41 min); a train's gates start at its
+    priority."""
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    [step] = [step for step in workflow["jobs"]["lint"]["steps"]
+              if step.get("name") == "Every cheap gate (tools/check.sh), each on armada"]
+    gates = [line.split("\t")[0] for line in (ROOT / "tools/check_gates").read_text().splitlines()
+             if line and not line.startswith("#")]
+    # A checkout whose main moved on past its merge-base, as CI's (fetch-depth 0) holds it.
+    checkout = tmp_path / "checkout"
+    (checkout / "tools").mkdir(parents=True)
+    (checkout / "tools/check_gates").write_text((ROOT / "tools/check_gates").read_text())
+    git(checkout, "init", "-q", "-b", "main")
+    git(checkout, "add", "-A")
+    git(checkout, "commit", "-qm", "base")
+    base = git(checkout, "rev-parse", "HEAD").strip()
+    git(checkout, "checkout", "-qb", "head")
+    git(checkout, "commit", "-q", "--allow-empty", "-m", "a head")
+    git(checkout, "checkout", "-q", "main")
+    git(checkout, "commit", "-q", "--allow-empty", "-m", "main moves on")
+    git(checkout, "update-ref", "refs/remotes/origin/main", "main")
+    git(checkout, "checkout", "-q", "head")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
+    (bin_dir / "armada").chmod(0o755)
+    for ref, priority in (("fix/lane", []), ("ci/batch-abc-1", ["--priority=10"]),
+                          ("ci/stage-abc-1", ["--priority=5"])):
+        script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
+        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref}
+        ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
+                             env=environment)
+        assert ran.returncode == 0, ran.stderr
+        assert (tmp_path / "items").read_text().split() == gates
+        words = (tmp_path / "words").read_text().split()
+        assert words[:2] == ["map", f"--commit={'a' * 40}"] and words[-2:] == [base, "{item}"]
+        assert [word for word in words if word.startswith("--priority")] == priority
+
+
+def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
+    """A push to base/kernels, a base/<producer> promote and the background whole suite run their suite
+    at a lane's whole-suite priority, -10 as verdict.sh's, so they never take containers from a train (10)
+    or a lane's precheck or targeted run (0); a train's runs at 10, and a lane's branch at the default
+    (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger)."""
+    def priority(ref: str) -> list[str]:
+        calls = suite_step(tmp_path / ref.replace("/", "-"), ref, "", "off", 2)
+        [run] = [call for call in calls if call[0] == "run"]
+        return [word for word in run if word.startswith("--priority")]
+
+    for ref in ("base/kernels", "ci/base-abc-1", "ci/full-whole-1"):
+        assert priority(ref) == ["--priority=-10"], ref
+    assert priority("ci/batch-abc-1") == ["--priority=10"]
+    # A train staged on the testing train's tip runs beside it, below it (owner and Main, 2026-10-28).
+    assert priority("ci/stage-abc-1") == ["--priority=5"]
+    assert priority("fix/lane") == []

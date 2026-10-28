@@ -20,6 +20,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
+from dew.nn.sharding import per_shard
+
 
 def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes: tuple, interpret: bool,
         prologue=None, prologue_operands: tuple = (), prologue_axes: tuple = (), epilogue=None,
@@ -64,6 +66,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
         prologue_axes=prologue_axes, epilogue=epilogue,
         sides=(len(prologue_operands), len(epilogue_operands)), exact_sums=exact_sums,
         matrices=len(matrices))
+    per_shard("the dense GEMM's Triton launch")
     outs = pl.pallas_call(
         kernel,
         out_shape=tuple(jax.ShapeDtypeStruct((padded, padded_width), dtype) for dtype in out_dtypes),
@@ -125,6 +128,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, *, tile, out_dtype, interpret: bool, pr
 
     kernel = functools.partial(_tgmm_kernel, rows=rows, block_m=block_m, prologue=prologue,
                                prologue_axes=prologue_axes, exact_sums=exact_sums)
+    per_shard("the dense kernel gradient's Triton launch")
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((padded_depth, padded_width), out_dtype),

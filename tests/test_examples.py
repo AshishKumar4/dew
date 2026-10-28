@@ -511,6 +511,43 @@ def test_pinn_burgers_smoke_trains_the_profile_in_float64_and_reports_its_residu
     assert np.isfinite(metrics["log10_max_residual"])
 
 
+BURGERS_PIECES = """
+import importlib.util, json, sys
+import jax, jax.numpy as jnp, numpy as np
+
+spec = importlib.util.spec_from_file_location("pinn_burgers_under_test", sys.argv[1])
+burgers = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = burgers
+spec.loader.exec_module(burgers)
+model = burgers.Profile(pyramid=0, width=5, depth=3)
+profile = burgers.BurgersProfile(model)
+variables = profile.fresh_variables(jax.random.key(0), None)
+value, slope = jax.value_and_grad(lambda at: profile.equation(variables, at))(jnp.float64(0.0))
+drawn = [model.init(jax.random.key(seed), jnp.zeros((1,), jnp.float64))["params"] for seed in range(200)]
+largest = {layer: float(max(np.abs(np.asarray(params[layer]["bias"])).max() for params in drawn))
+           for layer in ("Dense_0", "Dense_2")}
+print(json.dumps({"zero": [float(value), float(slope)], "largest": largest}))
+"""
+"""The Burgers example's residual and its slope at eta = 0, and its layers' largest bias of 200 draws."""
+
+
+def test_the_burgers_residual_is_finite_where_its_points_start_and_its_biases_are_bounded_by_their_inputs(
+        tmp_path):
+    """The profile equation and its derivative are finite at eta = 0, inside the points' [0, c), where
+    the tail's factored form gave a negative power of zero times zero (row 1993). Each layer's bias is
+    drawn as PyTorch's Linear draws it, within 1 / sqrt of its inputs: the first layer's one input lets
+    a bias past 1 / sqrt(5), and the last layer's five inputs keep one within it, where the bias was
+    bounded by its output width (row 1994)."""
+    script = tmp_path / "burgers_pieces.py"
+    script.write_text(BURGERS_PIECES)
+    finished = smoke("pinn_burgers", tmp_path, str(REPO_ROOT / "examples" / "pinn_burgers.py"), script=script,
+                     smoke_args=False)
+    pieces = json.loads(finished.stdout.strip().splitlines()[-1])
+    assert np.isfinite(pieces["zero"]).all()
+    bound = 1 / math.sqrt(5)
+    assert pieces["largest"]["Dense_0"] > bound >= pieces["largest"]["Dense_2"]
+
+
 @pytest.mark.parametrize("method", ["perturbation", "backprop"])
 def test_forward_only_lm_smoke_trains_a_decoder_with_and_without_backpropagation(tmp_path, method):
     """A two-layer decoder of Dust's layout on random rows, by node perturbation and by backpropagation:

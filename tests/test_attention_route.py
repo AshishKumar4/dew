@@ -31,8 +31,8 @@ from test_attention_template import (
     SOFTCAP,
     STARTS,
     block_groups,
+    case_keep,
     cross_documents,
-    dews_mask,
     geometry,
     key_validity,
     own_documents,
@@ -350,12 +350,12 @@ def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_refere
 def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
     groups, or key validity and counted places, documents and a window it draws over the mask its spans
-    mean, so it is on par (check 1) with one given that mask (`dews_mask`) under the same key, whose float64
+    mean, so it is on par (check 1) with one given that mask (`case_keep`) under the same key, whose float64
     run is the truth: a call that drew over other keys, or dropped others, would sit far from it."""
     case = CASES[name]
     dropped = functools.partial(scaled_dot_product_attention, dropout_rate=0.25,
                                 dropout_rng=jax.random.key(3), deterministic=False)
-    spanned, mask = keywords(case), jnp.asarray(dews_mask(case))[:, None]
+    spanned, mask = keywords(case), jnp.asarray(case_keep(case))[:, None]
 
     def blocked(query, key, value):
         return dropped(query, key, value, **spanned)
@@ -366,6 +366,35 @@ def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     draw = drawing(*geometry(case), jnp.float32, sinks=False)
     assert_as_exact(jax.jit(blocked), jax.jit(masked), lambda seed: draw(seed)[:3],
                     f"dropped {name} over its spans' mask", seeds=SEEDS)
+
+
+SIDE_OF_ONE_SEEDS = 16
+"""Check 1's declared seeds for a bf16 attention with a side of one."""
+
+
+@pytest.mark.parametrize("sides", [(1, 12), (5, 1)], ids=["one query", "one key"])
+def test_a_bf16_attention_with_a_side_of_one_is_on_par_with_float64(sides):
+    """A bf16 attention whose queries or keys are one, a grouped decode step's or a one-key read's, is
+    on par (check 1, float64 truth) on the device it runs on, its gradients too: an A100 computes jax.nn's
+    BF16_BF16_F32 query-key product with a side of one off round-to-nearest-even at its ties (row 1550),
+    which a call carried into its output."""
+    from dew.nn.attention import reference_attention
+
+    queries, keys = sides
+
+    def drawn(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(jnp.asarray(rng.standard_normal(shape), jnp.bfloat16) for shape in (
+            (2, queries, HEADS, WIDTH), (2, keys, KV_HEADS, WIDTH), (2, keys, KV_HEADS, WIDTH)))
+
+    def attended(attend):
+        return lambda query, key, value: with_gradients(attend)(query, key, value, jnp.ones_like(query))
+
+    def named(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation="xla")
+
+    assert_as_exact(jax.jit(attended(named)), jax.jit(attended(reference_attention)), drawn,
+                    f"bf16 attention of {queries} queries over {keys} keys", seeds=SIDE_OF_ONE_SEEDS)
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
@@ -400,7 +429,8 @@ def test_the_accurate_form_is_one_option_away():
     """`generation.chosen(attention_form='accurate')` runs every template call in the accurate form (natural
     logits and the accurate products, `attention_route.FORMS`), its forward and gradients bitwise a call's
     that names that form, and 'fast' runs the default, a call's that names none; the two forms differ; a
-    form the template does not have is refused."""
+    form the template does not have is refused. Bit for bit by construction: the choice resolves to the
+    named form's arguments before the call traces, so the two calls trace one program."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=False)(0)
 

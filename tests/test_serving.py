@@ -15,7 +15,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from episode_support import ToolPolicy
 from flax import linen as nn
 from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
@@ -23,6 +22,7 @@ from reference_error import as_given, assert_as_exact
 from serving_support import Served, assert_served_as_exact
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
+from tool_policy import ToolPolicy
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.loading import place

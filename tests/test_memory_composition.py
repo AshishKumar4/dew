@@ -437,6 +437,18 @@ class ConvolvedMemory(nn.Module):
         return nn.Conv(1, (3,), padding="SAME", dtype=self.dtype, name="conv")(x[..., None])[..., 0]
 
 
+class GeneralMemory(nn.Module):
+    """An inner network that maps the view's vector through a rank-three kernel (`DenseGeneral`),
+    width kept: a matmul a weight-only rule quantizes whose kernel is no [in, out] matrix."""
+
+    dtype: jnp.dtype | None = None
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return nn.DenseGeneral((2, x.shape[-1] // 2), use_bias=False, dtype=self.dtype,
+                               name="general")(x).reshape(x.shape)
+
+
 SERVED = {"moving": ((INNER,), None, True), "projections": ((r".*self_attn/[qkvo]_proj",), None, False),
           "convolved": ((INNER,), ConvolvedMemory(), True)}
 """The served-memory cases: the patterns serving quantizes, the memory's inner network (None: Titans'
@@ -492,6 +504,121 @@ def test_a_served_memory_computes_the_quantized_memory_from_its_stored_w0(case):
                                   np.asarray(served.apply(held, ids)))
     assert_as_exact(dew_fn, reference_fn, draw, f"served memory {case}", seeds=SEEDS[f"served memory {case}"],
                     truth_fn=truth_fn)
+
+
+@pytest.mark.parametrize("memory", [None, "delta_rule"])
+def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(memory):
+    """A memory decoder served quantized (`TextGeneration.quantized`) under a spec that rounds the
+    backward stochastically (`bwd_qtype`, `bwd_stochastic_rounding`) draws its inner steps' rounding
+    from its request's own key (`dew.sampling.text.rounding_keys`), Titans' MLP and a linear memory
+    whose cache holds the recurrence's state alike: a task call and one live server each repeat a
+    request alike, and another key moves its likelihoods though greedy decoding draws nothing. A row's
+    stream is its own (`test_a_cached_memorys_rounding_is_each_rows_own`); a batch-mate's values still
+    enter through the quantization's scales (ledger 2032). Without the stream the decode raised in
+    Qwix's make_rng (ledger 2020)."""
+    pytest.importorskip("qwix")
+    from model_support import Digits
+
+    from dew.inference import RunProcessor, TextGeneration
+    from dew.inference.serving import Server
+    from dew.quantization import Quantization
+    from dew.sampling import Sampling
+
+    model = decoder(None if memory is None else layer(memory)).clone(max_seq_len=64)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    task = TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=12))
+    bound = task.quantized(Quantization(patterns=(INNER,), bwd_qtype="int8",
+                                        bwd_stochastic_rounding="uniform"))
+    server = Server.from_task(bound, slots=2, capacity=64)
+
+    def likelihoods(result) -> np.ndarray:
+        return np.asarray(result.raw_log_probs)
+
+    for generate in (lambda prompts, key: [bound(prompt, 4, key=key) for prompt in prompts],
+                     lambda prompts, key: server(prompts, 4, key=key)):
+        (first,), (again,), (moved,) = generate(["12"], 3), generate(["12"], 3), generate(["12"], 4)
+        np.testing.assert_array_equal(likelihoods(again), likelihoods(first))
+        assert not np.array_equal(likelihoods(moved), likelihoods(first))
+
+
+def test_a_cached_memorys_rounding_is_each_rows_own():
+    """A cached memory's stochastic rounding draws from each row's key in the cache
+    (`dew.nn.kv_cache.ROUNDING_KEYS`) folded with each token's place, or from a stream the call brings:
+    in one program over the same tokens, a row computes alike whatever key another row holds, and its
+    own key moves it; a call's own `stochastic_rounding` stream repeats and moves with its key. So a
+    served request's rounding is its key's alone, whatever batch or slot holds it (ledger 2020).
+    Weight-only serving keeps the rows' arithmetic apart, so only the stream could join them."""
+    pytest.importorskip("qwix")
+    from model_support import model_draw
+
+    from dew.nn.kv_cache import with_rounding_keys
+    from dew.quantization import Quantization, quantize_for_serving
+    from dew.sampling.text import rounding_keys
+
+    model = decoder()
+    variables, ids = model_draw(model, (2, LENGTH), 37)(0)
+    spec = Quantization(patterns=(INNER,), weight_only=True, bwd_qtype="int8",
+                        bwd_stochastic_rounding="uniform")
+    served, held = quantize_for_serving(model, variables, spec, ids)
+    empty = served.apply(held, 2, method="init_cache", mutable=["cache"])[1]["cache"]
+
+    @jax.jit
+    def decoded(rounding, stream=None):
+        return served.apply({**held, "cache": with_rounding_keys(empty, rounding)}, ids, decode=True,
+                            mutable=["cache"],
+                            rngs=None if stream is None else {"stochastic_rounding": stream})[0]
+
+    keys = rounding_keys(jax.random.split(jax.random.key(1), 2))
+    other = keys.at[1].set(rounding_keys(jax.random.key(2)[None])[0])
+    mine, theirs = np.asarray(decoded(keys)), np.asarray(decoded(other))
+    np.testing.assert_array_equal(mine[0], theirs[0])
+    assert not np.array_equal(mine[1], theirs[1])
+    brought = np.asarray(decoded(keys, jax.random.key(5)))
+    np.testing.assert_array_equal(np.asarray(decoded(other, jax.random.key(5))), brought)
+    assert not np.array_equal(np.asarray(decoded(keys, jax.random.key(6))), brought)
+
+
+@pytest.mark.parametrize(("network", "weight_only", "stochastic"),
+                         [(None, None, False), (None, False, True), ("dense-general", True, True)],
+                         ids=["unquantized", "stochastic", "weight-only-dense-general"])
+def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_only, stochastic):
+    """A paged server's prefix cache shares a memory decoder's prompt state across requests where the
+    state is the tokens' alone: a memory that rounds deterministically (unquantized) keeps no rounding
+    key, so a second key reuses the first's prefix; one whose quantized backward rounds stochastically,
+    a weight-only rule's matmuls of any rank among them, keeps its request's key in the cache
+    (`dew.nn.kv_cache.ROUNDING_KEYS`) and serves, and only its own key reuses its prefix (ledger 2036)."""
+    from model_support import Digits
+
+    from dew.inference import RunProcessor, TextGeneration
+    from dew.inference.serving import Server
+    from dew.nn.kv_cache import KVCache
+    from dew.sampling import Sampling
+
+    memory = None if network is None else InContextMemory(
+        network=GeneralMemory(), heads=2, head_features=8, chunk=4, normalize=True,
+        learning_rate=Gate(scale=STEP), momentum=Gate(), retention=Gate(bias=-2.0))
+    model = decoder(memory).clone(max_seq_len=64)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    task = TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=12))
+    if weight_only is not None:
+        pytest.importorskip("qwix")
+        from dew.quantization import Quantization
+
+        task = task.quantized(Quantization(patterns=(INNER,), weight_only=weight_only, bwd_qtype="int8",
+                                           bwd_stochastic_rounding="uniform"))
+    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=16), prefix_cache=True)
+    prompt = "1" * 33
+
+    def reused(key: int) -> int:
+        before = server.prefix_hits
+        server(prompt, 2, key=key)
+        return server.prefix_hits - before
+
+    assert reused(1) == 0
+    assert (reused(2) > 0) is not stochastic
+    assert reused(1) > 0
 
 
 def test_a_qwix_quantized_linear_memory_leaves_the_recurrence():

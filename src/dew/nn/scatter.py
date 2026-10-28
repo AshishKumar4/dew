@@ -22,6 +22,11 @@ which `DROPPED` alone does not cover: `KVStore.write_tokens` maps it over its gr
 import jax
 import jax.numpy as jnp
 
+__all__ = [
+    "DROPPED",
+    "gather_positions",
+]
+
 DROPPED = 2**30
 
 

@@ -32,7 +32,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
-from dew.batch import Batch, Variables, real_slots, thaw
+from dew.batch import TEXT_KEY, Batch, Variables, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
@@ -42,7 +42,7 @@ from dew.nn.protocols import Lacks, TokenModel
 from dew.objectives.base import OMITTED, Aux, EMASpec, Omitted, Ratio, Shown, Source, Step, ended, model_rngs
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
-from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
+from dew.objectives.lm.objective import batch_text, text_preview
 from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
 from dew.sampling.sample import sample
 

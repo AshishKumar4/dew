@@ -64,6 +64,11 @@ class Scoring[Request, Row, Payload, Output, Answer](Protocol):
         """One pass over `rows` with `variables`: each row's output, in order."""
         ...
 
+    def compile(self, variables: Variables) -> Sequence[object]:
+        """Compile every program the task's passes run with `variables`, up front, so a server
+        compiles none while it serves; returns the shapes it serves at, one program each."""
+        ...
+
     def answer(self, payload: Payload, outputs: Sequence[Output]) -> Answer:
         """A request's answer from what it admitted and its rows' outputs, in its rows' order."""
         ...
@@ -107,13 +112,18 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         self._failed: BaseException | None = None
         self.arrived: Callable[[], None] = _nothing
         """Called after each submission: an `Engine` serving this kind wakes to it."""
+        self.programs: tuple[object, ...] = ()
+        """The shapes of the programs compiled up front (`from_task`), one each."""
 
     @classmethod
     def from_task(cls, task: Scoring[Request, Row, Payload, Output, Answer], variables: Variables, *,
                   rows: int = 64) -> ScoringServer[Request, Row, Payload, Output, Answer]:
-        """A server over `task`'s passes with `variables`, held resident; a step looks at most `rows`
-        requests."""
-        return cls(task, variables, rows=rows)
+        """A server over `task`'s passes with `variables`, held resident, every program its passes run
+        compiled up front (`Scoring.compile`, the shapes in `programs`); a step looks at most `rows`
+        requests. A server built directly compiles each program on its first pass."""
+        server = cls(task, variables, rows=rows)
+        server.programs = tuple(task.compile(server.variables))
+        return server
 
     @property
     def task(self) -> Scoring[Request, Row, Payload, Output, Answer]:

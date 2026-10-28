@@ -67,6 +67,7 @@ from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerConte
 from dew.nn.mla import IndexerFront
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import LongRopeScaling, Scaling, rotary_freqs, rotate
+from dew.nn.scatter import gather_positions
 from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import (
     candidate_pool,
@@ -146,7 +147,7 @@ def real_first(x, valid):
     if valid is None:
         return x
     order, _ = valid_order(valid)
-    return jnp.take_along_axis(x, order.reshape(*order.shape, *(1,) * (x.ndim - 2)), axis=1)
+    return gather_positions(x, order)
 
 
 def window_origins(places, valid, windows: int, rate: int):

@@ -32,6 +32,7 @@ from dew.batch import (
     with_validity,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
+from dew.nn.scatter import gather_positions
 from dew.nn.sharding import explicit_spec, rows_like
 
 if TYPE_CHECKING:
@@ -320,7 +321,7 @@ def rotate_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
     reads slot `(i + shift) % S`, so a row's first `shift` slots move to its end, and a negative
     count rotates it back."""
     slots = (jnp.arange(values.shape[1])[None, :] + shifts[:, None]) % values.shape[1]
-    return jnp.take_along_axis(values, slots.reshape(slots.shape + (1,) * (values.ndim - 2)), axis=1)
+    return gather_positions(values, slots)
 
 
 def cu_seqlens(begins: jax.Array, sequences: int, firsts: jax.Array | None = None) -> jax.Array:
@@ -734,11 +735,8 @@ def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coord
 
     starts = None if value.starts is None else jnp.concatenate(
         [value.starts, jnp.zeros((len(value.starts), width), value.starts.dtype)], axis=1)
-    # No document starts in the response: each row's firsts stand, past its last now `width` further.
-    firsts = value.firsts
-    if firsts is not None and value.starts is not None:
-        length = value.starts.shape[1]
-        firsts = jnp.where(firsts < length, firsts, length + width)
+    # No document starts in the response: its firsts built again over the longer rows (`document_firsts`).
+    firsts = None if starts is None else document_firsts(starts, value.max_segments + 1)
     return replace(value, valid=continued(value.valid, _response_validity),
                    positions=continued(value.positions, _response_positions),
                    segments=continued(value.segments, _response_document), starts=starts, firsts=firsts,

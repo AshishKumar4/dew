@@ -29,6 +29,7 @@ from dew.interop.families.gpt_neox import GPT_NEOX
 from dew.interop.families.gpt_oss import GPT_OSS
 from dew.interop.families.k2_horizon import K2_HORIZON
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
+from dew.interop.families.lfm3 import LFM3
 from dew.interop.families.llama import GRANITEMOE, MISTRAL, MIXTRAL, llama_config, ministral_config
 from dew.interop.families.llama4 import LLAMA4_TEXT
 from dew.interop.families.mamba import MAMBA
@@ -55,6 +56,9 @@ from dew.interop.families.starcoder2 import STARCODER2
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 ENTRIES = (
+    # Its convolution kind first: its gated attention and sliding layers are matched broadly below
+    # (Qwen 3.5's output gate, Ministral's sliding layers).
+    LFM3,
     DORY,
     OURO,
     BLOOM,

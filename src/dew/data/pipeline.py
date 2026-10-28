@@ -33,6 +33,61 @@ class Rejected:
     permanent: bool = True
 
 
+type Cuts = Mapping[str, tuple[int, int]]
+"""A record's cut record (`_dew_cut`): by what each cut, the rows it shortened and the tokens it removed;
+characters where the kind names them (`<kind>_characters`), as a cut of text encoded whole is measured."""
+
+
+def cut(element: Batch, removed: Mapping[str, int]) -> Batch:
+    """`element` cut short by a step that removed `removed` of it (by what it cut, the tokens), its cut
+    record composed with what earlier steps recorded (`composed`)."""
+    if not any(removed.values()):
+        return element
+    made = {kind: (1, tokens) for kind, tokens in removed.items() if tokens}
+    return {**element, "_dew_truncated": True, "_dew_cut": composed(element.get("_dew_cut", {}), made)}
+
+
+def composed(earlier: Cuts, later: Cuts) -> dict[str, tuple[int, int]]:
+    """Two cut records of the same rows, one step after another: a kind both cut counts its rows once,
+    the most either shortened, and adds what each removed; a 100-token text cut to 80, then to 60,
+    removed 40 of one row."""
+    kinds = {**earlier, **later}
+    return {kind: (max(earlier.get(kind, (0, 0))[0], later.get(kind, (0, 0))[0]),
+                   earlier.get(kind, (0, 0))[1] + later.get(kind, (0, 0))[1]) for kind in kinds}
+
+
+def cut_unit(kind: str) -> str | None:
+    """The unit a cut of `kind` removes: characters for a kind that names them (`<kind>_characters`,
+    a text encoded whole), none for an event that removes nothing (`options_alike`, a row whose cut
+    left two options alike), else tokens."""
+    if kind == "options_alike":
+        return None
+    return "characters" if kind.endswith("_characters") else "tokens"
+
+
+def cut_counts(cuts: Iterable[Mapping[str, int]]) -> dict[str, tuple[int, int]]:
+    """Several rows' cuts (each the tokens a cut removed of the row, by what it cut) as one record's
+    `_dew_cut`, which `dew.data.mixing.CorpusCounts.delivered` counts: by what each cut, the rows it
+    shortened and the tokens it removed; distinct rows add, where `composed` adds one row's successive
+    cuts."""
+    found: dict[str, tuple[int, int]] = {}
+    for row in cuts:
+        for kind, tokens in row.items():
+            shortened, removed = found.get(kind, (0, 0))
+            found[kind] = (shortened + 1, removed + tokens)
+    return found
+
+
+class Refused(ValueError):
+    """A request a served task refuses, under the reason its training would reject the same record
+    under (`Rejected`), which a server counts as a run's data counters count rejections
+    (`dew.data.mixing.CorpusCounts`)."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 type Record = Batch | bytes | Rejected | None
 
 

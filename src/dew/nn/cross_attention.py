@@ -57,6 +57,7 @@ from dew.nn.dropout import Dropout
 
 from .activations import GatedActivation
 from .attention import CROSS_KEY, CROSS_VALUE, NormalAttention
+from .documents import CrossDocuments, holds_keys
 from .flops import counted_flops
 from .inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext
 from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
@@ -256,9 +257,8 @@ class GatedCrossAttention(nn.Module):
         present = (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
         if context is not None and context.segments is not None and context.queries is not None:
             # A token whose document holds no context reads none, as its row alone would skip the block.
-            keys = context.segments[:, None, :]
-            owned = (context.queries[:, :, None] == keys) & (keys > 0)
-            present = jnp.any(owned, axis=-1).reshape(owned.shape[:2] + (1,) * (stream.ndim - 2))
+            held = holds_keys(CrossDocuments(context.queries, context.segments))
+            present = held.reshape(held.shape[:2] + (1,) * (stream.ndim - 2))
         dropout = Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:

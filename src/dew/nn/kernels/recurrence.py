@@ -29,16 +29,16 @@ from dew.nn.precision import (
     L2NORM_EPS,
     at_least_fp32,
     compensated_add,
-    float32_einsum,
     float32_products,
     l2norm,
     products_dtype,
+    rms_statistics,
     stochastic_bf16,
 )
 
 from ..sharding import explicit_spec
 from . import chunked_launch, norm_swiglu, short_conv, tuning
-from .generation import INHERENT, Refusal, triton_runs
+from .generation import INHERENT, Refusal, linear_tangent, triton_runs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,25 +128,18 @@ def round_to_bf16(state, key, value):
     return stochastic_bf16(state, mixed ^ (mixed >> 16))
 
 
-def update(state, query, key, value, decay, write, *, delta: bool, in_kernel: bool = False):
+def update(state, query, key, value, decay, write, *, delta: bool):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` per key dimension `[...,
     Dk]` (`exp(g)`) and `write` the write gate, broadcast against the values `[..., Dv]`: its output
     `[..., Dv]` and the updated state.
-    Both readouts are products with the old state, `(q decay)^T S + (q . k) d` with `d = write (v -
-    (k decay)^T S)` under the delta rule and `write v` without it, so one pass over the state serves
-    them and the write. `q . k` is a product (`float32_einsum`), summed as Dew sums one, not a reduction
-    whose order XLA chooses by the shape it is batched at: under a skip that cancels it (`(q . k) write`
-    against `D`), a reduction a token at a time and the same in the portable rule's batched adjoint
-    rounded a last bit apart, which put the portable gradient's cancelled row 4.9 times the token
-    recurrence's distance from float64 (test_recurrence_stability's rated site under resets on chunk
-    edges, seed 6). A kernel's body (`in_kernel`, the fused step's) sums it in its own registers, where
-    Pallas's Triton lowering takes no platform-dependent product."""
-    read_query = jnp.sum((query * decay)[..., :, None] * state, axis=-2)
+    The output reads the updated state, `q^T S'`, as the recurrence states it, with the delta rule and
+    without: the one-pass form `(q decay)^T S + (q . k) write (v - (k decay)^T S)` overflowed where
+    `q^T S'` stays finite, its `q . k` past fp32's largest at keys and queries of 2^80 against a write of
+    2^-80 (rows 1859 and 1962)."""
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
     written = corrected * write
-    score = (jnp.sum(query * key, axis=-1) if in_kernel else float32_einsum('...d,...d->...', query, key))
-    out = read_query + score[..., None] * written
-    return out, state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
+    updated = state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
+    return jnp.sum(query[..., :, None] * updated, axis=-2), updated
 
 
 def _held(updated, key, value, dtype):
@@ -172,9 +165,9 @@ def gated(gates: Gates, gate, log_a, bias, beta):
 
 
 def gated_rms(out, z, weight, norm: OutputNorm):
-    """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`,
-    the mean a product by the reciprocal, as XLA's."""
-    inverse = jax.lax.rsqrt(jnp.sum(out * out, axis=-1, keepdims=True) * (1.0 / out.shape[-1]) + norm.epsilon)
+    """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`, its
+    inverse RMS the one statistic every norm takes (`rms_statistics`)."""
+    inverse = rms_statistics(out, norm.epsilon)[1]
     return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
 
 
@@ -310,22 +303,18 @@ def skipped(hooks: Hooks, out, value, given: dict, work):
     return out + _skip(given['skip'].astype(work), value.astype(work)) if hooks.skip else out
 
 
-@jax.custom_vjp
-def _skip(skip, value):
-    """`D v` of the skip `D` `[Hv]` and values `[..., Hv, Dv]`, whose gradient in `D` sums every token's and
-    value's product as a product (at `float32_products`' precision) rather than one reduction over them
-    all: XLA:CPU's reduction, without YNNPACK's fusions, summed a chunked call's `B S Dv` products in turn,
-    2.1 times the token-by-token recurrence's distance from float64 (Mamba2's rated decay,
-    test_recurrence_stability after the gate compiled both arms without them)."""
+def _skip_product(skip, value):
+    """`D v`: the skip `D` `[Hv]` against values `[..., Hv, Dv]`."""
     return skip[:, None] * value
 
 
 def _skip_forward(skip, value):
-    return _skip(skip, value), (skip, value)
+    return _skip_product(skip, value), (skip, value)
 
 
-def _skip_backward(residual, grad):
-    skip, value = residual
+def _skip_backward(saved, operands, grad):
+    del operands
+    skip, value = saved
     # Rows an Explicit axis splits contract into `D`'s own placement, which JAX cannot infer from a
     # contraction over a split dimension (a data-parallel layout's hybrid, test_parallelism_matrix).
     placed = explicit_spec(value)
@@ -337,7 +326,13 @@ def _skip_backward(residual, grad):
     return summed.astype(skip.dtype), (grad * skip[:, None]).astype(value.dtype)
 
 
-_skip.defvjp(_skip_forward, _skip_backward)
+_skip = linear_tangent(_skip_forward, _skip_backward, _skip_product)
+"""`D v` (`_skip_product`) differentiated at every order (`generation.linear_tangent`): forward mode the
+product's own tangent, reverse mode its gradient in `D` summing every token's and value's product as a
+product (at `float32_products`' precision) rather than one reduction over them all: XLA:CPU's reduction,
+without YNNPACK's fusions, summed a chunked call's `B S Dv` products in turn, 2.1 times the token-by-token
+recurrence's distance from float64 (Mamba2's rated decay, test_recurrence_stability after the gate compiled
+both arms without them). A custom VJP alone refused `jax.jvp` through a decode step's reference."""
 
 
 def normed(hooks: Hooks, out, given: dict, work):
@@ -441,7 +436,7 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
             write_gate = scalar('beta') if hooks.gated_write else jnp.ones((1,), jnp.float32)
         decay = jnp.broadcast_to(decay, key.shape)
         out, updated = update(state_ref[...].astype(jnp.float32), query, key, value, decay, write_gate,
-                              delta=hooks.delta, in_kernel=True)
+                              delta=hooks.delta)
         if hooks.skip:
             out = out + scalar('skip') * value
         if hooks.output is not None:
