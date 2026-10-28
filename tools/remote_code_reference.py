@@ -143,24 +143,33 @@ def _stored_once(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 OPENED = """import json, sys, numpy, torch
 from transformers import AutoModelForCausalLM
-model, info = AutoModelForCausalLM.from_pretrained(sys.argv[1], trust_remote_code=True, dtype=torch.float32,
-                                                   output_loading_info=True)
-ids = torch.from_numpy(numpy.load(sys.argv[2]).astype('int64'))
-with torch.no_grad():
-    numpy.save(sys.argv[3], model(input_ids=ids).logits.numpy())
-torch.save(model.state_dict(), sys.argv[4])
-print(json.dumps({"class": type(model).__name__, **{key: sorted(value) for key, value in info.items()}}))
+ids = torch.from_numpy(numpy.load(sys.argv[1]).astype('int64'))
+opened = []
+for directory in sys.argv[2:]:
+    model, info = AutoModelForCausalLM.from_pretrained(directory, trust_remote_code=True, dtype=torch.float32,
+                                                       output_loading_info=True)
+    with torch.no_grad():
+        logits = model(input_ids=ids).logits
+    report = {key: sorted(value) for key, value in info.items()}
+    opened.append((type(model).__name__, report, model.state_dict(), logits))
+(name, info, state, logits), (other, other_info, other_state, other_logits) = opened
+matched = info == other_info and not any(info.values())
+print(json.dumps({"class": name == other, "every weight matched": matched,
+                  "state": sorted(state) == sorted(other_state)
+                  and all(torch.equal(state[key], other_state[key]) for key in state),
+                  "logits bitwise": bool(torch.equal(logits, other_logits))}))
 """
-"""A fresh interpreter's offline open of an export through its own code (`opens`)."""
+"""A fresh interpreter's offline opens of two directories through their own code (`opens`), compared."""
 
 
 def opens(name: str, export: Path, scratch: Path) -> None:
     """Whether `export`, a Dew save of `name`'s fixture (`PretrainedDecoder.from_model(...).save`), opens
-    offline through the release's own transformers loader as the release does: a fresh interpreter, the
-    hub offline and its module cache empty, so it reads the export's own code alone, builds the release's
-    class with every weight matched, holding the release's state tensor for tensor and computing its
-    logits bit for bit over the fixture's ids (ledger 2038). Run in the release's environment, after Dew's
-    writes the export:
+    offline through the release's own transformers loader as the release does: one fresh interpreter, the
+    hub offline and its module cache empty, opens the export, which reads its own code alone, and the
+    release (the fixture's config and weights beside the release's code and auto_map at its commit), and
+    finds the same class, every weight matched, the same state tensor for tensor and the same logits bit
+    for bit over the fixture's ids (ledger 2038). Run in the release's environment, after Dew's writes
+    the export:
       python -c 'from dew.interop import Pretrained, PretrainedDecoder; loaded = Pretrained.load(
           "tests/fixtures/hf/lfm3-tiny"); PretrainedDecoder.from_model(loaded.model, loaded.variables).save(
           "/tmp/lfm3-export")'
@@ -169,23 +178,22 @@ def opens(name: str, export: Path, scratch: Path) -> None:
     import subprocess
     import sys
 
-    run = subprocess.run([sys.executable, "-c", OPENED, str(export), str(FIXTURES / name / "input_ids.npy"),
-                          str(scratch / "logits.npy"), str(scratch / "state.pt")], check=True,
-                         capture_output=True, text=True,
+    from huggingface_hub import hf_hub_download
+
+    repo, revision, files, _ = RELEASES[name]
+    release = scratch / "release"
+    release.mkdir()
+    released = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
+    config = json.loads((FIXTURES / name / "config.json").read_text())
+    (release / "config.json").write_text(json.dumps({**config, "auto_map": released["auto_map"]}))
+    shutil.copy(FIXTURES / name / "model.safetensors", release / "model.safetensors")
+    for file in files:
+        shutil.copy(hf_hub_download(repo, file, revision=revision), release / file)
+    run = subprocess.run([sys.executable, "-c", OPENED, str(FIXTURES / name / "input_ids.npy"), str(export),
+                          str(release)], check=True, capture_output=True, text=True,
                          env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                               "HF_MODULES_CACHE": str(scratch / "modules")})
-    opened = json.loads(run.stdout.strip().splitlines()[-1])
-    released = released_model(name, scratch / "release")
-    ids = torch.from_numpy(np.load(FIXTURES / name / "input_ids.npy").astype(np.int64))
-    with torch.no_grad():
-        logits = released.float()(input_ids=ids).logits.numpy()
-    state, held = released.state_dict(), torch.load(scratch / "state.pt")
-    checks = {"class": opened["class"] == type(released).__name__,
-              "every weight matched": not any(opened[key] for key in ("missing_keys", "unexpected_keys",
-                                                                       "mismatched_keys", "error_msgs")),
-              "state": sorted(state) == sorted(held)
-              and all(torch.equal(state[key], held[key]) for key in state),
-              "logits bitwise": np.array_equal(np.load(scratch / "logits.npy"), logits)}
+    checks = json.loads(run.stdout.strip().splitlines()[-1])
     print(name, "opens as the release does" if all(checks.values()) else f"differs: {checks}")
     if not all(checks.values()):
         raise SystemExit(1)
