@@ -169,7 +169,20 @@ class Mosaic(base.Template[mainloop.Tiles]):
           launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
         - stages: the deepest ring of the states launch's steps of which a multiprocessor holds as many
           programs as one stage's (`states_held`, `_staged`), one where none of two or more is legal.
+        - a forward without a gradient: the same rules without the fast backward's (`Tiles.forward`, where
+          they differ): on an H100 the 27B gated delta net's forward took 0.513 ms at the training call's
+          32-wide block, its states launch's 192 programs two waves, and 0.433 at 64 wide, one wave of 96,
+          where fla's port took 0.440 (JS-fwdtiles2-h100-a7ec9a134).
         None where no block is legal: the launch refuses the call."""
+        trained = self._derive(ba, target, training=True)
+        if trained is None:
+            return None
+        alone = self._derive(ba, target, training=False)
+        return trained if alone in (None, trained) else dataclasses.replace(trained, forward=alone)
+
+    def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, *, training: bool
+                ) -> mainloop.Tiles | None:
+        """`derived`'s rules, the fast backward's with them where `training`."""
         family = bundle(target, _dtype(ba))
         if family is None:
             return None
@@ -185,7 +198,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return None
         def trains(index: int) -> bool:
             tiles = staged(index)
-            return tiles is not None and self._backward_holds(ba, tiles, target)
+            return training and tiles is not None and self._backward_holds(ba, tiles, target)
 
         trained = next((index for index in range(start, len(blocks)) if trains(index)), start)
         chosen = staged(trained)
@@ -205,7 +218,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         if not one_wave(chosen):
             programs = columns // chosen.block_v * sequences * heads
             return self._walked(ba, chosen, target,
-                                programs // (multiprocessors * self.states_held(ba, chosen, target)))
+                                programs // (multiprocessors * self.states_held(ba, chosen, target)),
+                                training=training)
         # Narrower only while the fast backward holds where it held at the block given way from.
         held = trains(trained)
         for index in range(trained + 1, len(blocks)):
@@ -216,7 +230,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return chosen
 
     def _walked(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
-                waves: int) -> mainloop.Tiles:
+                waves: int, *, training: bool = True) -> mainloop.Tiles:
         """`tiles` with the value blocks of one sequence and head a walk program takes (`Tiles.walkers`),
         one a consumer role beside one producer, where its states launch's programs fill `waves` waves of
         the device's: the most roles the family's program takes (`Family.consumers`) that divide the head's
@@ -236,8 +250,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 continue
             grouped = self._staged(ba, tiles.block_v, target, walkers=walkers,
                                    wide=tiles.block_o or tiles.block_v)
-            if grouped is not None and self._backward_holds(ba, grouped, target) == self._backward_holds(
-                    ba, tiles, target):
+            if grouped is not None and (not training or self._backward_holds(ba, grouped, target)
+                                        == self._backward_holds(ba, tiles, target)):
                 return grouped
         return tiles
 
