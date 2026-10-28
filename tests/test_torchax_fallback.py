@@ -752,7 +752,8 @@ def test_a_float64_forwards_logits_are_as_wide_as_its_output_tables(tokens, tmp_
 
 
 TORCHAX_SEEDS = 8
-"""The float32 torchax model's declared draws of token ids against torch's forward (check 1)."""
+"""The float32 torchax model's declared draws of token ids against torch's forward (check 1), sized by
+`seeds_for` paired with the model on an A100."""
 
 
 @pytest.mark.gpu(reason="TF32 is a GPU's default float32 product")
