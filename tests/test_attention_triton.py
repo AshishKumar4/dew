@@ -257,12 +257,13 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
 SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi": ("alibi",),
                "temperature": ("temperature",), "key-bias": ("key",), "tile-bias": ("tile",),
                "resumed": ("resumed",), "custom-vjp": ("custom",), "row-indexed": ("indexed",),
-               "softcap-sinks-alibi": ("softcap", "sinks", "alibi")}
+               "column-indexed": ("key-indexed",), "softcap-sinks-alibi": ("softcap", "sinks", "alibi")}
 """The score hooks the backward differentiates, each kind of parameter among them: ALiBi's slopes a
 head's, a query's temperature (divided by, so padding's zeros would be infinite slopes), a per-key bias,
 a dense bias, a softcap through a `jax.custom_vjp` (which forward-mode differentiation refuses), a bias
-indexed off the query's coordinates' column (which reads them at their tile rank); and the softmax's
-initial state as sinks or as a resumed partial."""
+indexed off the query's coordinates' column and one off the keys' coordinates' row (each reads them at its
+tile rank, a unit axis on the Mosaic mainloop, whose unit row reduces across warps, ledger 1428); and the
+softmax's initial state as sinks or as a resumed partial."""
 
 
 @jax.custom_vjp
@@ -311,6 +312,8 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             s = custom_softcap(s)
         if "indexed" in names:
             s = s + 0.01 * q_pos[:, :1].astype(s.dtype)
+        if "key-indexed" in names:
+            s = s + 0.01 * k_pos[:1, :].astype(s.dtype)
         if "alibi" in names:
             s = s + values.pop(0).astype(s.dtype) * k_pos.astype(s.dtype)
         if "temperature" in names:
@@ -339,7 +342,8 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             initial = template.Initial(jax.random.normal(streams[5], (rows, heads, queries)), total, acc)
         return tuple(params), initial
 
-    scoring = bool({"softcap", "custom", "indexed", "alibi", "temperature", "key", "tile"} & set(names))
+    scoring = bool({"softcap", "custom", "indexed", "key-indexed", "alibi", "temperature", "key", "tile"}
+                   & set(names))
     return (score_mod if scoring else None), tuple(kinds), draw
 
 

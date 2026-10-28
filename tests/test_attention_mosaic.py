@@ -203,7 +203,7 @@ INTERPRETED_HOOK_SITES = {"none": ((1, 2, 1), 8), "alibi": ((1, 2, 1), 128), "ke
                           "custom-vjp": ((1, 2, 1), 8), "softcap": ((1, 2, 1), 8), "sinks": ((1, 4, 2), 16),
                           "temperature": ((1, 2, 1), 8), "tile-bias": ((1, 2, 1), 8),
                           "resumed": ((1, 2, 1), 128), "softcap-sinks-alibi": ((2, 2, 1), 128),
-                          "row-indexed": ((1, 2, 1), 8)}
+                          "row-indexed": ((1, 2, 1), 8), "column-indexed": ((1, 2, 1), 8)}
 """The interpreted hooked backward's site under each hook: its rows, query heads and key heads, and its
 seeds, sized by `seeds_for` at that shape (the reference against itself), never the compiled site's. The
 claim interpreted is the hooked backward lowering and computing the template's gradients, so each site
@@ -1022,3 +1022,33 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     assert counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key) == forward
     assert counted(trained, query, key, key) == forward
     assert counted(backward, query, key, key, query, residuals) == 2 * forward
+
+
+@pytest.mark.parametrize("hook", ["row-indexed", "column-indexed"])
+def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(hook):
+    """A score hook that forms a unit column (`q_pos[:, :1]`) or a unit row (`k_pos[:1, :]`, which Mosaic GPU
+    selects by a reduction across warps, its scratch the launch's warpgroups reserve, ledger 1428), the
+    training forward and the backward compiled by ptxas for an H100 on this CPU (tests/kernel_compile.py),
+    within its shared memory and registers."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    queries = 256
+    spans = template.spans(queries, queries, 1, causal=True)
+    score_mod, _ = score_hooks(SCORE_HOOKS[hook], queries, queries)
+    hooks = template.Hooks(score_mod)
+    query = jax.ShapeDtypeStruct((1, queries, 4, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, queries, 2, 128), jnp.bfloat16)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=True)
+
+    def backward(query, key, value, dout):
+        residuals = trained(query, key, value)[1:]
+        grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals)
+        return grads.query, grads.key, grads.value
+
+    found = compile_mosaic_kernels([KernelCase("forward", lambda: (trained, (query, key, key))),
+                                    KernelCase("backward", lambda: (backward, (query, key, key, query)))],
+                                   "sm90")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
