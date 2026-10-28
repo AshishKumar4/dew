@@ -64,6 +64,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.kernels import recurrence
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
@@ -148,15 +149,19 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
 
     def one_token(s, step):
         x_t, dt_t, B_t, C_t, start = step                   # [B, H, P], [B, H], [B, H, N], [B]
+        # The decode step's update without the delta rule (`recurrence.update`): `C` the query, `B` the
+        # key, `x` the value and `dt` the write, over the memory `[N, P]`; a document's first token
+        # decays the memory it enters to zero.
         decay = jnp.where(start[:, None], 0.0, jnp.exp(dt_t * A))
-        s = s * decay[..., None, None] + (dt_t[..., None] * x_t)[..., None] * B_t[..., None, :]
-        read = float32_einsum('bhps,bhs->bhp', s, C_t)
+        read, s = recurrence.update(s, C_t, B_t, x_t, jnp.broadcast_to(decay[..., None], B_t.shape),
+                                    dt_t[..., None], delta=False)
         return s, read + x_t * D[None, :, None]
 
+    # The SSD's memory is `[P, N]`, values by keys: the update's `[N, P]` transposed.
     final, out = jax.lax.scan(
-        one_token, jnp.asarray(state, work),
+        one_token, jnp.swapaxes(jnp.asarray(state, work), -1, -2),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
-    return jnp.moveaxis(out, 0, 1), final
+    return jnp.moveaxis(out, 0, 1), jnp.swapaxes(final, -1, -2)
 
 
 class MambaRMSNormGated(nn.Module):
