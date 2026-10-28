@@ -12,7 +12,8 @@ the sampler recorded under the same weights.
 import jax
 import numpy as np
 import pytest
-from affine_run import dataset, frozen_trainer, raw_leaf
+from affine_run import dataset, raw_leaf
+from affine_training import frozen_trainer
 from recording import RecordingTracker
 from rl_support import TinyHead
 

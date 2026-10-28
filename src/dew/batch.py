@@ -93,6 +93,9 @@ COORDINATES_FIELD = "coordinates"
 """The token field that holds the tokens' `Coordinates`, which a decoder reads in place of the
 validity field, `segment_ids` and `positions`."""
 
+TEXT_KEY = "text"
+"""Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
+
 BLOCKS_FIELD = "block_groups"
 """The token field that numbers the tokens' blocks, which the attention layers that read blocks see whole
 (`AttentionMetadata.block_groups`, `dew.nn.visibility.prefix_blocks`)."""

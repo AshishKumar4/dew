@@ -482,7 +482,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             views = _gmm_views(lhs_gmem, rhs_gmem, prologue_gmems, group, row_start, ni, tiles=tiles,
                                groups=g, transpose_rhs=transpose_rhs,
                                axes_of={i: prologue_axes[i] for i in stepped})
-            active = jnp.bool_(True) if dense else (group.group_id < g) & (group.actual_size > 0)
+            active = jnp.ones((), jnp.bool_) if dense else (group.group_id < g) & (group.actual_size > 0)
             return active, steps, views, (group, row_start, ni)
 
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, *, streams):

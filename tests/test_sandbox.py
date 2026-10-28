@@ -10,21 +10,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from episode_support import (
-    CALL_THREE,
-    EOS,
-    GROUPS,
-    IDENTITY,
-    NINE,
-    PROMPT,
-    START,
-    action,
-    build,
-    environment,
-    trained_batch,
-    verify,
-)
+from episode_support import IDENTITY, action, build, environment, trained_batch, verify
 from process_support import running
+from tool_policy import CALL_THREE, EOS, GROUPS, NINE, PROMPT, START
 
 from dew.objectives.rl import EpisodeStatus
 

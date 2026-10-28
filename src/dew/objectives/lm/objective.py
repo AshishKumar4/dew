@@ -45,6 +45,7 @@ from dew.batch import (
     BLOCKS_FIELD,
     COORDINATES_FIELD,
     FROZEN,
+    TEXT_KEY,
     VALID_ROWS,
     Batch,
     Coordinates,
@@ -118,10 +119,6 @@ from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_stack import DecoderBank
-
-TEXT_KEY = "text"
-"""Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
-
 
 BLOCKS_KEY = "text_block_groups"
 """Batch key `[B, seq_len + 1]` int32 block ids are read under, written by `dew.data.steps.blocks.Blocks`."""
