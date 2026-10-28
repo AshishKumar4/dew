@@ -368,8 +368,8 @@ def clocked_descent(accumulation: int):
     of each step and the final weight of Adam on `Echoed` over `x`'s CLOCKED_RECORDS records read in
     order, each `id % 3 + 1` rows, in batches of BATCH rows (the last short), at a rate falling linearly from
     PEAK to CLOCKED_END over the run's progress, the share of its records whose last row an earlier batch held
-    (`TrainState.consumed`); a window the stream ends inside commits over its own rows at a closing step
-    of no rows, which reports the window's loss. In float64, the truth."""
+    (`TrainState.consumed`); a window the stream ends inside commits over its own rows at the stream's
+    last batch. In float64, the truth."""
     @as_given
     def descended(x):
         ids = np.arange(1, CLOCKED_RECORDS + 1)
@@ -382,11 +382,9 @@ def clocked_descent(accumulation: int):
         for update, at in enumerate(range(0, len(batches), accumulation)):
             window = batches[at:at + accumulation]
             losses += [jnp.mean(jnp.square(w - held)) for held, _ in window[:-1]]
-            # The window commits at its last step, real or closing, the examples it held before it consumed.
+            # The window commits at its last step, a whole update's or the stream's last batch, the progress
+            # it reads the examples its batches before that step consumed.
             consumed += sum(count for _, count in window[:-1])
-            if len(window) < accumulation:
-                losses.append(jnp.mean(jnp.square(w - window[-1][0])))
-                consumed += window[-1][1]
             held = jnp.concatenate([rows for rows, _ in window])
             losses.append(jnp.mean(jnp.square(w - held)))
             gradient = 2 * jnp.sum(w - held, axis=0) / (len(held) * FEATURES)
@@ -394,8 +392,7 @@ def clocked_descent(accumulation: int):
             corrected = (first / (1 - 0.9 ** (update + 1)), second / (1 - 0.999 ** (update + 1)))
             moved = corrected[0] / (jnp.sqrt(corrected[1]) + 1e-8)
             w = w - (PEAK + (CLOCKED_END - PEAK) * consumed / CLOCKED_RECORDS) * moved
-            if len(window) == accumulation:
-                consumed += window[-1][1]
+            consumed += window[-1][1]
         return {"w": w, "loss": jnp.stack(losses)}
     return descended
 
