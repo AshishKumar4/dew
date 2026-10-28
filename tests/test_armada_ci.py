@@ -1401,10 +1401,10 @@ def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypa
     not read (owner, 2026-10-27, via OrganicMouse: G03's parallelism matrix marks 11 such cells)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_matrix.py": "import pytest\nfrom pathlib import Path\n"
-                                         "@pytest.mark.whole_suite\ndef test_cell():\n"
-                                         "    with Path('runs-cell').open('a') as runs: runs.write('x')\n"
-                                         "def test_contract():\n"
-                                         "    with Path('runs-contract').open('a') as runs: runs.write('x')\n"})
+                       "@pytest.mark.whole_suite\ndef test_cell():\n"
+                       "    with Path('runs-cell').open('a') as runs: runs.write('x')\n"
+                       "def test_contract():\n"
+                       "    with Path('runs-contract').open('a') as runs: runs.write('x')\n"})
     (tmp_path / ".verdict").mkdir()
     out = tmp_path / ".verdict/verdict.json"
 
