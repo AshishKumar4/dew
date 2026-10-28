@@ -53,7 +53,7 @@ from flax.nnx import bridge
 from recording import RecordingTracker
 from steady_state import steady_state
 from test_text_rollout_contract import assert_generation_scores_as_full_forwards
-from tiny_models import PER_ARCH, TINY
+from tiny_configs import PER_ARCH, TINY
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Loader, replayed

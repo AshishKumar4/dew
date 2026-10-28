@@ -14,12 +14,7 @@ import jax
 import numpy as np
 import pytest
 from episode_support import (
-    CALL_THREE,
-    EOS,
-    GROUPS,
     IDENTITY,
-    NINE,
-    START,
     Harness,
     SquareSession,
     action,
@@ -28,6 +23,7 @@ from episode_support import (
     collect,
     environment,
 )
+from tool_policy import CALL_THREE, EOS, GROUPS, NINE, START
 
 from dew.objectives.rl import EpisodeJournal, RecoverableEnvironment, Transcript, session_of
 

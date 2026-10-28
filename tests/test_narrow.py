@@ -118,8 +118,9 @@ def _keeping_gradients(optimizer):
 def _decoder(*, scanned=False, remat=None, mixture=False, rows=8):
     """`_trained`'s tied bf16 decoder over fp32 parameters, as its LM objective, and the batch of
     `rows` rows it trains on."""
+    from dew.batch import TEXT_KEY
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.objectives.lm import LMObjective
     from dew.objectives.routing import ExpertBalance
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
@@ -145,7 +146,7 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     as `remat` names. With `longer`, every other step reads a batch of that
     many rows, whose shape the trainer plans apart. Returns the state, each
     step's loss and the trainer, its plan the last shape's."""
-    from dew.objectives.lm import TEXT_KEY
+    from dew.batch import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
     objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),

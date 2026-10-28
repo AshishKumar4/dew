@@ -13,7 +13,6 @@ from flax import linen as nn
 from dew.artifacts import Representations
 from dew.data.dataset import Loader
 from dew.objectives.base import Aux, EMASpec, Objective, mean_of_totals, merge_totals
-from dew.training import Checkpoints, Layout, Trainer
 
 BATCH = 8
 FEATURES = 3
@@ -55,12 +54,6 @@ def batches():
     batch = {"x": x, "y": 2 * x[:, :2]}
     while True:
         yield batch
-
-
-def fit_one_step() -> None:
-    """One step of a plain run over `batches`, the least `Trainer.fit` that readies its process."""
-    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0)).fit(
-        Loader(lambda partition: batches(), None, None, 8), steps=1, log_every=1)
 
 
 class Counting:
@@ -105,15 +98,6 @@ class Replaying:
 
     def set_state(self, state):
         self.position = int(state)
-
-
-def frozen_trainer(tmp_path=None, **kwargs) -> Trainer:
-    """The regression's trainer with its average frozen at unit decay, the
-    reference a preference or RL objective reads, checkpointing under
-    `tmp_path` when one is given."""
-    checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path / "run"))
-    return Trainer(Regression(ema_decay=1.0), optax.sgd(0.1), key=jax.random.key(0),
-                   layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints, **kwargs)
 
 
 def dataset(train=Counting, val=None, batch=BATCH) -> Loader:
