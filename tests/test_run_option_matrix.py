@@ -147,3 +147,15 @@ def test_an_option_a_kinds_mesh_or_data_cannot_take_is_refused(kind, option, tmp
     value = {"microbatches": 2, "update_tokens": 64}[option]
     with pytest.raises(ValueError):
         trained(kind, tmp_path, option, **{"trainer.steps": 2, f"trainer.{option}": value})
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_a_kinds_run_is_tracked_on_wandb_offline_and_publishes_only_there(kind, tmp_path, monkeypatch):
+    """A run tracked on W&B offline (`wandb`) writes its W&B run beside where it runs; publishing its
+    final checkpoint (`publish`) without W&B to publish to is refused before the run trains."""
+    monkeypatch.chdir(tmp_path)
+    trained(kind, tmp_path, "tracked", **{"trainer.steps": 2,
+                                            "trainer.wandb": {"project": "dew-tests", "offline": True}})
+    assert list((tmp_path / "wandb").glob("offline-run-*"))
+    with pytest.raises(ValueError):
+        trained(kind, tmp_path, "published", **{"trainer.steps": 2, "trainer.publish": "True"})
