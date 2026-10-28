@@ -1678,13 +1678,14 @@ class _RandomLeaves:
 
 
 def test_a_draws_evidence_read_at_once_is_each_leafs_read_alone_bit_for_bit():
-    """A draw's summaries read at once (`_summaries`) are `leaf_summary`'s of each leaf alone, and
+    """A draw's truths' rows read at once (`_LaidTruths`) are `_TruthRows`' of each leaf alone (each row's
+    own RMS, its size, the leaf's finiteness), its summaries (`_summaries`) `leaf_summary`'s, and
     `_evidence`'s rows the rows it paired from those (`_evidence_leaf_by_leaf`), bit for bit, over 160
     random draws (`_RandomLeaves`): scalars, vectors, empty leaves and rows of widths 1 to 9,000, one
     shape repeated (a run laid as one matrix), in float16, bfloat16, float32 and float64, C-ordered,
     F-ordered and strided, with rows of float64 zero, an arm exactly zero on a row, values not finite or
     near float64's range, a recorded reference, and a reference held to truths of its own."""
-    from reference_error import _evidence, _LaidTruths, _summaries, leaf_summary
+    from reference_error import _evidence, _LaidTruths, _summaries, _TruthRows, leaf_summary
 
     def outcome(fn, *arguments):
         try:
@@ -1697,7 +1698,16 @@ def test_a_draws_evidence_read_at_once_is_each_leafs_read_alone_bit_for_bit():
         for draw in range(160):
             trees = random.draw()
             assert outcome(_evidence, *trees) == outcome(_evidence_leaf_by_leaf, *trees), draw
-            dew, _, truth, _ = trees
+            dew, _, truth, their_truth = trees
+            for values in (list(truth.values()), list(their_truth.values())):
+                held = _LaidTruths.of(values)
+                ends = np.cumsum([0] + [size // width if width else 0
+                                        for leaves, size, width in held.runs for _ in range(leaves)])
+                for index, at in enumerate(held.laid):
+                    alone = _TruthRows.of(np.asarray(values[at], np.float64))
+                    rows = slice(ends[index], ends[index + 1])
+                    assert _bits([held.own[rows], held.sizes[rows], bool(held.finite[index])]) == _bits(
+                        [alone.own, alone.sizes, alone.finite]), (draw, at)
             arms, truths = list(jax.device_get(dew).values()), list(truth.values())
             arms[::3] = [None] * len(arms[::3])
             held = _LaidTruths.of(truths)
