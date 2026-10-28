@@ -44,7 +44,6 @@ from dew.nn.dropout import Dropout
 from dew.registry import from_record, read_arguments
 
 from ..activations import GatedActivation, Situ, ungated_activation
-from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossAttention, GatedCrossAttention
@@ -78,6 +77,7 @@ from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain
+from ..norms import RMSNorm
 from ..precision import (
     at_least_fp32,
     capped_logits,

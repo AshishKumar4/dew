@@ -26,14 +26,8 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
-from dew.nn.attention import (
-    LayerNorm,
-    RMSNorm,
-    causal_attention_mask,
-    kernel_for_materialized_mask,
-    max_attention_logits,
-    scaled_dot_product_attention,
-)
+from dew.nn.attention import kernel_for_materialized_mask, scaled_dot_product_attention
+from dew.nn.attention_masks import causal_attention_mask, max_attention_logits
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
@@ -44,6 +38,7 @@ from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import (
     at_least_fp32,
     compensated_add,

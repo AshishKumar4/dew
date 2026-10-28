@@ -30,7 +30,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import gelu_tanh
-from dew.nn.attention import RMSNorm, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.blocks import modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import (
@@ -41,6 +41,7 @@ from dew.nn.flops import (
     patch_lengths,
     projection_flops,
 )
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
 from dew.nn.sharding import logical_axes

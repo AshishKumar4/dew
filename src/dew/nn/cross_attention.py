@@ -14,7 +14,7 @@ frozen while the block trains (`dew.interop.Pretrained.with_cross_attention`).
 The reference layer is IDEFICS's `IdeficsGatedCrossAttentionLayer`
 (transformers' modeling_idefics.py), and its names are the names used here.
 Its attention is the one every cross-attention runs, a diffusion block's and
-Wan's alike (`dew.nn.attention.NormalAttention`), held in the block's own
+Wan's alike (`dew.nn.attention_blocks.NormalAttention`), held in the block's own
 scope, over the decoder's grouped key-value heads and keeping a cached call's
 keys and values; the gates, the feed-forward and the residual join are the
 block's.
@@ -56,7 +56,7 @@ from dew.batch import coordinates
 from dew.nn.dropout import Dropout
 
 from .activations import GatedActivation
-from .attention import CROSS_KEY, CROSS_VALUE, NormalAttention
+from .attention_blocks import CROSS_KEY, CROSS_VALUE, NormalAttention
 from .documents import CrossDocuments, holds_keys
 from .flops import counted_flops
 from .inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext

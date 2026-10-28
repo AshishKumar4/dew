@@ -42,8 +42,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .attention import unweighted_rmsnorm
 from .flops import projection_flops
+from .norms import unweighted_rmsnorm
 from .precision import at_least_fp32, float32_einsum, float32_matmul
 
 HEADS = ('mean', 'weighted', 'carried')

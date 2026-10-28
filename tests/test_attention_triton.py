@@ -18,7 +18,7 @@ from test_attention_template import (
     geometry as core_geometry,
 )
 
-from dew.nn.attention import alibi_bias
+from dew.nn.attention_masks import alibi_bias
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,

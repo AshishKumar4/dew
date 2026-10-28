@@ -67,7 +67,7 @@ if TYPE_CHECKING:
     # classes, which a reader and a checker need.
     PresetSpec = Preset
 
-# Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
+# Every other dial of a stage is `dew.nn.attention_blocks.Stage`'s own default, and
 # a stage that names one restates it.
 ATTENTION = {"heads": 8}
 

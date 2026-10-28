@@ -45,7 +45,8 @@ from dew.mesh import MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
 
-from .attention import FORWARD_MODE, gated_rms_normalized, repeat_kv_heads
+from .attention import FORWARD_MODE
+from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
@@ -54,6 +55,7 @@ from .kernels import generation
 from .kernels.generation import INHERENT, Refusal, triton_runs
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed, recurrent_delta_rule
 from .kernels.selection import Kernel, Op, Requirement, forced, select
+from .norms import gated_rms_normalized
 from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, float32_dot_general, l2norm
 from .sharding import (
     HEADS,

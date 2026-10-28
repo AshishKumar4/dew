@@ -16,7 +16,7 @@ from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import DiffusionConditioner, T5Segment
 from dew.inputs.encoders import CharTable, ConditionWork, T5Text
-from dew.nn.attention import Stage
+from dew.nn.attention_blocks import Stage
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, MTPBlock
