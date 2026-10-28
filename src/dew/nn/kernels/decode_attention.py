@@ -62,12 +62,20 @@ if TYPE_CHECKING:
     from dew.nn.kv_cache import PagedCase
 
 BLOCK = 32
-"""Keys a step of the loop reads."""
+"""Keys a step of the loop reads, but a compensated walk's (`step_keys`)."""
 QUERIES = 16
 """Query positions a program holds: the fewest a tensor-core dot takes."""
 WARPS = 4
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The dtypes it attends in: its products' own precision, accumulated in fp32."""
+
+
+def step_keys(dtype) -> int:
+    """The keys a step of the loop reads over values of `dtype`: `BLOCK`, or one chain of a compensated walk's
+    (`algebra.CHUNK`, fp32's, `algebra.compensates`), whose step then sums its product whole, where a step of
+    `BLOCK` keys would split its value tile in registers, a layout change through shared memory (116736
+    bytes at 256-wide fp32 heads, past an sm120 block's 101376)."""
+    return algebra.CHUNK if algebra.compensates(dtype) else BLOCK
 
 SPLITS = (1, 2, 4, 8, 16, 32)
 """The slices a launch may cut each row's keys into (`Split`), each held to the float64 gate on the GPU."""
@@ -119,13 +127,14 @@ power-of-two width from 16 to 256, a capacity of whole blocks and one of its dty
 def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and in
-    either form whether a row's sums of `dtype` values need a guard (`algebra.headroom`). A decode
+    either form whether a row's sums of `dtype` values need a guard (`algebra.headroom`) and keep their
+    additions' rounding (`algebra.compensates`). A decode
     block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(capped, softcap),
                            natural=natural, headroom=algebra.headroom(dtype),
-                           initial=sinks)
+                           initial=sinks, compensated=algebra.compensates(dtype))
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
@@ -139,12 +148,11 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
     rows = jnp.arange(QUERIES)
     spans = ((jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)),)
 
-    def body(step, state):
+    def keys_at(step):
         key, value = read(step)
         coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], spans)
         logits = algebra.modify(spec, kernel_dot(query, key.T, interpret), coords)
-        keys = algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
-        return algebra.plain_step(spec, state, keys)
+        return algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
 
     def walk(live=None) -> algebra.Partial:
         # The plain walk where `live` is None, else the guarded one, those rows shifting.
@@ -155,7 +163,7 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         elif live is not None:
             start = algebra.headroomed(start, live)
         first, last = steps
-        return jax.lax.fori_loop(first, last, body, start)
+        return algebra.plain_walk(spec, first, last, keys_at, start)
 
     if not spec.headroom:
         return walk()
@@ -213,14 +221,15 @@ def _first_slice_sink(sinks_ref) -> jax.Array | None:
 def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, spec: algebra.Forward, splits: int,
             interpret: bool, sinks: bool):
     sinks_ref, out_refs = (refs[0], refs[1:]) if sinks else (None, refs)
+    block = step_keys(value_ref.dtype)
 
     def read(step):
-        keys = pl.ds(step * BLOCK, BLOCK)
+        keys = pl.ds(step * block, block)
         return key_ref[keys, :], value_ref[keys, :]
 
     span = spans_ref[0], spans_ref[1]
-    steps = _slice(span, BLOCK, pl.program_id(2), splits)
-    _write(out_refs, spec, _attend(query_ref[...], span, read, BLOCK, spec, steps, interpret,
+    steps = _slice(span, block, pl.program_id(2), splits)
+    _write(out_refs, spec, _attend(query_ref[...], span, read, block, spec, steps, interpret,
                                    _first_slice_sink(sinks_ref)))
 
 
@@ -364,7 +373,8 @@ class DecodeAttention(tuning.KernelOp):
         """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop, and
         the GPU's multiprocessors."""
         query = ba.arguments['query']
-        return (_rows(query) * query.shape[2], pl.cdiv(ba.arguments['key'].shape[1], BLOCK),
+        return (_rows(query) * query.shape[2],
+                pl.cdiv(ba.arguments['key'].shape[1], step_keys(ba.arguments['value'].dtype)),
                 gpu_target().multiprocessors)
 
 
@@ -392,7 +402,7 @@ class PagedDecodeAttention(tuning.KernelOp):
 
         rows, kv_heads, _, width = query.shape
         count, page_size = key_pages.shape[1:3]
-        splits, pages = config.splits, BLOCK // page_size
+        splits, pages = config.splits, max(step_keys(value_pages.dtype) // page_size, 1)
         pooled = pl.BlockSpec((None, count, page_size, width), lambda row, head, split: (head, 0, 0, 0))
         queried = pl.BlockSpec((None, None, QUERIES, width), lambda row, head, split: (row, head, 0, 0))
         summed = pl.BlockSpec((None, None, None, QUERIES, width),
@@ -430,9 +440,9 @@ class PagedDecodeAttention(tuning.KernelOp):
     @staticmethod
     def _launch(ba) -> tuple[int, int, int | None]:
         """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop over
-        its table, `BLOCK` keys a step, and the GPU's multiprocessors."""
-        query = ba.arguments['query']
-        steps = pl.cdiv(ba.arguments['table'].shape[1], BLOCK // ba.arguments['key_pages'].shape[2])
+        its table, `step_keys` a step, and the GPU's multiprocessors."""
+        query, pages = ba.arguments['query'], ba.arguments['value_pages']
+        steps = pl.cdiv(ba.arguments['table'].shape[1], max(step_keys(pages.dtype) // pages.shape[2], 1))
         return _rows(query) * query.shape[1], steps, gpu_target().multiprocessors
 
 
