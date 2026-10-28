@@ -76,9 +76,16 @@ def store_version(metadata: Mapping[str, object]) -> str | None:
     object it opens is still at it (`Store.committed`)."""
     for key in ("generation", "VersionId", "ETag", "etag"):
         value = metadata.get(key)
-        if value not in (None, ""):
+        # A bucket whose versioning is suspended names every object's one version "null", which a
+        # replacement keeps: no version, and the ETag stands for it.
+        if value not in (None, "") and not (key == "VersionId" and value == "null"):
             return f"{key.lower()}:{str(value).strip(chr(34))}"
     return None
+
+
+_CHECKED: set[tuple[int, str, str, str]] = set()
+"""The committed objects each process has checked at their store's version (`Store.committed`), by the
+process, the object's URL, its storage options and the version: an object is asked once a process."""
 
 
 def matching(found: ObjectInfo, expected: Mapping[str, object], url: str) -> None:
@@ -485,37 +492,66 @@ class Store:
 
     def committed(self, entry: Mapping[str, object] | None) -> CommittedRead:
         """Where this object's bytes are read as `entry` committed them (an export's manifest entry: its
-        bytes, its sha256, and the store's version where its writer read one, `store_version`): in place
-        where it is this host's disk, this process's memory or a Hub commit's file, which no other writer
-        replaces, or where `entry` states nothing; in place, checked at this open, as the store states it
-        now and not as a listing cached it, against the store's version it was committed
-        at, where `entry` holds one; its copy in the transport's mirror, checked whole against the
-        sha256 as it downloads (`BoundedFileCache`), where `entry` holds a sha256 alone, and refused
-        where the mirror cannot hold it, since a stream read unchecked could read an object replaced
-        since it was committed."""
+        bytes, its sha256, and the store's version where its writer read one, `store_version`), for a
+        reader that takes a path: in place where it is this host's disk, this process's memory or a Hub
+        commit's file, which no other writer replaces, or where `entry` states nothing; in place,
+        checked against the store's version it was committed at (`_check`), where `entry` holds one
+        and no transport cache serves it; its copy in the transport's mirror, checked whole against the
+        sha256 as it downloads (`BoundedFileCache`), otherwise, refused where the mirror cannot hold it,
+        since a stream read unchecked could read an object replaced since it was committed. Hold the
+        pin while the copy is read; `open_committed` opens the bytes themselves."""
         place = self.readable()
         if entry is None or local(place.fs) or in_memory(place.fs) or self._immutable(place):
             return CommittedRead(place, None)
-        version = entry.get("version")
-        if isinstance(version, str):
-            place.fs.invalidate_cache(place.path)
-            live = store_version(place.fs.info(place.path))
-            if live != version:
-                raise OSError(f"{self.url} changed since it was committed: the store states its version "
-                              f"is {live}, committed {version}")
+        version, digest, size = entry.get("version"), entry.get("sha256"), entry.get("bytes")
+        caching = place.fs if isinstance(place.fs, CachingFileSystem) else None
+        if isinstance(version, str) and caching is None:
+            self._check(place, version)
             return CommittedRead(place, None)
-        digest = entry.get("sha256")
-        if not isinstance(digest, str):
+        if not isinstance(digest, str) or not isinstance(size, int):
+            if isinstance(version, str) and caching is not None:
+                # A transport cache keeps its own copy, which the version does not name: read past it.
+                target = Readable(caching.fs, place.path, None)
+                self._check(target, version)
+                return CommittedRead(target, None)
             return CommittedRead(place, None)
+        pin = self._mirrored(digest, size)
+        return CommittedRead(Readable(LocalFileSystem(), pin.name, None), pin)
+
+    def open_committed(self, entry: Mapping[str, object] | None) -> BinaryIO:
+        """This object's bytes, opened as `entry` committed them (`committed`): a mirrored copy's pin
+        is the file itself, released as it closes."""
+        read = self.committed(entry)
+        if read.pin is not None:
+            return read.pin
+        return read.readable.fs.open(read.readable.path, "rb")
+
+    def _check(self, place: Readable, version: str) -> None:
+        """Refuse this object where its store states another version than `version`, as the store
+        answers now and not as a listing cached it; asked once a process (`_CHECKED`)."""
+        key = (os.getpid(), self.url, json.dumps(self.storage_options or {}, sort_keys=True, default=str),
+               version)
+        if key in _CHECKED:
+            return
+        place.fs.invalidate_cache(place.path)
+        live = store_version(place.fs.info(place.path))
+        if live != version:
+            raise OSError(f"{self.url} changed since it was committed: the store states its version is "
+                          f"{live}, committed {version}")
+        _CHECKED.add(key)
+
+    def _mirrored(self, digest: str, size: int) -> io.BufferedReader:
+        """This object's copy in the transport's mirror, checked whole against `digest` as it
+        downloads, pinned while the returned file is open; refused where the mirror cannot hold it."""
         fs, path = self.cached().resolve()
-        pin = fs.open(path, "rb", source_snapshot={"sha256": digest, "size": entry["bytes"]})
+        pin = fs.open(path, "rb", source_snapshot={"sha256": digest, "size": size})
         if not isinstance(pin, io.BufferedReader) or not isinstance(pin.name, str):
             pin.close()
-            raise OSError(f"{self.url} is committed by its sha256 alone, which only its whole copy in the "
+            raise OSError(f"{self.url} is committed by its sha256, which only its whole copy in the "
                           "transport's mirror checks, and the mirror has no room for it: raise the mirror's "
                           "max_bytes (the dewcache storage option, Cache's mirror_bytes), or export it again "
                           "through Dew, which records the store's version")
-        return CommittedRead(Readable(LocalFileSystem(), pin.name, None), pin)
+        return pin
 
     @staticmethod
     def _immutable(place: Readable) -> bool:

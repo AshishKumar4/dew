@@ -131,16 +131,14 @@ class ArrayRecords:
     def reader(self):
         paths = []
         for url in self.urls:
-            store = Store(url, self.storage_options)
-            fs, path = store.resolve()
-            if local(fs):
-                paths.append(path)
-                continue
             # A committed version checked as the shard opens; a sha256 alone, its checked mirrored copy.
-            read = store.committed(self.committed.get(url))
+            read = Store(url, self.storage_options).committed(self.committed.get(url))
+            fs, path, _ = read.readable
             if read.pin is not None:
                 self._pins.append(read.pin)
-                paths.append(read.readable.path)
+                paths.append(path)
+            elif local(fs):
+                paths.append(path)
             elif on_gcs(fs):
                 paths.append("gs://" + path)
             else:

@@ -357,9 +357,10 @@ def test_a_csv_field_past_pythons_limit_reads_by_the_limit_its_caller_sets(tmp_p
 def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(trickled):
     """A server that sends its headers or its body a byte every tenth of a second holds a fetch
     no longer than its timeout: the attempt is dropped as transient at its deadline, not before it,
-    while the server still has bytes to send, where it once read on byte by byte, each byte inside
-    the socket's timeout, to the response's end (row 1947: the end is the deadline's, not a wall-clock
-    bound's)."""
+    and before the server has sent half of its six-second response, where it once read on byte by
+    byte, each byte inside the socket's timeout, to the response's end. The server's own bytes are the
+    clock that bounds the end (row 1947): a loaded host slows them as it slows the fetch, where a
+    wall-clock bound failed a loaded fetch, and a deadline of three seconds or more would pass half."""
     import http.server
     import time
 
@@ -397,8 +398,8 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
         server.server_close()
     assert isinstance(fetched, Rejected) and not fetched.permanent
     # Its deadline, set after `began` by at least the hop onto the IO loop, longer than the clock's
-    # resolution a timer may fire early by, has passed; the response, six seconds long, has not ended.
-    assert waited >= 1.0 and unsent > 0
+    # resolution a timer may fire early by, has passed; the server has sent less than half.
+    assert waited >= 1.0 and unsent > total // 2
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():

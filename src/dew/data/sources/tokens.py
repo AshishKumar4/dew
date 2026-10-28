@@ -52,12 +52,15 @@ class TokenRecords:
     field: str
     eos_id: int | None = None
     storage_options: Mapping[str, object] | None = None
+    committed: Mapping[str, Mapping[str, object]] | None = None
+    """Each shard's committed entry, by its URL, which its reader reads it as (`Store.committed`)."""
 
     @cached_property
     def records(self):
         from .records import ArrayRecords
 
-        return ArrayRecords(self.paths, self.storage_options, counts=self.documents.counts)
+        return ArrayRecords(self.paths, self.storage_options, counts=self.documents.counts,
+                            committed=self.committed)
 
     @cached_property
     def documents(self) -> Ranges:
@@ -179,6 +182,7 @@ class TokenFiles(Dataset):
         root = Store(self.url, self.storage_options)
         indexes = []
         paths = []
+        shards: dict[str, Mapping[str, object]] = {}
         entries = committed["files"]
         if not isinstance(entries, list):
             raise ValueError("token export files must be a list")
@@ -194,9 +198,10 @@ class TokenFiles(Dataset):
                 raise ValueError("token export index needs length and cumulative end columns")
             indexes.append(index)
             paths.append(root.child(entry["path"]).url)
+            shards[paths[-1]] = entry
         # The field of each record that holds its tokens, "text" where the export names none.
         return TokenRecords(tuple(paths), tuple(indexes), str(self.meta.get("dtype", "int32")),
-                            self.field or "text", eos, self.storage_options)
+                            self.field or "text", eos, self.storage_options, shards)
 
     def stated(self) -> Mapping[str, object]:
         """What the store's manifest says of its tokens, none of them read (`Dataset.facts`): their

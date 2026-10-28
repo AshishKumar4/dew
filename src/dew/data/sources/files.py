@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import hashlib
 import io
 import itertools
 import json
 import math
-import os
 import posixpath
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -91,6 +91,58 @@ def _inferred(url: str) -> Format | None:
     return next((kind for kind, suffixes in _SUFFIXES.items() if name.endswith(suffixes)), None)
 
 
+class _CommittedFiles(pafs.FileSystemHandler):
+    """Arrow's view of committed files: each opened by the path Arrow knows it by, so partitions are
+    discovered from the files' own directories, as its entry committed it (`Store.committed`), in the
+    process that opens it: checked against the store's version, then read through `inner` (Arrow's own
+    client), or read from its copy in the transport's mirror, checked whole against its sha256. Every
+    other call is `inner`'s."""
+
+    def __init__(self, inner: pafs.FileSystem, files: Mapping[str, tuple[str, Mapping[str, object] | None,
+                                                                         Mapping[str, object]]]):
+        self.inner, self.files = inner, dict(files)
+
+    def __eq__(self, other: pafs.FileSystemHandler) -> bool:
+        return (isinstance(other, _CommittedFiles) and self.inner.equals(other.inner)
+                and self.files == other.files)
+
+    def __ne__(self, other: pafs.FileSystemHandler) -> bool:
+        return not self == other
+
+    def get_type_name(self) -> str:
+        return f"dew-committed-{self.inner.type_name}"
+
+    def normalize_path(self, path: str) -> str:
+        return self.inner.normalize_path(path)
+
+    def get_file_info(self, paths):
+        return self.inner.get_file_info(paths)
+
+    def get_file_info_selector(self, selector):
+        return self.inner.get_file_info(selector)
+
+    def _committed(self, path: str):
+        """The file at `path` as Arrow reads it: through `inner` once its version is checked, else its
+        checked mirrored copy; `inner`'s own where no entry commits it."""
+        if path not in self.files:
+            return None
+        url, options, entry = self.files[path]
+        read = Store(url, options).committed(entry)
+        return None if read.pin is None else pa.PythonFile(read.pin, mode="r")
+
+    def open_input_file(self, path: str):
+        return self._committed(path) or self.inner.open_input_file(path)
+
+    def open_input_stream(self, path: str):
+        return self._committed(path) or self.inner.open_input_stream(path)
+
+    def _writes(self, *args, **options):
+        raise OSError("committed files are read, never written")
+
+    create_dir = delete_dir = delete_dir_contents = delete_root_dir_contents = delete_file = _writes
+    move = copy_file = open_output_stream = open_append_stream = _writes
+
+
 def _arrow_filesystem(fs: AbstractFileSystem) -> pafs.FileSystem:
     """Arrow's filesystem over `fs`: Arrow's own S3 or GCS client where it
     carries every setting `fs` reads with (`_native_s3`, `_native_gcs`), as
@@ -159,7 +211,8 @@ def export_place(path: str) -> str:
 def export_content(committed: Mapping[str, object]) -> Mapping[str, object]:
     """A committed export's manifest with each file where it is placed (`export_place`), not where
     its writer put it, so two exports of the same rows hold the same content, which the manifest's
-    order, places, sizes and hashes say alike."""
+    order, places, sizes and hashes say alike; a file's store version, which names a write and not
+    its bytes, is left out."""
     files = committed.get("files")
     if not isinstance(files, list) or not all(isinstance(entry, Mapping) for entry in files):
         raise ValueError("export manifest files must be a list of file entries")
@@ -168,7 +221,7 @@ def export_content(committed: Mapping[str, object]) -> Mapping[str, object]:
         """`entry` with its path, and its length index's, where the export places them."""
         return {key: (export_place(fact) if key == "path" and isinstance(fact, str)
                       else placed(fact) if key == "lengths" and isinstance(fact, Mapping) else fact)
-                for key, fact in entry.items()}
+                for key, fact in entry.items() if key != "version"}
 
     return {**committed, "files": [placed(entry) for entry in files]}
 
@@ -186,8 +239,10 @@ def _fragment_rows(fragment) -> int:
     return fragment.count_rows()
 
 
-def _open_lines(fs: AbstractFileSystem, path: str):
-    compression = infer_compression(path.lower())
+def _open_lines(fs: AbstractFileSystem, path: str, name: str) -> BinaryIO:
+    """The lines of the file at `path`, decompressed as `name`, its URL wherever its bytes are read
+    from (a mirrored copy's own name says nothing), names its compression."""
+    compression = infer_compression(name.lower())
     if compression == "zstd":
         from zstandard import ZstdDecompressor
 
@@ -240,9 +295,6 @@ _SCAN_BYTES = 1 << 20
 """The bytes a search for a line start reads at a time (`_line_start`), so a record of any length is
 passed over in bounded memory."""
 
-_COMMITTED: dict[tuple[int, str, str | None], CommittedRead] = {}
-"""Each process's committed read of each file it opened (`Files._read_place`), by the process, the file's
-URL and its committed entry: checked once a process, and a mirrored copy pinned for the process."""
 
 
 def _line_start(file: BinaryIO, offset: int, stop: int | None = None) -> int:
@@ -318,16 +370,18 @@ class Files(Dataset):
             Store(str(self.url), self.storage_options).child(entry["path"]).url: entry for entry in entries
         }
 
-    def _read_place(self, url: str) -> Readable:
-        """Where this process reads the file at `url`: as its committed entry names it
-        (`Store.committed`), checked when this process first opens it, and its mirrored copy, where it
-        reads one, held for the process (`_COMMITTED`)."""
-        entry = self.declared.get(url)
-        key = (os.getpid(), url, None if entry is None else json.dumps(entry, sort_keys=True, default=str))
-        held = _COMMITTED.get(key)
-        if held is None:
-            held = _COMMITTED.setdefault(key, Store(url, self.storage_options).committed(entry))
-        return held.readable
+    def _committed(self, url: str) -> CommittedRead:
+        """Where the file at `url` is read as its committed entry names it (`Store.committed`); hold
+        its pin while it is read."""
+        return Store(url, self.storage_options).committed(self.declared.get(url))
+
+    @contextlib.contextmanager
+    def _lines_of(self, url: str) -> Iterator[BinaryIO]:
+        """The lines of the file at `url`, read as its committed entry names it (`_committed`)."""
+        read = self._committed(url)
+        with (contextlib.nullcontext() if read.pin is None else read.pin,
+              _open_lines(read.readable.fs, read.readable.path, url) as file):
+            yield file
 
     def _header(self, url: str) -> Mapping[str, object]:
         if url in self.declared:
@@ -580,7 +634,7 @@ class Files(Dataset):
         preparing(self, sum(fs.size(path) or 0 for fs, path in stores), "an offset index beside each file")
         for url in self.paths:
             fs, path = Store(url, self.storage_options).resolve()
-            with _open_lines(fs, path) as file:
+            with _open_lines(fs, path, url) as file:
                 names = _header(file) if self.kind == "csv" else None
                 offsets = [(0, start, size) for _, start, size in _lines(self.kind, file, names)]
             encoded = io.BytesIO()
@@ -686,13 +740,18 @@ class Files(Dataset):
         partitions are discovered under, so a copy's location adds none: a Hub dataset's files
         read from huggingface_hub's cache where it holds every one, and from the Hub otherwise."""
         stores = [Store(url, self.storage_options) for url in self.paths]
-        located = [self._read_place(url) for url in self.paths]
+        located = [store.readable() for store in stores]
         # Some of a Hub dataset's files in huggingface_hub's cache, on this host's disk, and some not.
         if len({local(place.fs) for place in located}) > 1:
             located = [Readable(*store.resolve(), None) for store in stores]
         filesystem = _arrow_filesystem(located[0].fs)
         paths = tuple(filesystem.normalize_path(place.path) for place in located)
         names = dict(zip(paths, self.paths, strict=True))
+        # Files a manifest commits are opened as it committed them, in whichever process reads them.
+        committed = {path: (url, self.storage_options, self.declared[url]) for path, url in names.items()
+                     if url in self.declared and not local(Store(url, self.storage_options).resolve()[0])}
+        if committed:
+            filesystem = pafs.PyFileSystem(_CommittedFiles(filesystem, committed))
         roots = [place.root for place in located if place.root is not None]
         base = posixpath.commonpath(roots) if len(roots) == len(located) else None
         return filesystem, paths, names, base
@@ -783,8 +842,7 @@ class Files(Dataset):
             if not planned:
                 break
             for number in planned:
-                fs, path, _ = self._read_place(self.paths[number])
-                with _open_lines(fs, path) as file:
+                with self._lines_of(self.paths[number]) as file:
                     starts[number] = _record_starts(file, sizes[number], parts[number], self.kind)
                 if len(starts[number]) < parts[number]:
                     out.add(number)
@@ -1026,8 +1084,7 @@ class _IndexedLines:
     def fieldnames(self) -> tuple[tuple[str, ...], ...]:
         headers = []
         for url in self.source.paths:
-            fs, path, _ = self.source._read_place(url)
-            with _open_lines(fs, path) as file:
+            with self.source._lines_of(url) as file:
                 headers.append(_header(file))
         return tuple(headers)
 
@@ -1038,20 +1095,23 @@ class _IndexedLines:
         group, row = self.ranges.locate(index)
         entry = self.tables[group][row]
         shard = int(entry["shard"]) if self.source.index else group
-        fs, path, _ = self.source._read_place(self.source.paths[shard])
+        url = self.source.paths[shard]
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
         offset = int(entry["offset"])
-        compression = infer_compression(path.lower())
-        if compression is not None:
-            with _open_lines(fs, path) as file:
-                _seek_lines(file, offset)
-                payload = file.read(int(entry["bytes"]))
-        else:
-            payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
+        read = self.source._committed(url)
+        fs, path, _ = read.readable
+        with contextlib.nullcontext() if read.pin is None else read.pin:
+            if infer_compression(url.lower()) is not None:
+                with _open_lines(fs, path, url) as file:
+                    _seek_lines(file, offset)
+                    payload = file.read(int(entry["bytes"]))
+            else:
+                # The record's own bytes, one ranged read.
+                payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
         held = [line for line, _, _ in _lines(self.source.kind, io.BytesIO(payload), names)]
         if len(held) != 1:
             raise ValueError(f"{self.source.describe()}'s index names {len(held)} records, not one, at byte "
-                             f"{offset} of {path}: provision it again")
+                             f"{offset} of {url}: provision it again")
         return _decoded(self.source.kind, held[0])
 
 
@@ -1121,9 +1181,10 @@ class _LineIterator(grain.DatasetIterator):
     def __init__(self, source: Files, shard: Shard):
         super().__init__()
         self.source, self.shard = source, shard
-        self.fs, self.path, _ = source._read_place(shard.uri)
-        self.compression = infer_compression(self.path.lower())
-        self.file = _open_lines(self.fs, self.path)
+        self.compression = infer_compression(shard.uri.lower())
+        # The committed read's pin, where it reads a mirrored copy, held until the reader closes.
+        self.read = source._committed(shard.uri)
+        self.file = _open_lines(self.read.readable.fs, self.read.readable.path, shard.uri)
         self._opened = True
         self.names = _header(self.file) if source.kind == "csv" else None
         if self.names is None and shard.start:
@@ -1152,7 +1213,7 @@ class _LineIterator(grain.DatasetIterator):
         if self.compression is not None:
             # Zstandard streams seek forward only; restoration starts from a fresh decoder.
             self.file.close()
-            self.file = _open_lines(self.fs, self.path)
+            self.file = _open_lines(self.read.readable.fs, self.read.readable.path, self.shard.uri)
         _seek_lines(self.file, offset)
         # The records read on from the restored offset, after a pass that read them all too.
         self.records = _lines(self.source.kind, self.file, self.names, self.shard.stop)
@@ -1160,3 +1221,5 @@ class _LineIterator(grain.DatasetIterator):
     def close(self) -> None:
         if self._opened:
             self.file.close()
+            if self.read.pin is not None:
+                self.read.pin.close()

@@ -120,12 +120,14 @@ def _array_shard(root: Store, writer: str, number: int, batch, index: ObjectRef 
         path = Path(temporary) / "part.array_record"
         write_array_record(path, (encode(row) for row in batch))
         relative = f"shards/{writer}/part-{number:06d}.array_record"
-        return {
-            "path": relative,
-            "rows": len(batch),
-            "lengths": index,
-            **root.child(relative).verified(path.read_bytes()),
-        }
+        shard = root.child(relative)
+        written = shard.verified(path.read_bytes())
+        fs, located = shard.resolve()
+        # The store's own answer, not a listing's, which states no version.
+        fs.invalidate_cache(located)
+        version = store_version(fs.info(located))
+        return {"path": relative, "rows": len(batch), "lengths": index, **written,
+                **({"version": version} if version else {})}
 
 
 @runtime_checkable
