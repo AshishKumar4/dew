@@ -400,7 +400,7 @@ class StatePassing(_Launch):
     def _fwd(self, states: jax.Array, da: jax.Array, h0: jax.Array, seq: jax.Array | None, *, chunk: int,
              dtype: str, interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, chunks, heads, flat = states.shape
-        padded = da.shape[-1]
+        padded = da[0].shape[-1]
         size = config.bm
         rows = pl.BlockSpec((None, chunks, None, size), lambda i, b, h: (b, 0, h, i))
         final = pl.BlockSpec((None, None, size), lambda i, b, h: (b, h, i))
@@ -592,7 +592,7 @@ class ChunkScanBwdDstates(_Launch):
              interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, heads, width = dout.shape
         groups, state = c.shape[2:]
-        padded = da.shape[-1]
+        padded = da[0].shape[-1]
         ratio = heads // groups
         bm, bn = config.bm, config.bn
         columns = state // bn
@@ -656,7 +656,7 @@ class StatePassingBwd(_Launch):
              seq: jax.Array | None, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         batch, chunks, heads, flat = states.shape
-        padded = da.shape[-1]
+        padded = da[0].shape[-1]
         size = config.bm
         rows = pl.BlockSpec((None, chunks, None, size), lambda i, b, h: (b, 0, h, i))
         whole = pl.BlockSpec((None, None, size), lambda i, b, h: (b, h, i))
