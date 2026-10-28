@@ -1485,15 +1485,18 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
             value = _tile(slots, "values", held)
             if call.per_key:
                 local, *gated = staged
+                # The tiles taken before the first step's branch: a slot is the stream's, every step's.
+                queries, halves = ([block(name, operand, c) for c in range(width // call.block)]
+                                   for name, operand in (("queries", call.given), ("gates", gates)))
+                lows = [block("lows", gates, c) for c in range(width // call.block)]
 
                 # Each key block's gated queries staged once, at the first step, for every value block's
                 # product: computed each step, they were live across the walk's steps beside each one's sum.
                 @pl.when(index == 0)
                 def _():
                     for c, tile in enumerate(gated):
-                        decays = tuple(block(name, gates, c).value() for name in ("gates", "lows"))
-                        family.staged(algebra.key_gated(block("queries", call.given, c).value(), decays),
-                                      tile[0])
+                        decays = (halves[c].value(), lows[c].value())
+                        family.staged(algebra.key_gated(queries[c].value(), decays), tile[0])
 
                 out = algebra.key_decayed_output(
                     lambda c: _Parts(gated[c], call.given.dtype), entered, width // call.block,
