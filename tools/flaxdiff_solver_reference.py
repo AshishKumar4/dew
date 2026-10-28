@@ -13,19 +13,33 @@ The model is a stand-in denoiser of (x, sigma), the same function on both
 sides, so what is compared is the samplers' stages and history and the
 schedule they read sigma and time through. Each sampler walks FlaxDiff's own
 grid (`get_steps(1, 0, STEPS)`) from x_T as `generate_samples` walks it,
-every interval but the closing denoise. What lands: the grid, x_T, a
-cotangent, and per sampler the latent after every interval and the
-vector-Jacobian product of the last one through the whole walk, in float32
-and in float64.
+every interval but the closing denoise, and `generate_samples` itself walks
+it with the closing denoise, its output before and through the clip to
+[-1, 1] of the pipeline's `post_process`. What lands, over the seeds check 1
+draws (`record_case`, tools/recorded_references.py), per sampler: the
+latent after every interval and the vector-Jacobian product of the last one
+through the whole walk (`<sampler> walk`), and the closing output unclipped
+and clipped (`<sampler> closed`), as published in float32 and by its float64
+twin, summarized (each leaf's error from its truth and its truth's sketch,
+`record_case`'s summary), and FlaxDiff's grid. Each draw walks its own
+grid, FlaxDiff's with every point moved within JITTER of a spacing, given to
+the samplers as `generate_samples` takes a grid it is given
+(`steps_override`). The float64 twin widens every
+`jnp.float32` of the schedule and the sampler's common steps, each a dtype
+argument or cast at the pinned commit (schedulers/common.py:18, a dtype
+default; karras.py:49, an astype, and :71, a random draw's dtype the walk
+does not make; samplers/common.py:144 and :206, the step array's dtype), so
+its sigma arithmetic runs in float64 on the float32 grid's own times. A
+seed's inputs, x_T, the cotangent and the grid, are a seeded NumPy draw
+(`draw`) the test makes again.
 
     python tools/flaxdiff_solver_reference.py
-    python tools/flaxdiff_solver_reference.py rounding tests/fixtures/flaxdiff_solvers/rounding.npz 4
 """
 
 from __future__ import annotations
 
 import ast
-import sys
+import functools
 import types
 from pathlib import Path
 
@@ -35,12 +49,17 @@ import numpy as np
 from flax import struct
 from reference_source import fetched, ran, selected
 
-jax.config.update("jax_enable_x64", val=True)
-
 COMMIT = "15c55b001304604147a2a8002a76cf5d4c32092f"
 FLAXDIFF = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{COMMIT}/flaxdiff/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flaxdiff_solvers" / "solvers.npz"
 STEPS, SIGMA_MAX, RHO, SIGMA_DATA = 12, 80.0, 7.0, 0.5
+SHAPE = (32, 64)
+JITTER = 0.01
+"""How far a draw moves each point of the grid, in its spacings. A walk's rounding is dominated by the
+sigmas its grid fixes, which both sides compute by one formula: on one grid each side rounds each of them
+once, a coin flip no count of draws resolves (RK4's latent after its fourth interval at a pooled 1.59 times
+FlaxDiff's over 80 draws of one grid, each interval alone at 0.92 to 1.05 of it, armada 10-28). Each draw
+rounds its own grid's."""
 SAMPLERS = {"rk4": ("rk4_sampler.py", "RK4Sampler"), "multistep": ("multistep_dpm.py", "MultiStepDPM")}
 
 
@@ -111,9 +130,9 @@ def walk(scope: dict, name: str, x_T, steps):
     return jnp.stack(latents)
 
 
-def closed(scope: dict, name: str, x_T, steps: int, clipped: bool):
-    """`generate_samples` as written from `x_T` (its `priors`) over
-    `get_steps(1, 0, steps)`: every interval but the last grid point, then
+def closed(scope: dict, name: str, x_T, steps, clipped: bool):
+    """`generate_samples` as written from `x_T` (its `priors`) over the
+    grid `steps` (its `steps_override`): every interval but the last grid point, then
     the clean prediction there. The instance holds what the published
     constructor would have bound: the stand-in as `sample_model`, no
     autoencoder and no conditions, and `post_process`, with no autoencoder
@@ -123,65 +142,87 @@ def closed(scope: dict, name: str, x_T, steps: int, clipped: bool):
     sampler.sample_model = lambda params, x_t, t: model(x_t, t)
     sampler.post_process = scope["clip_images"] if clipped else (lambda samples: samples)
     sampler.autoencoder = sampler.input_config = None
-    return sampler.generate_samples(None, x_T.shape[0], x_T.shape[1], diffusion_steps=steps, priors=x_T)
+    return sampler.generate_samples(None, x_T.shape[0], x_T.shape[1], diffusion_steps=STEPS, priors=x_T,
+                                    steps_override=steps)
 
 
-def rounding(destination: Path, copies: int) -> None:
-    """RK4's clipped output over independent initial states.
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's inputs: x_T, standard normals at the schedule's top sigma, the cotangent the last
+    latent is pulled back by, and its grid, FlaxDiff's with each point moved within JITTER of a spacing
+    and both ends kept inside [0, 1]."""
+    generator = np.random.default_rng([0xF1, seed])
+    shift = JITTER / (STEPS - 1) * generator.uniform(-1, 1, STEPS)
+    shift[0], shift[-1] = -abs(shift[0]), abs(shift[-1])
+    return {"x_T": (generator.standard_normal(SHAPE) * SIGMA_MAX).astype(np.float32),
+            "cotangent": generator.standard_normal(SHAPE).astype(np.float32),
+            "times": (np.linspace(1.0, 0.0, STEPS) + shift).astype(np.float32)}
 
-    Its denoiser and stages are pointwise, so permutations repeat the same
-    rounding draw. More independent states average their per-input variance
-    without changing the reference rule. The float64 namespace widens the
-    source's explicit float32 timestep casts as well as the input; otherwise
-    its sigma calculations retain float32 roundings in the oracle. Every
-    `jnp.float32` the widening replaces is a dtype argument or cast:
-    schedulers/common.py:18 (a dtype default), karras.py:49 (astype) and :71
-    (a random draw's dtype, unused by the walk), samplers/common.py:144 and
-    :206 (the step array's dtype), at the pinned commit.
-    """
-    generator = np.random.default_rng(4)
-    initial = (generator.standard_normal((32 * copies, 64)) * SIGMA_MAX).astype(np.float32)
-    single = closed(published(), "rk4", jnp.asarray(initial), STEPS, clipped=True)
-    truth = closed(published(wide=True), "rk4", jnp.asarray(initial, jnp.float64), STEPS, clipped=True)
-    np.savez_compressed(destination, copies=np.asarray(copies), x_T=initial,
-                        clipped=np.asarray(single), clipped_f64=np.asarray(truth))
-    print(f"{destination}: {copies} independent initial states per original entry")
+
+def runs(name: str, dtype) -> dict:
+    """Sampler `name` as published in `dtype` (float64 widened, `published`), compiled over a draw's
+    grid: its walk's latent after every interval and the last one's pullback of the cotangent, and its
+    closing output before and through the clip."""
+    scope = published(wide=dtype == jnp.float64)
+
+    @jax.jit
+    def walked(x_T, cotangent, steps):
+        latents = walk(scope, name, x_T, steps)
+        (gradient,) = jax.vjp(lambda x: walk(scope, name, x, steps)[-1], x_T)[1](cotangent)
+        return {**{f"after {index}": latent for index, latent in enumerate(latents)}, "gradient": gradient}
+
+    @jax.jit
+    def closing(x_T, cotangent, steps):
+        return {label: closed(scope, name, x_T, steps, clipped) for clipped, label in
+                ((False, "closed"), (True, "clipped"))}
+
+    return {"walk": walked, "closed": closing}
+
+
+def evaluated(inputs, compiled, part: str):
+    """`part` of a seed's float32 run and its float64 twin's, each leaf checked to be its run's dtype."""
+    results = []
+    for dtype in (jnp.float32, jnp.float64):
+        drawn = (jnp.asarray(inputs[key], dtype) for key in ("x_T", "cotangent", "times"))
+        result = compiled[dtype][part](*drawn)
+        assert all(leaf.dtype == dtype for leaf in result.values()), (part, dtype)
+        results.append(jax.tree.map(np.asarray, result))
+    return tuple(results)
+
+
+def float32_arm(fn):
+    """Dew's arm `fn` compiled and run with x64 off, as the test runs it beside this process's float64
+    twin."""
+    compiled = jax.jit(fn)
+
+    def run(inputs):
+        with jax.enable_x64(new_val=False):
+            return jax.tree.map(np.asarray, compiled(inputs))
+
+    return run
 
 
 def main() -> None:
-    scope = published()
-    grid = scope["KarrasVENoiseScheduler"](timesteps=1.0)
-    steps32 = jnp.linspace(1.0, 0.0, STEPS, dtype=jnp.float32)
-    generator = np.random.default_rng(4)
-    arrays = {"commit": np.array(COMMIT), "times": np.asarray(steps32),
-              "x_T": (generator.standard_normal((32, 64)) * SIGMA_MAX).astype(np.float32),
-              "cotangent": generator.standard_normal((32, 64)).astype(np.float32)}
-    assert grid.max_timesteps == 1.0
-    for name in SAMPLERS:
-        for dtype, tail in ((jnp.float32, ""), (jnp.float64, "_f64")):
-            x_T = jnp.asarray(arrays["x_T"], dtype)
-            steps = jnp.asarray(steps32, dtype)
+    # Set here, not on import: the test loads this file for `draw` alone.
+    jax.config.update("jax_enable_x64", val=True)
+    from recorded_references import provenance, record_case, save
+    from test_samplers import flaxdiff_closed, flaxdiff_walked
 
-            def final(x_T, name=name, steps=steps):
-                return walk(scope, name, x_T, steps)[-1]
+    from dew.sampling import RK4, MultiStepDPM
 
-            latents = walk(scope, name, x_T, steps)
-            _, pullback = jax.vjp(final, x_T)
-            (gradient,) = pullback(jnp.asarray(arrays["cotangent"], dtype))
-            assert latents.dtype == dtype and gradient.dtype == dtype, (name, latents.dtype)
-            arrays[f"{name}/latents{tail}"] = np.asarray(latents)
-            arrays[f"{name}/grad{tail}"] = np.asarray(gradient)
-            for clipped, label in ((False, "closed"), (True, "clipped")):
-                closing = closed(scope, name, x_T, STEPS, clipped)
-                assert closing.dtype == dtype, closing.dtype
-                arrays[f"{name}/{label}{tail}"] = np.asarray(closing)
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
-    print(f"{FIXTURE}: {sorted(arrays)}")
+    assert published()["KarrasVENoiseScheduler"](timesteps=1.0).max_timesteps == 1.0
+    arrays = {"times": np.asarray(jnp.linspace(1.0, 0.0, STEPS, dtype=jnp.float32))}
+    for name, solver in (("rk4", RK4()), ("multistep", MultiStepDPM())):
+        compiled = {dtype: runs(name, dtype) for dtype in (jnp.float32, jnp.float64)}
+        for part, dew in (("walk", flaxdiff_walked(solver)), ("closed", flaxdiff_closed(solver))):
+            # Sized paired, as check 1 judges: a draw's grid moves both sides' roundings alike.
+            arrays.update(record_case(f"{name} {part}", draw,
+                                      functools.partial(evaluated, compiled=compiled, part=part),
+                                      store_inputs=False, summary=True, dew=float32_arm(dew)))
+    written = save(FIXTURE, {**arrays, "provenance": provenance(
+        "AshishKumar4/FlaxDiff", COMMIT, "cpu", "python tools/flaxdiff_solver_reference.py")},
+        reference=f"AshishKumar4/FlaxDiff {COMMIT}", license="MIT")
+    print(f"{written}: {sorted(arrays)}")
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["rounding"]:
-        rounding(Path(sys.argv[2]), int(sys.argv[3]))
-    else:
-        main()
+    main()
