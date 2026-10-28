@@ -125,7 +125,7 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import GROUPS, KVCache, is_paged, leaf_name
+from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.visibility import with_served_blocks
@@ -567,6 +567,9 @@ class Server:
             self.group_fields = frozenset(name for name, leaf in GROUPS.items() if leaf in held)
             """The group fields some layer reads whole (`dew.nn.kv_cache.GROUPS`), whose groups its cache
             keeps beside the keys: the ones a served prompt's slot beside its tokens."""
+            self.keyed = ROUNDING_KEYS in held
+            """Whether a layer's decode cache holds its rows' rounding keys (`dew.nn.kv_cache.ROUNDING_KEYS`),
+            so a prompt's state follows its request's key, which then names its prefix too (`_prepared`)."""
             # None selects the one mixed forward of `_mixed_step`.
             self.mixed_refusal = mixed_refusal(model, shapes, rows.placement)
             """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
@@ -845,8 +848,13 @@ class Server:
         groups = {name: np.asarray(fields[name])[0][valid[0]].astype(np.int32)
                   for name in GROUPS if name in fields and name in self.group_fields}
         salt = b""
-        if context is not None or groups:
+        if context is not None or groups or self.keyed:
             hasher = hashlib.blake2b(digest_size=16)
+            if self.keyed:
+                # A cached memory rounds by the request's own key (`dew.nn.kv_cache.ROUNDING_KEYS`), so the
+                # state after a prefix is that key's: the prefix is shared only under one key.
+                hasher.update(b"seed" if isinstance(seed, int) else b"key")
+                hasher.update(np.asarray(seed).tobytes() + np.int64(fold).tobytes())
             if context is not None:
                 # The context's dtype too, so equal bytes of another dtype salt apart.
                 array_fingerprint(hasher, np.asarray(context))
