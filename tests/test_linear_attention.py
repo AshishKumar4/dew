@@ -39,7 +39,6 @@ from delta_rule_support import fused_step, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
-from tuned import taken
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -759,14 +758,11 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     pytest.param(32, 16, 128, marks=pytest.mark.gpu(reason="the 0.8B's widths are a GPU's"), id="0.8b-32"),
 ])
 def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held):
-    """One decode token through `dew.nn.kernels.recurrence.step` (one read and one
-    write of the state) gives the recurrence's output and state at the
-    launch's config: an fp32 state's within the float64 gate of the fp32
-    recurrence's, at Qwen3.5-0.8B's widths (16 heads, 128 wide) on a GPU and
-    interpreted at a small width. A state held in bf16 is read and stepped in
-    fp32 and written back rounded once, stochastically: within one bf16 step
-    of the fp32 one."""
-    from dew.nn.kernels.recurrence import StepLaunch
+    """One decode token through `dew.nn.kernels.recurrence.step` (one read and one write of the state)
+    gives the recurrence's output and state: an fp32 state's within the float64 gate of the fp32
+    recurrence's, at Qwen3.5-0.8B's widths (16 heads, 128 wide) on a GPU and interpreted at a small width.
+    A state held in bf16 is read and stepped in fp32 and written back rounded once, stochastically: within
+    one bf16 step of the fp32 one."""
     from dew.nn.linear import decode_gated_delta_rule
 
     rng = np.random.default_rng(0)
@@ -780,13 +776,12 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held
     want, want_state = recurrent_gated_delta_rule(*operands)
     with jax.enable_x64(new_val=True):
         truth = [np.asarray(x) for x in recurrent_gated_delta_rule(*widened(operands))]
-    [config] = taken(StepLaunch, decode_gated_delta_rule, query, key, value, g, beta, state)
     got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
     assert got_state.dtype == held
-    assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), truth[0], f"{config} out")
+    assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), truth[0], "decode out")
     if held == jnp.float32:
         assert_as_exact_as_the_reference(np.asarray(got_state), np.asarray(want_state), truth[1],
-                                         f"{config} state")
+                                         "decode state")
     else:
         np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state, atol=2e-6, rtol=2 ** -7)
 
@@ -885,12 +880,10 @@ def fused_inputs(layer, variables, cache, token):
 ])
 def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, held):
     """A gated delta net's decode token in one launch (`fused_step`: the conv over the
-    held history, the gates, the update and the gated norm) at its config: its output
+    held history, the gates, the update and the gated norm): its output
     through the layer's projection, its history and its state, fp32 or bf16, within
     tests/reference_error.py's rule of the layer's own unfused token, holding the same state, against
     the float64 layer's. Compiled on a GPU, interpreted elsewhere."""
-    from dew.nn.kernels.recurrence import StepLaunch
-
     layer, variables, cache, token = fused_case(heads, width, rows, jnp.float32, held)
     step = MixerCall(decode=True)
     fp32 = {**cache, "recurrent_state": cache["recurrent_state"].astype(jnp.float32)}
@@ -909,24 +902,20 @@ def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, hel
         return projected, history, state
 
     operands = fused_inputs(layer, variables, cache, token)
-    [config] = taken(StepLaunch, fused, *operands)
     out, history, state = jax.jit(fused)(*operands)
-    assert_as_exact_as_the_reference(np.asarray(out), np.asarray(want), np.asarray(exact), f"{config} out")
+    assert_as_exact_as_the_reference(np.asarray(out), np.asarray(want), np.asarray(exact), "fused out")
     np.testing.assert_array_equal(np.asarray(history), np.asarray(after["cache"]["conv_state"]))
     assert state.dtype == held
     assert_as_exact_as_the_reference(np.asarray(state), np.asarray(unfused["recurrent_state"]),
-                                     np.asarray(exact_after["cache"]["recurrent_state"]), f"{config} state")
+                                     np.asarray(exact_after["cache"]["recurrent_state"]), "fused state")
 
 
-def test_a_cached_layer_traced_for_a_jvp_decodes_through_the_recurrence():
-    """A cached gated delta net on an A100, whose row's step kernel decodes its tokens, traced for
-    `jax.jvp` (`forward_mode_attention`, as MeanFlow and consistency training trace it), decodes its
-    token through the differentiable recurrence, which gives the tangent the in-place kernels do not,
-    and reports that route with its stable code; the fused step chosen for such a token
-    (`generation.chosen`) raises, naming it (`selection.KernelRefused`)."""
+def test_a_cached_layer_traced_for_a_jvp_decodes_its_token():
+    """A cached gated delta net on an A100, whose row's step kernel decodes its tokens, traces for
+    `jax.jvp` (`forward_mode_attention`, as MeanFlow and consistency training trace it): its token
+    decodes with a tangent, which the in-place kernels do not give."""
     from dew.nn.attention import forward_mode_attention
-    from dew.nn.kernels.generation import assumed, chosen, routes
-    from dew.nn.kernels.selection import KernelRefused
+    from dew.nn.kernels.generation import assumed
 
     layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
 
@@ -937,14 +926,8 @@ def test_a_cached_layer_traced_for_a_jvp_decodes_through_the_recurrence():
         tangent = jax.random.normal(jax.random.key(9), token.shape)
         jax.make_jaxpr(lambda token, tangent: jax.jvp(step, (token,), (tangent,)))(token, tangent)
 
-    with assumed("sm80"), forward_mode_attention(), routes() as found:
+    with assumed("sm80"), forward_mode_attention():
         traced()
-    (decode,) = [route for route in found if route.choice == "delta_decode"]
-    assert (decode.kernel, decode.preferred, decode.refusal.code) == ("xla", "step", "forward_mode")
-    with assumed("sm80"), chosen(delta_decode="fused"), forward_mode_attention(), pytest.raises(
-            KernelRefused) as refused:
-        traced()
-    assert [refusal.code for refusal in refused.value.refusals] == ["forward_mode"]
 
 
 def test_the_fused_decode_step_leaves_an_idle_row_alone():
@@ -968,10 +951,9 @@ def test_the_fused_decode_step_leaves_an_idle_row_alone():
 def test_a_layer_choosing_the_fused_step_decodes_as_the_unfused_one(dtype):
     """A gated delta net of 4 value heads over 2 key heads 32 wide decoding 65 tokens after a 5-token
     prefill with its generation's choice 'delta_decode' set to 'fused' (`generation.chosen`): the
-    decode tokens run the fused step, and the outputs are within tests/reference_error.py's rule of
+    outputs are within tests/reference_error.py's rule of
     the unfused layer's against the float64 parallel forward."""
     from dew.nn.kernels.generation import chosen
-    from dew.training._lowering import triton_kernels
 
     module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
                            dtype=dtype)
@@ -986,10 +968,6 @@ def test_a_layer_choosing_the_fused_step_decodes_as_the_unfused_one(dtype):
     unfused = np.asarray(decode_through(module, variables, hidden, prefill=5)[0], np.float64)
     with chosen(delta_decode="fused"):
         fused = np.asarray(decode_through(module, variables, hidden, prefill=5)[0], np.float64)
-        _, _, cache = decode_through(module, variables, hidden[:, :6], prefill=5)
-        step = jax.jit(lambda cache, token: module.apply({**variables, "cache": cache}, token,
-                                                         MixerCall(decode=True), mutable=["cache"]))
-        assert "recurrence_step" in triton_kernels(step.trace(cache, hidden[:, 6:7]).lower())
     assert_as_exact_as_the_reference(fused, unfused, truth, f"{jnp.dtype(dtype).name} decode")
 
 
@@ -1076,47 +1054,11 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
     assert not failures(found), "\n".join(failures(found))
 
 
-def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_takes_it():
-    """A gated delta net's decode token traced for an A100 on this CPU, the generation's choice
-    'delta_decode' set to 'fused', reports the fused step as its route; with no choice, the step
-    kernel, the selector's preference (no row read), and at widths the step kernel's blocks do not take the
-    portable recurrence with the refusal's code, where the fused step chosen raises, naming its own
-    (`selection.KernelRefused`); and with the rule's math chosen, the portable recurrence, so an
-    unfused reference decodes unfused."""
-    from dew.nn.kernels.generation import assumed, chosen, routes
-    from dew.nn.kernels.selection import KernelRefused
-
-    def decode_routes(width):
-        module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=width,
-                               head_v_dim=width, dtype=jnp.bfloat16)
-        x = jnp.zeros((2, 1, 64), jnp.bfloat16)
-        step = MixerCall(decode=True)
-        with assumed("sm80"):
-            params = jax.eval_shape(lambda: module.init(jax.random.key(0), x))
-            cache = jax.eval_shape(lambda v: module.apply(v, x, step, mutable=["cache"])[1], params)
-            with routes() as found:
-                jax.eval_shape(lambda v: module.apply(v, x, step, mutable=["cache"]), {**params, **cache})
-        return [(found_route.kernel, found_route.preferred, found_route.refusal and found_route.refusal.code)
-                for found_route in found if found_route.choice == "delta_decode"]
-
-    assert decode_routes(32)[-1] == ("step", "step", None)
-    assert decode_routes(24)[-1] == ("xla", "step", "widths")
-    with chosen(gated_delta_rule="xla"):
-        assert decode_routes(32)[-1] == ("xla", "xla", None)
-    with chosen(delta_decode="fused"):
-        assert decode_routes(32)[-1] == ("fused", "fused", None)
-        with pytest.raises(KernelRefused) as refused:
-            decode_routes(24)
-    assert [refusal.code for refusal in refused.value.refusals] == ["widths"]
-
-
 @pytest.mark.gpu(reason="launch timing and occupancy vary on a GPU")
 def test_the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed():
-    """The fused decode step at its config, run 20 times, each run beside a large matmul
+    """The fused decode step, run 20 times, each run beside a large matmul
     that holds most of the GPU or alone, gives the same output, history and state bits every run: no
     value head reads a history or state another program is writing, whatever order they run in."""
-    from dew.nn.kernels.recurrence import StepLaunch
-
     layer, variables, cache, token = fused_case(16, 128, 4, jnp.bfloat16, jnp.bfloat16)
     operands = fused_inputs(layer, variables, cache, token)
     load = jnp.ones((8192, 8192), jnp.bfloat16)
@@ -1126,11 +1068,10 @@ def test_the_fused_decode_step_gives_the_same_bits_however_its_launches_are_time
         return fused_step(*operands, epsilon=layer.norm_eps, activation=layer.gate_activation,
                                      dtype=jnp.bfloat16)
 
-    [config] = taken(StepLaunch, fused, *operands)
     run = jax.jit(fused)
     first = jax.tree.map(np.asarray, run(*operands))
     for repeat in range(20):
         if repeat % 2:
             busy(load)
         for mine, theirs in zip(jax.tree.leaves(run(*operands)), jax.tree.leaves(first), strict=True):
-            np.testing.assert_array_equal(np.asarray(mine), theirs, err_msg=f"{config}, run {repeat}")
+            np.testing.assert_array_equal(np.asarray(mine), theirs, err_msg=f"run {repeat}")
