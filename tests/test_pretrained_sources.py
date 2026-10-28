@@ -436,6 +436,7 @@ def test_a_tensor_a_load_without_its_weights_holds_has_shapes_and_no_values():
     an array, raises PayloadUnread, so no reader computes on a value it was not given (ledger 1904)."""
     import numpy as np
 
+    from dew.interop.codecs import dequantize_fp8_blocks
     from dew.interop.unread import PayloadUnread, Unread, lookup
 
     codes = Unread((4, 8), np.uint8)
@@ -444,15 +445,32 @@ def test_a_tensor_a_load_without_its_weights_holds_has_shapes_and_no_values():
     decoded = lookup(np.arange(256, dtype=np.float32), codes) * np.float32(0.5)
     assert (decoded.shape, decoded.dtype) == ((4, 8), np.float32)
     assert np.shape(decoded) == (4, 8) and decoded.astype(np.float16).dtype == np.float16
-    # NumPy's own dtypes and geometry: an int32 beside a float32 is float64, a weak Python scalar keeps
-    # the array's dtype, and a byte view widens the last axis by the item's bytes.
-    assert np.add(Unread((2,), np.int32), np.ones(2, np.float32)).dtype == np.float64
-    assert (Unread((2,), np.uint8) + 1).dtype == np.uint8
-    assert np.concatenate([Unread((2,), np.int32), np.ones(3, np.float32)]).dtype == np.float64
-    assert Unread((2, 3), np.float32).view(np.uint8).shape == (2, 12)
-    assert Unread((4, 8), np.float32).dot(Unread((8, 2), np.float32)).shape == (4, 2)
+    # NumPy's own shapes and dtypes, operation by operation, as on arrays that hold values: its promotion (an
+    # int32 beside a float32 is float64, a weak Python scalar keeps the array's dtype, a NumPy scalar does
+    # not), its accumulation (an int32 sum is int64), a method as its function, and a byte view's geometry.
+    stored = {"codes": np.zeros((4, 8), np.uint8), "flags": np.zeros(2, np.bool_),
+              "ints": np.zeros((4, 8), np.int32), "wide": np.zeros(2, np.float64),
+              "halves": np.zeros((4, 8), np.float16)}
+    operations = (lambda arrays: arrays["ints"] + 1, lambda arrays: np.add(arrays["ints"], np.float32(1)),
+                  lambda arrays: arrays["flags"] | True, lambda arrays: arrays["wide"] * np.float64(2),
+                  lambda arrays: np.where(arrays["flags"], 0, 1),
+                  lambda arrays: np.where(arrays["ints"][0], np.ones(8, np.float32), np.zeros(8, np.float32)),
+                  lambda arrays: arrays["ints"].dot(np.ones((8, 2), np.float32)),
+                  lambda arrays: np.concatenate([arrays["ints"], np.ones((1, 8), np.float32)]),
+                  lambda arrays: arrays["ints"].sum(), lambda arrays: arrays["halves"].mean(axis=0),
+                  lambda arrays: -arrays["halves"], lambda arrays: arrays["codes"].view(np.uint32),
+                  lambda arrays: arrays["ints"].clip(0, 1.5))
+    for operation in operations:
+        given, shapes = operation(stored), operation({name: Unread(array.shape, array.dtype)
+                                                      for name, array in stored.items()})
+        assert (shapes.shape, shapes.dtype) == (np.shape(given), given.dtype)
     # NumPy's elementwise `==` is `np.equal`; Python's `==` would answer one bool of the values.
-    assert np.equal(codes, 0).shape == (4, 8) and (-decoded).dtype == np.float32
+    assert np.equal(codes, 0).shape == (4, 8)
+    # A block-scaled FP8 weight decodes to its shape alone where either its codes or its scales are unread.
+    for weight, scale in ((np.ones((2, 2), np.float32), Unread((1, 1), np.float32)),
+                          (Unread((2, 2), np.float32), np.ones((1, 1), np.float32))):
+        blocks = dequantize_fp8_blocks(weight, scale, 2)
+        assert isinstance(blocks, Unread) and (blocks.shape, blocks.dtype) == ((2, 2), np.float32)
     for asked in (lambda: bool(np.array_equal(codes, codes)), lambda: float(decoded[0, 0]),
                   lambda: codes == 0, lambda: np.asarray(codes), lambda: np.isfinite(decoded).all() or None,
                   lambda: np.zeros((4, 8)) + np.asarray(decoded)):

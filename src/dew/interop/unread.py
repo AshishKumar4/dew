@@ -72,18 +72,31 @@ def _array(function: Callable[..., Traced], *args: Operand, **kwargs: Operand) -
     return shapes
 
 
+_WEAK = (int, float, complex)
+"""The Python scalar types NumPy keeps weak in a ufunc's loop (NEP 50), by exact type: a bool, or a NumPy
+scalar that subclasses one of them (`np.float64`), takes its own dtype."""
+
+
 def _dtype_of(value: ArrayLike) -> np.dtype | type:
-    """A ufunc operand's dtype as NumPy resolves loops by, a Python scalar's type kept weak (NEP 50)."""
-    if isinstance(value, (bool, int, float, complex)):
+    """A ufunc operand's dtype as NumPy resolves loops by, a weak Python scalar's type (`_WEAK`)."""
+    if type(value) in _WEAK:
         return type(value)
     return value.dtype if isinstance(value, Unread) else np.asarray(value).dtype
 
 
 def _cast(value: ArrayLike, dtype: np.dtype) -> ArrayLike:
-    """`value` in `dtype`, an `Unread` as one, a Python scalar as it is (NumPy keeps it weak)."""
-    if isinstance(value, (bool, int, float, complex)):
+    """`value` in `dtype`, an `Unread` as one, a weak Python scalar as it is (`_WEAK`)."""
+    if type(value) in _WEAK:
         return value
     return value.astype(dtype) if isinstance(value, Unread) else np.asarray(value).astype(dtype)
+
+
+def _stand_in(value: Operand) -> Operand:
+    """An array operand, an `Unread` or one holding values, as ones of its rank and dtype; any other
+    operand as it is (`_NUMPY_DTYPED`)."""
+    if isinstance(value, Unread | np.ndarray):
+        return np.ones((1,) * value.ndim, value.dtype)
+    return value
 
 
 def _retyped(shapes: Abstract, dtypes: tuple[np.dtype, ...]) -> Abstract:
@@ -187,14 +200,14 @@ class Unread:
         if func in _METADATA:
             return _METADATA[func](*args, **kwargs)
         shapes = evaluated(_counterpart(func.__name__), *args, **kwargs)
-        if func in _PROMOTING:
-            # NumPy's promotion of its operands, not JAX's lattice.
-            operands = [value for value in jax.tree.leaves((args, kwargs), is_leaf=lambda leaf: isinstance(
-                leaf, Unread)) if isinstance(value, (Unread, np.ndarray, np.generic))]
-            promoted = np.result_type(*(_dtype_of(value) for value in operands))
-            return jax.tree.map(lambda leaf: Unread(leaf.shape, promoted), shapes,
-                                is_leaf=lambda leaf: isinstance(leaf, Unread))
-        return shapes
+        if func not in _NUMPY_DTYPED:
+            return shapes
+        # NumPy's own dtypes, its promotion and accumulation rather than JAX's, on stand-ins of ones.
+        given, named = jax.tree.map(_stand_in, (args, kwargs), is_leaf=lambda leaf: isinstance(leaf, Unread))
+        dtypes = [np.asarray(standing).dtype for standing in jax.tree.leaves(func(*given, **named))]
+        arrays, tree = jax.tree.flatten(shapes, is_leaf=lambda leaf: isinstance(leaf, Unread))
+        return jax.tree.unflatten(tree, [Unread(array.shape, dtype)
+                                         for array, dtype in zip(arrays, dtypes, strict=True)])
 
     def __getitem__(self, index: Operand) -> Unread:
         return _array(lambda array, index: array[index], self, index)
@@ -204,9 +217,13 @@ class Unread:
         _array(lambda array, index, value: array.at[index].set(value), self, index, value)
 
     def __getattr__(self, name: str) -> Callable[..., Unread]:
-        # The array methods NumPy readers call (`all`, `any`, `mean`, `clip`, ...), as `jax.Array`'s.
-        if name.startswith("_") or not callable(getattr(jax.Array, name, None)):
+        # The array methods NumPy readers call (`all`, `dot`, `mean`, `clip`, ...): NumPy's function of
+        # the name where it has one, as the function form runs on an Unread, else `jax.Array`'s.
+        if name.startswith("_") or not callable(getattr(np.ndarray, name, None)):
             raise AttributeError(name)
+        function = getattr(np, name, None)
+        if function is not None:
+            return lambda *args, **kwargs: function(self, *args, **kwargs)
         return lambda *args, **kwargs: _array(
             lambda array, *given, **named: getattr(array, name)(*given, **named), self, *args, **kwargs)
 
@@ -304,10 +321,13 @@ def lookup(table: np.ndarray, index: Stored) -> Stored:
     return np.take(table, index, axis=0)
 
 
-_PROMOTING = frozenset({np.concatenate, np.stack, np.hstack, np.vstack, np.append, np.where, np.dot,
-                        np.matmul, np.tensordot, np.einsum, np.outer, np.kron})
-"""The NumPy functions whose result takes its operands' promoted dtype, which NumPy's lattice gives
-(an int32 beside a float32 is float64 there, float32 in JAX's)."""
+_NUMPY_DTYPED = frozenset({np.concatenate, np.stack, np.hstack, np.vstack, np.append, np.where, np.dot,
+                           np.vdot, np.inner, np.outer, np.tensordot, np.einsum, np.kron, np.clip, np.sum,
+                           np.prod, np.cumsum, np.cumprod, np.mean})
+"""The NumPy functions whose result dtype NumPy's promotion or accumulation decides, which JAX's lattice
+does not follow (an int32 beside a float32 is float64 in NumPy's, float32 in JAX's; an int32 sum is int64),
+and which no operand's shape decides: NumPy answers it on stand-ins of ones of each array operand's rank
+and dtype (`_stand_in`), and `jax.eval_shape` the shapes."""
 
 
 def _shape_of(array: Stored) -> tuple[int, ...]:
