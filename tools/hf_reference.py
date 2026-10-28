@@ -337,7 +337,8 @@ def tiny_phi3() -> Phi3ForCausalLM:
 
 
 def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
-    """Same-weight fp32/float64 logits, left-padding and greedy continuation.
+    """Same-weight fp32/float64 logits, the left-padding mask the tests pad drawn ids under, and the
+    greedy continuation; the tests run transformers over drawn ids themselves (check 1).
 
     Phi-3's crossing oracle is its uncached full-prefix forward. Its pinned
     generate drops the prefix at that crossing (transformers issue #49334),
@@ -350,60 +351,25 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     ids = np.load(directory / 'input_ids.npy')
     mask = np.ones_like(ids, bool)
     mask[1, :3] = False
-    padded = np.where(mask, ids, 0)
-    positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
-    positioned = ({} if model.config.model_type == 'bloom' else
-                  {'position_ids': torch.from_numpy(positions).long()})
-    np.save(directory / 'padded_ids.npy', padded)
     np.save(directory / 'attention_mask.npy', mask)
-    phi3 = model.config.model_type == 'phi3'
     model.eval()
     with torch.no_grad():
         generated = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
                                    max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
-        logits = model(torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
-                       use_cache=False, **positioned).logits.numpy()
-        if phi3:
+        if model.config.model_type == 'phi3':
             np.save(directory / 'transformers_generated.npy', generated)
             generated = ids[:, :4].copy()
-            scores = []
             for _ in range(6):
                 score = model(torch.from_numpy(generated).long(), use_cache=False).logits[:, -1].numpy()
-                scores.append(score)
                 generated = np.concatenate((generated, score.argmax(-1)[:, None]), axis=1)
-            np.save(directory / 'generation_logits.npy', np.stack(scores, axis=1))
-            np.save(directory / 'short_logits.npy',
-                    model(torch.from_numpy(ids[:, :4]).long(), use_cache=False).logits.numpy())
     np.save(directory / 'generated.npy', generated)
-    np.save(directory / 'padded_logits.npy', logits)
-    affine = model.config.model_type in ('phi', 'gptj')
-    if affine:
-        full = torch.from_numpy(np.load(directory / 'logits.npy'))
-        losses = torch.nn.functional.cross_entropy(
-            full[:, :-1].transpose(1, 2), torch.from_numpy(ids[:, 1:]).long(), reduction='none')
-        np.save(directory / 'losses.npy', losses.numpy())
     # Its float64 twin (`float64_twin`): frequency and sinusoidal buffers built in float64 rather than
     # widened from a rounded fp32 table, the checkpoint's values loaded into it.
     truth_model = float64_twin(model, lambda: AutoModelForCausalLM.from_config(
         model.config, dtype=torch.float64, attn_implementation='eager'))
     with float64(), torch.no_grad():
         truth = truth_model(torch.from_numpy(ids).long(), use_cache=False).logits.double().numpy()
-        if affine:
-            losses = torch.nn.functional.cross_entropy(
-                torch.from_numpy(truth[:, :-1]).transpose(1, 2),
-                torch.from_numpy(ids[:, 1:]).long(), reduction='none')
-            np.save(directory / 'losses_f64.npy', losses.numpy())
-        padded_truth = truth_model(
-            torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
-            use_cache=False, **positioned).logits.double().numpy()
-        if phi3:
-            np.save(directory / 'short_logits_f64.npy',
-                    truth_model(torch.from_numpy(ids[:, :4]).long(), use_cache=False).logits.double().numpy())
-            scores = [truth_model(torch.from_numpy(generated[:, :4 + step]).long(),
-                                  use_cache=False).logits[:, -1].double().numpy() for step in range(6)]
-            np.save(directory / 'generation_logits_f64.npy', np.stack(scores, axis=1))
     np.save(directory / 'logits_f64.npy', truth)
-    np.save(directory / 'padded_logits_f64.npy', padded_truth)
 
 
 MINIMAX_M2_CONFIGS = (
@@ -429,7 +395,7 @@ def write_minimax_m2() -> None:
         bos_token_id=1, eos_token_id=2))
     model.set_experts_implementation('eager')
     write_tiny('minimax-m2-tiny', model, padded=True)
-    directory = write_float64_logits('minimax-m2-tiny', model)
+    directory = FIXTURES / 'minimax-m2-tiny'
     weights = {}
     for name, value in model.float().state_dict().items():
         if '.mlp.experts.' in name:
@@ -452,7 +418,6 @@ def write_minimax_m2() -> None:
 def write_minimax_m2_fp8(config: dict, weights: dict, ids: torch.Tensor) -> None:
     """Run Transformers' CPU dequantization on the released FP8 storage layout."""
     from safetensors.torch import save_file
-    from torch_precision import float64, float64_twin
     from transformers import FineGrainedFP8Config, MiniMaxM2ForCausalLM
 
     directory = FIXTURES / 'minimax-m2-fp8-tiny'
@@ -480,9 +445,6 @@ def write_minimax_m2_fp8(config: dict, weights: dict, ids: torch.Tensor) -> None
     np.save(directory / 'input_ids.npy', ids.numpy().astype(np.int32))
     with torch.no_grad():
         np.save(directory / 'logits.npy', model(input_ids=ids, use_cache=False).logits.numpy())
-    with float64(), torch.no_grad():
-        truth = float64_twin(model)(input_ids=ids, use_cache=False).logits.numpy()
-    np.save(directory / 'logits_f64.npy', truth)
     (directory / 'model.safetensors').chmod(0o644)
 
 
@@ -573,14 +535,15 @@ MODERNBERT_CONFIGS = (
 
 
 def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
-    """ModernBertForMaskedLM's logits and ModernBertModel's states, fp32 and float64.
+    """ModernBertForMaskedLM's logits, fp32 and float64, and ModernBertModel's states in bf16 and
+    float64, which the GPU's bf16 kernels are held to.
 
     Four layers give the global, local, local, global pattern, and a local
     span of 6 (three keys either side) is shorter than the 12-token probe, so
     a window applied on one side only, or not at all, shows in the states.
-    Beside the plain rows: right-padded rows with their validity mask, and
-    rows packing two documents, whose reference is each document run alone
-    at positions from zero.
+    Beside the plain rows: the validity mask right-padded rows take, and the
+    segment ids of rows packing two documents, under which
+    tests/test_hf_modernbert.py runs the reference on drawn ids itself.
     """
     from torch_precision import float64, float64_twin
     from transformers import ModernBertConfig, ModernBertForMaskedLM
@@ -597,42 +560,24 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
     ids = np.load(directory / 'input_ids.npy')
     mask = np.ones_like(ids, bool)
     mask[1, -3:] = False
-    padded = np.where(mask, ids, 0)
     documents = np.where(np.arange(ids.shape[1]) < 5, 1, 2)[None].repeat(ids.shape[0], 0)
-    np.save(directory / 'padded_ids.npy', padded)
     np.save(directory / 'attention_mask.npy', mask)
     np.save(directory / 'segment_ids.npy', documents.astype(np.int32))
-
-    def states(model, dtype_scope):
-        with dtype_scope, torch.no_grad():
-            encoder = model.model
-            plain = encoder(torch.from_numpy(ids).long()).last_hidden_state
-            masked = encoder(torch.from_numpy(padded).long(),
-                             attention_mask=torch.from_numpy(mask)).last_hidden_state
-            packed = torch.cat([encoder(torch.from_numpy(ids[:, :5]).long()).last_hidden_state,
-                                encoder(torch.from_numpy(ids[:, 5:]).long()).last_hidden_state], dim=1)
-            logits = model(torch.from_numpy(ids).long()).logits
-        return {'hidden': plain, 'padded_hidden': masked, 'packed_hidden': packed, 'logits': logits}
-
-    import contextlib
-
+    tokens = torch.from_numpy(ids).long()
     model.eval()
-    for key, value in states(model, contextlib.nullcontext()).items():
-        np.save(directory / f'{key}.npy', value.float().numpy())
     # The reference's own bf16 run, which a bf16 forward is held to, on a
     # copy: a round trip through bf16 would round the float64 run's weights.
     import copy
 
     with torch.no_grad():
+        np.save(directory / 'logits.npy', model(tokens).logits.numpy())
         narrow = copy.deepcopy(model).to(torch.bfloat16)
-        np.save(directory / 'hidden_bf16.npy',
-                narrow.model(torch.from_numpy(ids).long()).last_hidden_state.float().numpy())
+        np.save(directory / 'hidden_bf16.npy', narrow.model(tokens).last_hidden_state.float().numpy())
     # Its float64 twin (`float64_twin`), whose inverse frequencies are built in float64.
     wide = float64_twin(model)
-    with float64():
-        truths = states(wide, contextlib.nullcontext())
-    for key, value in truths.items():
-        np.save(directory / f'{key}_f64.npy', value.double().numpy())
+    with float64(), torch.no_grad():
+        np.save(directory / 'hidden_f64.npy', wide.model(tokens).last_hidden_state.double().numpy())
+        np.save(directory / 'logits_f64.npy', wide(tokens).logits.double().numpy())
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:

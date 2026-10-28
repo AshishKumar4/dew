@@ -84,7 +84,7 @@ def write_tiny(modeling) -> None:
     mask[1, :3] = False
     padded = np.where(mask, ids, 0)
     positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
-    arrays = {'input_ids': ids, 'padded_ids': padded, 'attention_mask': mask}
+    arrays = {'input_ids': ids, 'attention_mask': mask}
     arrays['logits'], arrays['exit_logits'] = outputs(model, ids)
     arrays['padded_logits'], _ = outputs(model, padded, mask, positions)
     with torch.no_grad():
@@ -95,7 +95,6 @@ def write_tiny(modeling) -> None:
     truth = last_pass(float64_twin(model, lambda: modeling.OuroForCausalLM(config)))
     with float64():
         arrays['logits_f64'], arrays['exit_logits_f64'] = outputs(truth, ids)
-        arrays['padded_logits_f64'], _ = outputs(truth, padded, mask, positions)
     for name, array in arrays.items():
         np.save(directory / f'{name}.npy', array)
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")

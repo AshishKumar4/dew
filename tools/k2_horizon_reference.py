@@ -8,8 +8,8 @@ every release ships) on the environment's transformers:
 tests/fixtures/hf/k2-horizon-tiny/ is a random K2HorizonForCausalLM of two
 layers over a width of 16, four query heads of 8 over two key/value heads,
 its norms' statistics over two groups (the 3.7B's layernorm_num_groups) and
-its rotary the 0.9B's YaRN, with fp32 and float64 logits, left-padded logits
-and the cached greedy continuation. k2-horizon-{0.9b,3.7b,7b}/ pin the
+its rotary the 0.9B's YaRN, with fp32 logits, left-padded logits and the
+cached greedy continuation. k2-horizon-{0.9b,3.7b,7b}/ pin the
 released configs, which the translation is held to. `--padding` records
 instead the rows the release's own token lookup leaves untrained under
 k2-horizon-tiny's config with its pad id stated, left out and null
@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 from reference_source import config_lookups, hub_modules, record_padding
-from torch_precision import float64, float64_twin
+from torch_precision import float64_twin
 
 from dew.interop.verify import probe_ids, scatter_weights
 
@@ -76,17 +76,11 @@ def write_tiny(modeling) -> None:
     mask[1, :3] = False
     padded = np.where(mask, ids, 0)
     positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
-    arrays = {'input_ids': ids, 'padded_ids': padded, 'attention_mask': mask,
+    arrays = {'input_ids': ids, 'attention_mask': mask,
               'logits': logits(model, ids), 'padded_logits': logits(model, padded, mask, positions)}
     with torch.no_grad():
         arrays['generated'] = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
                                              max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
-    # Its float64 twin (`float64_twin`): built inside the widening, so the rotary table is computed in
-    # float64 rather than widened from fp32; the weights are the same.
-    truth = float64_twin(model, lambda: modeling.K2HorizonForCausalLM(config))
-    with float64():
-        arrays['logits_f64'] = logits(truth, ids)
-        arrays['padded_logits_f64'] = logits(truth, padded, mask, positions)
     for name, array in arrays.items():
         np.save(directory / f'{name}.npy', array)
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
