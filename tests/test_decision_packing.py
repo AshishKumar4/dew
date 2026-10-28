@@ -66,9 +66,10 @@ def qwen35(length: int) -> Pretrained:
 
 
 def attending(length: int) -> CausalTransformer:
-    """A decoder of attention alone, which the parallel layout's pairwise mask needs."""
+    """A decoder of attention alone, which the parallel layout's key runs need, on the attention template,
+    which reads them as its spans (`DecisionModel._read`, row 1835)."""
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                             max_seq_len=length, attention_impl="xla")
+                             max_seq_len=length, attention_impl="template")
 
 
 ROWS = StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8)
@@ -83,7 +84,7 @@ ARMS = {
                 lambda: LabelReadout(64, LABELS.ids(TOKENIZER, 3))),
 }
 """Joint rows under the joint schema head and rows of one question under the marker head,
-both over Qwen3.5; parallel options, whose pairwise mask Gated DeltaNet refuses, over attention;
+both over Qwen3.5; parallel options, whose key runs Gated DeltaNet refuses, over the attention template;
 options under labels read at each row's answer cue by the backbone's own logits, over Qwen3.5."""
 
 
