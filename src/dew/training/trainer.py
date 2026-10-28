@@ -352,6 +352,9 @@ class Trainer(Generic[Loss, Effects]):
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
         self._prefetch = PREFETCH_DEPTH
+        # The examples a fit's run is bounded to where its read counts no steps ahead, which its state's
+        # clock reads (`TrainState.consumed`); none for a run counted otherwise.
+        self._examples: int | None = None
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -419,6 +422,7 @@ class Trainer(Generic[Loss, Effects]):
             # the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
             key=run_key,
+            consumed=None if self._examples is None else jnp.zeros((), jnp.int32),
         )
 
     @functools.cached_property
@@ -623,6 +627,11 @@ class Trainer(Generic[Loss, Effects]):
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
+        if self._examples is not None and state.consumed is None:
+            raise ValueError(
+                f"step {resume}'s checkpoint was written before a run bounded in examples kept the examples "
+                "it consumed, so its schedule was counted in steps ahead of the run, which this Dew no "
+                "longer counts: resume it with the Dew that wrote it, or start a fresh run from its weights")
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = dataclasses.replace(state, opt_state=with_rates(state.opt_state, self._config.rates()))
@@ -879,7 +888,7 @@ class Trainer(Generic[Loss, Effects]):
         with no invented commit telemetry, which reads it whole."""
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
-                               split=split, record=self.record, fetch=fetch).step()
+                               split=split, record=self.record, fetch=fetch, examples=self._examples).step()
         custom = self.step(self.objective, self.optimizer)
 
         def run(current, batch, part, tokens):
@@ -1196,7 +1205,7 @@ class Trainer(Generic[Loss, Effects]):
                                                      shape_only=True)
             placement = self.shardings(prepared)
             transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes,
-                                      record=self.record)
+                                      record=self.record, examples=self._examples)
             body = transaction.step(realize=execution.realize, host=True)
 
         def run(current, batch):
@@ -1296,6 +1305,9 @@ class Trainer(Generic[Loss, Effects]):
             self.objective, dataset, validation, steps=steps, epochs=epochs, tokens=tokens, examples=examples,
             accumulation=self.accumulation, startup=self._startup)
         self._device, self._prefetch = loader.device, device_prefetch
+        # A run bounded in examples whose read counts no steps ahead keeps its progress in its examples
+        # consumed (`TrainState.consumed`), which its schedule and cadences read.
+        self._examples = examples if examples is not None and steps is None else None
         self._schedule(None if steps is None else steps // self.accumulation)
         plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
                           written=(log_every, eval_every, checkpoint_every),
@@ -1360,7 +1372,7 @@ class Trainer(Generic[Loss, Effects]):
         """The configured optimizer, built for `updates` updates; its state holds the rate it logs."""
         if self._config is None:
             return
-        built = self._config.build(updates)
+        built = self._config.build(updates, clocked=self._examples is not None)
         self._optimizer = self.objective.optimizer(built)
 
     def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,
@@ -1529,8 +1541,11 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume))
         if initial is not None:
             # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
-            # accumulation's mirrors of the parameters with them.
+            # accumulation's mirrors of the parameters with them; a run bounded in examples starts its
+            # clock where a state that keeps none stands.
             initial = owned_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
+            if self._examples is not None and initial.consumed is None:
+                initial = dataclasses.replace(initial, consumed=jnp.zeros((), jnp.int32))
             shardings, _ = self._validated(initial)
             supplied = jax.device_put(initial, shardings)
             return int(supplied.step), None, lambda: (supplied, shardings), None

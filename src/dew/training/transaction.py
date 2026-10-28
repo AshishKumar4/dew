@@ -326,7 +326,8 @@ class Transaction:
     run; only where each phase executes differs.
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
-                 record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None):
+                 record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None,
+                 examples: int | None = None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -344,10 +345,14 @@ class Transaction:
         through both: a plain Adam step's peak rose from 2.483 GB to 3.020 GB with its state in host
         memory, and fetched past the gradient it is 2.483 GB again (node receipt TL-a100-offload-1338-c,
         hostmem.json). XLA:GPU still holds the whole state for the update, so keeping it on the host
-        frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way.
+        frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way. `examples`
+        is a run's bound in source examples, where it counts no updates ahead: each update hands its
+        optimizer the run's progress, the share of them its state has consumed (`TrainState.consumed`),
+        which a schedule over the run reads (`dew.optim.ScheduleBase.progressed`).
         """
         self.fetch = fetch
         self.record = record
+        self.examples = examples
         self.objective = objective
         self.optimizer = optimizer
         self.copies = copies or {}
@@ -520,6 +525,12 @@ class Transaction:
         """Add one replayed microbatch's unscaled gradient into the running sum."""
         return jax.tree.map(lambda a, b: a + _unscale(b, factor), accumulated, contribution)
 
+    def progress(self, current: TrainState) -> jax.Array:
+        """The share of the run's bound in examples `current` has consumed, float32: what its dispatched
+        batches consumed before this update (`TrainState.consumed`)."""
+        assert self.examples is not None and current.consumed is not None, "a clocked run counts examples"
+        return jnp.asarray(current.consumed, jnp.float32) / self.examples
+
     def commit(self, current, gradient, effects, qk):
         """Apply the pooled native gradient and return its finiteness and global norm.
 
@@ -539,7 +550,9 @@ class Transaction:
             # (`Objective.projected`), and the step stores them projected again.
             stored = self.objective.projected(current.variables["params"], updated=False)
             if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
-                update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk)
+                clocked = {} if self.examples is None else {"progress": self.progress(current)}
+                update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk,
+                                                          **clocked)
             else:
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored)
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
