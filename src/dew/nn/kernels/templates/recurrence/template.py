@@ -135,6 +135,17 @@ class Mosaic(base.Template[mainloop.Tiles]):
         family = bundle(self.launched())
         return cost.THREAD_REGISTERS if family is None else family.registers(1)
 
+    def _held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> bool:
+        """Whether every forward launch's consumer threads hold their registers at its own roles' budget
+        (`Family.registers` at `Launch.consumers`: a walk of `Tiles.walkers` roles holds less a role than a
+        launch of one)."""
+        target = self.launched()
+        family = bundle(target, _dtype(ba))
+        if family is None:
+            return super()._held(ba, config)
+        return all(launch.registers <= family.registers(launch.consumers)
+                   for launch in self._launches(ba, config, target, backward=False))
+
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
         (docs/design/kernel-templates.md §7), each rule naming the fact it reads:
@@ -179,7 +190,37 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return programs <= multiprocessors * self.states_held(ba, tiles, target)
 
         # `legal` runs widest first: the last of those in one wave is the narrowest.
-        return next((tiles for tiles in reversed(legal) if one_wave(tiles)), legal[0])
+        chosen = next((tiles for tiles in reversed(legal) if one_wave(tiles)), legal[0])
+        if one_wave(chosen):
+            return chosen
+        programs = columns // chosen.block_v * sequences * heads
+        return self._walked(ba, chosen, target, programs // (multiprocessors * self.states_held(ba, chosen,
+                                                                                                  target)))
+
+    def _walked(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
+                waves: int) -> mainloop.Tiles:
+        """`tiles` with the value blocks of one sequence and head a walk program takes (`Tiles.walkers`),
+        one a consumer role beside one producer, where its states launch's programs fill `waves` waves of
+        the device's: the most roles the family's program takes (`Family.consumers`) that divide the head's
+        value blocks, no more than its waves (a grouped grid still fills a wave), whose launches hold their
+        registers at that many roles' budget (`Family.registers`) and their shared memory, at its stage
+        rule (`_staged`); one role else. A walk's chain waits a chunk on its products: the states launch
+        took 1.04 ms over 66 waves of programs of about 6.6 chunks in a Qwen3.5-4B training step on an H100,
+        one 256-thread program a multiprocessor (design-walks-kda.md: two roles hold its 128 registers' need
+        and the reverse launch's 184 within their 232, and read the head's keys once for both)."""
+        family = bundle(target, _dtype(ba))
+        assert family is not None
+        _, columns, _ = _widths(ba, family)
+        blocks = columns // tiles.block_v
+        for walkers in range(min(family.consumers, waves), 1, -1):
+            if blocks % walkers:
+                continue
+            grouped = self._staged(ba, tiles.block_v, target, walkers=walkers,
+                                   wide=tiles.block_o or tiles.block_v)
+            if grouped is not None and self._backward_holds(ba, grouped, target) == self._backward_holds(
+                    ba, tiles, target):
+                return grouped
+        return tiles
 
     def trains(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the call's gradient runs on `target`: its fast backward takes it (the delta rule, a decay a
@@ -224,17 +265,20 @@ class Mosaic(base.Template[mainloop.Tiles]):
         unit = family.narrowest_columns(jnp.bfloat16)
         return [block for block in range(columns - columns % unit, 0, -unit) if columns % block == 0]
 
-    def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget
-                ) -> mainloop.Tiles | None:
-        """`block`'s tiles with the widest output block legal beside it (`Tiles.block_o`), at the deepest
-        ring of the states launch's steps of which a multiprocessor holds as many programs as one stage's
-        (`states_held`; `resources.deepest`, within `Family.most_shared` over a step's bytes), else one stage;
-        None where no output block is legal beside it. The ring deepest alone held an A100's states launch
-        to one program a multiprocessor, where its registers held three (SE-family-a100-8c5b5b16a)."""
+    def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget, *,
+                walkers: int = 1, wide: int | None = None) -> mainloop.Tiles | None:
+        """`block`'s tiles at `walkers` walk roles (`Tiles.walkers`) with the widest output block legal beside
+        it (`Tiles.block_o`; `wide` where given), at the deepest ring of the states launch's steps of which
+        a multiprocessor holds as many programs as one stage's (`states_held`; `resources.deepest`, within
+        `Family.most_shared` over a step's bytes), else one stage; None where no output block is legal
+        beside it. The ring deepest alone held an A100's states launch to one program a multiprocessor,
+        where its registers held three (SE-family-a100-8c5b5b16a)."""
         family = bundle(target, _dtype(ba))
         assert family is not None
-        shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if wide == block else wide)
-                                               for wide in self._blocks(ba, family))
+        widths = self._blocks(ba, family) if wide is None else [wide]
+        shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if width == block else width,
+                                                              walkers)
+                                               for width in widths)
                            if self.legal(ba, tiles, target)), None)
         if shallowest is None:
             return None

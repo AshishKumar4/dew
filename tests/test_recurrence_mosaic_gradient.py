@@ -26,8 +26,9 @@ from test_recurrence_mosaic import (
 )
 
 from dew.nn.kernels import recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
-from dew.nn.kernels.templates.recurrence import template
+from dew.nn.kernels.recurrence_chunk import Chunk, mosaic_rule, recomputing
+from dew.nn.kernels.templates import bundles
+from dew.nn.kernels.templates.recurrence import mainloop, template
 
 pytestmark = pytest.mark.kernel
 
@@ -101,6 +102,37 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
         return
     assert_as_exact(compiled(on), compiled(functools.partial(chunk_on, 'fla', hooks)), draws,
                     f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
+
+
+WALKS = interpreted([('one sequence', 'forward'), ('one sequence', 'training')],
+                    {('one sequence', 'forward')})
+"""A two-role walk's products: the forward interpreted off a GPU, its fast backward the GPU tier's."""
+
+
+@pytest.mark.parametrize(('case', 'product'), WALKS)
+def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
+    """The states and reverse launches with two value blocks of a sequence and head a program, one a
+    consumer role (`Tiles.walkers`, warpgroup MMA's bundle, which the derivation gives a call whose walks
+    fill more than a wave), on par from float64 with the fla port's forward, or forward and gradient, over
+    the case's draws (check 1, truth the recurrence a token at a time's): each role's columns, staging and
+    stores its own."""
+    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
+    shape = {**geometry(case), 'value_width': 64}
+    tiles = mainloop.Tiles(32, 1, walkers=2)
+
+    def walked(given: Chunk):
+        return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
+                           tiles=tiles, scale=hooks.scale, family=bundles.of('sm90', jnp.bfloat16))
+
+    reference = functools.partial(chunk_on, 'fla', hooks)
+    truth = functools.partial(token_by_token, hooks)
+    if product == 'forward':
+        assert_as_exact(jax.jit(walked), jax.jit(reference), functools.partial(draw, jnp.bfloat16, **shape),
+                        f'a two-role walk, {case}', seeds=SEEDS, truth_fn=jax.jit(truth))
+        return
+    draws = functools.partial(drawn, jnp.bfloat16, **shape)
+    assert_as_exact(with_gradients(walked), with_gradients(reference), draws,
+                    f'a two-role walk\'s gradient, {case}', seeds=SEEDS, truth_fn=with_gradients(truth))
 
 
 def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:

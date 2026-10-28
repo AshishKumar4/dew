@@ -141,11 +141,17 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
 
 
 def consumer_registers(consumers: int) -> int:
-    """The registers a thread of each of `consumers` consumer warpgroups holds: the multiprocessor's 64K less
-    the producer's, shared among them in setmaxnreg's steps of 8 and at most its 256 (two consumers' 232,
-    JAX's warp-specialized pipeline's `_compute_registers(40, 2)`)."""
-    share = (64 * 1024 // 128 - PRODUCER_REGISTERS) // consumers
-    return min(256, share // 8 * 8)
+    """The registers a thread of each of `consumers` consumer warpgroups holds: the program's launch pool
+    less the producer's, shared among them in setmaxnreg's steps of 8 and at most its 256 (two consumers'
+    232, JAX's warp-specialized pipeline's `_compute_registers(40, 2)`). The pool is what the program
+    launches with, its threads' share of the multiprocessor's 64K in the allocator's steps of 8, which
+    setmaxnreg moves between a program's warps and never past ("The total number of registers allocated to
+    all warps in the CTA cannot exceed the initial CTA launch", NVIDIA forums 302068): four consumers' 640
+    threads launch at 96 a thread, so they hold 104, where the multiprocessor's share would ask 112 and wait
+    for registers no warp gives back."""
+    threads = (consumers + 1) * THREADS
+    pool = min(255, 64 * 1024 // threads) // 8 * 8 * threads
+    return min(256, (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS) // 8 * 8)
 
 
 CONSUMER_REGISTERS = consumer_registers(2)
