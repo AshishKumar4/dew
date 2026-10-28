@@ -939,11 +939,11 @@ class Trainer(Generic[Loss, Effects]):
                 raise ValueError("a step compiled ahead runs where the devices hold the state; this "
                                  "layout keeps the variables on the host")
             return self._compile_host(state, batch)
-        planned = self._plan(state, batch, trials, capacity)
+        planned = self._compiled_plan(state, batch, trials, capacity)
         return self._runner(planned.released(), self.device_mesh)
 
     @ruled
-    def _plan(self, state: TrainState, batch: Batch, trials: Trials | None,
+    def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None,
               capacity: int | None) -> Planned:
         """The device step's plan, shared by `compile` and `compile_ahead`: the search, its record and
         the trainer at its chosen rung. Its lowering stays alive until the caller has read it;

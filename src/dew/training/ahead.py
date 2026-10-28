@@ -246,7 +246,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                                    capacity: int | None = None) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only GPUs its
     mesh is built over (`compile_only_gpus`) and never run. The planner `Trainer.compile` uses
-    (`Trainer._plan`) selects and compiles the step once; that executable is serialized, not compiled
+    (`Trainer._compiled_plan`) selects and compiles the step once; that executable is serialized, not compiled
     again. Its batch is what `fit` hands to its step (`step_batch`), its fresh state abstract, and
     tracing reads the target's kernel choices (`assumed`). The plan reports every compile and the
     time the search took. `capacity` states bytes per GPU; absent it, memory fit is unknown rather
@@ -267,7 +267,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     began = time.perf_counter()
     start = trainer._started()
     with assumed(generation):
-        planned = trainer._plan(start.abstract, step_batch(trainer, batch), None, capacity)
+        planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)

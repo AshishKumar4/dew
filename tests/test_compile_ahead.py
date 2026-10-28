@@ -7,6 +7,7 @@ under one placement, whichever backend compiles it. What it costs and its execut
 a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import dataclasses
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +33,32 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False):
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                    layout=Layout(min_shard=TINY_SHARD), split=1, ahead=ahead)
+
+
+def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch, caplog):
+    """A compile-only GPU with stated memory takes the run's own fit search, whose one fitting
+    program is the saved executable, not another compile outside the report. The report records
+    that compile's time and memory, and planning creates no device state or runner to execute."""
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
+    with caplog.at_level(logging.DEBUG, logger="jax._src.dispatch"):
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30)
+    step_compiles = [message for message in caplog.messages
+                     if message.startswith("Finished XLA compilation of jit(step)")]
+    assert len(step_compiles) == 1
+    plan = record(ahead.plan, "plan")
+    (probe,) = listed(plan["probes"], "probes", read=record, what="probes")
+    assert probe["fits"] is True and probe["temp"] == ahead.temp_bytes
+    assert probe["argument"] == ahead.argument_bytes
+    seconds = probe["compile_seconds"]
+    assert isinstance(seconds, float) and ahead.planned_seconds is not None
+    assert ahead.planned_seconds >= seconds > 0
+    destination = tmp_path / "planned.dew-aot"
+    ahead.save(destination)
+    saved = AheadOfTime.load(destination)
+    assert saved.plan == ahead.plan and saved.program == ahead.program
 
 
 @pytest.mark.mesh(devices=8)
