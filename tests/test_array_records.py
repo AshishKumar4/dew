@@ -4,7 +4,7 @@ reads in flight through eviction and close."""
 import os
 import pickle
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from uuid import uuid4
 
@@ -337,40 +337,41 @@ def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arra
         source.close()
 
 
-def test_a_read_past_the_bound_never_waits_on_another_source_opening_a_shard(arrayrecord_paths, monkeypatch):
+def test_a_read_past_the_bound_never_waits_on_another_source_opening_a_shard(arrayrecord_paths):
     """A source opening a shard holds its own lock while it opens (a remote shard downloads). A read
     of another source that leaves the process past its idle bound trims without waiting on it: it
     passes the opening source over and returns, and the bound holds once that source's read drains
     (row 2046). Before, the trim took every source's lock in turn and waited on the open."""
-    from dew.data.sources.records import ArrayRecords
+    from dew.data.sources.records import ArrayRecords, ShardReaders
 
     real = {os.path.realpath(path) for path in arrayrecord_paths}
     opening, released = threading.Event(), threading.Event()
-    slow = os.path.realpath(arrayrecord_paths[-1])
-    underlying_open = ArrayRecords._shard
 
-    def slow_open(self, shard):
-        if os.path.realpath(self.urls[shard]) == slow:
-            opening.set()
-            assert released.wait(timeout=60)
-        return underlying_open(self, shard)
+    def opened(path: str) -> ArrayRecords:
+        return ArrayRecords((path,), counts=(8,))
 
-    monkeypatch.setattr(ArrayRecords, "_shard", slow_open)
-    held = [ArrayRecords((path,), counts=(8,)) for path in arrayrecord_paths[:-1]]
-    late = ArrayRecords((arrayrecord_paths[-1],), counts=(8,))
-    again = ArrayRecords((arrayrecord_paths[0],), counts=(8,))
+    def slow(path: str) -> ArrayRecords:
+        # The open a remote shard waits on, held until the test lets it finish.
+        opening.set()
+        assert released.wait(timeout=60)
+        return opened(path)
+
+    held = [ShardReaders(opened) for _ in arrayrecord_paths[:-1]]
+    late, again = ShardReaders(slow), ShardReaders(opened)
     try:
-        for source in held:
-            assert source[0] is not None
+        for readers, path in zip(held, arrayrecord_paths, strict=False):
+            assert readers.read(path, 0) is not None
         with ThreadPoolExecutor(2) as pool:
-            pending = pool.submit(late.__getitem__, 0)
+            pending = pool.submit(late.read, arrayrecord_paths[-1], 0)
             assert opening.wait(timeout=60)
-            assert pool.submit(again.__getitem__, 1).result(timeout=60) is not None
-            assert not pending.done()
+            answered = pool.submit(again.read, arrayrecord_paths[0], 1)
+            # Bounded so a read that waits on the open fails here rather than hanging the test.
+            assert answered in wait([answered], timeout=60).done
+            assert answered.result() is not None and not pending.done()
             released.set()
             assert pending.result(timeout=60) is not None
         assert sum(opened.path in real for opened in psutil.Process().open_files()) <= Loading().threads
     finally:
         released.set()
-        for source in (*held, late, again):
-            source.close()
+        for readers in (*held, late, again):
+            readers.close()
