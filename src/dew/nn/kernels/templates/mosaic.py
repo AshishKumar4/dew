@@ -650,16 +650,17 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     def issued(self, acc: Accumulator, left: tuple, right: tuple, interpret: bool) -> Accumulator:
         """`acc` with the products of `left`'s and `right`'s parts (`product.formed`, each a part's
-        shared-memory tile or its 16-bit registers) issued into it in place, the pairs `product.terms`
-        gives, smallest first (`products`)."""
+        shared-memory tile) issued into it in place, the pairs `product.terms` gives, smallest first
+        (`products`)."""
         for i, j in product.terms(len(left), len(right)):
             acc = self.products(acc, left[i], right[j], interpret)
         return acc
 
     def apart(self, shape: tuple[int, int], left: tuple, right: tuple, interpret: bool) -> jax.Array:
         """The products of `left`'s and `right`'s parts (`issued`'s), each into its own fresh fp32
-        accumulator of `shape` (`summed`), summed smallest first: a tensor core's accumulation truncates
-        (mma.sync's), so a part accumulated onto a larger one loses its last bit where a sum rounds it."""
+        accumulator of `shape` (`summed`), added left to right in `product.terms`' order, so the smallest
+        meet first: a tensor core's accumulation truncates (mma.sync's), so a part accumulated onto a larger
+        one loses its last bit where a sum rounds it."""
         def issue(i: int, j: int, acc: Accumulator) -> Accumulator:
             return self.products(acc, left[i], right[j], interpret)
 
