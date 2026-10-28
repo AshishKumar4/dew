@@ -130,15 +130,9 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     A negative query slot denotes an invalid token. Cache validity excludes
     unfilled slots; a window retains the query and its preceding W-1 keys.
     """
-    positions = jnp.asarray(query_positions)
-    if positions.ndim == 1:
-        positions = positions[None, :]
-    q_pos = positions[:, :, None]
-    keys = jnp.arange(kv_len)[None, None, :]
-    mask = (q_pos >= 0) & visible(q_pos, keys, causal=True, window=sliding_window)
-    if key_valid is not None:
-        mask = mask & jnp.asarray(key_valid, bool)[:, None, :]
-    return mask[:, None]
+    positions = jnp.atleast_2d(jnp.asarray(query_positions, jnp.int32))
+    return visibility_mask(positions.shape[1], kv_len, True, sliding_window, key_valid=key_valid,
+                           query_slots=positions)
 
 
 def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
@@ -166,16 +160,10 @@ def structural_mask(query_positions, kv_len: int, causal: bool,
     """The `[B, 1, T, S]` keys that causality and a window leave each query,
     from shared `[T]` or per-row `[B, T]` positions, or None when neither
     applies. A negative query position sees nothing."""
-    if causal:
-        return causal_attention_mask(query_positions, kv_len, sliding_window)
-    if sliding_window is None:
+    if not causal and sliding_window is None:
         return None
-    positions = jnp.asarray(query_positions)
-    if positions.ndim == 1:
-        positions = positions[None, :]
-    keys = jnp.arange(kv_len)[None, None, :]
-    queries = positions[:, :, None]
-    return ((queries >= 0) & windowed(queries, keys, sliding_window, causal=False))[:, None]
+    positions = jnp.atleast_2d(jnp.asarray(query_positions, jnp.int32))
+    return visibility_mask(positions.shape[1], kv_len, causal, sliding_window, query_slots=positions)
 
 
 def chunk_mask(query_positions, key_positions, chunk_size: int):
@@ -201,10 +189,9 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
     fused kernels take them as flags. Unset stays unset, so a caller that
     distinguishes no mask from an all-true one keeps doing so.
     """
-    structural = structural_mask(jnp.arange(query_length), key_length, causal, sliding_window)
-    if structural is not None:
-        mask = structural if mask is None else jnp.logical_and(mask, structural)
-    return mask
+    if not causal and sliding_window is None:
+        return mask
+    return visibility_mask(query_length, key_length, causal, sliding_window, mask=mask)
 
 
 def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
@@ -241,14 +228,14 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
 def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_window: int | None, mask=None,
                     segment_ids=None, key_value_seq_lengths=None, key_value_seq_starts=None, *,
                     block_groups=None, image_groups=None, key_valid=None, key_runs=None,
-                    places=None) -> jax.Array:
+                    places=None, chunk: int | None = None, query_slots=None) -> jax.Array:
     """The keys each query sees, `[B or 1, 1, Q, K]`: the call's spans (`key_spans`) as a mask
     (`template.dense`), narrowed by `mask`. It is the mask a call's coordinates mean on the paths
     whose kernel does not read them all."""
     seen = template.dense(key_spans(query_length, key_length, causal, sliding_window, segment_ids,
                                     key_value_seq_lengths, key_value_seq_starts, block_groups=block_groups,
                                     image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-                                    places=places))[:, None]
+                                    places=places, chunk=chunk, query_slots=query_slots))[:, None]
     return seen if mask is None else jnp.logical_and(seen, mask)
 
 
@@ -296,8 +283,7 @@ def with_key_lengths(mask: jax.Array | None, lengths: jax.Array, key_length: int
     """`mask` narrowed to each row's first `lengths[b]` keys, `[B, 1, 1, K]`
     where there was no mask. This is the mask a `key_value_seq_lengths`
     call means on the paths whose kernel takes no lengths."""
-    kept = (jnp.arange(key_length) < lengths[:, None])[:, None, None, :]
-    return kept if mask is None else jnp.logical_and(mask, kept)
+    return visibility_mask(1, key_length, False, None, mask=mask, key_value_seq_lengths=lengths)
 
 
 def with_key_starts(mask: jax.Array | None, starts: jax.Array | None, key_length: int) -> jax.Array | None:
@@ -306,8 +292,7 @@ def with_key_starts(mask: jax.Array | None, starts: jax.Array | None, key_length
     starts leave `mask` as it is."""
     if starts is None:
         return mask
-    kept = (jnp.arange(key_length) >= jnp.asarray(starts)[:, None])[:, None, None, :]
-    return kept if mask is None else jnp.logical_and(mask, kept)
+    return visibility_mask(1, key_length, False, None, mask=mask, key_value_seq_starts=starts)
 
 
 def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = False,
