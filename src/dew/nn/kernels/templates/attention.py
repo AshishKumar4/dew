@@ -84,10 +84,15 @@ def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax
 
 
 def dense(spans: KeySpans) -> jax.Array:
-    """`visible` over every query and key: `[B, Q, K]` boolean."""
-    queries = jnp.arange(spans.start.shape[1])[:, None]
-    keys = jnp.arange(spans.keys)[None, :]
-    return jax.vmap(lambda row: visible(spans, row, queries, keys))(jnp.arange(spans.start.shape[0]))
+    """`visible` over every query and key: `[B, Q, K]` boolean, by broadcasting alone (`within`), so a
+    batch-sharded call's spans take no gather."""
+    keys = jnp.arange(spans.keys)[None, None, :]
+    ids = (None if spans.query_ids is None or spans.key_ids is None
+           else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))
+    # A run axis stays last (`within`), the keys' axis beside the queries'.
+    start, end = ((spans.start[:, :, None, :], spans.end[:, :, None, :]) if spans.start.ndim == 3
+                  else (spans.start[:, :, None], spans.end[:, :, None]))
+    return within(keys, start, end, ids)
 
 
 def reads(spans: KeySpans) -> jax.Array:

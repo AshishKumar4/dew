@@ -131,8 +131,11 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     unfilled slots; a window retains the query and its preceding W-1 keys.
     """
     positions = jnp.atleast_2d(jnp.asarray(query_positions, jnp.int32))
-    return visibility_mask(positions.shape[1], kv_len, causal=True, sliding_window=sliding_window,
-                           key_valid=key_valid, query_slots=positions)
+    seen = visibility_mask(positions.shape[1], kv_len, causal=True, sliding_window=sliding_window,
+                           query_slots=positions)
+    # The filled slots ANDed after the spans, which then search no keys' ids: a batch-sharded cache's
+    # validity takes no gather under explicit sharding (test_parallelism_matrix's data4_explicit).
+    return seen if key_valid is None else seen & jnp.asarray(key_valid, bool)[:, None, None, :]
 
 
 def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
