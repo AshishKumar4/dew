@@ -879,8 +879,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
-                     **({"whole_suite": counts[name]["whole_suite"]} if "whole_suite" in counts.get(name, {})
-                        else {}),
+                     **{key: cells for key, cells in counts.get(name, {}).items() if key == "whole_suite"},
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:
