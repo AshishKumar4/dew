@@ -747,9 +747,16 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
         _check_backward("causal", (1, 64, 2, 1), form=form, interpret=True, keys=256)
 
 
+HOPPER_HOOK_SITES = ("alibi", "resumed", "softcap-sinks-alibi")
+"""The hooked backward's sites the H100 alone runs (`…_under_every_score_hook_on_an_h100`, compiled, at the
+template site's shape and seeds): a head's ALiBi slope or a resumed state is one value a draw, so check 1
+takes 128 draws at any head count, past the CPU suite's 240 s target interpreted (1.9 s a draw a row of two
+heads: 270 to 650 s, row 1849); the CPU keeps every other hook, sinks and softcap among them."""
+
+
 @INTERPRETS
 @pytest.mark.parametrize("form", ["default", "accurate"])
-@pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
+@pytest.mark.parametrize("hooks", [hooks for hooks in BACKWARD_HOOKS if hooks not in HOPPER_HOOK_SITES])
 def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
     """The backward in both forms under each score hook over causal packed documents under a window, under
     the interpreter: the gradients of the queries, keys and values, of each hook parameter and of the initial
