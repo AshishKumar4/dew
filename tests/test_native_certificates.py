@@ -40,7 +40,8 @@ def draw(seed: int, signed: bool):
     def values(shape):
         return bf16(rng.normal(size=shape) if signed else rng.uniform(0.5, 2.0, size=shape))
 
-    return (values((ROWS, DEPTH)), values((len(SIZES), DEPTH, WIDTH)) / np.sqrt(DEPTH),
+    # The matrices scaled before they are rounded: the products certified are of the values the kernel reads.
+    return (values((ROWS, DEPTH)), bf16(values((len(SIZES), DEPTH, WIDTH)) / np.sqrt(DEPTH)),
             values((ROWS, WIDTH)))
 
 
