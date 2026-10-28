@@ -302,8 +302,9 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
 
 @pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
 def test_the_mosaic_launches_state_their_work(training):
-    """A bf16 gated delta rule's forward, or its forward and gradient, through the template, lowered for an
-    H100: every launch states its cost (`_kernel`'s, `templates.gemm.cost`), which Dew's FLOP count reads to
+    """A bf16 gated delta rule's forward, or its forward and gradient, through the template, lowered for the
+    GPU the test runs on, or off one an H100 (Mosaic GPU lowers no Hopper copy for an A100's device):
+    every launch states its cost (`_kernel`'s, `templates.gemm.cost`), which Dew's FLOP count reads to
     size it (`instrumentation._stated_flops`: no launch unsized, row 1895's kernel report), their products
     together at least the model's recurrent function's (`flops.delta_flops`: the chunked form's preparation
     and inversion are work past it)."""
@@ -321,7 +322,8 @@ def test_the_mosaic_launches_state_their_work(training):
     def rule(*operands):
         return mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1))[0].astype(jnp.float32).sum()
 
-    with generation.assumed("sm90"):
+    lowered_for = generation.device_generation() if mainloop.family_of() is not None else "sm90"
+    with generation.assumed(lowered_for):
         fn = jax.grad(rule, argnums=(0, 1, 2)) if training else rule
         text = jax.jit(fn).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
     launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
