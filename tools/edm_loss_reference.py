@@ -115,7 +115,8 @@ def run(loss, net, network, arrays: dict, dtype) -> dict[str, np.ndarray]:
     for hook in hooks:
         hook.remove()
     value.mean().backward()
-    out = {"sigma": sigmas[0].reshape(-1).numpy(), "loss": value.detach().numpy(),
+    # Each image's sigma a row of its own: a lognormal spread's largest would size the whole leaf.
+    out = {"sigma": sigmas[0].reshape(-1, 1).numpy(), "loss": value.detach().numpy(),
            "grad/network_output": outputs[0].grad.numpy()}
     head = getattr(net, "logvar_linear", None)
     if head is not None:

@@ -83,7 +83,7 @@ def edm_loss(inputs):
     weights = {name: jnp.asarray(inputs[name]) for name in ("a", "b", "c")}
     output = jax.grad(lambda offset: jnp.mean(per_element(process, inputs, weights, offset=offset)))(
         jnp.zeros(nhwc(inputs["images"]).shape))
-    return {"sigma": process.schedule.sigmas(jnp.asarray(inputs["normals"])),
+    return {"sigma": process.schedule.sigmas(jnp.asarray(inputs["normals"]))[:, None],
             "loss": per_element(process, inputs, weights),
             "grad/network_output": jnp.transpose(output, (0, 3, 1, 2))}
 
@@ -101,7 +101,7 @@ def edm2_loss(inputs):
         return jnp.mean(per_element(process, inputs, weights, head, offset))
 
     gradient, output = jax.grad(mean, argnums=(0, 1))(weights, jnp.zeros(nhwc(inputs["images"]).shape))
-    return {"sigma": process.schedule.sigmas(jnp.asarray(inputs["normals"])),
+    return {"sigma": process.schedule.sigmas(jnp.asarray(inputs["normals"]))[:, None],
             "loss": per_element(process, inputs, weights, head),
             "grad/network_output": jnp.transpose(output, (0, 3, 1, 2)),
             "grad/logvar_weight": gradient["head"]["params"]["linear"][MP_KERNEL].T}
@@ -114,7 +114,7 @@ def test_the_training_sigmas_are_nvlabs(regime, site):
     them over the recorded seeds (check 1)."""
     schedule = EDM(regime=regime)().schedule
     draw, recorded, truth, seeds = recorded_site(site)
-    assert_as_exact(lambda index, inputs: {"sigma": schedule.sigmas(jnp.asarray(inputs["normals"]))},
+    assert_as_exact(lambda index, inputs: {"sigma": schedule.sigmas(jnp.asarray(inputs["normals"]))[:, None]},
                     as_given(lambda index, inputs: {"sigma": recorded(index, inputs)["sigma"]}), draw,
                     f"{site} sigmas", seeds=seeds,
                     truth_fn=as_given(lambda index, inputs: {"sigma": truth(index, inputs)["sigma"]}))
