@@ -974,10 +974,12 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
 
 def _intra_held(call: _Call) -> _Held:
     """The intra launch's registers (`_intra`): the sum of the pairs, beside a sub-chunk's and key block's
-    prefix halves, exponent, gated rows and keys; then the doubling's, as the solve's."""
+    prefix halves and exponent, its rows and keys widened and each one's exponential, gated (seven tiles: at
+    four an H100's compile spilled 64 bytes a thread 32 columns wide, Kimi delta attention's); then the
+    doubling's, as the solve's."""
     pairing = (_pairing_operand(call), CHUNK, call.block)
     return _Held(phases=(
-        [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 4 + _masks(CHUNK, call.block) * 2
+        [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 7 + _masks(CHUNK, call.block) * 2
         + _fragments(call, pairing, pairing),
         [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
 
@@ -1340,12 +1342,14 @@ def _output_held(call: _Call, bv: int) -> _Held:
     under a decay a head the first step's scores too, their sum, their pairs' decays and their masks (an
     fp32 call's split into parts), held with the value block's tiles, the step's whole set (as its phases
     alone, a 64-wide value block's output spilled 16 bytes a thread on an A100's at 200 stated registers);
-    under one a key dimension a key block's prefix halves and the scores in fp32."""
+    under one a key dimension a key block's prefix halves, its decay raised from them and its queries widened,
+    and the scores in fp32 (at the halves alone an H100's compile spilled 100 bytes a thread, Kimi delta
+    attention's at 216 stated registers)."""
     held, memories = call.held, call.memories
     values = [_f32(CHUNK, bv)] * 2 + _held(held, CHUNK, bv) + _fragments(
         call, (call.given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
     if call.per_key:
-        return _Held(phases=(values + [_f32(CHUNK, call.block)] * 2 + [_f32(CHUNK, CHUNK)],))
+        return _Held(phases=(values + [_f32(CHUNK, call.block)] * 4 + [_f32(CHUNK, CHUNK)],))
     return _Held(phases=(values + [_f32(CHUNK, bv)] + [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
                          + (_held(held, CHUNK, CHUNK) if held.parts > 1 else []),))
 
@@ -1356,7 +1360,10 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
     value block: under a decay a head its own pairs' scores taken once, at the first step, and staged for
     every block's (`algebra.chunk_scores`, `chunk_output`), under one a key dimension the intra launch's
     (`scores`, `_intra`; `algebra.key_decayed_output`)."""
-    width, value_width, bv, gates = call.width, call.value_width, tiles.output_block, call.gates
+    bv = tiles.output_block
+    # Under a decay a key dimension its key block is the widest whose tiles a thread holds (`_narrowed`).
+    call = _narrowed(call, lambda narrowed: _output_held(narrowed, bv)) if call.per_key else call
+    width, value_width, gates = call.width, call.value_width, call.gates
     held, memories, family = dataclasses.replace(call.held, rows=call.rows), call.memories, call.family
     steps = value_width // bv
 
