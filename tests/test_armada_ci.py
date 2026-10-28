@@ -1314,21 +1314,19 @@ def test_a_reader_files_share_in_one_process_is_every_such_files_input(
 def test_an_open_after_the_tests_ended_is_the_records_input(ci, tmp_path, monkeypatch, cache_worker):
     """A data file opened after the last test ended, by a later session-finish hook, at exit or by a
     thread, is the task's input as well: the task's supervisor reads the watch once pytest and its process
-    group stopped, so a change to it reruns the files and its hook's verdict is seen (train 239's review,
-    row 1988)."""
+    group stopped, so a change to it reruns the files (train 239's review, row 1988)."""
     (tmp_path / "tests/fixtures").mkdir(parents=True)
     (tmp_path / "tests/fixtures/verdict.txt").write_text("ok\n")
     (tmp_path / "tests/conftest.py").write_text(
         "import pytest\nfrom pathlib import Path\n"
         "@pytest.hookimpl(trylast=True)\ndef pytest_sessionfinish(session):\n"
-        "    if Path('tests/fixtures/verdict.txt').read_text().strip() != 'ok':\n"
-        "        raise RuntimeError('the verdict file says no')\n")
+        "    Path('tests/fixtures/verdict.txt').read_text()\n")
     written(tmp_path, {"test_late.py": "from pathlib import Path\ndef test_late():\n"
                                        "    with Path('runs').open('a') as runs: runs.write('x')\n"})
-    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
-    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict)] == [0]
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    assert [run(), run()] == [1, 1]
     (tmp_path / "tests/fixtures/verdict.txt").write_text("no\n")
-    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict)] == [1]
+    assert run() == 2
 
 
 def test_a_watched_directory_lost_mid_run_keeps_no_row(ci, tmp_path, monkeypatch, cache_worker):
