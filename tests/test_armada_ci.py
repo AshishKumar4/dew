@@ -1402,8 +1402,9 @@ def planned_checkout(ci, root: Path, monkeypatch, cache_worker,
     written, and the plan's 3.12 entries' files, each entry's sorted."""
     verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
     vendor, family, model = pinned.split("-")
-    (root / ".armada.json").write_text(json.dumps(
-        {"task": {"cpu": {"vendor": vendor, "family": int(family), "model": int(model)}}}))
+    config = json.loads((ROOT / ".armada.json").read_text())
+    config["task"]["cpu"] = {"vendor": vendor, "family": int(family), "model": int(model)}
+    (root / ".armada.json").write_text(json.dumps(config))
     names = ("a", "b", "c")
     written(root, {f"test_{name}.py": "from pathlib import Path\n"
                                      f"def test_{name}():\n"
