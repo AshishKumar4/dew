@@ -89,7 +89,6 @@ from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
 from dew.quantization import decoded_frozen_fp8, decoded_stored, moving_weights, quantized_products
 
-from .activations import UNGATED
 from .attention import FORWARD_MODE, LayerNorm
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks
 from .mlp import GatedMLP
@@ -217,14 +216,14 @@ class MLPMemory(nn.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         widths = (*self.hidden, x.shape[-1])
         for first in range(0, len(widths), 2):
-            if first:
-                x = UNGATED[self.activation](x)
             if first + 1 == len(widths):
                 return Dense(widths[first], dtype=self.dtype, precision=self.precision,
                              name=f"layers_{first}")(x)
+            # A pair before further layers applies the activation after its second map too.
             mlp = GatedMLP(widths[first], widths[first + 1], self.activation, use_bias=True, linear=Dense,
-                           in_features=x.shape[-1], names=(f"layers_{first}", f"layers_{first + 1}"),
-                           dtype=self.dtype, precision=self.precision)
+                           in_features=x.shape[-1], activation_after=first + 2 < len(widths),
+                           names=(f"layers_{first}", f"layers_{first + 1}"), dtype=self.dtype,
+                           precision=self.precision)
             nn.share_scope(self, mlp)
             x = mlp(x)
         return x

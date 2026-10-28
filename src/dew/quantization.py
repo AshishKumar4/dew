@@ -1383,15 +1383,15 @@ def _serving_provider() -> type:
     class PtqProvider(_group_scaled_convolution(), _complex_in_float(), qwix.PtqProvider):
         keeps_out_sharding: ClassVar[bool] = True  # ptq.py:180 passes it on
 
-        def __init__(self, rules: Sequence[object], moving: Sequence[object] = ()) -> None:
+        def __init__(self, rules: Sequence[object], moving: Sequence[object]) -> None:
             super().__init__(
                 rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
                 _einsum_fn=_scaled_in_float32(qwix.einsum),
                 _conv_general_dilated_fn=_scaled_in_float32(
                     _integer_convolution_on_cuda(qwix.conv_general_dilated)))
             # The training provider over the spec's training rules, which forms a moving weight's
-            # products (`moving_weights`); none where the caller gives no training rules.
-            self._moving = _providers()[0](moving) if moving else None
+            # products (`moving_weights`).
+            self._moving = _providers()[0](moving)
 
         def _moved(self, op: str, weight) -> QtProvider | None:
             """The training provider that multiplies `weight` where it is a moving weight a rule matches
@@ -1399,10 +1399,6 @@ def _serving_provider() -> type:
             other weight."""
             if not MOVING.get() or isinstance(weight, Annotated) or not self._matched(op):
                 return None
-            if self._moving is None:
-                raise ValueError(f"a moving weight reached a quantized {op}, and this serving provider "
-                                 "holds no training rules to round it by; quantize through "
-                                 "quantize_for_serving")
             return self._moving
 
         def _recorded(self, op: str, weight) -> bool:
@@ -1430,6 +1426,11 @@ def _serving_provider() -> type:
             out = self._dot_general_fn(*_widened((lhs, rhs.array), preferred_element_type),
                                        dimension_numbers, out_sharding=out_sharding)
             return _honoured(out, preferred_element_type, None)
+
+        def conv_general_dilated(self, lhs, rhs, *args, **kwargs):
+            if (moving := self._moved("conv_general_dilated", rhs)) is not None:
+                return moving.conv_general_dilated(lhs, rhs, *args, **kwargs)
+            return super().conv_general_dilated(lhs, rhs, *args, **kwargs)
 
         def einsum(self, einsum_str, *operands, **kwargs):
             if len(operands) == 2 and (moving := self._moved("einsum", operands[1])) is not None:
