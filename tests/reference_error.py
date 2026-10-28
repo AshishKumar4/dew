@@ -881,9 +881,8 @@ SKETCH_VERSION = 2
 """The sketch a recording keeps (`<site>.sketch_version`; a recording that names none keeps version 1):
 1 dense, an entry's SKETCH signs its own random bits; 2 structured, an entry's sign k its own random
 sign times its column's and its row's sign k (`truth_sketch`), which a leaf's grid multiplies by a matrix
-product: on armada's CPUs (debug/sketch-v2-bench, 10-27) 30 ms to 3.2 at 2^16 entries, 200 to 41 at 2^20,
-1620 to 290 at 2^23 (Main, 10-27: gemma4_unified's recorded backward spent 430 s of its 700 s
-sketching)."""
+product, sixfold cheaper on armada's CPUs at 2^20 entries (Main, 10-27: gemma4_unified's recorded
+backward spent 430 s of its 700 s sketching)."""
 SKETCH_COLUMNS = 4096
 """The most columns of a leaf's grid in the structured sketch, a smaller leaf's one row of its own entries:
 its entries in order, row by row, the last row padded with zeros, each sign k an entry's own random sign
