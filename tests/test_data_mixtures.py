@@ -32,13 +32,13 @@ from token_support import write_token_corpus
 
 from dew import position
 from dew.batch import VALID_ROWS, freeze, thaw
-from dew.data import Files, Loading, Memory, phases, presets, schedule
+from dew.data import Files, Loading, Memory, from_grain, phases, presets, schedule
 from dew.data.compile import compile, held, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, PhasedStream, Ramp, Stage, ramped
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
-from dew.data.sources import Grain, TokenFiles
+from dew.data.sources import TokenFiles
 from dew.objectives.base import Aux, Objective, Ratio
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -1803,7 +1803,7 @@ def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_co
     # as a stream of its own share (as a token-budget batch reads them too).
     # Grain stores, each read by index as a run's files are: one held in memory is scanned for the
     # records it holds before it is read (`_Present`).
-    corpora = [Pipeline(Grain(pygrain.MapDataset.source(Seen(64, corpus, touched)), name=f"seen-{corpus}"))
+    corpora = [Pipeline(from_grain(pygrain.MapDataset.source(Seen(64, corpus, touched)), f"seen-{corpus}"))
                .shuffle(corpus).repeat().filter(Kept()) for corpus in range(300)]
     weights = [1.0, 1.0] + [1e-9] * 298
     data = compile(mix(corpora, weights).batch(8), read="indexed", seed=0,
