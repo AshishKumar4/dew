@@ -53,7 +53,7 @@ from dew.nn.precision import capped_logits, head_product, scaled_logits
 if TYPE_CHECKING:
     from dew._records import JSON
     from dew.diffusion.process import DenoisingCondition
-    from dew.inputs.encoders import ConditionWork
+    from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.cross_attention import CrossAttention
     from dew.nn.dit import TextContext

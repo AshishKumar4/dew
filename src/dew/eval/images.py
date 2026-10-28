@@ -26,7 +26,7 @@ from dew.artifacts import ImageGrid, uint8_pixels
 from dew.batch import Batch
 from dew.data.images import CAPTIONS
 from dew.nn.precision import accumulated
-from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
+from dew.nn.text_checkpoints import DEFAULT_MODEL as CLIP_CHECKPOINT
 
 from .common import ImageMetric, metric_device
 

@@ -66,6 +66,9 @@ collected: dict[str, int] = {}
 is 0."""
 deselected: dict[str, int] = {}
 """Each test file's tests the selection set aside, as pytest reports it (`pytest_deselected`)."""
+whole_suite: dict[str, list[str]] = {}
+"""Each test file's tests marked whole_suite, by their node ids, as pytest resolves a node's marks (its own,
+its class's, its module's, a parameter set's, a conftest's), which `ci.py slow` reads in the file's row."""
 starts: dict[str, int] = {}
 """How many followed children each test file's own process started (`followed.start`)."""
 children = Path(tempfile.mkdtemp(prefix="dew-children-"))
@@ -192,6 +195,12 @@ def pytest_deselected(items):
     tally(deselected, items)
 
 
+def pytest_collection_finish(session):
+    for item in session.items:
+        if item.get_closest_marker("whole_suite"):
+            whole_suite.setdefault(item.nodeid.split("::")[0], []).append(item.nodeid)
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_fixture_setup(fixturedef, request):
     if fixturedef.scope != "session":
@@ -229,8 +238,10 @@ def pytest_sessionfinish(session):
         Path(out).write_text(json.dumps(recorded))
     # Each file's collection, which accounts for a file whose every test the selection set aside (`ci.py`).
     if counted := os.environ.get("DEW_COLLECTED"):
-        Path(counted).write_text(json.dumps({name: {"collected": count, "deselected": deselected.get(name, 0)}
-                                             for name, count in collected.items()}))
+        Path(counted).write_text(json.dumps({
+            name: {"collected": count, "deselected": deselected.get(name, 0),
+                   **({"whole_suite": whole_suite[name]} if name in whole_suite else {})}
+            for name, count in collected.items()}))
 
 
 def gpu_peak() -> int | None:
