@@ -466,28 +466,114 @@ def test_a_clocked_run_whose_last_examples_make_no_rows_ends_at_its_bound(accumu
     assert CLOCKED_RECORDS % 3 == 0 and int(state.consumed) == CLOCKED_RECORDS
 
 
-def test_a_run_on_steps_keeps_no_examples_clock(tmp_path):
-    """Only a run on the examples clock pays for it: a run of steps over the same data reads batches without
-    the count of the examples they consume, which an examples bound adds, keeps no clock in its state, and
-    checkpoints none."""
-    (x,) = clocked_records(0)
-    batches = []
-    for examples in (CLOCKED_RECORDS, None):
-        loader, _ = fitted(clocked_chain(x), None, objective=Echoed().data(), examples=examples)
-        stream = loader.train(DataPartition())
-        try:
-            batches.append(next(stream))
-        finally:
-            if isinstance(stream, Closeable):
-                stream.close()
-    assert set(batches[0]) - set(batches[1]) == {EXAMPLES_CONSUMED} and set(batches[1]) <= set(batches[0])
+def thin_fit(x, accumulation: int = 1, **fit):
+    """A run of `Thin` over CLOCKED_RECORDS records of `x` (`clocked_chain`) under `Linear`, fitted as
+    `fit` says: its final state."""
     optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    chain = fit.pop("chain", clocked_chain(x))
+    return Trainer(Thin(), optim, key=0, accumulation=accumulation,
+                   checkpoints=fit.pop("checkpoints", None)).fit(chain, log_every=1, **fit)
+
+
+def test_a_clocked_run_a_take_ends_first_consumes_only_what_it_dispatched():
+    """A take after the batch ends a clocked run before its bound: the run consumed the examples whose last
+    rows its two batches held (ids 1 to 16, the rowless every third carried on), not the bound it never
+    read to, which only a stream that ran out at its bound gives its last batch."""
+    (x,) = clocked_records(0)
+    state = thin_fit(x, chain=clocked_chain(x).take(2), examples=CLOCKED_RECORDS)
+    assert int(state.step) == 2 and int(state.consumed) == 16
+
+
+def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_clock_keeps_none(tmp_path):
+    """A state supplied to a fit opens its data afresh: a clocked fit from a finished clocked run's state
+    consumes its whole bound again from none, ending at it; a run of steps from that state keeps no clock,
+    in its state or its checkpoints."""
+    (x,) = clocked_records(0)
+    first = thin_fit(x, examples=CLOCKED_RECORDS)
+    again = thin_fit(x, examples=CLOCKED_RECORDS, state=first)
+    assert int(first.consumed) == int(again.consumed) == CLOCKED_RECORDS
+    assert int(again.step) == 2 * int(first.step)
     checkpoints = Checkpoints(str(tmp_path))
-    state = Trainer(Echoed(), optim, key=0, checkpoints=checkpoints).fit(
-        clocked_chain(x), steps=3, log_every=1, checkpoint_every=3)
+    stepped = thin_fit(x, steps=int(first.step) + 2, state=first, checkpoints=checkpoints, checkpoint_every=1)
     checkpoints.wait()
-    assert state.consumed is None
-    assert not {CONSUMED_EXAMPLES, CONSUMED_COMMITTED} & checkpoints.control(3).keys()
+    assert stepped.consumed is None
+    assert not {CONSUMED_EXAMPLES, CONSUMED_COMMITTED} & checkpoints.control(int(stepped.step)).keys()
+
+
+class Seen(Pulled):
+    """`Pulled`, keeping the fields of every batch its loss is traced over."""
+
+    def __init__(self):
+        super().__init__()
+        self.fields: list[frozenset[str]] = []
+
+    def loss(self, variables, batch, step):
+        self.fields.append(frozenset(batch))
+        return super().loss(variables, batch, step)
+
+
+def test_only_a_run_on_the_examples_clock_carries_its_count_to_the_step(tmp_path):
+    """A run bounded in examples whose plan counts its steps ahead (a global order read in memory) runs on
+    steps: the count its data marks rides no batch into its step, its state keeps no clock and its
+    checkpoints none, while a run whose plan counts none reads the count in its step."""
+    (x,) = clocked_records(0)
+    ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    planned = Pipeline(Memory({"x": x, "id": ids})).read("memory").batch(BATCH)
+    loader, _ = fitted(planned, None, objective=Seen().data(), examples=CLOCKED_RECORDS)
+    stream = loader.train(DataPartition())
+    try:
+        assert EXAMPLES_CONSUMED in next(stream)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    seen, checkpoints = Seen(), Checkpoints(str(tmp_path))
+    state = Trainer(seen, optim, key=0, checkpoints=checkpoints).fit(
+        planned, examples=CLOCKED_RECORDS, log_every=1, checkpoint_every=1)
+    checkpoints.wait()
+    assert state.consumed is None and seen.fields
+    assert not any(EXAMPLES_CONSUMED in held for held in seen.fields)
+    assert not {CONSUMED_EXAMPLES, CONSUMED_COMMITTED} & checkpoints.control(int(state.step)).keys()
+    clocked = Seen()
+    Trainer(clocked, optim, key=0).fit(clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
+    assert clocked.fields and all(EXAMPLES_CONSUMED in held for held in clocked.fields)
+
+
+def test_a_clocked_run_whose_split_is_planned_compiles_one_step():
+    """Every batch of a clocked run carries whether it closes its window, so a run whose first compile
+    plans its split keeps one step program: one compile over its batches of one shape, its short last
+    batch filled to it."""
+    (x,) = clocked_records(0)
+    tracker = RecordingTracker()
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    Trainer(Echoed(), optim, key=0, tracker=tracker).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
+                                                         log_every=1)
+    assert len(tracker.scalars) > 1
+    assert sum("train/compile_s" in scalars for _, scalars in tracker.scalars) == 1
+
+
+def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():
+    """A batched step after a pack that makes no rows of a group of windows leaves the examples whose last
+    tokens those windows held to the next window kept: the batches of a read bounded in examples consume
+    every one once, where the step's empty group was refused."""
+    docs = [np.full(index % 4 + 2, index + 1, np.int32) for index in range(12)]
+
+    def drop_first(columns):
+        # The group of windows holding the first document's tokens makes no rows; the rest keep theirs.
+        if any(1 in np.asarray(window) for window in columns["text"]):
+            return {name: [] for name in columns}
+        return columns
+
+    chain = (Pipeline(Memory({"text": docs})).read("streamed").pack(6, fields=("text",))
+             .flat_map(drop_first, batched=True, batch_size=2).batch(2))
+    stream = compile(chain, read="streamed", examples=len(docs)).train(DataPartition())
+    try:
+        batches = list(stream)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    assert not any(1 in np.asarray(batch["text"]) for batch in batches)
+    assert sum(int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in batches) == len(docs)
 
 
 def clocked_records(seed: int) -> tuple[np.ndarray]:

@@ -269,6 +269,49 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         self._predicate.consumed = integer(counted.get("consumed", 0), "consumed examples pending")
 
 
+class Carried(pygrain.IterDataset[Batch]):
+    """`parent`'s rows, each marker's source examples (`Rejected.consumed`) carried on to the next row and
+    the markers dropped, counting nothing: the carrier after a step whose markers no corpus's count
+    follows, a batched map's group it makes no rows of (`dew.data.lowering._Groups`). The examples it
+    owes are checkpointed with its parent's position; those the stream ends owing are its end's
+    (`dew.training._fit.drained`)."""
+
+    def __init__(self, parent: pygrain.IterDataset[Batch | Rejected]):
+        super().__init__(parent)
+        self._records = parent
+
+    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
+        return _CarriedIterator(iter(self._records))
+
+
+class _CarriedIterator(pygrain.DatasetIterator[Batch]):
+    def __init__(self, parent: pygrain.DatasetIterator):
+        super().__init__(parent)
+        self._read, self._owed = parent, 0
+
+    def __next__(self) -> Batch:
+        while True:
+            element = next(self._read)
+            if isinstance(element, Rejected):
+                self._owed += element.consumed
+                continue
+            owed, self._owed = self._owed, 0
+            if not owed:
+                return element
+            held = integer(element.get(CONSUMED, 0), "a row's consumed examples")
+            return {**element, CONSUMED: owed + held}
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"parent": self._read.get_state(), "owed": self._owed}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._read.set_state(record(state["parent"], "carried parent"))
+        self._owed = integer(state["owed"], "examples owed")
+
+    def close(self) -> None:
+        self._read.close()
+
+
 class Accepted(pygrain.IterDataset[Batch]):
     """Grain's filter, with checkpointed counts. A filter of an endless repeat whose passes it
     rejects alike refuses a run of `certain_after` rejections, two whole passes, as reading nothing

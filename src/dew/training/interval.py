@@ -194,12 +194,10 @@ class Interval:
             checked_streak(int(on_host(streak, step)), step, display)
 
     @classmethod
-    def resumed(cls, control: dict, *, last_saved: int | None, consumed: int | None = None) -> Interval:
-        """An interval from now on, its token clock read off a checkpoint's `control`
-        (`committed_tokens`), which it takes the clock's fields out of, its consumed examples the
-        checkpoint's, or a state's it starts from where it is given one (`consumed`)."""
-        held = int(control.pop(CONSUMED_EXAMPLES, 0))
-        consumed = held if consumed is None else consumed
+    def resumed(cls, control: dict, *, last_saved: int | None) -> Interval:
+        """An interval from now on, its token clock and its consumed examples read off a checkpoint's
+        `control` (`committed_tokens`), which it takes the clocks' fields out of."""
+        consumed = int(control.pop(CONSUMED_EXAMPLES, 0))
         committed = int(control.pop(CONSUMED_COMMITTED, consumed))
         return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control),
                    resumable=last_saved, consumed=consumed, consumed_before=consumed,

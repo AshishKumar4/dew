@@ -714,7 +714,17 @@ def compile(
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured)
     loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
-    return loader if examples is None else dataclasses.replace(loader, examples=examples)
+    if examples is None:
+        return loader
+    return dataclasses.replace(loader, examples=examples, bound_ends=_bound_ends(staged.original))
+
+
+def _bound_ends(pipeline: Pipeline) -> bool:
+    """Whether `pipeline`'s read, bounded in examples (`_bounded`), ends where its bound does: no limit or
+    slice after the bound ends it first (`Loader.bound_ends`)."""
+    at = next((index for index, stage in enumerate(pipeline.stages)
+               if isinstance(stage, Map) and isinstance(stage.step, Consumed)), len(pipeline.stages))
+    return not any(isinstance(stage, (Limit, Slice)) for stage in pipeline.stages[at + 1:])
 
 
 def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective: ObjectiveData | None,

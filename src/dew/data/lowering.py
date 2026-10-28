@@ -74,6 +74,7 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import (
     Accepted,
+    Carried,
     Chunked,
     CorpusCounts,
     KeyedMix,
@@ -635,8 +636,9 @@ class _Groups:
         if not consumed:
             return outputs
         if not outputs:
-            raise ValueError("a batched step made no rows of a group of a run bounded in examples, which "
-                             "leaves the examples the group consumes on no row; keep a row of each group")
+            # A group it makes no rows of leaves its examples on a marker, which the next row carries on
+            # (`Carried`).
+            return [Rejected("empty_expansion", consumed=sum(consumed))] if sum(consumed) else []
         return [*({**row, CONSUMED: 0} for row in outputs[:-1]), {**outputs[-1], CONSUMED: sum(consumed)}]
 
 
@@ -1731,6 +1733,8 @@ class _Build:
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, _Groups(stage))
+            if _consumes(pipeline):
+                rows = Carried(rows)
         else:
             return self.layout_stage(rows, stage, pipeline)
         return rows

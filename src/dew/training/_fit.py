@@ -422,12 +422,11 @@ def drained(batch: Batch, consumed: int, bound: int) -> Batch:
     if not remainder:
         return batch
     column = batch[EXAMPLES_CONSUMED]
-    # The batch's first row takes them: the step sums the column over the whole batch.
-    if isinstance(column, jax.Array):
-        credited = jax.device_put(column.at[0].add(remainder), column.sharding)
-    else:
-        credited = np.asarray(column).copy()
-        credited[0] += remainder
+    # The batch's first row takes them, the step summing the column over the whole batch: an elementwise
+    # sum with a column laid out as the batch's, which keeps its sharding.
+    owed = np.zeros(np.shape(column), np.int32)
+    owed[0] = remainder
+    credited = column + (jax.device_put(owed, column.sharding) if isinstance(column, jax.Array) else owed)
     return {**batch, EXAMPLES_CONSUMED: credited, CONSUMED_COUNT: ConsumedCount(held.examples + remainder)}
 
 

@@ -1398,8 +1398,7 @@ class Trainer(Generic[Loss, Effects]):
         current, position, placed, abstract = self._starting(run, plan.dataset, initial, resume)
         run.last_checkpoint = time.perf_counter()
         interval = Interval.resumed(run.stop_control, last_saved=(
-            current if checkpoints is not None and checkpoints.latest is not None else None),
-            consumed=None if initial is None or initial.consumed is None else int(initial.consumed))
+            current if checkpoints is not None and checkpoints.latest is not None else None))
         state, shardings, complete = self._opened(plan, run, interval, current, position, placed, abstract,
                                                   resumed=initial is None and interval.last_saved is not None)
         if complete:
@@ -1429,7 +1428,7 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                batch, ahead = self._closes(run, interval, batch)
+                batch, ahead = self._closes(run, interval, batch, plan.dataset.bound_ends)
                 batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
                 device, _ = split_fields(batch)
                 inputs = self.objective.inputs
@@ -1493,21 +1492,19 @@ class Trainer(Generic[Loss, Effects]):
                     self._stop_trace(run, profile, profiler)
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
 
-    def _closes(self, run: FitRun, interval: Interval, batch: Batch) -> tuple[Batch, bytes | None]:
+    def _closes(self, run: FitRun, interval: Interval, batch: Batch,
+                bound_ends: bool) -> tuple[Batch, bytes | None]:
         """`batch` marked where it is a clocked run's last (`CLOSES_WINDOW`), so the update it ends commits
-        with the microbatches its window holds, known by reading ahead (`FitRun.ends_here`), and the
-        stream's position after it, taken before that read, which the step saves; else as read."""
+        with the microbatches its window holds, known by reading ahead (`FitRun.ends_here`), every batch
+        of the run marked so the step keeps one program; and the stream's position after it, taken
+        before that read, which the step saves. Where its stream ran out at its bound (`bound_ends`), the
+        last also consumes the examples the bound read that no batch counted (`drained`)."""
         if self._examples is None:
             return batch, None
         position = None if run.train is None else run.train.source_state
         last = run.ends_here(interval)
-        if run.ran_out:
-            # The examples the bound read after its last row kept are consumed by the run's last batch.
+        if run.ran_out and bound_ends:
             batch = drained(batch, interval.consumed, self._examples)
-        window = (self._split or 1) * self.accumulation
-        # A split not yet planned may part the batch into a window of its own.
-        if window == 1 and self._split is not None:
-            return batch, position
         return {**batch, CLOSES_WINDOW: np.bool_(last)}, position
 
     def _closed(self, run: FitRun, primary: BaseException | None,
@@ -1569,11 +1566,11 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume))
         if initial is not None:
             # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
-            # accumulation's mirrors of the parameters with them; a run bounded in examples starts its
-            # clock where a state that keeps none stands.
+            # accumulation's mirrors of the parameters with them. Its run reads its data afresh, so a
+            # clock of examples starts at none consumed, and a run on another clock keeps none.
             initial = owned_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
-            if self._examples is not None and initial.consumed is None:
-                initial = dataclasses.replace(initial, consumed=jnp.zeros((), jnp.int32))
+            initial = dataclasses.replace(
+                initial, consumed=None if self._examples is None else jnp.zeros((), jnp.int32))
             shardings, _ = self._validated(initial)
             supplied = jax.device_put(initial, shardings)
             return int(supplied.step), None, lambda: (supplied, shardings), None
