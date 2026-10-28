@@ -573,6 +573,15 @@ def capped(softcap: float, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array
     return softcap * jnp.tanh(logits / softcap)
 
 
+def key_biased(score_mod: Callable | None, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array,
+               bias: jax.Array) -> jax.Array:
+    """`score_mod`'s logits (the scaled logits where None) plus a bias one term a key, `bias` the tile's
+    keys' `[1, k]` (a `Kind.KEY` parameter): ALiBi's slope times each key's place, added after a softcap as
+    `reference_attention` adds its bias. It is a score hook as `functools.partial(key_biased, score_mod)`."""
+    capped = logits if score_mod is None else score_mod(logits, q_pos, k_pos)
+    return capped + bias
+
+
 DROP_DOMAIN = 0x6A09E667
 """The keep draw's domain tag: the fraction bits of sqrt(2), so the draw's first word is one no other
 `fmix32` user mixes first, and its stream never coincides with theirs."""
