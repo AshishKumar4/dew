@@ -661,13 +661,21 @@ def _split_delta_forward(length: int, devices: int) -> jax.stages.Lowered:
 
 def test_a_gated_delta_net_split_over_the_sequence_runs_each_devices_own_slice():
     """A gated delta net on a mesh splitting its sequence runs the recurrence on each device's slice, as its
-    lowered H100 program states it: over two devices and 384 tokens no kernel call takes the whole sequence,
-    each its device's 192 tokens (the conv behind its halo), where the rule ran the whole sequence on every
-    device before (row 1437); and its collectives are the conv's halo and the summaries' gathers alone, no
+    lowered H100 program states it: over two devices and 384 tokens, every kernel call of the layer over one
+    device's 192 tokens is among its calls, operand for operand, but the conv's, which reads its three-token
+    halo too, beside its slice's summary (the rule from `[0 | I]`), where the rule ran the whole sequence on
+    every device before (row 1437); and its collectives are the halo's and the summaries' gathers alone, no
     activation reduced (`recurrence_chunk.entering_memory`, `linear.sequence_conv`)."""
+    def kernels(operations: list[Operation]) -> list[tuple]:
+        return [(target, operands) for name, target, operands, _ in operations
+                if name == "stablehlo.custom_call"]
+
     operations = _operations(_split_delta_forward(384, 2))
-    kernels = [operands for name, _, operands, _ in operations if name == "stablehlo.custom_call"]
-    assert kernels and all(384 not in shape for operand in kernels for shape, _ in operand), kernels
+    calls, local = kernels(operations), kernels(_operations(_split_delta_forward(192, 1)))
+    convolved = [(target, (((1, 195, 512), dtype), *rest)) for target, ((shape, dtype), *rest) in local
+                 if shape == (1, 192, 512)]
+    assert convolved and all(call in calls for call in convolved), (calls, local)
+    assert all(call in calls for call in local if call[1][0][0] != (1, 192, 512)), (calls, local)
     collectives = {_collective(name) for name, *_ in operations if _collective(name)}
     assert collectives <= {"all-gather", "collective-permute"}, collectives
 
