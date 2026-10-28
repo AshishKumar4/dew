@@ -543,7 +543,7 @@ class CausalSelfAttention(nn.Module):
             section = self.mrope_section
         return rotary_freqs(
             rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, rot_dim=self._rot_dim(),
-            partial_rotary_type=self.ctx.partial_rotary_type, rope_scaling=self.ctx.rotary_scaling(),
+            partial_rotary_type=self.ctx.partial_rotary_type, rope_scaling=self.ctx.rope_scaling,
             dtype=dtype, reach=reach, section=section)
 
     def _group_fields(self) -> tuple[str, ...]:

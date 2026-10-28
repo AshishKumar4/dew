@@ -909,7 +909,7 @@ class MLAMixer(MixerBase):
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
-            rope_scaling=ctx.rotary_scaling(),
+            rope_scaling=ctx.rope_scaling,
             scale_offset=ctx.scale_offset,
             scale_after_cast=ctx.scale_after_cast,
             attention_bias=ctx.attention_bias,

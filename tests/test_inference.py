@@ -430,6 +430,41 @@ def test_an_earlier_projector_record_reloads_its_saved_image_model(tmp_path, fam
     np.testing.assert_array_equal(actual, expected)
 
 
+def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
+    """A run saved when a decoder and its layer kinds stated YaRN in a field of its own beside
+    `rope_scaling` reloads (`earlier_shapes`), its YaRN read as today's one rope scaling (ledger
+    1898): the restored model computes, bit for bit, what the trained one does."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.layer_plan import LayerKind
+    from dew.nn.rope import YarnScaling
+    from dew.objectives.lm import LMObjective
+
+    yarn = YarnScaling(factor=4.0, original_max_position_embeddings=8)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
+                              max_seq_len=16, attention_impl="reference", rope_scaling=yarn,
+                              layer_types=("sliding_attention", "full_attention"),
+                              kinds={"sliding_attention": LayerKind(window=4, rope_scaling=yarn)})
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+
+    def earlier(fields):
+        scaling = fields.pop("rope_scaling")
+        return {**fields, "rope_scaling": None,
+                "yarn": {key: value for key, value in scaling.items() if key != "rope_type"}}
+
+    fields = record["model"]["fields"]
+    fields["kinds"]["sliding_attention"] = earlier(fields["kinds"]["sliding_attention"])
+    record["model"]["fields"] = earlier(fields)
+    with Checkpoints(str(tmp_path), keep=1) as checkpoints:
+        checkpoints.save(0, state, artifact=record)
+        checkpoints.wait()
+    restored = TextGeneration.from_run(str(tmp_path), step=0)
+    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]], jnp.int32)
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, tokens),
+                                  model.apply(state.variables, tokens))
+
+
 def test_every_route_generates_through_the_same_packed_projections(tmp_path):
     """A run's task and a source's hold their query/key/value and gate/up packed, packed once at
     their load from the weights they own; a live objective's task keeps the trainer's own arrays,

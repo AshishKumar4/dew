@@ -541,7 +541,7 @@ def test_a_yarn_layer_refuses_a_proportional_partial_rotary(rng):
     layer given YaRN and a partial rotary under the proportional convention, the default, refuses at
     its first call."""
     with pytest.raises(ValueError):
-        tiny(partial_rotary_factor=0.5, yarn=YarnScaling()).init(rng, tokens(rng))
+        tiny(partial_rotary_factor=0.5, rope_scaling=YarnScaling()).init(rng, tokens(rng))
 
 
 def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):

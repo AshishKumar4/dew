@@ -294,7 +294,7 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source):
 
 
 def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
-    """V4's layers take the model's one rope scaling (`MixerContext.rotary_scaling`), each kind's own
+    """V4's layers take the model's one rope scaling (`MixerContext.rope_scaling`), each kind's own
     in its place where the kind gives one (`kind_of`), as the compressed kinds give their YaRN ramp: a
     Llama 3.1 ramp makes the decoder compute otherwise than the unscaled one, where the layers
     forwarded YaRN alone, rotated at the plain frequencies and left the logits bit for bit the same.
@@ -304,13 +304,13 @@ def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
     ids = jnp.asarray(reference["input_ids"])
     ramp = RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0,
                        original_max_position_embeddings=4)
-    scaled, unscaled = (plain.clone(yarn=None, rope_scaling=scaling).apply(loaded.variables, ids)
+    scaled, unscaled = (plain.clone(rope_scaling=scaling).apply(loaded.variables, ids)
                         for scaling in (ramp, None))
     assert not np.array_equal(scaled, unscaled)
     longrope = LongRopeScaling(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
                                original_max_position_embeddings=4)
     with pytest.raises(ValueError):
-        plain.clone(yarn=None, rope_scaling=longrope).apply(loaded.variables, ids)
+        plain.clone(rope_scaling=longrope).apply(loaded.variables, ids)
 
 
 def test_a_prefilled_decode_cache_holds_no_payload_twice(source):

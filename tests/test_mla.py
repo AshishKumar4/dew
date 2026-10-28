@@ -471,8 +471,8 @@ def mla_model(settings: dict, **overrides) -> CausalTransformer:
         "num_heads": settings["num_attention_heads"],
         "head_dim": settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"],
         "mlp_features": 48, "max_seq_len": 64, "rope_theta": float(settings["rope_theta"]),
-        "yarn": yarn_record(settings["rope_scaling"], "rope_scaling",
-                            int(settings["max_position_embeddings"])),
+        "rope_scaling": yarn_record(settings["rope_scaling"], "rope_scaling",
+                                    int(settings["max_position_embeddings"])),
         "norm_eps": float(settings["rms_norm_eps"]), "qk_norm": False,
         "attention_bias": bool(settings["attention_bias"]),
         "mixer": mla_record(settings), "attention_impl": "reference"}
@@ -514,14 +514,14 @@ def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
                     original_max_position_embeddings=4)], ids=["llama3", "longrope"])
 def test_the_mla_kind_rotates_by_the_models_rope_scaling(scaling):
     """A model's Llama 3.1 or LongRoPE scaling reaches its latent attention as
-    it reaches its ordinary attention (`MixerContext.rotary_scaling`): the
+    it reaches its ordinary attention (`MixerContext.rope_scaling`): the
     kind's layer computes, bit for bit, what the standalone block given that
     scaling computes, where a kind that forwarded YaRN alone rotated at the
     plain frequencies (audit NN-04). The seven positions pass LongRoPE's four,
     so it reads its long factors."""
     settings = CONFIG["v3"]
     tensors = fixture("mla_v3")
-    model = mla_model(settings, yarn=None, rope_scaling=scaling)
+    model = mla_model(settings, rope_scaling=scaling)
     variables = model.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32))
     layer = variables["params"]["layers_0"]
     variables = {**variables, "params": {

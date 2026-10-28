@@ -1129,7 +1129,7 @@ def export_config(model) -> Mapping[str, object]:
     # nested rope_parameters (modeling_olmo3.py:277-291, the spelling
     # Olmo3Config.to_dict writes); a reference with one table for the whole
     # model cannot say it, so that is refused naming the kinds.
-    tables = {kind: model.kind_of(kind).yarn or model.kind_of(kind).rope_scaling
+    tables = {kind: model.kind_of(kind).rope_scaling
               for kind in sorted(set(types))}
     ramped = {kind: table for kind, table in tables.items() if table is not None}
     per_kind = bool(ramped) and (set(ramped) != set(tables)

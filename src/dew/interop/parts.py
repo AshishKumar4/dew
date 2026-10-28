@@ -426,7 +426,7 @@ def _rope(config) -> Mapping[str, object]:
         raise Ambiguous(f"the rotary's record is not one this rotation reads ({error})") from error
     fields: dict[str, object] = {'rope_theta': ropes.theta}
     if ropes.scaling is not None:
-        fields[decoder_parts.ramp_field(ropes.scaling)] = ropes.scaling
+        fields['rope_scaling'] = ropes.scaling
     return fields
 
 

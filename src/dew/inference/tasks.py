@@ -387,8 +387,9 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
     and refused where it holds more than its name and fields (ledger 1239),
     a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
-    fields (`_earlier_projectors`, ledger 1622), and a row of segments' question budgets, which it
-    ignored and an earlier record wrote at their defaults (row 2006). A record in today's shapes passes
+    fields (`_earlier_projectors`, ledger 1622), a model's or kind's YaRN field beside its rope scaling
+    (`_earlier_scalings`, ledger 1898), and a row of segments' question budgets, which it ignored and an
+    earlier record wrote at their defaults (row 2006). A record in today's shapes passes
     as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     for key in ("head", "layout"):
@@ -431,8 +432,31 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
     if "model" in current:
-        current = _earlier_projectors(current)
+        current = _earlier_scalings(_earlier_projectors(current))
     return current
+
+
+def _earlier_scalings(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A record whose model or layer kinds stated YaRN as its own `yarn` field beside `rope_scaling`
+    read as today's one `rope_scaling` (ledger 1898), wherever the model nests them. A record that sets
+    both fields is refused: they were two scalings of the same frequencies. Carried to 1.0 (ledger
+    1552)."""
+    def current(value):
+        if isinstance(value, Mapping):
+            fields = {key: current(field) for key, field in value.items()}
+            if "yarn" in fields and "rope_scaling" in fields:
+                yarn = fields.pop("yarn")
+                if yarn is not None:
+                    if fields["rope_scaling"] is not None:
+                        raise ValueError("an earlier record sets yarn and rope_scaling, two rope scalings")
+                    fields["rope_scaling"] = ({"rope_type": "yarn", **yarn} if isinstance(yarn, Mapping)
+                                              else yarn)
+            return fields
+        if isinstance(value, list | tuple):
+            return [current(field) for field in value]
+        return value
+
+    return {**record, "model": current(record["model"])}
 
 
 def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
