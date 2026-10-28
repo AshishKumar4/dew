@@ -20,8 +20,9 @@ families that need them. A token updates and reads, per head over a state `S` `[
   and the write `grown[-1] S + (k exp(gc[-1] - gc))^T v_new`;
 - `readout(q, entering, entered, k, pairs, v_new) -> o`: the memory entered read through the decayed
   queries, plus the chunk's own pairs;
-- `compose(first, second)`: two spans' transitions `S -> T S + W` as one, associatively, for a scan over
-  shards or chunks run in parallel.
+- `compose(first, second)`: two spans' transitions `S -> T S + W` (`Span`) as one, associatively, for a scan
+  over shards or chunks run in parallel; `entering(span, axis)` the memory each shard of a sequence enters its
+  span with, their exclusive prefix across the mesh axis.
 
 Each works over any leading dimensions: the portable math (`recurrence_chunk.chunk_delta_rule`) calls them on
 `[B, H, NC, ...]` arrays, and a kernel's body on one chunk's tiles. Packed `documents` restart the decays at
@@ -34,7 +35,7 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 import functools
 import math
 from collections.abc import Callable
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -425,16 +426,68 @@ def _remembered_tangent(issue, name, primals, tangents):
     return remembered(decayed, entered, issue, name), issue(name, d_decayed, entered) + read
 
 
-def compose(first, second, issue: Issue = portable):
-    """Two spans' transitions as one: each a pair `(T [..., Dk, Dk], W [..., Dk, Dv])` taking the memory
-    entering to `T S + W`; `second` after `first` is `(T2 T1, T2 W1 + W2)`, associative, so a scan over spans
-    may run as a tree."""
-    (t1, w1), (t2, w2) = first, second
-    return issue("compose", t2, t1), issue("compose", t2, w1) + w2
+class Span(NamedTuple):
+    """A span's affine map of the memory entering it, `S -> T S + W`: its `write` `W` `[..., Dk, Dv]` and its
+    `transfer` `T`, a dense one `[..., Dk, Dk]` (the delta rule's, `transition`, or a rule's final memory from
+    the identity, `recurrence_chunk.entering_memory`) or a head's decay as its log `[...]`, never expanded to
+    a matrix: it scales the whole memory, which then may be laid either way round (Mamba-2's `[..., P,
+    N]`)."""
+
+    transfer: jax.Array
+    write: jax.Array
+
+    @property
+    def dense(self) -> bool:
+        return self.transfer.ndim == self.write.ndim
+
+    def decayed(self, memory, issue: Issue = portable) -> jax.Array:
+        """`T S`."""
+        if self.dense:
+            return issue("compose", self.transfer, memory)
+        return jnp.exp(self.transfer)[..., None, None] * memory
+
+    def applied(self, memory, issue: Issue = portable) -> jax.Array:
+        """`T S + W`: the memory the span leaves from the memory `S` entering it."""
+        return self.decayed(memory, issue) + self.write
 
 
-def transition(key, w, u, grown, last, kept, issue: Issue = portable):
-    """A chunk's transition `(T, W)` (`compose`): with `carry`'s operands, `T = grown[-1] kept - (k last)^T W`
+def compose(first: Span, second: Span, issue: Issue = portable) -> Span:
+    """Two spans' transitions as one (`Span`, each of the same form): `second` after `first` is `(T2 T1, T2 W1
+    + W2)`, a decay's logs summed, associative, so a scan over spans may run as a tree."""
+    first, second = Span(*first), Span(*second)
+    transfer = (issue("compose", second.transfer, first.transfer) if second.dense
+                else first.transfer + second.transfer)
+    return Span(transfer, second.applied(first.write, issue))
+
+
+def entering(span: Span, axis: str, initial=None, issue: Issue = portable) -> jax.Array:
+    """The memory each shard of a sequence the mesh axis `axis` splits enters its `span` with, inside a
+    `shard_map` that holds `axis` manual: the shards' spans before it composed (`compose`) and applied to
+    `initial`, the memory the first shard enters (zero where None). A Kogge-Stone scan: shifts 1, 2, 4, ...
+    for `ceil(log2 n)` rounds, one span a shard a round, each shard composing the one it is handed where a
+    shard that far back exists, then one shift more to make the prefix exclusive; autodiff transposes each
+    `ppermute`. A dense span's prefix composes its transfers too (`T2 T1`), where gathering every shard's
+    summaries and applying them in turn (fla's context-parallel states) held n of them a shard."""
+    shards, index = jax.lax.axis_size(axis), jax.lax.axis_index(axis)
+
+    def shifted(value, shift: int):
+        pairs = [(r, r + shift) for r in range(shards - shift)]
+        return jax.tree.map(lambda x: jax.lax.ppermute(x, axis, pairs), value)
+
+    span, shift = Span(*span), 1
+    while shift < shards:
+        composed = compose(shifted(span, shift), span, issue)
+        span = jax.tree.map(lambda new, old: jnp.where(index >= shift, new, old), composed, span)
+        shift *= 2
+    before = shifted(span, 1)
+    if initial is None:
+        return jnp.where(index > 0, before.write, 0.0)
+    return jnp.where(index > 0, before.applied(initial.astype(before.write.dtype), issue), initial)
+
+
+def transition(key, w, u, grown, last, kept, issue: Issue = portable) -> Span:
+    """A chunk's transition `(T, W)` (`Span`, `compose`): with `carry`'s operands, `T = grown[-1] kept - (k
+    last)^T W`
     and `W = (k last)^T U`, so `carry`'s memory leaving is `T S + W`. Packed documents keep the memory
     entering only where `kept` because the operands are built so (`recurrence_chunk.chunked`): `W` is zero
     outside the document the memory entering belongs to and `last` outside the chunk's last document; `kept`
@@ -442,7 +495,7 @@ def transition(key, w, u, grown, last, kept, issue: Issue = portable):
     decayed = jnp.swapaxes(key * last, -1, -2)
     dk = key.shape[-1]
     diagonal = jnp.eye(dk, dtype=grown.dtype) * jnp.swapaxes(grown[..., -1:, :], -1, -2) * kept
-    return diagonal - issue("corrected", decayed, w), issue("write", decayed, u)
+    return Span(diagonal - issue("corrected", decayed, w), issue("write", decayed, u))
 
 
 def peeled_transition(key, w, u, grown, last, kept, token, *, delta: bool, issue: Issue = portable):
@@ -451,7 +504,7 @@ def peeled_transition(key, w, u, grown, last, kept, token, *, delta: bool, issue
     linear, written = transition(key, w, u, grown, last, kept, issue)
     k, _, g, beta, start = token
     no_write = k, jnp.zeros_like(k), g, beta, start
-    return _last_token(linear, no_write, delta), _last_token(written, token, delta)
+    return Span(_last_token(linear, no_write, delta), _last_token(written, token, delta))
 
 
 # A chunk's tiles. The functions below are the same algebra on one chunk of one head, as a mainloop's
