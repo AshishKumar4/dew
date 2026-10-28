@@ -54,7 +54,7 @@ class Opens:
                 names[:] = [name for name in names if name != "__pycache__" and not name.startswith(".")]
                 watch = libc.inotify_add_watch(self.fd, directory.encode(), OPEN | DELETE_SELF | MOVE_SELF)
                 if watch < 0:
-                    # The kernel will hold no more watches (fs.inotify.max_user_watches): blind, its descriptor
+                    # The kernel holds no more watches (fs.inotify.max_user_watches): blind, its descriptor
                     # closed, so `closed` neither waits on a reader nor reads one.
                     self.blind = True
                     os.close(self.fd)

@@ -1186,7 +1186,8 @@ def test_a_watch_the_kernel_cannot_hold_whole_is_blind_and_keys_nothing(tmp_path
         "import watched\n"
         "print(watched.Opens(sys.argv[2]).closed())\n")
     ran = subprocess.run(["unshare", "--user", "--map-root-user", sys.executable, "-c", script,
-                          str(ROOT / "tools/armada"), str(tmp_path)], capture_output=True, text=True, timeout=60)
+                          str(ROOT / "tools/armada"), str(tmp_path)],
+                         capture_output=True, text=True, timeout=60)
     assert (ran.returncode, ran.stdout.strip()) == (0, "None"), ran.stderr
 
 
