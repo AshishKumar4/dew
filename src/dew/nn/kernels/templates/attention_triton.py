@@ -487,8 +487,8 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
 
 
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
-               scale: float, how: algebra.Recompute, block_k: int, split: bool, accurate: bool,
-               interpret: bool):
+               scale: float, dq_scale: float, how: algebra.Recompute, block_k: int, split: bool,
+               accurate: bool, interpret: bool):
     refs = list(refs)
     id_refs = [refs.pop(0), refs.pop(0)] if ids else []
     (query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, initial_ref, maximum_ref, index_ref,
@@ -561,7 +561,8 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         weights, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor,
                                                    delta, seen, q_pos, k_pos, params, key_index=key_index,
                                                    scale=scale, how=how, interpret=interpret)
-        return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=scale,
+        # dQ at the call's whole scale, its logits' at the scale its query's power left (`prescale`).
+        return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=dq_scale,
                                kinds=score_kinds, summed=summed, dot=product, accurate=accurate)
 
     nothing = jnp.zeros((block_q,), jnp.float32)
@@ -693,6 +694,7 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
     split: bool = True
     how: algebra.Recompute = algebra.PLAIN
     accurate: bool = ACCURATE
+    prescale: float = 1.0
 
     def _fwd(self, query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value,
              shift, others, own, others_total, forward_total, start, end, query_ids, key_ids, score_params, *,
@@ -704,7 +706,7 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
         sums = (others, own, others_total, forward_total) if self.split else None
         dq_out = _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index,
                             anchor_value, shift, sums, *spans, warps=config.dq_warps,
-                            stages=config.dq_stages, **shared)
+                            stages=config.dq_stages, dq_scale=self.scale * self.prescale, **shared)
         delta, anchor, peak, total = dq_out[1:5]
         # Each query's anchor key as the dQ launch chose it, -1 where it took D about 0.
         dkv_out = _dkv_launch(query, key, value, dout, peak, total, anchor, delta, dq_out[6], *spans,
@@ -760,8 +762,8 @@ def _geometry(query, key, value, start, end, query_ids, key_ids, block_q: int, b
 
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
                sums, start, end, query_ids, key_ids, score_params, *, score_mod,
-               score_kinds: tuple[Kind, ...], scale: float, how: algebra.Recompute, block_q: int,
-               block_k: int, warps: int, stages: int, accurate: bool,
+               score_kinds: tuple[Kind, ...], scale: float, dq_scale: float, how: algebra.Recompute,
+               block_q: int, block_k: int, warps: int, stages: int, accurate: bool,
                interpret: bool) -> tuple[jax.Array, ...]:
     """The backward's dQ launch over padded operands (`backward` pads them): a program per query block
     and query head takes each query's D about 0 or about the anchor key `key_index`'s `anchor_value · dO`,
@@ -813,7 +815,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 out_shape.append(jax.ShapeDtypeStruct(param.shape, jnp.float32))
                 out_specs.append(per_head)
     kernel = functools.partial(_dq_kernel, ids=ids, score_kinds=score_kinds,
-                               score_mod=score_mod, scale=scale, how=how, block_k=block_k,
+                               score_mod=score_mod, scale=scale, dq_scale=dq_scale, how=how, block_k=block_k,
                                split=sums is not None, accurate=accurate, interpret=interpret)
     out = pl.pallas_call(
         kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
@@ -898,13 +900,14 @@ def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) ->
 
 
 def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
-            split: bool, natural: bool, accurate: bool, initial: bool, interpret: bool):
+            prescale: float, split: bool, natural: bool, accurate: bool, initial: bool, interpret: bool):
     """The Triton mainloop's two launches under one tuning decision (`TritonBackward`), recomputing the
-    weights as a forward of the call's form computed them (`algebra.recompute`)."""
+    weights as a forward of the call's form computed them (`algebra.recompute`), the query taken by
+    `prescale` (`attention.prescale`)."""
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
-                                            natural=natural, initial=initial))
+                                            natural=natural, initial=initial, prescale=prescale))
     op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale, score_dtypes=score_dtypes,
-                        split=split, how=how, accurate=accurate)
+                        split=split, how=how, accurate=accurate, prescale=prescale)
     return op(*arrays, interpret=interpret)
 
 

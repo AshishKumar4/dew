@@ -283,7 +283,8 @@ def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]
 
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
                sums, spans, score_params, *, score_mod, score_kinds: tuple[Kind, ...], scale: float,
-               how: algebra.Recompute, block_q: int, block_k: int, split: bool, accurate: bool, drop=None):
+               dq_scale: float, how: algebra.Recompute, block_q: int, block_k: int, split: bool,
+               accurate: bool, drop=None):
     """The Triton mainloop's dQ launch (`attention_triton._dq_launch`), a query block and head at a time:
     each query's denominator and `D - c` from the forward's split `sums` (`algebra.split_delta`), or without
     `split` from a first pass at the forward's maximum (`algebra.off_anchor_delta`) but for the rows whose
@@ -382,7 +383,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                                  columns[None, :] == chosen[:, None], algebra.inverse(total),
                                                  multiplier=zt)
                 return algebra.dq_step(carry, weights, cotangents, slopes, seen, k_tile, total,
-                                       scale=scale, kinds=score_kinds, summed=summed, dot=interpreted_dot,
+                                       scale=dq_scale, kinds=score_kinds, summed=summed, dot=interpreted_dot,
                                        accurate=accurate)
 
             nothing = jnp.zeros((block_q,), jnp.float32)
@@ -512,20 +513,21 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
             others, own, others_total, forward_total, start, end, query_ids, key_ids, score_params, *,
             score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
-            block_q: int, block_k: int, split: bool, natural: bool, accurate: bool, initial: bool,
-            drop=None):
+            prescale: float, block_q: int, block_k: int, split: bool, natural: bool, accurate: bool,
+            initial: bool, drop=None):
     """The Triton backward's outputs (`TritonBackward`), from this mainloop's two launches, recomputing the
-    weights as a forward of the call's form computed them (`algebra.recompute`)."""
+    weights as a forward of the call's form computed them (`algebra.recompute`), the query taken by
+    `prescale` (`attention.prescale`), dQ at the call's whole scale."""
     del score_dtypes
     spans = start, end, query_ids, key_ids
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
-                                            natural=natural, initial=initial))
+                                            natural=natural, initial=initial, prescale=prescale))
     shared = {"score_mod": score_mod, "score_kinds": score_kinds, "scale": scale, "how": how,
               "block_q": block_q, "block_k": block_k, "accurate": accurate, "drop": drop}
     sums = others, own, others_total, forward_total
     dq, softmax, chosen, dq_grads = _dq_launch(query, key, value, dout, peak, total, initial_term, maximum,
                                                key_index, anchor_value, shift, sums, spans, score_params,
-                                               split=split, **shared)
+                                               split=split, dq_scale=scale * prescale, **shared)
     delta, anchor, m, denominator, _ = softmax
     dk, dv, key_grads = _dkv_launch(query, key, value, dout, m, denominator, anchor, delta, chosen, spans,
                                     score_params, **shared)

@@ -698,12 +698,14 @@ def prescale(dtype, width: int, scale: float) -> tuple[float, float]:
     `scale`'s power of two at or below its magnitude, so no product the reference keeps finite overflows
     here (it scales the query before its products, `dew.nn.attention`): Q 2^127 and K 4 over a width of 16,
     a product of 2^129 where the reference's is 2^127; else 1 and `scale` (fp16's products never pass it). A
-    power of two scales exactly, so the logits, the weights and every gradient but the query's are the
-    unscaled call's bit for bit, and the query's takes the power back (`gradients`)."""
+    power of two scales exactly, so the logits, the weights and the key's and value's gradients are the
+    unscaled call's bit for bit but where a value leaves fp32's normal range, and the query's, taken at the
+    whole scale (`gradients`), is too."""
     largest = float(jnp.finfo(dtype).max)
     if scale == 0 or largest * largest * width < float(jnp.finfo(jnp.float32).max):
         return 1.0, scale
-    power = 2.0 ** math.floor(math.log2(abs(scale)))
+    # Never above 1: a scale of 1 or more makes the reference's products no smaller than these.
+    power = min(2.0 ** math.floor(math.log2(abs(scale))), 1.0)
     return power, scale / power
 
 
@@ -1118,7 +1120,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     batch, queries, heads, width = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
-    # The query's products taken as the forward took them (`prescale`), its gradient the power back.
+    # The query's products taken as the forward took them (`prescale`): every launch recomputes its logits
+    # from them at the scale left, and takes dQ, the call's own query's gradient, at the call's whole scale.
     query, scale, power = prescaled(query, width ** -0.5 if scale is None else scale)
     # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
     dout = dout.astype(query.dtype)
@@ -1154,7 +1157,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     maximum = call.rows(maxima.astype(jnp.float32))
     outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
                      shift, others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
-                     score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
+                     score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale,
+                     prescale=power)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[7:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
@@ -1198,7 +1202,6 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded
                               else (at_least_fp32(key.dtype), at_least_fp32(value.dtype)))
-    dq = dq if power == 1.0 else dq * power
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
                      dk[:, :keys, :, :width].astype(key_dtype),
                      dv[:, :keys, :, :value_width].astype(value_dtype),

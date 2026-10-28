@@ -94,6 +94,12 @@ class _Backward:
         return self.spec.scale
 
     @property
+    def dq_scale(self) -> float:
+        """dQ's scale: the call's whole scale, the logits' times the power its query took before its
+        products (`algebra.Forward.prescale`), so dQ is the call's own query's gradient."""
+        return self.spec.scale * self.spec.prescale
+
+    @property
     def summed(self) -> tuple[bool, ...]:
         """Which score parameters the dQ program sums per query (`DQ_GRADS`); the others' gradients the dK/dV
         program writes."""
@@ -149,7 +155,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         scored = _scores(walk, coords_of(k_first), masked, params, s, dp, peak, prior, anchor, delta, chosen)
         exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = algebra.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
-                                                prior, scale=walk.scale, kinds=walk.kinds,
+                                                prior, scale=walk.dq_scale, kinds=walk.kinds,
                                                 summed=walk.summed, accurate=walk.accurate)
         row_sums = (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
                     terms.keyed_shift)
@@ -312,8 +318,10 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
                                     transposed=True)
     if add_dq is not None:
         # The tile's dQ, its staged cotangents times the resident keys (`algebra.cotangent_product`'s
-        # `a @ b`), added into dQ: the query tile's other key blocks add theirs.
-        add_dq(q_first, family.product(buffers.at[1], k_smem, (tiles.block_q, k_smem.shape[-1])))
+        # `a @ b`), added into dQ: the query tile's other key blocks add theirs. The cotangents carry the
+        # logits' scale, the query's power taken back to dQ's (`_Backward.dq_scale`).
+        dq = family.product(buffers.at[1], k_smem, (tiles.block_q, k_smem.shape[-1]))
+        add_dq(q_first, dq if walk.spec.prescale == 1.0 else dq * walk.spec.prescale)
     store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
     key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
     # The staged parts' reads done (the walk's settling) before the next tile's overwrite them.
@@ -456,7 +464,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
-                     score_params, *, score_mod, score_kinds, score_dtypes, scale: float,
+                     score_params, *, score_mod, score_kinds, score_dtypes, scale: float, prescale: float,
                      spec: algebra.Forward, accurate: bool, tiles: BackwardTiles, family: mosaic.Family,
                      interpret: bool):
     """`gradients`' launch on this mainloop: D from the forward's split sums, each query's anchor key as the
@@ -474,8 +482,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     opt-in tuning run names it (`MosaicBackward.derived`). Returns what `gradients` takes: dQ, the softmax's
     rows, each query's anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums
     `[1, B, H, 1]`, which `gradients` sums over the batch), then dK, dV and the dK/dV parameters'
-    (`DKV_GRADS`)."""
-    del scale
+    (`DKV_GRADS`). The logits' scale and the query's power are `spec`'s."""
+    del scale, prescale
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
     cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)
