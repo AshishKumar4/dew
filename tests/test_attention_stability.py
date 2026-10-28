@@ -1023,6 +1023,34 @@ def test_a_negative_scale_past_the_folds_reach_keeps_a_finite_logit_finite(scale
         assert all(np.isfinite(np.asarray(leaf)).all() for leaf in grads[:3]), f"{name}'s gradients"
 
 
+SMALL_SCALE = 2.0 ** -80
+"""A scale far below one, whose power of two the queries take for their logits (`attention.prescale`)."""
+SMALL_SCALE_FAMILY = Family(_drawn(16, 64, rows=8), _kept(16, 64, rows=8))
+"""Drawn queries, keys and values at `SMALL_SCALE`, which `test_gradients_at_a_scale_far_below_one_are_on_par`
+casts to each dtype."""
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("name", _mainloops(SMALL_SCALE_FAMILY, {}))
+@pytest.mark.parametrize("options", [{}, ACCURATE], ids=["default", "accurate"])
+def test_gradients_at_a_scale_far_below_one_are_on_par(options, name, dtype):
+    """Both forms, fp32 and bf16, at a scale of 2^-80 over drawn calls: every logit is small and each key
+    weighs about alike, and the reference's gradients are normal, dK the score cotangents at the whole scale
+    times the queries. A template mainloop's output and gradients hold check 1: the queries take the scale's
+    power of two for their logits alone, where taken for dK too its products fall 2^80 below the reference's
+    and flush to zero (row 1957's review)."""
+    family = dataclasses.replace(SMALL_SCALE_FAMILY, dtype=dtype)
+
+    def attend(query, key, value, extra):
+        del extra
+        return jax.nn.dot_product_attention(query, key, value, scale=SMALL_SCALE,
+                                            implementation="xla").astype(query.dtype)
+
+    differentiated = jax.jit(with_gradients(_mainloops(family, {"scale": SMALL_SCALE, **options})[name]))
+    assert_as_exact(differentiated, as_given(jax.jit(with_gradients(attend))), _cast(family, family.draw),
+                    f"{name} {options} {dtype} at scale 2^-80", seeds=8, truth_fn=with_gradients(attend))
+
+
 DECODED = [(family, form) for family, form in FAMILY_RUNS
            if FAMILIES[family].draw(0)[0].shape[1] == 1 and FAMILIES[family].draw(0)[0].shape[3] >= 16
            and not isinstance(FAMILIES[family].draw(0)[3], tuple)]
