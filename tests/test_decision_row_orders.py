@@ -253,44 +253,39 @@ def test_a_framed_row_keeps_its_special_tokens_between_the_halves_of_its_turn():
     assert rows[0] == rows[1]
 
 
+def lettered_row(lines: OptionLines, question, option_tokens: int | None):
+    """The byte-encoded row of `question` about "x" whose options `lines` writes under the labels A and
+    B, cut to `option_tokens`."""
+    segments = (Instructions({"choice": "{}"}), lines, State(), AnswerCue())
+    layout = StateFirstLayout(labels=Labels(names=("A", "B"), variants=("{}",)), segments=segments,
+                              option_tokens=option_tokens)
+    bytes_specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
+    [encoded] = layout.rows(ByteTokenizer(), bytes_specials, "x", question)
+    return encoded
+
+
 def test_a_template_that_writes_a_field_before_its_label_finds_options_alike_without_it():
     """A line whose template writes a field before its label (`{text}[{label}] {name}`) holds its options
     without the label wherever it stands: a cut that leaves two options their shared text and labels
     alone leaves them alike, one that keeps a letter of each name leaves them apart, and under a budget
     that cuts nothing the row is the row of no budget."""
-    labels = Labels(names=("A", "B"), variants=("{}",))
-    bytes_specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
-    segments = (Instructions({"choice": "{}"}), OptionLines(line="{text}[{label}] {name}",
-                                                            bare="{name} [{label}]"), State(), AnswerCue())
+    lines = OptionLines(line="{text}[{label}] {name}", bare="{name} [{label}]")
     alike = {"q": Choice("Which?", {"alpha": "same", "beta": "same"})}
-
-    def row(question, option_tokens: int | None):
-        layout = StateFirstLayout(labels=labels, segments=segments, option_tokens=option_tokens)
-        [encoded] = layout.rows(ByteTokenizer(), bytes_specials, "x", question)
-        return encoded
-
-    assert row(alike, 8).options_alike
-    assert row(alike, 9).options_cut > 0 and not row(alike, 9).options_alike
+    assert lettered_row(lines, alike, 8).options_alike
+    assert lettered_row(lines, alike, 9).options_cut > 0 and not lettered_row(lines, alike, 9).options_alike
     bare = {"q": Choice("Which?", ["alpha", "beta"])}
-    assert row(bare, 64) == row(bare, None) and not row(bare, 64).cuts
+    assert lettered_row(lines, bare, 64) == lettered_row(lines, bare, None)
+    assert not lettered_row(lines, bare, 64).cuts
 
 
 def test_a_cut_inside_a_label_leaves_options_alike():
     """A budget that ends inside an option's label (`A.` cut to `A`) holds nothing of the option past it,
     so two such options are alike; one that keeps a letter of each name past the label leaves them apart
     (the control)."""
-    labels = Labels(names=("A", "B"), variants=("{}",))
-    segments = (Instructions({"choice": "{}"}), OptionLines(), State(), AnswerCue())
-    bytes_specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
     question = {"q": Choice("Which?", ["alpha", "beta"])}
-
-    def row(option_tokens: int):
-        layout = StateFirstLayout(labels=labels, segments=segments, option_tokens=option_tokens)
-        [encoded] = layout.rows(ByteTokenizer(), bytes_specials, "x", question)
-        return encoded
-
-    assert row(1).options_alike
-    assert row(4).options_cut > 0 and not row(4).options_alike
+    assert lettered_row(OptionLines(), question, 1).options_alike
+    cut = lettered_row(OptionLines(), question, 4)
+    assert cut.options_cut > 0 and not cut.options_alike
 
 
 def test_a_requests_questions_share_one_encoding_of_its_state():

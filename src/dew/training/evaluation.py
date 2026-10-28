@@ -213,12 +213,12 @@ class Evaluation:
         scores: dict[str, float] = {}
         previews: tuple[Artifact, ...] = ()
         scored = records = 0
-        if batches is not None and (metrics or preview_enabled or loss):
+        written = None if scored_to is None or warm else Path(scored_to) / split
+        if batches is not None and (metrics or preview_enabled or loss or written is not None):
             scores, previews, scored, records = _score_split(
                 objective, variables, batches, context, mesh, metrics=metrics, split=split,
                 root=root, preview_enabled=preview_enabled, score_key=score_key,
-                preview_key=preview_key, loss=loss, warm=warm,
-                written=None if scored_to is None or warm else Path(scored_to) / split)
+                preview_key=preview_key, loss=loss, warm=warm, written=written)
         scores.update(training_scores)
         elapsed = time.perf_counter() - started
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
