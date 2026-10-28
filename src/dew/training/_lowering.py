@@ -47,12 +47,13 @@ class KernelCall:
     kernel's compiler, 'triton', 'mosaic_gpu' or 'mosaic_tpu', a library's 'gemm', 'convolution' or
     'attention', or None for a call nothing sizes), its kernel's `name` (Triton's config names it, a
     Mosaic TPU call's `kernel_name`, a Mosaic GPU call's location, the name-stack entry its `mpmd_map`
-    lowers under; any other call's target), a Pallas kernel's IR as Pallas serialized it (Triton IR,
-    or Mosaic's module bytecode), its `config` (Triton's warps and stages, a Mosaic GPU kernel's hash),
-    and the FLOPs its kernel states (its cost estimate), None where it states none."""
+    lowers under, None where its location names none; any other call's target), a Pallas kernel's IR as
+    Pallas serialized it (Triton IR, or Mosaic's module bytecode), its `config` (Triton's warps and stages, a
+    Mosaic GPU kernel's hash), and the FLOPs its kernel states (its cost estimate), None where it states
+    none."""
 
     kind: str | None
-    name: str
+    name: str | None
     ir: bytes
     config: str
     flops: float | None
@@ -146,11 +147,26 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
     return KernelCall(kind, target, b"", "", None)
 
 
-def _kernel_name(location: ir.Location) -> str:
-    """A Mosaic GPU call's kernel name: its location's name stack ends `<kernel>/mpmd_map`."""
-    found = re.match(r'loc\("([^"]+)"', str(location))
-    stack = found.group(1).split("/") if found else ["?"]
+def _kernel_name(location: ir.Location) -> str | None:
+    """A Mosaic GPU call's kernel name: its location's name stack (`_named`) ends `<kernel>/mpmd_map`; None
+    where its location carries no name."""
+    named = _named(location)
+    if named is None:
+        return None
+    stack = named.split("/")
     return stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
+
+
+def _named(location: ir.Location) -> str | None:
+    """The name a location carries: a name location's own, a call site's callee's, or the first of a fused
+    location's parts that carries one; None where none does."""
+    if location.typeid == ir.NameLoc.static_typeid:
+        return ir.NameLoc(location).name_str
+    if location.typeid == ir.CallSiteLoc.static_typeid:
+        return _named(ir.CallSiteLoc(location).callee)
+    if location.typeid == ir.FusedLoc.static_typeid:
+        return next((name for name in map(_named, ir.FusedLoc(location).locations) if name is not None), None)
+    return None
 
 
 def triton_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
@@ -185,7 +201,8 @@ class KernelReport:
                          for route in self.routes)
         launches: dict[tuple[str, str], dict] = {}
         for call in self.calls:
-            entry = launches.setdefault((call.kind or "", call.name), {
+            # A call whose location names no kernel is its own kernel's, by its config (its kernel's hash).
+            entry = launches.setdefault((call.kind or "", call.name if call.name is not None else call.config), {
                 "kind": call.kind, "name": call.name, "calls": 0, "configs": [], "flops": 0.0})
             entry["calls"] += 1
             if call.config not in entry["configs"]:
