@@ -1177,7 +1177,7 @@ def _states_held(call: _Call, values: _Operand, keys: _Operand, bv: int) -> _Hel
         + _fragments(call, (held, CHUNK, call.block), (keys, CHUNK, call.block)),))
 
 
-def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
+def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Tiles):
     """`(h [chunks * HV * Dk, Dv], corrected [R, HV * Dv], final [B * HV * Dk, Dv])`: the memory each chunk
     enters and the corrected values as `call.held`, and each row's final memory, fp32, each sequence's chunks
     in order over a value block (`algebra.corrected`, `carried`). Under the delta rule `u` is the weighted
@@ -1197,8 +1197,8 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
     # The keys the memory takes: a key head's, or a value head's decayed to their chunk's end.
     keys, keyed = (held, 1) if call.per_key else (call.given, call.group)
 
-    def program(k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, h_ref, corrected_ref,
-                final_ref, *, streams, staging, landing):
+    def program(k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, h_ref,
+                corrected_ref, final_ref, *, streams, staging, landing):
         j, s, h = lax.axis_index("blocks"), lax.axis_index("sequences"), lax.axis_index("heads")
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
         staged, scratch = staging
@@ -1250,16 +1250,23 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
             gated, decay = _gated_write(call, corrected, loaded, (hi_ref, lo_ref), last, h)
             separate = None
             if held.parts > 1:
-                # An fp32 call's last write outside the product (`algebra.carried`), held to the fp32
-                # recurrence; a 16-bit call's is fla's product.
+                # An fp32 call's last real token's write outside the product (`algebra.carried`), held to
+                # the fp32 recurrence, as the portable math peels it (`_peeled_chunk_inputs`); a 16-bit
+                # call's is fla's product. A chunk past its document's end holds zeros after its tokens: its
+                # last slot's write left the last real one in the product, 2.0 times the portable math's
+                # final memory from float64 under a steep decay (VisualOrca, interpreted and on an H100).
+                final_token = taken_ref[n] - 1
+
                 def key_rows(i):
-                    """The chunk's last key's slice `i`, a row's vector: its parts' rows summed, exactly."""
-                    views = keys.vectors(k_ref, last, h // keyed * width + i * call.block, call.block)
+                    """The chunk's last real key's slice `i`, a row's vector: its parts' rows summed,
+                    exactly."""
+                    views = keys.vectors(k_ref, n * CHUNK + final_token, h // keyed * width + i * call.block,
+                                         call.block)
                     return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32)
                                                       for view in views))
 
-                ends = family.iota((CHUNK, bv), 0) == CHUNK - 1
-                separate = key_rows, _columns(call, scratch)(jnp.where(ends, gated, 0.0))
+                ends = family.iota((CHUNK, bv), 0) == final_token
+                separate = key_rows, _columns(call, scratch)(jnp.where(ends, gated, 0.0)), final_token
             state = algebra.carried(
                 state, lambda i: _tile(slots, "keys", keys, columns=pl.ds(i * call.block, call.block)), gated,
                 decay, held.dtype, issue, last=separate)
@@ -1289,7 +1296,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
                    after=after,
                    # Its last write's column sums an fp32 call's alone (`_columns`).
                    reduces=held.parts > 1)(
-        k, k if w is None else w, u, hi, lo, beta, h0, sequences)
+        k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken)
 
 
 def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
@@ -1617,8 +1624,8 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     if kept is not None and delta and not per_key:
         (w, h, corrected), final = kept, None
     else:
-        h, corrected, final = _states(keys, w, u, hi, lo, beta, h0.reshape(-1, columns), sequences, call,
-                                      tiles)
+        h, corrected, final = _states(keys, w, u, hi, lo, beta, h0.reshape(-1, columns), sequences, taken,
+                                      call, tiles)
         final = final.reshape(batch, heads, width, columns)[:, :, :key_width, :value_width]
     return _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta,
                 None if per_key else a, w, scores, h, corrected, final, taken, sequences, laid,

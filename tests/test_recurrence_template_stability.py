@@ -23,7 +23,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened, with_gradients
+from reference_error import (
+    FEWEST_SEEDS,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    widened,
+    with_gradients,
+)
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import NATIVE, REFUSED, taken, template_call
 from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cotangents, restarting, stressed
@@ -132,6 +138,19 @@ def test_the_template_stays_finite_and_on_par_where_chunked_forms_break(name, re
         assert_finite(dew, truth, draws(seed), regime)
     assert_as_exact(dew, reference, draws, f'the template, {name} under {regime}, its {product}',
                     seeds=seeds, truth_fn=truth)
+
+
+def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted():
+    """The rated scan's 16-bit forward through the template under the decay bound, interpreted off a GPU, on
+    par with the portable math from float64 over check 1's fewest draws: its rows end in a ragged chunk (70
+    tokens), and its last real token's write, which weighs most under a steep decay, is held outside the
+    product as the portable math peels it; the padded last slot's put the final memory 2.0 times the
+    portable math's distance, interpreted and on an H100."""
+    hooks = SITES['rated']
+    assert_as_exact(functools.partial(chunk, hooks, mainloop='mosaic'), reference_arm(hooks),
+                    lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0]),),
+                    'the template, rated under the decay bound, its forward', seeds=FEWEST_SEEDS,
+                    truth_fn=functools.partial(token_by_token, hooks))
 
 
 @pytest.mark.parametrize('name', SITES)
