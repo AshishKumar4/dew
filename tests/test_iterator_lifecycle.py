@@ -884,40 +884,55 @@ def test_a_mix_repeated_whole_goes_on_counting_each_corpus_on_its_second_pass():
 
 
 def counted_source(name: str):
-    """Six records of corpus `name`, a third of them rejected (`reject_thirds`)."""
-    return from_grain(grain.MapDataset.source([{"i": np.int32(index)} for index in range(6)]), name
-                      ).filter_map(reject_thirds)
+    """Six records of corpus `name`, each naming it, a third of them rejected (`reject_thirds`)."""
+    records = [{"i": np.int32(index), "corpus": np.array(name)} for index in range(6)]
+    return from_grain(grain.MapDataset.source(records), name).filter_map(reject_thirds)
 
 
-def test_a_nested_mix_repeated_whole_goes_on_counting_every_corpus_on_its_second_pass():
-    """A mix whose first member is itself a mix, repeated whole: on its second pass each corpus, at
-    either level, goes on counting from the first pass's counts, rows and rejections alike (row
-    2059). Before, the inner mix's corpora, rewound past a parent the outer mix had not opened, lost
-    the first pass's counts."""
-    chain = mix([mix([counted_source("a"), counted_source("b")]), counted_source("c")]).repeat(2)
-    metrics = chain.stats(records=24)
-    assert [metrics[f"data/rows/{name}"] for name in "abc"] == [8, 8, 8]
-    assert [metrics[f"data/rejected/{name}/third"] for name in "abc"] == [4, 4, 4]
+def delivered_and_counted(chain) -> tuple[dict[str, int], dict[str, float]]:
+    """Each corpus's rows a whole read of `chain` delivers, and the counts the read's position holds
+    of them (`state_counts`), as `Pipeline.stats` reads them."""
+    from dew.data.compile import _diagnostic
+    from dew.data.mixing import data_metrics, state_counts
+
+    reader, delivered = _diagnostic(chain), {}
+    try:
+        for batch in reader:
+            for name in np.asarray(batch["corpus"]).reshape(-1):
+                delivered[str(name)] = delivered.get(str(name), 0) + 1
+        return delivered, data_metrics(state_counts(reader.get_state()).values())
+    finally:
+        reader.close()
 
 
-def test_a_live_mix_restored_to_where_it_opened_no_corpus_counts_none():
-    """A mix read on and then restored, in place, to its start, where it had opened no corpus: its
-    corpora count nothing, as they had counted nothing there. Before, each corpus kept the counts
-    it had reached since, carried into a restore as into a repeat's rewind (row 2059)."""
-    from dew.data.compile import compile
-    from dew.data.dataset import DataPartition, Loading
-    from dew.data.mixing import state_counts
+def test_a_nested_mix_repeated_whole_counts_every_corpus_it_delivered_on_both_passes():
+    """A mix whose first member is itself a mix, repeated whole: every corpus, at either level,
+    counts every row the two passes delivered of it and a rejection for each two, the counts going on
+    across the outer rewind that reopens the inner mix (row 2059). Before, the inner mix's corpora,
+    rewound past a member the outer mix had not opened, counted only their last pass."""
+    delivered, counted = delivered_and_counted(
+        mix([mix([counted_source("a"), counted_source("b")]), counted_source("c")]).repeat(2))
+    assert set(delivered) == {"a", "b", "c"}
+    for name, rows in delivered.items():
+        assert (counted[f"data/rows/{name}"], counted[f"data/rejected/{name}/third"]) == (rows, rows // 2)
 
-    data = compile(mix([counted_source("a"), counted_source("b")]).repeat().batch(2), read="streamed",
-                   loading=Loading(workers=0), seed=0)
-    reader = data.train(DataPartition())
+
+def test_a_live_mix_rolled_back_to_where_it_opened_no_corpus_counts_none():
+    """A mix read on and rolled back, in place, to its start, where it had opened no corpus: its
+    corpora count nothing, as nothing had been counted there. Before, each corpus kept the counts it
+    had reached since, carried into a rollback as into a repeat's rewind (row 2059)."""
+    from dew.data.compile import _diagnostic
+    from dew.data.mixing import data_metrics, state_counts
+
+    reader = _diagnostic(mix([counted_source("a"), counted_source("b")]).repeat())
     try:
         start = reader.get_state()
-        for _ in range(3):
+        for _ in range(6):
             next(reader)
-        assert state_counts(reader.get_state())
+        assert data_metrics(state_counts(reader.get_state()).values())
         reader.set_state(start)
-        restored = state_counts(reader.get_state())
-        assert all(counts.metrics(name).get(f"data/rows/{name}", 0) == 0 for name, counts in restored.items())
+        rolled = data_metrics(state_counts(reader.get_state()).values())
+        counted = [value for name, value in rolled.items() if name.startswith(("data/rows/", "data/rejected/"))]
+        assert all(value == 0 for value in counted)
     finally:
         reader.close()
