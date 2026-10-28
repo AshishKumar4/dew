@@ -893,6 +893,16 @@ def request_key(key: int | jax.Array | None) -> jax.Array:
     return typed
 
 
+def seed_of(key: int | jax.Array) -> int | None:
+    """`key` as an integer seed, None for a JAX PRNG key, refused as `request_key` refuses it, without
+    making a key: a seed's key opens JAX's backend."""
+    if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
+        return int(key)
+    if not isinstance(key, jax.Array):
+        raise ValueError("key must be an integer seed or a single JAX PRNG key")
+    return None
+
+
 def request_rows(keys: jax.Array) -> jax.Array:
     """Normalize a vector of JAX keys, one a row (`dew.sampling.solvers.RowKeys`), to typed keys."""
     typed = jax.random.wrap_key_data(jax.random.key_data(keys), impl=jax.random.key_impl(keys))

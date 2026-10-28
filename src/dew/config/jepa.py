@@ -17,7 +17,7 @@ import jax.numpy as jnp
 from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig, media_field
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
-from dew.nn.backbones.jepa import JepaVideoEncoder
+from dew.nn.protocols import ReadsClips
 from dew.objectives.jepa.masking import MultiBlockMask
 from dew.optim import OptimConfig
 from dew.registry import JsonDict, ModelConfig
@@ -66,8 +66,7 @@ class JepaRunConfig(RunConfig):
         sample = self.sample()
         video = sample.key == "video"
         encoder = self.model.build()
-        # A clip's encoder is one that reads frames (`JepaVideoEncoder`, or a model built on it).
-        if video != isinstance(encoder, JepaVideoEncoder):
+        if video != (isinstance(encoder, ReadsClips) and encoder.reads_clips):
             raise ValueError("a video dataset and an encoder that reads clips (--model jepa_video_encoder) "
                              "go together")
         # A frame is [height, width, channels], an image's or each of a clip's.

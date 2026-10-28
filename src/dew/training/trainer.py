@@ -277,12 +277,9 @@ class Trainer(Generic[Loss, Effects]):
         built = isinstance(optimizer, optax.GradientTransformation)
         self._config = None if built else optimizer
         self._optimizer = objective.optimizer(optimizer) if built else None
-        self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
-        if self.seed is None and not isinstance(key, jax.Array):
-            raise ValueError("key must be an integer seed or a single JAX PRNG key")
-        # A seed's key is made when first read, after `fit` readies the process (`key`): making it here
-        # would open JAX's backend before the process's flags and cache are set.
-        self._given_key, self._key = key, None
+        from dew.nn.inputs import seed_of
+        # A seed's key is made when first read, after `fit` readies the process (`key`).
+        self.seed, self._given_key, self._key = seed_of(key), key, None
         self.mesh = mesh
         self.layout = layout
         self._microbatches = microbatches
@@ -1446,7 +1443,9 @@ class Trainer(Generic[Loss, Effects]):
                 batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
                 device, _ = split_fields(batch)
                 inputs = self.objective.inputs
-                if not compiled and self.rollout is None and inputs is not None:
+                if batch_signature(device) not in compiled and self.rollout is None and inputs is not None:
+                    # Each batch of a shape the run has not stepped is checked against what the
+                    # objective declares, a later ramp's or schedule's stage as the first.
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
                     # The objective reads the batch its device steps make (`_model_batch`).
                     with jax.set_mesh(self.device_mesh):

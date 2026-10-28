@@ -7,12 +7,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+import flax.linen as nn
+import numpy as np
+import optax
+import pytest
+from affine_run import Replaying
 from objective_cases import IMAGES
 
 from dew.config import TrainerConfig
 from dew.config.jepa import JepaRunConfig
 from dew.data import TFDS, Loading, presets
+from dew.data.dataset import Loader
+from dew.inputs import Field, InputSpec
+from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
+from dew.training import Trainer
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,3 +76,28 @@ def test_a_trainer_opens_no_backend_until_its_key_is_read():
                           check=False)
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout.strip().splitlines()[-1]) == {"built": False, "read": True}
+
+
+class Pooled(nn.Module):
+    """A map that reads its input's mean, so it takes any width its batch has."""
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(2)(x.mean(axis=-1, keepdims=True))
+
+
+def test_a_batch_of_a_shape_the_run_has_not_stepped_is_checked_against_its_declaration():
+    """An objective declares its input three wide; a stream whose second batch is five wide, as a
+    later stage of a ramp or a schedule may make it, is refused at that batch, before it compiles a
+    step for it. Before, only the first batch was checked, and a model that reads any width trained
+    on the undeclared one (AT-03)."""
+    def batch_at(step: int) -> dict:
+        x = np.random.default_rng(step).normal(size=(8, 3 if step == 0 else 5)).astype(np.float32)
+        return {"x": x, "y": x[:, :2]}
+
+    objective = Supervised(Pooled(), lambda outputs, batch: (outputs - batch["y"]) ** 2,
+                           inputs=InputSpec(Field("x", (3,))))
+    trainer = Trainer(objective, optax.sgd(0.1), key=0)
+    data = Loader(train=lambda partition: Replaying(batch_at), val=None, batch=8, records=None)
+    with pytest.raises(ValueError):
+        trainer.fit(data, steps=2, log_every=1)

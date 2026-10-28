@@ -192,6 +192,8 @@ class JepaEncoder(_JepaStackOptions):
     `TokenStack` runs over one image's tokens and `FactorizedTokenStack` over a
     clip's frames.
     """
+    reads_clips: ClassVar[bool] = False
+    """Whether the encoder reads a clip's frames, (B, T, H, W, C), rather than an image."""
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -239,6 +241,7 @@ class JepaVideoEncoder(JepaEncoder):
     """
 
     stack_type = FactorizedTokenStack
+    reads_clips = True
 
     @nn.nowrap
     def spatiotemporal_flops(self, frames, patches, input_channels: int) -> float:
