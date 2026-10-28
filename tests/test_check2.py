@@ -234,6 +234,107 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
         assert ct.certified(fn, ints)[1] == [], fn
 
 
+def _first_equation(fn, operands, name):
+    """The first `name` equation `fn` runs on `operands`, calls included: its params, the operands it was
+    given and its results, the program run one equation at a time as `certified` runs it."""
+    from jax.extend import core
+    from reference_error import _body
+
+    def run(jaxpr, consts, arguments):
+        env = dict(zip(jaxpr.constvars, consts, strict=True))
+        env.update(zip(jaxpr.invars, arguments, strict=True))
+
+        def read(var):
+            return np.asarray(var.val, var.aval.dtype) if isinstance(var, core.Literal) else env[var]
+
+        for eqn in jaxpr.eqns:
+            given, body = [read(var) for var in eqn.invars], _body(eqn)
+            if body is not None:
+                found = run(*body, given)
+                if found is not None:
+                    return found
+                results = jax.core.eval_jaxpr(*body, *given)
+            else:
+                results = eqn.primitive.bind(*given, **eqn.params)
+                results = list(results) if eqn.primitive.multiple_results else [results]
+                if eqn.primitive.name == name:
+                    return eqn.params, given, results
+            env.update(zip(eqn.outvars, results, strict=True))
+        return None
+
+    closed = jax.make_jaxpr(fn)(*operands)
+    found = run(closed.jaxpr, closed.consts, operands)
+    assert found is not None, f"no {name} equation"
+    return found
+
+
+def _off_by_one_element(result):
+    """`result` with its first element moved by one step of its storage (a flipped low bit)."""
+    wrong = np.array(result, copy=True)
+    flat = wrong.reshape(-1)
+    if flat.dtype == np.bool_:
+        flat[0] = not flat[0]
+    elif np.issubdtype(flat.dtype, np.integer):
+        flat[0] = flat[0] + 1
+    else:
+        bits = flat.view(ct._bits(flat).dtype)
+        bits[0] ^= 1
+    return wrong
+
+
+@pytest.mark.parametrize("name, fn, operands", [
+    ("pad", lambda a: jax.lax.pad(a, np.float32(-3), ((1, 2, 0), (-1, 1, 2))),
+     [np.float32(np.arange(12).reshape(3, 4))]),
+    ("iota", lambda: jax.lax.broadcasted_iota(jnp.int32, (3, 5), 1), []),
+    ("gather", lambda a, i: a[i], [np.float32(np.arange(20).reshape(5, 4)), np.int32([[4], [0], [2]])]),
+    ("gather", lambda a, i: jnp.take_along_axis(a, i, axis=1, mode="clip"),
+     [np.float32(np.arange(20).reshape(5, 4)), np.int32([[0, 9], [3, -2], [1, 1], [2, 0], [3, 3]])]),
+    ("gather", lambda a, i: jnp.take(a, i, axis=0, mode="fill", fill_value=-1.0),
+     [np.float32(np.arange(20).reshape(5, 4)), np.int32([1, 7, -1, 4])]),
+    ("gather", lambda a, i: jax.vmap(lambda row, at: row[at])(a, i),
+     [np.float32(np.arange(20).reshape(5, 4)), np.int32([3, 0, 1, 2, 3])]),
+    ("stack", lambda a, b: jnp.stack([a, b], axis=1), [np.float32([1, 2, 3]), np.float32([4, 5, 6])]),
+    ("optimization_barrier", lambda a, b: jax.lax.optimization_barrier((a, b)),
+     [np.float32([1, 2]), np.float32([[3, 4, 5]])]),
+], ids=["pad", "iota", "gather", "gather clipped", "gather filled", "gather batched", "stack", "barrier"])
+def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn, operands):
+    """Every move check 2 certifies by a numpy oracle of XLA's semantics (`CONTRACTS`), padding with
+    interior and negative edges, an iota, a gather in each mode and batched, a stack and an optimization
+    barrier of two operands: the program certifies, its contract holding the lane's own result at every
+    element, and the contract refuses that result with one element a step off."""
+    assert ct.certified(fn, *operands)[1] == []
+    params, given, results = _first_equation(fn, operands, name)
+    contract = ct.CONTRACTS[name]
+    for result in results:
+        native = np.asarray(result)
+        assert np.all(contract(params, given, native, None)), name
+        assert not np.all(contract(params, given, _off_by_one_element(native), None)), name
+
+
+def test_a_scan_is_certified_a_step_at_a_time_and_a_steps_finding_named_by_it():
+    """`certified` runs a scan's body once a step (forward and reversed), its carry threaded and its
+    outputs stacked, giving the lane's own scan's results; a body primitive no contract covers is found at
+    each step, by the step's path."""
+    x = np.float32(np.linspace(0.5, 2, 12).reshape(4, 3))
+
+    def cumulative(reverse):
+        def run(x):
+            return jax.lax.scan(lambda carry, row: (carry * row + 1, carry - row), np.float32(np.ones(3)), x,
+                                reverse=reverse)
+        return run
+
+    for reverse in (False, True):
+        outputs, findings = ct.certified(cumulative(reverse), x)
+        assert findings == []
+        for found, native in zip(jax.tree.leaves(outputs), jax.tree.leaves(jax.jit(cumulative(reverse))(x)),
+                                 strict=True):
+            np.testing.assert_array_equal(np.asarray(found), np.asarray(native))
+    _, findings = ct.certified(lambda x: jax.lax.scan(lambda c, row: (c + jnp.sin(row), None),
+                                                      np.float32(np.zeros(3)), x), x)
+    assert len(findings) == 4 and all("scan#" in finding and f"/{step}/sin" in finding
+                                      for step, finding in enumerate(findings)), findings
+
+
 def test_calls_are_certified_inside_and_unsupported_types_refused():
     """A rematerialised body is run one primitive at a time; a float16, float64-free complex or float8
     value has no contract of ours, and a key's wrapping is held to its data."""

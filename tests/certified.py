@@ -522,6 +522,97 @@ def _reshaped(params, value):
     return np.reshape(value, params["new_sizes"])
 
 
+def _padded(params, value, fill):
+    """lax.pad's result: each axis dilated by its interior padding, then given its low and high padding,
+    a negative one cropping."""
+    for axis, (low, high, interior) in enumerate(params["padding_config"]):
+        low, high, interior = int(low), int(high), int(interior)
+        if interior and value.shape[axis] > 1:
+            size = value.shape[axis] + (value.shape[axis] - 1) * interior
+            dilated = np.full((*value.shape[:axis], size, *value.shape[axis + 1:]), fill, value.dtype)
+            index = [slice(None)] * value.ndim
+            index[axis] = slice(None, None, interior + 1)
+            dilated[tuple(index)] = value
+            value = dilated
+        widths = [(0, 0)] * value.ndim
+        widths[axis] = (max(low, 0), max(high, 0))
+        value = np.pad(value, widths, constant_values=fill)
+        index = [slice(None)] * value.ndim
+        index[axis] = slice(max(-low, 0), value.shape[axis] - max(-high, 0))
+        value = value[tuple(index)]
+    return value
+
+
+def _iota(params):
+    shape, axis = tuple(params["shape"]), params["dimension"]
+    counted = np.arange(shape[axis], dtype=np.dtype(params["dtype"]))
+    return np.broadcast_to(counted.reshape([shape[axis] if dim == axis else 1 for dim in range(len(shape))]),
+                           shape)
+
+
+def _barrier(params, operands, result, fmt):
+    """An optimization barrier's results are its operands, unchanged: each result one of them, bit for bit
+    (`_held` hands a contract each result alone)."""
+    result = np.asarray(result)
+    same = [np.asarray(value) for value in operands
+            if np.shape(value) == result.shape and np.asarray(value).dtype == result.dtype]
+    held = any(np.array_equal(_bits(value), _bits(result)) for value in same)
+    return np.full(result.shape, held)
+
+
+def _gathered(params, operand, indices):
+    """lax.gather's result, by XLA's semantics: each output index's batch coordinates pick a start vector
+    from `indices` (its last axis the index vector), placed on the operand's `start_index_map` axes and
+    its batching axes, clamped so the slice fits (the clip and promise-in-bounds modes) or the whole slice
+    the fill value where it does not (fill-or-drop), then offset by the output's offset coordinates on the
+    operand's axes a slice keeps."""
+    import jax
+
+    numbers = params["dimension_numbers"]
+    sizes, mode = tuple(params["slice_sizes"]), params["mode"]
+    fill = jax.lax.GatherScatterMode.FILL_OR_DROP
+    shape = operand.shape
+    out_rank = len(numbers.offset_dims) + indices.ndim - 1
+    offset_axes = [axis for axis in range(operand.ndim)
+                   if axis not in numbers.collapsed_slice_dims and axis not in numbers.operand_batching_dims]
+    batch_dims = [dim for dim in range(out_rank) if dim not in numbers.offset_dims]
+    kept = [size for axis, size in enumerate(sizes) if axis in offset_axes]
+    out_shape = [0] * out_rank
+    for dim, size in zip(numbers.offset_dims, kept, strict=True):
+        out_shape[dim] = size
+    for dim, size in zip(batch_dims, indices.shape[:-1], strict=True):
+        out_shape[dim] = size
+    result = np.empty(out_shape, operand.dtype)
+    if params.get("fill_value") is not None:
+        filler = params["fill_value"]
+    elif np.issubdtype(operand.dtype, np.inexact):
+        filler = np.nan
+    elif np.issubdtype(operand.dtype, np.bool_):
+        filler = True
+    else:
+        filler = np.iinfo(operand.dtype).min if np.issubdtype(operand.dtype, np.signedinteger) else \
+            np.iinfo(operand.dtype).max
+    for out in np.ndindex(*out_shape):
+        batch = tuple(out[dim] for dim in batch_dims)
+        vector = indices[batch]
+        start = [0] * operand.ndim
+        for position, axis in enumerate(numbers.start_index_map):
+            start[axis] = int(vector[position])
+        for axis, batch_axis in zip(numbers.operand_batching_dims, numbers.start_indices_batching_dims,
+                                    strict=True):
+            start[axis] = batch[batch_axis]
+        if mode == fill and any(start[axis] < 0 or start[axis] + sizes[axis] > shape[axis]
+                                for axis in range(operand.ndim)):
+            result[out] = filler
+            continue
+        start = [min(max(begin, 0), shape[axis] - sizes[axis]) for axis, begin in enumerate(start)]
+        offsets = [out[dim] for dim in numbers.offset_dims]
+        for axis, offset in zip(offset_axes, offsets, strict=True):
+            start[axis] += offset
+        result[out] = operand[tuple(start)]
+    return result
+
+
 def _bitcast(params, value):
     """lax.bitcast_convert_type's shapes: a narrower type adds a trailing axis of the width ratio, a
     wider one takes the trailing axis away."""
@@ -708,6 +799,11 @@ CONTRACTS = {
     "concatenate": _moved(lambda params, *parts: np.concatenate(parts, axis=params["dimension"])),
     "copy": _moved(lambda params, a: a),
     "copy_p": _moved(lambda params, a: a),
+    "optimization_barrier": _barrier,
+    "pad": _moved(_padded),
+    "iota": _moved(_iota),
+    "gather": _moved(_gathered),
+    "stack": _moved(lambda params, *parts: np.stack(parts, axis=params["axis"])),
     "random_bits": _random_bits,
     "random_wrap": _wrapped,
     "random_unwrap": _unwrapped,
@@ -757,6 +853,8 @@ def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
             if eqn.primitive.name == "cond":
                 branch = eqn.params["branches"][int(np.asarray(operands[0]))]
                 results = _run(branch.jaxpr, branch.consts, operands[1:], findings, at + "/")
+            elif eqn.primitive.name == "scan":
+                results = _scanned(eqn.params, operands, findings, at + "/")
             elif body is not None:
                 results = _run(*body, operands, findings, at + "/")
             else:
@@ -765,6 +863,32 @@ def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
                 _held(eqn, operands, results, findings, at)
         env.update(zip(eqn.outvars, results, strict=True))
     return [read(var) for var in jaxpr.outvars]
+
+
+def _scanned(params, operands, findings, where: str) -> list:
+    """A scan run a step at a time (`_run` of its body), its carry threaded from step to step and its
+    outputs stacked, every step's equations held to their contracts as the program's are, each by its
+    step's path."""
+    import jax.numpy as jnp
+
+    body = params["jaxpr"]
+    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(operands))).unpack())
+    consts, carry, xs = (operands[:constants], operands[constants:constants + carries],
+                         operands[constants + carries:])
+    ys = []
+    steps = range(params["length"])
+    for step in reversed(steps) if params["reverse"] else steps:
+        outputs = _run(body.jaxpr, body.consts, [*consts, *carry, *(x[step] for x in xs)], findings,
+                       f"{where}{step}/")
+        carry = outputs[:carries]
+        ys.append(outputs[carries:])
+    if params["reverse"]:
+        ys.reverse()
+    if ys:
+        stacked = [jnp.stack(column) for column in zip(*ys, strict=True)]
+    else:
+        stacked = [jnp.zeros((0, *var.aval.shape), var.aval.dtype) for var in body.jaxpr.outvars[carries:]]
+    return [*carry, *stacked]
 
 
 def _held(eqn, operands, results, findings, at) -> None:

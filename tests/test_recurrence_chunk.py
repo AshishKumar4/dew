@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from certified import assert_certified
 from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import (
     FEWEST_SEEDS,
@@ -491,6 +492,28 @@ def portable_draw(seed: int, rows: int, packed: bool) -> tuple:
     starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
     operands = (query, key, value, g, beta)
     return operands, starts, tuple(jax.random.normal(keys[6], x.shape) for x in operands)
+
+
+CERTIFIED_SEEDS = 2
+"""The chunk ops' check-2 draws: every element of every operation certified on each (tests/certified.py)."""
+
+
+@pytest.mark.parametrize("decay", ["gated", "none"])
+@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
+def test_the_chunk_ops_certify_element_by_element(packed, decay):
+    """The portable delta rule's chunk ops (`chunk_delta_rule`: the decay's prefix, the chunks' WY
+    inverse and memories, the scan over chunks and the outputs), with a decay a head and with none, over
+    one sequence and packed documents: run one primitive at a time, every element of every operation,
+    each step of the scan included, within its own operation's certified bound (check 2, row 1340)."""
+    def draw(seed):
+        operands, starts, _ = portable_draw(seed, 1, packed)
+        query, key, value, g, beta = operands
+        return query, key, value, g if decay == "gated" else jnp.zeros_like(g), beta, starts
+
+    def rule(query, key, value, g, beta, starts):
+        return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=CHUNK, starts=starts)
+
+    assert_certified(rule, draw, f"the chunk ops, {decay} decay", seeds=CERTIFIED_SEEDS)
 
 
 @pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
