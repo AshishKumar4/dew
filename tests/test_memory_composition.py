@@ -424,29 +424,72 @@ def test_a_quantized_memorys_update_rounds_from_its_own_stream():
     assert not np.array_equal(np.asarray(drawn[0]), np.asarray(other[0]))
 
 
-def test_a_served_memory_computes_the_quantized_memory_from_its_stored_w0():
-    """Serving quantization (`quantize_for_serving`) of every inner Dense of two memory layers stores
-    each head's W_0 quantized, the steps starting from the float it decodes to (`decoded_stored`), and
-    rounds every product of the moving weights as quantized training does (`moving_weights`): the
-    served decoder, and the same tree after a round trip through the host, computes bit for bit what
-    quantized training (`Quantization.apply`) computes from the stored W_0. Its projections, which no
-    step moves, serve as quantized training computes them from their float weights."""
-    pytest.importorskip("qwix")
-    from dew.quantization import Annotated, Quantization, decoded_stored, quantize_for_serving
+class ConvolvedMemory(nn.Module):
+    """An inner network that convolves the view's vector as a one-channel signal, width kept: a memory's
+    network that runs a convolution rather than a matmul."""
 
-    model = decoder()
-    ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
-    variables = model.init(jax.random.key(0), ids)
-    for patterns, moving in (((INNER,), True), ((r".*self_attn/[qkvo]_proj",), False)):
-        spec = Quantization(patterns=patterns)
-        served, held = quantize_for_serving(model, variables, spec, ids)
-        assert any(isinstance(leaf, Annotated)
-                   for leaf in jax.tree.leaves(held, is_leaf=lambda leaf: isinstance(leaf, Annotated)))
-        logits = np.asarray(served.apply(held, ids))
-        reloaded = jax.tree.map(jnp.asarray, jax.device_get(held))
-        np.testing.assert_array_equal(np.asarray(served.apply(reloaded, ids)), logits)
-        start = {**variables, "params": decoded_stored(held)["params"]} if moving else variables
-        np.testing.assert_array_equal(logits, np.asarray(spec.apply(model).apply(start, ids)))
+    dtype: jnp.dtype | None = None
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return nn.Conv(1, (3,), padding="SAME", dtype=self.dtype, name="conv")(x[..., None])[..., 0]
+
+
+SERVED = {"moving": ((INNER,), None, True), "projections": ((r".*self_attn/[qkvo]_proj",), None, False),
+          "convolved": ((INNER,), ConvolvedMemory(), True)}
+"""The served-memory cases: the patterns serving quantizes, the memory's inner network (None: Titans'
+MLP), and whether those weights move."""
+
+
+def served_site(case: str):
+    """The served-memory site `case` (`SERVED`): the served decoder over its stored tree, from seed 0's
+    serving preparation, and check 1's arms over each seed's: the served decoder, quantized training
+    from the stored W_0, and that training in float64, with the draw."""
+    from model_support import model_draw
+
+    from dew.quantization import Quantization, decoded_stored, quantize_for_serving
+
+    patterns, network, moving = SERVED[case]
+    memory = None if network is None else InContextMemory(
+        network=network, heads=2, head_features=8, chunk=4, normalize=True,
+        learning_rate=Gate(scale=STEP), momentum=Gate(), retention=Gate(bias=-2.0))
+    model, wide = decoder(memory), decoder(memory, dtype=jnp.float64)
+    spec = Quantization(patterns=patterns)
+    draw_model = model_draw(model, (ROWS, LENGTH), 37)
+    served = quantize_for_serving(model, *draw_model(0)[:1], spec, draw_model(0)[1])[0]
+
+    def draw(seed: int):
+        variables, ids = draw_model(seed)
+        stored = quantize_for_serving(model, variables, spec, ids)[1]
+        start = {**variables, "params": decoded_stored(stored)["params"]} if moving else variables
+        return stored, start, ids
+
+    return (served, lambda stored, start, ids: served.apply(stored, ids),
+            lambda stored, start, ids: spec.apply(model).apply(start, ids), draw,
+            lambda stored, start, ids: spec.apply(wide).apply(start, ids))
+
+
+@pytest.mark.parametrize("case", SERVED)
+def test_a_served_memory_computes_the_quantized_memory_from_its_stored_w0(case):
+    """Serving quantization (`quantize_for_serving`) of two memory layers' inner networks stores each
+    head's W_0 quantized, the steps starting from the float it decodes to (`decoded_stored`), and rounds
+    every product of the moving weights, a matmul's or a convolution's, as quantized training does
+    (`moving_weights`): the served decoder computes what quantized training (`Quantization.apply`)
+    computes from the stored W_0, on par against that training in float64 (check 1). Its projections,
+    which no step moves, serve as quantized training computes them from their float weights. The same
+    tree after a round trip through the host computes the same program bit for bit."""
+    pytest.importorskip("qwix")
+    from dew.quantization import Annotated
+
+    served, dew_fn, reference_fn, draw, truth_fn = served_site(case)
+    held, _, ids = draw(0)
+    assert any(isinstance(leaf, Annotated)
+               for leaf in jax.tree.leaves(held, is_leaf=lambda leaf: isinstance(leaf, Annotated)))
+    reloaded = jax.tree.map(jnp.asarray, jax.device_get(held))
+    np.testing.assert_array_equal(np.asarray(served.apply(reloaded, ids)),
+                                  np.asarray(served.apply(held, ids)))
+    assert_as_exact(dew_fn, reference_fn, draw, f"served memory {case}", seeds=SEEDS[f"served memory {case}"],
+                    truth_fn=truth_fn)
 
 
 def test_a_qwix_quantized_linear_memory_leaves_the_recurrence():
