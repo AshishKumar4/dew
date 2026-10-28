@@ -122,7 +122,7 @@ class _FirstFitPacking(pygrain.DatasetIterator[Batch]):
         self._restart(documents.get_state())
         self._counter = 0
 
-    def _restart(self, began: object) -> None:
+    def _restart(self, began: Mapping[str, object]) -> None:
         """No window open or emitted, the next document read where `began` stands."""
         self._began, self._ending = began, None
         self._placement.restart()
@@ -130,7 +130,7 @@ class _FirstFitPacking(pygrain.DatasetIterator[Batch]):
         self._emitting: list[Batch] | None = None
         self._next = 0
 
-    def _emitted(self, ending: object) -> list[Batch]:
+    def _emitted(self, ending: Mapping[str, object]) -> list[Batch]:
         """Every window that holds a document laid out, to emit in order, the windows after them
         beginning where `ending` stands."""
         self._ending = ending
@@ -166,7 +166,7 @@ class _FirstFitPacking(pygrain.DatasetIterator[Batch]):
             self._began, self._emitting, self._next = self._ending, None, 0
         return window
 
-    def get_state(self) -> dict[str, object]:
+    def get_state(self) -> Mapping[str, object]:
         return {"parent": self._began, "next_row": self._next, "counter": self._counter}
 
     def set_state(self, state) -> None:
