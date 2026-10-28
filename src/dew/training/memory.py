@@ -79,8 +79,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
 
     Only an objective whose rows hold tokens gives them (`Objective.row_tokens`), so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
-    `gpu_target().kernels['xla_triton_gemm']` measured a win and no module the step runs
-    keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
+    the GPU measured a win without them (`GpuTarget.triton_gemm_fusions`) and no module the step
+    runs keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
     (`compiler_options`).
     """
     generation = device_generation()
@@ -92,7 +92,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
     modules = [entry.module for entry in objective.program_key()]
-    if (gpu_target(generation).kernels.get('xla_triton_gemm') == 'off'
+    if (not gpu_target(generation).triton_gemm_fusions
             and xla_flag('xla_gpu_enable_triton_gemm') is None
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):

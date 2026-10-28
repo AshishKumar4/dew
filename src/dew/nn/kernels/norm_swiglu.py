@@ -82,7 +82,7 @@ from dew.mesh import logical_spec
 from ..precision import at_least_fp32, compensated_add, compensated_total, rounded_to, two_product
 from ..sharding import automatic_axes, manual_map
 from . import generation, tuning
-from .generation import INHERENT, measured_kernel
+from .generation import INHERENT, device_generation
 from .selection import Kernel, Op, Requirement, select
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
@@ -306,6 +306,11 @@ class NormCase:
     fp32_statistics: bool
     activation: str | None
 
+    @property
+    def cell(self) -> tuple[str, str]:
+        """The cell a receipt measures (`selection.Celled`): the device's generation and the rows' dtype."""
+        return device_generation(), self.dtypes[0].name
+
 
 def norm_case(x, scale, dtype, axes, *, branch=None, gate=None, activated=False, fp32_statistics=True,
               activation=None) -> NormCase:
@@ -354,10 +359,18 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
 """The fused norms' requirements: a plain, stream and gated RMSNorm over fp32 or bf16 rows of at most
 8192 features, with fp32 statistics, a vector weight, and operands placed as the kernel reads them."""
 
+FUSED_FASTER = ("this module's table (469e47b1f): Qwen3.5-0.8B's 4 x 3072 rows of 1024 in bf16, the fused "
+                "kernels' forward and reverse against XLA's fusions of the same math on an A100-SXM4-40GB "
+                "and an H100 SXM")
+"""The receipt behind the fused norm's and SiLU product's declared cells (`NORM`, `SWIGLU`)."""
+
 NORM: Op[NormCase] = Op('rms_norm', (Kernel('pallas', NORM_SUPPORTS), Kernel('xla', (), generic=True)),
-                        lambda case: measured_kernel('rms_norm', 'xla'))
-"""The norm selector: the fused kernel where its requirements hold and the target's row names it,
-else XLA's arithmetic."""
+                        lambda case: 'xla',
+                        declared={(device, 'bfloat16'): ('pallas', FUSED_FASTER)
+                                  for device in ('sm80', 'sm90')})
+"""The norm selector: XLA's arithmetic, but the fused kernel where it measured faster (bf16 rows on an
+A100 and an H100: the seam 76/187 against 103/200 us and 36/81 against 44/89, the gated norm's 118;224
+against 123;343 and 52;101 against 59;149) and its requirements hold."""
 
 
 def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
@@ -373,8 +386,8 @@ def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
 
 
 def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str, *, axes=None) -> str:
-    """Resolve the gated RMSNorm (`gated_rms_norm`), the one kernel family
-    `KERNELS` names 'rms_norm'; other gates keep their XLA arithmetic."""
+    """Resolve the gated RMSNorm (`gated_rms_norm`) through the norm's selector (`NORM`); other gates
+    keep their XLA arithmetic."""
     return _selected(NORM, norm_case(x, scale, dtype, axes, gate=gate, activation=activation),
                      implementation)
 
@@ -388,6 +401,12 @@ class SwigluCase:
     promotes: np.dtype
     shape_fits: bool
     placed: bool
+
+    @property
+    def cell(self) -> tuple[str, str]:
+        """The cell a receipt measures (`selection.Celled`): the device's generation and the product's
+        dtype."""
+        return device_generation(), self.promotes.name
 
 
 SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
@@ -408,20 +427,16 @@ SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
 as the kernel reads them."""
 
 
-def _swiglu_preferred(case: SwigluCase) -> str:
-    """The kernel measured fastest for a SiLU product of the case's dtype (its operands' common dtype,
-    so a bf16 gate over an fp32 up, Gemma-4's per-layer input, is an fp32 product): the target's row
-    for a bf16 one, which every row measured, and XLA for an fp32 one, which fuses the product's
-    converts and neighbours into one pass the kernel's launch splits (8 layers of Dory's 1 x 2048 nGPT
-    block on an A100: 5.4 ms a step through the kernel, 2.6 through XLA). A kernel named per call or
-    by `chosen` runs as named."""
-    return 'xla' if case.promotes == jnp.float32 else measured_kernel('swiglu', 'xla')
-
-
 SWIGLU: Op[SwigluCase] = Op('swiglu', (Kernel('pallas', SWIGLU_SUPPORTS), Kernel('xla', (), generic=True)),
-                            _swiglu_preferred)
-"""The SwiGLU selector: the fused product where its requirements hold and the target prefers it, else
-XLA's arithmetic."""
+                            lambda case: 'xla',
+                            declared={(device, 'bfloat16'): ('pallas', FUSED_FASTER)
+                                      for device in ('sm80', 'sm90')})
+"""The SwiGLU selector: XLA's arithmetic, but the fused product where it measured faster (a bf16 product
+on an A100 and an H100: 193;320 against 235;361 us and 87;147 against 113;171) and its requirements hold.
+A product of the operands' common dtype, so a bf16 gate over an fp32 up (Gemma-4's per-layer input) is an
+fp32 product, which no receipt covers: XLA fuses its converts and neighbours into one pass the kernel's
+launch splits (8 layers of Dory's 1 x 2048 nGPT block on an A100: 5.4 ms a step through the kernel, 2.6
+through XLA). A kernel named per call or by `chosen` runs as named."""
 
 
 def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
@@ -437,7 +452,7 @@ def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
 
 def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
-    the kernel `KERNELS` names 'swiglu', which reads the halves where the projection wrote them.
+    through the SwiGLU selector (`SWIGLU`), whose kernel reads the halves where the projection wrote them.
     `axes` are the product's logical axes, `[..., H]`'s."""
     case = SwigluCase(dtypes=(jnp.dtype(gate_up.dtype),), promotes=jnp.dtype(gate_up.dtype),
                       shape_fits=gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,

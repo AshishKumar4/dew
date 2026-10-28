@@ -120,8 +120,7 @@ SUPPORTS: tuple[Requirement[ConvCase], ...] = (
 and the shapes and dtypes they take."""
 
 CONV: Op[ConvCase] = Op('short_conv', (Kernel('pallas', SUPPORTS), Kernel('xla', (), generic=True)),
-                        lambda case: generation.measured_kernel(
-                            'short_conv', 'pallas' if generation.backend() == 'gpu' else 'xla'))
+                        lambda case: 'pallas' if generation.backend() == 'gpu' else 'xla')
 """The conv selector: the kernels on a GPU where their requirements hold, else XLA's conv
 (`dew.nn.linear.xla_conv1d`)."""
 

@@ -690,7 +690,7 @@ def chunked_tile() -> tuple[int, int]:
     4096; at 8192 tokens 219.1 against 228.3 (1024 x 8192), 227.8 (2048 x
     16384) and 219.3 (8192 x 4096) with less memory. The whole logits beat the
     4096 x 8192 tile where they fit once the step compiles without XLA's
-    Triton GEMM fusions (`gpu_target().kernels['xla_triton_gemm']`): 53.5
+    Triton GEMM fusions (`GpuTarget.triton_gemm_fusions`): 53.5
     against 65.5 ms at 2048 tokens, 93.4 against 110.2 at 4096. With the
     fusions, exactly 4096 whole took 286.0 ms."""
     return gpu_target().head_tile or (1024, 8192)
