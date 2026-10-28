@@ -1262,6 +1262,17 @@ def test_a_moe_decoder_saves_every_tensor_its_source_holds(name, tmp_path):
     assert json.loads((tmp_path / "config.json").read_text())["use_cache"] is True
 
 
+def test_a_moe_decoder_written_from_its_model_holds_its_sources_tensors(tmp_path):
+    """A mixture-of-experts decoder written from its model and variables alone
+    (`PretrainedDecoder.from_model`) writes every tensor its source checkpoint holds, bit for bit: each
+    expert's projections sliced from their stacked kernel by the plan the load stacked them by
+    (`decoder_parts.expert_path`), each oriented as the load read it (`decoder_parts.stored_order`)."""
+    loaded = Pretrained.load(FIXTURES / "qwen3-moe-tiny", dtype="float32", param_dtype="auto",
+                             attention_impl="xla")
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
+    assert_same_tensors(written_tensors(tmp_path), written_tensors(FIXTURES / "qwen3-moe-tiny"))
+
+
 def test_a_dense_decoder_written_from_its_model_holds_its_sources_tensors(tmp_path):
     """A causal decoder written from its model and variables alone (`PretrainedDecoder.from_model`,
     the encoder every family's derived export shares) writes every tensor its source checkpoint holds,

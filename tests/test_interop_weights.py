@@ -129,6 +129,8 @@ def test_a_host_leafs_export_transposes_on_the_host():
 
 PACKS = {
     "a transposed qkv (GPT-2's c_attn)": ("gpt2", ".attn.c_attn.weight", (8, 24), {}),
+    "one part under its own name, transposed (GPT-2's mlp.c_proj)": (
+        "gpt2", ".mlp.c_proj.weight", (8, 6), {}),
     "unequal widths (Phi-3's qkv)": ("phi3", ".self_attn.qkv_proj.weight", (24, 5),
                                      {"num_heads": 4, "num_kv_heads": 2, "head_dim": 3}),
     "runs a key head (MiMo-V2's grouped qkv)": ("mimo_v2", ".self_attn.qkv_proj.weight", (24, 5),
@@ -136,9 +138,10 @@ PACKS = {
     "transposed experts (Qwen 3.5 MoE's gate_up_proj)": (
         "qwen3_5_moe_text", ".experts.gate_up_proj", (2, 6, 4), {}),
 }
-"""Packed source tensors of each kind the export joins: one transposed after its parts are joined, one of
-unequal parts, one interleaved in runs, and stacked experts transposed on their last two axes; each by its
-family, a stored shape and the translated geometry its parts' widths and runs read."""
+"""Packed source tensors of each kind the export joins: one transposed after its parts are joined, a part
+alone under the pack's own name, transposed, one of unequal parts, one interleaved in runs, and stacked
+experts transposed on their last two axes; each by its family, a stored shape and the translated geometry
+its parts' widths and runs read."""
 
 
 @pytest.mark.parametrize("kind", PACKS)

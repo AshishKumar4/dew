@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
 
@@ -1504,7 +1505,7 @@ def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
         for target, expert in slices:
             if target in layouts:
                 raise ValueError(f"{'.'.join(path)} and {layouts[target].paths[0]} both write {target}")
-            layouts[target] = WeightLayout(target, (path,), stored, order, expert_index=expert)
+            layouts[target] = PartPlan(path, expert, order).layout(target, stored)
     return layouts
 
 
@@ -1741,6 +1742,47 @@ def expert_path(stacked: tuple[str, ...], expert: int) -> tuple[str, ...]:
     return (*stacked[:-2], str(expert), *stacked[-2:])
 
 
+class PartPlan(NamedTuple):
+    """How one stored tensor fills its leaf and is written back from it, the one weight plan a load
+    reads by and both exports write by: the leaf (the stacked one, for an expert's slice) and the
+    expert it is (`expert_slot`), the order that writes the leaf back as the stored tensor
+    (`stored_order`), the dtype the checkpoint stores it in where a leaf's would differ (an index
+    table's integer width; a floating weight is written in its leaf's dtype, bfloat16 and FP8
+    included), and the length a zero-padded tensor stores past its leaf (`DecoderFamily.zero_padded`).
+    A load builds its `SourceLeaf` from it, the import-derived bindings and the native export their
+    `WeightLayout`s (`layout`)."""
+
+    path: tuple[str, ...]
+    expert: int | None
+    order: tuple[int, ...] | None
+    dtype: np.dtype | None = None
+    padded: int | None = None
+
+    def layout(self, name: str, shape: tuple[int, ...], place: Callable[[tuple[str, ...]], tuple[str, ...]]
+               = tuple) -> WeightLayout:
+        """The layout that writes the `shape`d stored tensor `name` back from its leaf, placed in the
+        tree that holds it by `place`."""
+        return WeightLayout(name, (place(self.path),), tuple(shape), self.order, None, self.expert,
+                            self.dtype, self.padded)
+
+
+def part_plan(part: Part, stored: Stored, family: "DecoderFamily",
+              leaf_rank: Callable[[tuple[str, ...], int | None], int] | None = None) -> PartPlan | None:
+    """The plan of `part`, stored as `stored` (the part itself, or an unpacked tensor as the checkpoint
+    holds it before `prepare` reshaped it), None where no leaf takes it. `leaf_rank` reads the rank its
+    leaf has past an expert's axis, which a matrix kernel's orientation swaps under (DeepSeek V4's
+    grouped projection holds a group axis its stored rows fold); the stored tensor's rank without it."""
+    if part.path is None:
+        return None
+    path, expert = expert_slot(part.path) or (part.path, None)
+    order = stored_order(path, stored.ndim, stored.ndim)
+    if order is not None and leaf_rank is not None:
+        order = stored_order(path, stored.ndim, leaf_rank(path, expert))
+    dtype = None if jnp.issubdtype(stored.dtype, jnp.floating) else stored.dtype
+    padded = stored.shape[0] if part.name.endswith(family.zero_padded) else None
+    return PartPlan(path, expert, order, dtype, padded)
+
+
 def held_parts(readings: Sequence[Reading]) -> dict[str, Part]:
     """Each part `readings` hold, once: the tree's one leaf for a part a fused tensor and a tensor
     of its own both store (`_held_twice`)."""
@@ -1770,12 +1812,12 @@ def packed_readings(tensors: Mapping[str, Stored], packed: Sequence[Packed],
     part with the leaf `path` says it fills (None without one). `stored` holds the tensors as the
     checkpoint stores them where `tensors` are another's reading of them (`DecoderFamily.prepare`'s);
     by default they are."""
-    held = tensors if stored is None else stored
     readings = []
     for name, tensor in tensors.items():
         packing = packing_of(packed, name)
         parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
-        readings.append(Reading(name, held.get(name), packing, tuple(
+        # One read of each: a lazy mapping builds a tensor on every access (`LazyTensors`).
+        readings.append(Reading(name, tensor if stored is None else stored.get(name), packing, tuple(
             Part(part, value, None if path is None else path(part)) for part, value in parts.items())))
     return tuple(readings)
 
