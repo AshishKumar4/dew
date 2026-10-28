@@ -341,6 +341,39 @@ def record_of(key: str, token: str) -> bytes | None:
         return None
 
 
+READ_TOKEN = "DEW_XLA_CACHE_READ_TOKEN"
+"""The test cache's read-only token, which the plan reads records with (`reusable`): it never writes them."""
+
+
+def pinned_class() -> str | None:
+    """The one CPU class .armada.json pins its tasks to (task.cpu), as `cpu_class` names it, which their rows
+    are recorded under; None where it pins none or several, or the tasks run on a CUDA lane, whose class
+    (`device_class`) the plan cannot know."""
+    config = Path(".armada.json")
+    if not config.is_file() or "cuda" in os.environ.get("JAX_PLATFORMS", "").split(","):
+        return None
+    cpu = json.loads(config.read_text()).get("task", {}).get("cpu")
+    return f"{cpu['vendor']}-{cpu['family']}-{cpu['model']}" if isinstance(cpu, dict) else None
+
+
+def reusable(python: str, names: list[str], common: str) -> set[str]:
+    """The files of `names` whose whole row ran green on exactly these inputs (`common`, and each file's
+    own, `fresh`) on the class the tasks run on (`pinned_class`), read at plan time with the cache's read
+    token (`READ_TOKEN`): a task of their own would only look each up and exit. None where the plan has no
+    token or no single class (Main, 2026-10-28: a lane run with most files unchanged booted a container a
+    task)."""
+    token, held = os.environ.get(READ_TOKEN), pinned_class()
+    if not token or held is None or "DEW_XLA_CACHE_URL" not in os.environ:
+        return set()
+
+    def hit(name: str) -> bool:
+        found = recorded(record_key(python, row(python, name, ""), held, common), token)
+        return found is not None and fresh(found, name, common)
+
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        return {name for name, found in zip(names, pool.map(hit, names), strict=True) if found}
+
+
 def reused(python: str, name: str, split: str, common: str, network: bool = False) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
     (`device_class`), if it ran green there on exactly these inputs; else None. The record of the last
@@ -530,7 +563,9 @@ def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
     then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
-    the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task."""
+    the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files
+    whose rows the cache holds for exactly these inputs (`reusable`) share one task, which looks each up
+    again in its container, so the verdict names every file and containers scale with the change."""
     cache = os.environ.get("DEW_TEST_CACHE") or "on"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     recorded = recorded_tests()
@@ -541,8 +576,12 @@ def plan(target: float, timings: dict) -> list[dict]:
         files = every if whole else [name for name in every if name in NEWEST_FILES]
         timings = borrowed(timings, python)
         timed = weights(files, timings, python)
-        tasks: list[tuple[list[str], str, float]] = [
-            ([name], "", target) for name, seconds in timed.items() if seconds is None]
+        kept = sorted(reusable(python, [name for name, seconds in timed.items() if seconds is None
+                                        or seconds <= target], shared(python))) if cache == "on" else []
+        timed = {name: seconds for name, seconds in timed.items() if name not in kept}
+        # A lookup a file, in seconds: the task's weight is its container's start and those lookups.
+        tasks: list[tuple[list[str], str, float]] = [(kept, "", float(len(kept)))] if kept else []
+        tasks += [([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
                 at, count = measured_cut(timings, python, name) or (seconds, 1)
