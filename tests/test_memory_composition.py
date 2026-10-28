@@ -496,12 +496,15 @@ def test_a_served_memory_computes_the_quantized_memory_from_its_stored_w0(case):
 
 def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream():
     """A memory decoder served quantized (`TextGeneration.quantized`) under a spec that rounds the
-    backward stochastically (`bwd_stochastic_rounding`) draws its inner steps' rounding from its
-    request's own stream (`dew.sampling.text.rounding_keys`), apart from its sampling, through the
-    prefill and every decode step: the task and a server answer one request with the same text, again
-    on a second call; without the stream the decode raised in Qwix's make_rng (ledger 2020)."""
+    backward stochastically (`bwd_qtype`, `bwd_stochastic_rounding`) draws its inner steps' rounding from
+    its request's own key, folded with each token's place (`dew.nn.kv_cache.ROUNDING_KEYS`), apart from
+    its sampling: a request generates alike alone and served beside another, in either slot of one live
+    server, tokens, lengths, termination and likelihoods; and another key rounds apart, its likelihoods
+    moving though greedy decoding draws nothing. Without the stream the decode raised in Qwix's make_rng
+    (ledger 2020)."""
     pytest.importorskip("qwix")
     from model_support import Digits
+    from test_serving import assert_same_generation
 
     from dew.inference import RunProcessor, TextGeneration
     from dew.inference.serving import Server
@@ -514,9 +517,13 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream():
                           sampling=Sampling(temperature=0, eos_token_ids=12))
     bound = task.quantized(Quantization(patterns=(INNER,), bwd_qtype="int8",
                                         bwd_stochastic_rounding="uniform"))
-    first = bound("12", 4, key=3)
-    assert bound("12", 4, key=3).text == first.text
-    assert Server.from_task(bound, slots=2, capacity=64)(["12"], 4, key=3)[0].text == first.text
+    alone = {prompt: bound(prompt, 4, key=3) for prompt in ("12", "567")}
+    server = Server.from_task(bound, slots=2, capacity=64)
+    for prompts in (["12", "567"], ["567", "12"]):
+        for served, prompt in zip(server(prompts, 4, key=3), prompts, strict=True):
+            assert_same_generation(served, alone[prompt])
+    assert not np.array_equal(np.asarray(bound("12", 4, key=4).raw_log_probs),
+                              np.asarray(alone["12"].raw_log_probs))
 
 
 def test_a_qwix_quantized_linear_memory_leaves_the_recurrence():

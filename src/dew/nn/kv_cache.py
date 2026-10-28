@@ -71,6 +71,11 @@ GROUPS = {"image_groups": "cached_image_groups", "block_groups": "cached_block_g
 layer reads it (`Append.groups`), by the field's name."""
 POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale", PLACES, *GROUPS.values()})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
+ROUNDING_KEYS = "rounding_keys"
+"""A per-row cache leaf, each row's key data of its stochastic-rounding stream `[rows, words]`, which a
+decoding layer that rounds stochastically (a quantized memory's moving weights) folds with each token's
+place and head, so a row's draws are its request's key's and its places' alone; a serving driver writes
+it from the request's key (`with_rounding_keys`), zeros where none does."""
 
 _LIMITS = {"int8": 127.0, "float8_e4m3fn": float(jnp.finfo(jnp.float8_e4m3fn).max)}
 
@@ -84,6 +89,12 @@ def leaf_name(path: tuple[jax.tree_util.KeyEntry, ...]) -> str | None:
         return None
     name = last.key
     return name if isinstance(name, str) else None
+
+
+def with_rounding_keys(cache: Mapping[str, object], keys: jax.Array) -> Mapping[str, object]:
+    """`cache` with every `ROUNDING_KEYS` leaf holding `keys`, each row's key data."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, leaf: keys.astype(leaf.dtype) if leaf_name(path) == ROUNDING_KEYS else leaf, cache)
 
 
 def overflowed(cache: Mapping[str, object], capacity: int) -> jax.Array:

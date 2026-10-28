@@ -84,6 +84,7 @@ from dew.batch import valid_order
 from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
+from dew.nn.kv_cache import ROUNDING_KEYS
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
@@ -741,13 +742,30 @@ class InContextMemory(nn.Module):
         state = self.variable("cache", STATE, lambda: rows)
         momentum = self.variable("cache", MOMENTUM, lambda: rows)
         seen = self.variable("cache", COUNT, lambda: jnp.zeros_like(steps.real, jnp.int32)[:, 0])
+        default = jax.random.key_data(jax.random.key(0))
+        rounding = self.variable("cache", ROUNDING_KEYS, lambda: rows_like(
+            jnp.zeros((steps.real.shape[0], *default.shape), default.dtype), steps.real))
         places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
-        reads, carry = self._stepped(heads, steps._replace(places=places),
+        keys = {**(steps.keys or {}), **_rounding_keys(rounding.value, places, self.heads)}
+        reads, carry = self._stepped(heads, steps._replace(places=places, keys=keys),
                                      (start.value, state.value, momentum.value))
         if allocated:
             start.value, state.value, momentum.value = carry
             seen.value = _at_last(places + 1, steps.real, seen.value)
         return reads
+
+
+def _rounding_keys(rows: jax.Array, places: jax.Array, heads: int) -> dict[tuple, jax.Array]:
+    """A cached call's `stochastic_rounding` stream, each token and head's key data `[B, S, H, words]`:
+    its row's key (`ROUNDING_KEYS`) folded with the token's place in its document and with the head, so
+    a row's rounding is its request's key's and its places' alone, whatever batch, slot or call holds
+    it, and a token verified and replayed at one place rounds alike."""
+    def token(row: jax.Array, place: jax.Array) -> jax.Array:
+        key = jax.random.fold_in(jax.random.wrap_key_data(row), place)
+        return jax.random.key_data(jax.vmap(lambda head: jax.random.fold_in(key, head))(jnp.arange(heads)))
+
+    words = jax.vmap(jax.vmap(token, in_axes=(None, 0)))(rows, places)
+    return {("stochastic_rounding", jax.random.key_impl(jax.random.key(0))): rows_like(words, rows)}
 
 
 class _Head(NamedTuple):

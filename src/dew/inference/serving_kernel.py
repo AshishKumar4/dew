@@ -28,14 +28,24 @@ from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.tuning import tune
-from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, grouped, is_paged, leaf_name
+from dew.nn.kv_cache import (
+    POOLED,
+    ROW_CURSORS,
+    TABLE,
+    as_words,
+    from_words,
+    grouped,
+    is_paged,
+    leaf_name,
+    with_rounding_keys,
+)
 from dew.nn.protocols import Serving
 from dew.nn.scatter import DROPPED
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, row_step
-from dew.sampling.text import decode_ops, prefill_state, rounding_keys, rounding_rngs
+from dew.sampling.text import decode_ops, prefill_state, rounding_keys
 
 
 @struct.dataclass
@@ -106,11 +116,9 @@ def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacit
     ops = decode_ops(model, params, pad_id, None)
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
                         {"attention_mask": jnp.zeros((slots, 1), bool)})
-    keys = jax.random.key_data(jax.random.key(0))
-    rounding = jnp.zeros((slots, *keys.shape), keys.dtype)
-    _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops,
-                                                                        rounding=rounding)[0],
+    _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops)[0],
                                                   errors=checkify.user_checks))
+    keys = jax.random.key_data(jax.random.key(0))
     return Slots(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), decoder),
                  jnp.zeros((slots, 2 * capacity), jnp.int32),
                  jnp.zeros((slots, 2 * capacity), bool),
@@ -230,9 +238,9 @@ class Paged:
         scattered back to the rows' slots.
         """
         rows = admission.cursors.shape[0]
-        rounding = rounding_keys(jax.random.wrap_key_data(admission.keys))
-        allocated = model.apply(params, rows, method="init_cache", mutable=["cache"],
-                                rngs=rounding_rngs(rounding))[1]["cache"]
+        allocated = with_rounding_keys(
+            model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"],
+            rounding_keys(jax.random.wrap_key_data(admission.keys)))
         continues = admission.cursors > 0
 
         def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:
@@ -249,7 +257,7 @@ class Paged:
 
         cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
         fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, None),
-                                    cache=cache, rounding=rounding)
+                                    cache=cache)
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:

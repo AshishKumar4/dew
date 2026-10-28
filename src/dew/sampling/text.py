@@ -38,7 +38,7 @@ from dew.batch import Variables, real_slots, token_positions, valid_order, with_
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
-from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
+from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, with_rounding_keys, write_cache
 from dew.nn.protocols import (
     BlockDenoiser,
     BlockDrafting,
@@ -342,10 +342,10 @@ def row_texts(decoder, generation, prompt_width: int | None) -> tuple[str, ...]:
 
 
 def rounding_keys(keys: jax.Array) -> jax.Array:
-    """The key data of each row's stochastic-rounding stream (`DecoderState.rounding`): a default-impl
-    key, `ROUNDING_STREAM`'s, folded with each word of the row's request key in turn, so it is apart
-    from the sampling stream whatever that key's implementation, as a training step's rounding stream
-    is apart from its dropout (`dew.objectives.base.training_rngs`)."""
+    """Each row's key data of its stochastic-rounding stream (`dew.nn.kv_cache.ROUNDING_KEYS`) from its
+    request's `keys`: a default-impl key, `ROUNDING_STREAM`'s, folded with each word of the row's key
+    in turn, so it is apart from the sampling stream whatever that key's implementation, as a training
+    step's rounding stream is apart from its dropout (`dew.objectives.base.training_rngs`)."""
     def derived(words: jax.Array) -> jax.Array:
         key = jax.random.key(ROUNDING_STREAM)
         for index in range(words.shape[0]):
@@ -353,22 +353,6 @@ def rounding_keys(keys: jax.Array) -> jax.Array:
         return jax.random.key_data(key)
 
     return jax.vmap(derived)(jax.random.key_data(keys))
-
-
-def rounding_rngs(rounding: jax.Array | None) -> dict[str, jax.Array] | None:
-    """A model call's RNG streams from the rows' rounding key data (`DecoderState.rounding`): its
-    `stochastic_rounding` stream, the first row's key; none where the decode carries none. A cache's
-    allocation takes it too, as its dummy decode step runs the model."""
-    return None if rounding is None else {"stochastic_rounding": jax.random.wrap_key_data(rounding)[0]}
-
-
-def _rounded(rounding: jax.Array | None) -> tuple[dict[str, jax.Array] | None, jax.Array | None]:
-    """A model call's streams (`rounding_rngs`) and every row's key for the next call."""
-    if rounding is None:
-        return None, None
-    keys = jax.random.wrap_key_data(rounding)
-    following = jax.random.key_data(jax.vmap(lambda key: jax.random.fold_in(key, 1))(keys))
-    return rounding_rngs(rounding), following
 
 
 def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
@@ -382,12 +366,13 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     not draft from nothing, and a block drafter's windows take every real
     prompt position's context. `cache` continues a cache the caller holds,
     whose cursors say where each prompt resumes; None allocates an empty one. `rounding` is each
-    row's stochastic-rounding key data (`rounding_keys`), which the prefill and every later call draws
-    from (`DecoderState.rounding`).
+    row's stochastic-rounding key data (`rounding_keys`), which the cache then holds for every later
+    call (`dew.nn.kv_cache.with_rounding_keys`); None leaves the cache's.
     """
     batch, width = inputs.tokens.shape
-    rngs, rounding = _rounded(rounding)
-    held = _empty_cache(model, params, batch, ops, rngs) if cache is None else cache
+    held = _empty_cache(model, params, batch, ops) if cache is None else cache
+    if rounding is not None:
+        held = with_rounding_keys(held, rounding)
     exposed = isinstance(model, Exposing)
     selective = isinstance(model, Selective)
     real = real_slots(inputs.token_fields, (batch, width))
@@ -399,7 +384,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         *scored,
         decode=True,
         mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])],
-        rngs=rngs,
+        rngs=None,
         method=("states_and_logits_at" if selective else "states_and_logits" if exposed else None),
         capture_intermediates=False,
         **inputs.kwargs(),
@@ -411,7 +396,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     rotary = inputs.token_fields.get("rotary_positions")
     logical = rotary if rotary is not None else token_positions(inputs.token_fields)
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
-                         None if states is None else states[rows, slot], rounding=rounding)
+                         None if states is None else states[rows, slot])
     if rebuild_position(model) is not None:
         if cache is not None or logical is not None or inputs.conditioning:
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
@@ -437,13 +422,11 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     return state, last >= 0
 
 
-def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps,
-                 rngs: dict[str, jax.Array] | None = None) -> Variables:
-    """A zeroed decode cache for `batch` rows, with the drafter's own beside it, its dummy step drawing
-    from `rngs` (`rounding_rngs`). A decoder whose every mixer is tokenwise (`MLPMixer`) keeps no
-    cache, and its collection is empty."""
+def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps) -> Variables:
+    """A zeroed decode cache for `batch` rows, with the drafter's own beside it. A decoder whose every
+    mixer is tokenwise (`MLPMixer`) keeps no cache, and its collection is empty."""
     def initialized(method: str) -> dict:
-        _, mutated = model.apply(params, batch, method=method, mutable=["cache"], rngs=rngs)
+        _, mutated = model.apply(params, batch, method=method, mutable=["cache"])
         return flatten_dict(dict(mutated["cache"])) if "cache" in mutated else {}
 
     cache = initialized("init_cache")
@@ -533,11 +516,10 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
         width = tokens.shape[1]
         positions = ({} if state.positions is None else
                      {"positions": state.positions[:, None] + jnp.arange(width)[None, :]})
-        rngs, rounding = _rounded(state.rounding)
         def append():
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
-                decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=rngs,
+                decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=None,
                 method="states_and_logits" if exposed else None,
                 capture_intermediates=False, **positions)
 
@@ -559,13 +541,12 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 32. Rebuilding the prefix retains the prompt's information.
                 https://github.com/huggingface/transformers/issues/49334
                 """
-                empty = model.apply(params, tokens.shape[0], method='init_cache', mutable=['cache'],
-                                    rngs=rngs)[1]['cache']
+                empty = model.apply(params, tokens.shape[0],
+                                     method='init_cache', mutable=['cache'])[1]['cache']
                 answer, updated = model.apply(
                     {**params, 'cache': empty}, history,
                     attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
-                    decode=True, mutable=['cache'], rngs=rngs,
-                    method='states_and_logits' if exposed else None)
+                    decode=True, mutable=['cache'], method='states_and_logits' if exposed else None)
                 rows = jnp.arange(tokens.shape[0])[:, None]
                 # The same answer `append` gives: states beside the logits where the model exposes them.
                 picked = jax.tree.map(lambda leaf: leaf[rows, slots], answer)
@@ -588,7 +569,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
         moved = (None if state.positions is None else
                  state.positions + jnp.sum(valid, axis=1, dtype=state.positions.dtype))
         return (dataclasses.replace(state, cache=updated["cache"], logits=logits[:, -1],
-                                    positions=moved, rounding=rounding,
+                                    positions=moved,
                                     tokens=history, lengths=lengths,
                                     hidden=None if states is None else states[:, -1]),
                 logits, states)
@@ -621,13 +602,12 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
         # takes it under its own name.
         placed = ({"rotary_positions": positions} if positions.ndim == 3
                   else {"positions": positions})
-        rngs, rounding = _rounded(state.rounding)
         (logits, states), updated = model.apply(
             {**params, "cache": state.cache}, hidden, ids, depth=depth, attention_mask=valid,
-            input_embeddings=embeds, decode=True, mutable=["cache"], rngs=rngs,
+            input_embeddings=embeds, decode=True, mutable=["cache"], rngs=None,
             prediction_phase=prediction_phase,
             method="mtp_step", capture_intermediates=False, **placed)
-        return dataclasses.replace(state, cache=updated["cache"], rounding=rounding), logits, states
+        return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
     def embed(tokens: jax.Array) -> jax.Array:
         prepared = model.apply(params, tokens, method="token_embeddings")
