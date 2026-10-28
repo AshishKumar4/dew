@@ -1194,19 +1194,22 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
 def test_a_schedules_completed_stage_cannot_move_under_a_resumed_run_and_its_later_stages_can(tmp_path):
     """A run that completed its first stage at 50 committed tokens saves that threshold beside the
     record count it ended at: resumed into a schedule whose first stage ends at 500, it is refused,
-    where it once read the second stage at once, and resumed into one whose second stage changed, it
-    reads on (row 1871, DATA-04)."""
+    where it once read the stage after it at once, and resumed into one whose stage past the one it
+    stands in changed, it reads on (row 1871, DATA-04)."""
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
+    third = Pipeline(Memory(Indexed(3, 64))).shuffle(2).repeat()
     trained = token_trainer(tmp_path / "run")
-    trained.fit(schedule([(first, 50), (second, None)]).batch(8), steps=8)
+    trained.fit(schedule([(first, 50), (second, 10_000), (third, None)]).batch(8), steps=8)
     assert trained.checkpoints is not None
     _, saved = trained.checkpoints.restore(share=DataPartition())
     assert saved is not None and position.read(saved).thresholds == (50,)
     with pytest.raises(ValueError):
-        token_trainer(tmp_path / "run").fit(schedule([(first, 500), (second, None)]).batch(8), steps=10)
-    later = Pipeline(Memory(Indexed(3, 64))).shuffle(2).repeat()
-    state = token_trainer(tmp_path / "run").fit(schedule([(first, 50), (later, None)]).batch(8), steps=10)
+        token_trainer(tmp_path / "run").fit(schedule([(first, 500), (second, 10_000), (third, None)]).batch(8),
+                                           steps=10)
+    fourth = Pipeline(Memory(Indexed(4, 64))).shuffle(3).repeat()
+    state = token_trainer(tmp_path / "run").fit(
+        schedule([(first, 50), (second, 10_000), (fourth, None)]).batch(8), steps=10)
     assert int(state.step) == 10
 
 
