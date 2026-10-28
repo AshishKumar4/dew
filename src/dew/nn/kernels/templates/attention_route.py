@@ -90,8 +90,11 @@ class _Config:
 
 
 def _on_gpu() -> bool:
-    """Whether calls run on a GPU of sm80 or later, where the Triton mainloop runs (`bf16_dot_runs`)."""
-    return generation.gpu_placed() and generation.bf16_dot_runs()
+    """Whether calls are chosen for a GPU of sm80 or later, where the GPU mainloops run (`bf16_dot_runs`):
+    the target's backend (`generation.backend`), which an assumed GPU answers for, so a step a Trainer or an
+    AOT lowering traces under `generation.assumed` compiles the mainloop the GPU runs, not the host's (audit
+    K5: the host's placement, `gpu_placed`, sent such a step to the plain-JAX mainloop)."""
+    return generation.backend() == 'gpu' and generation.bf16_dot_runs()
 
 
 DROPS_NOT = ("the template's GPU mainloops draw no probability dropout yet (the Triton mainloop is frozen, "
@@ -136,29 +139,40 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     ...
 
 
-MAINLOOPS = ("mosaic", "triton", "portable")
-"""The template's mainloops, which `generation.chosen(attention_mainloop=...)` names for every template call
-in its block: Mosaic GPU's, the frozen Triton one's, the plain-JAX one's."""
+@dataclasses.dataclass(frozen=True)
+class _Pass:
+    """A pass of the template as its mainloop's selector reads it (`MAINLOOP`): whether it runs on a GPU,
+    why the Mosaic mainloop declines it (`attention_mosaic.forward_declined`, `backward_declined`, None where
+    it takes it) and why the Triton one refuses its spans (`attention_triton.refused`)."""
+
+    on_gpu: bool
+    mosaic: str | None
+    triton: str | None
 
 
-def _mainloop(declined: str | None, spans: KeySpans) -> str:
-    """The mainloop a pass runs: the one `generation.chosen(attention_mainloop=...)` names, which must take
-    the call (`selection.KernelRefused` naming why it does not: off a GPU, or Mosaic's own reason
-    `declined`, or the Triton mainloop's refusal of the spans), else the first that takes it here: Mosaic
-    GPU's, Triton's, the plain-JAX one's."""
-    triton = "the call runs off a GPU" if not _on_gpu() else attention_triton.refused(spans)
-    mosaic = "the call runs off a GPU" if not _on_gpu() else declined
-    reasons = {"mosaic": mosaic, "triton": triton, "portable": None}
-    named = selection.forced("attention_mainloop")
-    if named is not None:
-        if named not in MAINLOOPS:
-            raise ValueError(f"attention_mainloop {named!r}: the template's mainloops are "
-                             f"{', '.join(MAINLOOPS)}")
-        if reasons[named] is not None:
-            raise selection.KernelRefused("attention_mainloop", named,
-                                          [generation.Refusal(named, str(reasons[named]))])
-        return named
-    return next(name for name in MAINLOOPS if reasons[name] is None)
+_ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the call runs off a GPU",
+                                       generation.INHERENT)
+MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
+    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.Requirement[_Pass](
+        'declined', lambda case: case.mosaic is None, lambda case: str(case.mosaic),
+        'roadmap: the Mosaic template takes every call'))),
+    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.Requirement[_Pass](
+        'spans', lambda case: case.triton is None, lambda case: str(case.triton), generation.INHERENT))),
+    selection.Kernel[_Pass]('portable', (), generic=True),
+), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')
+"""The template's mainloops, the first that takes a pass: Mosaic GPU's, which a GPU prefers, the frozen
+Triton one's, the plain-JAX one's, which a CPU runs. `generation.chosen(attention_mainloop=...)` names one
+for every pass in its block, which runs it or refuses it by name (`selection.select`); each pass reports its
+route, so the kernel-route audit sees a call on a GPU that leaves the Mosaic template, with Mosaic's own
+reason."""
+
+
+def _mainloop(declined: str | None, spans: KeySpans, hooks: Hooks) -> str:
+    """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
+    Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's)."""
+    on_gpu = _on_gpu()
+    case = _Pass(on_gpu, declined, attention_triton.refused(spans, hooks) if on_gpu else None)
+    return selection.select(MAINLOOP, case).kernel
 
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
@@ -167,8 +181,7 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     form = {"scale": config.scale, "natural": config.natural}
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=residuals,
                                                  **form) if _on_gpu() else None
-    mainloop = _mainloop(declined, spans)
-    _report(mainloop, declined)
+    mainloop = _mainloop(declined, spans, hooks)
     if mainloop == 'mosaic':
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=residuals, **form)
     if mainloop == 'triton':
@@ -198,26 +211,13 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     rounded = config.operand_dtype is None
     declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_gpu()
                 else None)
-    mainloop = _mainloop(declined, spans)
-    _report(mainloop, declined)
+    mainloop = _mainloop(declined, spans, hooks)
     if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
     if mainloop == 'triton':
         return attention_triton.backward(*call, residuals=residuals, rounded=rounded, **form)
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
                                        residuals=residuals, rounded=rounded, **form)
-
-
-def _report(kernel: str, declined: str | None = None) -> None:
-    """Report the mainloop a pass of the template runs (`generation.route`, 'attention_mainloop'): the one
-    `generation.chosen` names, else Mosaic GPU's on a GPU, else the plain-JAX one's; a GPU pass off Mosaic's
-    names why it `declined` the call
-    (`attention_mosaic.forward_declined`, `backward_declined`: each refusal's own reason and ledger row),
-    undeclared, so the kernel-route audit holds it unexplained until a row or a fix answers it."""
-    preferred = selection.forced('attention_mainloop') or ('mosaic' if _on_gpu() else 'portable')
-    refusal = (None if declined is None or kernel == preferred
-               else generation.Refusal('mosaic', declined))
-    generation.route('attention_mainloop', kernel=kernel, preferred=preferred, refusal=refusal)
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients) -> Hooks:

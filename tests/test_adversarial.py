@@ -40,16 +40,14 @@ def test_a_head_is_stylegan_ts_at_grid_height_one():
     with a (1, 9) kernel, from the same weights and spectral-norm vectors.
     Both run in float64, so the gap is a few roundings of O(1) logits."""
     with jax.enable_x64(new_val=True):
-        def conv(name):
-            return {"kernel": jnp.asarray(HEAD[f"{name}.kernel"]), "bias": jnp.asarray(HEAD[f"{name}.bias"])}
+        def layer(name, *fields):
+            return {field: jnp.asarray(HEAD[f"{name}.{field}"]) for field in fields}
 
-        def norm(name):
-            return {"weight": jnp.asarray(HEAD[f"{name}.weight"]), "bias": jnp.asarray(HEAD[f"{name}.bias"])}
-
+        conv, norm = ("kernel", "bias"), ("weight", "bias")
         condition_width = HEAD["c"].shape[-1]
-        params = {"block_0": {"conv": conv("main.0.0"), "norm": norm("main.0.1")},
-                  "block_1": {"conv": conv("main.1.fn.0"), "norm": norm("main.1.fn.1")},
-                  "cls": conv("cls"),
+        params = {"block_0": {"conv": layer("main.0.0", *conv), "norm": layer("main.0.1", *norm)},
+                  "block_1": {"conv": layer("main.1.fn.0", *conv), "norm": layer("main.1.fn.1", *norm)},
+                  "cls": layer("cls", *conv),
                   "cmapper_weight": jnp.asarray(HEAD["cmapper.weight"]) * np.sqrt(condition_width),
                   "cmapper_bias": jnp.asarray(HEAD["cmapper.bias"])}
         spectral = {"block_0": {"conv": {"u": jnp.asarray(HEAD["main.0.0.u"])}},

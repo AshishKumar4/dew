@@ -42,7 +42,7 @@ from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESI
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
 from ..precision import float32_dot_general, scaled
-from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
+from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
@@ -103,14 +103,6 @@ class SeamNorm(Protocol):
     add, the norm and, in reverse, the stream's own cotangent."""
 
     def seam(self, x, branch=None, *, axes=None) -> tuple[jax.Array, jax.Array]: ...
-
-
-@runtime_checkable
-class ReadsTrain(Protocol):
-    """A token mixer or feed-forward whose call takes `train`, for a dropout of its own."""
-
-    @property
-    def reads_train(self) -> bool: ...
 
 
 @runtime_checkable

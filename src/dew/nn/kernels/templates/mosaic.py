@@ -323,6 +323,12 @@ def program_shared(block: int, programs: int) -> int:
     return (block + cost.RESERVED_SHARED) // programs - cost.RESERVED_SHARED
 
 
+def held_area(family: "Family", consumers: int) -> int:
+    """The fp32 accumulator elements `consumers` consumers of `family` hold beside what they hold besides
+    (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns)."""
+    return (family.registers(consumers) - family.held_registers) * THREADS * consumers
+
+
 def held_rows(family: "Family", consumers: int, columns: int) -> int:
     """The most rows, in whole roles of `consumers` consumers of `family` (`Family.role_rows` each), whose
     fp32 accumulator of `columns` columns their threads hold beside what they hold besides

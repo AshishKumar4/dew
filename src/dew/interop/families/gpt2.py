@@ -23,6 +23,7 @@ from dew.interop.decoder_parts import (
     ungated_mlp,
 )
 from dew.interop.safetensors_io import LazyTensors
+from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 
@@ -127,8 +128,8 @@ def _gptj_order(head_dim: int, rotated: int) -> np.ndarray:
                            np.arange(rotated, head_dim)))
 
 
-def _gptj_prepare(tensors: Mapping[str, np.ndarray],
-                  config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+def _gptj_prepare(tensors: Mapping[str, Stored],
+                  config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
     if config is None:
         raise ValueError('GPT-J rotary storage requires translated head geometry')
     head_dim = _records.integer(config['head_dim'], 'head_dim')
@@ -216,8 +217,8 @@ def gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     )
 
 
-def _gpt2_prepare(tensors: Mapping[str, np.ndarray],
-                   _config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+def _gpt2_prepare(tensors: Mapping[str, Stored],
+                   _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
     """Check and drop the fixed attention buffers, and nest the bare model's names."""
     prepared = {}
     for name, tensor in tensors.items():

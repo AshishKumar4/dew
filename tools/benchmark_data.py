@@ -350,14 +350,17 @@ def _dropping(config: Worker):
     """The workload's corpus as a chain whose steps can drop records and keep every one here: an image
     decode that rejects what doesn't decode, or a target count before the pack."""
     measured = config.measurement
-    from dew.data import Files, presets
+    from dew.data import Files, images, presets
     from dew.data.pipeline import Pipeline
     from dew.data.sources import TokenFiles
     from dew.data.steps.text import CountTargets
 
     if config.workload == "image":
+        # The image arm's own chain but for the decode's rejects, its captions dropped on the host
+        # as that arm drops them, since a batch carries no text to the devices.
         rows = Pipeline(Files(str(config.source), format="array_record")).shuffle(measured.seed).repeat()
-        return rows.pipe(presets.images, measured.image_size, batch=measured.batch, rejects=True)
+        return rows.pipe(presets.images, measured.image_size, batch=measured.batch, draft=True, rejects=True,
+                         caption=images.caption(), host=(images.EncodeCaptions(),))
     documents = Pipeline(TokenFiles(str(config.source))).shuffle(measured.seed).repeat()
     documents = documents.filter_map(CountTargets())
     return documents.pipe(presets.lm, None, seq_len=measured.seq_len, batch=measured.batch, bins=32)
@@ -631,9 +634,9 @@ def training_measure(factory, objective, config: Worker) -> dict:
 
 def device_idle(directory: str) -> dict[str, float]:
     """The share of the traced steps' device window no kernel ran in, from the accelerator's own
-    timeline (`trace_window.window_split`, summed over its devices), and the part of it a batch's
+    timeline (`dew.telemetry.trace.window_split`, summed over its devices), and the part of it a batch's
     host-to-device copy ended, the device waiting for data."""
-    from trace_window import device_events, window_totals
+    from dew.telemetry.trace import device_events, window_totals
 
     planes, _ = device_events(directory)
     if not planes:
@@ -653,6 +656,22 @@ def stage_profile(factory, batches: int = 16) -> list[dict]:
     return [{"file": Path(key[0]).name, "line": key[1], "function": key[2],
              "self_seconds": value[2], "cumulative_seconds": value[3], "calls": value[1]}
             for key, value in sorted(profile.stats.items(), key=lambda pair: pair[1][3], reverse=True)[:20]]
+
+
+def host_facts() -> dict:
+    """What automatic loading sizes by on this host (`dew.data.dataset.Host`), beside the machine's own
+    counts and the cgroup files it reads, so an arm's record says why its workers were what they were."""
+    import psutil
+
+    from dew.data.dataset import Host, _own_cgroup
+
+    group = _own_cgroup()
+    read = ("cpu.max", "memory.max", "memory.current", "memory.stat")
+    files = {name: (group / name).read_text().strip()[:2000] for name in read if (group / name).is_file()}
+    host = Host.current()
+    return {"cpus": host.cpus, "memory_bytes": host.memory, "affinity": len(os.sched_getaffinity(0)),
+            "cpu_count": os.cpu_count(), "available_bytes": psutil.virtual_memory().available,
+            "cgroup": str(group), "cgroup_files": files}
 
 
 def matrix_worker(config: Worker) -> dict:
@@ -686,7 +705,8 @@ def matrix_worker(config: Worker) -> dict:
                            "fresh process and loader objects; shared OS page cache after input preparation"),
             "environment": {"python": platform.python_version(), "platform": platform.platform(),
                 "cpu": platform.processor(), "packages": {name: importlib.metadata.version(name)
-                    for name in ("jax", "jaxlib", "numpy", "grain", "transformers")}}}
+                    for name in ("jax", "jaxlib", "numpy", "grain", "transformers")}},
+            "host": host_facts()}
         result["first_batch_from_open_seconds"] = opened + result["loader"]["first_batch_seconds"]
         if measured.train_steps:
             result["training"] = training_measure(factory, objective, config)

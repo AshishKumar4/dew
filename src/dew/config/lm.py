@@ -119,6 +119,7 @@ class LMRunConfig(DecoderRunConfig):
                    max(tokens.seq_len, len(samples.prompt) + samples.max_new_tokens))
         run, source = self, None
         if self.pretrained is None:
+            self.built_fresh()
             # A fresh masked-diffusion model may corrupt to the id past the
             # tokenizer's, as MDLM does, so the table covers its mask id too.
             mask = self.model.arguments.get("mask_token_id")
@@ -201,6 +202,7 @@ class LMRunConfig(DecoderRunConfig):
         from dew.interop.sources import SourceReference
 
         assert self.pretrained is not None
+        self.sourced_model()
         choices = ("max_seq_len", "dtype", "attention_impl")
         overridden = sorted(set(self.model.fields) - set(choices))
         if overridden:

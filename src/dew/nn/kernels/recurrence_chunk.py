@@ -26,6 +26,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -205,8 +206,8 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     chunks; regrouped it is 1.068 and 0.989. The vector decay's is 1.021, and the formed gates'
     gate, log_a and bias 1.053, 1.038 and 1.023 over 320 draws. All arithmetic remains fp32.
     Only the chunk boundaries couple across the sequence; bounded groups schedule each chunk's C-step
-    token scans, not one scan over the sequence's T. Forward-mode callers keep the primal's tangent,
-    as the port's forward-mode fallback does (`FORWARD_MODE`).
+    token scans, not one scan over the sequence's T. Forward mode takes the chunked math's own tangent
+    (`_portable_rule`), in any context.
     """
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
@@ -218,9 +219,10 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
              else state.astype(work))
     query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
     scale = Dk ** -0.5 if scale is None else scale
-    rule = (_chunk_delta_rule if FORWARD_MODE.get() or query.shape[1] == 0
-            else _differentiable_chunk_delta_rule)
-    return rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+    if query.shape[1] == 0:
+        return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+    rule = _portable_rule(chunk_size, delta, scale, jnp.dtype(dtype))
+    return rule(query, key, value, g, beta, state, starts)
 
 
 def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
@@ -432,12 +434,33 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
     return dq * scale, dk, dv, dg, dbeta, ungrouped(initial)[:, :, 0], None
 
 
-_differentiable_chunk_delta_rule = jax.custom_vjp(_chunk_delta_rule, nondiff_argnums=(6, 8, 9, 10))
-_differentiable_chunk_delta_rule.defvjp(_chunk_delta_residual, _chunk_delta_backward)
+@functools.cache
+def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype) -> Callable:
+    """The portable rule over `(query, key, value, g, beta, state, starts)` differentiated at every order
+    (`generation.linear_tangent`): reverse mode runs its reverse rule (`_chunk_delta_residual`,
+    `_chunk_delta_backward`), forward mode (`jax.jvp`, `jax.linearize`) the chunked math's own tangent,
+    in any context: a custom VJP alone refused a plain `jax.jvp` outside the attention's forward-mode
+    context (row 1834)."""
+    def forward(query, key, value, g, beta, state, starts):
+        return _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale,
+                                     dtype)
+
+    def backward(saved, operands, cotangent):
+        # Every operand's cotangent, as the portable rule's pullback gives them (`linear_tangent` checks the
+        # trees agree): `starts` has no tangent space, its cotangent float0's zero, or none without it.
+        starts = operands[6]
+        cotangents = _chunk_delta_backward(chunk_size, delta, scale, dtype, saved, cotangent)[:6]
+        return (*cotangents, None if starts is None else np.zeros(starts.shape, jax.dtypes.float0))
+
+    def portable(query, key, value, g, beta, state, starts):
+        return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+
+    return generation.linear_tangent(forward, backward, portable)
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
-                           starts=None, max_segments: int | None = None, floor: float | None = None):
+                           starts=None, max_segments: int | None = None, floor: float | None = None,
+                           firsts=None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
@@ -465,8 +488,8 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     """
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
                              floor=floor)
-    return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts),
-                 chunk_size=chunk_size, max_segments=max_segments)
+    return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts,
+                              firsts=firsts), chunk_size=chunk_size, max_segments=max_segments)
 
 
 @jax.tree_util.register_dataclass
@@ -481,12 +504,14 @@ class Chunk(recurrence.Gated):
     with the gates), `skip` `[Hv]` the skip's `D`, `z` `[B, S, Hv, Dv]` and `weight` `[Dv]` the
     epilogue's, `rate` `[Hv]` a rated decay's, at most zero (`recurrence.Hooks.rated`). `state`
     `[B, Hv, Dk, Dv]` is the memory entering, zero where None, and `starts` `[B, S]` marks packed
-    documents' first tokens, each from a zero memory."""
+    documents' first tokens, each from a zero memory, `firsts` their rows' documents' first slots as the
+    batch built them (`dew.batch.Coordinates.firsts`; the kernels sort them from `starts` where None)."""
     query: jax.Array
     key: jax.Array
     value: jax.Array
     state: jax.Array | None = None
     starts: jax.Array | None = None
+    firsts: jax.Array | None = None
 
 
 def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_SIZE,
@@ -529,16 +554,15 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     g, beta = recurrence.log_gates(hooks, given, work)
     g = jnp.zeros(value.shape[:3], work) if g is None else g
     beta = jnp.ones(value.shape[:3], work) if beta is None else beta
-    state, starts = operands.state, operands.starts
+    state, starts, firsts = operands.state, operands.starts, operands.firsts
     epilogue = hooks.skip or hooks.output is not None
     if mainloop is not None:
-        from .templates.recurrence import template
-
         if mainloop != 'mosaic':
             raise ValueError(f"no {mainloop!r} mainloop: the recurrence template's is 'mosaic'")
         # Unrounded where an epilogue follows, as on the portable math.
-        out, final = template.MOSAIC(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                                     scale=scale, delta=hooks.delta, wide=epilogue, floor=hooks.floor)
+        out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
+                                   max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
+                                   floor=hooks.floor)
         out = recurrence.skipped(hooks, out, value, given, work)
     elif hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
@@ -549,16 +573,14 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                 scale=scale, wide=epilogue, floor=hooks.floor, product=product)
                     if decayed else 'xla') for product in ('forward', 'training')]
 
-        def run(kernel, query, key, value, g, beta, state, starts):
+        def run(kernel, query, key, value, g, beta, state, starts, firsts):
             if kernel == 'mosaic_gpu':
-                from .templates.recurrence import template
-
-                return template.MOSAIC(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                                       scale=scale, wide=epilogue, floor=hooks.floor)
+                return template_rule(query, key, value, g, beta, state, starts, firsts,
+                                     max_segments=max_segments, scale=scale, wide=epilogue, floor=hooks.floor)
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                scale=scale, wide=epilogue)
+                                scale=scale, wide=epilogue, firsts=firsts)
             group = value.shape[2] // key.shape[2]
             if group > 1:
                 query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
@@ -566,7 +588,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             return chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state, size,
                                     starts=starts, delta=hooks.delta, scale=scale, dtype=work)
 
-        arrays = (query, key, value, g, beta, state, starts)
+        arrays = (query, key, value, g, beta, state, starts, firsts)
         if kernels[0] == kernels[1]:
             out, final = run(kernels[0], *arrays)
         else:
@@ -728,7 +750,7 @@ def kernel_routed(query, key, value, g, beta, *, floor: float | None = None) -> 
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
-             scale: float | None = None, wide: bool = False):
+             scale: float | None = None, wide: bool = False, firsts=None):
     """The port's chunked rule for any call the portable math takes:
     `[B, S, Hk, Dk]` queries and keys, `[B, S, Hv, Dv]` values, the log decay
     `g` `[B, S, Hv]` per head (`fla_gdn.chunk_gated_delta_rule`) or `[B, S,
@@ -775,17 +797,52 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     if documents is not None:
         # The kernels start each row from its memory; a first token that begins a document drops it.
         state = jnp.where(starts[:, 0, None, None, None], 0.0, state)
-    rows, heads = grouped_heads(value.shape, key.shape[2])
-    P = jax.sharding.PartitionSpec
-    four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
+    four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
+    if firsts is None:
+        return manual_map(functools.partial(_blocked_rule, documents=documents, scale=scale, wide=wide),
+                          (four, four, four, decays, three, memory, resets),
+                          (four, memory))(query, key, value, g, beta, state, starts)
     return manual_map(functools.partial(_blocked_rule, documents=documents, scale=scale, wide=wide),
-                      (four, four, four, P(*four[:g.ndim]), three, memory, P(rows, None)),
-                      (four, memory))(query, key, value, g, beta, state, starts)
+                      (four, four, four, decays, three, memory, resets, resets),
+                      (four, memory))(query, key, value, g, beta, state, starts, firsts)
+
+
+def _shard_specs(shape: tuple[int, ...], key_heads: int, decay_ndim: int) -> tuple:
+    """A delta rule's per-shard placement (`manual_map`) over values of `shape` reading `key_heads`: the
+    `[B, T, H, D]` operands', the write gate's `[B, T, H]`, the memory's `[B, H, Dk, Dv]`, the decay's (a
+    head's or a key dimension's), and the documents' starts' `[B, T]`: rows where the rules split them, and
+    value heads with the key heads they read where the head split divides the key heads (`grouped_heads`),
+    the time axis whole."""
+    rows, heads = grouped_heads(shape, key_heads)
+    P = jax.sharding.PartitionSpec
+    four = P(rows, None, heads, None)
+    return four, P(rows, None, heads), P(rows, heads, None, None), P(*four[:decay_ndim]), P(rows, None)
+
+
+def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=None, **options):
+    """The recurrence template's op (`templates.recurrence.template.MOSAIC`, `mosaic_rule`) on each shard
+    (`manual_map`), placed as `fla_rule`: its tiles derived from each shard's shapes, its forward and its
+    gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
+    its launches on the global batch, layer 0's solve over 4 rows for its 2, beside 40 GB of gathers a
+    microbatch (row 1897). `options` are the op's (`max_segments`, `scale`, `delta`, `wide`, `floor`)."""
+    from .templates.recurrence import template
+
+    four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
+    optional = [(state, memory), (starts, resets), (firsts, resets)]
+    operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None))
+    specs = (four, four, four, decays, three, *(spec for x, spec in optional if x is not None))
+
+    def local(query, key, value, g, beta, *given):
+        given = iter(given)
+        state, starts, firsts = (None if x is None else next(given) for x, _ in optional)
+        return template.MOSAIC(query, key, value, g, beta, state, starts, firsts=firsts, **options)
+
+    return manual_map(local, specs, (four, memory))(*operands)
 
 
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
-                wide: bool = False, family=None, floor: float | None = None):
+                wide: bool = False, family=None, floor: float | None = None, firsts=None):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
     (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their
@@ -830,11 +887,12 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     ported = (not fast and delta and not interpret and dtype != jnp.float32
               and all(requirement.holds(case) for requirement in PORT_SUPPORTS))
 
-    # The documents' starts an operand, not closed over (a custom VJP's function closes over no tracer).
+    # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
+    # tracer).
     @jax.custom_vjp
-    def rule(query, key, value, g, beta, state, starts):
-        return mainloop.forward(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                scale=scale, delta=delta, wide=wide, **run)
+    def rule(query, key, value, g, beta, state, starts, firsts):
+        return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
+                                max_segments=max_segments, scale=scale, delta=delta, wide=wide, **run)
 
     def forward(*operands):
         if not fast:
@@ -843,27 +901,27 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # weighted keys and corrected values, as the port keeps its memory, but where the block's remat rung
         # recomputes them (`RECOMPUTED`).
         out, final, (inverse, kept) = mainloop.kept_forward(*operands[:6], starts=operands[6],
-                                                            max_segments=max_segments, scale=scale,
-                                                            delta=delta, wide=wide, **run)
+                                                            firsts=operands[7], max_segments=max_segments,
+                                                            scale=scale, delta=delta, wide=wide, **run)
         return (out, final), (operands, (inverse, kept if "delta_memory" not in RECOMPUTED.get() else None))
 
     def backward(saved, grads):
         operands, (inverse, kept) = saved
         out_grad, final_grad = grads
-        query, key, value, g, beta, state, starts = operands
+        query, key, value, g, beta, state, starts, firsts = operands
         if fast:
             grads = mainloop.gradients(query, key, value, g, beta, state, out_grad, final_grad, starts=starts,
-                                       max_segments=max_segments, scale=scale, inverse=inverse, kept=kept,
-                                       **run_back)
-            return (*grads[:5], None if state is None else grads[5], None)
+                                       firsts=firsts, max_segments=max_segments, scale=scale,
+                                       inverse=inverse, kept=kept, **run_back)
+            return (*grads[:5], None if state is None else grads[5], None, None)
 
         if ported:
             def port(query, key, value, g, beta, state):
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                scale=scale, wide=wide)
+                                scale=scale, wide=wide, firsts=firsts)
 
             _, pull = jax.vjp(port, query, key, value, g, beta, state)
-            return (*pull((out_grad, final_grad)), None)
+            return (*pull((out_grad, final_grad)), None, None)
 
         def portable(query, key, value, g, beta, state):
             group = value.shape[2] // key.shape[2]
@@ -876,10 +934,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
             return out, final
 
         _, pull = jax.vjp(portable, query, key, value, g, beta, state)
-        return (*pull((out_grad, final_grad)), None)
+        return (*pull((out_grad, final_grad)), None, None)
 
     rule.defvjp(forward, backward)
-    return rule(query, key, value, g, beta, state, starts)
+    return rule(query, key, value, g, beta, state, starts, firsts)
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
@@ -899,7 +957,7 @@ def recomputing(names: tuple[str, ...]):
         RECOMPUTED.reset(token)
 
 
-def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int | None,
+def _blocked_rule(query, key, value, g, beta, state, starts, firsts=None, *, documents: int | None,
                   scale: float | None = None, wide: bool = False):
     """The port's rule on one shard, shaped to its kernels' blocks: values
     wider than the port's widest split into more value heads of their key
@@ -931,7 +989,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     value = _padded(value, 3, blocks[1])
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
     # A row's padding after its documents runs as one more sequence of its own.
-    spans = None if documents is None else cu_seqlens(starts, B * (documents + 1))
+    spans = None if documents is None else cu_seqlens(starts, B * (documents + 1), firsts)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
     out, final = port(query, key, value, g, beta, state, spans, scale, CHUNK_SIZE,
                       not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get(), wide)
@@ -1105,13 +1163,16 @@ two of at least 16, the smallest block Triton's dot takes (a call's head and sta
 `_rated_scan`); and a GPU Dew's Triton kernels run on, any of them."""
 
 TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
+    Requirement('forward_mode', lambda case: case.reverse,
+                "forward_mode_attention traces for jax.jvp, which the TPU scan's custom VJP gives no "
+                "tangent: the portable math's scan takes it (row 1869, audit K2)", row=INHERENT),
     Requirement('geometry', lambda case: case.tpu is not None,
                 lambda case: "the TPU's Pallas scan takes a float32 scan on a TPU over power-of-two widths "
                              "and a chunk its program holds, not head width {}, state {} and chunk {}"
                              .format(*case.widths), row=INHERENT),
 )
-"""What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: its tiling over the geometry
-(`ssd_kernel_runs`)."""
+"""What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: reverse mode alone (its custom VJP gives no
+tangent) and its tiling over the geometry (`ssd_kernel_runs`)."""
 
 
 def scan_case(x, B, chunk_size: int, *, tpu: bool = True) -> ScanCase:

@@ -60,54 +60,6 @@ def test_yaads_objective_switches_by_the_whole_errors_norm():
         np.testing.assert_array_equal(np.asarray(gradient), np.asarray(step, np.float32))
 
 
-def test_an_l2_linear_memory_runs_the_gated_delta_rule():
-    """A linear memory on the l2 objective that steps every token is the delta rule: traced for an
-    H100, its call takes the gated delta rule's kernels through the shared recurrence's dispatch, a route
-    each product (forward, training; `recurrence_chunk.PORT_CELLS`), and the same memory chunked by four,
-    whose gradients wait for their chunk's start, decides no such route."""
-    from dew.nn.kernels import generation
-
-    def routes(module: InContextMemory) -> list[tuple[str, str]]:
-        x = jax.ShapeDtypeStruct((ROWS, LENGTH, WIDTH), jnp.float32)
-        params = jax.eval_shape(module.init, jax.random.key(0), x)
-        with generation.assumed("sm90"), generation.routes() as found:
-            jax.eval_shape(module.apply, params, x)
-        return [(route.choice, route.kernel) for route in found if route.choice == "gated_delta_rule"]
-
-    assert routes(layer("delta_rule")) == [("gated_delta_rule", "fla")] * 2
-    assert routes(layer("delta_rule").clone(chunk=CHUNK)) == []
-
-
-@pytest.mark.parametrize(("dtype", "features", "chosen", "kernel", "verdict"), [
-    ("float32", FEATURES, {}, "step", "kernel"),
-    ("float64", FEATURES, {}, "xla", "inherent"),
-    ("float32", 12, {}, "xla", "gap: roadmap: recurrence step widths"),
-    ("float32", FEATURES, {"delta_decode": "fused"}, "step", "inherent")],
-    ids=["fp32", "float64", "width_12", "fused_chosen"])
-def test_a_cached_linear_memorys_token_takes_the_shared_decode_dispatch(dtype, features, chosen, kernel,
-                                                                        verdict):
-    """A linear memory's cached token, traced for an H100, steps through the shared decode dispatch: the
-    recurrence's step kernel where it takes the state, fp32 of power-of-two widths, else the portable
-    step, so a float64 memory keeps its own precision and a head width the kernel's blocks do not take
-    never reaches its launch; with the fused step chosen, which a memory has nothing to fuse into, the
-    step. Each route off the preferred kernel says why, as the kernel-route audit reads it."""
-    from dew.nn.kernels import generation
-    from tools import kernel_routes
-
-    module = layer("delta_rule", dtype=jnp.dtype(dtype)).clone(head_features=features)
-    decode = MixerCall(decode=True)
-    with jax.enable_x64(new_val=dtype == "float64"):
-        x = jax.ShapeDtypeStruct((ROWS, 1, WIDTH), jnp.dtype(dtype))
-        params = jax.eval_shape(module.init, jax.random.key(0), x)
-        _, cache = jax.eval_shape(lambda held, x: module.apply(held, x, decode, mutable=["cache"]),
-                                  params, x)
-        with generation.assumed("sm90"), generation.chosen(**chosen), generation.routes() as found:
-            jax.eval_shape(lambda held, cached, x: module.apply({**held, **cached}, x, decode,
-                                                                mutable=["cache"]), params, cache, x)
-    [route] = [route for route in found if route.choice == "delta_decode"]
-    assert (route.kernel, kernel_routes.verdict(route)) == (kernel, verdict)
-
-
 class Product(nn.Module):
     """`k W`, a linear memory's function as a network of this test's own, which the layer runs on its
     general path rather than the shared recurrence."""

@@ -695,15 +695,13 @@ one warm call and summed the op time by JAX scope:
 The dots and the decoder's convolutions run near the core's fp32 rate, but
 the depthwise convolutions did not. XLA:CPU runs a grouped convolution
 through YNNPACK, which took 6.4 ms for one 2 x 16 x 16 x 768 map of 7 MFLOP.
-On the CPU, a depthwise 3x3 convolution of more than 16 features now runs as
-its nine shifted products. Each product is rounded to fp32 before it is
-summed in the kernel's row-major order, which is YNNPACK's arithmetic bit
-for bit, and a map takes 1.4 ms. YNNPACK sums 16 features or fewer in
-another order, so those keep the convolution.
-
-I ran three alternating processes each way, three calls each, on a shared
-and loaded host. The cell's median went from 24.45 s to 21.37 (fastest 22.68
-to 20.51), and without the decode from 18.96 to 15.99 (17.52 to 14.91).
+A CPU-only route once ran a depthwise 3x3 convolution of more than 16
+features as its nine shifted products, YNNPACK's arithmetic bit for bit, at
+1.4 ms a map. Three alternating processes each way, three calls each, on a
+shared and loaded host, took the cell's median from 24.45 s to 21.37 (fastest
+22.68 to 20.51), and without the decode from 18.96 to 15.99 (17.52 to 14.91).
+Product code takes no CPU-only route (ledger 1698), so that route is retired:
+the CPU now runs lax's convolution, as every backend but CUDA does.
 Every image's sha256 is the same (`923e1b09`).
 
 ## The hybrid DiT's SSM blocks, 2026-10-01

@@ -233,3 +233,50 @@ def test_cfg_plus_plus_takes_the_papers_ddim_update(interval):
         return (np.asarray(jax.random.normal(jax.random.PRNGKey(seed), (rows, 4, 4, 3))),)
 
     assert_as_exact(walked, walk, noise, f"cfg++ {interval}", seeds=CFG_PLUS_PLUS_SEEDS)
+
+
+def test_a_unit_scale_guides_to_the_conditional_prediction_exactly():
+    """At a unit scale, a step outside its guidance interval, `guide` returns the conditional prediction
+    as the sources return it unguided, where the affine form would round it through the difference: a
+    conditional 1 beside an unconditional 2**30 gives 1, not 0 (ledger 1874). A row guided at another
+    scale keeps the affine form."""
+    from dew.sampling.guidance import guide
+
+    conditional = jnp.asarray([[1.0], [1.0]], jnp.float32)
+    unconditional = jnp.asarray([[2.0 ** 30], [3.0]], jnp.float32)
+    guided = np.asarray(guide(conditional, unconditional, jnp.asarray([1.0, 2.0], jnp.float32)))
+    np.testing.assert_array_equal(guided, [[1.0], [3.0 + 2.0 * (1.0 - 3.0)]])
+    # Its derivatives are the affine combination's at every scale, a unit one's included.
+    gradients = jax.grad(lambda c, u, s: guide(c, u, s).sum(), argnums=(0, 1, 2))(
+        jnp.asarray([[2.0], [2.0]]), jnp.asarray([[1.0], [1.0]]), jnp.asarray([1.0, 3.0]))
+    np.testing.assert_array_equal(np.asarray(gradients[0]), [[1.0], [3.0]])
+    np.testing.assert_array_equal(np.asarray(gradients[1]), [[0.0], [-2.0]])
+    np.testing.assert_array_equal(np.asarray(gradients[2]), [1.0, 1.0])
+    # Opposite finite predictions whose difference passes float32's largest: moving the conditional
+    # alone at a unit scale moves the guided prediction by as much, finitely.
+    largest = jnp.asarray([[2.0 ** 127]], jnp.float32)
+    still = (jnp.ones((1, 1), jnp.float32), jnp.zeros((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32))
+    _, moved = jax.jvp(guide, (largest, -largest, jnp.ones((1,), jnp.float32)), still)
+    np.testing.assert_array_equal(np.asarray(moved), [[1.0]])
+    # Both predictions moved alike by float32's largest power of two keep the guided one moving by it.
+    alike = (largest, largest, jnp.zeros((1,), jnp.float32))
+    _, moved = jax.jvp(guide, (jnp.ones((1, 1)), jnp.ones((1, 1)), jnp.full((1,), 2.0)), alike)
+    np.testing.assert_array_equal(np.asarray(moved), [[2.0 ** 127]])
+    # The least normal predictions of opposite sign keep the scale's derivative, their normal difference.
+    least = jnp.asarray([[2.0 ** -126]], jnp.float32)
+    scaled = (jnp.zeros((1, 1)), jnp.zeros((1, 1)), jnp.ones((1,)))
+    _, moved = jax.jvp(guide, (least, -least, jnp.ones((1,), jnp.float32)), scaled)
+    np.testing.assert_array_equal(np.asarray(moved), [[2.0 ** -125]])
+
+
+def test_an_integer_scale_guides_and_differentiates():
+    """An integer scale, CFG++'s 1 among them, guides as its float does and carries a tangent: the
+    gradient through it in the predictions is finite (ledger 1917)."""
+    from dew.sampling.guidance import guide
+
+    conditional, unconditional = jnp.asarray([[2.0]]), jnp.asarray([[1.0]])
+    for scale in (1, 3):
+        np.testing.assert_array_equal(np.asarray(guide(conditional, unconditional, scale)),
+                                      np.asarray(guide(conditional, unconditional, float(scale))))
+        gradient = jax.grad(lambda c, scale=scale: guide(c, unconditional, scale).sum())(conditional)
+        np.testing.assert_array_equal(np.asarray(gradient), [[float(scale)]])

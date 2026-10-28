@@ -24,11 +24,10 @@ from collections.abc import Mapping
 from functools import partial
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import record_bool, record_int
+from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
@@ -231,10 +230,15 @@ def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
             "bos_token_id": 0, "pad_token_id": 0, "eos_token_id": 0}
 
 
-def tensors_from_mamba_ssm(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Rename a mamba_ssm state dict to the port's names.
+def tensors_from_mamba_ssm(tensors: Mapping[str, Stored]) -> Mapping[str, Stored]:
+    """Rename a mamba_ssm state dict to the port's names, each tensor read only when it is read.
 
     `Mamba2Model.load_hook` (modeling_mamba2.py) is the whole rename:
     `embedding.` becomes `embeddings.` wherever a name holds it.
     """
-    return {name.replace("embedding.", "embeddings."): tensor for name, tensor in tensors.items()}
+    from dew.interop.safetensors_io import LazyTensors, tensor_specs
+
+    specs = tensor_specs(tensors)
+    names = {name.replace("embedding.", "embeddings."): name for name in specs}
+    return LazyTensors({renamed: specs[name] for renamed, name in names.items()},
+                       lambda renamed: tensors[names[renamed]])

@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save
 from reference_error import (
     REDRAW,
+    SIZING_FROM,
     as_given,
     input_digest,
     leaf_summary,
@@ -37,7 +38,8 @@ from reference_error import (
     truth_sketch,
 )
 
-__all__ = ["merge_shards", "provenance", "record_case", "record_reference", "record_shard", "save"]
+__all__ = ["merge_shards", "provenance", "record_case", "record_reference", "record_shard", "save",
+           "with_pilots"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
@@ -156,14 +158,20 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
     """`label`'s summarized recording from its shards (`record_shard`), as `record_case`'s summary writes
     it: their seeds joined in order from seed 0, the count the joined evidence resolves
     (`seeds_resolving`, the reference against itself), and that count's (1 + REDRAW) times kept. Shards
-    that leave a seed out or repeat one are refused, and so are too few seeds for the count's redraw."""
-    ordered = sorted(shards, key=lambda shard: int(shard[f"{label}.drawn"][0]))
-    joined = {key: np.concatenate([shard[key] for shard in ordered])
-              for key in ordered[0] if not _whole(label, key)}
-    joined.update({key: ordered[0][key] for key in ordered[0] if _whole(label, key)})
+    that leave a seed out or repeat one are refused, and so are too few seeds for the count's redraw.
+    Shards of seeds from SIZING_FROM on are the recording's pilots, the draws a paired sizing of it takes
+    and no verdict does (`seeds_for`): joined in order from SIZING_FROM, every one kept, under
+    `<label>.pilot.`, their leaves the verdict's in shape and dtype, as a run from seed 0 is."""
+    straddling = [_runs(shard[f"{label}.drawn"]) for shard in shards
+                  if (np.asarray(shard[f"{label}.drawn"]) < SIZING_FROM).any()
+                  and (np.asarray(shard[f"{label}.drawn"]) >= SIZING_FROM).any()]
+    if straddling:
+        raise ValueError(f"{label}: shards of seeds {straddling} hold verdict seeds and pilots from "
+                         f"SIZING_FROM alike")
+    verdict = [shard for shard in shards if int(shard[f"{label}.drawn"][0]) < SIZING_FROM]
+    pilots = [shard for shard in shards if int(shard[f"{label}.drawn"][0]) >= SIZING_FROM]
+    joined = _joined(label, verdict, 0)
     drawn = joined[f"{label}.drawn"]
-    if not np.array_equal(drawn, np.arange(len(drawn))):
-        raise ValueError(f"{label}: the shards hold seeds {_runs(drawn)}, not one run from seed 0")
     names = [key.removeprefix(f"{label}.mse.") for key in joined if key.startswith(f"{label}.mse.")]
     confirmed = seeds_resolving(np.stack([joined[f"{label}.mse.{name}"] for name in names], axis=1),
                                 names, label)
@@ -173,7 +181,44 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
                          f"shards hold {len(drawn)}")
     result = _finished(label, joined, confirmed)
     print(f"{label}: declared {confirmed} seeds; merged {kept} draws' evidence", flush=True)
-    return result
+    return with_pilots(label, result, pilots) if pilots else result
+
+
+def with_pilots(label: str, recording: Mapping[str, np.ndarray],
+                shards: Sequence[Mapping[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    """`recording`, a summarized one (`record_case`'s summary or `merge_shards`'), with the pilots of
+    `shards` (`record_shard` over seeds from SIZING_FROM on): joined in order from SIZING_FROM, every one
+    kept, under `<label>.pilot.`, their leaves the recording's in name, shape and dtype. A recording that
+    holds pilots already is refused, as are pilots that leave a seed out of their run."""
+    if f"{label}.pilot.input_digest" in recording:
+        raise ValueError(f"{label}: the recording holds pilots already")
+    held = _joined(label, shards, SIZING_FROM)
+    pilot = _kept(label, held, len(held[f"{label}.drawn"]))
+    whole = {key for key in recording if _whole(label, key)}
+    if {key for key in pilot if _whole(label, key)} != whole or any(
+            not np.array_equal(pilot[key], recording[key]) for key in whole):
+        raise ValueError(f"{label}: the pilots' leaves are not the verdict's in name, shape and dtype")
+    print(f"{label}: with {len(held[f'{label}.drawn'])} pilots", flush=True)
+    return {**recording, **{f"{label}.pilot.{key.removeprefix(f'{label}.')}": value
+                            for key, value in pilot.items() if not _whole(label, key)}}
+
+
+def _joined(label: str, shards: Sequence[Mapping[str, np.ndarray]], first: int) -> dict[str, np.ndarray]:
+    """`shards`' evidence joined in order, refused unless their seeds are one run from `first`."""
+    if not shards:
+        raise ValueError(f"{label}: no shard holds seeds from {first}")
+    ordered = sorted(shards, key=lambda shard: int(shard[f"{label}.drawn"][0]))
+    joined = {key: np.concatenate([shard[key] for shard in ordered])
+              for key in ordered[0] if not _whole(label, key)}
+    joined.update({key: ordered[0][key] for key in ordered[0] if _whole(label, key)})
+    for shard in ordered[1:]:
+        for key in (key for key in shard if _whole(label, key)):
+            if not np.array_equal(shard[key], joined.get(key)):
+                raise ValueError(f"{label}: one shard's {key} is {shard[key]}, another's {joined.get(key)}")
+    drawn = joined[f"{label}.drawn"]
+    if not np.array_equal(drawn, np.arange(first, first + len(drawn))):
+        raise ValueError(f"{label}: the shards hold seeds {_runs(drawn)}, not one run from seed {first}")
+    return joined
 
 
 def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
@@ -207,7 +252,14 @@ def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
 def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int) -> dict[str, np.ndarray]:
     """The recording `evidence` (`_evidence`) makes at `confirmed` declared seeds: its first (1 + REDRAW)
     times that many seeds, each leaf's rows of float64 zero by their span a seed (`zero_offsets`)."""
-    kept = (1 + REDRAW) * confirmed
+    result = _kept(label, evidence, (1 + REDRAW) * confirmed)
+    result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
+    return result
+
+
+def _kept(label: str, evidence: Mapping[str, np.ndarray], kept: int) -> dict[str, np.ndarray]:
+    """`evidence`'s (`_evidence`) first `kept` seeds, each leaf's rows of float64 zero by their span a seed
+    (`zero_offsets`)."""
     result = {f"{label}.input_digest": evidence[f"{label}.input_digest"][:kept]}
     names = [key.removeprefix(f"{label}.mse.") for key in evidence if key.startswith(f"{label}.mse.")]
     for name in names:
@@ -219,7 +271,6 @@ def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int) ->
                        f"{label}.zero_offsets.{name}": offsets,
                        f"{label}.shape.{name}": evidence[f"{label}.shape.{name}"],
                        f"{label}.dtype.{name}": evidence[f"{label}.dtype.{name}"]})
-    result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     return result
 
 

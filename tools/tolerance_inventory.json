@@ -146,7 +146,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoding_components.py": {
-   "comparisons": 8,
+   "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_decoding_strategies.py": {
@@ -253,10 +253,6 @@
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_gguf.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_gpt_oss.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
@@ -282,11 +278,11 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_moe.py": {
-   "comparisons": 16,
+   "comparisons": 15,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 20,
+   "comparisons": 18,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_opt.py": {
@@ -306,7 +302,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_image_metrics.py": {
-   "comparisons": 5,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_inference.py": {
@@ -371,10 +367,6 @@
   },
   "tests/test_lm_recipe.py": {
    "comparisons": 6,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_local_attention.py": {
-   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_lora.py": {
@@ -442,7 +434,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe.py": {
-   "comparisons": 12,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe_biased_exchange.py": {
@@ -466,7 +458,7 @@
    "lane": "Training"
   },
   "tests/test_multimodal_model.py": {
-   "comparisons": 18,
+   "comparisons": 11,
    "lane": "Kernels"
   },
   "tests/test_multiprocess.py": {
@@ -565,16 +557,8 @@
    "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_records.py": {
-   "comparisons": 1,
-   "lane": "Training"
-  },
   "tests/test_reference_runs.py": {
    "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_released_checkpoints.py": {
-   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_reporting.py": {
@@ -691,10 +675,6 @@
   },
   "tests/test_vision.py": {
    "comparisons": 19,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_vllm_interop.py": {
-   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_vae.py": {

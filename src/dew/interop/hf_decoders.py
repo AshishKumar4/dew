@@ -60,6 +60,7 @@ from dew.interop.decoder_parts import (
     translated,
 )
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
+from dew.interop.unread import Stored, equal, held
 from dew.interop.weights import checkpoint_dtype, insert, nested
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
@@ -69,6 +70,10 @@ from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_
 from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
 from dew.nn.vision.gemma4_unified import translate_gemma4_unified_vision_config
 from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
+from dew.nn.vision.muse_glimmer import (
+    translate_muse_glimmer_projector_config,
+    translate_muse_glimmer_vision_config,
+)
 from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
 from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.registry import from_record, towers
@@ -134,7 +139,10 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
-        default_tied = hf_config.get("model_type") not in QWEN35_TYPES
+        # Transformers ties by the wrapper config's own field (modeling_utils' tie_weights reads
+        # `getattr(config, "tie_word_embeddings", False)`), which Qwen 3.5's and Muse Glimmer's
+        # configs leave unset.
+        default_tied = hf_config.get("model_type") not in (*QWEN35_TYPES, "muse_glimmer")
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
@@ -311,6 +319,23 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     return _wrapper_fields(family, used, text, tower, projector, image, None, video=video)
 
 
+def _muse_glimmer_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read a Muse Glimmer wrapper: its windowed trunk, the merge adapter and projection, the decoder
+    (`MuseGlimmerModel`, modeling_muse_glimmer.py:933-941). One resolution per call, so the soft-token
+    count varies with the image, as Qwen 3.5's does."""
+    text = _wrapper_text(hf_config, used)
+    tower = translate_muse_glimmer_vision_config(hf_config)
+    projector = translate_muse_glimmer_projector_config(hf_config)
+    used.update(("out_hidden_size", "projector_hidden_size", "projector_hidden_act", "video_token_id"))
+    # MuseGlimmerConfig's placeholders where a config leaves them out (configuration_muse_glimmer.py:194).
+    image = _defaulted_token_id(hf_config, used, "image_token_id", 200092)
+    video = _records.integer(hf_config.get("video_token_id", 200091), "video_token_id")
+    # MuseGlimmerModel embeds both placeholders as token zero, filled or not (modeling_muse_glimmer.py's
+    # forward); its language model alone (`text_only`) reads its own config and looks them up.
+    text["embedding_zero_ids"] = (image, video)
+    return _wrapper_fields("muse_glimmer", used, text, tower, projector, image, None, video=video)
+
+
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Read a Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
@@ -331,15 +356,16 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
-    **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
+    **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
+    "muse_glimmer": _muse_glimmer_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, gemma4_unified, qwen3_5, qwen3_5_moe, gemma3n and decoder-family
-    bundles translate. Records retain the decoder, tower, projector, image token ID and token count, and
-    for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
+    gemma3, llama4, gemma4, gemma4_unified, qwen3_5, qwen3_5_moe, gemma3n, muse_glimmer and
+    decoder-family bundles translate. Records retain the decoder, tower, projector, image token ID
+    and token count, and for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
     audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 4 Unified has neither tower: its
     embedders project vision patches and raw audio frames, either optional. Gemma 3n's
     embedders also embed their hard vocabulary ranges.
@@ -420,13 +446,14 @@ def _renamed(checked: Checked, names: Mapping[str, str]) -> Checked:
             for name, group in checked.items() if name in local}
 
 
-def _equal(read: Callable[[str], np.ndarray], first: str, second: str, checked: Checked) -> bool:
+def _equal(read: Callable[[str], Stored], first: str, second: str, checked: Checked) -> bool:
     """Whether source tensors `first` and `second` hold equal values: known where `checked` joins
-    them, else read and compared."""
-    return second in checked.get(first, frozenset()) or np.array_equal(read(first), read(second))
+    them, else read and compared; of a load without its weights, whether their shapes and dtypes are
+    (`valued`)."""
+    return second in checked.get(first, frozenset()) or equal(read(first), read(second))
 
 
-def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], record,
+def _wrapper_sources(names: Collection[str], read: Callable[[str], Stored], record,
                      checked: Checked = NOTHING_CHECKED):
     """Route source names once, checking any names that claim one local leaf.
     The table retains names, not decoded arrays, so read can be a codec accessor.
@@ -465,7 +492,7 @@ def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, objec
     return text
 
 
-def language_model_names(names: Collection[str], read: Callable[[str], np.ndarray], record: WrapperFields,
+def language_model_names(names: Collection[str], read: Callable[[str], Stored], record: WrapperFields,
                          checked: Checked = NOTHING_CHECKED) -> dict[str, str]:
     """Each tensor name of a wrapper's language model, as its text family reads it, to the wrapper's
     name of it (`wrapper_route`). The media towers' names are not among them, nor read: only the
@@ -474,7 +501,7 @@ def language_model_names(names: Collection[str], read: Callable[[str], np.ndarra
     return _wrapper_sources(own, read, record, checked)[0]["language_model"]
 
 
-def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], config,
+def _text_aliases(names: Collection[str], read: Callable[[str], Stored], config,
                   tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight'),
                   checked: Checked = NOTHING_CHECKED) -> tuple[tuple[str, str], ...]:
     """Check tied-head/MTP values and return the verified source relationships.
@@ -529,7 +556,7 @@ def _tied_names(family: "DecoderFamily", config, names: Collection[str]) -> tupl
     return head_name, embedding_name if found is None else found
 
 
-def _denoiser_sources(names: Collection[str], read: Callable[[str], np.ndarray], *,
+def _denoiser_sources(names: Collection[str], read: Callable[[str], Stored], *,
                       text_only: bool, checked: Checked = NOTHING_CHECKED):
     """Return the shared text names, preferring the encoder as the weight map does.
     Alias-only inspection of a complete source leaves media validation to its
@@ -572,7 +599,7 @@ def alias_groups(aliases: Collection[tuple[str, str]]) -> tuple[frozenset[str], 
     return tuple(set(groups.values()))
 
 
-def validate_source_aliases(names: Collection[str], read: Callable[[str], np.ndarray],
+def validate_source_aliases(names: Collection[str], read: Callable[[str], Stored],
                             config: Mapping[str, object], *, media: bool) -> tuple[tuple[str, str], ...]:
     """Return the pairs of source tensor names that hold equal values.
 
@@ -602,7 +629,7 @@ def validate_source_aliases(names: Collection[str], read: Callable[[str], np.nda
 
 
 def translate_wrapper_weights(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     record: WrapperFields,
     *,
     param_dtype: str = "float32",
@@ -635,7 +662,7 @@ def wrapper_source_depths(record: WrapperFields) -> Callable[[str], int | None]:
 
 
 def read_wrapper(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     record: WrapperFields,
     *,
     param_dtype: str = "float32",
@@ -757,7 +784,7 @@ def held_depths(fields: dict, params: Mapping[str, object]) -> None:
 
 
 def translate_weights(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     config: DecoderFields,
     model_type: str | DecoderFamily | None = None,
     *,
@@ -772,7 +799,7 @@ def translate_weights(
 
 
 def read_decoder(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     config: DecoderFields,
     model_type: str | DecoderFamily | None = None,
     *,
@@ -824,7 +851,7 @@ def read_decoder(
         path = part.path
         if path is None or name in copies:
             continue
-        stored = np.asarray(part.tensor)
+        stored = held(part.tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
@@ -839,7 +866,7 @@ def read_decoder(
 
 
 def translate_denoiser_weights(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     config: DecoderFields,
     *,
     param_dtype: str = "float32",

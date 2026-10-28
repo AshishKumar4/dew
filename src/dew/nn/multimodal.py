@@ -18,9 +18,9 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
 from dew.nn.kv_cache import POSITION
-from dew.nn.protocols import OutputTable, ProjectionGroup, held_groups
+from dew.nn.protocols import OutputTable, ProjectionGroup, ReadsTrain, held_groups
 from dew.nn.sharding import explicit_spec
-from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase, TowerGeometry
+from dew.nn.vision import ProjectorBase, TowerBase, TowerGeometry
 from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
@@ -73,8 +73,8 @@ class VisionConditioner(nn.Module):
     Pixels have shape [batch, images, channels, height, width]. All images
     in a numeric batch share their processed resolution; the processor keeps
     per-image lengths and does not substitute preprocessing inside the model.
-    `train` reaches the one tower with stochastic layers, Gemma 3n's
-    MobileNet and its drop-path.
+    `train` reaches a tower that reads it (`ReadsTrain`), as Gemma 3n's
+    MobileNet does for its drop path, whichever inputs it takes.
     """
 
     vision: TowerBase
@@ -96,15 +96,14 @@ class VisionConditioner(nn.Module):
             raise ValueError("pixel_values must be row-aligned NCHW images or positioned patch pixels")
         batch, images = pixels.shape[:2]
         flat = pixels.reshape(batch * images, *pixels.shape[2:])
+        stochastic = {"train": train} if isinstance(self.tower, ReadsTrain) and self.tower.reads_train else {}
         if grid is not None:
-            features = self.tower(flat, grid_thw=grid.reshape(batch * images, 3))
-        elif isinstance(self.vision, Gemma3nVision):
-            features = self.tower(flat, train=train)
+            features = self.tower(flat, grid_thw=grid.reshape(batch * images, 3), **stochastic)
         elif positions is None:
-            features = self.tower(flat)
+            features = self.tower(flat, **stochastic)
         else:
             features = self.tower(
-                flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:])
+                flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:]), **stochastic
             )
         projected = self.projector(features)
         return projected.reshape(batch, images * projected.shape[1], projected.shape[-1])
@@ -342,8 +341,10 @@ class MultimodalTransformer(DecoderWrapper):
             )
         else:
             decoder_tokens = jnp.where(media, 0, tokens)
+        # The decoder's own lookup (`token_embeddings`), so a placeholder no media fills reads as its
+        # decoder reads it.
         embeddings = self.language_model.scaled_embeddings(
-            self.language_model.embed_tokens(decoder_tokens))
+            self.language_model.token_embeddings(decoder_tokens))
         if self.family == "gemma3n":
             embedders = [self.conditioner.projector]
             if self.audio is not None:
@@ -494,6 +495,10 @@ class MultimodalTransformer(DecoderWrapper):
     def in_context(self) -> bool:
         """Whether the decoder holds a continuum level (`SteppedInContext`)."""
         return self.language_model.in_context
+
+    def affine_head(self) -> bool:
+        """Whether the decoder's head past its level is affine in its states (`SteppedInContext`)."""
+        return self.language_model.affine_head()
 
     @nn.nowrap
     def in_context_level(self, variables):
