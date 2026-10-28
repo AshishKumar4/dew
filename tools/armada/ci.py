@@ -729,8 +729,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["-m", "coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    command = [*selected(session.pytest_run(python, report, *measured), network), "-p", "executed", *tests,
-               *grouping]
+    command = [*selected(session.pytest_run(python, report, *measured), network, cache), "-p", "executed",
+               *tests, *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
@@ -934,13 +934,15 @@ def collected(python: str, marks: str) -> dict[str, int]:
     return counts
 
 
-def selected(command: list[str], network: bool) -> list[str]:
+def selected(command: list[str], network: bool, cache: str = "off") -> list[str]:
     """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
-    tests alone, every one the rest of CI sets aside."""
-    if not network:
-        return command
+    tests alone, every one the rest of CI sets aside. Where the cache's policy is "on" (a train's or a lane's
+    run of what changed) it sets aside the tests marked whole_suite too, which run where nothing is reused
+    (the policy "off": the daily run, a pushed full-* branch, a change to what every test reads) (owner,
+    2026-10-27)."""
     at = command.index(session.SELECTION[1])
-    return [*command[:at], "network", *command[at + 1:]]
+    whole = " and not whole_suite" if cache == "on" else ""
+    return [*command[:at], "network" if network else session.SELECTION[1] + whole, *command[at + 1:]]
 
 
 GPU_HEADROOM = (1.25, 2 ** 30)

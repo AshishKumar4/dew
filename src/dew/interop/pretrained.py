@@ -37,7 +37,7 @@ from dew.inference.images import TextToImage
 from dew.inference.loading import place
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import InputSpec
-from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, verify
+from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, unread, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.composite import CompositeSource, NativeComponent
 from dew.interop.config_records import NativeFields
@@ -125,7 +125,7 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     return tuple(bindings), retained
 
 
-def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tuple[str, str], ...],
+def _share_quantized_aliases(tensors: dict[str, unread.Stored], aliases: tuple[tuple[str, str], ...],
                              quantized: tuple[str, ...]) -> None:
     """Share only aliases verified on original values before codec narrowing.
 
@@ -183,7 +183,7 @@ class Pretrained:
     model_config: Mapping[str, object]
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
-    retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
+    retained_tensors: Mapping[str, unread.Stored] = field(default_factory=dict)
     """The source tensors no forward reads, kept as stored for `save` to write back.
 
     A pipeline keeps a text encoder's vision tower here, each tensor named
@@ -199,7 +199,7 @@ class Pretrained:
     DeepSeek-V4's `.scale`, for example, is float8_e8m0fnu, and float32 in the
     Base releases. `save` writes the scales back in this dtype.
     """
-    quantization_grid: Mapping[str, np.ndarray] = field(default_factory=dict, repr=False)
+    quantization_grid: Mapping[str, unread.Stored] = field(default_factory=dict, repr=False)
     """The scales and zeros an integer format (AWQ, GPTQ) encodes a saved weight against.
 
     They are kept as the source stored them.
@@ -562,6 +562,9 @@ class Pretrained:
         if self.adapter is not None:
             values = self.adapter.merge(values)
         quantization = self._quantization()
+        # Their values, each read as it is written: a load without its weights holds none (`PayloadUnread`).
+        retained = LazyTensors(tensor_specs(self.retained_tensors),
+                               lambda name: np.asarray(self.retained_tensors[name]))
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif self.weight_layouts:
@@ -571,8 +574,8 @@ class Pretrained:
             scalar_mode = layer_scalar_mode(values, scalars[0]) if scalars else None
             layouts = {layout.name: layout for layout in self.weight_layouts}
             if quantization is None:
-                return decoder_parts.layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
-            tensors = {**self.retained_tensors,
+                return decoder_parts.layout_tensors(layouts, values, scalar_mode, retained)
+            tensors = {**retained,
                        **{name: layout.export(values, scalar_mode) for name, layout in layouts.items()}}
         else:
             raise ValueError("this source has no reversible weight layout")
@@ -1240,7 +1243,7 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
 
 
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
-                   gguf_path: Path | None) -> tuple[Mapping[str, object], Mapping[str, np.ndarray] | None]:
+                   gguf_path: Path | None) -> tuple[Mapping[str, object], Mapping[str, unread.Stored] | None]:
     """The decoder's config, and its tensors where the config came with them
     (a GGUF file holds both); refused, naming what the source ships instead,
     before any weight downloads when there is no config.json."""
@@ -1258,9 +1261,9 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
     return config, None
 
 
-def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], param_dtype: str, *, media: bool
-             ) -> tuple[Mapping[str, np.ndarray], tuple[str, ...], str | None, dict[str, np.ndarray],
-                        decoders.Checked]:
+def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], param_dtype: str, *,
+             media: bool) -> tuple[Mapping[str, unread.Stored], tuple[str, ...], str | None,
+                                   dict[str, unread.Stored], decoders.Checked]:
     """The tensors with a quantized source's weights decoded, and what `save`
     needs to write them back: the quantized names, the scales' dtype and the
     integer formats' grid; and the spellings checked equal before a narrowing
@@ -1282,8 +1285,8 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
     return tensors, quantized_tensors, scale_dtype, grid, decoders.checked_groups(aliases)
 
 
-def _language_model_tensors(tensors: Mapping[str, np.ndarray], record: decoder_parts.WrapperFields
-                            ) -> Mapping[str, np.ndarray]:
+def _language_model_tensors(tensors: Mapping[str, unread.Stored], record: decoder_parts.WrapperFields
+                            ) -> Mapping[str, unread.Stored]:
     """A wrapper's language model's tensors under its text family's names
     (`decoders.language_model_names`), each read only when the translation reads it; the media
     towers' are neither among them nor read."""
@@ -1294,7 +1297,7 @@ def _language_model_tensors(tensors: Mapping[str, np.ndarray], record: decoder_p
 
 
 def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[WeightLayout, ...],
-                        config: Mapping[str, object], grid: Mapping[str, np.ndarray]
+                        config: Mapping[str, object], grid: Mapping[str, unread.Stored]
                         ) -> tuple[nn.Module, Variables]:
     """Write each stored input scale into the `QUANTIZATION` variables of every Linear its source
     weight binds, and return the model computing under them.
@@ -1310,7 +1313,7 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:
         return model, variables
-    sites: dict[tuple[str, ...], tuple[InputKind, jax.Array]] = {}
+    sites: dict[tuple[str, ...], tuple[InputKind, unread.Stored]] = {}
     consumed: set[str] = set()
     for layout in layouts:
         part = layout.name.removesuffix('.weight') + codec.input_suffix
@@ -1322,21 +1325,26 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
             raise ValueError(f"{layout.name} needs its input QDQ per expert or input part, "
                              "which one stored input scale does not quantize")
         consumed.add(part)
-        scale = np.asarray(grid[part])
+        scale = unread.held(grid[part])
         if scale.dtype != np.float32 or scale.size != 1:
             raise ValueError(f"{part} must be one float32 stored global scale, "
                              f"got {scale.dtype} {scale.shape}")
-        value = float(scale.reshape(()))
-        quantizer = (InputQuantizer.fp8(value) if codec.input_kind(layout.name) == 'fp8' else
-                     InputQuantizer.nvfp4(value, codec.input_scale_dtype == 'float8_e4m3fn',
-                                          format=codec.input_format))
+        kind: InputKind = 'fp8' if codec.input_kind(layout.name) == 'fp8' else 'nvfp4'
+        if unread.valued(scale):
+            value = float(scale.reshape(()))
+            quantizer = (InputQuantizer.fp8(value) if kind == 'fp8' else
+                         InputQuantizer.nvfp4(value, codec.input_scale_dtype == 'float8_e4m3fn',
+                                              format=codec.input_format))
+            stored = np.asarray(quantizer.scale)
+        else:
+            # A load without its weights holds the scale's shape and dtype; its value is checked on load.
+            stored = scale.reshape(())
         for path in layout.paths:
             site = path[1:-1]
             # A fused tensor and an equal member stored beside it bind one Linear twice: they must
             # quantize its input alike, or one calibration would be silently dropped.
-            held_kind, held_scale = sites.setdefault(site, (quantizer.kind, quantizer.scale))
-            agrees = held_kind == quantizer.kind and np.array_equal(np.asarray(held_scale),
-                                                                    np.asarray(quantizer.scale))
+            held_kind, held_scale = sites.setdefault(site, (kind, stored))
+            agrees = held_kind == kind and unread.equal(held_scale, stored)
             if not agrees:
                 raise ValueError(f"{layout.name}'s input quantizer and another stored for "
                                  f"{'/'.join(site)} disagree; one Linear takes one")
@@ -1361,12 +1369,12 @@ class _Built(NamedTuple):
     record: Mapping[str, object]
     built: Mapping[str, object]
     layouts: tuple[WeightLayout, ...]
-    retained: dict[str, np.ndarray]
+    retained: dict[str, unread.Stored]
     export_adapter: Callable[..., Mapping[str, np.ndarray]] | None = None
 
 
 def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperFields,
-                    tensors: Mapping[str, np.ndarray], directory: Path, *, dtype: str, attention_impl: str,
+                    tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str, attention_impl: str,
                     max_seq_len: int | None, param_dtype: str, lazy: bool,
                     checked: decoders.Checked) -> _Built:
     """A multimodal wrapper, `record` its translated config: the decoder under its text_config and the
@@ -1517,7 +1525,7 @@ def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransforme
     return {spelling.get(name, name): tensor for name, tensor in written.items()}
 
 
-def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
+def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.Stored], directory: Path,
                     route: DecoderRoute | VerifiedRoute, *, dtype: str, attention_impl: str,
                     max_seq_len: int | None, param_dtype: str, lazy: bool, quantized: bool,
                     checked: decoders.Checked) -> _Built:
@@ -1775,12 +1783,12 @@ class _Translated(NamedTuple):
     built: _Built
     quantized_tensors: tuple[str, ...]
     scale_dtype: str | None
-    grid: dict[str, np.ndarray]
+    grid: dict[str, unread.Stored]
 
 
 def _translated(config: Mapping[str, object],
                 route: DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute,
-                tensors: Mapping[str, np.ndarray], directory: Path, *, dtype: str, param_dtype: str,
+                tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str, param_dtype: str,
                 attention_impl: str, max_seq_len: int | None, streaming: bool) -> _Translated:
     """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
     weights decoded, the decoder, media wrapper or DiffusionGemma translated and checked against its
@@ -1871,8 +1879,8 @@ def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
     return written
 
 
-def _kept_tensors(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], route: SourceRoute,
-                  kept: int) -> Mapping[str, np.ndarray]:
+def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], route: SourceRoute,
+                  kept: int) -> Mapping[str, unread.Stored]:
     """`tensors` without those of the prediction depths past the first `kept`, none read: the depth of
     each as its family places it (`decoders.source_depth`), a decoder's by its route's record, a
     wrapper's language model's through the wrapper's names."""
@@ -1896,7 +1904,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                         dtype: str, param_dtype: str, attention_impl: str,
                         max_seq_len: int | None, weights: bool = True,
                         component: NativeComponent | None = None,
-                        tensors: Mapping[str, np.ndarray] | None = None,
+                        tensors: Mapping[str, unread.Stored] | None = None,
                         overrides: Mapping[str, object] | None = None,
                         remote: Path | None = None, pinned: sources.SourceReference | None = None,
                         routed: _Routed | None = None,

@@ -48,6 +48,7 @@ from dew.interop.decoder_parts import (
     translated,
     yarn_record,
 )
+from dew.interop.unread import Stored, held, valued
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
@@ -1072,8 +1073,8 @@ def _v4_spelling(name: str) -> str:
     return block + renamed
 
 
-def deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
-                          _config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
+def deepseek_v4_prepare(tensors: Mapping[str, Stored],
+                          _config: Mapping[str, object] | None = None) -> dict[str, Stored]:
     """Reshape the grouped output projection and the hash table as the tree holds them.
 
     `DeepseekV4GroupedLinear` stores one block per head group in a matrix of
@@ -1093,8 +1094,8 @@ def deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
             if partner is None:
                 raise ValueError(f"{name} needs its block's query projection (wq_b) to name its head groups")
             groups = tensors[partner].shape[0] // tensor.shape[1]
-            prepared[name] = np.ascontiguousarray(
-                tensor.reshape(groups, -1, tensor.shape[1]).transpose(0, 2, 1))
+            prepared[name] = held(tensor.reshape(groups, -1, tensor.shape[1]).transpose(0, 2, 1),
+                                  contiguous=True)
         elif spelling.endswith('.gate.tid2eid'):
             if not np.issubdtype(tensor.dtype, np.integer):
                 raise ValueError(f"{name} must contain integer expert indices")
@@ -1102,14 +1103,15 @@ def deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
             if router_name is None:
                 raise ValueError(f"{name} has no gate.weight declaring its expert count")
             router = tensors[router_name]
-            if tensor.size:
+            # The indices' range is checked where they are held (`valued`).
+            if tensor.size and valued(tensor):
                 lower, upper = np.min(tensor), np.max(tensor)
                 limits = np.iinfo(np.int32)
                 if lower < limits.min or upper > limits.max:
                     raise ValueError(f"{name} has expert indices outside the lossless int32 range")
                 if lower < 0 or upper >= router.shape[0]:
                     raise ValueError(f"{name} has indices outside its {router.shape[0]} experts")
-            prepared[name] = np.asarray(tensor, np.int32)
+            prepared[name] = held(tensor, np.int32)
     return prepared
 
 

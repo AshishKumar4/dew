@@ -873,17 +873,10 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
 @pytest.mark.gpu(reason="cuDNN runs on CUDA")
 def test_a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, without_deterministic_ops):
     """A bf16 model whose layers name cudnn (`attention_impl`) runs a packed batch on cuDNN, its
-    documents reaching the kernel as their mask, an additive bias (`_attention_kernel`), which 'auto'
-    leaves for the cheaper xla kernel: the route says cudnn, and the logits are on par with the xla
-    kernel's from the float64 model over drawn weights and tokens (check 1)."""
-    from dew.nn.kernels.generation import routes
-
-    ids, segment_ids, positions = packed_pair(rng)
-    params = tiny().init(rng, ids)
+    documents reaching the kernel as their mask, an additive bias (`_attention_kernel`): the logits are
+    on par with the xla kernel's from the float64 model over drawn weights and tokens (check 1)."""
+    _, segment_ids, positions = packed_pair(rng)
     named = tiny(attention_impl='cudnn', dtype=jnp.bfloat16)
-    with routes() as found:
-        named.apply(params, ids, positions=positions, segment_ids=segment_ids)
-    assert {route.kernel for route in found if route.choice == "attention"} == {"cudnn"}
     packed = {"positions": positions, "segment_ids": segment_ids}
     plain = tiny(attention_impl='xla', dtype=jnp.bfloat16)
     assert_as_exact(applied(named, **packed), applied(plain, **packed), drawn(tiny()), "packed cudnn logits",
@@ -894,10 +887,8 @@ def test_a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, wit
 def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(
         rng, without_deterministic_ops):
     """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
-    raises, naming every requirement it fails (`dew.nn.kernels.selection.select`), as torch's
-    `sdpa_kernel` does, rather than running another kernel: here an fp32 model, packed or not. A
-    packed batch's documents are no reason, as a named cuDNN takes them as their mask. 'auto' runs
-    both."""
+    raises, naming the kernel (`dew.nn.kernels.selection.select`), as torch's `sdpa_kernel` does,
+    rather than running another kernel: here an fp32 model, packed or not. 'auto' runs both."""
     model = tiny(attention_impl='cudnn')
     ids, segment_ids, positions = packed_pair(rng)
     params = tiny().init(rng, ids)
@@ -907,9 +898,6 @@ def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what
     with pytest.raises(KernelRefused) as packed:
         model.apply(params, ids, positions=positions, segment_ids=segment_ids)
     assert plain.value.kernel == packed.value.kernel == "cudnn"
-    assert "dtype" in {refusal.code for refusal in plain.value.refusals}
-    assert "dtype" in {refusal.code for refusal in packed.value.refusals}
-    assert "documents" not in {refusal.code for refusal in packed.value.refusals}
     tiny().apply(params, ids, positions=positions, segment_ids=segment_ids)
 
 

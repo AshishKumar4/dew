@@ -149,6 +149,11 @@ def recorded(evaluations: list[tuple[Evaluated, jax.Array]], ran: jax.Array) -> 
                     evaluated=ran)
 
 
+COMMIT_FIELDS = ("opt_state", "ema")
+"""The state's fields a resident step reads only as it commits, past its gradient: the optimizer state, and
+the EMA but where the objective reads it in its forward (`Transaction.fetch`)."""
+
+
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
@@ -319,7 +324,7 @@ class Transaction:
     run; only where each phase executes differs.
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
-                 record: bool = False):
+                 record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -330,7 +335,16 @@ class Transaction:
         replay. `copies` names the parameters the forward reads through the
         state's narrow copies, which the commit rewrites (`dew.training.narrow`). `record` makes each
         evaluation return what its `Step.sample` and `Step.boundary` calls produced (`recorded`).
+        `fetch` brings the fields of `COMMIT_FIELDS` a resident step's state keeps in host memory to the
+        device (`Trainer._fetched`): the step reads them only once its gradient is ready, as the commit
+        does, so the device holds them through the update and not through the forward and backward, but
+        for an EMA the objective reads in its forward. Fetched at the step's start, an A100 held them
+        through both: a plain Adam step's peak rose from 2.483 GB to 3.020 GB with its state in host
+        memory, and fetched past the gradient it is 2.483 GB again (node receipt TL-a100-offload-1338-c,
+        hostmem.json). XLA:GPU still holds the whole state for the update, so keeping it on the host
+        frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way.
         """
+        self.fetch = fetch
         self.record = record
         self.objective = objective
         self.optimizer = optimizer
@@ -341,6 +355,21 @@ class Transaction:
         self.shared = isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
         self.stats_tree = jax.tree.structure(stats_shape)
         self.effects_tree = jax.tree.structure(self.aux_shape.effects)
+
+    def fetched(self, state: TrainState) -> TrainState:
+        """`state` with the fields `fetch` brings to the device there, `state` itself where nothing is."""
+        return state if self.fetch is None else self.fetch(state)
+
+    def past(self, state: TrainState, gradient) -> TrainState:
+        """`state` for the commit, its host-resident fields (`fetch`) brought to the device past `gradient`:
+        they pass an optimization barrier with it, so the device takes them only once it is ready. Where
+        nothing rests on the host the state is the commit's as it is: with the barrier there too, a step
+        that fit by a byte past its own rung found no rung (tests/test_narrow.py, at f001b108c)."""
+        if self.fetch is None:
+            return state
+        resting = {field: getattr(state, field) for field in COMMIT_FIELDS}
+        _, kept = jax.lax.optimization_barrier((gradient, resting))
+        return self.fetch(dataclasses.replace(state, **kept))
 
     def realize(self, variables: Variables, batch: Batch, step_info: Step) -> Realization:
         """Evaluate the objective's loss and keep the pullback of that trace.
@@ -455,8 +484,8 @@ class Transaction:
         accepted, attempt = state.microstep - fill + index, previous.attempts[index]
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
         step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
-                         with_ema(variables, state.ema), committed=state.updates, record=self.record,
-                         qk_stats=clips_qk(state.opt_state),
+                         with_ema(variables, self.fetched(state).ema), committed=state.updates,
+                         record=self.record, qk_stats=clips_qk(state.opt_state),
                          **self.examples(state, index, batch, part=attempt % self.split,
                                          rejected=attempt - accepted))
         return self.read(variables, state.compute), batch, step_info
@@ -668,7 +697,7 @@ class Transaction:
             # Every attempt the run made and did not accept, so a rejected one's slot draws afresh.
             rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
-                             with_ema(state.variables, state.ema), committed=state.updates,
+                             with_ema(state.variables, self.fetched(state).ema), committed=state.updates,
                              record=self.record, qk_stats=clips_qk(state.opt_state),
                              **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
@@ -735,7 +764,7 @@ class Transaction:
                 # its own gradient is ready.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                return finish(state, batch, aux, pending, gradient, attempt, tokens)
+                return finish(self.past(state, gradient), batch, aux, pending, gradient, attempt, tokens)
             moving, held = apart(state)
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
                                                     tokens)
