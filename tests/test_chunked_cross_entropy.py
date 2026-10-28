@@ -401,6 +401,32 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     assert moved and max(moved) < matrix.size // 2, moved
 
 
+def column_order_case():
+    """A head over 512 columns ordered by its columns, as its check-1 site
+    (`test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_orders`) and that site's
+    null runs (tools/gate_null_runs.py) take it: the draw of an order, its columns permuted and its
+    targets relabelled, with one cotangent for every order (so the orbit moves only the order of the
+    sums) and the inverse relabelling last; and the scoring of a head's terms through it, each token's loss
+    and log Z and the gradients for the states, the head, the scale and the bias under the cotangent, at
+    the highest matmul precision."""
+    states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
+    states, matrix = eighths(states, matrix)
+    scale, bias = columns(512)
+    rng = np.random.default_rng(29)
+    cotangent = tuple(jnp.asarray(rng.standard_normal(targets.shape), jnp.float32) for _ in range(2))
+
+    def draw(seed):
+        columns_in = order(512, seed)
+        relabel = np.argsort(columns_in)
+        return (states, matrix[:, columns_in], scale[columns_in], bias[columns_in], relabel[targets],
+                cotangent, relabel)
+
+    def scored(head):
+        return under('highest', pulled(head, 4))
+
+    return draw, scored
+
+
 def scaled_whole_head(states, matrix, scale, bias, targets):
     """Each token's loss and log Z from the whole logits of a head with a per-token scale and bias
     (`jax.nn.logsumexp`), the reference a tiled head's terms are held to."""
@@ -417,31 +443,17 @@ def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_
     relabelled, which reorders every row's sum of exponentials and moves no value). A row summed in
     one loop of XLA's CPU reduction with a combine of its own, and a share divided out and then
     scaled, held the whole head's state gradient 3.9 times as far."""
-    states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
-    states, matrix = eighths(states, matrix)
-    scale, bias = columns(512)
-
-    # One cotangent for every order, so the orbit moves only the order of the sums.
-    rng = np.random.default_rng(29)
-    cotangent = tuple(jnp.asarray(rng.standard_normal(targets.shape), jnp.float32) for _ in range(2))
+    ordered, scored = column_order_case()
 
     def draw(seed):
-        columns_in = order(512, seed)
-        relabel = np.argsort(columns_in)
-        return states, matrix[:, columns_in], scale[columns_in], bias[columns_in], relabel[targets], cotangent
+        return ordered(seed)[:-1]
 
     def terms(states, matrix, scale, bias, targets):
         head = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale)
         losses, _, log_z = chunked_cross_entropy(states, head, targets, 4, tile=tile)
         return losses, log_z
 
-    whole = scaled_whole_head
-
-    def scored(head):
-        # Each token's loss and log Z, and the gradients of a loss of both, the cotangent's.
-        return under('highest', pulled(head, 4))
-
-    assert_as_exact(jax.jit(scored(terms)), jax.jit(scored(whole)), draw, f'{tile} column orders',
+    assert_as_exact(jax.jit(scored(terms)), jax.jit(scored(scaled_whole_head)), draw, f'{tile} column orders',
                     seeds=SEEDS['column orders'])
 
 
