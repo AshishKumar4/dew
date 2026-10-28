@@ -2,6 +2,7 @@
 
 import collections
 import copy
+import functools
 import itertools
 from dataclasses import replace
 from pathlib import Path
@@ -65,11 +66,10 @@ def qwen35(length: int) -> Pretrained:
     return Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference", max_seq_len=length)
 
 
-def attending(length: int) -> CausalTransformer:
-    """A decoder of attention alone, which the parallel layout's key runs need, on the attention template,
-    which reads them as its spans (`DecisionModel._read`, row 1835)."""
+def attending(length: int, implementation: str = "xla") -> CausalTransformer:
+    """A decoder of attention alone, which the parallel layout's key runs need, on `implementation`."""
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                             max_seq_len=length, attention_impl="template")
+                             max_seq_len=length, attention_impl=implementation)
 
 
 ROWS = StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8)
@@ -79,7 +79,10 @@ ARMS = {
     "joint": (JointLayout(max_len=1536), qwen35,
              lambda: JointSchemaHead(64, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)),
     "marker": (ROWS, qwen35, lambda: DecisionHead(64, layers=1)),
-    "parallel": (replace(ROWS, parallel=True), attending, lambda: DecisionHead(32, layers=1)),
+    # The parallel arm's decoder on the attention template, which reads the layout's key runs as its spans
+    # (`DecisionModel._read`, row 1835).
+    "parallel": (replace(ROWS, parallel=True), functools.partial(attending, implementation="template"),
+                 lambda: DecisionHead(32, layers=1)),
     "readout": (replace(ROWS, head_max_len=128, option_tokens=24, labels=LABELS), qwen35,
                 lambda: LabelReadout(64, LABELS.ids(TOKENIZER, 3))),
 }
