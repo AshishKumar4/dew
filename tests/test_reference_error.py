@@ -1034,45 +1034,6 @@ def test_a_recording_read_for_some_of_its_leaves_judges_them_alone():
                     truth_fn=truth)
 
 
-def test_a_recording_sketched_again_is_the_recording_made_now():
-    """A summarized recording of the dense sketch (version 1, its version unnamed), sketched again
-    (`resketched`) through the test's float64 path, is the recording `record_case`'s summary makes at
-    SKETCH_VERSION: the same evidence, its sketches and its pilots' the structured ones within float64's
-    rounding of the truth recomputed; a float64 path that does not compute the recorded truth is refused
-    before anything is sketched."""
-    from reference_error import SIZING_FROM, truth_sketch
-    from tool_support import load
-
-    recorder = load("recorded_references")
-    draw, evaluate = _tiny_row_recording(_product)
-
-    def product(inputs):
-        return _product(inputs["x"], inputs["w"])
-
-    pilots = range(SIZING_FROM, SIZING_FROM + 8)
-    with jax.enable_x64(new_val=True):
-        now = recorder.record_case("site", draw, evaluate, product, summary=True)
-        now = recorder.with_pilots("site", now, [recorder.record_shard("site", draw, evaluate, pilots)])
-        # The same recording as one made before sketches had versions: each seed's truth's dense sketch.
-        older = {key: value for key, value in now.items() if key != "site.sketch_version"}
-        for prefix, seeds in (("", range(len(now["site.input_digest"]))), ("pilot.", pilots)):
-            older[f"site.{prefix}sketch.y"] = np.stack([
-                truth_sketch(np.asarray(evaluate(draw(seed))[1]["y"]), seed, version=1) for seed in seeds])
-    again = recorder.resketched(older, "site", inputs_of=draw, truth_fn=product)
-    assert again.keys() == now.keys()
-    for key, value in now.items():
-        if ".sketch." in key:
-            np.testing.assert_allclose(again[key], value, rtol=1e-12, atol=0, err_msg=key)
-        else:
-            np.testing.assert_array_equal(again[key], value, err_msg=key)
-
-    def moved(inputs):
-        return {"y": product(inputs)["y"] * (1 + 1e-6)}
-
-    with pytest.raises(AssertionError):
-        recorder.resketched(older, "site", inputs_of=draw, truth_fn=moved)
-
-
 def test_a_recorded_truth_over_windows_counts_one_window_and_checks_every_one():
     """A summarized recording of windows read back through `indexed_recording` with a truth over windows
     (`over_windows`): its rounding count traces one window, as one draw's program, so the truth is read
@@ -1431,7 +1392,7 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     blocks = np.flip((truth[:, None] * signs).reshape(-1, 64, SKETCH), axis=1).cumsum(axis=1)[:, -1]
     other_order = np.asarray([math.fsum(blocks[:, index].tolist()) for index in range(SKETCH)])
     allowed = 2 * sketch_rounding(float(np.sum(np.abs(truth))))
-    assert np.all(np.abs(truth_sketch(truth, 3, version=1) - other_order) <= allowed)
+    assert np.all(np.abs(truth_sketch(truth, 3) - other_order) <= allowed)
     empty = leaf_summary(jnp.zeros((16, 0), jnp.bfloat16), np.zeros((16, 0)))
     assert (empty.mse, empty.worst, empty.finite, empty.dtype) == (0.0, 0.0, True, "bfloat16")
     with pytest.raises(AssertionError):
@@ -1440,8 +1401,7 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     swapped = truth.copy()
     swapped[[0, 1]] = swapped[[1, 0]]
     bits = _sign_bits(truth.size, 3)
-    assert (bits[0] == bits[1]) or np.any(truth_sketch(swapped, 3, version=1)
-                                          != truth_sketch(truth, 3, version=1))
+    assert (bits[0] == bits[1]) or np.any(truth_sketch(swapped, 3) != truth_sketch(truth, 3))
 
 
 def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
@@ -1561,7 +1521,7 @@ def test_a_truth_sketch_is_its_signed_sums_bit_for_bit():
             padded = np.concatenate([chunk, np.zeros((-len(chunk) % SKETCH_BLOCK, SKETCH))])
             blocks.append(padded.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
         expected = [math.fsum(column) for column in np.concatenate(blocks).T.tolist()]
-        assert truth_sketch(values, seed=3, version=1).tolist() == expected
+        assert truth_sketch(values, seed=3).tolist() == expected
 
 
 def test_a_leaf_summary_reads_the_same_with_its_truths_rows_read_once():

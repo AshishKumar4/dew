@@ -30,19 +30,16 @@ from fetched_fixtures import save
 from reference_error import (
     REDRAW,
     SIZING_FROM,
-    SKETCH_VERSION,
     as_given,
-    indexed_recording,
     input_digest,
     leaf_summary,
     seeds_for,
     seeds_resolving,
     truth_sketch,
-    widened,
 )
 
-__all__ = ["merge_shards", "provenance", "record_case", "record_reference", "record_shard", "resketched",
-           "save", "with_pilots"]
+__all__ = ["merge_shards", "provenance", "record_case", "record_reference", "record_shard", "save",
+           "with_pilots"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
@@ -201,34 +198,6 @@ def with_pilots(label: str, recording: Mapping[str, np.ndarray],
                             for key, value in pilot.items() if not _whole(label, key)}}
 
 
-def resketched(stored: Mapping[str, np.ndarray], site: str, *, inputs_of, truth_fn) -> dict[str, np.ndarray]:
-    """`stored`, a summarized recording of an older sketch's version, with its truths sketched at
-    SKETCH_VERSION: each recorded seed's truth, verdict seeds and pilots alike, recomputed by `truth_fn`
-    (the test's float64 path) on its inputs drawn again (`inputs_of`), held first to the recording's own
-    sketch as check 1 holds it (`indexed_recording`), so a truth the recording does not hold is refused
-    rather than sketched; then sketched anew. Its evidence is the recording's. A recording already at
-    SKETCH_VERSION is returned as it is."""
-    if int(stored.get(f"{site}.sketch_version", 1)) == SKETCH_VERSION:
-        return dict(stored)
-    draw, _, truth = indexed_recording(stored, site, int(stored[f"{site}.seeds"]), inputs_of=inputs_of,
-                                       truth_fn=truth_fn)
-    result = dict(stored)
-    pilots = len(stored.get(f"{site}.pilot.input_digest", ()))
-    with jax.enable_x64(new_val=True):
-        for prefix, seeds in (("", range(len(stored[f"{site}.input_digest"]))),
-                              ("pilot.", range(SIZING_FROM, SIZING_FROM + pilots))):
-            sketches = {}
-            for seed in seeds:
-                index, inputs = draw(seed)
-                for name, value in truth(index, widened(inputs)).items():
-                    sketches.setdefault(name, []).append(truth_sketch(np.asarray(value, np.float64), seed))
-            result.update({f"{site}.{prefix}sketch.{name}": np.stack(rows)
-                           for name, rows in sketches.items()})
-    result[f"{site}.sketch_version"] = np.int32(SKETCH_VERSION)
-    print(f"{site}: sketched again at version {SKETCH_VERSION}", flush=True)
-    return result
-
-
 def _joined(label: str, shards: Sequence[Mapping[str, np.ndarray]], first: int) -> dict[str, np.ndarray]:
     """`shards`' evidence joined in order, refused unless their seeds are one run from `first`."""
     if not shards:
@@ -258,8 +227,7 @@ def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
             leaves.setdefault(name, []).append(leaf_summary(reference[name], truth[name]))
             sketches.setdefault(name, []).append(truth_sketch(truth[name], seed))
             shapes.setdefault(name, np.asarray(np.shape(truth[name]), np.int64))
-    evidence = {f"{label}.drawn": np.asarray(seeds, np.int64), f"{label}.input_digest": np.asarray(digests),
-                f"{label}.sketch_version": np.int32(SKETCH_VERSION)}
+    evidence = {f"{label}.drawn": np.asarray(seeds, np.int64), f"{label}.input_digest": np.asarray(digests)}
     for name, summaries in leaves.items():
         evidence.update({
             f"{label}.mse.{name}": np.asarray([leaf.mse for leaf in summaries]),
@@ -288,8 +256,6 @@ def _kept(label: str, evidence: Mapping[str, np.ndarray], kept: int) -> dict[str
     """`evidence`'s (`_evidence`) first `kept` seeds, each leaf's rows of float64 zero by their span a seed
     (`zero_offsets`)."""
     result = {f"{label}.input_digest": evidence[f"{label}.input_digest"][:kept]}
-    if f"{label}.sketch_version" in evidence:
-        result[f"{label}.sketch_version"] = evidence[f"{label}.sketch_version"]
     names = [key.removeprefix(f"{label}.mse.") for key in evidence if key.startswith(f"{label}.mse.")]
     for name in names:
         offsets = np.cumsum([0, *evidence[f"{label}.zero_counts.{name}"][:kept]])
@@ -304,9 +270,8 @@ def _kept(label: str, evidence: Mapping[str, np.ndarray], kept: int) -> dict[str
 
 
 def _whole(label: str, key: str) -> bool:
-    """Whether `key` holds one value for the whole recording (a leaf's shape and dtype, the sketch's
-    version), not one a seed."""
-    return key.startswith((f"{label}.shape.", f"{label}.dtype.")) or key == f"{label}.sketch_version"
+    """Whether `key` holds one value for the whole recording (a leaf's shape and dtype), not one a seed."""
+    return key.startswith((f"{label}.shape.", f"{label}.dtype."))
 
 
 def _runs(seeds: np.ndarray) -> str:
