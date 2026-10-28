@@ -315,8 +315,8 @@ def orbit(width: int):
 def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: int, *, exact: bool = False):
     """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
     it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
-    compiled once for every draw at the plan fit takes, a frontier's first, untimed in Dew's tests
-    (live planning never times alternatives): a function of the raw batch and the order returning
+    compiled once for every draw at the plan fit admits, without timing alternatives:
+    a function of the raw batch and the order returning
     the stepped state's variables, optimizer state and EMA taken back to the identity order
     (`in_identity_order`). `exact` runs one device in float64 from the state widened, the batch's
     samples widened (`wide`), built at its first call, so under the caller's float64."""
