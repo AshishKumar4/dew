@@ -34,7 +34,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import fla_gdn, recurrence
+from dew.nn.kernels import fla_gdn, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     Sequences,
@@ -54,7 +54,7 @@ from dew.nn.kernels.chunked_launch import (
     spanned,
     write_rows,
 )
-from dew.nn.kernels.fla_gdn import _dot, _tril_inverse, _weighted_values
+from dew.nn.kernels.fla_gdn import _dot, _weighted_values
 
 SUB = 16
 """fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
@@ -166,7 +166,6 @@ def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chun
     @pl.when(taken > 0)
     def _():
         count = chunk // SUB
-        index = jnp.arange(SUB)
         zero = jnp.zeros((SUB, SUB), jnp.float32)
 
         def part(ref, i, j):
@@ -180,17 +179,8 @@ def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chun
             for j in range(count):
                 store(aqk_ref, i, j, part(aqkd_ref, i, j) if j <= i else zero)
         kks = {(i, j): part(akkd_ref, i, j) for i in range(count) for j in range(i + 1)}
-        inverse = {(i, i): _tril_inverse(kks[i, i], index) for i in range(count)}
-        for distance in range(1, count):
-            for i in range(distance, count):
-                j = i - distance
-                if distance == 1:
-                    inverse[i, j] = -_dot(_dot(inverse[i, i], kks[i, j], exact=exact, solve=solve),
-                                          inverse[j, j], exact=exact, solve=solve)
-                else:
-                    inner = sum(_dot(kks[i, m], inverse[m, j], exact=exact, solve=solve)
-                                for m in range(j, i))
-                    inverse[i, j] = -_dot(inverse[i, i], inner, exact=exact, solve=solve)
+        inverse = algebra.inverted(kks, lambda name, a, b: _dot(a, b, exact=exact, solve=solve),
+                                   neighbours_first=True)
         for i in range(count):
             for j in range(count):
                 store(akk_ref, i, j, inverse[i, j] if j <= i else zero)
