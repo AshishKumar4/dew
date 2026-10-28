@@ -670,9 +670,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         layout = self.layout if len(shape) == 2 else self.row
         return plgpu.layout_cast(jnp.full(shape, value, dtype), layout)
 
-    def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
-        """Indices along `dimension` of a tile in the accumulator's layout."""
-        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=self.layout)
+    def iota(self, shape: tuple[int, ...], dimension: int) -> jax.Array:
+        """Indices along `dimension` of a tile in the accumulator's layout or a row's (`zeros`)."""
+        layout = self.layout if len(shape) == 2 else self.row
+        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=layout)
 
     def rows_of(self, ref) -> jax.Array:
         """A row vector read from `ref` (`[rows]`) in a row's layout."""

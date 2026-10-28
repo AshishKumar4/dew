@@ -518,7 +518,12 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     `[bk, bq]`) holds its queries' vectors in a column's layout and its keys' in a row's."""
     query_axis, key_axis = (1, 0) if keys_first else (0, 1)
     q_pos = first + family.iota(shape, query_axis) if q_pos is None else q_pos
-    k_pos = k_first + (family.iota(shape, key_axis) if columns is None else columns)
+    if keys_first:
+        # The keys' places a row vector broadcast, no int tile held (a query's column vector does not lower:
+        # Mosaic GPU's layout inference finds no layout for it beside the tile's).
+        k_pos = lax.broadcast_in_dim(k_first + family.iota((shape[0],), 0), shape, (0,))
+    else:
+        k_pos = k_first + (family.iota(shape, key_axis) if columns is None else columns)
     if spans is None:
         return algebra.Coords(q_pos, k_pos, keys_first=keys_first)
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
