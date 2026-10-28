@@ -126,6 +126,9 @@ class AttentionCase:
     spans_only: bool
     mask: bool
     bias: bool
+    key_bias: bool
+    """Whether the call's bias is one term a key, `[B or 1, H or 1, 1, K]` (ALiBi's), of at most fp32's width,
+    which the template reads as a key score hook in fp32 (`attention.template_attention`)."""
     sinks: bool
     softcap: float | None
     arithmetic: bool
@@ -377,9 +380,9 @@ TEMPLATE_SUPPORTS = (
     _Need('mask', lambda case: not case.mask,
           "the call has an arbitrary mask, which the template reads as spans and never as a mask",
           row=INHERENT),
-    _Need('bias', lambda case: not case.bias,
-          "the call has a bias, a dense term beside the spans that carry the template's validity",
-          row=INHERENT),
+    _Need('bias', lambda case: not case.bias or case.key_bias,
+          "the call's bias varies by query, a dense term beside the spans that carry the template's "
+          "validity; a bias one term a key (ALiBi's) is its key score hook", row=INHERENT),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),

@@ -21,11 +21,27 @@ def windowed(query, key, window: int, *, causal: bool):
     (`dew.nn.kernels.templates.attention.spans`), for coordinates no span holds: a stated mask's places,
     which need not run in order, and a banded layout's rows."""
     before, after = window_sides(causal, window)
-    behind = query - key
+    # NumPy coordinates stay NumPy's, so a program that traces knows a static window as it traces.
+    xp = jnp if any(isinstance(x, jax.Array) for x in (query, key)) else np
+    query, key = xp.asarray(query), xp.asarray(key)
+    ahead = query >= key
+    within_before = _distance(query, key, xp) <= before
     if causal:
-        return behind <= before
-    # Each side's distance taken in its own order, so no unsigned coordinate wraps.
-    return jnp.where(query >= key, behind <= before, key - query <= after)
+        return ~ahead | within_before
+    return xp.where(ahead, within_before, _distance(key, query, xp) <= after)
+
+
+def _distance(far, near, xp):
+    """`far - near` where `far >= near`, exact for every integer pair: integers' difference taken in the
+    unsigned word of their common width, which holds it where the signed one wraps."""
+    common = xp.result_type(far, near)
+    if not np.issubdtype(common, np.integer):
+        return far - near
+    unsigned = np.dtype(f"uint{np.dtype(common).itemsize * 8}")
+    if xp is np:
+        return far.astype(common).view(unsigned) - near.astype(common).view(unsigned)
+    far, near = (jax.lax.bitcast_convert_type(x.astype(common), unsigned) for x in (far, near))
+    return far - near
 
 
 def visible(query, key, *, causal: bool, window: int | None = None):
