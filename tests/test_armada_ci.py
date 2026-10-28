@@ -1430,3 +1430,38 @@ def test_a_tip_the_land_queue_graded_green_is_proven_for_mains_push_alone(tmp_pa
     assert proven_step(tmp_path / "lane", "refs/heads/fix/lane", "", status) == ""
     # A successful run proves the commit for any push, as before.
     assert proven_step(tmp_path / "run", "refs/heads/fix/lane", "77\n", "") == "77"
+
+
+def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int) -> list[str]:
+    """The armada commands ci.yml's suite step gives, its own script run in bash for a push of `ref` with
+    the proven job's output `proven` and the cache's `policy`, beside an armada whose stored verdict at the
+    commit exits `verdict` (0 green, 1 red, 2 none): each call's command and first argument."""
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    [step] = [step for step in workflow["jobs"]["test"]["steps"]
+              if step.get("name") == "Run the suite and the multi-host gangs on armada"]
+    script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True)
+    calls = tmp_path / "calls"
+    (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$1" >> {calls}\n'
+                                    f'[ "$1" = verdict ] && exit {verdict}\nexit 0\n')
+    (bin_dir / "armada").chmod(0o755)
+    subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=120,
+                   env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "PROVEN": proven,
+                        "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref, "BACKGROUND_POOL": "",
+                        "RUNNER_TEMP": str(tmp_path), "ARMADA_URL": "http://127.0.0.1:9", "ARMADA_TOKEN": ""})
+    return calls.read_text().split() if calls.exists() else []
+
+
+def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
+    """Main's push of a tip the land queue graded green, its own CI run red on a row the regrade passed,
+    carries the queue's proof: the suite step submits no suite, whatever the stored verdict or the cache's
+    policy (a train that changed what every test reads runs main's push with the cache off); the background
+    whole suite (ci/full-whole-*), whose commit main's push proved, runs it as ever, and an unproven push
+    with a red verdict too (train 237's review, P1: the proof skipped the gangs alone)."""
+    assert "run" not in suite_step(tmp_path / "main", "main", "4242", "on", 1)
+    assert "run" not in suite_step(tmp_path / "main-off", "main", "4242", "off", 1)
+    assert "run" in suite_step(tmp_path / "whole", "ci/full-whole-1", "4242", "off", 0)
+    assert "run" in suite_step(tmp_path / "lane", "fix/lane", "", "on", 1)
