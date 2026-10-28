@@ -51,12 +51,10 @@ from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
-from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
-from dew.inputs import Field
 from dew.lora import LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig
@@ -81,18 +79,16 @@ from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.budget import Pause, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
-from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
 from dew.training.profiling import ProfileReport, ProfileWindow
-from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
 from dew.training.selection import Best
 from dew.training.tracker import LocalTracker, Tracker, Trackers, Wandb, WandbTracker
-from dew.training.trainer import Trainer
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
+    from dew.inputs import Field
     from dew.interop import Pretrained
 
 
@@ -714,10 +710,12 @@ class Prepared:
     train: Callable[[str], TrainState]
 
 
-def media_field(chain: Dataset, run: str) -> Field:
+def media_field(chain: Dataset, run: str) -> "Field":
     """The batch field a run over images or clips reads, at the size its chain makes it
     (`Dataset.facts`): a clip's video, else an image. Raises ValueError, naming the `run`, for a chain
     of neither, or one whose size varies."""
+    from dew.inputs import Field
+
     fields = record(chain.facts()["fields"], "the chain's fields")
     name = "video" if "video" in fields else "image"
     shape = fields.get(name)
@@ -1302,6 +1300,8 @@ class RunConfig:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
         stages and `data_seed`, the training read bounded to `trainer.examples` where the run counts
         them, so its length is read off the loader this returns."""
+        from dew.data.compile import fitted
+
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
                       examples=self.trainer.examples)
 
@@ -1437,6 +1437,10 @@ class RunConfig:
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
+        # The training layer is the run's, read where it trains, so a config read alone reads none of it.
+        from dew.training.display import TrainingDisplay
+        from dew.training.quantization import quantize_trunk
+
         self.check_process()
         dataset, validation = self.compiled(objective.data(), dataset, validation)
         # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
@@ -1484,28 +1488,8 @@ class RunConfig:
             # The whole pool accepts the resume before its record is replaced or its state restored.
             agreed("run resume", check_resumed)
             agreed("run metadata", record_run)
-            # The trainer holds mesh, microbatches, layout, accumulation, split,
-            # dynamic_scale, profile and tune_kernels; prepare_process read the
-            # process fields, and the rest are fit's arguments or built the
-            # checkpoints and the tracker.
-            state = Trainer(
-                objective, self.optim, key=trainer.key, mesh=trainer.mesh,
-                microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
-                split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
-                tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
-                tune_kernels=trainer.tune_kernels,
-            ).fit(
-                dataset, steps=steps, tokens=trainer.tokens,
-                log_every=trainer.log_every,
-                eval_every=trainer.eval_interval(dataset),
-                checkpoint_every=trainer.checkpoint_interval(dataset),
-                checkpoint_final=trainer.checkpoint_final,
-                metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
-                best=trainer.best_policies(), stop=trainer.stop, cooldowns=trainer.cooldowns,
-                resume=trainer.resume,
-                # A run that names no metrics and validates no split has no suite to score.
-                validation=validation if suites is None else suites or None, summaries=self.val_summaries,
-            )
+            state = self._fit(objective, dataset, validation, suites=suites, steps=steps, metrics=metrics,
+                              rollout=rollout, checkpoints=checkpoints, tracker=tracker)
             if after is not None:
                 after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
@@ -1520,6 +1504,36 @@ class RunConfig:
 
         finally:
             _closed(tracker, checkpoints, sys.exception())
+
+    def _fit(self, objective: Objective[Loss, Effects], dataset: Loader,
+             validation: Mapping[str, Reader] | None, *, suites: Mapping[str, EvalSuite] | None,
+             steps: int | None, metrics: Sequence[Metric], rollout: Rollout | None, checkpoints: Checkpoints,
+             tracker: Tracker) -> TrainState:
+        """The run's training (`train`): a `Trainer` of `objective` holding mesh, microbatches, layout,
+        accumulation, split, dynamic_scale, profile and tune_kernels as the config states them, fit on
+        `dataset` at its length, cadences and policies; prepare_process read the process fields, and
+        the checkpoints and the tracker are the run's."""
+        from dew.training.trainer import Trainer
+
+        trainer = self.trainer
+        return Trainer(
+            objective, self.optim, key=trainer.key, mesh=trainer.mesh,
+            microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
+            split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
+            tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
+            tune_kernels=trainer.tune_kernels,
+        ).fit(
+            dataset, steps=steps, tokens=trainer.tokens,
+            log_every=trainer.log_every,
+            eval_every=trainer.eval_interval(dataset),
+            checkpoint_every=trainer.checkpoint_interval(dataset),
+            checkpoint_final=trainer.checkpoint_final,
+            metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
+            best=trainer.best_policies(), stop=trainer.stop, cooldowns=trainer.cooldowns,
+            resume=trainer.resume,
+            # A run that names no metrics and validates no split has no suite to score.
+            validation=validation if suites is None else suites or None, summaries=self.val_summaries,
+        )
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
               tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:
