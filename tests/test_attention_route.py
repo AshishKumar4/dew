@@ -355,12 +355,13 @@ def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     case = CASES[name]
     dropped = functools.partial(scaled_dot_product_attention, dropout_rate=0.25,
                                 dropout_rng=jax.random.key(3), deterministic=False)
+    spanned, mask = keywords(case), jnp.asarray(dews_mask(case))[:, None]
 
     def blocked(query, key, value):
-        return dropped(query, key, value, **keywords(case))
+        return dropped(query, key, value, **spanned)
 
     def masked(query, key, value):
-        return dropped(query, key, value, mask=jnp.asarray(dews_mask(case))[:, None])
+        return dropped(query, key, value, mask=mask)
 
     draw = drawing(*geometry(case), jnp.float32, sinks=False)
     assert_as_exact(jax.jit(blocked), jax.jit(masked), lambda seed: draw(seed)[:3],
