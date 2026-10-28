@@ -55,6 +55,7 @@ from dew.nn.inputs import (
     continuation_keys,
     local_rows,
     mesh_of,
+    numbered_blocks,
     prompt_major,
     unruled_fields,
 )
@@ -179,8 +180,9 @@ class DiscreteProcess:
 
     def generate(self, model: nn.Module, variables: Variables, inputs: ModelInputs | jax.typing.ArrayLike,
                  max_new_tokens: int, *, key: int | jax.Array,
-                 n: int = 1, steps: int = MDLM_STEPS, solver: Unmask | None = None,
-                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
+                 n: int = 1, steps: int = MDLM_STEPS, solver: Unmask | Confident | None = None,
+                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0,
+                 block: int | None = None) -> CanvasGeneration:
         """Generate `max_new_tokens` tokens after each prompt with native MDLM.
 
         The whole response span starts masked, and `solver` (`Unmask` by
@@ -195,28 +197,44 @@ class DiscreteProcess:
         (`ModelInputs.extended`): its slots are text, at the positions after
         the prompt's, and the conditioning is the prompt's own.
 
+        With `block`, the response is walked a block at a time, as LLaDA2's
+        releases generate (their `generate(block_length=)`): the row's tokens cut
+        into blocks of `block` places, counted over its document's real tokens
+        from its first (`dew.nn.inputs.numbered_blocks`), and each block holding
+        response slots unmasked over its own `steps` with every other slot
+        held, in order, each position reading its own block's keys and the
+        earlier blocks' alone (the call's `attention_key_runs`), so a block
+        sees the clean blocks before it and none after. The last block is
+        walked whole, past `max_new_tokens` where it ends inside it, and the
+        response kept to `max_new_tokens`.
+
         Raises `ValueError` when the model does not read the whole row
         (`refuse_causal`), when the prompt plus `max_new_tokens` exceeds the
         `max_seq_len` it declares, or when the inputs include a token field
         a response has no rule to continue.
         """
         solver = Unmask() if solver is None else solver
+        if block is not None and (type(block) is not int or block < 1):
+            raise ValueError(f"block counts the places a walk unmasks together, got {block!r}")
 
         def check(canonical: ModelInputs, pooled: bool) -> tuple[ModelInputs, tuple, None]:
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
-            _validate_request(model, self, prepared, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
-            controls = (max_new_tokens, steps, n, self, solver, eos_token_ids, pad_token_id, model)
+            _validate_request(model, self, prepared, max_new_tokens + (0 if block is None else block - 1),
+                              steps, n, eos_token_ids, pad_token_id)
+            controls = (max_new_tokens, steps, n, self, solver, eos_token_ids, pad_token_id, model, block)
             return prepared, controls, None
 
         request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="masked generation")
         plan = request.plan
         generation = program(
             _generate, model,
-            static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id"),
+            static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id",
+                             "block"),
             in_shardings=(None, plan.sharding, plan.sharding), out_shardings=(plan.sharding, None))
         generated, undefined = generation(model, decoding_storage(model, variables),
                                           plan.place(request.padded()), plan.keys(request.key), self,
-                                          solver, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
+                                          solver, max_new_tokens, steps, n, eos_token_ids, pad_token_id,
+                                          block)
         if bool(jax.device_get(undefined)):
             raise ValueError(REVEALED_UNDEFINED)
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
@@ -262,6 +280,12 @@ class DiscreteDenoiser:
     token gets zero probability, whatever score the model gives it, because
     it marks corruption and a revealed position must never draw it. When
     `mutable_mask` is given, only masked positions inside it can change.
+
+    A blockwise walk (`DiscreteProcess.generate`'s `block`) names the block it
+    walks, `block` `[B, S]`, its prompt slots among them, which a quota of
+    reveals spreads over (`Confident`), and the keys each position reads,
+    `key_runs` `[B, S, 1, 2]`, its own block's and the ones before it, which
+    the model takes as the call's `attention_key_runs`.
     """
 
     process: DiscreteProcess
@@ -269,6 +293,8 @@ class DiscreteDenoiser:
     params: Variables
     inputs: ModelInputs | None = None
     mutable_mask: jax.Array | None = None
+    block: jax.Array | None = None
+    key_runs: jax.Array | None = None
 
     def masked(self, tokens):
         mask = tokens == self.process.mask_id
@@ -276,6 +302,8 @@ class DiscreteDenoiser:
 
     def __call__(self, x_t, t):
         fields = {} if self.inputs is None else self.inputs.kwargs()
+        if self.key_runs is not None:
+            fields = {**fields, "attention_key_runs": self.key_runs}
         logits = self.model.apply(self.params, x_t, **fields, rngs=None, mutable=False,
                                   capture_intermediates=False,
                                   method="logits" if isinstance(self.model, Logits) else None)
@@ -334,6 +362,66 @@ class Unmask:
                 f"{type(process).__name__}")
         alpha_t = process.schedule.alpha(t)
         return (process.schedule.alpha(t_next) - alpha_t) / (1 - alpha_t)
+
+
+@dataclass(frozen=True)
+class Confident:
+    """LLaDA2's reveal, as its release's `generate` takes it (inclusionAI/LLaDA2.0-mini@dad945c,
+    modeling_llada2_moe.py): each step draws every masked position's token from the model's
+    distribution at `temperature`, its `top_k` best kept (`temperature` 0 takes the best), and reveals
+    the positions whose drawn token holds more than `threshold` of that distribution where they number
+    at least the step's quota, else the quota's most probable. The quota spreads the walked block's
+    slots, its prompt's among them (`DiscreteDenoiser.block`; the changeable slots where no block is
+    walked), over the walk's steps as evenly as they divide, the first steps one more, so a block is
+    whole by its last step. The mask token is no draw (`DiscreteDenoiser`)."""
+
+    threshold: float = 0.95
+    temperature: float = 1.0
+    top_k: int | None = None
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.threshold <= 1.0:
+            raise ValueError(f"threshold is a probability, got {self.threshold}")
+        if self.temperature < 0.0:
+            raise ValueError(f"temperature is nonnegative, got {self.temperature}")
+        if self.top_k is not None and self.top_k < 1:
+            raise ValueError(f"top_k keeps at least one token, got {self.top_k}")
+
+    def init(self, x, times, process, *, key) -> tuple[jax.Array, jax.Array]:
+        """The step reached and the walk's step count."""
+        return jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32)
+
+    def step(self, x, t, t_next, denoised, log_probs, state, key, process, denoise):
+        def drawn(scores):
+            return jax.random.categorical(key, scores, axis=-1).astype(jnp.int32)
+        return self._revealed(x, log_probs, state, denoise, drawn)
+
+    def step_rows(self, x, t, t_next, denoised, log_probs, state, keys, process, denoise):
+        """`step`, row `i` drawing its tokens from `keys[i]` alone (`RowSolver`)."""
+        return self._revealed(x, log_probs, state, denoise, lambda scores: row_draw(keys, scores))
+
+    def _revealed(self, x, log_probs, state, denoise, drawn):
+        index, steps = state
+        masked = denoise.masked(x) & wellformed(log_probs)
+        scores = log_probs
+        if self.top_k is not None:
+            cutoff = jax.lax.top_k(scores, min(self.top_k, scores.shape[-1]))[0][..., -1:]
+            scores = jnp.where(scores < cutoff, -jnp.inf, scores)
+        if self.temperature not in (0.0, 1.0):
+            scores = scores / self.temperature
+        scores = jax.nn.log_softmax(scores, axis=-1)
+        tokens = jnp.argmax(scores, axis=-1).astype(jnp.int32) if self.temperature == 0.0 else drawn(scores)
+        probability = jnp.exp(jnp.take_along_axis(scores, tokens[..., None], -1)[..., 0])
+        confidence = jnp.where(masked, probability, -jnp.inf)
+        walked = denoise.mutable_mask if denoise.block is None else denoise.block
+        size = jnp.sum(masked if walked is None else walked, axis=-1)
+        quota = jnp.minimum(size // steps + (index < size % steps), jnp.sum(masked, axis=-1))
+        confident = confidence > self.threshold
+        # The quota's most confident: each position's rank among its row's, stable in slot order.
+        rank = jnp.argsort(jnp.argsort(-confidence, axis=-1, stable=True), axis=-1, stable=True)
+        reveal = jnp.where((jnp.sum(confident, axis=-1) >= quota)[:, None], confident,
+                           masked & (rank < quota[:, None]))
+        return jnp.where(reveal, tokens, x), (index + 1, steps)
 
 
 @dataclass(frozen=True)
@@ -427,8 +515,9 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
 
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys: jax.Array,
-              process: DiscreteProcess, solver: Unmask, budget: int, steps: int, n: int,
-              eos_ids: tuple[int, ...], pad_id: int) -> tuple[CanvasGeneration, jax.Array]:
+              process: DiscreteProcess, solver: Unmask | Confident, budget: int, steps: int, n: int,
+              eos_ids: tuple[int, ...], pad_id: int, block: int | None = None
+              ) -> tuple[CanvasGeneration, jax.Array]:
     """The compiled body: one masked walk per row, `n` continuations each, and whether a response
     position stayed masked, its scores holding no distribution at every step it would have revealed.
 
@@ -445,14 +534,23 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
         zeros = jnp.zeros((batch * n,), jnp.int32)
         return (CanvasGeneration(jnp.repeat(inputs.tokens, n, axis=0), zeros, zeros.astype(bool), zeros),
                 jnp.zeros((), bool))
-    full, mutable = _response_inputs(inputs, budget, process.mask_id)
-
+    width = budget if block is None else budget + block - 1
+    full, mutable = _response_inputs(inputs, width, process.mask_id)
+    blocks = None
+    if block is not None:
+        # Each row's last block walked whole, through the slot its response's last falls in.
+        blocks = _blocks(full, block)
+        mutable = mutable & (blocks <= blocks[:, prompt + budget - 1:prompt + budget])
     denoise = process.denoiser(model, variables, inputs=full, mutable_mask=mutable)
 
     def continued(draw_keys):
-        tokens = sample(denoise, full.tokens, steps, solver=solver, key=RowKeys(draw_keys))
+        if blocks is None or block is None:
+            tokens = sample(denoise, full.tokens, steps, solver=solver, key=RowKeys(draw_keys))
+        else:
+            tokens = _blockwise(denoise, full.tokens, blocks, block, steps, solver, draw_keys)
+            tokens = tokens[:, :prompt + budget]
         active = jnp.any(mutable, axis=-1)
-        undefined = jnp.any(mutable & (tokens == process.mask_id))
+        undefined = jnp.any(mutable[:, :prompt + budget] & (tokens == process.mask_id))
         response, length, ended = jax.vmap(
             lambda row, count: through_eos(row, count, eos_ids, pad_id))(
                 tokens[:, prompt:], jnp.where(active, budget, 0))
@@ -465,4 +563,50 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
 
 
 
-__all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask", "aligned"]
+def _blocks(inputs: ModelInputs, block: int) -> jax.Array:
+    """Each slot's block of `block` places in `inputs`, counted over its document's real tokens from its
+    first (`numbered_blocks`, the counting attention and block routing read), -1 on padding."""
+    fields = inputs.token_fields
+    rows, length = inputs.tokens.shape
+    shape = (rows, length)
+    _, segments = token_layout(fields)
+    laid = coordinates(shape, segments=segments, valid=real_slots(fields, shape),
+                       positions=token_positions(fields))
+    return numbered_blocks(laid, shape, block)
+
+
+def _blockwise(denoise: DiscreteDenoiser, tokens: jax.Array, blocks: jax.Array, block: int, steps: int,
+               solver: Unmask | Confident, keys: jax.Array) -> jax.Array:
+    """One walk of `steps` a block (`DiscreteProcess.generate`'s `block`), in order: each block holding
+    a changeable slot walked with every other slot held, each position reading the keys of its own block
+    and the earlier ones (`attention_key_runs`, one run from its row's first slot), a padding slot every
+    key; a block's draws from each row's key folded with the block's number."""
+    from dew.sampling.sample import sample
+    from dew.sampling.solvers import RowKeys
+
+    batch, length = tokens.shape
+    slots = jnp.arange(length)
+    # A block's end: the slot after its last, the next slot that opens another block.
+    opens = jnp.where(jnp.concatenate([blocks[:, 1:] != blocks[:, :-1], jnp.ones((batch, 1), bool)], 1),
+                      slots + 1, length)
+    ends = jax.lax.cummin(opens, axis=1, reverse=True)
+    runs = jnp.stack([jnp.zeros_like(blocks), jnp.where(blocks < 0, length, ends)], -1)[:, :, None]
+    changeable = jnp.ones_like(blocks, bool) if denoise.mutable_mask is None else denoise.mutable_mask
+    first = jnp.min(jnp.where(changeable, blocks, length))
+    held = replace(denoise, key_runs=runs.astype(jnp.int32))
+
+    def walk(index, tokens):
+        number = first + index
+        walked = blocks == number
+        stepped = replace(held, mutable_mask=changeable & walked, block=walked)
+        folded = jax.vmap(jax.random.fold_in, in_axes=(0, None))(keys, number)
+        def walked_through(tokens):
+            return sample(stepped, tokens, steps, solver=solver, key=RowKeys(folded))
+        return jax.lax.cond(jnp.any(changeable & walked), walked_through, lambda tokens: tokens, tokens)
+
+    # From the batch's first block with a changeable slot, as many as a row of `length` slots holds.
+    return jax.lax.fori_loop(0, -(-length // block) + 1, walk, tokens)
+
+
+__all__ = ["MDLM", "Confident", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule",
+           "Unmask", "aligned"]
