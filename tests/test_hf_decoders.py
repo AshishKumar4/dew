@@ -661,8 +661,8 @@ def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path, na
     """The mixin replaces rope_parameters with a stated rope_scaling whole,
     so an explicit plain rope_scaling over a ramp is plain rope at the
     family's default base, as that spelling stated alone is. A family
-    whose mixer reads only one plain or YaRN entry refuses other ramps
-    and per-kind records through the same loader."""
+    whose mixer reads one rope entry refuses per-kind records through the
+    same loader, and GPT-OSS, whose mixer reads YaRN alone, other ramps."""
     plain = {"rope_type": "default"}
     conflicting = _respelled(name, tmp_path / "conflicting",
                              lambda config: {**config, "rope_scaling": plain})
@@ -677,11 +677,11 @@ def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path, na
     if name == "llama31-tiny":
         assert np.max(np.abs(logits[0] - reference)) > 1e-3
     else:
-        for index, entry in enumerate((
-            {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,
-             "high_freq_factor": 4.0, "original_max_position_embeddings": 16},
-            {"full_attention": plain, "sliding_attention": plain},
-        )):
+        llama3 = {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,
+                  "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
+        # DeepSeek's latent attention takes Llama 3.1's ramp beside YaRN's; GPT-OSS's reads YaRN alone.
+        for index, entry in enumerate((*(llama3,) * name.startswith("gpt-oss"),
+                                       {"full_attention": plain, "sliding_attention": plain})):
             unsupported = _respelled(name, tmp_path / f"unsupported-{index}",
                                       lambda config, entry=entry: {**config, "rope_scaling": entry})
             with pytest.raises(ValueError):

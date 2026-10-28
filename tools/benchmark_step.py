@@ -71,8 +71,9 @@ from dew.nn.flops import MissingFlopsCount
 from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
-from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
+from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
+from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
@@ -89,7 +90,7 @@ from benchmark_cases import (
     small_cases,
 )
 from benchmark_models import build_trainer, compiled_step, global_batch, timed_steps, trainer_mesh
-from trace_window import communication_totals, device_events, kernel_category, kernel_totals, window_split
+from trace_window import kernel_category, kernel_totals
 
 Row = dict[str, object]
 
@@ -299,14 +300,14 @@ def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any
 
 
 def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
-    """Each device's traced window split by `trace_window.window_split` into
+    """Each device's traced window split by `dew.telemetry.trace.window_split` into
     compute, every collective, the communication no compute kernel
     overlapped, and idle time ended by a host-to-device copy (input) or by
     anything else (host), averaged over the devices.
 
     `exposed_communication_ms_per_step` is the collective time no compute
     kernel on the same device ran beside: what overlap did not hide. Each
-    HLO collective (`instrumentation.COLLECTIVES`) gets its own time and exposed time,
+    HLO collective (`dew.telemetry.trace.COLLECTIVES`) gets its own time and exposed time,
     `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
     op each NCCL kernel ran for.
     """
@@ -316,7 +317,7 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 
-    totals = communication_totals(devices, COLLECTIVES)
+    totals = communication_totals(devices)
     totals.pop("busy")  # device_timeline's, over every device
     per_step = 1e-6 / steps / len(devices)
     window = totals.pop("window")
@@ -544,8 +545,10 @@ def entered(within: str | None) -> contextlib.AbstractContextManager:
 
 
 def main(config: BenchmarkConfig) -> list[Row]:
-    if not config.peak_run:
-        # A step's compile seconds are a cold compile's, which no cached executable stands in for.
+    if not config.peak_run and not jax.config.jax_compilation_cache_dir:
+        # Run alone, a step's compile seconds are a cold compile's, which no cached executable stands in for.
+        # A caller that names its cache (JAX_COMPILATION_CACHE_DIR: perf_gate's per-tree cache, whose later
+        # rounds load what its first compiled) keeps it, and its own switch (JAX_ENABLE_COMPILATION_CACHE).
         jax.config.update("jax_enable_compilation_cache", val=False)
     # Before this process opens a backend, which would hold the device each case's peak process needs.
     measuring = not (joins_pool(None, pool_cluster(None)) or config.peak_run)

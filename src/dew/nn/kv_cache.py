@@ -40,6 +40,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import scipy.linalg
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
@@ -178,10 +179,7 @@ def hadamard(size: int) -> jax.Array:
     if size < 1 or size & (size - 1):
         raise ValueError(f"an int8 KV cache rotates keys by a Hadamard matrix, which needs a "
                          f"power-of-two head_dim; got {size}. quantized='float8_e4m3fn' takes any width")
-    matrix = jnp.ones((1, 1), jnp.float32)
-    while matrix.shape[0] < size:
-        matrix = jnp.block([[matrix, matrix], [matrix, -matrix]])
-    return matrix / math.sqrt(size)
+    return jnp.asarray(scipy.linalg.hadamard(size), jnp.float32) / math.sqrt(size)
 
 
 def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
@@ -312,7 +310,10 @@ class KVStore:
     returns every slot of every row, `[rows, capacity, kv_heads, head_dim]`,
     dequantized and with the keys in the stored rotation. A slot that no token
     has reached holds whatever its page last held, and the caller's validity
-    mask excludes it.
+    mask excludes it. A store whose values are its keys (`keys_as_values`, a
+    head that serves as both) keeps them once where its keys are stored as
+    given, with no rotation, and reads them back as its values; a rotated
+    layout's keys are not its values' layout, so it keeps both.
     """
 
     module: nn.Module
@@ -321,21 +322,25 @@ class KVStore:
     kv_heads: int
     head_dim: int
     dtype: jnp.dtype
+    keys_as_values: bool = False
 
     @classmethod
     def open(cls, module: nn.Module, layout: KVCache, rows: int, capacity: int, kv_heads: int,
-             head_dim: int, dtype: jnp.dtype, *, value_dim: int | None = None,
+             head_dim: int, dtype: jnp.dtype, *, value_dim: int | None = None, keys_as_values: bool = False,
              places: bool = False, groups: tuple[str, ...] = ()) -> KVStore:
         """Declare the module's cache variables, allocating them on first use, and return the store.
 
-        Values are `value_dim` wide, None for the keys' `head_dim`. `places`
+        Values are `value_dim` wide, None for the keys' `head_dim`, or are the keys themselves where
+        `keys_as_values` and the layout stores keys as given (no rotation), which allocates no storage
+        of their own. `places`
         also keeps each token's place beside its key (`Append.places`), and
         `groups` each token's group of the fields it names (`GROUPS`,
         `Append.groups`), -1 where none has been written. A paged
         layout raises `ValueError` when `capacity` is not a multiple of
         `page_size`, or when `rows` does not split into the pool's groups.
         """
-        store = cls(module, layout, rows, kv_heads, head_dim, jnp.dtype(dtype))
+        once = keys_as_values and layout.key_rotation(head_dim) is None
+        store = cls(module, layout, rows, kv_heads, head_dim, jnp.dtype(dtype), once)
         layout.key_rotation(head_dim)
         storage = layout.storage(dtype)
         if layout.page_size is None:
@@ -351,11 +356,10 @@ class KVStore:
             shape = (kv_heads, pages, layout.page_size, head_dim)
             module.variable("cache", TABLE, default_page_table, rows, per_row, pages, layout.groups)
         values = (*shape[:-1], head_dim if value_dim is None else value_dim)
-        for name, stored in (("cached_key", shape), ("cached_value", values)):
+        for (name, scale), stored in zip(store.payloads, (shape, values), strict=False):
             module.variable("cache", name, jnp.zeros, stored, storage)
-        if layout.quantized is not None:
-            for name in ("key_scale", "value_scale"):
-                module.variable("cache", name, jnp.ones, shape[:-1], jnp.float32)
+            if layout.quantized is not None:
+                module.variable("cache", scale, jnp.ones, shape[:-1], jnp.float32)
         # A scale's storage with one head: every key head of a token sits at its place and in its group.
         held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
         if places:
@@ -363,6 +367,13 @@ class KVStore:
         for name in groups:
             module.variable("cache", GROUPS[name], jnp.full, held, -1, jnp.int32)
         return store
+
+    @property
+    def payloads(self) -> tuple[tuple[str, str], ...]:
+        """The leaves the store keeps, each beside its scale's: the keys', and the values' unless the keys
+        serve as them, stored as given (`keys_as_values`)."""
+        keys, values = ("cached_key", "key_scale"), ("cached_value", "value_scale")
+        return (keys,) if self.keys_as_values else (keys, values)
 
     @property
     def rotation(self) -> jax.Array | None:
@@ -375,11 +386,11 @@ class KVStore:
         self.module.put_variable("cache", name, value)
 
     def write(self, key: jax.Array, value: jax.Array, positions: jax.Array) -> None:
+        """Store `key` and `value` at `positions`, `value` once where it is the keys (`payloads`)."""
         rotation = self.rotation
         if rotation is not None:
             key = rotated(key, rotation)
-        pairs = [("cached_key", "key_scale", key), ("cached_value", "value_scale", value)]
-        for name, scale_name, incoming in pairs:
+        for (name, scale_name), incoming in zip(self.payloads, (key, value), strict=False):
             if self.layout.quantized is None:
                 stored, scale = incoming.astype(self.layout.storage(self.dtype)), None
             else:
@@ -421,8 +432,15 @@ class KVStore:
             grouped(pool, 1, groups), grouped(page, 0, groups), grouped(safe % size, 0, groups),
             grouped(values.astype(pool.dtype), 0, groups)).reshape(pool.shape)
 
+    def plain(self, keys: jax.Array) -> jax.Array:
+        """Return keys read back in the store's rotation `[..., head_dim]` in their own basis: for keys a
+        projection expands before any query meets them (a latent attention's latents), or that serve as
+        values too (DeepSeek V4's shared head), where no query is rotated into their basis."""
+        return keys if self.rotation is None else rotated(keys, self.rotation.T)
+
     def read(self) -> tuple[jax.Array, jax.Array]:
-        return self._read("cached_key", "key_scale"), self._read("cached_value", "value_scale")
+        keys = self._read("cached_key", "key_scale")
+        return keys, keys if self.keys_as_values else self._read("cached_value", "value_scale")
 
     def write_places(self, places: jax.Array, positions: jax.Array) -> None:
         """Keep the tokens' `places` `[rows, tokens]` at their slots `positions`, where their keys go."""
@@ -456,7 +474,7 @@ class KVStore:
         unrotated, and a paged pool must have one group, as the mixed call
         requires.
         """
-        for name, incoming in (("cached_key", key), ("cached_value", value)):
+        for (name, _), incoming in zip(self.payloads, (key, value), strict=False):
             pool = self._get(name)
             size = self.layout.page_size
             self._put(name, write_tokens(pool, incoming, rows, positions) if size is None
@@ -474,7 +492,8 @@ class KVStore:
                 return _gather_pages(stored, self._get(TABLE)[rows], 1).astype(self.dtype)
             return stored[rows].astype(self.dtype)
 
-        return rows_of("cached_key"), rows_of("cached_value")
+        keys = rows_of("cached_key")
+        return keys, keys if self.keys_as_values else rows_of("cached_value")
 
     def _read(self, name: str, scale_name: str) -> jax.Array:
         stored = self._get(name)
@@ -533,7 +552,8 @@ class KVStore:
 
         given = () if starts is None else (starts,)
         sunk = () if sinks is None else (sinks,)
-        arrays = (query, self._get("cached_key"), self._get("cached_value"), lengths, self._get(TABLE),
+        pools = [self._get(name) for name, _ in self.payloads]
+        arrays = (query, pools[0], pools[-1], lengths, self._get(TABLE),
                   *given, *sunk)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
@@ -800,6 +820,20 @@ def cache_positions(module: nn.Module, batch: int, length: int, valid):
     return positions, allocated
 
 
+class DecodeCursor(nn.Module):
+    """A decoder's own count of each row's real tokens, the logical cursor a model-level reader
+    takes a cached call's places from (`cache_positions`): allocation-aware, so the call that
+    allocates the cache counts none, and kept whatever mixer a layer runs, a recurrent one that
+    keeps no cursor of its own included."""
+
+    @nn.compact
+    def __call__(self, valid) -> jax.Array:
+        """Each token's place `[B, S]` continuing its row's count, a padding slot -1; the count
+        advances by the call's real tokens (`valid`)."""
+        batch, length = valid.shape
+        return cache_positions(self, batch, length, valid)[0]
+
+
 def cached_validity(module: nn.Module, length: int) -> jax.Array:
     """Which of `module`'s `length` cache slots hold a token, `[rows, length]`:
     those before the row's cursor, which `cache_positions` fills in order.
@@ -815,7 +849,8 @@ _DEFAULT_LAYOUT = KVCache()
 
 
 def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_LAYOUT,
-                  value_dim: int | None = None, places: bool = False, groups: tuple[str, ...] = ()):
+                  value_dim: int | None = None, keys_as_values: bool = False, places: bool = False,
+                  groups: tuple[str, ...] = ()):
     """Fixed-size K/V with a cursor and cached validity for each batch row.
 
     Returns [B, S] compact slot positions and a writer. Invalid tokens have
@@ -824,7 +859,8 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     slots which the caller excludes with `cached_validity`. `layout` chooses the
     storage behind the slots, dense or paged, full or quantized
     (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
-    are `value_dim` wide, None for the keys' width. `places` also keeps each
+    are `value_dim` wide, None for the keys' width, or the keys themselves
+    where `keys_as_values` (`KVStore`). `places` also keeps each
     token's place beside its key (`dew.nn.kv_cache.Append.places`), and
     `groups` its groups of the fields named (`Append.groups`).
     """
@@ -839,7 +875,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
     store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim,
-                         places=places, groups=groups)
+                         keys_as_values=keys_as_values, places=places, groups=groups)
     positions, allocated = cache_positions(module, batch, length, valid)
     return positions, Append(store, positions, allocated)
 

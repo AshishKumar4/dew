@@ -129,11 +129,10 @@ def decay(shape: str, update: int, updates: int) -> float:
     return 1.0 - done if shape == "linear" else 1.0 - math.sqrt(done)
 
 
-def check_branches(branching: bool, suites: Mapping[str, object], *, settable: bool, rollout: bool) -> None:
-    """Refuse cooldown branches, where the run is `branching`, that it could not score, decay or read
-    as it reads on: one with no validation suite to score them; an optimizer whose state holds no
-    learning rate a branch can scale (`settable`, `dew.optim.settable_rates`); and a rollout's
-    (`rollout`), whose acquisition one reader at a time owns."""
+def check_branches(branching: bool, suites: Mapping[str, object], *, settable: bool) -> None:
+    """Refuse cooldown branches, where the run is `branching`, that it could not score or decay: one
+    with no validation suite to score them, and an optimizer whose state holds no learning rate a
+    branch can scale (`settable`, `dew.optim.settable_rates`)."""
     if not branching:
         return
     if not suites:
@@ -143,9 +142,6 @@ def check_branches(branching: bool, suites: Mapping[str, object], *, settable: b
         raise ValueError("a cooldown scales the learning rate the optimizer's state holds, as an "
                          "OptimConfig's solvers and optax.inject_hyperparams of a constant hold it; this "
                          "state holds none, or one Optax computes from a step count at each update")
-    if rollout:
-        raise ValueError("a cooldown branch reads a stream of its own, and a rollout's acquisition is "
-                         "one reader's at a time: cooldowns of rollout runs are not built")
 
 
 __all__ = ["Branch", "Cooldowns"]
