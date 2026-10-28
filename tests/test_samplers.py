@@ -360,6 +360,41 @@ def flaxdiff_walk(solver, x_T, times):
     return jnp.stack(latents)
 
 
+def flaxdiff_walked(solver):
+    """Dew's arm of a FlaxDiff walk under `solver`: a draw's latent after every interval of its grid, and
+    the last one's pullback of its cotangent (tools/flaxdiff_solver_reference.py pairs its sizing with
+    it)."""
+    def walked(inputs):
+        x_T = jnp.asarray(inputs["x_T"])
+        times = inputs["times"]
+        latents = flaxdiff_walk(solver, x_T, times)
+        cotangent = jnp.asarray(inputs["cotangent"])
+        (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x, times)[-1], x_T)[1](cotangent)
+        return {**{f"after {index}": latent for index, latent in enumerate(latents)}, "gradient": gradient}
+
+    return walked
+
+
+def flaxdiff_outputs(closed):
+    """A closing walk's leaves: its output as it is, and through the clip to [-1, 1] of FlaxDiff's
+    `post_process`."""
+    return {"closed": closed, "clipped": jnp.clip(closed, -1, 1)}
+
+
+def flaxdiff_closed(solver):
+    """Dew's arm of a FlaxDiff closing walk under `solver`: `sample` over a draw's grid with its default
+    closing denoise (tools/flaxdiff_solver_reference.py pairs its sizing with it)."""
+    process, _ = karras_process()
+
+    def closing(inputs):
+        x_T = jnp.asarray(inputs["x_T"])
+        return flaxdiff_outputs(sample(StandIn(process), x_T, solver=solver, key=jax.random.key(0),
+                                       times=jnp.asarray(inputs["times"], x_T.dtype),
+                                       initial=flaxdiff_start(solver, x_T)))
+
+    return closing
+
+
 def assert_on_par_with_flaxdiff(site: str, dew, truth_fn=None) -> None:
     """`dew(inputs)`, Dew's leaves on a draw, on par with `site`'s recording of FlaxDiff's own float32
     run over its declared seeds (check 1). The truth is `truth_fn(inputs)`, `dew` unless given, run
@@ -390,21 +425,13 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     clean prediction at the last time: `sample`'s own float64 scan refuses
     MultiStepDPM's float32 history (row 2063)."""
     process, _ = karras_process()
-
-    def outputs(closed):
-        return {"closed": closed, "clipped": jnp.clip(closed, -1, 1)}
-
-    def closing(inputs):
-        x_T = jnp.asarray(inputs["x_T"])
-        return outputs(sample(StandIn(process), x_T, solver=solver, key=jax.random.key(0),
-                              times=jnp.asarray(inputs["times"], x_T.dtype),
-                              initial=flaxdiff_start(solver, x_T)))
+    closing = flaxdiff_closed(solver)
 
     def walked_and_closed(inputs):
         x_T = jnp.asarray(inputs["x_T"])
         times = jnp.asarray(inputs["times"], x_T.dtype)
         last = flaxdiff_walk(solver, x_T, times)[-1]
-        return outputs(StandIn(process)(last, jnp.full((x_T.shape[0],), times[-1]))[0])
+        return flaxdiff_outputs(StandIn(process)(last, jnp.full((x_T.shape[0],), times[-1]))[0])
 
     assert_on_par_with_flaxdiff(f"{name} closed", closing, walked_and_closed)
     assert float(jnp.abs(closing(writer("flaxdiff_solver_reference").draw(0))["closed"]).max()) > 2
@@ -424,16 +451,7 @@ def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver):
     the recorded seeds (check 1). FlaxDiff's grid is Dew's own `times(12)`."""
     process, _ = karras_process()
     np.testing.assert_array_equal(process.times(12), recording(FLAXDIFF)["times"])
-
-    def walked(inputs):
-        x_T = jnp.asarray(inputs["x_T"])
-        times = inputs["times"]
-        latents = flaxdiff_walk(solver, x_T, times)
-        cotangent = jnp.asarray(inputs["cotangent"])
-        (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x, times)[-1], x_T)[1](cotangent)
-        return {**{f"after {index}": latent for index, latent in enumerate(latents)}, "gradient": gradient}
-
-    assert_on_par_with_flaxdiff(f"{name} walk", walked)
+    assert_on_par_with_flaxdiff(f"{name} walk", flaxdiff_walked(solver))
 
 
 @pytest.mark.parametrize("solver", [DDIM(), Euler()], ids=lambda s: type(s).__name__)

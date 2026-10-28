@@ -189,19 +189,35 @@ def evaluated(inputs, compiled, part: str):
     return tuple(results)
 
 
+def float32_arm(fn):
+    """Dew's arm `fn` compiled and run with x64 off, as the test runs it beside this process's float64
+    twin."""
+    compiled = jax.jit(fn)
+
+    def run(inputs):
+        with jax.enable_x64(new_val=False):
+            return jax.tree.map(np.asarray, compiled(inputs))
+
+    return run
+
+
 def main() -> None:
     # Set here, not on import: the test loads this file for `draw` alone.
     jax.config.update("jax_enable_x64", val=True)
     from recorded_references import provenance, record_case, save
+    from test_samplers import flaxdiff_closed, flaxdiff_walked
+
+    from dew.sampling import RK4, MultiStepDPM
 
     assert published()["KarrasVENoiseScheduler"](timesteps=1.0).max_timesteps == 1.0
     arrays = {"times": np.asarray(jnp.linspace(1.0, 0.0, STEPS, dtype=jnp.float32))}
-    for name in SAMPLERS:
+    for name, solver in (("rk4", RK4()), ("multistep", MultiStepDPM())):
         compiled = {dtype: runs(name, dtype) for dtype in (jnp.float32, jnp.float64)}
-        for part in ("walk", "closed"):
+        for part, dew in (("walk", flaxdiff_walked(solver)), ("closed", flaxdiff_closed(solver))):
+            # Sized paired, as check 1 judges: a draw's grid moves both sides' roundings alike.
             arrays.update(record_case(f"{name} {part}", draw,
                                       functools.partial(evaluated, compiled=compiled, part=part),
-                                      store_inputs=False, summary=True))
+                                      store_inputs=False, summary=True, dew=float32_arm(dew)))
     written = save(FIXTURE, {**arrays, "provenance": provenance(
         "AshishKumar4/FlaxDiff", COMMIT, "cpu", "python tools/flaxdiff_solver_reference.py")},
         reference=f"AshishKumar4/FlaxDiff {COMMIT}", license="MIT")
