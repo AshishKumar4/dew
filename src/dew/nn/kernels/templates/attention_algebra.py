@@ -62,8 +62,10 @@ class Forward:
     `initial` state (`raw`), whether natural logits stay `scaled` whatever the scale (`raw`; the fold's
     rewalk, `unfolded`), the call's query count `queries` where a mainloop walks query rows past it
     without spans (a full or causal call padded to whole tiles or whole programs, whose padding rows, a
-    tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does), and
-    whether its walks keep what their running sums' additions drop (`compensated`, `compensates`)."""
+    tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does),
+    whether its walks keep what their running sums' additions drop (`compensated`, `compensates`), and the
+    power of two the queries took before their products (`prescale`, `attention.prescale`), which `scale`
+    is the call's scale over."""
 
     form: str
     keys: int
@@ -76,6 +78,7 @@ class Forward:
     scaled: bool = False
     queries: int | None = None
     compensated: bool = False
+    prescale: float = 1.0
 
     @property
     def raw(self) -> bool:
@@ -103,8 +106,9 @@ class Forward:
         under a query of 1 at scale 0.5 weigh 1 and 0 in the reference and 0.5 each folded, and a
         cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, §3, the
         exponent's forms). On drawn inputs both forms pass check 1."""
-        # The factor as the kernel multiplies by it, rounded to fp32.
-        factor = abs(float(np.float32(self.scale * LOG2E)))
+        # The factor as the kernel would multiply the call's own products by it, rounded to fp32: the call's
+        # scale, its products' power of two (`prescale`) times the scale left after it.
+        factor = abs(float(np.float32(self.scale * self.prescale * LOG2E)))
         return not self.natural and self.score_mod is None and factor < 1.0
 
     @property

@@ -692,6 +692,28 @@ def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
             return value[row, :, head]
 
 
+def prescale(dtype, width: int, scale: float) -> tuple[float, float]:
+    """The power of two a call's queries take before their products with the keys, and the scale left after
+    it: where the products of `dtype` operands `width` wide can pass fp32's largest (bf16's and fp32's),
+    `scale`'s power of two at or below its magnitude, so no product the reference keeps finite overflows
+    here (it scales the query before its products, `dew.nn.attention`): Q 2^127 and K 4 over a width of 16,
+    a product of 2^129 where the reference's is 2^127; else 1 and `scale` (fp16's products never pass it). A
+    power of two scales exactly, so the logits, the weights and every gradient but the query's are the
+    unscaled call's bit for bit, and the query's takes the power back (`gradients`)."""
+    largest = float(jnp.finfo(dtype).max)
+    if scale == 0 or largest * largest * width < float(jnp.finfo(jnp.float32).max):
+        return 1.0, scale
+    power = 2.0 ** math.floor(math.log2(abs(scale)))
+    return power, scale / power
+
+
+def prescaled(query: jax.Array, scale: float) -> tuple[jax.Array, float, float]:
+    """`query` taken by its call's power of two before its products (`prescale`), the scale left after it,
+    and the power."""
+    power, left = prescale(query.dtype, query.shape[-1], scale)
+    return (query if power == 1.0 else query * jnp.asarray(power, query.dtype)), left, power
+
+
 def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None) -> jax.Array:
     """The scores `[B, H, Q, K]` the template's softmax takes, as `reference` computes them: the products
@@ -701,7 +723,7 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
     batch, queries, heads, width = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
-    scale = width ** -0.5 if scale is None else scale
+    query, scale, _ = prescaled(query, width ** -0.5 if scale is None else scale)
     seen = dense(spans)
     grouped = query.reshape(batch, queries, kv_heads, heads // kv_heads, width)
     products = float32_einsum("bqhgd,bkhd->bhgqk", grouped, key,
@@ -1096,7 +1118,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     batch, queries, heads, width = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
-    scale = width ** -0.5 if scale is None else scale
+    # The query's products taken as the forward took them (`prescale`), its gradient the power back.
+    query, scale, power = prescaled(query, width ** -0.5 if scale is None else scale)
     # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
     dout = dout.astype(query.dtype)
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
@@ -1175,6 +1198,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded
                               else (at_least_fp32(key.dtype), at_least_fp32(value.dtype)))
+    dq = dq if power == 1.0 else dq * power
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
                      dk[:, :keys, :, :width].astype(key_dtype),
                      dv[:, :keys, :, :value_width].astype(value_dtype),

@@ -34,6 +34,7 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     kept_dtype,
     power_of_two,
+    prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import (
     _dkv_allocations,
@@ -403,9 +404,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The call's query count where the launch pads past it (`algebra.Forward.queries`).
         queries = start.shape[1]
         padded = _padded(queries, key.shape[1], config)[0] > queries
-        spec = algebra.Forward(spans.form, spans.keys, ids=query_ids is not None, scale=self.scale,
+        # The products of the query `gradients` takes before them (`prescale`), at the scale left after it.
+        power, scale = prescale(query.dtype, query.shape[3], self.scale)
+        spec = algebra.Forward(spans.form, spans.keys, ids=query_ids is not None, scale=scale,
                                score_mod=self.score_mod, natural=self.natural, initial=initial is not None,
-                               queries=queries if padded else None)
+                               queries=queries if padded else None, prescale=power)
         launch = functools.partial(_launch_backward, spec=spec, accurate=self.accurate, tiles=config,
                                    family=family, interpret=interpret)
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,

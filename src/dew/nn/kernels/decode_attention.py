@@ -54,7 +54,7 @@ from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import NATURAL, capped, kernel_dot
+from .templates.attention import NATURAL, capped, kernel_dot, prescaled
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -124,7 +124,8 @@ over an `AttentionCase`): a GPU Dew's Triton kernels run on, at most `QUERIES` p
 power-of-two width from 16 to 256, a capacity of whole blocks and one of its dtypes on both sides."""
 
 
-def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool) -> algebra.Forward:
+def _spec(scale: float, power: float, softcap: float | None, natural: bool, dtype, sinks: bool
+          ) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and in
     either form whether a row's sums of `dtype` values need a guard (`algebra.headroom`) and keep their
@@ -134,7 +135,7 @@ def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(capped, softcap),
                            natural=natural, headroom=algebra.headroom(dtype),
-                           initial=sinks, compensated=algebra.compensates(dtype))
+                           initial=sinks, compensated=algebra.compensates(dtype), prescale=power)
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
@@ -336,6 +337,8 @@ class DecodeAttention(tuning.KernelOp):
 
         batch, _, heads, width = query.shape
         splits = config.splits
+        # The query taken by its scale's power of two before its products, as the template takes it.
+        query, scale, power = prescaled(query, 1 / math.sqrt(width))
         keyed = pl.BlockSpec((None, key.shape[1], None, width), lambda row, head, split: (row, 0, head, 0))
         queried = pl.BlockSpec((None, QUERIES, None, width), lambda row, head, split: (row, 0, head, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
@@ -359,7 +362,7 @@ class DecodeAttention(tuning.KernelOp):
             )(spans, query, key, value, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=1).astype(query.dtype)
 
-        spec = _spec(1 / math.sqrt(width), softcap, natural, value.dtype, sinks is not None)
+        spec = _spec(scale, power, softcap, natural, value.dtype, sinks is not None)
         return _guarded(launch, spec), None
 
     def _get_heuristics_config(self, ba) -> Split:
@@ -402,6 +405,7 @@ class PagedDecodeAttention(tuning.KernelOp):
 
         rows, kv_heads, _, width = query.shape
         count, page_size = key_pages.shape[1:3]
+        query, scale, power = prescaled(query, 1 / math.sqrt(width))
         splits, pages = config.splits, max(step_keys(value_pages.dtype) // page_size, 1)
         pooled = pl.BlockSpec((None, count, page_size, width), lambda row, head, split: (head, 0, 0, 0))
         queried = pl.BlockSpec((None, None, QUERIES, width), lambda row, head, split: (row, head, 0, 0))
@@ -428,7 +432,7 @@ class PagedDecodeAttention(tuning.KernelOp):
             )(spans, table, query, key_pages, value_pages, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=2).astype(query.dtype)
 
-        spec = _spec(1 / math.sqrt(width), softcap, natural, value_pages.dtype, sinks is not None)
+        spec = _spec(scale, power, softcap, natural, value_pages.dtype, sinks is not None)
         return _guarded(launch, spec), None
 
     def _get_heuristics_config(self, ba) -> Split:

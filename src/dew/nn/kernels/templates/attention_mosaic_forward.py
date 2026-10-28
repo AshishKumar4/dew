@@ -33,7 +33,15 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic
-from dew.nn.kernels.templates.attention import Hooks, KeySpans, Param, Split, output_hooked, padded_call
+from dew.nn.kernels.templates.attention import (
+    Hooks,
+    KeySpans,
+    Param,
+    Split,
+    output_hooked,
+    padded_call,
+    prescaled,
+)
 from dew.nn.kernels.templates.attention_mosaic_program import (
     Tiles,
     _block,
@@ -246,11 +254,14 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     (`refused`, which the op's eligibility reads too)."""
     if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family):
         raise NotImplementedError(reason)
+    # The query taken by its scale's power of two before its products (`prescale`).
+    query, scale, power = prescaled(query, scale)
     call = padded_call(query, key, value, spans, hooks, _block(tiles))
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
                            initial=hooks.initial is not None,
-                           queries=call.queries if call.query.shape[1] > call.queries else None)
+                           queries=call.queries if call.query.shape[1] > call.queries else None,
+                           prescale=power)
     unit = family.column_unit(query.dtype)
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     read = (_spans_of(spec, call, tiles.block_q, tiles.block_k), _hooked_of(hooks, call, unit))

@@ -39,6 +39,7 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     kernel_dot,
     padded_call,
+    prescaled,
     within,
 )
 from dew.nn.kernels.templates.base import Template, dividing
@@ -262,6 +263,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
              acc0, *, residuals: bool, interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
+        # The query taken by its scale's power of two before its products (`prescale`).
+        query, scale, power = prescaled(query, self.scale)
         batch, queries, heads, width = query.shape
         keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
         group = heads // kv_heads
@@ -306,9 +309,9 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         # A call's own key count, none included; an op built without one counts its launch's keys.
         # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), as the
         # plain-JAX and Mosaic mainloops do: the template's production route runs this one on a GPU.
-        spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
+        spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, scale,
                                self.score_mod, self.natural, algebra.headroom(value.dtype), initial,
-                               compensated=algebra.compensates(value.dtype))
+                               compensated=algebra.compensates(value.dtype), prescale=power)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,

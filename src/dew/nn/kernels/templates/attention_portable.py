@@ -27,6 +27,7 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     interpreted_dot,
     padded_call,
+    prescaled,
     ranges_walk,
     within,
 )
@@ -221,14 +222,15 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     `residuals`, the running maxima and denominators `[B, H, Q]`, the anchor keys and the split sums too;
     `natural` keeps the logits natural (`algebra.Forward.base2`)."""
     hooks = Hooks() if hooks is None else hooks
+    # The query taken by its scale's power of two before its products (`prescale`).
+    query, scale, power = prescaled(query, query.shape[3] ** -0.5 if scale is None else scale)
     call = padded_call(query, key, value, spans, hooks, pad)
     queries, value_width = call.queries, value.shape[-1]
     # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
     # fold its logits' reach (`algebra.walked`).
-    spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
-                           query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           algebra.headroom(value.dtype), hooks.initial is not None,
-                           compensated=algebra.compensates(value.dtype))
+    spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None, scale, hooks.score_mod,
+                           natural, algebra.headroom(value.dtype), hooks.initial is not None,
+                           compensated=algebra.compensates(value.dtype), prescale=power)
     if not residuals:
         out, _ = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k, residuals=False)
         return out[:, :queries, :, :value_width]
