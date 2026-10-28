@@ -1,16 +1,17 @@
 """Training without backpropagation by node perturbation (`dew.objectives.perturbation`).
 
-The estimate is the loss's gradient in expectation where the loss is quadratic in each layer's output
-and every unit's loss reads its own output alone: an antithetic pair's reward is then exactly the
-derivative along its jitter. Over many independent steps' keys, the estimates are the gradient JAX
-computes in expectation, whatever layout a dense call contracts, in bfloat16 sites as in float32, and
-for statistics that are a tuple: Student's t-test rejects in no coordinate. A language model's estimate
-is its configured objective's, a z-loss among its terms, a tied head's rows the batch only predicts
-included; a routed decoder's statistics take theirs, and an indexer's warm-up its whole KL. An update
-read in two microbatches estimates what its batch whole does, each example's jitter its own. A run
-trains with no derivative of its model taken, a batch norm's statistics kept as the clean loss keeps
-them, a rematerialized decoder estimated as its unrolled twin is, and a model whose layers are mapped is
-refused. The estimator's settings are its constructor's, which a run's record holds.
+The estimate is the loss's gradient in expectation where the loss is quadratic in each layer's output and
+every unit's loss reads its own output alone: an antithetic pair's reward is then exactly the derivative
+along its jitter. Over many independent steps' keys, the estimates are the gradient JAX computes in
+expectation, whatever layout a dense call contracts, in bfloat16 sites as in float32, and for statistics
+that are a tuple: Student's t-test rejects in no coordinate. A language model's estimate is its
+configured objective's, a z-loss among its terms, a tied head's rows the batch only predicts included,
+once under a wrapper that delegates its head; a routed decoder's statistics take theirs, and an indexer's
+warm-up its whole KL. An update read in two microbatches estimates what its batch whole does, each
+example's jitter its own. A run trains with no derivative of its model taken, a batch norm's statistics
+kept as the clean loss keeps them, a rematerialized decoder estimated as its unrolled twin is, and a
+model whose layers are mapped is refused. The estimator's settings are its constructor's, which a run's
+record holds.
 """
 
 import dataclasses
@@ -33,6 +34,8 @@ from dew.data import Memory
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
+from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.base import Objective, Ratio, Step
 from dew.objectives.lm import IndexerTraining, LMObjective
 from dew.objectives.perturbation import NodePerturbation
@@ -205,22 +208,40 @@ def test_a_language_models_estimate_is_its_configured_objectives():
     assert rejected(estimates["Dense_1"]["bias"], without["Dense_1"]["bias"]) < 1e-9
 
 
-def test_a_tied_heads_rows_the_batch_only_predicts_are_estimated():
+def tied(wrapped: bool):
+    """A one-layer tied decoder, or that decoder under a multimodal wrapper whose head read delegates to
+    the decoder's (`MultimodalTransformer.output_table`), and the path of its embedding's parameters."""
+    decoder = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                                mlp_features=32, max_seq_len=8, dtype="float32")
+    if not wrapped:
+        return decoder, ("embed_tokens", "embedding")
+    return (MultimodalTransformer(decoder, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1,
+                                                        num_heads=2, image_size=8, patch_size=4),
+                                  GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
+                                  family="gemma3", image_token_id=1),
+            ("language_model", "embed_tokens", "embedding"))
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["decoder", "wrapped"])
+def test_a_tied_heads_rows_the_batch_only_predicts_are_estimated_once(wrapped):
     """A decoder whose head is its embedding, tied, read as a matrix its loss contracts, over rows of the
-    ids 1 to 6 alone: the rows of the ids 7 to 12, which no input looks up and every prediction's
-    normalizer reads, take their estimate from that read, its matrix jittered there alone and added to
-    the lookup's estimate: over 256 steps' keys it is the analytic gradient of those rows in expectation
-    (the t-test rejects in no coordinate), where the lookup's alone would leave them at zero."""
-    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=8, dtype="float32")
+    ids 2 to 6 alone, bare or under a wrapper whose read delegates to the decoder's: the rows of the ids
+    7 to 12, which no input looks up and every prediction's normalizer reads, take their estimate from
+    the outermost read alone, its matrix jittered there once and added to the lookup's estimate: over
+    256 steps' keys it is the analytic gradient of those rows in expectation (the t-test rejects in no
+    coordinate), where the lookup's alone would leave them at zero and a read counted at each nesting
+    twice the gradient."""
+    model, embedding = tied(wrapped)
     objective = ForwardLM(model, seq_len=6, draws=4, weight_draws=64, weight_sigma=0.01)
     variables = objective.init(jax.random.key(0))
-    batch = {"text": jnp.asarray(np.random.default_rng(3).integers(1, 7, (8, 7)), jnp.int32)}
+    batch = {"text": jnp.asarray(np.random.default_rng(3).integers(2, 7, (8, 7)), jnp.int32)}
     estimates = estimated(objective, variables, batch)
     truth = gradient(LMObjective(model, seq_len=6), variables, batch, jax.random.key(0))
-    predicted = truth["embed_tokens"]["embedding"][7:]
+    for key in embedding:
+        estimates, truth = estimates[key], truth[key]
+    predicted = truth[7:]
     assert float(jnp.max(jnp.abs(predicted))) > 0
-    assert rejected(estimates["embed_tokens"]["embedding"][:, 7:], predicted) > 1e-9
+    assert rejected(estimates[:, 7:], predicted) > 1e-9
 
 
 class TwoTerms(NamedTuple):

@@ -6,10 +6,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 ## Unreleased
 
 - `dew.io.promote` publishes a run only where it ranks among its sweep's or project's best by a finite
-  summary metric, into a registry collection the sweep shares, and puts that collection's "best" alias on
-  its best version, one promoter at a time under the collection's lease (`dew.io.Lease`, a conditionally
-  written object beside the runs' checkpoints by default); `trainer.promote` names the rule and the
-  collection for a configured run. `dew.pipeline("wandb:...")` loads a published run from a W&B run or the registry.
+  summary metric, into a registry collection the sweep shares, its score and ranking recorded on the
+  version; the collection's best version is derived from those records when it is read
+  (`dew.io.best_version`, `wandb:<collection>:best`), so no promoter writes an alias. `trainer.promote`
+  names the rule and the collection for a configured run. `dew.pipeline("wandb:...")` loads a published run from a W&B run or the registry.
 - `NodePerturbation`, mixed into an objective, trains its model without backpropagation, by node
   perturbation of every Dense, DenseGeneral and Embed output as Dust does, the rest by weight-space
   evolution strategies, pooled over a split or accumulated update as its gradient is;

@@ -477,8 +477,8 @@ class TrainerConfig:
     promote: Promotion | None = None
     """Publish the final checkpoint to W&B only where the run ranks among its sweep's or project's best by
     a summary metric, into the registry collection the promotion names, which every run of a sweep
-    shares, its "best" alias on the collection's best version (`dew.io.promote`); requires `wandb` and
-    `checkpoint_final`, and takes the place of `publish`."""
+    shares, its best version derived when read (`dew.io.promote`, `dew.io.best_version`); requires `wandb`
+    and `checkpoint_final`, and takes the place of `publish`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
@@ -1443,7 +1443,7 @@ class RunConfig:
                     dew.io.publish(step, _artifact_name(name), tracker=wandb_tracker)
                 if (rule := trainer.promote) is not None and wandb_tracker is not None:
                     dew.io.promote(step, rule.collection, tracker=wandb_tracker, metric=rule.metric,
-                                   mode=rule.mode, top=rule.top, lease=rule.lease_at(trainer.checkpoint_dir))
+                                   mode=rule.mode, top=rule.top)
 
             agreed("checkpoint publishing", publish_checkpoint)
             return state

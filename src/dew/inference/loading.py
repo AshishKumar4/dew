@@ -58,7 +58,8 @@ def pipeline(
 
     `source` is a run directory, a source checkpoint directory or a Hub
     repository holding either, or a run published to W&B (`dew.io.publish`): `wandb:` and an artifact's
-    path with its version or alias (`wandb:wandb-registry-model/name:best`), or a run's
+    path with its version, an alias or `best`, the best version its records rank
+    (`wandb:wandb-registry-model/name:best`, `dew.io.best_version`), or a run's
     (`wandb:entity/project/run_id`), its newest model artifact, downloaded where W&B keeps artifacts
     (`dew.io.downloaded`). A run loads as the task its recorded objective declares
     (`Objective.saved_task`), including a plugin objective's own task.

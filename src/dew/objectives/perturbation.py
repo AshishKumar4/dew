@@ -15,7 +15,8 @@ other parameter (a norm's scale, a mixing scalar, an expert's weights) is estima
 weight-space evolution strategies, rewarded by the whole objective, and so is each use of a site's
 parameter that no layer call makes: a vocabulary head the loss reads as a matrix and contracts itself
 (`AffineHead.output_table`), a tied embedding's, whose matrix is jittered in that read alone and whose
-estimate is added to the lookup's, so a vocabulary row the batch only predicts is estimated too.
+estimate is added to the lookup's, so a vocabulary row the batch only predicts is estimated too. A
+wrapper's read that delegates to its decoder's is one read, its outermost, jittered and counted once.
 
 `NodePerturbation`, mixed into any objective over a Flax model,
 
@@ -51,7 +52,9 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import string
+from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -88,12 +91,22 @@ class Site:
 @dataclasses.dataclass(frozen=True)
 class TableUse:
     """One read of a model's vocabulary head as a matrix (`AffineHead.output_table`), which a loss
-    contracts itself rather than calling a layer: the unbound module that read it, so the read can be
-    taken again over other parameters, and the matrix's shape and dtype."""
+    contracts itself rather than calling a layer: the unbound module that read it and its path in the
+    model, so the read can be taken again over other parameters, and the matrix's shape and dtype."""
 
     module: nn.Module
+    path: Path
     shape: tuple[int, ...]
     dtype: jnp.dtype
+
+
+def _holds(tree, path: Path) -> bool:
+    """Whether a variables collection holds a subtree at `path`."""
+    for key in path:
+        if not isinstance(tree, Mapping) or key not in tree:
+            return False
+        tree = tree[key]
+    return True
 
 
 def _reads_table(context, output) -> bool:
@@ -106,7 +119,31 @@ def _table(context, output) -> TableUse | None:
     if not _reads_table(context, output):
         return None
     unbound, _ = context.module.unbind()
-    return TableUse(unbound, tuple(output.matrix.shape), output.matrix.dtype)
+    return TableUse(unbound, tuple(context.module.path), tuple(output.matrix.shape), output.matrix.dtype)
+
+
+def _passed(next_fun, args, kwargs, context):
+    """A call run as it is."""
+    return next_fun(*args, **kwargs)
+
+
+def _outermost(reading):
+    """`reading`, an interceptor of a model's calls, run on the outermost head read alone: a wrapper's
+    read that delegates to its decoder's (`MultimodalTransformer.output_table`) is one read of one
+    matrix, which the decoder's nested read passes through unseen."""
+    depth = 0
+
+    def intercepted(next_fun, args, kwargs, context):
+        nonlocal depth
+        if context.method_name != "output_table":
+            return reading(next_fun, args, kwargs, context)
+        depth += 1
+        try:
+            return (reading if depth == 1 else _passed)(next_fun, args, kwargs, context)
+        finally:
+            depth -= 1
+
+    return intercepted
 
 
 def _kind(context) -> str | None:
@@ -200,7 +237,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
 
         flat = leaves_by_path(params)
         try:
-            with nn.intercept_methods(captured):
+            with nn.intercept_methods(_outermost(captured)):
                 estimating._statistics_and_shares(variables, batch, step)
             gradients = self._sited(estimating, variables, batch, step, sites, cotangent, flat)
         except jax.errors.UnexpectedTracerError as escaped:
@@ -380,7 +417,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
                 return output.replace(matrix=output.matrix + jnp.asarray(sign * self.weight_sigma,
                                                                           drawn.dtype) * drawn)
 
-            with nn.intercept_methods(jitter):
+            with nn.intercept_methods(_outermost(jitter)):
                 return estimating._statistics_and_shares({**variables, "params": params}, batch, step)
 
         def draw(sums, index):
@@ -396,7 +433,10 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
             # The read is the parameters' re-layout (a tied embedding as it is, a kernel through its
             # adapter), so its pullback takes the matrix's estimate to theirs without the model's backward.
             def matrix(trained, table=table) -> jax.Array:
-                read = head_table(table.module, {**variables, "params": trained})
+                # The reading module's own variables, at its path in the model's.
+                own = {name: functools.reduce(lambda tree, key: tree[key], table.path, tree)
+                       for name, tree in {**variables, "params": trained}.items() if _holds(tree, table.path)}
+                read = head_table(table.module, own)
                 assert read is not None, "the head read its matrix in the clean pass"
                 return read.matrix
 

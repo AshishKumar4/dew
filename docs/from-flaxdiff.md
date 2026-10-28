@@ -40,8 +40,7 @@ Each row names what FlaxDiff provided, Dew's version of it, and the test that ho
 | The diffusion trainer: data parallel and FSDP, accumulation, EMA, mixed precision, checkpoints | `dew.Trainer` with `DiffusionObjective` | `tests/test_parallelism.py`, `tests/test_training_references.py`, `tests/test_tree_checkpoints.py` |
 | Weights & Biases logging and registry publishing | `WandbTracker`, `dew.io.publish` | `tests/test_reporting.py`, `tests/test_publish.py` |
 | Ranking a run against its sweep's or project's best and promoting it to the registry | `dew.io.promote`, `trainer.promote`; the trainer still never deletes a checkpoint | `tests/test_publish.py` |
-| `from_wandb_run` and `from_wandb_registry` | `dew.pipeline("wandb:entity/project/run_id")`, `dew.pipeline("wandb:wandb-registry-model/name:best")` | `tests/test_publish.py` |
-| Ranking a sweep's runs and promoting the best, and loading by W&B run name | Not in Dew yet: publish a chosen checkpoint and load it with `TextToImage.from_run` | |
+| `from_wandb_run` and `from_wandb_registry` | `dew.pipeline("wandb:entity/project/run_id")`, `dew.pipeline("wandb:wandb-registry-model/name:best")`, the best version derived from the versions' recorded scores when read | `tests/test_publish.py` |
 | FID, CLIP score, PSNR, SSIM | `dew.eval` | `tests/test_fid.py`, `tests/test_clip_metrics.py`, `tests/test_image_metrics.py` |
 | TPU create, setup and launch | `dew.cli.tpu`, `dew launch` | `tests/test_tpu_cli.py`, `tests/test_launch.py` (command contracts, not a TPU pod run) |
 
