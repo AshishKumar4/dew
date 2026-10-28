@@ -486,7 +486,10 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
     `sinks` `[N]` put one value-free logit a head in each row's softmax;
     `natural` keeps the logits natural (`algebra.Forward.base2`). Its
     Pallas call has no derivative: `dew.nn.attention` differentiates it as the
-    attention it stands in for."""
+    attention it stands in for. A cache of no keys gives the empty result
+    (`_empty`), no launch."""
+    if key.shape[1] == 0:
+        return _empty(query, value)
     sunk = None if sinks is None else _row_sinks(sinks, key.shape[2], query.shape[1])
 
     def launched(grouped, key, value):
@@ -498,6 +501,13 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
         return out[:, :rows]
 
     return grouped_query(launched, query, key, value)
+
+
+def _empty(query: jax.Array, value: jax.Array) -> jax.Array:
+    """A decode step's output over a cache of no keys, the reference's value product over none, sinks or
+    not (`attention_sinks`): zero, `query`'s shape at the values' width, before any launch forms a split
+    config over no steps (audit K6: none fit, an IndexError on an A100 and an H100)."""
+    return jnp.zeros((*query.shape[:-1], value.shape[-1]), query.dtype)
 
 
 def _row_sinks(sinks: jax.Array, kv_heads: int, positions: int) -> jax.Array:
@@ -533,7 +543,10 @@ def attend_paged(query: jax.Array, key_pages: jax.Array, value_pages: jax.Array,
     kv_heads` others; a `softcap` bounds the scaled logits and `sinks` `[heads]`
     join each row's softmax and `natural` keeps the logits natural as `attend`'s.
     `[rows, heads, D]` out, `interpret`
-    running it on the CPU."""
+    running it on the CPU. A table of no pages gives the empty result
+    (`_empty`), no launch."""
+    if table.shape[1] == 0:
+        return _empty(query, value_pages)
     rows, heads, width = query.shape
     kv_heads, _, page_size, _ = key_pages.shape
     group, pages = heads // kv_heads, BLOCK // page_size

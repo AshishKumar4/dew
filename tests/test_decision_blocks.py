@@ -43,6 +43,31 @@ def test_a_release_row_in_blocks_is_its_prefix_then_its_suffix(qwen):
     assert order.blocks is None and order.tokens == row.tokens
 
 
+def test_a_question_first_row_in_blocks_reads_its_question_then_its_state(qwen):
+    """The release's segments in the other order, the question and its options first: block 0 is the
+    question, from the row's start, and block 1 opens at the state's first character, after the text
+    between them, its state then the cue to the row's end, so neither block is empty and the state is
+    read in a block of its own."""
+    from dew.decision.layout import AnswerCue, OptionLines
+
+    layout = release()
+    segments = layout.segments or ()
+    state = [segment for segment in segments if isinstance(segment, State)]
+    question = [segment for segment in segments if isinstance(segment, (Instructions, OptionLines))]
+    reordered = (question[0], Text("\n\nOptions:\n"), question[1], Text("\n\n<state>\n"), *state,
+                 Text("\n</state>\n\n"), AnswerCue())
+    first = dataclasses.replace(layout, segments=reordered, blocks=True)
+    [row] = first.rows(qwen, SPECIALS, STATE, {"team": TEAM})
+    [ordered] = dataclasses.replace(first, blocks=False).rows(qwen, SPECIALS, STATE, {"team": TEAM})
+    assert ordered.tokens == row.tokens and row.blocks is not None
+    text = qwen.decode(list(row.tokens))
+    opened = row.blocks.index(1)
+    assert 0 < opened < len(row.tokens)
+    assert row.questions[0].span[1] <= opened
+    assert qwen.decode(list(row.tokens[opened:])).lstrip().startswith(STATE[:12])
+    assert "Question: " in qwen.decode(list(row.tokens[:opened])) and "Question: " in text
+
+
 def test_a_state_first_row_in_blocks_asks_its_question_from_its_head():
     """A state-first row's block 1 starts at its question's head, after its state, and a batch of such
     rows pads its blocks with -1, as a pass's widening does."""
