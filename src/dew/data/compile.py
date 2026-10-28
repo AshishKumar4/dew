@@ -1227,6 +1227,15 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     branch = dataclasses.replace(branch, stages=branch.stages[:at])
     branch = _objective_records(branch, steps[random:])
     branch = dataclasses.replace(branch, stages=(*branch.stages, *suffix))
+    if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in branch.stages):
+        # A held chain measured before its run's batch is known takes the objective's batch steps where
+        # it is batched (`_batch_steps_after`, `held`).
+        return branch
+    return _batch_steps_after(branch, objective, train=train)
+
+
+def _batch_steps_after(branch: Pipeline, objective: ObjectiveData, *, train: bool) -> Pipeline:
+    """`branch` with the objective's batch steps after its batch."""
     steps = objective.train_batch if train else objective.evaluate_batch
     # A string or object field stays in the batch for the host code and metrics that read it; the
     # prefetcher places the rest (`dew.distributed.batches.split_fields`).
@@ -1411,6 +1420,14 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
     chain = _held_batched(dataset._chain(), batch)
     if measured is None:
         measured = _held_measure(chain, objective)
+    elif not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in measured.branches[0].stages):
+        # Measured before its run's batch was known (`fitted`): batched now, the objective's batch steps
+        # after its batch.
+        def batched(branch: Pipeline) -> Pipeline:
+            branch = _held_batched(branch, batch)
+            return branch if objective is None else _batch_steps_after(branch, objective, train=False)
+
+        measured = dataclasses.replace(measured, branches=tuple(map(batched, measured.branches)))
     # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
     return validation(measured.branches[0], batch=1, objective=objective, read=_held_read(chain),
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed, widths=widths,
