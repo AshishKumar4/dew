@@ -7,14 +7,20 @@ runs of consecutive layers whose specs are equal, and `nn.scan` stacks each
 run into one group.
 """
 
+from __future__ import annotations
+
 import dataclasses
 from collections.abc import Hashable, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 from dew.registry import read_arguments
 
-from ..attention_residuals import ResidualSite
 from ..mixer_base import MixerBase
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
+
+if TYPE_CHECKING:
+    # A layer's place in the depth mixture, which the plan carries and the block reads.
+    from ..attention_residuals import ResidualSite
 
 
 @dataclasses.dataclass(frozen=True)
