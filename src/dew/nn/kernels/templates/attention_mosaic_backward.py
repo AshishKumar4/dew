@@ -132,33 +132,18 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     """A backward tile's weights unnormalized and over `total`, its score cotangents (`algebra.grad_scores`)
     and the score hook's slopes (`algebra.tile_logits`), from its products `s` and `dp`, its coordinates, its
     hook parameters `params`, its mask (`algebra.seen` where `masked`) and its queries' statistics."""
-    exponentials, weights, slopes, seen, inverse_total = _weighed(walk, coords, params, s, peak, total,
-                                                                  masked=masked)
-    cotangents = _cotangents(walk, coords, s, exponentials, dp, anchor, delta, chosen, seen, inverse_total)
-    return exponentials, weights, cotangents, slopes, seen
-
-
-def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, peak, total, *, masked: bool):
-    """`_scores`' first half: a tile's weights unnormalized and over `total`, the hook's slopes, its mask and
-    its queries' inverse totals along its own query axis (`algebra.Coords.queries`)."""
     seen = algebra.seen(walk.spec, coords, s) if masked else None
     how = walk.how
     logits, slopes = algebra.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
                                          coords.k_pos, params,
                                          scale=walk.spec.scale if how.factor is None else 1.0, slopes=True)
+    # Each query's statistics along the tile's own query axis (`algebra.Coords.queries`).
     inverse_total = coords.queries(algebra.inverse(total), s)
     exponentials, weights = algebra.normalized(logits, coords.queries(peak, s), inverse_total, how)
-    return exponentials, weights, slopes, seen, inverse_total
-
-
-def _cotangents(walk: _Backward, coords: algebra.Coords, like, exponentials, dp, anchor, delta, chosen, seen,
-                inverse_total):
-    """`_scores`' second half: a tile's score cotangents from its unnormalized weights and `dp`, its queries'
-    anchors and D (`algebra.grad_scores`)."""
-    del walk
     at_anchor = coords.k_pos == coords.queries(chosen, coords.k_pos)
-    return algebra.grad_scores(exponentials, dp, coords.queries(anchor, like), coords.queries(delta, like),
-                               seen, at_anchor, inverse_total)
+    cotangents = algebra.grad_scores(exponentials, dp, coords.queries(anchor, s), coords.queries(delta, s),
+                                     seen, at_anchor, inverse_total)
+    return exponentials, weights, cotangents, slopes, seen
 
 
 def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, index, slots,
@@ -359,23 +344,19 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
     s = family.product(k_smem, q_slot.transpose((1, 0)), shape)
     if walk.scaled:
         s = s * walk.spec.prescale
+    dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
-    coords = coords_of(q_first)
-    # Every tile masked, its queries' statistics read past their products, each phase's alone: the weights
-    # and dV's product, then dP and the cotangents, so the normalized weights and dP are never live together
-    # (a tile chosen masked or whole at run time joined both choices' tiles: 1184 bytes spilled at 64 x 64,
-    # one consumer).
-    peak, total, anchor, delta, chosen = rows_of(q_first)
-    exponentials, weights, slopes, seen, inverse_total = _weighed(walk, coords, params, s, peak, total,
-                                                                  masked=True)
+    # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
+    # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
+    # (spilled 1184 bytes at 64 x 64, one consumer).
+    exponentials, weights, cotangents, slopes, seen = _scores(walk, coords_of(q_first), params, s, dp,
+                                                             *rows_of(q_first), masked=True)
+    logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
     narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
     # dK's and dV's products against the program's share of the queries' and output cotangents' columns.
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
     dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_columns, walk.interpret)
-    dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
-    cotangents = _cotangents(walk, coords, s, exponentials, dp, anchor, delta, chosen, seen, inverse_total)
-    logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
     scaled = logits * walk.grad_scale
     if add_dq is None:
         # Each part formed as its product is issued (`algebra.formed_parts`).
