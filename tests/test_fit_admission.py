@@ -18,7 +18,6 @@ from dew.batch import VALID_ROWS
 from dew.config import TrainerConfig
 from dew.config.jepa import JepaRunConfig
 from dew.data import TFDS, Loading, presets
-from dew.data.compile import native
 from dew.data.dataset import DataPartition, Loader, rows_of
 from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Supervised
@@ -159,6 +158,8 @@ def test_data_handed_as_it_is_steps_as_given(handed):
 def test_a_handed_validation_batch_is_shared_alike_by_every_reader():
     """Five rows of handed arrays read by two shares: each reads three, the one short filled with a
     repeat its `VALID_ROWS` marks, so the shares make one global batch and every real row scores once."""
+    from dew.data.compile import native
+
     columns = regression_rows(5, 0)
     read = native(columns, training=False)
     shares = [next(read(DataPartition(index=index, count=2))) for index in range(2)]
