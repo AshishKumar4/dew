@@ -683,8 +683,9 @@ UNROUNDED = frozenset({
     "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr", "shard_map", "closed_call",
 })
 """Equations that move, select or order values without rounding them, or run programs whose own
-equations the audits read (`_every`): a float32 boundary value they carry past the boundaries stays
-the witnessed value, and only an equation that rounds past them must be float64."""
+equations the audits read (`reached`, through the gate's `equations`): a float32 boundary value they
+carry past the boundaries stays the witnessed value, and only an equation that rounds past them must
+be float64."""
 
 
 def _rounds(eqn) -> bool:
@@ -706,26 +707,6 @@ def _rounds(eqn) -> bool:
         isinstance(var, core.Literal) and np.all(np.asarray(var.val) == identity) for var in operands)
 
 
-def _programs(eqn):
-    """The programs an equation runs inside it: a jit's, a scan's or loop's body, a cond's branches."""
-    from jax.extend import core
-
-    for value in eqn.params.values():
-        for item in value if isinstance(value, (tuple, list)) else (value,):
-            if isinstance(item, core.ClosedJaxpr):
-                yield item.jaxpr
-            elif isinstance(item, core.Jaxpr):
-                yield item
-
-
-def _every(eqns):
-    """`eqns` and every equation of the programs inside them."""
-    for eqn in eqns:
-        yield eqn
-        for program in _programs(eqn):
-            yield from _every(program.eqns)
-
-
 def reached(jaxpr, cuts: set) -> list:
     """The equations whose outputs `jaxpr`'s first output, the loss, reads other than through `cuts`
     (outputs of the equations it stops at), and every equation inside a reached one's programs, which
@@ -745,7 +726,10 @@ def reached(jaxpr, cuts: set) -> list:
             continue
         found[id(eqn)] = eqn
         stack.extend(v for v in eqn.invars if isinstance(v, core.Var))
-    return list(_every(found.values()))
+    sys.path.insert(0, str(REPO / "tests"))
+    from reference_error import equations
+
+    return [inner for eqn in found.values() for inner in (eqn, *equations(eqn.params))]
 
 
 def _named(eqn) -> str:
