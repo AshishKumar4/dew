@@ -3,7 +3,9 @@
 Each case is a chain of the public presets and verbs, written as the recipe it replaced compiled:
 the frozen references are the batches the old loaders read. Images pin the public steps. Packed
 batches pin host Coordinates; packed text pins documents cut into pieces that share their boundary
-token, where 66beb5305 lost each piece's first next-token target. The other cases pin 66beb5305.
+token, where 66beb5305 lost each piece's first next-token target. The other cases pin 66beb5305. A
+host batch's documents' firsts (`Coordinates.firsts`, row 1923), which no old loader built, are Dew's
+own, recorded beside the frozen fields they derive from (its starts), every other field unchanged.
 """
 
 import functools

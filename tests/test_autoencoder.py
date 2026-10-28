@@ -326,34 +326,6 @@ def test_a_kl_loader_refuses_another_autoencoders_checkpoint(tmp_path, family):
         StableDiffusionVAE(str(folder), dtype=jnp.float32)
 
 
-def test_a_diffusers_flax_vae_loads_its_upsamplers_into_the_shared_upsampling(tmp_path):
-    """An SD1-era directory of diffusers' Flax `diffusion_flax_model.msgpack`, its upsamplers' convolutions
-    named `conv`, loads into the model's tree (each the shared upsampling's `Conv_0`) and decodes as the
-    model bound to those weights."""
-    from flax.serialization import msgpack_serialize
-
-    reference = tiny_vae()
-    published = jax.tree.map(np.asarray, reference.params)
-
-    def diffusers(tree):
-        def renamed(name, value):
-            if name.startswith("upsamplers_"):
-                return {"conv" if part == "Conv_0" else part: leaf for part, leaf in value.items()}
-            return diffusers(value) if isinstance(value, dict) else value
-
-        return {name: renamed(name, value) for name, value in tree.items()}
-
-    (tmp_path / "config.json").write_text(json.dumps({
-        "_class_name": "FlaxAutoencoderKL", "block_out_channels": [8, 16, 16], "layers_per_block": 1,
-        "norm_num_groups": 4, "latent_channels": 4, "in_channels": 3, "out_channels": 3}))
-    (tmp_path / "diffusion_flax_model.msgpack").write_bytes(msgpack_serialize(diffusers(published)))
-    loaded = StableDiffusionVAE(str(tmp_path), dtype=jnp.float32, latent_scale=1.0)
-    assert jax.tree.structure(loaded.params) == jax.tree.structure(published)
-    latent = jax.random.normal(jax.random.key(0), (1, 4, 4, 4))
-    np.testing.assert_array_equal(np.asarray(loaded.decode(loaded.params, latent)),
-                                  np.asarray(reference.decode(reference.params, latent)))
-
-
 def test_a_kl_config_naming_no_class_is_an_autoencoder_kls():
     """An older AutoencoderKL's config names no class; the KL loaders take it as one."""
     from dew.nn.autoencoders.api import check_class

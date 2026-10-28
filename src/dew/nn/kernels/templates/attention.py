@@ -180,8 +180,9 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     query's key intervals `[lo, hi)`, R of them, static, whose union it may see, intersected with all the
     rest: a window over `positions` is searched within each run alone, whose key places never decrease
     (its builder's contract: a layout whose places restart, as a decision row's options do, splits its
-    runs there), so the spans keep R intervals a query `[B, Q, R]`. Lengths and starts are int32 token
-    coordinates; places and ids keep their own dtypes."""
+    runs there), so the spans keep R intervals a query `[B, Q, R]`, but one run a query, which is one
+    interval `[B, Q]` as every mainloop walks it. Lengths and starts are int32 token coordinates; places
+    and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
     from dew.nn.visibility import block_ends, block_starts, window_sides
 
@@ -295,10 +296,11 @@ def _chunk_of(places, chunk: int) -> jax.Array:
 
 def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
                  by_places: list[tuple[jax.Array, jax.Array, jax.Array]]) -> tuple[jax.Array, jax.Array]:
-    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, `[B, Q, R]` each, and
-    each run's keys within each narrowing by places (`by_places`: its keys' values `[B, K]`, a window's
-    places or a chunk's numbers, and each query's least and greatest it keeps `[B, Q]`), searched in the run
-    alone, along which a run's places never decrease where the call's may restart between runs."""
+    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, `[B, Q, R]` each (one
+    run a query `[B, Q]`, the one interval every mainloop walks), and each run's keys within each narrowing
+    by places (`by_places`: its keys' values `[B, K]`, a window's places or a chunk's numbers, and each
+    query's least and greatest it keeps `[B, Q]`), searched in the run alone, along which a run's places
+    never decrease where the call's may restart between runs."""
     lo = jnp.maximum(jnp.clip(runs[..., 0], 0, keys), start[..., None])
     hi = jnp.maximum(jnp.minimum(jnp.clip(runs[..., 1], 0, keys), end[..., None]), lo)
     batch, _, count = lo.shape
@@ -307,7 +309,7 @@ def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
         first = _searched(values, flat_lo, flat_hi, jnp.repeat(least, count, axis=1), "left")
         last = _searched(values, flat_lo, flat_hi, jnp.repeat(greatest, count, axis=1), "right")
         lo, hi = first.reshape(lo.shape), jnp.maximum(last, first).reshape(hi.shape)
-    return lo, hi
+    return (lo[..., 0], hi[..., 0]) if count == 1 else (lo, hi)
 
 
 def _valid_ids(query_ids: jax.Array | None, key_ids: jax.Array | None, valid: jax.Array, batch: int,
@@ -692,6 +694,37 @@ def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
             return value[row, :, head]
 
 
+def prescale(dtype, width: int, scale: float) -> tuple[float, float]:
+    """The power of two a call's queries take before their products with the keys, and the scale left after
+    it: where the products of `dtype` operands `width` wide can pass fp32's largest (bf16's and fp32's),
+    `scale`'s power of two at or below its magnitude, so no product the reference keeps finite overflows
+    here (it scales the query before its products, `dew.nn.attention`): Q 2^127 and K 4 over a width of 16,
+    a product of 2^129 where the reference's is 2^127; else 1 and `scale` (fp16's products never pass it). A
+    power of two scales exactly, so the logits, the weights and the gradients (`gradients`: the cotangents
+    at the whole scale against the call's own queries and keys, no product taken back by the power) are the
+    unscaled call's bit for bit where every value stays in fp32's normal range and the form is the same: a
+    whole scale below `algebra.RAW_SCALES` leaves one that takes the raw form (`algebra.Forward.raw`), whose
+    differences round otherwise."""
+    largest = float(jnp.finfo(dtype).max)
+    if scale == 0 or largest * largest * width < float(jnp.finfo(jnp.float32).max):
+        return 1.0, scale
+    # Never above 1: a scale of 1 or more makes the reference's products no smaller than these.
+    power = min(2.0 ** math.floor(math.log2(abs(scale))), 1.0)
+    return power, scale / power
+
+
+def by_power(query: jax.Array, power: float) -> jax.Array:
+    """`query` taken by its call's power of two (`prescale`) for its products with the keys, in its dtype."""
+    return query if power == 1.0 else query * jnp.asarray(power, query.dtype)
+
+
+def prescaled(query: jax.Array, scale: float) -> tuple[jax.Array, float, float]:
+    """`query` taken by its call's power of two before its products (`prescale`, `by_power`), the scale
+    left after it, and the power."""
+    power, left = prescale(query.dtype, query.shape[-1], scale)
+    return by_power(query, power), left, power
+
+
 def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None) -> jax.Array:
     """The scores `[B, H, Q, K]` the template's softmax takes, as `reference` computes them: the products
@@ -1072,31 +1105,33 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
               residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
               scale: float | None = None, rounded: bool = True) -> Gradients:
     """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from the
-    forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first
-    holding the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's
-    `launch` (the Triton one, `attention_triton.backward`; the plain-JAX one,
-    `attention_portable.backward`): the call padded to whole `block`s (`padded_call`), `launch(query, key,
-    value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value, others, own, others_total,
-    total, start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds, score_dtypes, scale)`
-    giving dQ, the softmax's rows (`D - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it
-    chose it, the dQ program's hook gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's
-    (`DKV_GRADS`); each gradient fp32, then rounded to its input's dtype. D is taken two ways, about 0 and
-    about the anchor key's `v_c · dO`, each query the nearer, from the forward's split sums
-    (`attention_algebra.split_delta`) or a first pass of the dQ launch's own over the keys at the
-    forward's maximum (`off_anchor_delta`): the anchor key's `dP - c` enters as exactly 0; the main pass
-    then refines D once from its own sums for the dK/dV launch and the head, query and initial state's
-    gradients (`attention_algebra.refinement`). The output hook is no part of it: a differentiated call
-    applies `output_mod` past the kernel, where its own derivative runs, and passes `dout` before it.
-    Deterministic where `launch` writes every gradient element from one program (the two-launch schedules: a
-    head parameter's partial sums added in a fixed order and a key head's query heads summed in XLA); the
-    Mosaic one-launch schedule adds dQ's tiles atomically, in their arrival order."""
+    forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first holding
+    the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's `launch` (the
+    Triton one, `attention_triton.backward`; the plain-JAX one, `attention_portable.backward`): the call
+    padded to whole `block`s (`padded_call`), `launch(query, key, value, dout, peak0, total0, initial_term,
+    maximum, key_index, anchor_value, others, own, others_total, total, start, end, query_ids, key_ids,
+    score_params, *, score_mod, score_kinds, score_dtypes, scale, prescale)` giving dQ, the softmax's rows (`D
+    - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ program's hook
+    gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's (`DKV_GRADS`); each gradient fp32, then
+    rounded to its input's dtype. D is taken two ways, about 0 and about the anchor key's `v_c · dO`, each
+    query the nearer, from the forward's split sums (`attention_algebra.split_delta`) or a first pass of the
+    dQ launch's own over the keys at the forward's maximum (`off_anchor_delta`): the anchor key's `dP - c`
+    enters as exactly 0; the main pass then refines D once from its own sums for the dK/dV launch and the
+    head, query and initial state's gradients (`attention_algebra.refinement`). The output hook is no part of
+    it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
+    `dout` before it. Deterministic where `launch` writes every gradient element from one program (the
+    two-launch schedules: a head parameter's partial sums added in a fixed order and a key head's query heads
+    summed in XLA); the Mosaic one-launch schedule adds dQ's tiles atomically, in their arrival order."""
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
     batch, queries, heads, width = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
-    scale = width ** -0.5 if scale is None else scale
+    # The logits taken as the forward took them (`prescale`): every launch recomputes them from the query
+    # taken by the power, at the scale left, and takes the gradients' cotangents at the call's whole scale
+    # against the call's own keys and queries, so no factor of the power is taken back from a product.
+    power, scale = prescale(query.dtype, width, width ** -0.5 if scale is None else scale)
     # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
     dout = dout.astype(query.dtype)
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
@@ -1131,7 +1166,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     maximum = call.rows(maxima.astype(jnp.float32))
     outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
                      shift, others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
-                     score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
+                     score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale,
+                     prescale=power)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[7:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]

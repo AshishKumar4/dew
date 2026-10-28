@@ -150,6 +150,30 @@ def test_packed_documents_restart_their_windows_and_chunks(span, implementation)
 
 
 @pytest.mark.parametrize("implementation", ["xla", "template"])
+@pytest.mark.parametrize("real", [range(4, 12), (1, 2, 5, 6, 9, 11)], ids=["left-padded", "holey"])
+def test_a_chunked_row_with_padding_before_and_among_its_tokens_chunks_its_tokens(real, implementation):
+    """Chunks of 2 count a row's real tokens from its first: four padding slots before eight tokens, and six
+    tokens among padding across three chunks, each real query reading its chunk's real keys at or before
+    it, on par with the dense mask over them (check 1). Compacted (`compacted`), the padding sits after the
+    tokens at places that restart, which the template's span builder reads as no document's (row 1991's
+    review: searched as the row's own places, the last chunk's queries read nothing)."""
+    length, chunk = 12, 2
+    valid = np.zeros((2, length), bool)
+    valid[:, list(real)] = True
+    rank = np.cumsum(valid, axis=1) - 1
+    keep = (valid[:, :, None] & valid[:, None, :] & (rank[:, None, :] <= rank[:, :, None])
+            & (rank[:, :, None] // chunk == rank[:, None, :] // chunk))
+
+    def band(q, k, v):
+        places = counted_places(valid=jnp.asarray(valid))
+        return on_rows(local_attention(q, k, v, chunk=chunk, places=places, valid=jnp.asarray(valid),
+                                       implementation=implementation), valid)
+
+    assert_as_exact(jax.jit(band), jax.jit(masked(keep, valid)), drawn(length),
+                    f"{implementation} chunks over {list(real)}", seeds=SEEDS['chunk'])
+
+
+@pytest.mark.parametrize("implementation", ["xla", "template"])
 @pytest.mark.parametrize("given", ["origin", "repeated", "wide", "narrow"])
 @pytest.mark.parametrize("length", [12, 8], ids=["banded", "dense"])
 def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, length, implementation):

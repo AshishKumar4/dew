@@ -83,7 +83,7 @@ class _Upsampler(nn.Module):
     def __call__(self, x):
         if self.temporal:
             _TimeConv(self.features, 2 * self.features, name="time_conv")()
-        return Upsample(self.features, 2, dtype=jnp.dtype(self.dtype), name="resample")(x)
+        return Upsample(self.features, 2, dtype=jnp.dtype(self.dtype), conv="conv", name="resample")(x)
 
 
 def _average_down(x, features: int, temporal: bool, spatial: int):
@@ -325,10 +325,7 @@ def qwen_image_vae_path(name: str, ndim: int) -> tuple[str, ...]:
         raise ValueError(f"{name!r} is not an AutoencoderKLQwenImage21 tensor")
     # The attention's output conv is `proj` in the source; a bare `proj`
     # names the sharded feed-forward projections elsewhere in Dew.
-    # A downsampler's conv is its own `conv`; an upsampler's is the shared upsampling's `Conv_0`
-    # (`blocks.Upsample`).
-    conv = "resample.Conv_0" if ".upsampler." in name else "resample.conv"
-    parts = name.replace("resample.1", conv).replace(".proj.", ".attention_out.").split(".")
+    parts = name.replace("resample.1", "resample.conv").replace(".proj.", ".attention_out.").split(".")
     leaf = parts.pop()
     if ndim not in _LEAF_RANK[leaf]:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, _LEAF_RANK[leaf]))}")

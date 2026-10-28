@@ -393,6 +393,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The call's query count where the launch pads past it (`algebra.Forward.queries`).
         queries = start.shape[1]
         padded = _padded(queries, key.shape[1], config)[0] > queries
+        # The form and geometry; the launch takes the scale and the query's power `gradients` gives it.
         spec = algebra.Forward(spans.form, spans.keys, ids=query_ids is not None, scale=self.scale,
                                score_mod=self.score_mod, natural=self.natural, initial=initial is not None,
                                queries=queries if padded else None)

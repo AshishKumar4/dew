@@ -94,7 +94,8 @@ class _Level(nn.Module):
         if self.resample == "down":
             return FlaxDownsample2D(self.out_channels, dtype=self.dtype, name="downsamplers_0")(hidden_states)
         if self.resample == "up":
-            return Upsample(self.out_channels, 2, dtype=self.dtype, name="upsamplers_0")(hidden_states)
+            return Upsample(self.out_channels, 2, dtype=self.dtype, conv="conv",
+                            name="upsamplers_0")(hidden_states)
         return hidden_states
 
 
@@ -176,13 +177,12 @@ _VAE_ATTENTION = {"to_q": "query", "to_k": "key", "to_v": "value"}
 def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     """Map one diffusers AutoencoderKL tensor name to its path in this tree.
 
-    Four names differ. diffusers numbers repeated children with a dot
+    Three names differ. diffusers numbers repeated children with a dot
     (`down_blocks.0`) where linen uses an underscore (`down_blocks_0`). It
     calls the mid-block attention's projections `to_q/to_k/to_v/to_out.0`
     where `FlaxAttentionBlock` calls them `query/key/value/proj_attn`. It
     stores every gain as `weight`, where linen has a norm's `scale` and a
-    convolution's or a dense's `kernel`, which `rank` tells apart. An
-    upsampler's `conv` is the shared upsampling's `Conv_0`.
+    convolution's or a dense's `kernel`, which `rank` tells apart.
     """
     parts = torch_name.split(".")
     leaf = "bias" if parts[-1] == "bias" else ("scale" if rank == 1 else "kernel")
@@ -190,9 +190,6 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     # to_out.0 is the projection, the module's last; there is no second entry.
     if names[-2:] == ["to_out", "0"]:
         names[-2:] = ["proj_attn"]
-    # An upsampler is the shared nearest-upsample convolution (`blocks.Upsample`), its conv `Conv_0`.
-    if names[-3:-1] == ["upsamplers", "0"] and names[-1] == "conv":
-        names[-1] = "Conv_0"
     return (*indexed_path(_VAE_ATTENTION.get(name, name) for name in names), leaf)
 
 
@@ -369,23 +366,13 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
 
 
 def _restored(msgpack: Path) -> dict:
-    """diffusers' Flax VAE params in `msgpack`, each upsampler's convolution the shared upsampling's
-    (`_shared_upsamplers`)."""
+    """diffusers' Flax VAE params in `msgpack`, the tree this module's is."""
     from flax.serialization import msgpack_restore
 
     restored = msgpack_restore(msgpack.read_bytes())
     if not isinstance(restored, dict):
         raise ValueError(f"{msgpack} does not hold a param tree")
-    return _shared_upsamplers(restored)
-
-
-def _shared_upsamplers(tree: dict) -> dict:
-    """diffusers' Flax tree with each upsampler's `conv` the shared upsampling's `Conv_0`
-    (`blocks.Upsample`), as `_vae_path` maps the torch tensors."""
-    return {name: ({"Conv_0" if part == "conv" else part: leaf for part, leaf in value.items()}
-                   if name.startswith("upsamplers_") and isinstance(value, dict)
-                   else _shared_upsamplers(value) if isinstance(value, dict) else value)
-            for name, value in tree.items()}
+    return restored
 
 
 def _read_vae_weights(directory: Path) -> dict:

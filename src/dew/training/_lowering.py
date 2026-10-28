@@ -29,7 +29,6 @@ import logging
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import cast
 
 import jax
 from jax.extend.mlir import ir
@@ -61,12 +60,13 @@ class KernelCall:
 
 @dataclass(frozen=True)
 class CustomCall:
-    """One custom call of a lowered program: its target and the shapes of the arrays it reads and
-    writes."""
+    """One custom call of a lowered program: its target, the shapes of the arrays it reads and writes, and
+    the element types of those it reads (MLIR's spelling, `i32`, `bf16`)."""
 
     target: str
     operands: tuple[tuple[int, ...], ...]
     results: tuple[tuple[int, ...], ...]
+    operand_types: tuple[str, ...] = ()
 
 
 def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
@@ -106,12 +106,16 @@ def operations(lowered: jax.stages.Lowered) -> list[str]:
 
 def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
     """Every custom call a lowered program makes, in program order."""
+    def ranked(values):
+        return [ir.RankedTensorType(value.type) for value in values
+                if isinstance(value.type, ir.RankedTensorType)]
+
     def shapes(values) -> tuple[tuple[int, ...], ...]:
-        return tuple(tuple(value.type.shape) for value in values
-                     if isinstance(value.type, ir.RankedTensorType))
+        return tuple(tuple(kind.shape) for kind in ranked(values))
 
     return _read_calls(lowered, lambda target, operation: CustomCall(
-        target, shapes(operation.operands), shapes(operation.results)))
+        target, shapes(operation.operands), shapes(operation.results),
+        tuple(str(kind.element_type) for kind in ranked(operation.operands))))
 
 
 def kernel_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
@@ -160,15 +164,13 @@ def _kernel_name(location: ir.Location) -> str | None:
 
 
 def _named(location: ir.Location) -> str | None:
-    """The name a location carries: a name location's own, a call site's callee's, or the first of a fused
-    location's parts that carries one; None where none does."""
+    """The name a location carries, as JAX lowers an equation's (`mlir._source_info_to_location`): a name
+    location's own (its name stack), or a call site's callee's (a traceback without a name stack); None
+    where it carries none."""
     if location.typeid == ir.NameLoc.static_typeid:
         return ir.NameLoc(location).name_str
     if location.typeid == ir.CallSiteLoc.static_typeid:
         return _named(ir.CallSiteLoc(location).callee)
-    if location.typeid == ir.FusedLoc.static_typeid:
-        parts = cast("list[ir.Location]", ir.FusedLoc(location).locations)
-        return next((name for name in map(_named, parts) if name is not None), None)
     return None
 
 
