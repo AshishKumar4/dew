@@ -435,6 +435,10 @@ class TrainerConfig:
 
     False disables this save; cadenced, ranked and preemption saves keep their own policy.
     """
+    scored_to: str | None = None
+    """A directory that takes every validation batch's scoring artifacts at each evaluation, a decision
+    run's decisions among them, as `<scored_to>/step-<step>/<split>-<batch>.npz`, for pooling a pass's
+    metrics offline (`Trainer.fit`'s `scored_to`); None writes none."""
     accumulation: int = 1
     """The number of steps per optimizer update."""
     split: int | None = None
@@ -1491,8 +1495,22 @@ class RunConfig:
             # The whole pool accepts the resume before its record is replaced or its state restored.
             agreed("run resume", check_resumed)
             agreed("run metadata", record_run)
-            state = self._fit(objective, dataset, validation, suites=suites, steps=steps, metrics=metrics,
-                              rollout=rollout, checkpoints=checkpoints, tracker=tracker)
+            # The trainer (`built`) holds mesh, microbatches, layout, accumulation, split, dynamic_scale,
+            # profile, tune_kernels and any step compiled ahead; prepare_process read the process fields,
+            # and the rest are fit's arguments or built the checkpoints and the tracker.
+            ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
+            state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
+                               profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
+                dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
+                eval_every=trainer.eval_interval(dataset),
+                checkpoint_every=trainer.checkpoint_interval(dataset),
+                checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
+                metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
+                best=trainer.best_policies(), stop=trainer.stop, cooldowns=trainer.cooldowns,
+                resume=trainer.resume,
+                # A run that names no metrics and validates no split has no suite to score.
+                validation=validation if suites is None else suites or None, summaries=self.val_summaries,
+            )
             if after is not None:
                 after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
@@ -1507,29 +1525,6 @@ class RunConfig:
 
         finally:
             _closed(tracker, checkpoints, sys.exception())
-
-    def _fit(self, objective: Objective[Loss, Effects], dataset: Loader,
-             validation: Mapping[str, Reader] | None, *, suites: Mapping[str, EvalSuite] | None,
-             steps: int | None, metrics: Sequence[Metric], rollout: Rollout | None, checkpoints: Checkpoints,
-             tracker: Tracker) -> TrainState:
-        """The run's training (`train`): its trainer (`built`) over the config's mesh, with the run's
-        checkpoints and tracker, its profile, lowering and any step compiled ahead (`ahead`), fit on
-        `dataset` at its length, cadences and policies; prepare_process read the process fields."""
-        trainer = self.trainer
-        ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
-        return self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
-                          profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
-            dataset, steps=steps, tokens=trainer.tokens,
-            log_every=trainer.log_every,
-            eval_every=trainer.eval_interval(dataset),
-            checkpoint_every=trainer.checkpoint_interval(dataset),
-            checkpoint_final=trainer.checkpoint_final,
-            metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
-            best=trainer.best_policies(), stop=trainer.stop, cooldowns=trainer.cooldowns,
-            resume=trainer.resume,
-            # A run that names no metrics and validates no split has no suite to score.
-            validation=validation if suites is None else suites or None, summaries=self.val_summaries,
-        )
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
                                          steps: int | None, rollout: Rollout | None) -> CompiledAhead:

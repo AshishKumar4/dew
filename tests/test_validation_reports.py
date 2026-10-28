@@ -102,3 +102,7 @@ def test_a_pass_writes_every_batchs_decisions_where_asked(tmp_path):
     assert [path.name for path in alone] == [path.name for path in files]
     for path, arrays in zip(alone, pooled, strict=True):
         np.testing.assert_array_equal(np.load(path)["scored"], arrays["scored"])
+    # A split whose name holds a dot keeps every batch's file, the extension after its whole name.
+    dotted = tmp_path / "dotted"
+    Evaluation.run(objective, variables, reader, key=0, metrics=(), split="test.v1", scored_to=dotted)
+    assert sorted(path.name for path in dotted.iterdir()) == ["test.v1-00000.npz", "test.v1-00001.npz"]
