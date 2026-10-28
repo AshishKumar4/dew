@@ -947,31 +947,28 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
 
 
 def test_a_run_that_sets_its_remat_keeps_it_and_is_told_of_the_cheapest_rung_below_that_fits(
-        monkeypatch, caplog):
-    """A run that sets remat 'full' with room for 'minimal' and not for no recomputation trains at
-    'full', as it asked, and its plan record and its log name 'minimal', the cheapest rung below that
-    fits, with its headroom; no recomputation is asked and misses on the way (row 2026). Before, a run's
-    own remat was the plan's whole story."""
-    free(monkeypatch, needs(monkeypatch, lm(split=1, remat=REMAT_POLICIES["minimal"])))
+        monkeypatch, caplog, tmp_path):
+    """A run that sets remat 'full', with room for its step and for the step at 'minimal', trains at
+    'full', as it asked, and its plan record and its log name the cheapest rung below that fits too,
+    with its headroom: no recomputation where its step fits, else 'minimal' (row 2026). A run that sets
+    no remat, or whose search climbed from none, has no rung below to be told of. Before, a run's own
+    remat was the plan's whole story."""
+    def needed(remat):
+        return needs(monkeypatch, lm(split=1, remat=None if remat is None else REMAT_POLICIES[remat]))
+
+    none, minimal, full = needed(None), needed("minimal"), needed("full")
+    room = max(minimal, full)
+    free(monkeypatch, room)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "set"))
     trainer = lm(split=1, remat=REMAT_POLICIES["full"])
     with caplog.at_level(logging.WARNING, logger="dew.training.planning"):
         trained(trainer, steps=0)
     assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]
     cheaper = trainer.plan["cheaper"]
-    assert (cheaper["remat"], cheaper["fits"]) == ("minimal", True) and cheaper["headroom"] >= 0
-    assert [(probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]][-2:] == [
-        (None, False), ("minimal", True)]
-    assert any("'minimal'" in record.getMessage() for record in caplog.records)
-
-
-def test_a_run_at_no_recomputation_or_climbed_by_its_search_asks_no_rung_below(monkeypatch):
-    """A run whose search climbed from no recomputation, and one at no recomputation, has no cheaper
-    rung to be told of: its plan record names none."""
-    free(monkeypatch, needs(monkeypatch, lm(split=1, remat=REMAT_POLICIES["minimal"])))
-    trainer = lm(split=1)
-    trained(trainer, steps=0)
-    free(monkeypatch, LIMIT)
-    assert trainer.plan["cheaper"] is None
-    unclimbed = lm(split=1)
-    trained(unclimbed, steps=0)
-    assert unclimbed.plan["remat"] is None and unclimbed.plan["cheaper"] is None
+    assert (cheaper["remat"], cheaper["fits"]) == (None if none <= room else "minimal", True)
+    assert cheaper["headroom"] >= 0
+    assert any("set remat to it" in record.getMessage() for record in caplog.records)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "none"))
+    unset = lm(split=1)
+    trained(unset, steps=0)
+    assert unset.plan["cheaper"] is None

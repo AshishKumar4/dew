@@ -648,10 +648,8 @@ class FitSearch[LossT, EffectsT]:
                 options = self.required if self.xla_defaults else self.options(candidate)
                 executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
                 fit, headroom = step_fits(executable, self.mesh, candidate.held)
-                probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-                self.probes.append(probe)
                 if fit:
-                    return probe
+                    return Probe.read(split, candidate, self.current(), fit, headroom, executable)
             return None
         finally:
             self.objective.substitute(held)
