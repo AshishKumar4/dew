@@ -1,29 +1,30 @@
-"""The Hub census's loads without weights (tools/hf_coverage.py `loads`, ledger 1891), over a Hub on the
-loopback (tests/local_hub.py), which keeps every request it answers."""
+"""The Hub census's loads without weights (tools/hf_coverage.py `census` then `loads`, ledger 1891), over a
+Hub on the loopback (tests/local_hub.py), which keeps every request it answers."""
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 from local_hub import LocalHub
-from tool_support import load
+from tool_support import REPO_ROOT, load
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
 
 def test_the_census_loads_each_model_without_its_weights_and_rows_each_refusal(tmp_path):
-    """Over a census of a local Hub's models, `loads` loads a published decoder (llama-tiny's files)
-    without its weights, its row its parameter count, as a load of the same files on disk counts it;
-    refuses a model of a type no family maps, its row naming the refusal; and rows a repo the Hub does
-    not hold, and one whose config the census could not read, as the Hub's answer. Each load read its
-    weight files' safetensors headers alone: what the Hub sent of the decoder's model.safetensors was
-    ranges of it, less than the file, and no weight file was cached (the boundary 1888's network test
-    checks on the Hub itself)."""
+    """The census lists a local Hub's models, each at the commit the listing states, and `loads` loads
+    each without its weights: a published decoder (llama-tiny's files), its row its parameter count, as
+    a load of the same files on disk counts it; a model of a type no family maps, refused, its row naming
+    the refusal; and a repo with no config, the Hub's row, as is a repo the Hub does not hold. No load
+    fetched a weight file: what the Hub sent of the decoder's model.safetensors was ranges of its first
+    bytes, where its safetensors header is read, less than the file, and no weight file was cached (the
+    boundary 1888's network test checks on the Hub itself)."""
     import jax
 
     from dew.interop import Pretrained
 
-    coverage = load("hf_coverage")
     source = FIXTURES / "llama-tiny"
     decoder = {name: source / name for name in ("config.json", "generation_config.json", "model.safetensors")}
     unknown = tmp_path / "unknown" / "config.json"
@@ -31,28 +32,31 @@ def test_the_census_loads_each_model_without_its_weights_and_rows_each_refusal(t
     unknown.write_text(json.dumps({**json.loads((source / "config.json").read_text()),
                                    "model_type": "census_unknown",
                                    "architectures": ["CensusUnknownForCausalLM"]}))
-    refused = {"config.json": unknown, "model.safetensors": source / "model.safetensors"}
-    with LocalHub({"local/decoder": decoder, "local/unknown": refused}) as hub:
-        (tmp_path / "census.json").write_text(json.dumps([
-            {"id": "local/decoder", "commit": hub.commit("local/decoder")},
-            {"id": "local/unknown", "commit": hub.commit("local/unknown")},
-            {"id": "local/absent", "commit": "0" * 40},
-            {"id": "local/gated", "commit": "1" * 40, "unread": "gated"}]))
+    repos = {"local/decoder": decoder,
+             "local/unknown": {"config.json": unknown, "model.safetensors": source / "model.safetensors"},
+             "local/bare": {"model.safetensors": source / "model.safetensors"}}
+    out = tmp_path / "census"
+    with LocalHub(repos) as hub:
         env = {**{name: value for name, value in os.environ.items()
                   if name not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")},
                "HF_ENDPOINT": hub.endpoint, "HF_HUB_CACHE": str(tmp_path / "cache"),
-               "DEW_HUB_ANSWERS": str(tmp_path / "answers"),
-               "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
-        rows = {row.id: row for row in coverage.loads(tmp_path, jobs=3, env=env)}
-    report = (tmp_path / "loads.md").read_text()
+               "DEW_HUB_ANSWERS": str(tmp_path / "answers"), "PYTHONPATH": str(REPO_ROOT / "src")}
+        for command in (["census", str(out), "10"], ["loads", str(out), "--jobs", "3"]):
+            done = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "hf_coverage.py"), *command],
+                                  env=env, capture_output=True, text=True, check=False)
+            assert done.returncode == 0, done.stderr[-3000:]
+        absent = load("hf_coverage").loaded("local/absent", "0" * 40, env)
+    rows = {row["id"]: row for row in json.loads((out / "loads.json").read_text())}
+    report = (out / "loads.md").read_text()
     held = Pretrained.load(source, weights=False, dtype="bfloat16")
-    assert rows["local/decoder"].outcome == "loads", report
-    assert rows["local/decoder"].parameters == sum(leaf.size for leaf in jax.tree.leaves(held.variables))
-    assert rows["local/unknown"].outcome == "refused", report
-    assert "census_unknown" in (rows["local/unknown"].reason or ""), report
-    assert rows["local/absent"].outcome == "hub", report
-    assert (rows["local/gated"].outcome, rows["local/gated"].reason) == ("hub", "gated"), report
+    assert rows["local/decoder"]["commit"] == hub.commit("local/decoder"), report
+    assert rows["local/decoder"]["outcome"] == "loads", report
+    assert rows["local/decoder"]["parameters"] == sum(leaf.size for leaf in jax.tree.leaves(held.variables))
+    assert rows["local/unknown"]["outcome"] == "refused", report
+    assert "census_unknown" in (rows["local/unknown"]["reason"] or ""), report
+    assert (rows["local/bare"]["outcome"], rows["local/bare"]["reason"]) == ("hub", "no config.json"), report
+    assert absent.outcome == "hub" and "RepositoryNotFoundError" in (absent.reason or ""), absent
     reads = hub.sent("local/decoder", "model.safetensors")
-    assert reads and all(read.asked is not None for read in reads), hub.served
+    assert reads and all(read.asked is not None and read.asked[0] in (0, 8) for read in reads), hub.served
     assert sum(read.sent for read in reads) < decoder["model.safetensors"].stat().st_size, hub.served
     assert not [path for path in (tmp_path / "cache").rglob("*") if path.suffix in (".safetensors", ".bin")]

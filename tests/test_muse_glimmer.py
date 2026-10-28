@@ -147,24 +147,30 @@ def wrapper(tmp_path_factory):
     return directory, model, float64_twin(model)
 
 
+GEOMETRY = {"patch_size": VISION["patch_size"], "temporal_patch_size": VISION["patch_temporal"],
+            "merge_size": VISION["merge_size"], "do_resize": False, "do_rescale": False,
+            "do_normalize": False, "do_convert_rgb": False}
+"""The image and video processors' patch geometry, the tower's, with every step before patching off: a
+drawn image or video is already the tower's size and range."""
+
+
 def packed_image(image) -> dict[str, np.ndarray]:
     """`image` `[1, 3, H, W]` as the image processor packs it: its patch vectors and its grid."""
     from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
 
-    packed, _, _ = MuseGlimmerImageProcessor.patchify(None, torch.from_numpy(np.asarray(image)),
-                                                      VISION["patch_size"], VISION["patch_temporal"])
-    side = IMAGE_SIDE // VISION["patch_size"]
-    return {"pixel_values": packed[0].numpy(), "image_grid_thw": np.asarray([[1, side, side]])}
+    packed = MuseGlimmerImageProcessor(**GEOMETRY)(images=[torch.from_numpy(np.asarray(image)[0])],
+                                                    return_tensors="np")
+    return {"pixel_values": packed["pixel_values"], "image_grid_thw": packed["image_grid_thw"]}
 
 
 def packed_video(video) -> dict[str, np.ndarray]:
-    """`video` `[1, T, 3, H, W]` as the video processor packs it: its patch vectors, each a temporal
-    patch's, and its grid."""
+    """`video` `[1, T, 3, H, W]` as the video processor packs it, its frames as they are: its patch
+    vectors, each a temporal patch's (the last frame repeated to fill the last), and its grid."""
     from transformers.models.muse_glimmer.video_processing_muse_glimmer import MuseGlimmerVideoProcessor
 
-    packed, time, height, width = MuseGlimmerVideoProcessor.patchify(
-        None, torch.from_numpy(np.asarray(video)), VISION["patch_size"], VISION["patch_temporal"])
-    return {"pixel_values_videos": packed[0].numpy(), "video_grid_thw": np.asarray([[time, height, width]])}
+    packed = MuseGlimmerVideoProcessor(**GEOMETRY, do_sample_frames=False)(
+        videos=[torch.from_numpy(np.asarray(video)[0])], return_tensors="np")
+    return {"pixel_values_videos": packed["pixel_values_videos"], "video_grid_thw": packed["video_grid_thw"]}
 
 
 def wrapper_logits(model, ids, image=None, video=None):

@@ -24,7 +24,7 @@ transformers does not know (remote code only) have no reference to verify
 against and are counted apart. The shares are of downloads, over all types
 and over the most downloaded 200 and 50. Writes coverage.json. `loads`
 loads each model of the census by `Pretrained.load(weights=False)`, its
-config and its weights' safetensors headers read and no weight fetched, each
+config and its weights' safetensors headers read and no weight file fetched, each
 in a process of its own (`loaded`), so one model's refusal, whatever it
 raises, and its memory reach no other; it writes loads.json and loads.md, a
 row a model: it loads, with its parameter count; Dew refuses it, with the
@@ -59,9 +59,10 @@ def census(out: Path, limit: int, tags: Sequence[str] = ("text-generation",),
     from huggingface_hub.errors import EntryNotFoundError, GatedRepoError, RepositoryNotFoundError
 
     rows = []
+    # A listing states a model's commit and downloads only where asked (`expand`).
     listed = {info.id: info for tag in tags for order in orders
               for info in HfApi().list_models(pipeline_tag=tag, sort=order, limit=limit,
-                                              filter=list(filters) or None)}
+                                              filter=list(filters) or None, expand=["sha", "downloads"])}
     for info in listed.values():
         row = {"id": info.id, "commit": info.sha, "downloads": info.downloads or 0}
         try:
@@ -221,14 +222,27 @@ def classify(out: Path) -> None:
     print(json.dumps(summary, indent=1))
 
 
-_LOAD = """
+HUB_EXIT = 3
+"""The exit status of a load (`_LOAD`) the Hub refused, its error on its last line."""
+
+_LOAD = f"""
 import sys
+import httpx
 import jax
+from huggingface_hub.errors import HfHubHTTPError
 from dew.interop import Pretrained
-loaded = Pretrained.load(sys.argv[1], revision=sys.argv[2], weights=False, dtype="bfloat16")
-print(sum(leaf.size for leaf in jax.tree.leaves(loaded.variables)))
+try:
+    loaded = Pretrained.load(sys.argv[1], revision=sys.argv[2], weights=False, dtype="bfloat16")
+except (HfHubHTTPError, httpx.TransportError) as error:
+    print(f"{{type(error).__name__}}: {{error}}".replace(chr(10), " "))
+    sys.exit({HUB_EXIT})
+leaves = jax.tree.leaves(loaded.variables)
+if not leaves or not all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in leaves):
+    raise ValueError("a load without its weights holds values")
+print(sum(leaf.size for leaf in leaves))
 """
-"""A model loaded without its weights in a process of its own: its parameter count on the last line."""
+"""A model loaded without its weights in a process of its own, every leaf a shape alone: its parameter
+count on the last line; or the Hub's error (an HTTP error or a failed transport), exiting `HUB_EXIT`."""
 
 
 @dataclass(frozen=True)
@@ -246,15 +260,15 @@ class Load:
 
 def loaded(repo: str, commit: str, env: dict[str, str] | None = None) -> Load:
     """`repo` at `commit` loaded without its weights in a process of its own (`_LOAD`) under `env`
-    (this process's by default): a refusal is the exception the process ended on (`ended_on`), the
-    Hub's where it is one of `huggingface_hub`'s errors."""
+    (this process's by default): the Hub's error where it refused the repo, else Dew's refusal, the
+    exception the process ended on (`ended_on`)."""
     done = subprocess.run([sys.executable, "-c", _LOAD, repo, commit], env=env, capture_output=True,
                           text=True, check=False)
     if done.returncode == 0:
         return Load(repo, commit, "loads", parameters=int(done.stdout.split()[-1]))
-    reason = ended_on(done.stderr) or f"exit {done.returncode}"
-    return Load(repo, commit, "hub" if reason.startswith("huggingface_hub.errors.") else "refused",
-                reason=reason)
+    if done.returncode == HUB_EXIT:
+        return Load(repo, commit, "hub", reason=done.stdout.strip().splitlines()[-1])
+    return Load(repo, commit, "refused", reason=ended_on(done.stderr) or f"exit {done.returncode}")
 
 
 def ended_on(stderr: str) -> str:

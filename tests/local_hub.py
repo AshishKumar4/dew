@@ -1,8 +1,9 @@
 """A Hugging Face Hub on the loopback, for tests at the Hub's boundary without the network: it serves
-repos of local files, each at one commit, over the HTTP routes `huggingface_hub` calls (a repo's info,
-its tree, a file's metadata and its bytes, a range of them as a safetensors header read asks), and keeps
-every request it answers (`LocalHub.served`), so a test counts what a load fetched. A process reaches it
-through `HF_ENDPOINT` (`LocalHub.endpoint`), which `huggingface_hub` reads when it is imported."""
+repos of local files, each at one commit, over the HTTP routes `huggingface_hub` calls (a listing of its
+models, a repo's info, its tree, a file's metadata and its bytes, a range of them as a safetensors header
+read asks), and keeps every request it answers, a missing repo's or file's too (`LocalHub.served`), so a
+test counts what a load fetched. A process reaches it through `HF_ENDPOINT` (`LocalHub.endpoint`), which
+`huggingface_hub` reads when it is imported."""
 
 import hashlib
 import json
@@ -12,16 +13,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 @dataclass(frozen=True)
 class Served:
-    """One request the Hub answered: its method, the repo it named, the repo file (None for an API
-    route), the byte range it asked (None for the whole file) and the bytes of the file it sent."""
+    """One request the Hub answered: its method, the repo it named (None for the listing), the repo file
+    (None for an API route), the byte range it asked (None for the whole file) and the bytes of the file
+    it sent (none for a missing repo or file)."""
 
     method: str
-    repo: str
+    repo: str | None
     file: str | None
     asked: tuple[int, int] | None
     sent: int
@@ -64,6 +66,7 @@ class LocalHub:
                 if (served.repo, served.file, served.method) == (repo, file, "GET")]
 
 
+_LISTING = "/api/models"
 _API = re.compile(r"/api/models/(?P<repo>[^/]+/[^/]+)(?:/revision/(?P<revision>[^/]+)"
                   r"|/tree/(?P<tree>[^/]+)(?:/(?P<folder>.+))?)?")
 _FILE = re.compile(r"/(?P<repo>[^/]+/[^/]+)/resolve/(?P<revision>[^/]+)/(?P<file>.+)")
@@ -85,10 +88,23 @@ def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
             self._answer(head=False)
 
         def _answer(self, *, head: bool) -> None:
-            path = unquote(urlsplit(self.path).path)
+            address = urlsplit(self.path)
+            path = unquote(address.path)
+            if path == _LISTING:
+                # Every repo, whatever the listing filters, each with the fields `expand` asks, as the Hub
+                # states a commit and downloads only where asked.
+                hub.served.append(Served(self.command, None, None, None, 0))
+                expand = parse_qs(address.query).get("expand", [])
+                self._json([{"id": repo, "modelId": repo,
+                             **({"sha": hub.commit(repo)} if "sha" in expand else {}),
+                             **({"downloads": 0} if "downloads" in expand else {})} for repo in hub.repos],
+                           head=head)
+                return
             api, file = _API.fullmatch(path), _FILE.fullmatch(path)
             match = api or file
             if match is None or match["repo"] not in hub.repos:
+                hub.served.append(Served(self.command, None if match is None else match["repo"],
+                                         None if file is None else file["file"], None, 0))
                 self._missing("RepoNotFound", head=head)
                 return
             repo = match["repo"]
@@ -109,6 +125,7 @@ def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
                 return
             name = file["file"]
             if name not in files:
+                hub.served.append(Served(self.command, repo, name, None, 0))
                 self._missing("EntryNotFound", head=head, commit=commit)
                 return
             body = files[name].read_bytes()
