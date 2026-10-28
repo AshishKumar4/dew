@@ -1327,7 +1327,9 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
     if call.per_key:
         given = {"gates": ((CHUNK, width), gates), "lows": ((CHUNK, width), gates),
                  "scores": ((CHUNK, CHUNK), held)}
-        staging = _staging(held, (CHUNK, call.block))
+        # A key block's gated queries, then the scores, square: the key block narrows below a chunk
+        # (`_narrowed`).
+        staging = _staging(held, (CHUNK, call.block), (CHUNK, CHUNK))
     else:
         given = {"keys": ((CHUNK, width), call.given)}
         staging = _staging(held, (CHUNK, CHUNK))
@@ -1371,7 +1373,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 streams, staging, landing):
         n, h = _axis("chunks"), _axis("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
-        (staged,) = staging
+        staged, *scored = staging
         if call.per_key:
             given = {"gates": gates.views(hi_ref, row, CHUNK, h * width, width),
                      "lows": gates.views(lo_ref, row, CHUNK, h * width, width),
@@ -1406,7 +1408,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 out = algebra.key_decayed_output(
                     lambda c: block("queries", call.given, c).value(), decays, entered, width // call.block,
                     _tile(slots, "scores", held).value().astype(jnp.float32), value, scale,
-                    _Issuer(call, {"memory": staged, "local": staged}))
+                    _Issuer(call, {"memory": staged, "local": scored[0]}))
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
                 (gate, low), laid = loaded
