@@ -138,6 +138,8 @@ class AheadOfTime:
     planned_seconds: float | None = None
     """The seconds that search took, its derivations and every compile: the time a run spends planning
     before its first step on those GPUs."""
+    capacity: int | None = None
+    """The stated bytes per target GPU, or None where no memory capacity was supplied."""
 
     @property
     def peak_bytes(self) -> int:
@@ -201,6 +203,11 @@ class AheadTarget:
     path: str
     capacity_gib: float | None = None
 
+    @property
+    def capacity(self) -> int | None:
+        """The stated bytes per GPU, read both when building its topology and when planning."""
+        return None if self.capacity_gib is None else int(self.capacity_gib * 2**30)
+
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
                                   steps: int | None) -> CompiledAhead:
         """`trainer`, built over this target's devices (`compile_only_gpus`), its first step over
@@ -214,8 +221,7 @@ class AheadTarget:
                              "its rollout's, which it makes only as it trains")
         trainer.reading(loader)
         trainer.validate(steps=steps)
-        capacity = None if self.capacity_gib is None else int(self.capacity_gib * 2**30)
-        ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh), capacity)
+        ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh), self.capacity)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -274,8 +280,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     if capacity is not None:
         mesh = trainer.device_mesh
         devices = compile_only_gpus(generation, len(devices), capacity)
-        trainer.mesh = jax.sharding.Mesh(np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names,
-                                         axis_types=mesh.axis_types)
+        trainer.mesh = trainer.device_mesh = jax.sharding.Mesh(
+            np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names, axis_types=mesh.axis_types)
     began = time.perf_counter()
     start = trainer._started()
     with assumed(generation):
@@ -292,4 +298,5 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         flops=step_flops(compiled),
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
-        code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds)
+        code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
+        capacity=capacity)

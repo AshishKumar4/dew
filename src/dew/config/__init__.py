@@ -1540,7 +1540,7 @@ class RunConfig:
         compile-only GPUs, with no checkpoints or tracker: what ends a run that compiles ahead."""
         target = self.trainer.compile_ahead
         assert target is not None
-        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices))
+        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
         return target.compiled(self.built(objective, mesh, rollout), dataset, steps)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],

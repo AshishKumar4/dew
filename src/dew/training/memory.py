@@ -268,8 +268,7 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
         return None
     # A device that states no memory, one compiled for and absent (`compile_only_gpus`), holds the
     # `capacity` it is stated to, the step's arguments in it as they would be.
-    memory = [device_memory(device) or ({} if capacity is None else {
-        'bytes_limit': capacity, 'bytes_in_use': stats.argument_size_in_bytes}) for device in devices]
+    memory = [device_memory(device, capacity, stats.argument_size_in_bytes) for device in devices]
     if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
@@ -293,11 +292,16 @@ def peak_memory_gib() -> float | None:
     return max(peaks) / 1024 ** 3 if peaks else None
 
 
-def device_memory(device) -> Mapping[str, int]:
+def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
     """What `device`'s allocator states (`Device.memory_stats`), empty where it states nothing: a CPU's,
     or a compile-only GPU's (`dew.training.ahead.compile_only_gpus`), none of this process's own, which
-    holds no memory to read."""
-    return (device.memory_stats() or {}) if device in jax.local_devices() else {}
+    holds no memory to read. A stated capacity models a fresh BFC pool with `arguments` resident:
+    its free block and temporary-stranding policy are read exactly as for that allocator."""
+    if device in jax.local_devices():
+        return device.memory_stats() or {}
+    return {} if capacity is None else {
+        'bytes_limit': capacity, 'bytes_in_use': arguments, 'pool_bytes': capacity,
+        'largest_free_block_bytes': capacity - arguments}
 
 
 def local_devices(mesh: Mesh) -> list:
@@ -392,11 +396,11 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
     return memory['pool_bytes'] >= memory['bytes_limit'] and partitioning.lower() not in ('false', '0')
 
 
-def temporaries_factor(mesh: Mesh) -> int:
+def temporaries_factor(mesh: Mesh, capacity: int | None = None) -> int:
     """How many times its temporaries a step needs room for on this process's tightest device of
     `mesh` (`strands_temporaries`): 2 where an allocator can strand them, else 1."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return max((2 if (memory := device_memory(device))
+    return max((2 if (memory := device_memory(device, capacity))
                 and strands_temporaries(device.platform, memory) else 1) for device in local)
 
 

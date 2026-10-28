@@ -45,6 +45,7 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
     with caplog.at_level(logging.DEBUG, logger="jax._src.dispatch"):
         ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30)
+    assert tuple(trainer.device_mesh.devices.flat) == compile_only_gpus("sm90", 1, capacity=2**30)
     step_compiles = [message for message in caplog.messages
                      if message.startswith("Finished XLA compilation of jit(step)")]
     assert len(step_compiles) == 1
@@ -52,6 +53,12 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     (probe,) = listed(plan["probes"], "probes", read=record, what="probes")
     assert probe["fits"] is True and probe["temp"] == ahead.temp_bytes
     assert probe["argument"] == ahead.argument_bytes
+    assert ahead.capacity == 2**30
+    from dew.training.memory import device_memory
+
+    stated = device_memory(trainer.device_mesh.devices.flat[0], ahead.capacity, ahead.argument_bytes)
+    assert stated["pool_bytes"] == ahead.capacity
+    assert stated["largest_free_block_bytes"] == ahead.capacity - ahead.argument_bytes
     seconds = probe["compile_seconds"]
     assert isinstance(seconds, float) and ahead.planned_seconds is not None
     assert ahead.planned_seconds >= seconds > 0
@@ -170,13 +177,15 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert isinstance(default, LMRunConfig)
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
                            "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
-                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)],
+                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
+                           "--trainer.compile-ahead.capacity-gib", "1"],
                           default=default)
     with pytest.raises(CompiledAhead) as ended:
         run.run()
     assert ended.value.code == 0
     saved = AheadOfTime.load(path)
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
+    assert saved.capacity == 2**30 and saved.plan is not None
     assert not runs.exists()
 
 

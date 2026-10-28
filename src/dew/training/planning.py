@@ -570,7 +570,7 @@ class FitSearch[LossT, EffectsT]:
     compiled ahead for it states them (`AheadTarget.capacity`)."""
 
     def __post_init__(self):
-        self.factor = temporaries_factor(self.mesh)
+        self.factor = temporaries_factor(self.mesh, self.capacity)
         self.started = self.remat_rung()
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
         self.required = compiler_options(*self.objective.towers()) or None
