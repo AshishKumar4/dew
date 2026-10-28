@@ -15,11 +15,11 @@ from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike, VariableDict
 
-from dew.interop.weights import ParamTree, translate_parameters
+from dew.interop.unread import Stored
+from dew.interop.weights import Tree, translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS
@@ -267,8 +267,8 @@ class DiffusionGemma(DecoderWrapper):
 
 
 def translate_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> ParamTree:
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
+) -> Tree[Stored]:
     """Self-conditioning parameters, cast per weight before the layout copy."""
     paths = {
         "pre_norm.weight": ("pre_norm", "scale"),
