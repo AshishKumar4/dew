@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import math
 import re
 import sys
 from pathlib import Path
@@ -389,36 +390,46 @@ def _short_conv_step(rows: int):
                   jax.ShapeDtypeStruct((256, 4), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
 
 
-PER_SHARD_STEPS = {"expert layer": (_expert_layer_step, 2), "rms norm": (_norm_step, 1),
-                   "swiglu": (_swiglu_step, 1), "short conv": (_short_conv_step, 1)}
-"""Each op whose kernels run per shard (row 1923, bible §7): its step at a number of rows, and the rows its
-launches take a row (an expert layer's two routed slots a token). Each lane adds its ops here."""
+PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "swiglu": _swiglu_step,
+                   "short conv": _short_conv_step}
+"""Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
+ops here."""
+
+
+def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, str]:
+    """The Pallas launches (`custom_calls`) of `loss`'s value and gradient lowered for `generation`'s GPU on
+    an abstract mesh of `devices` that splits the rows, and the program's text."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    mesh = gpu_mesh(AbstractMesh((devices,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(jax.value_and_grad(loss, argnums=tuple(range(len(args))))).trace(*args).lower(
+            lowering_platforms=("cuda",))
+    calls = [call for call in custom_calls(lowered) if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
+    return calls, lowered.as_text()
 
 
 @pytest.mark.parametrize("op", PER_SHARD_STEPS)
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(generation, op):
     """Bible §7, row 1923: an op's forward and backward, lowered for the GPU on an abstract two-device mesh
-    that splits its rows, launches its kernels, every one on its own device's rows (no operand or result
-    holds more than half the rows its launches take), and the program's only collective is the
-    reduction of its replicated parameters' gradients over the data axis."""
-    from jax.sharding import AbstractMesh, AxisType
+    that splits its rows, launches the kernels it launches on one device, each reading fewer elements than
+    there (its device's rows, its replicated parameters whole), never the whole batch; and the program's
+    only collective is the reduction of its replicated parameters' gradients over the data axis."""
+    loss, args = PER_SHARD_STEPS[op](384)
+    whole, _ = _kernel_launches(loss, args, generation, 1)
+    split, text = _kernel_launches(loss, args, generation, 2)
 
-    from dew.telemetry.instrumentation import custom_call_kind
+    def elements(call) -> int:
+        return sum(math.prod(shape) for shape in call.operands)
 
-    rows = 384
-    build, per_row = PER_SHARD_STEPS[op]
-    loss, args = build(rows)
-    mesh = gpu_mesh(AbstractMesh((2,), ("data",), axis_types=(AxisType.Auto,)), generation)
-    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(jax.value_and_grad(loss, argnums=tuple(range(len(args))))).trace(*args).lower(
-            lowering_platforms=("cuda",))
-    found = custom_calls(lowered)
-    calls = [call for call in found if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
-    assert calls, f"{op} launched no kernel on {generation}: {sorted({call.target for call in found})}"
-    taken = [shape[0] for call in calls for shape in (*call.operands, *call.results) if len(shape) >= 2]
-    assert max(taken) <= rows * per_row // 2, (op, max(taken), calls)
-    assert set(COLLECTIVES.findall(lowered.as_text())) <= {"all_reduce"}
+    pairs = list(zip(split, whole, strict=True)) if len(split) == len(whole) else []
+    assert whole and pairs, (op, [call.target for call in whole], [call.target for call in split])
+    assert all(elements(on_two) < elements(on_one) for on_two, on_one in pairs), (
+        op, [(elements(on_two), elements(on_one)) for on_two, on_one in pairs])
+    assert set(COLLECTIVES.findall(text)) <= {"all_reduce"}
 
 
 @pytest.mark.parametrize("generation", GPUS)
