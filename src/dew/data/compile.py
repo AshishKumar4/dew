@@ -1319,9 +1319,9 @@ def native(handed: Handed, *, training: bool) -> Reader:
         if training:
             return lambda partition: _Shared(_Whole(batch), partition, held=False)
         return lambda partition: iter([_share(batch, partition, held=True)])
-    stream = handed
-    if isinstance(handed, pygrain.MapDataset):
-        stream = (handed.repeat() if training else handed).to_iter_dataset()
+    stream: pygrain.IterDataset = (
+        (handed.repeat() if training else handed).to_iter_dataset() if isinstance(handed, pygrain.MapDataset)
+        else handed)
     return lambda partition: _Shared(iter(stream), partition, held=not training)
 
 
@@ -1338,6 +1338,8 @@ def native_loader(handed: Handed) -> Loader:
     else:
         first = handed[0] if isinstance(handed, pygrain.MapDataset) else {
             name: np.asarray(column) for name, column in handed.items()}
+    if first is None:
+        raise ValueError("a Grain dataset handed to fit gives its batches, and its first is missing (None)")
     batch = rows_of(first)
     records = (len(handed) * batch if isinstance(handed, pygrain.MapDataset)
                else batch if isinstance(handed, Mapping) else None)
