@@ -79,7 +79,7 @@ from transformers import AutoConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 # NumPy alone, as the release's environment holds no JAX.
-from remote_code_draws import CHUNKS, PADDED, SITES, draw, positions
+from remote_code_draws import CHUNKS, PADDED, RATE, SITES, draw, positions
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 _PINNED = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop"
@@ -248,8 +248,20 @@ def received(stream) -> dict:
 def released_outputs(model, site: str, inputs: dict) -> dict[str, np.ndarray]:
     """The release's outputs at a recorded `site` (tests/remote_code_draws.py), as Dew's forward
     gives them (tests/model_support.py's `remote_code_site`), the gradients by the release's own tensor
-    names."""
+    names. An update steps `model` and restores its weights after."""
     ids = torch.from_numpy(inputs["ids"].astype(np.int64))
+    if site == "update":
+        weights = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+        model.zero_grad()
+        with torch.enable_grad():
+            logits = model(input_ids=ids).logits
+            torch.nn.functional.cross_entropy(logits[:, :-1].flatten(0, 1), ids[:, 1:].flatten()).backward()
+        torch.optim.SGD(model.parameters(), lr=RATE).step()
+        with torch.no_grad():
+            stepped = model(input_ids=ids).logits.numpy()
+            model.load_state_dict(weights)
+        model.zero_grad()
+        return {"logits": stepped}
     if site == "gradients":
         model.zero_grad()
         with torch.enable_grad():
@@ -297,7 +309,7 @@ def record(name: str, release_python: str) -> None:
     gradients' leaves are the release's tensors, each read into Dew's parameter it loads as (its
     `WeightLayout.restore`)."""
     # Dew's side, in Dew's environment: the release's runs in `release_python`'s.
-    from model_support import remote_code_site
+    from model_support import flat_tree, remote_code_site
     from recorded_references import provenance, record_case, save
 
     from dew.interop import Pretrained
@@ -305,7 +317,7 @@ def record(name: str, release_python: str) -> None:
     source = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
     vocabulary = int(json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"])
     layouts = {layout.name: layout for layout in source.weight_layouts}
-    shapes = {".".join(path): leaf.shape for path, leaf in _leaves(source.variables)}
+    shapes = {path: leaf.shape for path, leaf in flat_tree(source.variables).items()}
     worker = subprocess.Popen([release_python, __file__, name, "--serve"], stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE)
     arrays = {}
@@ -334,18 +346,10 @@ def record(name: str, release_python: str) -> None:
                               capture_output=True, text=True, check=True).stdout.split()
     arrays[f"{name}.provenance"] = provenance(
         repo, revision, "cpu",
-        f"python tools/remote_code_reference.py {name} --record --release-python <python>",
+        f"PYTHONPATH=src python tools/remote_code_reference.py {name} --record "
+        f"--release-python <a Python with transformers {versions[0]}>",
         transformers=versions[0], torch=versions[1])
     print(save(FIXTURES / name / "released.npz", arrays, reference=repo, license=LICENSES[name]), flush=True)
-
-
-def _leaves(tree, path=()):
-    """`tree`'s leaves with their key paths."""
-    if isinstance(tree, dict):
-        for key, value in tree.items():
-            yield from _leaves(value, (*path, key))
-    else:
-        yield path, tree
 
 
 def main() -> None:
@@ -386,7 +390,7 @@ def main() -> None:
                 # Its float64 twin (`float64_twin`), so the rotary tables its constructor computes are
                 # float64's (a float32 build cast afterwards keeps float32's, Dream's `inv_freq`), run
                 # inside `float64`, so a pin its forward carries widens too.
-                wide = float64_twin(model, lambda: released_model(name, Path(scratch) / "f64"))
+                wide = float64_twin(model, lambda name=name: released_model(name, Path(scratch) / "f64"))
                 with float64():
                     f64 = wide(input_ids=ids).logits.numpy()
             if arguments.check:

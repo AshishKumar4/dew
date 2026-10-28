@@ -19,11 +19,15 @@ one token a call."""
 PADDED = 4
 """The left padding of a padded draw's second row (`biased`), shorter than a convolution's history."""
 
-SITES = {"lfm3-tiny": ("logits", "packed", "decode", "gradients"), "lfm3-biased-tiny": ("biased",),
+RATE = 0.5
+"""The learning rate of an update site's one SGD step (`update`)."""
+
+SITES = {"lfm3-tiny": ("logits", "packed", "decode", "gradients", "update"), "lfm3-biased-tiny": ("biased",),
          "mimo-v2-tiny": ("logits",), "dream-tiny": ("logits",), "llada-tiny": ("logits",)}
 """Each release fixture's sites: its logits over plain rows; LFM3's over a packed row, through the decode
-cache in chunks, and its parameter gradients under a drawn cotangent; and, with its convolution's bias
-(`conv_bias`), over left-padded rows."""
+cache in chunks, its parameter gradients under a drawn cotangent, and its logits after one SGD step at
+`RATE` on the rows' next-token cross-entropy (`update`), the tied embedding and head stepped once; and,
+with its convolution's bias (`conv_bias`), over left-padded rows."""
 
 
 def draw(site: str, seed: int, vocabulary: int) -> dict[str, np.ndarray]:

@@ -25,8 +25,9 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
     taps, attention with per-head q/k norms and a sigmoid gate a head, the full layers turning half of
     each head at 1e6 and the sliding ones all of it at 1e4 over a window of four, sandwich norms and a
     tied head) over a packed row whose first documents are shorter than a convolution's history, through
-    the decode cache in chunks, its parameter gradients under a drawn cotangent and, with its
-    convolutions' bias, over left-padded rows (ledgers 2039, 2040)."""
+    the decode cache in chunks, its parameter gradients under a drawn cotangent, its logits after one SGD
+    step on the rows' next-token cross-entropy (a real update, the tied embedding and head stepped once)
+    and, with its convolutions' bias, over left-padded rows (ledgers 2039, 2040)."""
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
     path, label = FIXTURES / name / 'released.npz', f'{name} {site}'
     seeds = declared_seeds(path)[label]

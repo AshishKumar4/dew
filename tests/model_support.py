@@ -250,10 +250,12 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
     (tests/remote_code_draws.py), in float64 with `wide`, the truth its recording is held to: a seed's
     inputs to its outputs by leaf. `logits` over plain rows; `packed` over a packed row, each document's
     positions from 0; `decode` through the decode cache in `CHUNKS`; `gradients`, the parameters'
-    gradient of the logits' product with the cotangent, by each parameter's dotted path; `biased` over
-    left-padded rows, each row's real slots alone (`row0`, `row1`)."""
+    gradient of the logits' product with the cotangent, by each parameter's dotted path; `update`, the
+    logits after one SGD step at `RATE` on the rows' next-token cross-entropy; `biased` over left-padded
+    rows, each row's real slots alone (`row0`, `row1`)."""
+    import optax
     from reference_error import widened
-    from remote_code_draws import CHUNKS, DOCUMENTS, PADDED, positions
+    from remote_code_draws import CHUNKS, DOCUMENTS, PADDED, RATE, positions
 
     from dew.batch import coordinates
 
@@ -282,6 +284,17 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
                 return jnp.sum(logits * inputs["cotangent"].astype(logits.dtype))
             return dict(flat_tree(jax.grad(loss)(variables["params"])))
         return jax.jit(gradients)
+    if site == "update":
+        def updated(inputs):
+            def loss(params):
+                logits = model.apply({**variables, "params": params}, inputs["ids"])
+                return optax.softmax_cross_entropy_with_integer_labels(
+                    logits[:, :-1], inputs["ids"][:, 1:]).mean()
+            params, optimizer = variables["params"], optax.sgd(RATE)
+            steps, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
+            return {"logits": model.apply({**variables, "params": optax.apply_updates(params, steps)},
+                                          inputs["ids"])}
+        return jax.jit(updated)
     if site == "biased":
         def biased(inputs):
             mask = inputs["attention_mask"].astype(bool)
