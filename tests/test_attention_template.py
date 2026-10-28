@@ -139,10 +139,23 @@ places, under causality, beside packed documents and key validity, and in chunks
 restart at each option, so a suffix's chunk holds keys of every option."""
 
 
+def band_runs(width: int) -> np.ndarray:
+    """One run a query `[2, 100, 1, 2]`, the `width` keys up to its own, as a chunked or banded
+    local-attention layer passes its runs (`local_attention.chunk_runs`)."""
+    index = np.arange(QUERIES, dtype=np.int32)
+    run = np.stack([np.maximum(index + 1 - width, 0), index + 1], axis=-1)
+    return np.broadcast_to(run[None, :, None], (ROWS, QUERIES, 1, 2))
+
+
+ONE_RUN = {"band": 12}
+"""A call over one run a query (`band_runs`), which `template.spans` keeps as one key interval a query, the
+form every mainloop walks (ledger 1991)."""
+
+
 def geometry(case: dict) -> tuple[int, int]:
     """`case`'s query and key counts: a call's own documents, or blocks of its own tokens, are its keys, so
     it has as many of each; a cache call's blocks are its keys'."""
-    own = (case.get("segment_ids") == "own" or case.get("runs")
+    own = (case.get("segment_ids") == "own" or case.get("runs") or case.get("band")
            or (case.get("block_groups") and case.get("segment_ids") is None))
     return (QUERIES, QUERIES) if own else (QUERIES, KEYS)
 
@@ -178,6 +191,8 @@ def arguments(case: dict) -> dict:
         keywords["block_groups"], keywords["image_groups"] = block_groups(geometry(case)[1])
     if case.get("valid"):
         keywords["valid"] = key_validity(geometry(case)[1])
+    if case.get("band"):
+        keywords["runs"] = jnp.asarray(band_runs(case["band"]))
     if case.get("runs"):
         runs, places = decision_runs()
         keywords["runs"] = jnp.asarray(runs)
@@ -259,7 +274,8 @@ def dews_mask(case: dict) -> np.ndarray:
     return full if mask is None else np.broadcast_to(np.asarray(mask)[:, 0], full.shape)
 
 
-@pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values()], ids=[*CASES, *RUN_CASES])
+@pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values(), ONE_RUN],
+                         ids=[*CASES, *RUN_CASES, "one-run"])
 def test_key_spans_keep_the_keys_dews_masks_keep(case):
     """Each call form's spans (`template.spans`, `template.dense`) keep exactly the keys Dew's reference
     path keeps, under `jax.jit` too, the bounds traced."""
