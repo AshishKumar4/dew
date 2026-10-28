@@ -939,12 +939,12 @@ class MosaicTgmm(_Mosaic):
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """`_Mosaic.candidate` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family
-        whose products read registers loading its transposed stage in whole roles of rows (the step,
-        `block_k`: a 32-row stage failed to cast to the 64-row layout, ns-regs2)."""
+        whose products read registers loading its transposed stage in whole row atoms of its products (the
+        step, `block_k`, in `Family.transposed_rows`)."""
         if config.cluster != 1 or not super().candidate(ba, config, target):
             return False
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        return not (family.operands_in_registers and config.block_k % family.role_rows)
+        return not (family.operands_in_registers and config.block_k % family.transposed_rows)
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:

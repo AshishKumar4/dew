@@ -104,6 +104,14 @@ class Mma(mosaic.Family):
         return cls(jnp.dtype(dtype), m_warps)
 
     @property
+    def transposed_rows(self) -> int:
+        # The transposed stage casts to the products' left-operand layout in whole row atoms, `m_warps`
+        # warps of 16 rows: a 32-row step at two row warps lowers, where the 64-row role it was held to
+        # left an A100's dense kernel gradients 18 to 29% slower (BC-A100-DW-AB2: Llama 3 8B o's 1.680 to
+        # 1.378 ms, gate_up's 10.95 to 7.80).
+        return self.m_warps * 16
+
+    @property
     def lhs_copies(self) -> int:
         return 4 // self.m_warps
 

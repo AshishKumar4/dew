@@ -387,6 +387,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     role_rows: int
     """The rows a consumer role's products cover at least: one warpgroup's (wgmma's one MMA of 64 rows,
     mma.sync's four warps of 16 each)."""
+
+    @property
+    def transposed_rows(self) -> int:
+        """The rows a step of an operand its products read from registers transposed (a kernel gradient's
+        `[rows, depth]` stage) takes at least: a role's (`role_rows`)."""
+        return self.role_rows
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
