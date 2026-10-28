@@ -284,15 +284,26 @@ def _half_mahalanobis_jvp(primals, tangents):
     value, mean, variance = primals
     along_value, along_mean, along_variance = tangents
     difference, shift, (quotient, power) = _divergence_parts(value, mean, variance)
-    # The residual over the variance's power of two, in range wherever the derivative is, its products
-    # with the tangents summed, then over the variance's significand, one division a row: the plain
-    # `sum(residual * tangent) / variance` in range, bit for bit, the powers of two exact. Reverse mode
-    # meets the same factors in the other order, the residual's scale applied last.
+    # Each term's power of two restored half before the tangent's product and half after, so neither a
+    # tangent of zero meets a coefficient past float32's largest (inf * 0) nor reverse mode a cotangent
+    # taken below its least normal: `sum(residual * tangent) / variance` and `-term * t_variance /
+    # variance`, the plain formula's in range, bit for bit, the powers of two exact.
     level, spread = _split(variance)
-    scaled = _scaled(difference, shift - expand(spread, shift))
-    moved = (scaled * (along_value - along_mean)).sum(axis=tuple(range(1, value.ndim))) / level
-    stretch = _scaled(*_quotient(-quotient, power, variance))
-    return _half_mahalanobis(value, mean, variance), moved + stretch * along_variance
+    axes = tuple(range(1, value.ndim))
+    widest = jnp.max(shift, axis=axes)
+    residual_power = widest - spread
+    before = _half(residual_power)
+    products = _scaled(difference, shift - expand(widest - before, shift)) * (along_value - along_mean)
+    moved = _scaled(products.sum(axis=axes) / level, residual_power - before)
+    stretch_power = power - spread
+    stretched = _scaled(-quotient, _half(stretch_power)) * along_variance / level
+    return (_half_mahalanobis(value, mean, variance),
+            moved + _scaled(stretched, stretch_power - _half(stretch_power)))
+
+
+def _half(power: jax.Array) -> jax.Array:
+    """Half an integer power of two's exponent, rounded toward zero, the rest restored apart."""
+    return (power.astype(jnp.float32) * 0.5).astype(jnp.int32)
 
 
 _gaussian_kl = linear_tangent(_measured, _kl_pullback, _directional)

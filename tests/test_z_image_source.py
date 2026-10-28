@@ -329,3 +329,27 @@ def test_pipeline_walk_matches_the_source(load, source, record, request):
     assert_as_exact(native, as_given(lambda x_T: source_walk(narrow, x_T)), draw, f"Z-Image {load} walk",
                     seeds=PIPELINE_SEEDS["walk"],
                     truth_fn=lambda x_T: widened_call(wide, lambda pipe: source_walk(pipe, x_T)))
+
+
+@pytest.mark.parametrize(("latent", "real", "lengths"), [((6, 2), 8, (256, 2, 2)), ((4, 4), 32, (33, 8, 8))],
+                         ids=["grid", "prompt"])
+def test_positions_past_the_published_tables_rotate_at_their_own_places(latent, real, lengths):
+    """Each axis's rotary table reaches every position a call takes: a latent grid of three rows past a
+    two-row table, or a full 32-token prompt whose image sits at position 33 past a 33-row table, rotates
+    at its own positions, so the model computes, bit for bit, what the same weights compute with longer
+    tables, where a gather clamped to the table rotates the last rows as the row before them (audit
+    NN-A4)."""
+    height, width = latent
+    short = ZImageTransformer(in_channels=4, dim=32, n_layers=1, n_refiner_layers=1, n_heads=2,
+                              cap_feat_dim=16, axes_dims=(4, 6, 6), axes_lens=lengths)
+    long = short.clone(axes_lens=(256, 64, 64))
+    rng = np.random.default_rng(0)
+    latents = jnp.asarray(rng.standard_normal((1, height, width, 4)), jnp.float32)
+    condition = DenoisingCondition(jnp.asarray(rng.standard_normal((1, 32, 16)), jnp.float32),
+                                   mask=jnp.asarray(np.arange(32)[None] < real))
+    time = jnp.full((1,), 500.0)
+    params = short.init(jax.random.key(0), latents, time, condition)
+    params = jax.tree.map(lambda leaf: leaf + jnp.asarray(0.05 * rng.standard_normal(leaf.shape), leaf.dtype),
+                          params)
+    np.testing.assert_array_equal(short.apply(params, latents, time, condition),
+                                  long.apply(params, latents, time, condition))

@@ -1384,8 +1384,8 @@ takes larger inputs or fewer shared factors, not more seeds."""
 
 def recorded_pilots(reference_fn, draw, count: int):
     """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
-    from SIZING_FROM on, disjoint from every verdict's seeds and recorded with Dew's arm and the truth
-    from the same inputs: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
+    from SIZING_FROM on, disjoint from every verdict's seeds, the reference and its truth recorded on the
+    inputs Dew's arm takes live: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
     own; `reference_fn` is left as it is. Every pilot is read now (`draw`'s inputs at each), so a
     recording that does not hold them all is refused here, not at the doubling that reaches one."""
     if not getattr(reference_fn, "recorded", False):
@@ -1422,8 +1422,9 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
     verdict's inputs at SIZING_FROM and needs a pilot stream of its own first. A recorded reference
     (`indexed_recording`), which holds its recorded seeds alone, is refused, its site keeping its
-    recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, recorded
-    with Dew's arm and the truth (`recorded_pilots`): its paired sizing then takes those pilots alone,
+    recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, the
+    reference and its truth on the inputs Dew's arm takes live (`recorded_pilots`, or a summarized
+    recording's pilots, `indexed_recording`): its paired sizing then takes those pilots alone,
     up to as many as are held. Fails past `most`, where the site needs larger inputs or fewer shared
     factors, not more seeds.
 
@@ -1620,7 +1621,9 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     check 1 never judges Dew against its own float64 path where that path is not the reference's, as
     far as a wrong truth's move is independent of the sketch's signs (SKETCH). A seed whose recomputed
     truth has a row of float64 zero the recording's had not is refused. Its reference and truth are
-    host functions, called as check 1 calls them, not traced."""
+    host functions, called as check 1 calls them, not traced. Where it holds pilots (`<site>.pilot.`,
+    `merge_shards`), seeds from SIZING_FROM on read them, and its reference carries them
+    (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone (`seeds_for`)."""
     if any(name.startswith(f"{site}.sketch.") for name in stored):
         return _summarized(stored, site, seeds, inputs_of, truth_fn)
 
@@ -1678,15 +1681,18 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
                 if name.startswith(prefix)}
 
-    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets", "shape", "dtype")
-    mse, worst, finite, sketch, zero_rows, zero_errors, zero_offsets, shapes, dtypes = (
-        tree(kind) for kind in kinds)
+    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets")
+    verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
+    mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
+                                                ("mse", "worst", "finite", "sketch", "zero_offsets"))
+    shapes, dtypes = tree("shape"), tree("dtype")
     if truth_fn is None or inputs_of is None:
         raise AssertionError(f"{site}: a recording of the reference's evidence alone takes `truth_fn`, "
                              f"Dew's float64 path, and `inputs_of`, its inputs drawn again")
     if int(stored.get(f"{site}.redraw", -1)) != REDRAW:
         raise AssertionError(f"{site}: the recording holds no `{site}.redraw` of {REDRAW}")
     digests = stored[f"{site}.input_digest"]
+    pilots = len(stored.get(f"{site}.pilot.input_digest", ()))
     count = min([len(value) for part in (mse, worst, finite, sketch) for value in part.values()]
                 + [len(value) - 1 for value in zero_offsets.values()])
     if min(count, len(digests)) < (1 + REDRAW) * seeds:
@@ -1694,25 +1700,38 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
                              f"may draw {(1 + REDRAW) * seeds}")
     roundings = {}
 
+    def held(seed):
+        """`seed`'s evidence, its input digests and its row in them: a verdict seed's, or a pilot's."""
+        if seed < SIZING_FROM:
+            return verdict, digests, seed
+        if seed >= SIZING_FROM + pilots:
+            raise AssertionError(f"{site}: seed {seed} is past the recording's {pilots} pilots from "
+                                 f"SIZING_FROM")
+        return pilot, stored[f"{site}.pilot.input_digest"], seed - SIZING_FROM
+
     def draw(seed):
         drawn = inputs_of(seed)
-        if input_digest(drawn) != digests[seed]:
+        _, recorded, row = held(seed)
+        if input_digest(drawn) != recorded[row]:
             raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "
                                  f"digest differs); the generator's draw changed since the recording")
         return np.int32(seed), drawn
 
     def reference(index, inputs):
-        index = int(index)
+        evidence, _, row = held(int(index))
 
         def leaf(name):
-            start, stop = zero_offsets[name][index], zero_offsets[name][index + 1]
-            return RecordedLeaf(float(mse[name][index]), float(worst[name][index]),
-                                zero_rows[name][start:stop], zero_errors[name][start:stop],
-                                finite=bool(finite[name][index]), dtype=str(dtypes[name]))
+            start, stop = evidence["zero_offsets"][name][row], evidence["zero_offsets"][name][row + 1]
+            return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
+                                evidence["zero_rows"][name][start:stop],
+                                evidence["zero_errors"][name][start:stop],
+                                finite=bool(evidence["finite"][name][row]), dtype=str(dtypes[name]))
 
         return {name: leaf(name) for name in mse}
 
     reference.recorded = True
+    if pilots:
+        reference.pilots = range(SIZING_FROM, SIZING_FROM + pilots)
 
     # The truth recomputed, compiled as the gate compiles a truth; its roundings are counted on its trace.
     live = _truth_program(truth_fn)
@@ -1734,7 +1753,8 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
             if value.shape != tuple(shapes[name].tolist()):
                 raise AssertionError(f"{site}: the truth of {name!r} recomputed is {value.shape}, the "
                                      f"recorded reference's {tuple(shapes[name].tolist())}")
-            recorded = sketch[name][index]
+            evidence, _, row = held(index)
+            recorded = evidence["sketch"][name][row]
             if not np.isfinite(value).all():
                 raise AssertionError(f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not "
                                      f"finite")

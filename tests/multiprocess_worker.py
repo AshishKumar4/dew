@@ -186,6 +186,19 @@ def indexed_loader(records: int, batch: int = BATCH):
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class Indexed:
+    """`records` records that say which they are, in the field the objective reads."""
+
+    records: int
+
+    def __len__(self):
+        return self.records
+
+    def __getitem__(self, index):
+        return {"image": np.full((RES, RES, 3), index, np.uint8)}
+
+
 def elastic_loader(records: int, workers: int):
     """The same records compiled to a global order, whose position is a global count.
 
@@ -198,16 +211,7 @@ def elastic_loader(records: int, workers: int):
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
 
-    class Indexed:
-        """Records that say which they are, in the field the objective reads."""
-
-        def __len__(self):
-            return records
-
-        def __getitem__(self, index):
-            return {"image": np.full((RES, RES, 3), index, np.uint8)}
-
-    return compile(Pipeline(Memory(Indexed())).shuffle(0).repeat().batch(BATCH), seed=0,
+    return compile(Pipeline(Memory(Indexed(records))).shuffle(0).repeat().batch(BATCH), seed=0,
                    loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
 
 
@@ -243,14 +247,35 @@ def online_pipeline(records: int, address: str, *, shared: bool, epochs: int | N
     return catalog.filter_map(*fetched).shuffle(0).repeat(epochs)
 
 
-def online_loader(records: int, workers: int, address: str, *, shared: bool, replicated: bool = False):
-    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`), each share's
-    fetched by every process where the read is `replicated` (`Pipeline.elastic`)."""
+def online_loader(records: int, workers: int, address: str, *, shared: bool):
+    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`)."""
     from dew.data.compile import compile
 
-    chain = online_pipeline(records, address, shared=shared).batch(BATCH)
-    return compile(chain.elastic() if replicated else chain, seed=0,
+    return compile(online_pipeline(records, address, shared=shared).batch(BATCH), seed=0,
                    loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
+
+
+@dataclasses.dataclass(frozen=True)
+class Unthirded:
+    """Whether a record's image is not every third one's, so a stream filtered by it drops records."""
+
+    identity = "unthirded@1"
+
+    def __call__(self, row) -> bool:
+        return int(row["image"][0, 0, 0]) % 3 != 0
+
+
+def replicated_loader(records: int, workers: int):
+    """`elastic_loader`'s records filtered, so which rows there are only the whole order states, read
+    elastically (`Pipeline.elastic`): every process reads that order and keeps its share of each
+    batch. A fetch would read it differently on each, which an elastic read over several refuses."""
+    from dew.data import Memory
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    chain = Pipeline(Memory(Indexed(records))).shuffle(0).repeat().filter(Unthirded()).batch(BATCH).elastic()
+    return compile(chain, seed=0, loading=Loading(workers=workers, threads=2, read_buffer=8,
+                                                  worker_buffer=2)).train
 
 
 def batch_records(batch) -> list[int]:
@@ -689,9 +714,10 @@ def mode_fit(args) -> dict:
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
-    if args.online:
-        open_train = online_loader(args.records, args.workers, args.online, shared=args.shared,
-                                   replicated=args.replicated)
+    if args.replicated:
+        open_train = replicated_loader(args.records, args.workers)
+    elif args.online:
+        open_train = online_loader(args.records, args.workers, args.online, shared=args.shared)
     elif args.elastic:
         open_train = elastic_loader(args.records, args.workers)
     else:
@@ -2408,7 +2434,7 @@ def parse_args(argv=None):
     parser.add_argument("--refusal", action="store_true",
                         help="fit reports the ValueError it is refused with instead of raising it")
     parser.add_argument("--replicated", action="store_true",
-                        help="the online records read elastically, every process reading every share")
+                        help="the records filtered and read elastically (`replicated_loader`)")
     parser.add_argument("--shared", action="store_true",
                         help="each process fetches its own share of the shuffled catalog (`online_pipeline`)")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")

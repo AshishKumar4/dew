@@ -94,10 +94,11 @@ def windows(tokens: Path, batch: int):
 
 
 def collectives(hlo: str) -> dict:
-    """Each kind of collective (`instrumentation.COLLECTIVES`) in compiled HLO text: how many ops
+    """Each kind of collective (`dew.telemetry.trace.COLLECTIVES`) in compiled HLO text: how many ops
     there are, how many buffers they move (a combined collective is one op with a tuple of them),
     their bytes, and the sizes of the five largest ops. An async pair counts once, by its `-done`."""
-    from dew.telemetry.instrumentation import collective, hlo_instructions
+    from dew.telemetry.instrumentation import hlo_instructions
+    from dew.telemetry.trace import collective
 
     found: dict = {}
     for instruction in hlo_instructions(hlo).values():

@@ -34,7 +34,7 @@ from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.telemetry.instrumentation import COLLECTIVES
+from dew.telemetry.trace import COLLECTIVES
 from dew.training import Layout, MeshSpec, Trainer
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.

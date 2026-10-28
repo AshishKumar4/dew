@@ -122,11 +122,12 @@ class Heun:
         with jax.ensure_compile_time_eval():
             sigmas = schedule.sigmas(jnp.asarray(times[:-1], jnp.float32))
             churned = (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax)
-            if bool(jnp.any(churned & (sigmas * (1 + gamma) > schedule.sigma_max))):
+            top = schedule.sigma_range[1]
+            if bool(jnp.any(churned & (sigmas * (1 + gamma) > top))):
                 raise ValueError(
-                    f"the churn raises sigma past the schedule's top, {schedule.sigma_max}, "
+                    f"the churn raises sigma past the schedule's top, {top}, "
                     f"where the model has no time; keep s_tmax below "
-                    f"{schedule.sigma_max / (1 + gamma):.4g}")
+                    f"{top / (1 + gamma):.4g}")
         return jnp.asarray(gamma, jnp.float32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
