@@ -68,7 +68,7 @@ code. Checked against the source on 2026-09-22:
   `gemma`, `gemma2`, `gemma3_text`, `gemma3n_text`, `gemma4_text`,
   `glm4_moe`, `glm5_next_text`, `glm_moe_dsa`, `gpt2`, `gpt_bigcode`,
   `gpt_neo`, `gpt_neox`, `gpt_oss`, `gptj`, `granitemoe`, `k2_horizon`,
-  `kimi_k2`, `kimi_k25`, `kimi_k3`, `kimi_linear`, `llada`, `llama`,
+  `kimi_k2`, `kimi_k25`, `kimi_k3`, `kimi_linear`, `lfm3`, `llada`, `llama`,
   `llama4_text`, `mamba`, `mamba2`, `mimo_v2`, `mimo_v2_flash`,
   `minimax_m2`, `ministral`, `mistral`, `mixtral`, `modernbert`,
   `muse_glimmer_text`, `nemotron_h`, `olmo3`, `opt`, `ouro`, `phi`, `phi3`,
@@ -137,6 +137,7 @@ Component by family. "Dew today" is the last row: what
 | Kimi Linear (`kimi_linear`) | 3 KDA then 1 MLA with NoPE (`mla_use_nope`) | RMSNorm | SwiGLU | sigmoid + bias, top-8 of 256 in one group, scaling 2.446, 1 shared | 0 | remote code on the hub, not in transformers 5.16.1; its gate adds the bias in place, so its weights carry it, which K3's revision and vLLM do not |
 | Kimi K2.5 (`kimi_k25`) | DeepSeek-V3 MLA text backbone | RMSNorm | SwiGLU | sigmoid, top-8 of 384 | 0 | `kimi_k25` maps its text config to `deepseek_v3` |
 | Kimi K3 (`kimi_k3`, text `kimi_linear`) | 3 KDA (full-rank output gate) then 1 NoPE MLA with a sigmoid output gate, Attention Residuals over blocks of 12 | RMSNorm | SiTU (betas 4, 25) | sigmoid + bias, top-16 of 896, latent experts at 3584 with a norm, 2 shared | 0 | routed experts ship compressed-tensors MXFP4; `A_log` padded 96 to 128 |
+| LFM3 (`lfm3`) | gated short convolutions (7 taps, no activation) between GQA layers, full ones turning half of each head (zero tail) at 1e6, sliding ones (window 256) at 1e4; q/k norms and a sigmoid gate a head | RMSNorm, sandwich norms | SwiGLU | none | 0 | remote code on the hub at 40ebe0a, which runs under transformers 5.18.0 on: 5.15.0-5.17.0 remap its `conv` layer type to `linear_attention` and its mask lookup fails |
 | MiniMax-Text-01 / M1 (`minimax`) | lightning attention alternating with full attention, per-block alpha/beta scaling | RMSNorm | SwiGLU | softmax top-2 of 8 | no | decay slopes per head |
 | MiniMax-M2 (`minimax_m2`) | full GQA every layer, qk-norm over the whole projection | RMSNorm | SwiGLU experts | sigmoid top-8 of 256, no renormalisation | no | FP8 weights |
 | MiniMax-M3 (`minimax_m3_vl`) | GQA, partial rotary 0.5 | RMSNorm | clamped SwiGLU (7.0) | sigmoid + `e_score_correction_bias`, top-4 of 128, shared expert | 1 layer | 1M context |

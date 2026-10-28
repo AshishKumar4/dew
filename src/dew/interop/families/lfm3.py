@@ -168,5 +168,6 @@ LFM3 = DecoderFamily(
     aliases={'norm_eps': 'rms_norm_eps'},
     # Lfm3Config's defaults for the fields its decoder reads (configuration_lfm3.py).
     defaults={'conv_L_cache': 7, 'conv_bias': False, 'use_sandwich_norm': True, 'sliding_window': 256,
-              'tie_word_embeddings': True, 'max_position_embeddings': 128000, 'norm_eps': 1e-5},
+              'tie_word_embeddings': True, 'max_position_embeddings': 128000, 'norm_eps': 1e-5,
+              'pad_token_id': 124893},
 )
