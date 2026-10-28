@@ -18,17 +18,20 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import cost, mosaic, resources
 from dew.nn.sharding import per_shard
 
-_TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
-_SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
-"""Mosaic GPU's tile transforms, which it declares as protocol classes (a type checker takes them for
-uninstantiable)."""
+
+def _staging(block: tuple, swizzle: int | None) -> tuple:
+    """A stream's tile's transforms: a tile's swizzled (its own, `swizzle` where a stream names one); a side
+    vector's none, in whole 16-byte cp.async chunks."""
+    shape, dtype = block
+    if len(shape) == 1:
+        return ()
+    return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
 
 
 def swizzled(shape: tuple[int, int], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
     bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
-    swizzle = plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8)
-    return _TILING((8, swizzle // jnp.dtype(dtype).itemsize)), _SWIZZLE(swizzle)
+    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8))
 
 
 class Slots:
@@ -53,6 +56,8 @@ class Pipeline:
 
     blocks: dict
     stages: int
+    swizzles: dict = dataclasses.field(default_factory=dict)
+    """The swizzle a stream's tiles stage at where `Mma.streams` names one (`mosaic.swizzle_for`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -196,17 +201,18 @@ class Mma(mosaic.Family):
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                             interpret=mosaic.interpreted(interpret), kernel_name=name, cost_estimate=cost)
 
-    def scoped(self, body, *allocations, streams) -> None:
-        pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
+    def scoped(self, body, *allocations, streams):
+        return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
 
     def roles(self, consumers: int, consumer, producer) -> None:
         _one(consumers)
         del producer
         consumer(0)
 
-    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = ()):
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
+                swizzles: dict[str, int] | None = None):
         _one(consumers, clustered=bool(multicast))
-        return Pipeline(blocks, stages)
+        return Pipeline(blocks, stages, dict(swizzles or {}))
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -268,11 +274,10 @@ class Mma(mosaic.Family):
                 slots = Slots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
-            # A tile's blocks staged swizzled for ldmatrix; a side vector's untiled, in whole 16-byte
-            # cp.async chunks.
+            # A tile's blocks staged swizzled for ldmatrix (`_staging`).
             specs = [plgpu.BlockSpec(blocks[name][0],
                                      lambda j, lo=lo, index_map=streams.views[name][1]: index_map(j + lo),
-                                     transforms=swizzled(*blocks[name]) if len(blocks[name][0]) > 1 else ())
+                                     transforms=_staging(blocks[name], streams.pipeline.swizzles.get(name)))
                      for name in names]
             pipeline = plgpu.emit_pipeline(body, grid=(hi - lo,), in_specs=specs,
                                            max_concurrent_steps=streams.pipeline.stages, init_carry=carry)
