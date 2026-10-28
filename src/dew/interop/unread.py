@@ -123,6 +123,11 @@ class _Operator:
         self.ufunc = ufunc
         self.reflected = reflected
 
+    @staticmethod
+    def paired(*ufuncs: np.ufunc) -> tuple[_Operator, ...]:
+        """Each of `ufuncs`' operator, then its reflection."""
+        return tuple(_Operator(ufunc, reflected=reflected) for ufunc in ufuncs for reflected in (False, True))
+
     def __get__(self, array: Unread, owner: type[Unread]) -> Callable[[ArrayLike], Unread]:
         if self.reflected:
             return lambda other: self.ufunc(other, array)
@@ -269,21 +274,14 @@ class Unread:
     def __abs__(self) -> Unread:
         return _array(jnp.absolute, self)
 
-    __add__, __radd__ = _Operator(np.add), _Operator(np.add, reflected=True)
-    __sub__, __rsub__ = _Operator(np.subtract), _Operator(np.subtract, reflected=True)
-    __mul__, __rmul__ = _Operator(np.multiply), _Operator(np.multiply, reflected=True)
-    __truediv__, __rtruediv__ = _Operator(np.true_divide), _Operator(np.true_divide, reflected=True)
-    __floordiv__, __rfloordiv__ = _Operator(np.floor_divide), _Operator(np.floor_divide, reflected=True)
-    __mod__, __rmod__ = _Operator(np.remainder), _Operator(np.remainder, reflected=True)
-    __pow__, __rpow__ = _Operator(np.power), _Operator(np.power, reflected=True)
-    __matmul__, __rmatmul__ = _Operator(np.matmul), _Operator(np.matmul, reflected=True)
-    __and__, __rand__ = _Operator(np.bitwise_and), _Operator(np.bitwise_and, reflected=True)
-    __or__, __ror__ = _Operator(np.bitwise_or), _Operator(np.bitwise_or, reflected=True)
-    __xor__, __rxor__ = _Operator(np.bitwise_xor), _Operator(np.bitwise_xor, reflected=True)
-    __lshift__, __rlshift__ = _Operator(np.left_shift), _Operator(np.left_shift, reflected=True)
-    __rshift__, __rrshift__ = _Operator(np.right_shift), _Operator(np.right_shift, reflected=True)
-    __lt__, __le__ = _Operator(np.less), _Operator(np.less_equal)
-    __gt__, __ge__ = _Operator(np.greater), _Operator(np.greater_equal)
+    # Each binary ufunc's operator and its reflection, in this order.
+    (__add__, __radd__, __sub__, __rsub__, __mul__, __rmul__, __truediv__, __rtruediv__, __floordiv__,
+     __rfloordiv__, __mod__, __rmod__, __pow__, __rpow__, __matmul__, __rmatmul__, __and__, __rand__, __or__,
+     __ror__, __xor__, __rxor__, __lshift__, __rlshift__, __rshift__, __rrshift__) = _Operator.paired(
+        np.add, np.subtract, np.multiply, np.true_divide, np.floor_divide, np.remainder, np.power, np.matmul,
+        np.bitwise_and, np.bitwise_or, np.bitwise_xor, np.left_shift, np.right_shift)
+    __lt__, __le__, __gt__, __ge__ = (_Operator(np.less), _Operator(np.less_equal), _Operator(np.greater),
+                                      _Operator(np.greater_equal))
 
 
 type Stored = np.ndarray | Unread
