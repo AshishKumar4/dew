@@ -966,6 +966,11 @@ def test_a_quantized_packed_tensor_and_its_part_stored_apart_must_be_one_tensor(
     assert jax.tree.structure(apart.variables) == jax.tree.structure(alone.variables)
     for ours, theirs in zip(jax.tree.leaves(apart.variables), jax.tree.leaves(alone.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    # Without its weights the copy is checked by its shape, and the load holds what a load with them does.
+    shapes = Pretrained.load(tmp_path / "apart", dtype="float32", param_dtype=storage, attention_impl="xla",
+                             weights=False)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), apart.variables)
 
 
 def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path):

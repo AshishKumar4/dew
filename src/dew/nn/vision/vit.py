@@ -27,7 +27,8 @@ from flax import linen as nn
 from flax.typing import Dtype, Initializer, PrecisionLike
 
 from dew.batch import coordinates
-from dew.interop.weights import ParamTree, checkpoint_array, insert, placed
+from dew.interop.unread import Stored, held
+from dew.interop.weights import Tree, checkpoint_array, insert, placed
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
@@ -547,9 +548,9 @@ PATCH_CONVOLUTION = "patch_embed.proj.weight"
 """Where the Qwen-style towers keep their patch map: a `[out, in, time, h, w]` convolution."""
 
 
-def translate_vit_weights(hf_tensors: Mapping[str, np.ndarray],
+def translate_vit_weights(hf_tensors: Mapping[str, Stored],
                           path_of: Callable[[str], tuple[str, ...] | None],
-                          param_dtype: str = "float32") -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+                          param_dtype: str = "float32") -> tuple[Tree[Stored], tuple[WeightLayout, ...]]:
     """A trunk's variables from its tensors through its family's `path_of`, rooted at the collection,
     the patch convolution `PATCH_CONVOLUTION`, where the checkpoint has one, landing as one Dense map
     over the processor's channel, time and pixel order at `params/patch_embed/kernel`; with the
@@ -560,7 +561,7 @@ def translate_vit_weights(hf_tensors: Mapping[str, np.ndarray],
                                  if name != PATCH_CONVOLUTION}, path_of, param_dtype)
     if PATCH_CONVOLUTION in hf_tensors:
         conv = checkpoint_array(hf_tensors[PATCH_CONVOLUTION], param_dtype)
-        dense = np.ascontiguousarray(conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
+        dense = held(conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]), contiguous=True)
         insert(variables, ("params", "patch_embed", "kernel"), dense, PATCH_CONVOLUTION)
         # The Dense map's transpose is the convolution, its input axes flattened.
         kernel = ("params", "patch_embed", "kernel")
