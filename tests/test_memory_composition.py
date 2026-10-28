@@ -441,9 +441,12 @@ class GeneralMemory(nn.Module):
     """An inner network that maps the view's vector through a rank-three kernel (`DenseGeneral`),
     width kept: a matmul a weight-only rule quantizes whose kernel is no [in, out] matrix."""
 
+    dtype: jnp.dtype | None = None
+
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        return nn.DenseGeneral((2, x.shape[-1] // 2), use_bias=False, name="general")(x).reshape(x.shape)
+        return nn.DenseGeneral((2, x.shape[-1] // 2), use_bias=False, dtype=self.dtype,
+                               name="general")(x).reshape(x.shape)
 
 
 SERVED = {"moving": ((INNER,), None, True), "projections": ((r".*self_attn/[qkvo]_proj",), None, False),
