@@ -162,12 +162,15 @@ class Scope:
     """A program's shared-memory allocations by lifetime, as its kernel scopes them (`shared_bytes`): those
     live for the whole `program` (arrays, barriers, a ring's: `plgpu.SMEM`, `plgpu.Barrier`,
     `plgpu.ClusterBarrier`, nested in sequences and mappings); each walk's own, one after another (`walks`:
-    an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`; and whether the
-    program `reduces` across warps, reserving its family's scratch."""
+    an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`; whether the
+    program `reduces` across warps, reserving its family's scratch (`Family.reduction_scratch`); and its
+    `reducing_warpgroups`, each reserving its share where its arithmetic reduces implicitly
+    (`Family.warpgroup_reduction_scratch`, the kernel's)."""
     program: tuple = ()
     walks: tuple = ()
     after: tuple = ()
     reduces: bool = False
+    reducing_warpgroups: int = 0
 
 
 def _count(barriers) -> int:
@@ -184,7 +187,8 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
     estimate counts it (its `smem_scratch_bytes`): every array rounded up to `SMEM_ALIGNMENT`
     (`allocated`), the walks the largest of them, the tiles scoped after the walks the larger of them and
     the walks on a family that scopes its walks apart (`Family.walks_scoped`) and beside the program's
-    otherwise, and the family's reduction scratch where the program reduces (`Family.reduction_scratch`)."""
+    otherwise, and the family's reduction scratch where the program reduces (`Family.reduction_scratch`)
+    and its warpgroups' shares where they reduce implicitly (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
         return [math.prod(leaf.shape) * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(tree)
                 if not _barrier(leaf)]
@@ -197,6 +201,8 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
     else:
         sizes += after
     scratch = [family.reduction_scratch] if scope.reduces and family.reduction_scratch else []
+    if scope.reducing_warpgroups:
+        scratch.append(family.warpgroup_reduction_scratch * scope.reducing_warpgroups)
     return allocated(*sizes, *scratch) + max([0, *walks])
 
 
