@@ -15,6 +15,7 @@ from dew.nn.attention import (
     alibi_bias,
     chunk_mask,
     combined_attention_mask,
+    key_spans,
     scaled_dot_product_attention,
     with_key_lengths,
     with_key_starts,
@@ -707,6 +708,38 @@ def test_a_window_holding_no_key_keeps_its_lower_bound_against_an_image():
     blocks = template.spans(1, 2, 1, causal=True, sliding_window=2, positions=places, segment_ids=ids,
                             block_groups=groups)
     np.testing.assert_array_equal(np.asarray(template.dense(blocks)), [[[False, True]]])
+
+
+SLOTS = np.asarray([[3, 4, 5], [1, 2, -1]], np.int32)
+"""A cache call's queries' own keys in a 6-key cache: a row of three tokens appended at slots 3 to 5, and one of
+two at slots 1 and 2 beside a padding query (-1)."""
+SLOT_CASES = {
+    "causal": ({"causal": True},
+               [[[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1]],
+                [[1, 1, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0], [0, 0, 0, 0, 0, 0]]]),
+    "window of two": ({"causal": True, "sliding_window": 2},
+                      [[[0, 0, 1, 1, 0, 0], [0, 0, 0, 1, 1, 0], [0, 0, 0, 0, 1, 1]],
+                       [[1, 1, 0, 0, 0, 0], [0, 1, 1, 0, 0, 0], [0, 0, 0, 0, 0, 0]]]),
+    "chunks of two": ({"causal": True, "chunk": 2},
+                      [[[0, 0, 1, 1, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 1, 1]],
+                       [[1, 1, 0, 0, 0, 0], [0, 0, 1, 0, 0, 0], [0, 0, 0, 0, 0, 0]]]),
+    "a block of slots 2 to 4": ({"causal": True, "sliding_window": 1,
+                                 "block_groups": np.asarray([[-1, -1, 0, 0, 0, -1]] * 2, np.int32)},
+                                [[[0, 0, 1, 1, 1, 0], [0, 0, 1, 1, 1, 0], [0, 0, 0, 0, 0, 1]],
+                                 [[0, 1, 0, 0, 0, 0], [0, 0, 1, 1, 1, 0], [0, 0, 0, 0, 0, 0]]]),
+}
+"""Spans over `SLOTS` and the keys each query sees, written out by hand: causality ends a query's keys at its
+slot, a window or a chunk counts from it, a block holding it is read whole past the window, and a padding
+query sees none."""
+
+
+@pytest.mark.parametrize("case", SLOT_CASES.values(), ids=SLOT_CASES)
+def test_a_cache_calls_queries_see_keys_from_their_own_slots(case):
+    """A cache call's queries at their own slots (`key_spans`' `query_slots`): the keys each sees are the
+    case's written-out ones."""
+    options, expected = case
+    spans = key_spans(3, 6, query_slots=jnp.asarray(SLOTS), **{"sliding_window": None, **options})
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected, bool))
 
 
 @pytest.mark.parametrize(("query", "key"), [(jnp.int64, jnp.uint64), (jnp.int32, jnp.uint32)])
