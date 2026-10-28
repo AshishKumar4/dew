@@ -60,6 +60,7 @@ class GatedShortConv(nn.Module):
         self.conv = DepthwiseConv1d(features=self.emb_features, kernel=self.kernel, use_bias=self.use_bias,
                                     name='conv')
 
+    @nn.compact
     def __call__(self, x: jax.Array, call: MixerCall = PLAIN_CALL) -> jax.Array:
         batch, length, width = x.shape
         tokens = coordinates_of(call.metadata, batch, length)
