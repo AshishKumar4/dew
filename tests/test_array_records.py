@@ -4,7 +4,7 @@ reads in flight through eviction and close."""
 import os
 import pickle
 import threading
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
@@ -353,7 +353,7 @@ def test_a_read_past_the_bound_never_waits_on_another_source_opening_a_shard(arr
     def slow(path: str) -> ArrayRecords:
         # The open a remote shard waits on, held until the test lets it finish.
         opening.set()
-        assert released.wait(timeout=60)
+        released.wait()
         return opened(path)
 
     held = [ShardReaders(opened) for _ in arrayrecord_paths[:-1]]
@@ -363,15 +363,72 @@ def test_a_read_past_the_bound_never_waits_on_another_source_opening_a_shard(arr
             assert readers.read(path, 0) is not None
         with ThreadPoolExecutor(2) as pool:
             pending = pool.submit(late.read, arrayrecord_paths[-1], 0)
-            assert opening.wait(timeout=60)
-            answered = pool.submit(again.read, arrayrecord_paths[0], 1)
-            # Bounded so a read that waits on the open fails here rather than hanging the test.
-            assert answered in wait([answered], timeout=60).done
-            assert answered.result() is not None and not pending.done()
-            released.set()
-            assert pending.result(timeout=60) is not None
+            # The open is let go before the pool shuts down, which waits on it, whatever fails here.
+            try:
+                opening.wait()
+                answered = pool.submit(again.read, arrayrecord_paths[0], 1)
+                assert answered.result() is not None and not pending.done()
+            finally:
+                released.set()
+            assert pending.result() is not None
         assert sum(opened.path in real for opened in psutil.Process().open_files()) <= Loading().threads
     finally:
         released.set()
         for readers in (*held, late, again):
+            readers.close()
+
+
+def watched(opened: list, slow: tuple[threading.Event, threading.Event] | None = None):
+    """Opens a shard's reader that says whether it is closed; the one made `slow` closes only once
+    let."""
+    from dew.data.sources.records import ArrayRecords
+
+    class Watched(ArrayRecords):
+        closed = False
+
+        def close(self) -> None:
+            if slow is not None:
+                closing, released = slow
+                closing.set()
+                released.wait()
+            super().close()
+            self.closed = True
+
+    def opening(path: str) -> ArrayRecords:
+        # Read by its own file reader: no shard registry of its own counts towards the bound.
+        reader = Watched((path,))
+        opened.append(reader)
+        return reader
+
+    return opening
+
+
+def test_a_trim_asked_for_while_another_trims_is_made_before_the_trimmer_lets_go(arrayrecord_paths):
+    """A read that leaves the process past its idle bound while another read's trim is closing a
+    reader asks that trim to go again, which it does before it lets go: once both reads are done the
+    process holds no more idle readers than the bound (row 2059)."""
+    from dew.data.sources.records import ShardReaders
+
+    bound, opened = Loading().threads, []
+    closing, released = threading.Event(), threading.Event()
+    first = ShardReaders(watched(opened, (closing, released)))
+    sources = [first, *(ShardReaders(watched(opened)) for _ in range(bound + 1))]
+    path = arrayrecord_paths[0]
+    try:
+        for readers in sources[:bound]:
+            assert readers.read(path, 0) == b"0:0"
+        with ThreadPoolExecutor(1) as pool:
+            # Past the bound: this read's trim closes the first source's reader, the least recent.
+            trimming = pool.submit(sources[bound].read, path, 0)
+            # The close is let go before the pool shuts down, which waits on it, whatever fails here.
+            try:
+                closing.wait()
+                assert sources[bound + 1].read(path, 0) == b"0:0"
+            finally:
+                released.set()
+            assert trimming.result() == b"0:0"
+        assert sum(not reader.closed for reader in opened) <= bound
+    finally:
+        released.set()
+        for readers in sources:
             readers.close()

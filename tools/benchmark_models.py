@@ -32,7 +32,7 @@ from dew.diffusion.discrete import MDLM
 from dew.diffusion.process import DenoisingCondition
 from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
-from dew.inputs.encoders import ConditionEncoder
+from dew.inputs.condition import ConditionEncoder
 from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer

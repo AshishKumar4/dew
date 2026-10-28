@@ -12,9 +12,7 @@ set -eu
 # Every lock resolves for the oldest supported Python, so the interpreter running this changes nothing.
 RESOLVED=2026-10-12T00:00:00Z
 # Dew's own FlashAttention wheels resolve as they stood when 0.3.6 was published, past the pins the
-# locks hold (-P); nothing else moves. jax itself, which constraints.txt pins to one build of Dew's package
-# index, and qwix, which the quantization extra pins to another, take no date: that index's static pages give
-# no upload times, which a date would need.
+# locks hold (-P); nothing else moves.
 FLASH=2026-10-27T07:29:32Z
 # jaxlib and its CUDA plugins resolve as they stood when 0.12.0.1 was published, which the jax build Dew
 # carries its patches on pins exactly; nothing else moves.
@@ -25,13 +23,19 @@ ENVIRONMENTS=2026-10-17T00:00:00Z
 # certifi resolves past RESOLVED to 2026.10.19, the first without the emSign root whose intermediates'
 # keys were compromised (constraints.txt holds that floor); nothing else moves.
 CERTIFI=2026-10-20T03:00:00Z
+# Every package Dew's package index (constraints.txt's extra index) serves its own builds of, as its root page
+# lists them (the fork's patch_stack.py writes it: jax, qwix), takes no date: the index's static pages give no
+# upload times, which a date would need. Read at each lock, so a package the index takes on resolves with it.
+INDEX=$(sed -n 's/^--extra-index-url //p' constraints.txt)
+UNDATED=$(curl -fsS "$INDEX/" | sed -n 's|.*<a href="\([^/"]*\)/">.*|\1|p')
+[ -n "$UNDATED" ] || { echo "Dew's package index $INDEX lists no package" >&2; exit 1; }
 lock() {
   name=$1
   shift
   uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
     --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
-    --exclude-newer-package jax=false --exclude-newer-package qwix=false \
+    $(for package in $UNDATED; do echo --exclude-newer-package "$package=false"; done) \
     --exclude-newer-package "certifi=$CERTIFI" -P certifi --emit-index-url \
     $(for package in jaxlib jax-cuda12-plugin jax-cuda12-pjrt jax-cuda13-plugin jax-cuda13-pjrt libtpu; do
       echo --exclude-newer-package "$package=$JAXLIB" -P "$package"; done) \

@@ -5,7 +5,7 @@ stage (`_Lowering.eager`): the record steps, token splits, packing and
 windows, after filling the cache before them when there is one. It keeps
 the accepted rows, each with the source position it came from, as a
 `_Memory` source, which the Grain lowering then reads by index like any
-other. Record steps, token splits, Grain's packers and cache reads run by
+other. Record steps, token splits, packers and cache reads run by
 the Grain lowering's own definitions (`dew.data.lowering`); first-fit
 packing and windows run by their indexed plans (`plan_windows`, read as
 `PackedSource` reads it, and `IndexedWindows`), so the plan can
@@ -269,8 +269,8 @@ def _memory_stages(
                 rows, targets = _targeted([((plan.at("accepted", index),), packed[index])
                                            for index in range(len(packed))], counter, stage.fields[0], rule)
             else:
-                # Only first-fit of tokens alone has an indexed plan; the rest is Grain's
-                # own packer, run once over the corpus as an indexed read streams it.
+                # Only first-fit of tokens alone has an indexed plan; the rest is packed once over
+                # the corpus as an indexed read streams it (`_packed`).
                 packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
                 derived["packing"] = fingerprint(sizes)
                 rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
