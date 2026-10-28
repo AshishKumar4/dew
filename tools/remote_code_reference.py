@@ -141,13 +141,13 @@ def _stored_once(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return kept
 
 
-OPENED = """import json, sys, numpy, torch
-from transformers import AutoModelForCausalLM
-ids = torch.from_numpy(numpy.load(sys.argv[1]).astype('int64'))
+OPENED = """import json, sys, numpy, torch, transformers
+loader = getattr(transformers, sys.argv[1])
+ids = torch.from_numpy(numpy.load(sys.argv[2]).astype('int64'))
 opened = []
-for directory in sys.argv[2:]:
-    model, info = AutoModelForCausalLM.from_pretrained(directory, trust_remote_code=True, dtype=torch.float32,
-                                                       output_loading_info=True)
+for directory in sys.argv[3:]:
+    model, info = loader.from_pretrained(directory, trust_remote_code=True, dtype=torch.float32,
+                                         output_loading_info=True)
     with torch.no_grad():
         logits = model(input_ids=ids).logits
     report = {key: sorted(value) for key, value in info.items()}
@@ -180,7 +180,7 @@ def opens(name: str, export: Path, scratch: Path) -> None:
 
     from huggingface_hub import hf_hub_download
 
-    repo, revision, files, _ = RELEASES[name]
+    repo, revision, files, auto = RELEASES[name]
     release = scratch / "release"
     release.mkdir()
     released = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
@@ -189,8 +189,9 @@ def opens(name: str, export: Path, scratch: Path) -> None:
     shutil.copy(FIXTURES / name / "model.safetensors", release / "model.safetensors")
     for file in files:
         shutil.copy(hf_hub_download(repo, file, revision=revision), release / file)
-    run = subprocess.run([sys.executable, "-c", OPENED, str(FIXTURES / name / "input_ids.npy"), str(export),
-                          str(release)], check=True, capture_output=True, text=True,
+    # The release's own loader, the auto class its config registers it under.
+    run = subprocess.run([sys.executable, "-c", OPENED, auto, str(FIXTURES / name / "input_ids.npy"),
+                          str(export), str(release)], check=True, capture_output=True, text=True,
                          env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                               "HF_MODULES_CACHE": str(scratch / "modules")})
     checks = json.loads(run.stdout.strip().splitlines()[-1])
