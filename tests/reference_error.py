@@ -1029,7 +1029,7 @@ def _blocks(values: np.ndarray, runs) -> list[np.ndarray]:
     """`values` laid by `runs` (`_LaidTruths`), each run's leaves a (leaves, size) matrix."""
     ends = list(itertools.accumulate((leaves * size for leaves, size, _ in runs), initial=0))
     return [values[start:stop].reshape(leaves, size)
-            for start, stop, (leaves, size, _) in zip(ends, ends[1:], runs, strict=True)]
+            for start, stop, (leaves, size, _) in zip(ends[:-1], ends[1:], runs, strict=True)]
 
 
 def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
