@@ -141,10 +141,10 @@ def _nested(params) -> list:
     found = []
     for value in params.values():
         for program in value if isinstance(value, tuple) else (value,):
-            if isinstance(program, jax_core.Jaxpr):
-                found.append(program)
-            elif isinstance(program, jax_core.ClosedJaxpr):
-                found.append(program.jaxpr)
+            # A closed program holds its open one beside its constants.
+            inner = getattr(program, "jaxpr", program)
+            if isinstance(inner, jax_core.Jaxpr):
+                found.append(inner)
     return found
 
 
