@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.extend.core as jcore
@@ -43,6 +43,10 @@ class Footprint:
     residuals: int
     gradients: int
     held: int
+    resident: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    """The prepared state's logical bytes by field and device, before buffer assignment aliases
+    anything. These are not additional temporary bytes: the state's existing allocations already
+    count against allocator headroom, and newly built copies and accumulators are in `held`."""
 
     @property
     def temporaries(self) -> int:
@@ -53,7 +57,7 @@ class Footprint:
         """The terms traced so far, not an admission decision: workspace and scheduled liveness are
         not known from the pullback alone. XLA's fit check remains authoritative."""
         return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held,
-                "workspace": None, "admission": "unknown"}
+                "resident": dict(self.resident), "workspace": None, "admission": "unknown"}
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence) -> int:
@@ -126,4 +130,7 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
         return loss({**variables, "params": params}, batch, *rest)
 
     residuals = residual_bytes(trained, variables["params"], (variables, micro, *rest))
-    return Footprint(residuals, placed_bytes(prepared.variables["params"]), held)
+    resident = {name: placed_bytes(value) for name, value in {
+        "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
+        "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
+    return Footprint(residuals, placed_bytes(prepared.variables["params"]), held, resident)
