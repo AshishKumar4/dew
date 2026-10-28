@@ -416,7 +416,7 @@ def _consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) ->
     sight and carried to its last output: a row's count beside its own, a rejected row's on its marker
     (`Rejected.consumed`), which the corpus's next kept row carries on (`Accepted`). Every other row
     holds none, so the rows of one read hold the same fields."""
-    if not isinstance(given, Mapping) or CONSUMED not in given:
+    if given is None or isinstance(given, (bytes, Rejected)) or CONSUMED not in given:
         return step(given)
     consumed = integer(given[CONSUMED], "a row's consumed examples")
     outputs = step({name: column for name, column in given.items() if name != CONSUMED})

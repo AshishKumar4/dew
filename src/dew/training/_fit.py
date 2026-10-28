@@ -304,6 +304,9 @@ class FitRun:
     taken: Taken | None = None
     scored: frozenset[str] = frozenset()
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
+    last: Batch | None = None
+    """The latest step's batch, held in a run bounded in examples that updates every several steps, whose
+    window its stream's end leaves open (`Trainer._closing`)."""
     ahead: tuple[Batch | None] | None = None
     """The next batch, or None for the stream's end, read before the step that takes it, where a
     save had to know whether the run ends there (`ends_here`)."""

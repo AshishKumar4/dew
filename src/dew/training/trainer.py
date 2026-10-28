@@ -42,7 +42,7 @@ from dew._coordination import (
     broadcast_from_process_zero,
 )
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import FROZEN, Batch, Variables, owned_dicts, select
+from dew.batch import EXAMPLES_CONSUMED, FROZEN, VALID_ROWS, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking, Resume
 from dew.cleanup import attempted
 from dew.data.dataset import (
@@ -352,8 +352,7 @@ class Trainer(Generic[Loss, Effects]):
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
         self._prefetch = PREFETCH_DEPTH
-        # The examples a fit's run is bounded to where its read counts no steps ahead, which its state's
-        # clock reads (`TrainState.consumed`); none for a run counted otherwise.
+        # The examples bound of a run no read counts ahead, which its clock reads (`TrainState.consumed`).
         self._examples: int | None = None
 
     @property
@@ -1416,7 +1415,7 @@ class Trainer(Generic[Loss, Effects]):
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
                 batch = waited_read(run, interval, agree=not (seen and run.endless))
-                if batch is None:
+                if batch is None and (batch := self._closing(run, state)) is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
                 batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
@@ -1463,6 +1462,8 @@ class Trainer(Generic[Loss, Effects]):
                 self._display.step(run.current)
                 interval.count(batch, measured_flops, loss, finite, committed, aux)
                 run.clock.stepped(self.objective.row_tokens(device), rows_of(device))
+                if self._examples is not None and self.accumulation > 1:
+                    run.last = batch
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
                 if run.first_step is None:
@@ -1481,6 +1482,19 @@ class Trainer(Generic[Loss, Effects]):
                     assert profiler is not None
                     self._stop_trace(run, profile, profiler)
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
+
+    def _closing(self, run: FitRun, state: TrainState) -> Batch | None:
+        """The run's latest batch with every row masked (`VALID_ROWS` False, consuming no example), which a
+        run bounded in examples steps where its stream ends inside an update's window, so the window
+        commits over the rows it holds, its mean theirs, as a whole one does, rather than being dropped
+        with the examples it consumed. None where no window is open, or the run counts no examples."""
+        last = run.last
+        if last is None or int(state.microstep) % ((self._split or 1) * self.accumulation) == 0:
+            run.last = None
+            return None
+        consumed = last[EXAMPLES_CONSUMED]
+        return {**last, VALID_ROWS: jnp.zeros_like(consumed, dtype=bool),
+                EXAMPLES_CONSUMED: jnp.zeros_like(consumed)}
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
