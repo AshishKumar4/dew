@@ -400,11 +400,13 @@ def test_a_checkout_carrying_its_base_is_held_to_it_and_fetches_nothing(tmp_path
     shallow = tmp_path / "shallow"
     subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "head", root.as_uri(), str(shallow)],
                    check=True)
-    subprocess.run(["git", "remote", "set-url", "origin", str(tmp_path / "unreachable")], cwd=shallow,
-                   check=True)
+    # Its origin reachable: a checkout whose history lacks the base fails, and fetches nothing to find it.
     lacking = subprocess.run(["sh", str(BASE_HISTORY)], cwd=shallow, timeout=120, capture_output=True,
                              text=True, env={**os.environ, "BASE": base})
-    assert lacking.returncode != 0 and base in lacking.stderr and "unreachable" not in lacking.stderr
+    assert lacking.returncode == 1
+    for missing in ([f"{base}^{{commit}}"], ["refs/remotes/origin/main"]):
+        assert subprocess.run(["git", "rev-parse", "-q", "--verify", *missing], cwd=shallow,
+                              capture_output=True).returncode != 0
 
 
 def test_held_to_a_base_a_new_copy_beside_a_held_one_fails(tmp_path):
