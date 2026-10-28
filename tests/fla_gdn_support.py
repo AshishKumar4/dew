@@ -13,6 +13,7 @@ import jax.numpy as jnp
 from gdn_cases import CASES
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
+from dew.nn.precision import l2norm
 
 COMPILED_SHAPES = {name: CASES[name] for name in ("0.8b", "9b", "27b", "wide keys")}
 """The shapes every declared config compiles at (`gdn_cases`): the training shapes and the widest keys."""
@@ -93,6 +94,25 @@ def kernel_cases(target: str, dtypes: tuple[str, ...] = ("bfloat16", "float32"))
                     name = f"{target}/{kernel}/{dtype}/{flags}/{shape_name}" + "/reverse" * reverse
                     yield KernelCase(name, functools.partial(_case_call, launch, tiles, shape, dtype,
                                                              reverse=reverse))
+
+
+def delta_operands(seed: int, batch: int, length: int, key_heads: int, value_heads: int, width: int,
+                   columns: int, dtype=jnp.float32, *, per_key: bool = False, decay_shift: float = 3.0):
+    """A delta rule's operands and cotangents as a layer hands them over, the one draw every test of the
+    rule's kernels takes: l2-normalised queries and keys, values, a natural-log decay a head (or a key
+    dimension where `per_key`) `-exp(N - decay_shift)`, beta, an initial memory, and the output's and the
+    final memory's cotangents, `(q, k, v, g, beta, h0, do, dht)`, from `seed`'s eight keys; the queries,
+    keys, values, beta and the output's cotangent in `dtype`."""
+    keys = jax.random.split(jax.random.key(seed), 8)
+    q, k = (l2norm(jax.random.normal(key, (batch, length, key_heads, width))).astype(dtype)
+            for key in keys[:2])
+    v = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
+    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads, *(width,) * per_key)) - decay_shift)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, value_heads))).astype(dtype)
+    h0 = 0.1 * jax.random.normal(keys[5], (batch, value_heads, width, columns))
+    do = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
+    dht = 0.1 * jax.random.normal(keys[7], (batch, value_heads, width, columns))
+    return q, k, v, g, beta, h0, do, dht
 
 
 def head_chunks(x, chunk: int):

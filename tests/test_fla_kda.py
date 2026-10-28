@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import fla_gdn_support as support
 from delta_rule_support import NAMES, fla_side, float64_truth, math, plain_prefix, recurrence, through
 from reference_error import (
     as_given,
@@ -36,21 +37,6 @@ ON_A_GPU = pytest.mark.skipif(
     jax.default_backend() == "gpu",
     reason="on a GPU the port's fp32 products are fla's TF32 and its bar is fla's own distance "
            "(test_the_port_is_as_exact_as_fla); interpreted, they are exact")
-
-
-def operands(batch, length, key_heads, value_heads, width, columns, dtype, *, seed: int = 0):
-    """Normalised queries and keys, values, a natural-log decay per key dimension, beta, an initial
-    memory and the two cotangents, as a layer hands them over."""
-    keys = jax.random.split(jax.random.key(seed), 8)
-    q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
-    k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
-    v = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
-    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads, width)) - 2.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, value_heads))).astype(dtype)
-    h0 = 0.1 * jax.random.normal(keys[5], (batch, value_heads, width, columns))
-    do = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
-    dht = 0.1 * jax.random.normal(keys[7], (batch, value_heads, width, columns))
-    return q, k, v, g, beta, h0, do, dht
 
 
 def fla_math(q, k, v, g, beta, h0):
@@ -80,7 +66,8 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
     summed in fp32 (`FP32_SUMS`), by check 1 (`assert_as_exact`) over fresh operands drawn from each
     seed, truth the float64 token recurrence on them."""
     def draw(seed):
-        return operands(1, length, key_heads, value_heads, width, columns, jnp.float32, seed=seed)
+        return support.delta_operands(seed, 1, length, key_heads, value_heads, width, columns,
+                                      per_key=True, decay_shift=2.0)
 
     def run(rule):
         return lambda q, k, v, g, beta, h0, do, dht: through(rule, do, dht)(q, k, v, g, beta, h0)
@@ -199,7 +186,8 @@ def gpu_case(case, dtype):
     """A GPU case's operands (one row), the port's outputs and gradients through `fla_rule` as a
     function of the six operands, and the case's packed documents' first tokens, or None."""
     (length, key_heads, value_heads, width, columns), cuts = GPU_CASES[case]
-    inputs = operands(1, length, key_heads, value_heads, width, columns, dtype, seed=61)
+    inputs = support.delta_operands(61, 1, length, key_heads, value_heads, width, columns, dtype,
+                                    per_key=True, decay_shift=2.0)
     rule = fla_rule
     if cuts is not None:
         starts = np.zeros((1, length), bool)
