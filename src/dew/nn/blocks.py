@@ -327,15 +327,19 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
 
 
 class Upsample(nn.Module):
-    """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""
+    """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`, a module named `conv`
+    (its parameters' path, as the model owning them publishes it: a UNet's `Conv_0`, a KL autoencoder's
+    `conv`)."""
     features: int
     scale: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    conv: str = "Conv_0"
 
     @nn.nowrap
     def _convolution(self, **scope):
-        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
+        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision,
+                    **({"name": self.conv} if "parent" not in scope else {}), **scope)
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
