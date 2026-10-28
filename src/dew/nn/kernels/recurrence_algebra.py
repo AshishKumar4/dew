@@ -477,7 +477,7 @@ def entering(span: Span, axis: str, initial=None, issue: Issue = portable) -> ja
     span, shift = Span(*span), 1
     while shift < shards:
         composed = compose(shifted(span, shift), span, issue)
-        span = jax.tree.map(lambda new, old: jnp.where(index >= shift, new, old), composed, span)
+        span = jax.tree.map(functools.partial(jnp.where, index >= shift), composed, span)
         shift *= 2
     before = shifted(span, 1)
     if initial is None:

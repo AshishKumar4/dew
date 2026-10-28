@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import (
     FEWEST_SEEDS,
     assert_as_exact,
@@ -410,7 +410,7 @@ def test_each_shard_enters_with_the_spans_before_it_applied_in_turn(dense, shard
         return (transfer, jax.random.normal(keys[1], (shards, batch, heads, width, columns)),
                 jax.random.normal(keys[2], (batch, heads, width, columns)))
 
-    mesh = jax.make_mesh((shards,), ('shards',), devices=jax.devices()[:shards])
+    mesh = Mesh(np.asarray(jax.devices()[:shards]), ('shards',))
 
     def entered(transfer, write, initial):
         def shard(transfer, write, initial):
