@@ -120,7 +120,8 @@ def episode_returns(rewards, values, gamma, lam, dtype):
 
 
 STEP_REWARD_SEEDS = 8
-"""The step rewards' returns' declared seeds for check 1, each a rollout (`assert_as_exact`)."""
+"""The step rewards' returns' declared seeds for check 1, each a rollout (`assert_as_exact`), sized by
+`seeds_for` paired with PPORollout's returns on the CPU."""
 
 
 def test_each_step_reward_lands_on_the_last_action_of_the_call_it_paid_for():
