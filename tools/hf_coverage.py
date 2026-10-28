@@ -229,11 +229,11 @@ _LOAD = f"""
 import sys
 import httpx
 import jax
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 from dew.interop import Pretrained
 try:
     loaded = Pretrained.load(sys.argv[1], revision=sys.argv[2], weights=False, dtype="bfloat16")
-except (HfHubHTTPError, httpx.TransportError) as error:
+except (HfHubHTTPError, LocalEntryNotFoundError, httpx.TransportError) as error:
     print(f"{{type(error).__name__}}: {{error}}".replace(chr(10), " "))
     sys.exit({HUB_EXIT})
 leaves = jax.tree.leaves(loaded.variables)
@@ -242,7 +242,9 @@ if not leaves or not all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in leav
 print(sum(leaf.size for leaf in leaves))
 """
 """A model loaded without its weights in a process of its own, every leaf a shape alone: its parameter
-count on the last line; or the Hub's error (an HTTP error or a failed transport), exiting `HUB_EXIT`."""
+count on the last line; or the Hub's error, exiting `HUB_EXIT`: an HTTP error, a failed transport, or a
+file's metadata the Hub could not be reached for (`LocalEntryNotFoundError`, which huggingface_hub
+raises for a connection or server error on an uncached file)."""
 
 
 @dataclass(frozen=True)

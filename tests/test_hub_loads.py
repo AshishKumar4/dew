@@ -17,7 +17,8 @@ def test_the_census_loads_each_model_without_its_weights_and_rows_each_refusal(t
     """The census lists a local Hub's models, each at the commit the listing states, and `loads` loads
     each without its weights: a published decoder (llama-tiny's files), its row its parameter count, as
     a load of the same files on disk counts it; a model of a type no family maps, refused, its row naming
-    the refusal; and a repo with no config, the Hub's row, as is a repo the Hub does not hold. No load
+    the refusal; and a repo with no config, the Hub's row, as are a repo the Hub does not hold and a
+    model whose files the Hub, gone, cannot serve. No load
     fetched a weight file: what the Hub sent of the decoder's model.safetensors was ranges of its first
     bytes, where its safetensors header is read, less than the file, and no weight file was cached (the
     boundary 1888's network test checks on the Hub itself)."""
@@ -45,7 +46,11 @@ def test_the_census_loads_each_model_without_its_weights_and_rows_each_refusal(t
             done = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "hf_coverage.py"), *command],
                                   env=env, capture_output=True, text=True, check=False)
             assert done.returncode == 0, done.stderr[-3000:]
-        absent = load("hf_coverage").loaded("local/absent", "0" * 40, env)
+        coverage = load("hf_coverage")
+        absent = coverage.loaded("local/absent", "0" * 40, env)
+    # The Hub gone, an uncached file's metadata cannot be fetched: the Hub's row, not a refusal.
+    unreachable = coverage.loaded("local/decoder", hub.commit("local/decoder"),
+                                  {**env, "HF_HUB_CACHE": str(tmp_path / "fresh")})
     rows = {row["id"]: row for row in json.loads((out / "loads.json").read_text())}
     report = (out / "loads.md").read_text()
     held = Pretrained.load(source, weights=False, dtype="bfloat16")
@@ -56,6 +61,7 @@ def test_the_census_loads_each_model_without_its_weights_and_rows_each_refusal(t
     assert "census_unknown" in (rows["local/unknown"]["reason"] or ""), report
     assert (rows["local/bare"]["outcome"], rows["local/bare"]["reason"]) == ("hub", "no config.json"), report
     assert absent.outcome == "hub" and "RepositoryNotFoundError" in (absent.reason or ""), absent
+    assert unreachable.outcome == "hub", unreachable
     reads = hub.sent("local/decoder", "model.safetensors")
     assert reads and all(read.asked is not None and read.asked[0] in (0, 8) for read in reads), hub.served
     assert sum(read.sent for read in reads) < decoder["model.safetensors"].stat().st_size, hub.served
