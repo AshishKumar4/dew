@@ -33,12 +33,12 @@ from reference_error import (
 from token_support import token_batch_of
 
 from dew.artifacts import TokenScores
-from dew.batch import coordinates
+from dew.batch import TEXT_KEY, coordinates
 from dew.data.chat import ROLES_KEY, Role
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
+from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.objectives.routing import ExpertBalance
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer

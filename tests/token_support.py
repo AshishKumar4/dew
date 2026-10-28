@@ -9,7 +9,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-from dew.objectives.lm import TEXT_KEY
+from dew.batch import TEXT_KEY
 
 
 @dataclasses.dataclass(frozen=True)
