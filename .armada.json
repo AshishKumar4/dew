@@ -18,7 +18,7 @@
             "local": true },
   "task": {
     "command": ["python3", "tools/armada/ci.py", "task", "--python={python}", "--tests={tests}", "--split={split}",
-                "--out={out}", "--cache={cache}"],
+                "--out={out}", "--cache={cache}", "--whole={whole}"],
     "timeout": 1800,
     "mode": "fast",
     "speculative": true,
