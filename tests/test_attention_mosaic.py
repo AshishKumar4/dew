@@ -1040,10 +1040,11 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
 def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     """A score hook that forms a unit column (`q_pos[:, :1]`, `axis` 0) or a unit row (`k_pos[:1, :]`, 1,
     which Mosaic GPU selects by a reduction across warps, its scratch the launch's warpgroups reserve,
-    ledger 1428), the training forward and the backward lowered and compiled by ptxas for an H100 on this
-    CPU (tests/kernel_compile.py), within its shared memory (`failures`: no lowering error, no block past
-    it). Its registers at the derived tiles are the template's register model's (ledger 1617), hooked or
-    not."""
+    ledger 1428), the training forward lowered and compiled by ptxas for an H100 on this CPU
+    (tests/kernel_compile.py), within its shared memory (`failures`: no lowering error, no block past it);
+    the backward, whose dK/dV tiles hold their keys first, takes such a hook on another mainloop
+    (`attention_mosaic_program.pointwise`). Its registers at the derived tiles are the template's register
+    model's (ledger 1617), hooked or not."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, failures
 
@@ -1059,12 +1060,5 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     def trained(query, key, value):
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=True)
 
-    def backward(query, key, value, dout):
-        residuals = trained(query, key, value)[1:]
-        grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals)
-        return grads.query, grads.key, grads.value
-
-    found = compile_mosaic_kernels([KernelCase("forward", lambda: (trained, (query, key, key))),
-                                    KernelCase("backward", lambda: (backward, (query, key, key, query)))],
-                                   "sm90")
+    found = compile_mosaic_kernels([KernelCase("forward", lambda: (trained, (query, key, key)))], "sm90")
     assert not failures(found), "\n".join(failures(found))
