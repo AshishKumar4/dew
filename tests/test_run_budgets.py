@@ -3,7 +3,6 @@ runs out before its length."""
 
 import collections
 import dataclasses
-import itertools
 
 import grain.python as grain
 import jax.numpy as jnp
@@ -104,18 +103,15 @@ def trained(x, directory=None, stops: tuple[Pause | None, ...] = (None,)):
     return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(stepped)}
 
 
-def ids_read(loader: Loader, steps: int, field: str) -> collections.Counter:
-    """The real values of `field` in the first `steps` training batches of `loader`, which ends there."""
+def ids_read(loader: Loader, field: str) -> collections.Counter:
+    """The real values of `field` in every training batch of `loader`, whose read ends at its bound."""
     stream = loader.train(DataPartition())
     read: collections.Counter = collections.Counter()
     try:
-        for _ in range(steps):
-            batch = next(stream)
+        for batch in stream:
             real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch[field]), bool)), bool)
             values = np.asarray(batch[field])[real]
             read.update(values[values > 0].tolist())
-        with pytest.raises(StopIteration):
-            next(stream)
     finally:
         if isinstance(stream, Closeable):
             stream.close()
@@ -130,7 +126,7 @@ def test_an_examples_budget_reads_each_record_once_and_its_read_ends_there(examp
     RECORDS of them."""
     ids = np.arange(1, RECORDS + 1, dtype=np.int32)
     loader = compile(Pipeline(Memory({"id": ids})).shuffle(3).batch(BATCH), examples=examples)
-    read = ids_read(loader, loader.example_steps(examples), "id")
+    read = ids_read(loader, "id")
     passes, rest = divmod(examples, RECORDS)
     assert sum(read.values()) == examples
     assert collections.Counter(read.values()) == collections.Counter(
@@ -143,7 +139,7 @@ def test_an_examples_budget_counts_documents_before_they_are_packed():
     it, in the windows of the steps one pass over it counts, and ends."""
     documents = [{"text": np.full(length, length, np.int32)} for length in range(1, 6)]
     loader = compile(Pipeline(Memory(documents)).pack(8).batch(2), examples=13)
-    read = ids_read(loader, loader.example_steps(13), "text")
+    read = ids_read(loader, "text")
     reached = collections.Counter(1 + index % 5 for index in range(13))
     assert read == {token: count * token for token, count in reached.items()}
 
@@ -173,7 +169,7 @@ def test_an_examples_budget_counts_examples_before_the_objective_expands_them(ex
     expansion = Configured(lambda facts: Questioned(), needs=(), expands=True) if configured else Questioned()
     loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
                      objective=ObjectiveData(train=(expansion,)), examples=examples)
-    read = ids_read(loader, loader.example_steps(examples), "id")
+    read = ids_read(loader, "id")
     passes, rest = divmod(examples, RECORDS)
     assert sum(count / (record % 3 + 1) for record, count in read.items()) == examples
     assert all(count % (record % 3 + 1) == 0 for record, count in read.items())
@@ -276,7 +272,7 @@ def test_an_examples_budget_counts_the_examples_an_objectives_filter_keeps_given
     def kept(step) -> collections.Counter:
         loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
                          objective=ObjectiveData(train=(step,)), examples=7)
-        return ids_read(loader, loader.example_steps(7), "id")
+        return ids_read(loader, "id")
 
     given = kept(Evens())
     assert sum(given.values()) == 7 and all(record % 2 == 0 for record in given)
@@ -294,7 +290,7 @@ def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_
     three = Pipeline(Memory({"id": np.full(RECORDS, 2, np.int32)})).repeat()
     loader = compile(mix([one, three], weights=[0.5, 0.5]).batch(BATCH),
                      objective=ObjectiveData(train=(Questioned(),)), examples=EXAMPLES)
-    read = ids_read(loader, loader.example_steps(EXAMPLES), "id")
+    read = ids_read(loader, "id")
     assert read[2] % 3 == 0
     assert read[3] + read[2] // 3 == EXAMPLES
 
@@ -321,7 +317,7 @@ def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_row
     chain = chain.shuffle(3) if shuffled else chain
     loader = compile(chain.batch(BATCH), read="memory", objective=objective.data(), examples=EXAMPLES)
     rows = 0
-    for batch in itertools.islice(loader.train(DataPartition()), loader.example_steps(EXAMPLES)):
+    for batch in loader.train(DataPartition()):
         # A short last batch is filled with windows it marks as no rows of its own (`VALID_ROWS`).
         real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["segments"]), bool)), bool)
         rows += sum(len(set(window[window > 0].tolist())) for window in np.asarray(batch["segments"])[real])
@@ -333,6 +329,66 @@ def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_siz
     trains on each record as many times as the bound reaches it: its losses and weight match SGD on
     the same records at a rate falling to 0 over those updates (check 1)."""
     assert_as_exact(trained, descended, records, "examples run", seeds=EXAMPLES_SEEDS)
+
+
+class Repeated:
+    """An objective's expansion of each record into `id % 3 + 1` copies of its row, read after the bound."""
+
+    def flat_map(self, element):
+        return tuple({"x": element["x"]} for _ in range(int(element["id"]) % 3 + 1))
+
+
+class Echoed(Pulled):
+    """`Pulled` over the rows its data step makes of each record (`Repeated`)."""
+
+    def data(self):
+        from dew.data.pipeline import ObjectiveData
+
+        return ObjectiveData(train=(Repeated(),))
+
+
+@as_given
+def clocked_descent(x):
+    """The losses of each step and the final weight of Adam on `Echoed` over `x`'s RECORDS records read in
+    order, each `id % 3 + 1` rows, in batches of BATCH rows (the last short): an update a batch, at a rate
+    falling linearly from PEAK to 0 over the run's progress, the share of its records whose last row an
+    earlier batch held (`TrainState.consumed`): the reference arm, and in float64 the truth."""
+    ids = np.arange(1, RECORDS + 1)
+    owner = np.repeat(np.arange(RECORDS), ids % 3 + 1)
+    rows = x[owner]
+    last = np.r_[owner[1:] != owner[:-1], True]
+    w = first = second = jnp.zeros(FEATURES, x.dtype)
+    losses, consumed = [], 0
+    for update, start in enumerate(range(0, len(rows), BATCH)):
+        held = rows[start:start + BATCH]
+        losses.append(jnp.mean(jnp.square(w - held)))
+        gradient = 2 * jnp.sum(w - held, axis=0) / (len(held) * FEATURES)
+        first, second = 0.9 * first + 0.1 * gradient, 0.999 * second + 0.001 * jnp.square(gradient)
+        moved = (first / (1 - 0.9 ** (update + 1))) / (jnp.sqrt(second / (1 - 0.999 ** (update + 1))) + 1e-8)
+        w = w - PEAK * (1 - consumed / RECORDS) * moved
+        consumed += int(np.sum(last[start:start + BATCH]))
+    return {"w": w, "loss": jnp.stack(losses)}
+
+
+@as_given
+def clocked_run(x):
+    """The losses of every step and the final weight of a run bounded to RECORDS examples of `x`, read in
+    order as a stream, whose objective makes `id % 3 + 1` rows of each, under `Linear(PEAK)`: no pass
+    counts its steps ahead, so its schedule reads the examples its batches consumed."""
+    tracker = RecordingTracker()
+    chain = Pipeline(Memory({"x": x, "id": np.arange(1, RECORDS + 1, dtype=np.int32)})).read("streamed")
+    trainer = Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK)), key=0,
+                      tracker=tracker)
+    state = trainer.fit(chain.batch(BATCH), examples=RECORDS, log_every=1)
+    assert state is not None and int(state.consumed) == RECORDS
+    return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(losses(tracker))}
+
+
+def test_a_run_no_pass_counts_ahead_reads_its_schedule_off_the_examples_it_consumed():
+    """A run bounded in examples whose objective makes rows of each after the bound counts no steps ahead:
+    its rate falls over the share of its examples its batches consumed, each example consumed by the batch
+    that holds its last row, and its losses and weight are Adam's at that rate (check 1)."""
+    assert_as_exact(clocked_run, clocked_descent, records, "clocked run", seeds=EXAMPLES_SEEDS)
 
 
 def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):

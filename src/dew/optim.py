@@ -1430,7 +1430,7 @@ def linear_schedule(peak: jax.typing.ArrayLike, warmup_steps: int, decay_start: 
 
 def _after(progress: jax.Array, start: jax.Array) -> jax.Array:
     """How far a run at `progress` stands through the piece from `start` to its end, 0 to 1."""
-    return jnp.clip((progress - start) / jnp.maximum(1.0 - start, jnp.finfo(jnp.float32).tiny), 0.0, 1.0)
+    return jnp.clip((progress - start) / jnp.maximum(1.0 - start, jnp.finfo(progress.dtype).tiny), 0.0, 1.0)
 
 
 type Rates = Mapping[str, jax.Array | float]
@@ -1561,10 +1561,11 @@ class ScheduleBase:
         if isinstance(written, str):
             span = share(written)
             through = jnp.clip(progress / span, 0.0, 1.0) if span else jnp.ones_like(progress)
-            return through, progress >= span, jnp.asarray(span, jnp.float32)
+            return through, progress >= span, jnp.asarray(span, progress.dtype)
         count = self._counted(updates)
-        through = jnp.clip(count / written, 0.0, 1.0) if written else jnp.ones_like(progress)
-        return through, count >= written, marks.get("warmup", jnp.zeros([], jnp.float32))
+        through = (jnp.clip(count.astype(progress.dtype) / written, 0.0, 1.0) if written
+                   else jnp.ones_like(progress))
+        return through, count >= written, marks.get("warmup", jnp.zeros([], progress.dtype))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1677,7 +1678,7 @@ class Power(ScheduleBase):
             value = law(jnp.maximum(count, 1)) * through
         elif written:
             warm = jnp.minimum(rates['peak_value'], rates['a'] * (written * self.c) ** self.b)
-            value = jnp.where(count < written, warm * count / written, law(count))
+            value = jnp.where(count < written, warm * count.astype(progress.dtype) / written, law(count))
         else:
             value = law(count)
         tail = self.tail
@@ -1687,7 +1688,7 @@ class Power(ScheduleBase):
         if tail.steps is None:
             done = _after(progress, marks["tail"])
         else:
-            done = jnp.clip((count - tail.start) / (tail.steps - tail.start), 0.0, 1.0)
+            done = jnp.clip((count - tail.start).astype(progress.dtype) / (tail.steps - tail.start), 0.0, 1.0)
         return jnp.where(count >= tail.start, start + (rates['tail.end_value'] - start) * done, value)
 
     def values(self, steps: int | None, rates: Rates | None = None
