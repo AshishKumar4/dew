@@ -259,7 +259,9 @@ def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, 
                              chunk: int, bh: int):
     """mamba_ssm's `_chunk_cumsum_bwd_kernel` (ssd_chunk_state.py:101-174) without the step's bias,
     softplus and limit, for one chunk of `BH` heads: the step's gradient `ddA A + ddt` back in Dew's
-    `[T, H]`, and `A`'s `sum ddA dt` over the chunk for XLA to sum."""
+    `[T, H]`, and `A`'s `sum ddA dt` over the chunk for XLA to sum, a step at a time with its roundings
+    kept (`compensated_add`): summed plainly, a steep-then-mild chunk's rate gradient was 2.79 times the
+    recurrence's distance from float64, 1.20 compensated (row 2066)."""
     c, h = pl.program_id(1), pl.program_id(2)
     heads = pl.ds(h * bh, bh)
     steps = pl.ds(c * chunk, chunk)
@@ -267,8 +269,15 @@ def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, 
     dacs = dacs_ref[:, steps]
     ddt = dacs * a_ref[heads].astype(jnp.float32)[:, None] + ddt_ref[:, steps]
     write_rows(out_ref.at[steps, heads], limit, ddt.T)
-    dt = read_rows(dt_ref.at[steps, heads], limit).astype(jnp.float32).T
-    da_ref[...] = jnp.sum(dacs * dt, axis=1)
+
+    def step(k, summed):
+        at = c * chunk + k
+        dt = dt_ref[pl.ds(jnp.minimum(at, length - 1), 1), heads].astype(jnp.float32).T
+        product = dacs_ref[:, pl.ds(at, 1)] * jnp.where(at < length, dt, 0.0)
+        return compensated_add(summed, (product, jnp.zeros((bh, 1), jnp.float32)))
+
+    summed = jax.lax.fori_loop(0, chunk, step, (jnp.zeros((bh, 1), jnp.float32),) * 2)
+    da_ref[...] = sum(summed)[:, 0]
 
 
 @dataclasses.dataclass(frozen=True)
