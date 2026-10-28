@@ -1548,8 +1548,8 @@ class RunConfig:
         holds (key, microbatches, layout, accumulation, split, loss scale, kernel tuning), and the
         `resources` its mode adds (checkpoints, tracker, profile, a lowering or a step compiled
         ahead), so a run that trains and one that compiles ahead build the one trainer. The trainer is
-        the training package's lazy export (`dew.training`), read as the run trains, so a config read
-        alone reads none of it."""
+        the training package's lazy export (`dew.training`), read where a run trains or compiles
+        ahead, so a config read alone reads none of it."""
         trainer = self.trainer
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,

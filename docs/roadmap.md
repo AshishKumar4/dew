@@ -150,7 +150,7 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Add explicit continue/restart control beside automatic latest-checkpoint restore. In-memory state continuation was rejected. [208]
 - Match PNDM's multistep grouping and startup steps against Diffusers before remeasuring its parity margin. [647]
 - Find the tiled chunked head's residual at small token tiles, where a few head-gradient elements sit further from float64 than the whole-logits reference. [737]
-- Measure the startup a run saves by running its step compiled ahead (`--trainer.compile-ahead`, `--trainer.ahead`) on its GPUs, carry its tuning picks with it, and make the step compiled ahead the run's own program where its kernels read the GPU it is placed on (attention's cuDNN and FlashAttention calls). [720]
+- Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
 - Build the training design's remaining contracts: refusing a split leaf that declares no axes, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
 - Record every component through the registry's records, earlier saved runs loading through one translation per component until 1.0. [1412]
 - Find what changed Qwen3.5-4B's peak memory between pins. [1555]

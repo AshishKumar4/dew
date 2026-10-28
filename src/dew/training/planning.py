@@ -690,6 +690,7 @@ class FitSearch[LossT, EffectsT]:
             return told if taken and isinstance(told, dict) else None
         probe = self.cheaper(planned)
         return None if probe is None else probe.record()
+
     def climb(self) -> bool:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.
         if self.narrow and any(candidate.copies for candidate in self.lowered.values()):
