@@ -28,6 +28,7 @@ twin's distance from the truth.
 
 import dataclasses
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import flax
@@ -310,6 +311,29 @@ def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
                                original_max_position_embeddings=4)
     with pytest.raises(ValueError):
         plain.clone(yarn=None, rope_scaling=longrope).apply(loaded.variables, ids)
+
+
+def test_a_prefilled_decode_cache_holds_no_payload_twice(source):
+    """After a prompt's prefill for drafting, the target's and the drafter's decode caches hold no
+    payload twice: V4's window head, which serves as its keys and its values, and the drafter's context
+    are each kept once (`KVStore`'s `keys_as_values`), where both were allocated and written and every
+    window layer held each of its tokens' heads twice (ledger 1921)."""
+    from dew.sampling.text import decode_ops, prefill_state
+
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    ops = decode_ops(plain, loaded.variables, 0, 1)
+    state, _ = prefill_state(plain, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
+
+    def twice(node):
+        if not isinstance(node, Mapping):
+            return []
+        payloads = [leaf for leaf in node.values() if not isinstance(leaf, Mapping) and np.ndim(leaf) >= 3]
+        found = [index for index, leaf in enumerate(payloads)
+                 if any(np.array_equal(leaf, other) and np.any(leaf) for other in payloads[:index])]
+        return found + [held for child in node.values() for held in twice(child)]
+
+    assert not twice(jax.device_get(state.cache))
 
 
 def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
