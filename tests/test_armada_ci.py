@@ -1343,8 +1343,8 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
     runs outside every test process), another test module, or a change to a fixture it never opens (its
-    openers' input alone); it runs again once what its test process runs or reads changes: a plugin loaded into
-    it, a Python file added that can change what an import finds (a conftest.py, a top-level package
+    openers' input alone); it runs again once what its test process runs or reads changes: a plugin loaded
+    into it, a Python file added that can change what an import finds (a conftest.py, a top-level package
     under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
