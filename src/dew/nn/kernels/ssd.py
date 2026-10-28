@@ -27,7 +27,6 @@ holds the kernel to `chunk_ssd` and its `jax.grad`.
 
 from __future__ import annotations
 
-
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -36,7 +35,6 @@ from jax.typing import DTypeLike
 
 from ..precision import float32_products, products_dtype
 from . import generation
-
 
 MIN_WIDTH = 8
 """The narrowest chunk, head width or state width the kernel is chosen for.
