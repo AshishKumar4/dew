@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -34,11 +35,13 @@ def hold_progress_lock() -> None:
 
 def configuration(card: str | None, name: str | None) -> tuple[str, str | list | dict | None, str | None]:
     """The configuration `datasets` reads by `name` from a dataset card (its README's text, None for a
-    repository without one): the card's `configs` metadata (`MetadataConfigs`), `name` or the card's
-    default where None, with its `data_files` and its `data_dir`; a card of no `configs` reads the
-    repository by `datasets`' default patterns, as its one configuration, `default`. A name the card
-    has no configuration of, or None where it has several and no default, is refused, as
-    `load_dataset_builder` refuses it."""
+    repository without one): the card's `configs` metadata (`MetadataConfigs`), `name` or, where None,
+    the card's default, else the one configuration its `dataset_info` describes, with its `data_files`
+    and its `data_dir`. A card of no `configs` reads the repository by `datasets`' default patterns as
+    its one configuration, `default`, and a configuration named there lies in a directory of its name,
+    as the Hub's Parquet conversion lays each one out. A name the card has no configuration of, or
+    None where it has several and no default, is refused, as `load_dataset_builder` refuses it."""
+    from datasets.info import DatasetInfosDict
     from datasets.utils.metadata import MetadataConfigs
     from huggingface_hub import DatasetCard, DatasetCardData
 
@@ -46,11 +49,11 @@ def configuration(card: str | None, name: str | None) -> tuple[str, str | list |
     assert isinstance(metadata, DatasetCardData), type(metadata)
     configs = MetadataConfigs.from_dataset_card_data(metadata)
     if not configs:
-        if name not in (None, "default"):
-            raise ValueError(f"the dataset's card names no configuration, so none is {name!r}; read it "
-                             "unnamed")
-        return "default", None, None
+        return ("default", None, None) if name in (None, "default") else (name, None, name)
     chosen = name if name is not None else configs.get_default_config_name()
+    described = DatasetInfosDict.from_dataset_card_data(metadata)
+    if chosen is None and len(described) == 1:
+        chosen = next(iter(described))
     if chosen is None or chosen not in configs:
         raise ValueError(f"the dataset's configurations are {sorted(configs)}; name one of them, not "
                          f"{name!r}")
@@ -81,13 +84,27 @@ def split_files(paths: Sequence[str], split: str, *, data_files: str | list | di
     try:
         # A listing with no data files at all is datasets' FileNotFoundError (EmptyDatasetError).
         stated = sanitize_patterns(data_files) if data_files is not None else get_data_patterns(base)
-        patterns = {str(name): list(found) for name, found in stated.items()}
+        patterns = {str(name): [_listed_pattern(pattern) for pattern in found]
+                    for name, found in stated.items()}
         resolved = set(DataFilesList.from_patterns(patterns.get(split, []), base_path=base))
     except FileNotFoundError:
         resolved = set()
     finally:
         fs.rm(root, recursive=True)
     return sorted(url.split(root + "/", 1)[1] for url in resolved)
+
+
+def _listed_pattern(pattern: str) -> str:
+    """A configuration's data-files pattern as the repository's listing names its files: a URL into the
+    repository at a revision (`hf://datasets/owner/name@revision/...`) by its path in it; a URL into any
+    other store is refused, since a streamed split reads its own repository's files."""
+    if "://" not in pattern:
+        return pattern
+    found = re.fullmatch(r"hf://datasets/[^/@]+/[^/@]+(?:@[^/]+)?/(.*)", pattern)
+    if found is None:
+        raise ValueError(f"a configuration's data files {pattern!r} lie outside its repository, which a "
+                         "streamed split does not read; prepare the split, or read the files with Files")
+    return found[1]
 
 
 @dataclass(frozen=True)

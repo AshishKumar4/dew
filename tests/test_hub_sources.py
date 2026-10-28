@@ -627,17 +627,36 @@ def test_a_named_configurations_split_holds_the_files_its_card_gives_it(name, ex
 
 def test_a_card_of_several_configurations_and_no_default_is_read_only_by_name():
     """Unnamed, a card of several configurations and no default is refused, as `datasets` refuses it,
-    where a read once took every configuration's files; a card naming one default reads it unnamed,
-    and a repository with no card reads its default patterns as its one configuration."""
-    from dew.data.sources.hub import configuration
+    where a read once took every configuration's files; a card naming one default, or describing one
+    configuration alone in its `dataset_info`, reads it unnamed; a repository with no card reads its
+    default patterns as its one configuration, and a configuration named there from the directory of
+    its name, as the Hub's Parquet conversion lays it out."""
+    from dew.data.sources.hub import configuration, split_files
 
     with pytest.raises(ValueError):
         configuration(CONFIGURED_CARD, None)
     defaulted = CONFIGURED_CARD.replace("- config_name: fr\n", "- config_name: fr\n  default: true\n")
     assert configuration(defaulted, None)[0] == "fr"
+    described = CONFIGURED_CARD.replace("---\n# rows", "dataset_info:\n  config_name: en\n---\n# rows")
+    assert configuration(described, None)[0] == "en"
     assert configuration(None, None) == ("default", None, None)
+    _, data_files, data_dir = configuration(None, "en")
+    conversion = ["en/train/0000.parquet", "fr/train/0000.parquet"]
+    assert split_files(conversion, "train", data_files=data_files, data_dir=data_dir) == [
+        "en/train/0000.parquet"]
+
+
+def test_a_configurations_files_named_by_their_repositorys_urls_resolve_against_its_listing():
+    """A card's data files named by URLs into the repository at its revision resolve to the listing's
+    files as its relative patterns do; a URL into another store is refused, which a stream of the
+    repository's own files does not read."""
+    from dew.data.sources.hub import split_files
+
+    absolute = [{"split": "train", "path": "hf://datasets/owner/rows@0123abcd/processed/clean-*.parquet"}]
+    assert split_files(CONFIGURED_LISTING, "train", data_files=absolute) == ["processed/clean-0.parquet"]
     with pytest.raises(ValueError):
-        configuration(None, "en")
+        split_files(CONFIGURED_LISTING, "train",
+                    data_files=[{"split": "train", "path": "s3://other/x.parquet"}])
 
 
 def test_a_streamed_split_reads_its_configurations_files_online_and_offline_alike(monkeypatch):
