@@ -18,6 +18,7 @@ from reference_error import (
     as_given,
     assert_as_exact,
     declared_seeds,
+    dew_programs,
     indexed_recording,
     recording,
     widened,
@@ -151,8 +152,8 @@ def test_the_port_is_as_exact_as_mamba_ssm(case):
 
     forms = [pinned(heads) for heads in CASES[case]]
     count = len(forms)
-    assert_as_exact(lambda *args: tuple(form(*args) for form in forms),
-                    lambda *args: (reference(*args),) * count, draw,
+    assert_as_exact(dew_programs(lambda *args: tuple(form(*args) for form in forms)),
+                    as_given(lambda *args: (reference(*args),) * count), draw,
                     f"mamba_ssm {case}, heads {CASES[case]}", seeds=seeds,
                     truth_fn=lambda *args: (truth(*args),) * count)
 
