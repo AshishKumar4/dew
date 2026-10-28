@@ -21,7 +21,7 @@ from model_support import TINY_DECODER, model_draw
 from reference_error import as_given, assert_as_exact, seeds_for
 from serving_support import Served, assert_served_as_exact
 
-from dew.batch import BLOCKS_FIELD, coordinates
+from dew.batch import BLOCKS_FIELD, TEXT_KEY, coordinates
 from dew.data.chat import Role
 from dew.data.steps.blocks import Blocks
 from dew.inference.serving import Server
@@ -30,7 +30,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
 from dew.nn.visibility import prefix_blocks, prompt_blocks, served_blocks
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import batch_text
 from dew.sampling import Sampling
 

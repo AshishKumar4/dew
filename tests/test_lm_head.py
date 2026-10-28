@@ -8,9 +8,10 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
+from dew.batch import TEXT_KEY
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.training.memory import climb_to
 
 

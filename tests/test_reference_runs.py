@@ -34,8 +34,9 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 from tool_support import REPO_ROOT, load
 
+from dew.batch import TEXT_KEY
 from dew.interop import Pretrained
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.optim import Cosine, OptimConfig, ParamGroup
 from dew.training import MeshSpec, Trainer
 
