@@ -809,7 +809,9 @@ def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process
         """alpha_t, sigma_t, alpha_s, sigma_s and DDIM's standard deviation, each shaped to a row."""
         shaped = (-1,) + (1,) * len(shape)
         target = t - schedule.step_interval(t, t_next)
-        a_t, s_t, a_s, s_s = (jnp.reshape(rate, shaped) for time in (t, target)
+        # A tabulated schedule's rates are float32 at any time: widened with the time, so the truth's
+        # coefficients are float64's.
+        a_t, s_t, a_s, s_s = (jnp.reshape(rate, shaped).astype(t.dtype) for time in (t, target)
                               for rate in schedule.rates(time))
         return a_t, s_t, a_s, s_s, s_s / s_t * jnp.sqrt(s_t ** 2 - (a_t / a_s) ** 2 * s_s ** 2)
 
@@ -896,7 +898,7 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
     def walked(initial, seed):
         _, latents = sample(denoise, jnp.asarray(initial), solver=DDIM(eta=1.0), key=int(seed), times=times,
                             final_denoise=False, record=lambda x, state, denoised: x)
-        return jnp.stack(latents)
+        return tuple(latents)
 
     def source(dtype):
         def run(initial, seed):
@@ -913,7 +915,7 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
                     x = scheduler.step(prediction, time, x, eta=1.0,
                                        variance_noise=torch.tensor(noise, dtype=dtype)).prev_sample
                     latents.append(x.numpy().copy())
-            return np.stack(latents)
+            return tuple(latents)
         return run
 
     assert_as_exact(as_given(walked), as_given(source(torch.float32)), draw,
