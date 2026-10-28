@@ -28,4 +28,4 @@ def test_gmm_store_geometry(generation_name, block_m, block_n, m_warps, block_k,
     records=compile_mosaic_kernels([support.KernelCase("store",call)],generation_name)
     print("BC_STORE",json.dumps(dict(generation=generation_name,m=block_m,n=block_n,k=block_k,
                                     m_warps=m_warps,records=records)),flush=True)
-    assert len(records)==1 and not records[0].get("error"), records
+    assert len(records)==1 and not records[0].get("error") and records[0].get("kernels"), records
