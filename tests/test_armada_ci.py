@@ -1394,7 +1394,8 @@ def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
         "not (layouts and dense) and not (layouts and moe) and not (layouts and hybrid)"]
 
 
-def planned_checkout(ci, root: Path, monkeypatch, cache_worker, pinned: str) -> tuple[Path, Callable[[], list[str]]]:
+def planned_checkout(ci, root: Path, monkeypatch, cache_worker,
+                     pinned: str) -> tuple[Path, Callable[[], list[str]]]:
     """Three 3.12 test files, each weighing about a task of its own, run green on CPU class
     GenuineIntel-6-143 against the shared test cache (`cached_checkout`), in a checkout whose .armada.json
     pins its tasks to `pinned` (vendor-family-model), with the cache's read token: where their verdict is
@@ -1443,6 +1444,5 @@ def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, m
     recorded on another class plan every file a task of its own, as before."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17")
     armada_task(ci, monkeypatch, verdict)
-    monkeypatch.setattr(ci, "cpu_class", lambda: "AuthenticAMD-25-17")
     (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
