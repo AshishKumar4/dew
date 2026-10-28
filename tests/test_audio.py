@@ -7,6 +7,7 @@ forward bound allows accumulated GEMM/reduction rounding and rejects the
 wrong Gemma 4 left-window boundary (0.026 before correction).
 """
 
+import contextlib
 import copy
 import dataclasses
 import json
@@ -111,6 +112,7 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
 
     from dew.nn.audio import AudioFeedForward, AudioLightConv, _clippable
     from tools import audio_reference
+    from tools.torch_precision import float64
 
     config = audio_reference.audio_config("gemma4")
     config.hidden_act = "quick_gelu"
@@ -141,7 +143,9 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
         copies = {name: copy.deepcopy(getattr(layer, name)).to(dtype) for name in blocks}
 
         def run(x):
-            with torch.no_grad():
+            # In float64, under the widening of the blocks' own casts (Gemma4RMSNorm's `.float()`).
+            wide = float64() if dtype == torch.float64 else contextlib.nullcontext()
+            with torch.no_grad(), wide:
                 given = torch.from_numpy(np.asarray(x)).to(dtype)
                 return {name: block(given).double().numpy() for name, block in copies.items()}
 
