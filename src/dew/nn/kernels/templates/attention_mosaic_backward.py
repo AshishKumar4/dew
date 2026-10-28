@@ -94,9 +94,11 @@ class _Backward:
         return self.spec.scale
 
     @property
-    def dq_scale(self) -> float:
-        """dQ's scale: the call's whole scale, the logits' times the power its query took before its
-        products (`algebra.Forward.prescale`), so dQ is the call's own query's gradient."""
+    def grad_scale(self) -> float:
+        """The scale the gradients' cotangents take: the call's whole scale, the logits' times the power its
+        query took before its products (`algebra.Forward.prescale`), so their products stay within the
+        call's own range; dQ the call's own query's gradient, dK the prescaled query's, `gradients` taking
+        back its power."""
         return self.spec.scale * self.spec.prescale
 
     @property
@@ -155,7 +157,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         scored = _scores(walk, coords_of(k_first), masked, params, s, dp, peak, prior, anchor, delta, chosen)
         exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = algebra.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
-                                                prior, scale=walk.dq_scale, kinds=walk.kinds,
+                                                prior, scale=walk.grad_scale, kinds=walk.kinds,
                                                 summed=walk.summed, accurate=walk.accurate)
         row_sums = (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
                     terms.keyed_shift)
@@ -310,7 +312,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
     exponentials, weights, logits, pieces = lax.cond(whole(index), functools.partial(scores, masked=False),
                                                      functools.partial(scores, masked=True))
     narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
-    parts = algebra.cotangent_parts(logits * walk.scale, q_slot.dtype, accurate=walk.accurate)
+    parts = algebra.cotangent_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
     # Each staged part's transpose the left operand (`algebra.cotangent_product`'s `aᵀ @ b`).
     dv_acc = family.staged_products(dv_acc, ((narrowed, None),), do_slot, buffers.at[pl.ds(0, 1)],
                                     walk.interpret, transposed=True)
@@ -318,10 +320,8 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
                                     transposed=True)
     if add_dq is not None:
         # The tile's dQ, its staged cotangents times the resident keys (`algebra.cotangent_product`'s
-        # `a @ b`), added into dQ: the query tile's other key blocks add theirs. The cotangents carry the
-        # logits' scale, the query's power taken back to dQ's (`_Backward.dq_scale`).
-        dq = family.product(buffers.at[1], k_smem, (tiles.block_q, k_smem.shape[-1]))
-        add_dq(q_first, dq if walk.spec.prescale == 1.0 else dq * walk.spec.prescale)
+        # `a @ b`), added into dQ: the query tile's other key blocks add theirs.
+        add_dq(q_first, family.product(buffers.at[1], k_smem, (tiles.block_q, k_smem.shape[-1])))
     store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
     key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
     # The staged parts' reads done (the walk's settling) before the next tile's overwrite them.
@@ -482,8 +482,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     opt-in tuning run names it (`MosaicBackward.derived`). Returns what `gradients` takes: dQ, the softmax's
     rows, each query's anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums
     `[1, B, H, 1]`, which `gradients` sums over the batch), then dK, dV and the dK/dV parameters'
-    (`DKV_GRADS`). The logits' scale and the query's power are `spec`'s."""
-    del scale, prescale
+    (`DKV_GRADS`). The query arrives taken by `prescale`, its logits at `scale`, the scale left (`gradients`),
+    which `spec` takes."""
+    spec = dataclasses.replace(spec, scale=scale, prescale=prescale)
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
     cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)

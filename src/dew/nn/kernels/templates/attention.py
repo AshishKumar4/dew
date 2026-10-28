@@ -698,9 +698,10 @@ def prescale(dtype, width: int, scale: float) -> tuple[float, float]:
     `scale`'s power of two at or below its magnitude, so no product the reference keeps finite overflows
     here (it scales the query before its products, `dew.nn.attention`): Q 2^127 and K 4 over a width of 16,
     a product of 2^129 where the reference's is 2^127; else 1 and `scale` (fp16's products never pass it). A
-    power of two scales exactly, so the logits, the weights and the key's and value's gradients are the
-    unscaled call's bit for bit but where a value leaves fp32's normal range, and the query's, taken at the
-    whole scale (`gradients`), is too."""
+    power of two scales exactly, so the logits, the weights and the gradients, their cotangents at the whole
+    scale (`gradients`), are the unscaled call's bit for bit where every value stays in fp32's normal range
+    and the form is the same: a whole scale below `algebra.RAW_SCALES` leaves one that takes the raw form
+    (`algebra.Forward.raw`), whose differences round otherwise."""
     largest = float(jnp.finfo(dtype).max)
     if scale == 0 or largest * largest * width < float(jnp.finfo(jnp.float32).max):
         return 1.0, scale
@@ -725,7 +726,7 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
     batch, queries, heads, width = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
-    query, scale, _ = prescaled(query, width ** -0.5 if scale is None else scale)
+    scale = width ** -0.5 if scale is None else scale
     seen = dense(spans)
     grouped = query.reshape(batch, queries, kv_heads, heads // kv_heads, width)
     products = float32_einsum("bqhgd,bkhd->bhgqk", grouped, key,
@@ -1121,7 +1122,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
     # The query's products taken as the forward took them (`prescale`): every launch recomputes its logits
-    # from them at the scale left, and takes dQ, the call's own query's gradient, at the call's whole scale.
+    # from them at the scale left, and takes the gradients' cotangents at the call's whole scale, so dQ is
+    # the call's own query's and dK the prescaled query's, taken back by the power below.
     query, scale, power = prescaled(query, width ** -0.5 if scale is None else scale)
     # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
     dout = dout.astype(query.dtype)
@@ -1167,6 +1169,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     delta = anchor + delta
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
     dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
+    dk = dk if power == 1.0 else dk / power
     dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
     grads = []
     for param in hooks.score_params:
