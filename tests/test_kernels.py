@@ -937,18 +937,15 @@ def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
 @pytest.mark.parametrize("forced", [True, False])
 @pytest.mark.parametrize("dropout_rate", [0.0, 0.25])
 def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_rate):
-    """Without sinks the reference path (`reference_attention`) is flax's
-    `dot_product_attention` handed the key heads repeated over their group and
-    its probability product (`weighted_values`), on par with it from float64
-    over drawn operands (check 1): in each compute dtype, the softmax forced to
-    fp32 or not, an fp32 bias wider than half-precision logits and a causal mask. Its probability draw is Dew's own (row 1521: the
-    keep bits every route draws from one rng, `template.dropout_keep`, so a
-    route never changes which weights drop) and its multiplier Dew's (row 1533:
-    1 / (1 - rate) rounded once in at least fp32), applied where flax applies
-    its own: flax's weights (`dot_product_attention_weights`) under Dew's keep
-    mask and multiplier, then the value product. Both sum their fp32 products
-    as XLA does (`FP32_SUMS`), the reference path's own float64 sums on a CPU
-    being the policy's (tests/test_cpu_accumulation.py)."""
+    """Without sinks the reference path (`reference_attention`) is flax's `dot_product_attention` handed the
+    key heads repeated over their group and its probability product (`weighted_values`), on par with it from
+    float64 over drawn operands (check 1): in each compute dtype, the softmax forced to fp32 or not, an fp32
+    bias wider than half-precision logits and a causal mask. Its probability draw is Dew's own (row 1521:
+    the keep bits every route draws from one rng, `template.dropout_keep`, so a route never changes which
+    weights drop) and its multiplier Dew's (row 1533: 1 / (1 - rate) rounded once in at least fp32), applied
+    where flax applies its own: flax's weights (`dot_product_attention_weights`) under Dew's keep mask and
+    multiplier, then the value product. Both sum their fp32 products as XLA does (`FP32_SUMS`), the
+    reference path's own float64 sums on a CPU being the policy's (tests/test_cpu_accumulation.py)."""
     def draw(seed):
         keys = jax.random.split(jax.random.key(seed), 4)
         query = jax.random.normal(keys[0], (2, 6, 4, 8), dtype)
