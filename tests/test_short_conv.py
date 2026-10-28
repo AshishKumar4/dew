@@ -14,8 +14,13 @@ import numpy as np
 import pytest
 from fla_gdn_support import CONV_SHAPES
 from reference_error import (
+    FACTOR,
+    assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_rounds_where_the_reference_does,
+    chain_roundings,
+    distance,
+    widened,
     with_gradients,
     within,
 )
@@ -29,6 +34,9 @@ DELTA = ((32, 16), (32, 16), (32, None))
 SHARDED_SEEDS = 8
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
+REFUSED_SEEDS = 8
+"""The declared draws of a conv the kernels do not take against XLA's conv (check 1), sized by `seeds_for`
+paired with the kernels' arm on armada: the most any of its 16-bit geometries took."""
 """A delta rule's queries, keys and values on two 16-wide heads: the keys and queries normalised."""
 
 
@@ -164,25 +172,44 @@ def test_padding_tokens_are_zero_and_pass_no_gradient():
 ])
 def test_a_conv_the_kernels_do_not_take_runs(dtype, out, parts, taps):
     """On a GPU whose row names the kernels, a conv they do not take (`short_conv.CONV`: float64, a piece
-    off its block, more taps than they hold) runs, its value and gradients finite and the gradients in
-    their operands' dtypes."""
-    with jax.enable_x64(new_val=jnp.float64 in (dtype, out)):
-        keys = jax.random.split(jax.random.key(89), 3)
-        x = jax.random.normal(keys[0], (1, 8, sum(width for width, _ in parts))).astype(dtype)
-        taps = 0.3 * jax.random.normal(keys[1], (x.shape[-1], taps))
-        probe = [jax.random.normal(key, (1, 8, width)) for key, (width, _) in zip(
-            jax.random.split(keys[2], len(parts)), parts, strict=True)]
+    off its block, more taps than they hold) runs: its value and its gradients, in their operands'
+    dtypes, on par with XLA's conv over the draws (check 1), truth XLA's conv in float64. A float64 conv
+    has no truth finer than itself, so it is held by the oracle rule on a draw: each leaf within its own
+    dtype's rounding over the conv's chain of roundings of XLA's conv on the inputs widened."""
+    width, channels = sum(width for width, _ in parts), taps
 
-        def loss(conv):
-            def run(x, taps):
-                return sum(jnp.sum(piece.astype(jnp.float32) * weight) for piece, weight in zip(
-                    conv(x, taps, parts=parts, dtype=out), probe, strict=True))
-            return jax.value_and_grad(run, argnums=(0, 1))
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(89), seed), 3)
+        x = jax.random.normal(keys[0], (1, 8, width)).astype(dtype)
+        weights = 0.3 * jax.random.normal(keys[1], (width, channels))
+        probe = tuple(jax.random.normal(key, (1, 8, piece)) for key, (piece, _) in zip(
+            jax.random.split(keys[2], len(parts)), parts, strict=True))
+        return x, weights, probe
 
-        with generation.assumed("sm80"):
-            value, gradients = jax.jit(loss(causal_conv1d))(x, taps)
-    assert [gradient.dtype for gradient in gradients] == [x.dtype, taps.dtype]
-    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in (value, *gradients))
+    def loss(conv, out=out):
+        def run(x, weights, probe):
+            def scored(x, weights):
+                return sum(jnp.sum(piece.astype(weight.dtype) * weight) for piece, weight in zip(
+                    conv(x, weights, parts=parts, dtype=out), probe, strict=True))
+            return jax.value_and_grad(scored, argnums=(0, 1))(x, weights)
+        return run
+
+    with jax.enable_x64(new_val=jnp.float64 in (dtype, out)), generation.assumed("sm80"):
+        x, weights, probe = draw(0)
+        _, gradients = jax.jit(loss(causal_conv1d))(x, weights, probe)
+        assert [gradient.dtype for gradient in gradients] == [x.dtype, weights.dtype]
+        if out == jnp.float64:
+            found = jax.jit(loss(causal_conv1d))(x, weights, probe)
+            oracle = loss(xla_conv1d)(*widened((x, weights, probe)))
+            roundings = chain_roundings(jax.make_jaxpr(loss(causal_conv1d))(x, weights, probe))
+            for mine, exact in zip(jax.tree.leaves(found), jax.tree.leaves(oracle), strict=True):
+                scale = float(np.sqrt(np.mean(np.square(np.asarray(exact, np.float64)))))
+                bound = FACTOR * roundings * float(jnp.finfo(mine.dtype).eps) * scale
+                assert within(distance(mine, exact), bound), (distance(mine, exact), bound)
+            return
+        assert_as_exact(jax.jit(loss(causal_conv1d)), jax.jit(loss(xla_conv1d)), draw,
+                        f"a conv the kernels do not take: {jnp.dtype(dtype)}, {parts}, {taps} taps",
+                        seeds=REFUSED_SEEDS, truth_fn=loss(xla_conv1d, out=jnp.float64))
 
 
 @pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")

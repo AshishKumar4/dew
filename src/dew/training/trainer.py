@@ -178,10 +178,10 @@ from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.observe import Observe
 from dew.training.planning import (
     Candidate,
+    FitSearch,
     Planned,
     Trials,
     faster,
-    plan_step,
     read_whole,
     settled,
     splits,
@@ -195,6 +195,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
+    COMMIT_FIELDS,
     Committed,
     Transaction,
     compact_qk,
@@ -390,7 +391,7 @@ class Trainer(Generic[Loss, Effects]):
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
         # it shares the held arrays as they are, one copy for the run. Traced, no leaf is a held array,
         # so nothing is copied; a state held on the host is never donated, and takes the arrays over
-        # leaf by leaf as it is placed (`_placed_host`), so it takes them as they are.
+        # leaf by leaf as it is placed (`execution.placed_host`), so it takes them as they are.
         if not self.host_master:
             held = {id(leaf) for leaf in jax.tree.leaves(self.objective.held_variables())
                     if isinstance(leaf, jax.Array)}
@@ -501,15 +502,16 @@ class Trainer(Generic[Loss, Effects]):
             variables=buffered_shardings(accumulation.variables, batches=False))
         return dataclasses.replace(placed, accumulation=pending)
 
-    def _fetched(self, state: TrainState, shardings: Placement[TrainState]) -> TrainState:
-        """Bring the layout's host-resident fields to the device, where a step
-        or an evaluation reads them."""
+    def _fetched(self, state: TrainState, shardings: Placement[TrainState],
+                 fields: Sequence[str] | None = None) -> TrainState:
+        """Bring the layout's host-resident fields, or those of them among `fields`, to the device,
+        where a step or an evaluation reads them."""
         if self.host_master:
             return state
         return dataclasses.replace(state, **{
             field: jax.device_put(getattr(state, field), jax.tree.map(
                 lambda s: s.with_memory_kind("device"), getattr(shardings, field)))
-            for field in self.layout.host})
+            for field in self.layout.host if fields is None or field in fields})
 
     @ruled
     def validate(self, batch: Batch | None = None, *, steps: int | None = None,
@@ -606,13 +608,16 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints = self.checkpoints
         if checkpoints is None or resume is None:
             if self.host_master:
-                return self._placed_host(initializer, key, shardings), shardings, None
+                from dew.training.execution import placed_host
+                return (placed_host(self.objective, lambda: self.initial_state(initializer, key),
+                                    self.state_mesh, self.device_mesh, shardings), shardings, None)
             return (placed_start(self.initial_state, initializer, key, abstract, shardings, start.through,
                                  self.device_mesh), shardings, None)
         if self.host_master and FROZEN in abstract.variables:
+            from dew.training.execution import banked_frozen
             abstract = dataclasses.replace(abstract, variables={
-                **abstract.variables, FROZEN: self._banked_frozen(
-                    abstract.variables,
+                **abstract.variables, FROZEN: banked_frozen(
+                    self.objective, abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
@@ -741,67 +746,6 @@ class Trainer(Generic[Loss, Effects]):
         sites = stack_sites(self.objective, {**state.variables, FROZEN: frozen})
         return resident(rows.variables[FROZEN], sites, self.device_mesh)
 
-    def _banked_frozen(self, variables, stack, release=None):
-        """Stack each scanned run's shared leaves of the frozen collection of `variables` into one bank
-        (`dew.inference.banks.banked`).
-
-        That is the shape a placement and a checkpoint template take, and the
-        arrays the state holds."""
-        from dew.inference.banks import banked
-        from dew.training.execution import stack_sites
-        return banked(variables[FROZEN], stack_sites(self.objective, variables), stack, release)
-
-    def _placed_host(self, initializer, key, shardings: Placement[TrainState]) -> TrainState:
-        """A fresh CPU-owned state, its leaves streamed into place one at a time.
-
-        The tree is built eagerly on the CPU, where the held leaves the
-        objective hands over are read by reference and nothing of size is
-        computed. Each leaf is then moved to its placement and the source let
-        go as it lands (`host.stream`): a moving leaf to the companion, a
-        frozen one to where it stays resident (`execution.resident`). The
-        transient is one leaf, not the tree, and one JIT could not have
-        returned to the two device sets anyway.
-        """
-        from dew.distributed.host import evict, place_leaf, stream, transfer
-        from dew.training.execution import bank_bytes, check_bank_pool, stack_sites
-        held = self.objective.held_variables()
-        with jax.default_device(self.state_mesh.local_devices[0]):
-            state = self.initial_state(initializer, key)
-            if FROZEN in state.variables:
-                sites = stack_sites(self.objective, state.variables)
-                check_bank_pool(bank_bytes(state.variables[FROZEN], sites), self.device_mesh)
-                # A scanned run's frozen rows become its bank here and the bank lands where it stays
-                # resident before the next is stacked, so the host holds one bank in transit, not the
-                # stack; the rows' pages are let go as it lands and the held tree holds the placed bank
-                # where each row was. An objective placed this way holds banks at its rows afterwards and
-                # does not seed a second trainer.
-                targets = shardings.variables[FROZEN]
-
-                def stack(rows, path):
-                    target = targets
-                    for component in path:
-                        target = target[component]
-                    bank = place_leaf(jnp.stack(rows), target)
-                    for row in rows:
-                        evict(np.asarray(row))
-                    return bank
-
-                def release(namespace, index, keys, bank):
-                    # The rows sit under the held tree's own frozen split
-                    # when it came split, or under its params when init split it.
-                    node = None if held is None else held.get(FROZEN, held.get("params"))
-                    for component in (*namespace, f"layers_{index}", *keys[:-1]):
-                        node = node.get(component) if isinstance(node, dict) else None
-                    if isinstance(node, dict) and keys[-1] in node:
-                        node[keys[-1]] = bank
-                frozen = self._banked_frozen(state.variables, stack, release)
-                state = dataclasses.replace(state, variables={**state.variables, FROZEN: frozen})
-        params = stream(state.variables, shardings.variables, held)
-        ema = None if state.ema is None else stream(state.ema, shardings.ema)
-        rest = dataclasses.replace(state, variables=None, ema=None)
-        placed = transfer(rest, dataclasses.replace(shardings, variables=None, ema=None))
-        return dataclasses.replace(placed, variables=params, ema=ema)
-
     # ------------------------------------------------------------------ The step
     # ------------------------------------------------------------------
 
@@ -822,7 +766,7 @@ class Trainer(Generic[Loss, Effects]):
             aval.shape, aval.dtype, sharding=aval.sharding if aval.sharding.mesh.explicit_axes else None,
             weak_type=aval.weak_type), jax.jit(self._model_batch).trace(batch).out_avals)
 
-    def _loss_shape(self, state: TrainState, batch: Batch):
+    def _loss_shape(self, state: TrainState, batch: Batch, window: int):
         batch = self._model_shapes(batch)
         # Shapes and dtypes only: a resident frozen leaf sits in another memory space than the moving ones,
         # and the loss the realization runs reads a snapshot in one space. The step's key is drawn inside the
@@ -830,9 +774,9 @@ class Trainer(Generic[Loss, Effects]):
         params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
         def loss(params, batch, microstep, key, step, ema):
-            return self.objective._loss(params, batch, Step(microstep, jax.random.fold_in(key, step),
-                                                            with_ema(params, ema),
-                                                            qk_stats=clips_qk(state.opt_state)))
+            return self.objective._loss(params, batch, Step(
+                microstep, jax.random.fold_in(key, step), with_ema(params, ema),
+                qk_stats=clips_qk(state.opt_state), example_count=window * rows_of(batch) or None))
 
         return jax.eval_shape(loss, params, batch, state.microstep, state.key, state.step, state.ema)
 
@@ -927,12 +871,13 @@ class Trainer(Generic[Loss, Effects]):
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
-    def _step_body(self, shapes, copies, split: int):
-        """The objective transaction over a step's batch read in `split` microbatches, or a
-        custom step with no invented commit telemetry, which reads it whole."""
+    def _step_body(self, shapes, copies, split: int, fetch: Callable[[TrainState], TrainState] | None = None):
+        """The objective transaction over a step's batch read in `split` microbatches, which brings the
+        state's fields `fetch` brings to the device only once its gradient is ready, or a custom step
+        with no invented commit telemetry, which reads it whole."""
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
-                               split=split, record=self.record).step()
+                               split=split, record=self.record, fetch=fetch).step()
         custom = self.step(self.objective, self.optimizer)
 
         def run(current, batch, part, tokens):
@@ -1043,7 +988,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
                  trials: Trials | None) -> tuple[Planned, StepFlops | None]:
-        """The plan `compile` reads `batch` in (`plan_step`), from the run's splits (`splits`), the
+        """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the
         faster on `trials` of a frontier of two, guided under AutoPGLE (`Planned.guided`) and released
         (`Planned.released`), with `plan` its record and the objective at its rung, and a microbatch's
         FLOPs (`plan_flops`). A plan recorded beside the compilation cache (`recorded_rung`) is the first
@@ -1066,12 +1011,13 @@ class Trainer(Generic[Loss, Effects]):
         if self._rung() != before:
             _log.warning("taking an earlier run's plan; delete %s to decide again", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
-        plans, probes = plan_step(
+        search = FitSearch(
             lower, lambda candidate: step_options(self.objective, candidate.micro,
                                                   candidate.prepared.variables, mesh),
+            self.objective, mesh, self._xla_defaults, self._narrow,
+            None if self._base_rung is None else self._base_rung[1], resumed)
+        plans, probes = search.plans(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
-            objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults, narrow=self._narrow,
-            base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
             frontier=trials is not None and trials.frontier and recorded is None and resumed is None)
         seconds = ([] if trials is None or len(plans) == 1
@@ -1131,7 +1077,7 @@ class Trainer(Generic[Loss, Effects]):
         """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
         with the accumulation of a `window` of microbatches and the copies the step builds, as the
         step traces them over microbatches of `batch`'s shapes, none where `narrow` (the trainer's) is off."""
-        shapes = None if self.step is not None else self._loss_shape(state, batch)
+        shapes = None if self.step is not None else self._loss_shape(state, batch, window)
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
@@ -1147,7 +1093,12 @@ class Trainer(Generic[Loss, Effects]):
         (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
         it reads and neither donates nor returns, so the frozen arrays stay the ones the run (and the
         objective's held tree) holds, and no output copies them."""
-        body = self._step_body(shapes, copies, split)
+        # The transaction brings the optimizer state and the EMA the layout keeps on the host to the device
+        # once its gradient is ready (`Transaction.past`); a custom step, and every other field, reads them
+        # from its start.
+        late = () if self.step is not None else tuple(set(COMMIT_FIELDS) & set(self.layout.host))
+        body = self._step_body(shapes, copies, split, (lambda state: self._fetched(state, shardings, late))
+                               if late else None)
         moving, frozen = apart(shardings)
 
         def step(current, held, batch, part):
@@ -1155,8 +1106,9 @@ class Trainer(Generic[Loss, Effects]):
             # return the host-resident ones to pinned host memory.
             current = together(current, held)
             micro = microbatch(batch, part, split)
-            advanced, loss, aux, committed = body(self._fetched(current, shardings), self._model_batch(micro),
-                                                  part, batch_tokens(micro))
+            early = [field for field in self.layout.host if field not in late]
+            advanced, loss, aux, committed = body(self._fetched(current, shardings, early),
+                                                  self._model_batch(micro), part, batch_tokens(micro))
             stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1)
             return (apart(stepped)[0], *rest)
 
@@ -1235,7 +1187,7 @@ class Trainer(Generic[Loss, Effects]):
                                   stack_sites(self.objective, state.variables), device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
-            shapes = self._loss_shape(state, cpu_batch)
+            shapes = self._loss_shape(state, cpu_batch, self.accumulation)
             self._refuse_unpipelined(schedule)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, window=self.accumulation,
                                                      shape_only=True)
@@ -1675,7 +1627,7 @@ class Trainer(Generic[Loss, Effects]):
         """`Layout.validate` of the whole state the run's steps keep between them reading `batch`'s
         shapes (a marked batch, as the stream gives it) in `split` microbatches: `state` with the
         accumulation its window pools. The narrow copies are left out: the plan's first rung drops
-        them where the step does not fit with them (`dew.training.planning.plan_step`)."""
+        them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
         device, _ = split_fields(batch)
         with self._traced_on(self.device_mesh) as schedule:
             _, _, whole = self._prepared(state, microbatch_shapes(device, split), schedule,
@@ -2409,8 +2361,7 @@ class Trainer(Generic[Loss, Effects]):
         the split (`Evaluation.run`'s `warm`) and reports nothing.
 
         A CPU-owned run evaluates on the accelerator, over the same snapshot
-        a step realizes, so validation reads the weights where the loss
-        does."""
+        a step realizes, so validation reads the weights where the loss does."""
         paused = time.perf_counter()
         if not warm:
             self._display.status("evaluating")

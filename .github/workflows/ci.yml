@@ -283,7 +283,12 @@ jobs:
         # most tests import, and the daily run, which proves the commit again with every file): 160,
         # or a background run's share.
         if [ -n "$BACKGROUND_POOL" ]; then bound="--pool=$BACKGROUND_POOL --deadline=6000"; else bound="--deadline=2700"; fi
-        if [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; then
+        # A commit the proven job found proved (a run that passed, or, on main, the land queue's proof of the tip it
+        # graded green, red rows its regrade passed included) runs no suite again, whatever its stored verdict or the
+        # cache's policy; but for the background whole suite, which proves main's tip anew (train 237's review).
+        proven=$PROVEN
+        case "$GITHUB_REF_NAME" in ci/full-whole-*) proven= ;; esac
+        if [ -z "$proven" ] && { [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; }; then
           setsid $armada run ${{ github.sha }} $bound $priority --label="${{ github.ref_name }}" \
             > >(tee "$RUNNER_TEMP/suite.log") 2> >(tee "$RUNNER_TEMP/suite.err" >&2) &
           suite=$!

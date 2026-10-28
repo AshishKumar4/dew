@@ -6,9 +6,8 @@ batches pin host Coordinates; packed text pins documents cut into pieces that sh
 token, where 66beb5305 lost each piece's first next-token target. The other cases pin 66beb5305.
 """
 
-import dataclasses
+import functools
 import gzip
-import hashlib
 import importlib.util
 import itertools
 import json
@@ -42,44 +41,11 @@ stages changed on purpose (a waveform and its validity in place of per-frame row
 tests/test_data.py holds a video listing to itself across workers and a resume."""
 
 
-def _digest(batch):
-    """The batch's public fields: each array's shape, dtype and content digest by its path, and each
-    record's static facts (`Coordinates`' `max_segments` and `right_padded`) by theirs, not the tree's
-    spelling. A field that is None holds nothing and adds no entry, where a renamed field or a changed
-    static fact still changes the digest (Main, 10-27: a field added to Coordinates once re-recorded
-    142 tree strings whose leaves had not moved)."""
-    fields = {}
-
-    def walk(value, path):
-        if value is None:
-            return
-        if isinstance(value, dict):
-            for key in sorted(value):
-                walk(value[key], f"{path}[{key!r}]")
-        elif isinstance(value, (list, tuple)):
-            for index, item in enumerate(value):
-                walk(item, f"{path}[{index}]")
-        elif dataclasses.is_dataclass(value):
-            for field in dataclasses.fields(value):
-                item = getattr(value, field.name)
-                if field.metadata.get("pytree_node", True):
-                    walk(item, f"{path}.{field.name}")
-                else:
-                    fields[f"{path}.{field.name}"] = {"static": item}
-        else:
-            array = np.asarray(value)
-            encoded = (json.dumps(array.tolist(), sort_keys=True).encode()
-                       if array.dtype.hasobject else array.tobytes())
-            fields[path] = {"shape": list(array.shape), "dtype": array.dtype.str,
-                            "sha256": hashlib.sha256(encoded).hexdigest()}
-
-    walk(batch, "")
-    return fields
-
-
+@functools.cache
 def _oracle():
     """The frozen reference's capture script, whose token stores the reference read: the stores this
-    test reads are the ones it wrote (`token_store`)."""
+    test reads are the ones it wrote (`token_store`), and whose digest of a batch (`digest`) this test
+    reads Dew's by."""
     spec = importlib.util.spec_from_file_location("data_oracle_legacy", ORACLE)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -194,9 +160,9 @@ def test_loader_batches_positions_and_rng_match_the_frozen_reference(chains, nam
         partition = DataPartition(share, shares)
         reader = loaded.train(partition)
         try:
-            first = [_digest(row) for row in itertools.islice(reader, 4)]
+            first = [_oracle().digest(row) for row in itertools.islice(reader, 4)]
             state = reader.get_state()
-            rest = [_digest(row) for row in itertools.islice(reader, 4)]
+            rest = [_oracle().digest(row) for row in itertools.islice(reader, 4)]
         finally:
             reader.close()
         assert first == expected["shares"][share]["first"]
@@ -204,13 +170,13 @@ def test_loader_batches_positions_and_rng_match_the_frozen_reference(chains, nam
         resumed = loaded.train(partition)
         try:
             resumed.set_state(state)
-            assert [_digest(row) for row in itertools.islice(resumed, 4)] == rest
+            assert [_oracle().digest(row) for row in itertools.islice(resumed, 4)] == rest
         finally:
             resumed.close()
         if loaded.val is not None:
             held = loaded.val(partition)
             try:
-                observed = [_digest(row) for row in itertools.islice(held, 100)]
+                observed = [_oracle().digest(row) for row in itertools.islice(held, 100)]
                 assert next(held, None) is None
             finally:
                 held.close()

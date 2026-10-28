@@ -345,7 +345,7 @@ def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path
 
         def observed(params, hidden):
             ids = head.tied_labels()
-            tied = None if ids is None else task.model.label_logits(task.variables, hidden, inputs, ids)
+            tied = None if ids is None else task.model.readout_logits(task.variables, hidden, inputs, ids)
             scores = head.apply({"params": params}, hidden, inputs, table, tied=tied)[:, 0]
             return jnp.sum(scores * probe)
 
