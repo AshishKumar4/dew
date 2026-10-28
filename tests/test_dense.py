@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral
@@ -284,29 +284,40 @@ class _Host(nn.Module):
         return self.proj(x)
 
 
+BIASED_SEEDS = {False: 8, True: 8}
+"""The biased bf16 projection's declared draws against torch's nn.Linear (check 1), Dense and
+DenseGeneral."""
+
+
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
 def test_a_biased_bf16_projection_is_as_exact_as_torchs(general):
-    """A bfloat16 projection with a bias, Llama's and Qwen's query, key and value, is within
-    tests/reference_error.py's rule of torch's bfloat16 nn.Linear over the same bfloat16 weights and
-    inputs, both against float64: torch's addmm rounds product and bias once, Dew as flax does,
-    the product first, 1.37 times torch's rounding here."""
+    """A bfloat16 projection with a bias, Llama's and Qwen's query, key and value, is on par with
+    torch's bfloat16 nn.Linear over the same bfloat16 weights and inputs from its float64 run over drawn
+    ones (check 1): torch's addmm rounds product and bias once, Dew as flax does, the product first."""
     import torch
 
-    rng = np.random.default_rng(7)
-    x = rng.standard_normal((512, 64)).astype(np.float32)
-    kernel = (rng.standard_normal((64, 32)) * 0.1).astype(np.float32)
-    bias = rng.standard_normal(32).astype(np.float32)
     layer = (DenseGeneral(32, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16) if general
              else Dense(32, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16))
-    params = {"params": {"kernel": jnp.asarray(kernel, jnp.bfloat16),
-                         "bias": jnp.asarray(bias, jnp.bfloat16)}}
-    dew = np.asarray(layer.apply(params, jnp.asarray(x, jnp.bfloat16)), np.float64)
+
+    def draw(seed):
+        """The inputs, the kernel and the bias, each a bfloat16 value."""
+        rng = np.random.default_rng(seed)
+        drawn = (rng.standard_normal((512, 64)), rng.standard_normal((64, 32)) * 0.1, rng.standard_normal(32))
+        return tuple(np.asarray(jnp.asarray(value, jnp.bfloat16), np.float32) for value in drawn)
+
+    def projected(x, kernel, bias):
+        params = {"params": {"kernel": kernel.astype(jnp.bfloat16), "bias": bias.astype(jnp.bfloat16)}}
+        return layer.apply(params, x.astype(jnp.bfloat16))
 
     def linear(dtype):
-        weight, shift, inputs = (torch.tensor(a).to(torch.bfloat16).to(dtype) for a in (kernel.T, bias, x))
-        return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
+        def run(x, kernel, bias):
+            weight, shift, inputs = (torch.tensor(np.asarray(a, np.float64)).to(dtype)
+                                     for a in (kernel.T, bias, x))
+            return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
+        return as_given(run)
 
-    assert_as_exact_as_the_reference(dew, linear(torch.bfloat16), linear(torch.float64), "projection")
+    assert_as_exact(projected, linear(torch.bfloat16), draw, "projection", seeds=BIASED_SEEDS[general],
+                    truth_fn=linear(torch.float64))
 
 
 def test_an_adapter_adds_its_branch_to_the_layers_rounded_output():
