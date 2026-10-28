@@ -186,11 +186,9 @@ from dew.training.planning import (
     FitSearch,
     Planned,
     Trials,
-    faster,
     read_whole,
     settled,
     splits,
-    untimed_frontier,
     whole_step,
 )
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, start_capture, stop_capture
@@ -916,9 +914,8 @@ class Trainer(Generic[Loss, Effects]):
 
         The plan (`dew.training.planning`) takes the fewest microbatches at least recomputation, a
         transaction pooling `split` x `accumulation`. Batches split as the first plan or the pooling
-        state's window holds; later shapes climb the ladder alone. A plan that
-        splits or spans devices, left open and unrecorded, is timed on `trials` (`fit`'s, `Trials`)
-        against the batch whole a rung up where they ask for it, and the faster kept. Where JAX's AutoPGLE
+        state's window holds; later shapes climb the ladder alone. No admitted plan compiles or times
+        optional alternatives, even with `trials`: speed selection is offline. Where JAX's AutoPGLE
         is on (`jax_enable_pgle`), the plan admitted runs its first runs on a trial, `trials`' or, where
         none are given, a copy of the state beside it, refused where the devices hold no room for it
         (`Trials.profiled`), and its program compiles again guided by their profile (`Planned.guided`),
@@ -1014,8 +1011,8 @@ class Trainer(Generic[Loss, Effects]):
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
                  trials: Trials | None, capacity: int | None) -> tuple[Planned, StepFlops | None]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the
-        faster on `trials` of a frontier of two, guided under AutoPGLE (`Planned.guided`), with
-        `plan` its record and the objective at its rung, and a microbatch's
+        first that fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the
+        objective at its rung, and a microbatch's
         FLOPs (`plan_flops`). A plan recorded beside the compilation cache (`recorded_rung`) is the first
         candidate, kept untimed; `resumed` is a checkpoint's rung; `capacity` the bytes a device that
         states none holds (`FitSearch.capacity`)."""
@@ -1047,14 +1044,11 @@ class Trainer(Generic[Loss, Effects]):
             capacity=capacity)
         plans, probes = search.plans(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
-            # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
-            frontier=trials is not None and trials.frontier and recorded is None and resumed is None)
-        # Consumed once its first compile took it; a refusal leaves it for the next fit to refuse.
+            # Live runs compile the admitted plan alone. Speed comparisons belong to offline planning.
+            frontier=False)
+        # Consume the artifact only after its program was accepted; a refusal leaves it pending.
         self._ahead = search.ahead
-        seconds = ([] if trials is None or len(plans) == 1
-                   else trials.seconds([self._runner(plan, mesh) for plan in plans]))
-        # Every process runs the plan process zero timed clearly faster (`faster`).
-        planned = plans[broadcast_from_process_zero(faster(seconds) if seconds else 0)]
+        planned = plans[0]
         if runs := pgle_runs():
             trials = Trials(state, batch, owned=False, frontier=False) if trials is None else trials
             planned = planned.guided(trials.profiled(self._runner(planned, mesh), planned, mesh, runs), runs,
@@ -1069,9 +1063,9 @@ class Trainer(Generic[Loss, Effects]):
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
-        self.plan = settled(planned, plans, seconds, probes)
+        self.plan = settled(planned, plans, (), probes)
         search.told(planned)
-        if planned.split != candidates[0] or seconds:
+        if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned, flops
 
@@ -2187,8 +2181,8 @@ class Trainer(Generic[Loss, Effects]):
                       state: TrainState, batch: Batch, run: FitRun,
                       reported: int | None = None) -> tuple[CompiledStep, StepFlops | None, TrainState]:
         """Return the step compiled for this batch's abstract signature (`batch_signature`),
-        compiling on first sight, and the state to step, a fresh copy where the plan timed steps
-        on it (`Trials`). A compile reads `run`'s pending log first: it holds the devices idle
+        compiling on first sight, and the state to step, a fresh copy where AutoPGLE profiled it
+        on trials (`Trials`). A compile reads `run`'s pending log first: it holds the devices idle
         anyway, and its seconds are the next interval's.
 
         A ramped run reads a new shape at every stage, so `compiled` keeps
@@ -2197,12 +2191,12 @@ class Trainer(Generic[Loss, Effects]):
         another program, compiled as one: an executable refuses it. A step
         that begins a ramp's or a schedule's stage gets its state with the
         window a rejection left part filled dropped (`_staged`), the state
-        a timed trial steps on too. A compile reports at `reported`, a
+        an AutoPGLE trial steps on too. A compile reports at `reported`, a
         cooldown branch's at the run's step, else at the state's.
         """
         state = self._staged(state, run.current)
-        # Dew's tests keep a frontier's first plan (`UNTIMED_FRONTIER`), a test setting.
-        trials = Trials(state, batch, frontier=not untimed_frontier())
+        # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
+        trials = Trials(state, batch, frontier=False)
         signature = batch_signature(batch)
         if signature not in compiled:
             self._read_taken(run)
