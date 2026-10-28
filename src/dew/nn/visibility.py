@@ -22,22 +22,26 @@ def windowed(query, key, window: int, *, causal: bool):
     (`dew.nn.kernels.templates.attention.spans`), for coordinates no span holds: a stated mask's places,
     which need not run in order, and a banded layout's rows."""
     before, after = window_sides(causal, window)
-    query, key = jnp.asarray(query), jnp.asarray(key)
+    # NumPy coordinates stay NumPy's, so a program that traces knows a static window as it traces.
+    xp = jnp if any(isinstance(x, jax.Array) for x in (query, key)) else np
+    query, key = xp.asarray(query), xp.asarray(key)
     ahead = query >= key
-    within_before = _distance(query, key) <= before
+    within_before = _distance(query, key, xp) <= before
     if causal:
-        return jnp.where(ahead, within_before, True)
-    return jnp.where(ahead, within_before, _distance(key, query) <= after)
+        return xp.where(ahead, within_before, True)
+    return xp.where(ahead, within_before, _distance(key, query, xp) <= after)
 
 
-def _distance(far, near):
+def _distance(far, near, xp):
     """`far - near` where `far >= near`, exact for every integer pair: integers' difference taken in the
     unsigned word of their common width, which holds it where the signed one wraps."""
-    common = jnp.result_type(far, near)
-    if not jnp.issubdtype(common, jnp.integer):
+    common = xp.result_type(far, near)
+    if not np.issubdtype(common, np.integer):
         return far - near
-    unsigned = jnp.dtype(f"uint{common.itemsize * 8}")
-    far, near = (jax.lax.bitcast_convert_type(jnp.asarray(x, common), unsigned) for x in (far, near))
+    unsigned = np.dtype(f"uint{np.dtype(common).itemsize * 8}")
+    if xp is np:
+        return far.astype(common).view(unsigned) - near.astype(common).view(unsigned)
+    far, near = (jax.lax.bitcast_convert_type(x.astype(common), unsigned) for x in (far, near))
     return far - near
 
 
