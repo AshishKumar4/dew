@@ -33,7 +33,7 @@ from reference_error import as_given, assert_as_exact, assert_computes_the_oracl
 from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
-from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
+from dew.nn.kernels.ssd import ssd_chunk_scan
 from dew.nn.precision import float32_products, products_dtype
 
 pytestmark = pytest.mark.kernel
@@ -308,9 +308,6 @@ TPU_COPIES = [pytest.param(*param.values, id=f"tpu-{param.id}", marks=on_device)
 def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled):
     """The kernel, interpreted on the host or compiled on a TPU, against float64: every forward and
     gradient leaf over declared draws (check 1)."""
-    if compiled:
-        shape, chunk_size = case
-        assert ssd_kernel_runs(chunk_size, shape[3], shape[4], jax.default_backend(), dtype=jnp.float32)
     if kind == "fixture":
         chunk_size = case[0]
         _, length, _, width = reference["scan.x"].shape

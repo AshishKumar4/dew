@@ -262,13 +262,15 @@ class Member:
         return {**element, "member": np.int32(self.index)}
 
 
+def member(name, index):
+    """A mixture member of eight records, each marked with `index` and drawing as the member draws."""
+    return Pipeline(source(8), name=name).map(Member(index)).random_map(WideDraw()).repeat(1)
+
+
 def test_a_mixture_members_draws_stay_as_they_were_when_another_member_joins():
     """A random step in a mixture member draws by the name the member goes by, not by its place among
     the members: a member joining before it leaves its draws as they were, and two members of one
     name draw apart."""
-    def member(name, index):
-        return Pipeline(source(8), name=name).map(Member(index)).random_map(WideDraw()).repeat(1)
-
     def draws(members):
         data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
         stream = data.train(DataPartition())
@@ -317,9 +319,6 @@ def test_a_member_named_as_a_place_keeps_its_draws_when_an_unnamed_one_joins():
     """A member's name and an unnamed member's place are kept apart, whatever the name spells: a
     member named like a place keeps its draws when an unnamed member joins ahead of it, and an
     unnamed member keeps its own when that named member joins ahead of it."""
-    def member(name, index):
-        return Pipeline(source(8), name=name).map(Member(index)).random_map(WideDraw()).repeat(1)
-
     def draws(members, of):
         data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
         stream = data.train(DataPartition())
@@ -643,17 +642,23 @@ def test_host_steps_are_branch_scoped_and_common_steps_run_on_both(read):
         resumed.close()
 
 
-def test_rejection_iterator_resumes_exactly_and_refuses_topology_change():
-    data = compile(Pipeline(source()).shuffle(2).repeat().filter_map(Odd()).batch(3), loading=READ, seed=2)
-    reader = data.train(DataPartition())
-    listed(reader, 3)
-    saved = reader.get_state()
+def assert_resumes(data, reader, saved) -> None:
+    """A reader of `data` opened again and set to `saved`, where `reader` stood, reads the four
+    batches `reader` reads on from there; both are closed."""
     rest = listed(reader, 4)
     reader.close()
     resumed = data.train(DataPartition())
     resumed.set_state(saved)
     assert listed(resumed, 4) == rest
     resumed.close()
+
+
+def test_rejection_iterator_resumes_exactly_and_refuses_topology_change():
+    data = compile(Pipeline(source()).shuffle(2).repeat().filter_map(Odd()).batch(3), loading=READ, seed=2)
+    reader = data.train(DataPartition())
+    listed(reader, 3)
+    saved = reader.get_state()
+    assert_resumes(data, reader, saved)
     changed = data.train(DataPartition(0, 3))
     with pytest.raises(ValueError):
         changed.set_state(saved)
@@ -891,6 +896,26 @@ def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     resumed.close()
 
 
+def stated_rows(name, lengths):
+    """A store stating its count of token rows of `lengths`, each marked 1 where it is the long
+    corpus's."""
+    return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
+                   for size in lengths])
+
+
+def delivered_targets(data, batches: int) -> list[int]:
+    """The valid targets the first `batches` batches of `data`'s training read deliver, by corpus."""
+    stream = data.train(DataPartition())
+    targets = [0, 0]
+    try:
+        for batch in itertools.islice(stream, batches):
+            for source, count in zip(batch["source"], batch["targets"], strict=True):
+                targets[int(source)] += int(count)
+    finally:
+        stream.close()
+    return targets
+
+
 @pytest.mark.parametrize("sliced", [False, True])
 def test_a_token_mixture_weighs_the_rows_each_corpus_delivers(sliced):
     """Mixed by tokens, two corpora deliver equal valid targets. A corpus whose order reads every
@@ -908,14 +933,7 @@ def test_a_token_mixture_weighs_the_rows_each_corpus_delivers(sliced):
     long = long.take(1) if sliced else long
     mixed = mix([long.repeat(), corpus("short", (2, 2)).repeat()], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
-    stream = data.train(DataPartition())
-    targets = [0, 0]
-    try:
-        for batch in itertools.islice(stream, 8):
-            for source, count in zip(batch["source"], batch["targets"], strict=True):
-                targets[int(source)] += int(count)
-    finally:
-        stream.close()
+    targets = delivered_targets(data, 8)
     assert abs(targets[0] - targets[1]) <= 9
     assert data.plan is not None and data.plan.lowering == ("per-share" if sliced else "global")
 
@@ -942,23 +960,12 @@ def test_a_memory_read_weighs_a_token_mixture_by_the_targets_of_the_rows_it_hold
     counts their valid targets by the mixture's rule, not by the stores' stated counts of rows the
     steps changed: the order stays global, an epoch of it has a record count, and the corpora
     deliver equal targets by what their rows hold."""
-    def corpus(name, lengths):
-        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
-                       for size in lengths])
-
-    parts = [Pipeline(corpus("long", (2, 10, 10, 10)), name="long").map(Doubled()),
-             Pipeline(corpus("short", (2, 2)), name="short")]
+    parts = [Pipeline(stated_rows("long", (2, 10, 10, 10)), name="long").map(Doubled()),
+             Pipeline(stated_rows("short", (2, 2)), name="short")]
     mixed = mix([part.repeat() for part in parts], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
     assert data.plan is not None and data.plan.lowering == "global" and data.steps_per_epoch is not None
-    stream = data.train(DataPartition())
-    targets = [0, 0]
-    try:
-        for batch in itertools.islice(stream, 8):
-            for source, count in zip(batch["source"], batch["targets"], strict=True):
-                targets[int(source)] += int(count)
-    finally:
-        stream.close()
+    targets = delivered_targets(data, 8)
     assert abs(targets[0] - targets[1]) <= 19
 
 
@@ -975,22 +982,11 @@ def test_a_token_mixture_weighs_a_corpus_by_the_targets_its_rows_deliver():
     """A corpus whose rows a step still to run changes, here a random crop to half, delivers other
     targets than the rows its read holds and its store states: the mixture by tokens counts them as
     they arrive, so both corpora deliver equal targets, to within one row's."""
-    def corpus(name, lengths):
-        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
-                       for size in lengths])
-
-    parts = [Pipeline(corpus("long", (20, 20, 20, 20)), name="long").random_map(Halved()),
-             Pipeline(corpus("short", (4, 4)), name="short")]
+    parts = [Pipeline(stated_rows("long", (20, 20, 20, 20)), name="long").random_map(Halved()),
+             Pipeline(stated_rows("short", (4, 4)), name="short")]
     mixed = mix([part.repeat() for part in parts], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
-    stream = data.train(DataPartition())
-    targets = [0, 0]
-    try:
-        for batch in itertools.islice(stream, 16):
-            for source, count in zip(batch["source"], batch["targets"], strict=True):
-                targets[int(source)] += int(count)
-    finally:
-        stream.close()
+    targets = delivered_targets(data, 16)
     assert abs(targets[0] - targets[1]) <= 9
 
 
@@ -998,40 +994,23 @@ def test_a_token_mixture_counts_the_targets_a_corpus_delivers_after_its_repeat_c
     """A corpus whose rows a random crop changes after its repeat delivers other targets than its
     store states: the mixture by tokens weighs it by the targets its rows deliver, so both corpora
     deliver equal targets, to within one row's."""
-    def corpus(name, lengths):
-        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
-                       for size in lengths])
-
-    long = Pipeline(corpus("long", (20, 20, 20, 20)), name="long").repeat().random_map(Halved())
-    mixed = mix([long, Pipeline(corpus("short", (4, 4)), name="short").repeat()], by="tokens")
+    long = Pipeline(stated_rows("long", (20, 20, 20, 20)), name="long").repeat().random_map(Halved())
+    mixed = mix([long, Pipeline(stated_rows("short", (4, 4)), name="short").repeat()], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="memory", loading=READ)
-    stream = data.train(DataPartition())
-    targets = [0, 0]
-    try:
-        for batch in itertools.islice(stream, 16):
-            for source, count in zip(batch["source"], batch["targets"], strict=True):
-                targets[int(source)] += int(count)
-    finally:
-        stream.close()
+    targets = delivered_targets(data, 16)
     assert abs(targets[0] - targets[1]) <= 9
 
 
 @dataclasses.dataclass(frozen=True)
 class Cropped:
-    """A step that keeps the first half of a token row and its roles, as a crop keeps a part."""
+    """A step that keeps the first half of a token row in `field` and its roles, as a crop keeps a
+    part."""
+
+    field: str = "text"
 
     def __call__(self, row):
-        half = len(row["text"]) // 2
-        return {**row, "text": row["text"][:half], "text_roles": row["text_roles"][:half]}
-
-
-@dataclasses.dataclass(frozen=True)
-class CroppedTokens:
-    """`Cropped` over a row whose tokens a projection named `tokens`."""
-
-    def __call__(self, row):
-        half = len(row["tokens"]) // 2
-        return {**row, "tokens": row["tokens"][:half], "text_roles": row["text_roles"][:half]}
+        half = len(row[self.field]) // 2
+        return {**row, self.field: row[self.field][:half], "text_roles": row["text_roles"][:half]}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1115,16 +1094,7 @@ def delivered(corpora, role, read, batches=24):
     A mix by tokens keeps each corpus within one of its own rows of its share, so the two differ by
     at most one row of each."""
     mixed = mix([corpus.repeat() for corpus in corpora], by="tokens")
-    data = compile(mixed.map(Scored(role)).batch(8), read=read, loading=READ)
-    stream = data.train(DataPartition())
-    targets = [0, 0]
-    try:
-        for batch in itertools.islice(stream, batches):
-            for source, count in zip(batch["source"], batch["targets"], strict=True):
-                targets[int(source)] += int(count)
-    finally:
-        stream.close()
-    return targets
+    return delivered_targets(compile(mixed.map(Scored(role)).batch(8), read=read, loading=READ), batches)
 
 
 @pytest.mark.parametrize("role", [None, 1])
@@ -1176,7 +1146,7 @@ def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets
         if after == "renamed-roles-then-copied":
             return chain.rename_columns({"text_roles": "roles"}).map(Copied())
         if after == "renamed-text-then-cropped":
-            return (chain.rename_columns({"text": "tokens"}).map(CroppedTokens())
+            return (chain.rename_columns({"text": "tokens"}).map(Cropped("tokens"))
                     .rename_columns({"tokens": "text"}))
         if after == "selected-then-copied":
             return chain.select_columns("text", "text_roles", "source").map(Copied())
@@ -1265,22 +1235,11 @@ def test_a_counted_corpus_projected_after_its_count_keeps_it_in_memory():
 def test_a_token_mixture_weighs_its_corpora_by_their_stores_counts():
     """Mixed by tokens, two corpora whose stores state their counts deliver equal valid targets,
     in one global order weighed by those counts."""
-    def corpus(name, lengths):
-        return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
-                       for size in lengths])
-
-    parts = [Pipeline(corpus("long", (2, 10, 10, 10)), name="long"),
-             Pipeline(corpus("short", (2, 2)), name="short")]
+    parts = [Pipeline(stated_rows("long", (2, 10, 10, 10)), name="long"),
+             Pipeline(stated_rows("short", (2, 2)), name="short")]
     mixed = mix([part.repeat() for part in parts], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="indexed", loading=READ)
-    stream = data.train(DataPartition())
-    targets = [0, 0]
-    try:
-        for batch in itertools.islice(stream, 8):
-            for source, count in zip(batch["source"], batch["targets"], strict=True):
-                targets[int(source)] += int(count)
-    finally:
-        stream.close()
+    targets = delivered_targets(data, 8)
     assert abs(targets[0] - targets[1]) <= 9
     assert data.plan is not None and data.plan.lowering == "global"
 
@@ -1738,12 +1697,7 @@ def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
     ids = [value for batch in first for value in batch["id"]]
     assert sorted(ids) == list(range(20))
     state = reader.get_state()
-    rest = listed(reader, 4)
-    reader.close()
-    resumed = data.train(DataPartition())
-    resumed.set_state(state)
-    assert listed(resumed, 4) == rest
-    resumed.close()
+    assert_resumes(data, reader, state)
     from dew.data.ordering import BlockShuffle
 
     blocked = BlockShuffle(grain.MapDataset.source(stored.values), stored.physical, 2, 11)

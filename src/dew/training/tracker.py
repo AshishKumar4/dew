@@ -213,12 +213,7 @@ class _OwnedTracker:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        try:
-            self.close()
-        except BaseException as failure:
-            if exc is None:
-                raise
-            exc.add_note(f"Tracker close failed: {failure!r}")
+        attempted((("Tracker close", self.close),), primary=exc)
 
 
 class WandbTracker(_OwnedTracker):
@@ -458,25 +453,25 @@ def _(value: TextSamples, prefix: Path) -> list[Path]:
 
 @_write_preview.register
 def _(value: Representations, prefix: Path) -> list[Path]:
-    path = prefix.with_suffix('.npz')
-    np.savez(path, features=_home(value.features), labels=_home(value.labels))
-    return [path]
+    return _arrays(prefix, features=value.features, labels=value.labels)
 
 
 @_write_preview.register
 def _(value: TokenScores, prefix: Path) -> list[Path]:
+    return _arrays(prefix, losses=value.losses, weights=value.weights)
+
+
+def _arrays(prefix: Path, **arrays) -> list[Path]:
+    """`arrays`, brought home, saved together under `prefix` as one .npz preview."""
     path = prefix.with_suffix('.npz')
-    np.savez(path, losses=_home(value.losses), weights=_home(value.weights))
+    np.savez(path, allow_pickle=False, **{name: _home(array) for name, array in arrays.items()})
     return [path]
 
 
 @_write_preview.register
 def _(value: Decisions, prefix: Path) -> list[Path]:
-    path = prefix.with_suffix('.npz')
-    np.savez(path, probabilities=_home(value.probabilities), options=_home(value.options),
-             labels=_home(value.labels), targets=_home(value.targets), ordinal=_home(value.ordinal),
-             scored=_home(value.scored))
-    return [path]
+    return _arrays(prefix, probabilities=value.probabilities, options=value.options, labels=value.labels,
+                   targets=value.targets, ordinal=value.ordinal, scored=value.scored)
 
 
 MLFLOW_NAME = re.compile(r"[/\w.\- ]{0,250}")
