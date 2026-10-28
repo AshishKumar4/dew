@@ -916,9 +916,16 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
 
         def step(index, slots, carry, accumulators):
             del index
+            # Each stream's key blocks' views taken before the pairs' loop reads them: a ring's slot is the
+            # step's, which a loop's trace may not hold.
+            viewed = {(name, c): _tile(slots, name, operand, columns=pl.ds(c * call.block, call.block))
+                      for name, operand in (("queries", call.given), ("keys", call.given), ("gates", gates),
+                                            ("lows", gates))
+                      for c in range(width // call.block)}
 
             def block(name, operand, c):
-                return _tile(slots, name, operand, columns=pl.ds(c * call.block, call.block)).value()
+                del operand
+                return viewed[name, c].value()
 
             def operand(name):
                 return lambda c: block(name, call.given, c).astype(jnp.float32)
