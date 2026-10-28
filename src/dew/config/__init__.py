@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.interop import Pretrained
+    from dew.training.trainer import Trainer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1542,7 +1543,7 @@ class RunConfig:
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
-                               **resources) -> training.Trainer[LossT, EffectsT]:
+                               **resources) -> "Trainer[LossT, EffectsT]":
         """The run's trainer over `mesh`: how it steps, every numeric choice its `TrainerConfig`
         holds (key, microbatches, layout, accumulation, split, loss scale, kernel tuning), and the
         `resources` its mode adds (checkpoints, tracker, profile, a lowering or a step compiled
