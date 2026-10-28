@@ -41,13 +41,13 @@ def test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_e
     the same trainer's step reads and writes on eight CPU devices, under each layout: its share of
     the state, whole or split, and of the batch. XLA states what it costs and every byte count of its
     memory, and its peak holds its arguments, its outputs that alias none, and its temporaries."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead, compile_only_gpus, step_batch
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     ahead = compile_ahead(fine_tune(spec.build(compile_only_gpus("sm90", 8))), batch)
     run = fine_tune(spec.build())
     state, _, _ = run.place()
-    run.compile(state, batch)
+    run.compile(state, step_batch(run, batch))
     assert run.executable is not None
     here = run.executable.memory_analysis()
     assert (ahead.argument_bytes, ahead.output_bytes, ahead.alias_bytes) == (
@@ -172,14 +172,14 @@ def test_a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_
     tunes a GEMM's algorithm on the GPU it compiles on and takes its default with none attached."""
     from dew.nn.kernels.generation import chosen, device_generation
     from dew.state import apart
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus, step_batch
 
-    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     # A step that reads its parameters whole, so its arguments are the placed state's own.
     with chosen(narrow_copies="off"):
-        compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1))), batch).save(
-            tmp_path / "step.dew-aot")
+        compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1))),
+                      token_rows(VOCAB, BATCH, SEQ_LEN + 1)).save(tmp_path / "step.dew-aot")
         run = fine_tune(MeshSpec().build(jax.devices()[:1]))
+        batch = step_batch(run, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
         state, _, _ = run.place()
         run.compile(state, batch)
     ahead = AheadOfTime.load(tmp_path / "step.dew-aot")

@@ -212,13 +212,26 @@ class CompiledAhead(SystemExit):
                   "to %s", ahead.devices, ahead.generation or ahead.platform, ahead.peak_bytes, path)
 
 
+def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> Batch:
+    """`batch`, a global batch as a loader gives it, as `fit` hands it to its step: its work counted
+    (`Trainer._counted_batch`), each row marked with its place among the step's records
+    (`dew.training.distributed.marked`), and its host fields set apart (`split_fields`)."""
+    from dew.data.dataset import DataPartition
+    from dew.distributed.batches import split_fields
+    from dew.training.distributed import marked
+
+    device, _ = split_fields(marked(DataPartition.of(trainer.device_mesh), trainer._counted_batch)(batch))
+    return device
+
+
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the devices its mesh is
     built over and never run: the step `fit` would compile there, as its plan's first candidate lowers
     it (`Trainer._candidate`), at the base rung and the first split, its state the fresh one the
-    trainer builds, abstract and placed by its layout, compiled with the options the run's compile
-    takes. Over compile-only GPUs of one generation (`compile_only_gpus`) it traces as on those GPUs
-    (`dew.nn.kernels.generation.assumed`); over the trainer's own devices, as they are."""
+    trainer builds, abstract and placed by its layout, its batch `batch` as `fit` hands it to the step
+    (`step_batch`), compiled with the options the run's compile takes. Over compile-only GPUs of one
+    generation (`compile_only_gpus`) it traces as on those GPUs (`dew.nn.kernels.generation.assumed`);
+    over the trainer's own devices, as they are."""
     devices = list(trainer.device_mesh.devices.flat)
     platforms = {device.platform for device in devices}
     generations = ({gpu_target(device.device_kind).generation for device in devices} if platforms == {"gpu"}
@@ -229,7 +242,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                          f"{sorted({device.device_kind for device in devices})}")
     (generation,), (platform,) = generations, platforms
     start = trainer._started()
-    lowered, options = trainer._lowered_for(start.abstract, batch, generation, trainer.device_mesh)
+    lowered, options = trainer._lowered_for(start.abstract, step_batch(trainer, batch), generation,
+                                            trainer.device_mesh)
     compiled = lowered.compile(options)
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)
     memory = compiled.memory_analysis()
