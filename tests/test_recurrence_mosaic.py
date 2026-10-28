@@ -12,7 +12,6 @@ GPU's interpreter on the wgmma bundle (`mainloop.INTERPRETED`) at one row of a s
 roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
-import dataclasses
 import functools
 
 import jax
@@ -477,8 +476,10 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
         # whose walks fill more than a wave and these shapes never do: a role's registers are its share
         # of the program's.
         value_width = RESOURCE_SHAPES[name][3]
-        walked = ([(dataclasses.replace(derived, walkers=2), 'two roles ')]
-                  if family.consumers >= 2 and not packed and value_width // derived.block_v % 2 == 0 else [])
+        two = (template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
+                                       wide=derived.block_o or derived.block_v)
+               if family.consumers >= 2 and not packed and value_width // derived.block_v % 2 == 0 else None)
+        walked = [] if two is None else [(two, 'two roles ')]
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
                 for tiles, kind in derived_tiles + walked + ([] if training else unheld)]
 
