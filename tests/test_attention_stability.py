@@ -132,7 +132,10 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "fp16 values near their largest beside a state near fp32's largest": 32,
          "keys an ulp apart, float32": 32, "keys an ulp apart, bfloat16": 32,
          "keys near fp32's largest at equal logits": 32, "a far maximum in a later key tile": 8,
-         "a decode step's sink and one key": 32, "a decode step's sink near fp32's largest and one key": 8,
+         "a decode step's sink and one key": 32,
+         "a product past fp32's largest before a small scale, float32": 8,
+         "a product past fp32's largest before a small scale, bfloat16": 8,
+         "a decode step's sink near fp32's largest and one key": 8,
          "documents of one key": 8}
 """Each family's declared seeds, the fewest over which the reference compared with itself resolves check
 1's parity (`reference_error.seeds_for`), sized for every family at the suite's own draws and reference."""
@@ -484,6 +487,19 @@ def _far_maximum_in_a_later_tile(seed: int, rows: int = 64):
     return query, key, value, None, dout
 
 
+def _product_past_largest(seed: int):
+    # One query a row over two keys whose products with it pass fp32's largest before the scale (2^128 to
+    # 3 * 2^128 at a width of 16, scale 1/4) where the reference, which scales the query first, keeps them
+    # finite (a quarter of that): the kernels take the scale's power of two on the query before their
+    # products (`attention.prescale`). The larger logit takes every weight.
+    query = np.zeros((ROWS, 1, 1, 16), np.float32)
+    query[..., 0] = np.float32(2.0 ** 127) * _uniform(seed, 0.5, 1.0, (ROWS, 1, 1))
+    key = np.zeros((ROWS, 2, 1, 16), np.float32)
+    key[:, :, 0, 0] = _uniform(seed + 1, 4.0, 6.0, (ROWS, 2))
+    value, dout = _normal(seed + 2, (ROWS, 2, 1, 16), (ROWS, 1, 1, 16))
+    return query, key, value, None, dout
+
+
 def _families() -> dict[str, Family]:
     small = functools.partial(_small_weight, queries=8, logits=(16.0, 21.0), sizes=(3.0, 5.0))
     # 1024 cases a draw: 64 rows of 16 for the template, whose interpreted Triton mainloop's time grows with
@@ -570,6 +586,12 @@ def _families() -> dict[str, Family]:
         "keys near fp32's largest at equal logits": Family(_large_keys, _kept(1, 8)),
         "a far maximum in a later key tile": Family(_far_maximum_in_a_later_tile,
                                                     np.ones((64, 1, 1, 64), bool)),
+        # Its logits near fp32's largest, so the default form's fold takes them past it (the fold's documented
+        # divergence, `algebra.Forward.base2`): the accurate form alone holds check 1.
+        "a product past fp32's largest before a small scale, float32": Family(
+            _product_past_largest, _kept(1, 2), folded=False),
+        "a product past fp32's largest before a small scale, bfloat16": Family(
+            _product_past_largest, _kept(1, 2), folded=False, dtype="bfloat16"),
         # A query's gradient that cancels across its keys, in either dtype (`algebra.cotangent_product`).
         "keys an ulp apart, float32": Family(_near_keys("float32"), _kept(1, 2)),
         "keys an ulp apart, bfloat16": Family(_near_keys("bfloat16"), _kept(1, 2), dtype="bfloat16"),
