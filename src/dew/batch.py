@@ -201,8 +201,8 @@ def prefix_sum(x, axis: int = 1, *, dtype=None, xp=jnp):
     which the GPU's associative-scan rewrite refuses, and runs it as a loop of one iteration a token (a
     2xH100 training step ran ten times slower, ledger 1905). Here each of `SCAN_BLOCKS` blocks scans its
     own slots along an axis no mesh splits, and each block adds the sum of the blocks before it, in the
-    result's dtype throughout, so an integer sum wraps as `cumsum`'s does. Exact for integers; a float's sum is reassociated by blocks.
-    `xp` numpy computes it on the host."""
+    result's dtype throughout, so an integer sum wraps as `cumsum`'s does. Exact for integers; a float's
+    sum is reassociated by blocks. `xp` numpy computes it on the host."""
     if xp is np:
         return np.cumsum(x, axis=axis, dtype=dtype)
     x = jnp.asarray(x)
