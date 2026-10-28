@@ -213,10 +213,9 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
         # leading axis where it has a row axis.
         rowed = [None if segment_ids is None else document_ids(segment_ids)[0], block_groups, image_groups,
                  key_valid, key_runs, pair[0], query_slots]
-        rows = np.broadcast_shapes(*[(jnp.shape(x)[0],) for x in (key_value_seq_lengths, key_value_seq_starts)
-                                     if x is not None],
-                                   *[(jnp.shape(x)[0],) for x in rowed if x is not None and jnp.ndim(x) >= 2],
-                                   (1,))[0]
+        batches = [(jnp.shape(x)[0],) for x in (key_value_seq_lengths, key_value_seq_starts) if x is not None]
+        batches += [(jnp.shape(x)[0],) for x in rowed if x is not None and jnp.ndim(x) >= 2]
+        rows = int(np.broadcast_shapes(*batches, (1,))[0])
     lengths, starts = (None if x is None else jnp.asarray(x, jnp.int32)
                        for x in (key_value_seq_lengths, key_value_seq_starts))
     positions = None
