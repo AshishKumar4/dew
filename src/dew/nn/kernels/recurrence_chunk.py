@@ -982,8 +982,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     # tracer).
     @jax.custom_vjp
     def rule(query, key, value, g, beta, state, starts, firsts):
+        # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
+        alone = {**run, "tiles": tiles.forward or tiles}
         return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
-                                max_segments=max_segments, scale=scale, delta=delta, wide=wide, **run)
+                                max_segments=max_segments, scale=scale, delta=delta, wide=wide, **alone)
 
     def forward(*operands):
         if not fast:

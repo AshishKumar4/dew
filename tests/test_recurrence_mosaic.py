@@ -480,8 +480,10 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
                                        wide=derived.block_o or derived.block_v)
                if family.consumers >= 2 and not packed and value_width // derived.block_v % 2 == 0 else None)
         walked = [] if two is None else [(two, 'two roles ')]
+        # A forward without a gradient at its own tiles (`Tiles.forward`), which no fast backward narrows.
+        alone = [] if training or derived.forward is None else [(derived.forward, 'alone ')]
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
-                for tiles, kind in derived_tiles + walked + ([] if training else unheld)]
+                for tiles, kind in derived_tiles + walked + alone + ([] if training else unheld)]
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
