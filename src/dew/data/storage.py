@@ -10,12 +10,12 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import tempfile
 import threading
 import time
 import tomllib
 import urllib.parse
+import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -353,21 +353,19 @@ def _local_file_key(path: str, size: int) -> tuple[str, int, int, int]:
 
 
 def content_version(fs: AbstractFileSystem, path: str, size: int) -> str:
-    """A local file's full SHA256, persisted in Dew's cache until its metadata changes."""
+    """A local file's full SHA256, persisted in Dew's cache until its metadata changes: a record of
+    its own for each version of a file, written whole and moved into place, so versioning one file
+    never waits on another's, in this process or any other that shares the cache."""
+    # A record a version, not one database of them: under load one process's write held a shared
+    # database past the others' wait, which failed them ("database is locked").
     directory = Path(dew_cache_dir()) / "content-versions"
     directory.mkdir(parents=True, exist_ok=True)
     lock = hashlib.sha256(os.path.realpath(path).encode()).hexdigest()
-    with FileLock(str(directory / (lock + ".lock"))), contextlib.closing(
-        sqlite3.connect(directory / "versions.sqlite")
-    ) as versions:
+    with FileLock(str(directory / (lock + ".lock"))):
         key = _local_file_key(path, size)
-        fingerprint = hashlib.sha256(json.dumps(key).encode()).hexdigest()
-        versions.execute(
-            "CREATE TABLE IF NOT EXISTS versions (file TEXT PRIMARY KEY, sha256 TEXT NOT NULL)"
-        )
-        cached = versions.execute("SELECT sha256 FROM versions WHERE file = ?", (fingerprint,)).fetchone()
-        if cached is not None:
-            return str(cached[0])
+        kept = directory / (hashlib.sha256(json.dumps(key).encode()).hexdigest() + ".sha256")
+        if kept.exists():
+            return kept.read_text()
         with fs.open(path, "rb") as file:
             digest = hashlib.sha256()
             while payload := file.read(2**20):
@@ -375,8 +373,9 @@ def content_version(fs: AbstractFileSystem, path: str, size: int) -> str:
         checksum = digest.hexdigest()
         if _local_file_key(path, size) != key:
             raise OSError(f"local file changed while its content was versioned: {path}")
-        with versions:
-            versions.execute("INSERT INTO versions VALUES (?, ?)", (fingerprint, checksum))
+        written = kept.with_name(f"{kept.name}.{uuid.uuid4().hex}")
+        written.write_text(checksum)
+        os.replace(written, kept)
         return checksum
 
 

@@ -328,6 +328,39 @@ print(content_version(CachedOnly(), filename, os.stat(filename).st_size))
     assert len(opened) == 3
 
 
+def test_processes_sharing_the_cache_version_their_files_at_once(tmp_path, monkeypatch):
+    """Four processes sharing Dew's cache version 64 local files at once, each in its own order:
+    each file's version is recorded alone, so every process reads every file's checksum, none
+    waiting on another file's record (a shared store failed one of them under load with sqlite's
+    "database is locked")."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    paths = []
+    for index in range(64):
+        path = tmp_path / f"{index:02d}.txt"
+        path.write_bytes(bytes([index]) * (16 * 1024 + index))
+        paths.append(str(path))
+    script = """
+import os
+import random
+import sys
+from fsspec.implementations.local import LocalFileSystem
+from dew.data.storage import content_version
+
+paths = sys.argv[2:]
+random.Random(int(sys.argv[1])).shuffle(paths)
+for path in paths:
+    print(path, content_version(LocalFileSystem(), path, os.stat(path).st_size))
+"""
+    readers = [subprocess.Popen([sys.executable, "-c", script, str(seed), *paths], stdout=subprocess.PIPE,
+                                text=True, env={**os.environ, "XDG_CACHE_HOME": str(tmp_path / "cache")})
+               for seed in range(4)]
+    expected = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in paths}
+    for reader in readers:
+        out, _ = reader.communicate()
+        assert reader.returncode == 0
+        assert dict(line.split() for line in out.splitlines()) == expected
+
+
 def test_cache_keeps_active_file_pinned_and_evicts_lru(tmp_path):
     remote = fsspec.filesystem("memory")
     root = f"cache-{uuid4().hex}"
