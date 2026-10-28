@@ -37,6 +37,7 @@ from dew.nn.kernels.templates.attention_mosaic_backward import (
     _dkv_allocations,
     _dq_allocations,
     _launch_backward,
+    split_queries,
 )
 from dew.nn.kernels.templates.attention_mosaic_forward import (
     _forward_allocations,
@@ -375,13 +376,16 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
         return resources.live_registers(family, carried, products, cotangents)
+    # A consumer's share of a slot's queries where the consumers share its keys (`split_queries`).
+    queries = block_q // config.consumers if split_queries(family) else block_q
+    step = [(queries, block_k, jnp.float32)] * 2
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
-    fused = [(block_q, width, jnp.float32)] if config.fused else []
+    fused = [(queries, width, jnp.float32)] if config.fused else []
     # The keys-first step's per-query statistics in its tiles' column layout (`Family.column_registers`): the
     # maximum, the denominator, the anchor, D and the anchor key (`attention_mosaic_backward._scores`).
-    statistics = KEYS_FIRST_STATISTICS * family.column_registers(block_q, jnp.float32)
-    return resources.live_registers(family, carried, products, fused) + statistics
+    statistics = KEYS_FIRST_STATISTICS * family.column_registers(queries, jnp.float32)
+    return resources.live_registers(family, carried, step, fused) + statistics
 
 
 @dataclasses.dataclass(frozen=True)
