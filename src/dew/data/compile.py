@@ -20,7 +20,7 @@ import os
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import ClassVar, Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol, cast, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -1376,19 +1376,22 @@ def fitted[Entry](
                          "has none: read it as a chain (dew.data.Grain, dew.data.Memory), or set steps=")
     else:
         loader = native_loader(dataset)
-    one = isinstance(validation, Dataset | pygrain.MapDataset | pygrain.IterDataset) or (
-        isinstance(validation, Mapping) and all(isinstance(column, np.ndarray)
-                                                for column in validation.values()))
-    named = {"val": validation} if one else validation
-    if named is None:
+    if validation is None:
         return loader, None
+    named: Mapping[str, object]
+    if isinstance(validation, Dataset | pygrain.MapDataset | pygrain.IterDataset) or all(
+            isinstance(column, np.ndarray) for column in validation.values()):
+        named = {"val": validation}
+    else:
+        named = validation
 
-    def admitted(entry):
+    def admitted(entry: object) -> Reader | Entry:
         if isinstance(entry, Dataset):
             return held(entry, objective=objective, batch=loader.batch, seed=seed)
         if isinstance(entry, pygrain.MapDataset | pygrain.IterDataset | Mapping):
             return native(entry, training=False)
-        return entry
+        # The caller's own entry, a reader or an evaluation suite, passed on as it came.
+        return cast(Entry, entry)
     return loader, {name: admitted(entry) for name, entry in named.items()}
 
 

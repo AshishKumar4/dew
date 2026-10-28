@@ -2074,7 +2074,7 @@ class Trainer(Generic[Loss, Effects]):
                                    elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
-                   preview: bool, stated: Dataset | Loader, loss: bool) -> None:
+                   preview: bool, stated: Dataset | Loader | Handed, loss: bool) -> None:
         """The refusals `fit` makes before it places anything: validation
         nothing reads, and a pipeline's batch, whose placement could take
         minutes or run out of memory before the error. Every other mesh's

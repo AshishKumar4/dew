@@ -20,6 +20,7 @@ from dew._coordination import agreed_next
 from dew._records import JSON
 from dew.batch import Batch
 from dew.checkpoints import Checkpoints
+from dew.data.compile import Handed
 from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
@@ -434,8 +435,8 @@ def first_batch(loader: Loader, mesh: Mesh) -> Batch:
     return batch
 
 
-def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bool, seeded: bool,
-                     mesh: MeshSpec | Mesh | None, given: Mapping[str, object]) -> list[str]:
+def unrecorded_parts(objective: str, dataset: Dataset | Loader | Handed, *, optimized: bool,
+                     seeded: bool, mesh: MeshSpec | Mesh | None, given: Mapping[str, object]) -> list[str]:
     """Why a run's record cannot rebuild a trainer's run on `dataset`, each a part a
     `dew.config.RunConfig` states otherwise, read from the trainer's own fields
     (`Checkpoints.python_run`): an objective, of the class `objective` names, built in Python, an optax
@@ -452,6 +453,9 @@ def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bo
         reasons.append("the mesh is a jax.sharding.Mesh; a run's record states a MeshSpec")
     if isinstance(dataset, Loader):
         reasons.append("the data is a compiled Loader; a run's record states its chain")
+    elif not isinstance(dataset, Dataset):
+        reasons.append("the data was handed as it is, a Grain dataset or arrays; a run's record states "
+                       "a chain")
     reasons += [f"{name} is given to the trainer, which a run's record does not state"
                 for name, part in given.items() if part is not None]
     return reasons
