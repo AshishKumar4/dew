@@ -429,6 +429,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
         # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless call's.
         hooked = self.score_mod is not None or ba.arguments["initial"] is not None
+        found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
+        dkv_family = found.get(config.dkv.family)
+        if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
+            return False
         if (config.fused and (self.accurate or hooked)) or not super().legal(ba, config, target):
             return False
         # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows.
@@ -459,10 +463,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
         # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
+        # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
+        # splitting each slot's queries (`split_queries`); else on the dQ launch's.
+        fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
+        dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
         for columns in (1, 2, 4):
             def tiles(rows: int, walked: int, consumers: int, columns=columns) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=fused and columns == 1,
-                                     family=family.name, columns=columns)
+                                     family=family.name, columns=columns, **dkv)
 
             if config := _derived(family, query.dtype, key.shape[1], query.shape[1], tiles,
                                   lambda config: self.legal(ba, config, target), overlapped=False):
