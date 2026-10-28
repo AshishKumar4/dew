@@ -9,7 +9,6 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from .visibility import visible
 
 
 class CrossDocuments(NamedTuple):
@@ -50,8 +49,7 @@ def document_mask(segment_ids) -> jax.Array:
     the mask every kernel but splash and the pallas flash kernel reads for
     `segment_ids`; those two compare the ids per block.
     """
-    queries, keys = document_ids(segment_ids)
-    return (queries[:, :, None] == keys[:, None, :]) & (queries[:, :, None] != 0)
+    return _spanned(segment_ids, causal=False, sliding_window=None)
 
 
 def with_documents(mask, segment_ids):
@@ -121,9 +119,14 @@ def cross_document_mask(segment_ids: CrossDocuments, *, causal: bool,
     query's place, a window of w the w - 1 before it, or without causality those within w - 1 of it
     (`dew.nn.visibility.window_sides`). A key's rank in its document is its distance from the
     document's first key, the keys running in ascending id order."""
-    _, keys = document_ids(segment_ids)
-    ordered = _padding_last(keys)
-    key_rank = jnp.arange(keys.shape[-1])[None, :] - _searched(ordered, ordered, "left")
-    keep = document_mask(segment_ids) & visible(aligned_places(segment_ids)[:, :, None], key_rank[:, None, :],
-                                                 causal=causal, window=sliding_window)
-    return keep[:, None]
+    return _spanned(segment_ids, causal=causal, sliding_window=sliding_window)[:, None]
+
+
+def _spanned(segment_ids, *, causal: bool, sliding_window: int | None) -> jax.Array:
+    """The keys each query of a call of documents `segment_ids` sees, `[B, Q, K]`: the call's spans
+    (`template.spans`) as a mask."""
+    from dew.nn.kernels.templates import attention as template
+
+    queries, keys = document_ids(segment_ids)
+    return template.dense(template.spans(queries.shape[1], keys.shape[1], queries.shape[0], causal=causal,
+                                         sliding_window=sliding_window, segment_ids=segment_ids))
