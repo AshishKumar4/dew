@@ -360,12 +360,13 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
     s = family.product(k_smem, q_slot.transpose((1, 0)), shape)
     if walk.scaled:
         s = s * walk.spec.prescale
+    dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
     coords = coords_of(q_first)
-    # Every tile masked, its queries' statistics read past their products, each phase's alone: the weights
-    # and dV's product, then dP and the cotangents, so the normalized weights and dP are never live together
-    # (a tile chosen masked or whole at run time joined both choices' tiles: 1184 bytes spilled at 64 x 64,
-    # one consumer).
+    # Every tile masked, its queries' statistics read past both products, each phase's in it: the weights
+    # and dV's product, then the cotangents and dK's (a tile chosen masked or whole at run time joined both
+    # choices' tiles: 1184 bytes spilled at 64 x 64, one consumer; dP issued after dV's product held the
+    # unnormalized weights across it: 528 bytes at a width of 256 in four shares, against 24).
     peak, total = rows_of(q_first, 0, 1)
     exponentials, weights, slopes, seen, inverse_total = _weighed(walk, coords, params, s, peak, total,
                                                                   masked=True)
@@ -374,7 +375,6 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
     dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_columns, walk.interpret)
-    dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     anchor, delta, chosen = rows_of(q_first, 2, 3, 4)
     cotangents = _cotangents(walk, coords, s, exponentials, dp, anchor, delta, chosen, seen, inverse_total)
     logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
