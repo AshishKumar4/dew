@@ -139,7 +139,10 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     """The sequence a token at a time through the decode step's reference, a packed document's first
-    token starting from a zero memory: `(output, final memory)`, the output in the operands' dtype."""
+    token starting from a zero memory: `(output, final memory)`, the output in the operands' dtype. Host
+    operands are taken as JAX arrays: a float64 truth's first call runs on the gate's widened host arrays,
+    which the scan's traced token can't index."""
+    operands = jax.tree.map(jnp.asarray, operands)
     group = operands.value.shape[2] // operands.query.shape[2]
     query, key = (jnp.repeat(x, group, axis=2) for x in (operands.query, operands.key))
     work = jnp.promote_types(operands.value.dtype, jnp.float32)
