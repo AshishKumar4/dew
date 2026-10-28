@@ -1052,21 +1052,25 @@ class _Rate(optax.schedules.StatefulSchedule):
         updates = optax.safe_increment(state.updates)
         if not isinstance(state, ProgressState):
             return state._replace(updates=updates)
-        # The update that reaches a marked count records where the run's progress stood.
         assert progress is not None, "a schedule on a run's progress is handed it at each update"
-        marks = {name: jnp.where(updates == count, jnp.asarray(progress, jnp.float32), state.marks[name])
-                 for name, count in self.rate.marks().items()}
-        return state._replace(updates=updates, marks=marks)
+        return state._replace(updates=updates, marks=self._marked(state, progress))
+
+    def _marked(self, state: ProgressState, progress: jax.typing.ArrayLike) -> dict[str, jax.Array]:
+        """`state`'s marks with the progress of the update that stands at a marked count recorded: where
+        the run stood as the piece the count starts began."""
+        at = jnp.asarray(progress)
+        return {name: jnp.where(state.updates == count, at, state.marks[name].astype(at.dtype))
+                for name, count in self.rate.marks().items()}
 
     def __call__(self, state: RateState | ProgressState, *, progress: jax.Array | None = None,
                  **extra_args) -> jax.typing.ArrayLike:
         del extra_args
         if isinstance(state, ProgressState):
             assert progress is not None, "a schedule on a run's progress is handed it at each update"
-            at = jnp.asarray(progress, jnp.float32)
+            at, marks = jnp.asarray(progress), self._marked(state, progress)
             if not self.rate.rates():
-                return state.rates[CONSTANT] * self.rate.progressed({}, at, state.updates, state.marks)
-            return self.rate.progressed(state.rates, at, state.updates, state.marks)
+                return state.rates[CONSTANT] * self.rate.progressed({}, at, state.updates, marks)
+            return self.rate.progressed(state.rates, at, state.updates, marks)
         if not self.rate.rates():
             return state.rates[CONSTANT] * self.rate.schedule(self.steps)(state.updates)
         return self.rate.schedule(self.steps, state.rates)(state.updates)
@@ -1660,23 +1664,26 @@ class Power(ScheduleBase):
         """Its power law of its updates after its warmup, and its tail from `tail.start` to the run's end.
         A warmup written as a share of the run rises over that share of the progress to the law's value
         at the update it reaches, the law scaled by how far through it the run stands."""
-        count = jnp.asarray(self._counted(updates), jnp.float32)
+        count = self._counted(updates)
 
         def law(step):
-            return jnp.minimum(rates['peak_value'], rates['a'] * (step * self.c) ** self.b)
+            # Its step in float32, as `power_schedule`'s law reads it.
+            scaled = jnp.asarray(step, jnp.float32) * self.c
+            return jnp.minimum(rates['peak_value'], rates['a'] * scaled ** self.b)
 
         written = self.warmup_steps
         if isinstance(written, str):
             through, _, _ = self._warm(written, progress, updates, marks)
-            value = law(jnp.maximum(count, 1.0)) * through
+            value = law(jnp.maximum(count, 1)) * through
         elif written:
-            value = jnp.where(count < written, law(float(written)) * count / written, law(count))
+            warm = jnp.minimum(rates['peak_value'], rates['a'] * (written * self.c) ** self.b)
+            value = jnp.where(count < written, warm * count / written, law(count))
         else:
             value = law(count)
         tail = self.tail
         if tail is None:
             return value
-        start = law(float(tail.start))
+        start = law(tail.start)
         if tail.steps is None:
             done = _after(progress, marks["tail"])
         else:
