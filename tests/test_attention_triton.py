@@ -9,6 +9,7 @@ import pytest
 from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import (
     CASES,
+    ONE_RUN,
     ROWS,
     RUN_CASES,
     SINKS,
@@ -192,6 +193,14 @@ def test_the_frozen_mainloop_refuses_runs():
         attention_triton.forward(query, key, key, spans, interpret=True)
     with pytest.raises(NotImplementedError):
         attention_triton.backward(query, key, key, spans, None, query, interpret=True)
+
+
+@pytest.mark.parametrize("config", PINNED[:2], ids=str)
+def test_one_run_a_query_is_the_interval_the_frozen_mainloop_walks(config):
+    """One run a query (`test_attention_template.ONE_RUN`, a chunked or banded local-attention layer's runs)
+    is one key interval, which the frozen Triton mainloop walks forward and backward (ledger 1991)."""
+    check(ONE_RUN, HOOKS["none"], jnp.float32, config)
+    check_backward(ONE_RUN, (), jnp.float32, config)
 
 
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])

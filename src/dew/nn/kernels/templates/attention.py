@@ -180,8 +180,9 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     query's key intervals `[lo, hi)`, R of them, static, whose union it may see, intersected with all the
     rest: a window over `positions` is searched within each run alone, whose key places never decrease
     (its builder's contract: a layout whose places restart, as a decision row's options do, splits its
-    runs there), so the spans keep R intervals a query `[B, Q, R]`. Lengths and starts are int32 token
-    coordinates; places and ids keep their own dtypes."""
+    runs there), so the spans keep R intervals a query `[B, Q, R]`, but one run a query, which is one
+    interval `[B, Q]` as every mainloop walks it. Lengths and starts are int32 token coordinates; places
+    and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
     from dew.nn.visibility import block_ends, block_starts, window_sides
 
@@ -295,10 +296,11 @@ def _chunk_of(places, chunk: int) -> jax.Array:
 
 def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
                  by_places: list[tuple[jax.Array, jax.Array, jax.Array]]) -> tuple[jax.Array, jax.Array]:
-    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, `[B, Q, R]` each, and
-    each run's keys within each narrowing by places (`by_places`: its keys' values `[B, K]`, a window's
-    places or a chunk's numbers, and each query's least and greatest it keeps `[B, Q]`), searched in the run
-    alone, along which a run's places never decrease where the call's may restart between runs."""
+    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, `[B, Q, R]` each (one
+    run a query `[B, Q]`, the one interval every mainloop walks), and each run's keys within each narrowing
+    by places (`by_places`: its keys' values `[B, K]`, a window's places or a chunk's numbers, and each
+    query's least and greatest it keeps `[B, Q]`), searched in the run alone, along which a run's places
+    never decrease where the call's may restart between runs."""
     lo = jnp.maximum(jnp.clip(runs[..., 0], 0, keys), start[..., None])
     hi = jnp.maximum(jnp.minimum(jnp.clip(runs[..., 1], 0, keys), end[..., None]), lo)
     batch, _, count = lo.shape
@@ -307,7 +309,7 @@ def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
         first = _searched(values, flat_lo, flat_hi, jnp.repeat(least, count, axis=1), "left")
         last = _searched(values, flat_lo, flat_hi, jnp.repeat(greatest, count, axis=1), "right")
         lo, hi = first.reshape(lo.shape), jnp.maximum(last, first).reshape(hi.shape)
-    return lo, hi
+    return (lo[..., 0], hi[..., 0]) if count == 1 else (lo, hi)
 
 
 def _valid_ids(query_ids: jax.Array | None, key_ids: jax.Array | None, valid: jax.Array, batch: int,
