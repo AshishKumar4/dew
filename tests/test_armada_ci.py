@@ -1813,15 +1813,27 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
               if step.get("name") == "Every cheap gate (tools/check.sh), each on armada"]
     gates = [line.split("\t")[0] for line in (ROOT / "tools/check_gates").read_text().splitlines()
              if line and not line.startswith("#")]
-    base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=ROOT, capture_output=True,
-                          text=True).stdout.strip()
+    # A checkout whose main moved on past its merge-base, as CI's (fetch-depth 0) holds it.
+    checkout = tmp_path / "checkout"
+    (checkout / "tools").mkdir(parents=True)
+    (checkout / "tools/check_gates").write_text((ROOT / "tools/check_gates").read_text())
+    git(checkout, "init", "-q", "-b", "main")
+    git(checkout, "add", "-A")
+    git(checkout, "commit", "-qm", "base")
+    base = git(checkout, "rev-parse", "HEAD").strip()
+    git(checkout, "checkout", "-qb", "head")
+    git(checkout, "commit", "-q", "--allow-empty", "-m", "a head")
+    git(checkout, "checkout", "-q", "main")
+    git(checkout, "commit", "-q", "--allow-empty", "-m", "main moves on")
+    git(checkout, "update-ref", "refs/remotes/origin/main", "main")
+    git(checkout, "checkout", "-q", "head")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
     for ref, priority in (("fix/lane", []), ("ci/batch-abc-1", ["--priority=10"])):
         script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
-        ran = subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=60,
+        ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
                              env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref})
         assert ran.returncode == 0, ran.stderr
         assert (tmp_path / "items").read_text().split() == gates
