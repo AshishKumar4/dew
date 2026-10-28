@@ -14,12 +14,13 @@ from reference_error import as_given, assert_as_exact
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
 from dew.data import Memory
-from dew.data.compile import compile
+from dew.data.compile import compile, fitted
 from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import Pipeline
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, Linear, OneCycle, OptimConfig
 from dew.training import Best, Checkpoints, Pause, Trainer
+from dew.training.interval import CONSUMED_COMMITTED, CONSUMED_EXAMPLES
 
 FEATURES = 4
 RECORDS = 10
@@ -426,6 +427,67 @@ def clocked_run(accumulation: int, directory=None, stops: tuple[Pause | None, ..
         assert state is not None and int(state.consumed) == CLOCKED_RECORDS
         return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(stepped)}
     return trained
+
+
+class Thinned:
+    """An objective's expansion of each record into `id % 3` copies of its row, none of every third, read
+    after the bound."""
+
+    def flat_map(self, element):
+        return tuple({"x": element["x"]} for _ in range(int(element["id"]) % 3))
+
+
+class Thin(Pulled):
+    """`Pulled` over the rows its data step makes of each record (`Thinned`)."""
+
+    def data(self):
+        from dew.data.pipeline import ObjectiveData
+
+        return ObjectiveData(train=(Thinned(),))
+
+
+def clocked_chain(x) -> Pipeline:
+    """CLOCKED_RECORDS records of `x` beside their ids, read in order as a stream, in batches of BATCH
+    rows."""
+    ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
+    return Pipeline(Memory({"x": x, "id": ids})).read("streamed").batch(BATCH)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_clocked_run_whose_last_examples_make_no_rows_ends_at_its_bound(accumulation):
+    """The examples a bound reads after the last row it keeps are consumed at the stream's end, by the run's
+    last batch: every third record makes no rows, the bound's last among them, and the run ends having
+    consumed its whole bound, as its schedule's end reads it, whether its last batch ends a whole update or
+    a window of its own."""
+    (x,) = clocked_records(0)
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    state = Trainer(Thin(), optim, key=0, accumulation=accumulation).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
+    assert CLOCKED_RECORDS % 3 == 0 and int(state.consumed) == CLOCKED_RECORDS
+
+
+def test_a_run_on_steps_keeps_no_examples_clock(tmp_path):
+    """Only a run on the examples clock pays for it: a run of steps over the same data reads batches without
+    the count of the examples they consume, which an examples bound adds, keeps no clock in its state, and
+    checkpoints none."""
+    (x,) = clocked_records(0)
+    batches = []
+    for examples in (CLOCKED_RECORDS, None):
+        loader, _ = fitted(clocked_chain(x), None, objective=Echoed().data(), examples=examples)
+        stream = loader.train(DataPartition())
+        try:
+            batches.append(next(stream))
+        finally:
+            if isinstance(stream, Closeable):
+                stream.close()
+    assert set(batches[0]) - set(batches[1]) == {EXAMPLES_CONSUMED} and set(batches[1]) <= set(batches[0])
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    checkpoints = Checkpoints(str(tmp_path))
+    state = Trainer(Echoed(), optim, key=0, checkpoints=checkpoints).fit(
+        clocked_chain(x), steps=3, log_every=1, checkpoint_every=3)
+    checkpoints.wait()
+    assert state.consumed is None
+    assert not {CONSUMED_EXAMPLES, CONSUMED_COMMITTED} & checkpoints.control(3).keys()
 
 
 def clocked_records(seed: int) -> tuple[np.ndarray]:

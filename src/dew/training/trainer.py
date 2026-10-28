@@ -127,6 +127,7 @@ from dew.training._fit import (
     clocked,
     consumption_counted,
     declarations,
+    drained,
     first_batch,
     fit_policies,
     stage_reached,
@@ -1496,12 +1497,18 @@ class Trainer(Generic[Loss, Effects]):
         """`batch` marked where it is a clocked run's last (`CLOSES_WINDOW`), so the update it ends commits
         with the microbatches its window holds, known by reading ahead (`FitRun.ends_here`), and the
         stream's position after it, taken before that read, which the step saves; else as read."""
-        window = (self._split or 1) * self.accumulation
-        # A split not yet planned may part the batch into a window of its own.
-        if self._examples is None or (window == 1 and self._split is not None):
+        if self._examples is None:
             return batch, None
         position = None if run.train is None else run.train.source_state
-        return {**batch, CLOSES_WINDOW: np.bool_(run.ends_here(interval))}, position
+        last = run.ends_here(interval)
+        if run.ran_out:
+            # The examples the bound read after its last row kept are consumed by the run's last batch.
+            batch = drained(batch, interval.consumed, self._examples)
+        window = (self._split or 1) * self.accumulation
+        # A split not yet planned may part the batch into a window of its own.
+        if window == 1 and self._split is not None:
+            return batch, position
+        return {**batch, CLOSES_WINDOW: np.bool_(last)}, position
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
@@ -2173,8 +2180,7 @@ class Trainer(Generic[Loss, Effects]):
         rollout's caller, and only it writes the reason. A count asked of the
         objective directly stays strict.
         """
-        if self._examples is not None:
-            batch = consumption_counted(batch)
+        batch = consumption_counted(batch, clocked=self._examples is not None)
         if self._refusal is None:
             try:
                 return prepare_counts(self.objective, batch, count_model=True)

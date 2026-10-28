@@ -382,6 +382,12 @@ class FitRun:
             self.ahead = (waited_read(self, interval, agree=True),)
         return self.ahead[0] is None
 
+    @property
+    def ran_out(self) -> bool:
+        """Whether the stream ran out after the batch the run steps now (`ends_here`'s read found its
+        end), not closed before it ran out."""
+        return self.ahead is not None and self.ahead[0] is None
+
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
         a caller's alias would keep the closed stream reachable from a failed
@@ -404,10 +410,35 @@ def clocked(examples: int | None, steps: int | None, *, custom: bool, rollout: b
     return examples
 
 
-def consumption_counted(batch: Batch) -> Batch:
+def drained(batch: Batch, consumed: int, bound: int) -> Batch:
+    """A clocked run's last `batch`, its stream run out, holding the examples its bound read that no row
+    it dispatched carried: an example rejected, or of no rows, after the last row kept. The stream's end
+    consumes them, so the run ends at its bound (`TrainState.consumed`). `consumed` is what the batches
+    before it consumed (`Interval.consumed`)."""
+    held = batch[CONSUMED_COUNT]
+    assert isinstance(held, ConsumedCount), "a clocked run's batch is counted (`consumption_counted`)"
+    remainder = bound - consumed - held.examples
+    assert remainder >= 0, f"the run's batches consumed {consumed + held.examples} of its {bound} examples"
+    if not remainder:
+        return batch
+    column = batch[EXAMPLES_CONSUMED]
+    # The batch's first row takes them: the step sums the column over the whole batch.
+    if isinstance(column, jax.Array):
+        credited = jax.device_put(column.at[0].add(remainder), column.sharding)
+    else:
+        credited = np.asarray(column).copy()
+        credited[0] += remainder
+    return {**batch, EXAMPLES_CONSUMED: credited, CONSUMED_COUNT: ConsumedCount(held.examples + remainder)}
+
+
+def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
     """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
     prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
-    its start."""
+    its start. A run on another clock, one bounded in examples whose plan counts its steps ahead, keeps
+    no count: none rides to its step."""
+    if not clocked:
+        return batch if EXAMPLES_CONSUMED not in batch else {
+            name: value for name, value in batch.items() if name != EXAMPLES_CONSUMED}
     if EXAMPLES_CONSUMED not in batch:
         raise ValueError("a step after the examples bound dropped the batch's count of the examples it "
                          f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "

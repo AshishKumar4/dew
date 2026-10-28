@@ -558,7 +558,10 @@ class _Grouped:
         records = [row for row in rows if isinstance(row, Mapping)]
         alike = (bool(rows) and len(records) == len(rows)
                  and all(row.keys() == records[0].keys() for row in records))
-        held = {name: self.column([row[name] for row in records]) for name in records[0]} if alike else rows
+        # The source examples each row consumes are the run's accounting, no batch column: they cross as
+        # the integers they are, which the reading process counts (`_Ungrouped`, `Accepted`).
+        held = ({name: [row[name] for row in records] if name == CONSUMED else
+                 self.column([row[name] for row in records]) for name in records[0]} if alike else rows)
         return {"held": held, "alike": alike, "rows": len(rows), "markers": markers}
 
     def column(self, values: list[Field]) -> np.ndarray | list[Field]:
