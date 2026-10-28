@@ -212,6 +212,24 @@ class _Issuer:
         family = self.call.family
         return tuple(family.staged(value, buffer) for value, buffer in zip(values, buffers, strict=True))
 
+    def summed(self, products: list) -> jax.Array:
+        """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
+        accumulator in place (`Family.summed`): one accumulator held where each its own held two (Kimi delta
+        attention's output, `algebra.key_decayed_output`)."""
+        operands = [(self._operand(lhs, name, rhs), self._operand(rhs, name, lhs))
+                    for name, lhs, rhs in products]
+        shape = (products[0][1].shape[0], products[0][2].shape[1])
+        family, interpret = self.call.family, self.call.interpret
+
+        def issued(acc):
+            for left, right in operands:
+                count = max(len(left), len(right))
+                for i, j in ((i, j) for i in range(len(left)) for j in range(len(right)) if i + j < count):
+                    acc = family.products(acc, left[i], right[j], interpret)
+            return acc
+
+        return family.summed(shape, issued, interpret)
+
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
         left = self._operand(lhs, name, rhs)
         right = self._operand(rhs, name, lhs)
@@ -1412,10 +1430,12 @@ def _output_held(call: _Call, bv: int) -> _Held:
     if call.per_key:
         # The intra launch's scores in fp32 and masked beside the value block's sum; at the first step the
         # key blocks' gated queries, staged for every step.
-        values += [_f32(CHUNK, CHUNK)] + _masks(CHUNK, CHUNK)
+        values = ([_f32(CHUNK, bv)] + _held(held, CHUNK, bv) + [_f32(CHUNK, CHUNK)] + _masks(CHUNK, CHUNK)
+                  + _held(held, CHUNK, CHUNK) + _widest(
+                      _product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
+                      _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv))))
         keyed = [_f32(CHUNK, call.block)] * 4
-        return _Held(phases=(values, keyed) if one_block and not family.products_overlap
-                     else (values + keyed,))
+        return _Held(phases=(values, keyed) if one_block else (values + keyed,))
     scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
               + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
               + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
@@ -1481,7 +1501,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 out = algebra.key_decayed_output(
                     lambda c: _Parts(gated[c], call.given.dtype), entered, width // call.block,
                     _tile(slots, "scores", held).value().astype(jnp.float32), value, scale,
-                    _Issuer(call, {"local": local}))
+                    _Issuer(call, {"local": local}).summed)
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
                 (gate, low), laid = loaded

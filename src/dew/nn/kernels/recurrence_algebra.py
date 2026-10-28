@@ -721,17 +721,17 @@ def key_gated(query, gates: tuple):
     return (query * raised(*gates)).astype(query.dtype)
 
 
-def key_decayed_output(gated: Load, entered: Load, columns: int, scores, value, scale: float, issue: Issue):
+def key_decayed_output(gated: Load, entered: Load, columns: int, scores, value, scale: float,
+                       summed: Callable[[list], jax.Array]):
     """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `scale (q exp2(g))_narrow S + tril(Aqk) v`,
     each key block's gated queries `gated(c)` (`key_gated`'s) against the memory entered `entered(c)`
-    ('memory'), the scores `scores` (`Aqk`, scaled) rounded to the values' dtype ('local')."""
-    out = jnp.zeros((scores.shape[0], value.shape[-1]), jnp.float32)
-    for c in range(columns):
-        out = out + issue("memory", gated(c), entered(c))
-    out = out * scale
+    ('memory') and the scores `scores` (`Aqk`, scaled) rounded to the values' dtype ('local'), every product
+    into one accumulator (`summed`, the mainloop's: a list of `(name, left, right)`), as fla's chunk_kda
+    sums its key blocks' into one."""
     lag = _lags(scores.shape)
     local = jnp.where(lag >= 0, scores, 0.0).astype(value.dtype)
-    return out + issue("local", local, value)
+    products = [("memory", gated(c), entered(c)) for c in range(columns)] + [("local", local, value)]
+    return summed(products) * scale
 
 
 # The fast backward of a decay a head under the delta rule, fla's arithmetic on a chunk's tiles (the port's
