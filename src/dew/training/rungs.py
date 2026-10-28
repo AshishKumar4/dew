@@ -147,7 +147,8 @@ def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlo
     executable can."""
     runtime = executable.runtime_executable()
     # An executable compiled for absent devices is not loaded and has no runtime fingerprint.
-    fingerprint = runtime.fingerprint if isinstance(runtime, LoadedExecutable) else None
+    fingerprint = (runtime.fingerprint
+                   if runtime is not None and isinstance(runtime, LoadedExecutable) else None)
     named = fingerprint.hex() if isinstance(fingerprint, bytes) else None
     counted = record(recorded, 'recorded plan').get('flops') if recorded is not None else None
     if named is not None and isinstance(counted, list) and len(counted) == 4 and counted[:1] == [named]:

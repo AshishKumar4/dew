@@ -231,8 +231,10 @@ class CompiledAhead(SystemExit):
         _log.info("the step compiled ahead for %s %s GPUs holds %s bytes a device at its peak; saved to "
                   "%s", ahead.devices, ahead.generation, ahead.peak_bytes, path)
         if ahead.plan is not None:
+            probes = record(ahead.plan, "plan")["probes"]
+            assert isinstance(probes, list)
             _log.info("planned on them in %.1f s, %d programs compiled, the plan %s", ahead.planned_seconds,
-                      len(record(ahead.plan, "plan")["probes"]), json.dumps(ahead.plan))
+                      len(probes), json.dumps(ahead.plan))
 
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> Batch:
