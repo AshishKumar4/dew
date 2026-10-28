@@ -20,6 +20,15 @@ from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.registry import towers
 
+PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer')
+"""The wrappers whose processors pack images and videos alike, as runs of patch vectors beside their
+`(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's and Muse
+Glimmer's, whose towers attend within a frame."""
+
+VIDEO_MEDIA = (*PACKED_MEDIA, *GEMMA4_TYPES)
+"""The wrappers whose processors carry videos (`pixel_values_videos`): the packed ones and Gemma 4's,
+whose video frames carry their patches' positions."""
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
@@ -392,9 +401,9 @@ class Processor:
             raise ValueError("video_position_ids require the Gemma4 visual tower")
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
-            if ("pixel_values_videos" in values
-                    and self.config.get("model_type") not in (*QWEN35_TYPES, *GEMMA4_TYPES)):
-                raise ValueError("video patch inputs require a Qwen3.5 or Gemma4 visual tower")
+            if "pixel_values_videos" in values and self.config.get("model_type") not in VIDEO_MEDIA:
+                raise ValueError(f"video patch inputs require a visual tower that reads videos: "
+                                 f"{', '.join(VIDEO_MEDIA)}'s")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
             if self.config.get("model_type") in QWEN35_TYPES:
@@ -428,7 +437,7 @@ class Processor:
         tokens-per-image grid.
         """
         qwen = self.config.get("model_type") in QWEN35_TYPES
-        packed = qwen or self.config.get("model_type") == "muse_glimmer"
+        packed = self.config.get("model_type") in PACKED_MEDIA
         gemma = self.config.get("model_type") in GEMMA4_TYPES
         image_id, video_id = _media_token_ids(self.record)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
