@@ -1862,9 +1862,8 @@ def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None,
                                               force_fp32_for_softmax=force_fp32_for_softmax, named='xla'),
                                mask=True, folds=False)
     chosen = selected(ATTENTION, case, 'xla').name
-    arithmetic = query.dtype == jnp.bfloat16 and (
-        _xla_kernel_narrows(query) or _xla_kernel_rounds_off(query, key, folded=False))
-    return 'xla' if chosen == 'reference' and arithmetic else chosen
+    rounds = _xla_kernel_narrows(query) or _xla_kernel_rounds_off(query, key, folded=False)
+    return 'xla' if chosen == 'reference' and query.dtype == jnp.bfloat16 and rounds else chosen
 
 
 def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = False) -> bool:
