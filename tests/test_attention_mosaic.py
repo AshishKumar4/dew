@@ -72,11 +72,12 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
               "bfloat16-natural": (jnp.bfloat16, True), "float16-natural": (jnp.float16, True)}
 """The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
 BACKWARD_FORMS = {"default": (False, attention_mosaic.BackwardTiles(64, 64, 2, 2)),
-                  "fused": (False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True)),
+                  "fused": (False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)),
                   "accurate": (True, attention_mosaic.BackwardTiles(64, 64, 2, 1))}
 """The backward's forms and schedules, `(accurate, config)`: the fast form in two launches of two consumers
-and in one (the dK/dV program adding dQ), and the accurate form, one consumer's (its keyed sums beside dQ's
-hold a consumer's registers, `MosaicBackward.register_budget`)."""
+and in one of one consumer (the dK/dV program adding dQ, its derived default: two consumers' staged
+cotangents and queries pass an H100's shared memory at a width of 128), and the accurate form, one consumer's
+(its keyed sums beside dQ's hold a consumer's registers, `MosaicBackward.register_budget`)."""
 FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
