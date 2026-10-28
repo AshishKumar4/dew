@@ -155,27 +155,30 @@ class FirstFit:
 
     def restart(self) -> None:
         """Every window open and empty, as after the packer emits them."""
-        self.free = [list(self.rooms) for _ in range(self.bins)]
+        # The first field's room apart from the rest's: a plan of lengths places one field, compared
+        # as one number, over a corpus of 200,000 chunks.
+        self.free = [self.rooms[0]] * self.bins
+        self.others = [list(self.rooms[1:]) for _ in range(self.bins)]
         self.held = [0] * self.bins
 
     def place(self, sizes: Sequence[int]) -> int | None:
         """The window a document of `sizes` entries in each field goes to, which takes them, or None
         where no open window has room for it. One longer than a window is refused, as grain refuses
         it: no window ever has room for it."""
-        if any(size > room for size, room in zip(sizes, self.rooms, strict=True)):
+        size, rest, cap, held = sizes[0], sizes[1:], self.segments, self.held
+        if size > self.rooms[0] or (rest and any(
+                other > room for other, room in zip(rest, self.rooms[1:], strict=True))):
             raise ValueError(f"a document of {list(sizes)} entries is longer than the windows of "
                              f"{list(self.rooms)} it packs into; cut it first")
-        # A plan of lengths places one field, compared as one number: a corpus is 200,000 chunks.
-        (size, *rest), cap = sizes, self.segments
         for window, free in enumerate(self.free):
-            if free[0] < size or (cap is not None and self.held[window] >= cap):
-                continue
-            if rest and any(other > room for other, room in zip(rest, free[1:], strict=True)):
-                continue
-            for axis, taken in enumerate(sizes):
-                free[axis] -= taken
-            self.held[window] += 1
-            return window
+            if free >= size and (cap is None or held[window] < cap) and (not rest or all(
+                    other <= room for other, room in zip(rest, self.others[window], strict=True))):
+                self.free[window] = free - size
+                if rest:
+                    self.others[window] = [room - other for other, room in zip(rest, self.others[window],
+                                                                               strict=True)]
+                held[window] += 1
+                return window
         return None
 
     def holding(self) -> int:

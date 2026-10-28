@@ -167,7 +167,9 @@ def test_a_stream_lays_documents_as_grain_does_whatever_their_reader_hands_on():
         rooms = dict.fromkeys(FIELDS, 4) | {"score": 2}
 
         def stream(laid=laid):
-            return grain.MapDataset.source(range(6)).map(laid).to_iter_dataset()
+            # Read in turn, nothing ahead: each document is in the buffer only until the next is read.
+            return grain.MapDataset.source(range(6)).map(laid).to_iter_dataset(
+                grain.ReadOptions(num_threads=1, prefetch_buffer_size=0))
 
         reference = list(FirstFitPackIterDataset(stream(), length_struct=rooms, num_packing_bins=bins,
                                                  shuffle_bins=False, meta_features=FIELDS[1:]))
