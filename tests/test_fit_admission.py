@@ -117,10 +117,11 @@ def test_a_validation_split_of_undeclared_inputs_is_refused_before_the_run_train
     stream = Replaying(lambda step: batch(3, step))
     objective = Supervised(Pooled(), lambda outputs, batch: (outputs - batch["y"]) ** 2,
                            inputs=InputSpec(Field("x", (3,))))
-    data = Loader(train=lambda partition: stream, val=lambda partition: [batch(5, 0), batch(5, 1)], batch=8,
-                  records=None)
+    data = Loader(train=lambda partition: stream, val=None, batch=8, records=None)
+    held = {"held": lambda partition: [batch(5, 0), batch(5, 1)]}
     with pytest.raises(ValueError):
-        Trainer(objective, optax.sgd(0.1), key=0).fit(data, steps=40, log_every=1, eval_every=eval_every)
+        Trainer(objective, optax.sgd(0.1), key=0).fit(data, validation=held, steps=40, log_every=1,
+                                                      eval_every=eval_every)
     assert stream.position < 10
 
 
