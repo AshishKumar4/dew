@@ -615,7 +615,7 @@ def test_a_joint_run_refuses_a_cue_its_rows_cannot_render():
 
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, head=JointShape(), max_len=128,
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, head=JointShape(), max_len=1024,
                               segments=(Schema(), State()))
     run.prepare()
     with pytest.raises(ValueError):
