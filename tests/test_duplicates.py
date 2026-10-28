@@ -4,6 +4,7 @@ and constants read as their types), and passes the same files once the code has 
 share. Declarations alike (fields, imports, stubs, runs of one call with other data) are no copy. Held to
 a base, it refuses only a copy the base did not have, wherever it is written, and holds one that moved."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -373,22 +374,39 @@ def test_held_to_a_base_only_a_copy_the_base_lacked_fails(tmp_path):
     assert absolute.returncode == 1
 
 
-def test_a_shallow_checkout_is_held_to_its_base_once_tools_base_history_fetches_it(tmp_path):
-    """A shallow checkout of a head, as armada's are, holds no origin/main to hold it to;
-    tools/base_history.sh fetches main and its history from the checkout's origin, and the gate then
-    fails the head's new copy."""
+def test_a_checkout_carrying_its_base_is_held_to_it_and_fetches_nothing(tmp_path):
+    """A gate's container checkout carries its commit's history (armada's history full) and is given BASE,
+    its head's merge-base with main, with no origin/main and no reachable origin: tools/base_history.sh
+    points origin/main at BASE from the history it holds, fetching nothing, and the gate then fails the
+    head's new copy; a checkout whose history lacks BASE fails, naming it, fetching nothing (Main,
+    2026-10-28: the gates' fetches of main over HTTPS failed lanes' lint, curl 92)."""
     root = repository(tmp_path, {"spread.py": SPREAD, "ranges.py": RANGE_OVER_COUNT})
+    base = subprocess.run(["git", "rev-parse", "main"], cwd=root, check=True, capture_output=True,
+                          text=True).stdout.strip()
     third = RANGE_OVER_COUNT.replace("range_over_count", "third").replace("chosen", "picked")
     (root / "third.py").write_text(third)
     commit(root, "a head that copies it again")
+    carried = tmp_path / "carried"
+    subprocess.run(["git", "clone", "-q", "--branch", "head", root.as_uri(), str(carried)], check=True)
+    for command in (["remote", "set-url", "origin", str(tmp_path / "unreachable")],
+                    ["update-ref", "-d", "refs/remotes/origin/main"]):
+        subprocess.run(["git", *command], cwd=carried, check=True)
+    held = subprocess.run(["sh", str(BASE_HISTORY)], cwd=carried, timeout=120, capture_output=True, text=True,
+                          env={**os.environ, "BASE": base})
+    assert held.returncode == 0, held.stderr
+    assert gate(carried, "--base=origin/main").returncode == 1
+    assert owners(added(carried, "origin/main")) == [
+        ("function", ["ranges.py range_over_count", "spread.py spread", "third.py third"])]
     shallow = tmp_path / "shallow"
     subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "head", root.as_uri(), str(shallow)],
                    check=True)
-    assert gate(shallow, "--base=origin/main").returncode == 2
-    subprocess.run(["sh", str(BASE_HISTORY)], cwd=shallow, check=True, timeout=120)
-    assert gate(shallow, "--base=origin/main").returncode == 1
-    assert owners(added(shallow, "origin/main")) == [
-        ("function", ["ranges.py range_over_count", "spread.py spread", "third.py third"])]
+    # Its origin reachable: a checkout whose history lacks the base fails, and fetches nothing to find it.
+    lacking = subprocess.run(["sh", str(BASE_HISTORY)], cwd=shallow, timeout=120, capture_output=True,
+                             text=True, env={**os.environ, "BASE": base})
+    assert lacking.returncode == 1
+    for missing in ([f"{base}^{{commit}}"], ["refs/remotes/origin/main"]):
+        assert subprocess.run(["git", "rev-parse", "-q", "--verify", *missing], cwd=shallow,
+                              capture_output=True).returncode != 0
 
 
 def test_held_to_a_base_a_new_copy_beside_a_held_one_fails(tmp_path):

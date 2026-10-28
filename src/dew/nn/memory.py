@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import ClassVar, Literal, NamedTuple
 
 import jax
@@ -84,6 +85,7 @@ from dew.batch import valid_order
 from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
+from dew.nn.kv_cache import ROUNDING_KEYS
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
@@ -411,18 +413,23 @@ class InContextMemory(nn.Module):
         steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places,
                        self._keys(x))
         hooks, segments = self._route(), tokens.max_segments
-        if call.decode and self._recurrence() is not None:
+        # A cached call's tokens at their places in the row's document, which the cache counts, and its
+        # rounding stream from the row's key where the call brings none (`_cached`).
+        cached, counted = self._cached(steps) if call.decode else (None, None)
+        if cached is not None and self._recurrence() is not None:
             # A linear memory's cache holds the recurrence's state on either route: the route may change
             # between the calls one cache serves, as an adapter's dropout does with the dropout stream.
-            read = self._recurrent_decoded(hooks, heads, steps, log_kept, segments)
+            read = self._recurrent_decoded(hooks, heads, steps._replace(keys=cached.keys), log_kept, segments)
         elif hooks is not None:
             read = self._recurrent(hooks, heads, steps, log_kept, max_segments=segments)[0]
-        elif call.decode:
-            read = self._decoded(heads, steps)
+        elif cached is not None:
+            read = self._decoded(heads, cached)
         elif tokens.max_segments > 1:
             read = self._stepped(heads, steps)[0]
         else:
             read = self._chunked(heads, steps)
+        if counted is not None:
+            counted()
         read = read.astype(self.dtype or x.dtype)
         if self.output:
             read = Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -740,14 +747,46 @@ class InContextMemory(nn.Module):
         start = self.variable("cache", START, lambda: rows)
         state = self.variable("cache", STATE, lambda: rows)
         momentum = self.variable("cache", MOMENTUM, lambda: rows)
-        seen = self.variable("cache", COUNT, lambda: jnp.zeros_like(steps.real, jnp.int32)[:, 0])
-        places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
-        reads, carry = self._stepped(heads, steps._replace(places=places),
-                                     (start.value, state.value, momentum.value))
+        reads, carry = self._stepped(heads, steps, (start.value, state.value, momentum.value))
         if allocated:
             start.value, state.value, momentum.value = carry
-            seen.value = _at_last(places + 1, steps.real, seen.value)
         return reads
+
+    def _cached(self, steps: _Steps) -> tuple[_Steps, Callable[[], None]]:
+        """A cached call's steps at their places in the row's document, counted from the real tokens of
+        it the cache has seen (`COUNT`): the call's first document continues the row's, one that starts
+        in the call counts from 0; and the count's update past this call's tokens, which the caller runs
+        once its read is done, and which an allocating call leaves. The steps' `stochastic_rounding`
+        stream is the row's key in the cache (`ROUNDING_KEYS`) folded with each token's place and head
+        (`_rounding_keys`), where the call brings none of its own."""
+        allocated = self.has_variable("cache", COUNT)
+        seen = self.variable("cache", COUNT, lambda: jnp.zeros_like(steps.real, jnp.int32)[:, 0])
+        default = jax.random.key_data(jax.random.key(0))
+        rounding = self.variable("cache", ROUNDING_KEYS, lambda: rows_like(
+            jnp.zeros((steps.real.shape[0], *default.shape), default.dtype), steps.real))
+        places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
+        keys = dict(steps.keys or {})
+        if not any(name == "stochastic_rounding" for name, _ in keys):
+            keys.update(_rounding_keys(rounding.value, places, self.heads))
+
+        def counted() -> None:
+            if allocated:
+                seen.value = _at_last(places + 1, steps.real, seen.value)
+
+        return steps._replace(places=places, keys=keys), counted
+
+
+def _rounding_keys(rows: jax.Array, places: jax.Array, heads: int) -> dict[tuple, jax.Array]:
+    """A cached call's `stochastic_rounding` stream, each token and head's key data `[B, S, H, words]`:
+    its row's key (`ROUNDING_KEYS`) folded with the token's place in its document and with the head, so
+    a row's rounding is its request's key's and its places' alone, whatever batch, slot or call holds
+    it, and a token verified and replayed at one place rounds alike."""
+    def token(row: jax.Array, place: jax.Array) -> jax.Array:
+        key = jax.random.fold_in(jax.random.wrap_key_data(row), place)
+        return jax.random.key_data(jax.vmap(lambda head: jax.random.fold_in(key, head))(jnp.arange(heads)))
+
+    words = jax.vmap(jax.vmap(token, in_axes=(None, 0)))(rows, places)
+    return {("stochastic_rounding", jax.random.key_impl(jax.random.key(0))): rows_like(words, rows)}
 
 
 class _Head(NamedTuple):
