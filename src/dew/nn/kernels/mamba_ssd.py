@@ -253,13 +253,34 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int,
         seq[0][start], seq[0][start + chunk - 1] + 1, document, (zero, zero)))
 
 
+class _Cumsum(_Launch):
+    """The chunk cumsum's tiles and spans, its forward's and its backward's (`ChunkCumsum`,
+    `ChunkCumsumBwd`): one declaration for the pair, which runs over one geometry."""
+
+    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
+    SPANS = (("dt", 2), None, None)
+
+
+class _Passing(_Launch):
+    """The state passing's tiles and spans, its forward's and its backward's (`StatePassing`,
+    `StatePassingBwd`)."""
+
+    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
+    SPANS = ("state", None, None)
+
+
+class _StateGradient(_Launch):
+    """The state gradients' tiles, the keys' and the queries' (`ChunkStateBwdDb`, `ChunkScanBwdDc`, which
+    run one kernel, `_state_gradient`)."""
+
+    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
+
+
 @dataclasses.dataclass(frozen=True)
-class ChunkCumsum(_Launch):
+class ChunkCumsum(_Cumsum):
     """`chunk_cumsum`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum"
-    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
-    SPANS = (("dt", 2), None, None)
 
     def _fwd(self, dt: jax.Array, A: jax.Array, seq: jax.Array | None, *, chunk: int, interpret: bool,
              config: Tiles, return_residuals: bool = False):
@@ -302,12 +323,10 @@ def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, 
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkCumsumBwd(_Launch):
+class ChunkCumsumBwd(_Cumsum):
     """`chunk_cumsum_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum_bwd"
-    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
-    SPANS = (("dt", 2), None, None)
 
     def _fwd(self, dacs: jax.Array, ddt: jax.Array, dt: jax.Array, A: jax.Array, *, chunk: int,
              interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -421,12 +440,10 @@ def _state_passing_kernel(states_ref, da_ref, h0_ref, *refs, chunk: int):
 
 
 @dataclasses.dataclass(frozen=True)
-class StatePassing(_Launch):
+class StatePassing(_Passing):
     """`state_passing`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing"
-    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
-    SPANS = ("state", None, None)
 
     def _fwd(self, states: jax.Array, da: jax.Array, h0: jax.Array, seq: jax.Array | None, *, chunk: int,
              dtype: str, interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -676,12 +693,10 @@ def _state_passing_bwd_kernel(dout_ref, states_ref, da_ref, dfinal_ref, *refs, c
 
 
 @dataclasses.dataclass(frozen=True)
-class StatePassingBwd(_Launch):
+class StatePassingBwd(_Passing):
     """`state_passing_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing_bwd"
-    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
-    SPANS = ("state", None, None)
 
     def _fwd(self, dout: jax.Array, states: jax.Array, da: jax.Array, dfinal: jax.Array,
              seq: jax.Array | None, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
@@ -891,11 +906,10 @@ def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, 
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkStateBwdDb(_Launch):
+class ChunkStateBwdDb(_StateGradient):
     """`chunk_state_bwd_db`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_state_bwd_db"
-    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     SPANS = ("chunk", ("b", 3), None)
 
     def _fwd(self, x: jax.Array, dstates: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array,
@@ -906,11 +920,10 @@ class ChunkStateBwdDb(_Launch):
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkScanBwdDc(_Launch):
+class ChunkScanBwdDc(_StateGradient):
     """`chunk_scan_bwd_dc`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_scan_bwd_dc"
-    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     HEADS = "dout"
     SPANS = ("chunk", ("c", 3), None)
 
