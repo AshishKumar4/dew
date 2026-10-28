@@ -25,7 +25,15 @@ from dew.data.generation import Generation
 from dew.data.pipeline import ExpandStep, Pack
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _consumed, _indexed_manifest
-from dew.data.tokens import FirstFit, chunk_lengths, chunk_table, first_fit, packed_window
+from dew.data.tokens import (
+    FirstFit,
+    PackedWindows,
+    chunk_lengths,
+    chunk_table,
+    entries,
+    first_fit,
+    packed_window,
+)
 
 
 def plan_name(pack: Pack, field: str) -> str:
@@ -116,9 +124,9 @@ class _FirstFitPacking(pygrain.DatasetIterator[Batch]):
     def __init__(self, documents: pygrain.DatasetIterator[Batch], pack: Pack):
         super().__init__(documents)
         self._documents, self._pack = documents, pack
-        self._along = dict(pack.along)
-        self._sized = (pack.fields[0], *self._along)
-        self._placement = FirstFit((pack.seq_len, *self._along.values()), pack.bins, pack.segments)
+        self._lengths = dict.fromkeys(pack.fields, pack.seq_len) | dict(pack.along)
+        self._paired = (pack.fields[0], *(name for name, _ in pack.along))
+        self._placement = FirstFit([self._lengths[name] for name in self._paired], pack.bins, pack.segments)
         self._restart(documents.get_state())
         self._counter = 0
 
@@ -126,19 +134,26 @@ class _FirstFitPacking(pygrain.DatasetIterator[Batch]):
         """No window open or emitted, the next document read where `began` stands."""
         self._began, self._ending = began, None
         self._placement.restart()
-        self._held: list[list[Batch]] = [[] for _ in range(self._pack.bins)]
+        self._laid: PackedWindows | None = None
         self._emitting: list[Batch] | None = None
         self._next = 0
 
     def _emitted(self, ending: Mapping[str, object]) -> list[Batch]:
-        """Every window that holds a document laid out, to emit in order, the windows after them
-        beginning where `ending` stands."""
+        """Every window that holds a document, to emit in order, its fields by name as grain hands a
+        window on, the windows after them beginning where `ending` stands."""
+        assert self._laid is not None
         self._ending = ending
-        self._emitting = [packed_window(held, self._pack.seq_len, self._along)
-                          for held in self._held[:self._placement.holding()]]
+        self._emitting = [dict(sorted(window.items())) for window in self._laid.windows()]
         self._placement.restart()
-        self._held = [[] for _ in range(self._pack.bins)]
+        self._laid = None
         return self._emitting
+
+    def _lay(self, window: int, document: Batch) -> None:
+        """`document` laid in `window`, the first of a set laying out the set's windows at its
+        fields' dtypes and shapes, as grain lays them."""
+        if self._laid is None:
+            self._laid = PackedWindows(document, self._lengths, self._paired, self._pack.bins)
+        self._laid.add(window, document)
 
     def __next__(self) -> Batch:
         emitting = self._emitting
@@ -151,13 +166,13 @@ class _FirstFitPacking(pygrain.DatasetIterator[Batch]):
                     raise
                 emitting = self._emitted(before)
                 break
-            sizes = [len(document[field]) for field in self._sized]
+            sizes = [entries(document[name]) for name in self._paired]
             chosen = self._placement.place(sizes)
             if chosen is None:
                 emitting = self._emitted(before)
                 chosen = self._placement.place(sizes)
                 assert chosen == 0
-            self._held[chosen].append(document)
+            self._lay(chosen, document)
         window = emitting[self._next]
         self._next += 1
         self._counter += 1

@@ -96,6 +96,17 @@ def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
     assert data.plan.derived["0/valid_targets"] == fingerprint(sum(targets))
 
 
+def same(got, expected):
+    """Windows field for field, in order, each field's dtype and values, the fields named in the
+    order grain hands them on."""
+    assert len(got) == len(expected)
+    for index, (window_got, window_expected) in enumerate(zip(got, expected, strict=True)):
+        assert list(window_got) == list(window_expected)
+        for key, value in window_expected.items():
+            assert window_got[key].dtype == value.dtype, (index, key)
+            np.testing.assert_array_equal(window_got[key], value, err_msg=f"window {index} {key}")
+
+
 @pytest.mark.parametrize("window, bins, segments", [(8, 3, None), (16, 4, 3), (5, 2, 2), (4, 1, None),
                                                      *_drawn(8)])
 def test_a_stream_packs_first_fit_as_grain_does_and_resumes_where_grains_packer_left(window, bins, segments):
@@ -123,14 +134,6 @@ def test_a_stream_packs_first_fit_as_grain_does_and_resumes_where_grains_packer_
     dews = FirstFitPacked(stream(), pack)
     reference = list(grains)
 
-    def same(got, expected):
-        assert len(got) == len(expected)
-        for index, (window_got, window_expected) in enumerate(zip(got, expected, strict=True)):
-            assert window_got.keys() == window_expected.keys()
-            for key, value in window_expected.items():
-                assert window_got[key].dtype == value.dtype, (index, key)
-                np.testing.assert_array_equal(window_got[key], value, err_msg=f"window {index} {key}")
-
     same(list(dews), reference)
     for stop in sorted({0, 1, bins, len(reference) // 2, len(reference) - 1}):
         for saving, resuming in ((grains, dews), (dews, grains)):
@@ -140,6 +143,35 @@ def test_a_stream_packs_first_fit_as_grain_does_and_resumes_where_grains_packer_
             resumed = iter(resuming)
             resumed.set_state(read.get_state())
             same(list(resumed), reference[stop:])
+
+
+def test_a_stream_lays_documents_as_grain_does_whatever_their_reader_hands_on():
+    """Documents a stream hands on in one buffer it fills again for each, of empty fields, of a
+    scalar along an axis of its own, and of another dtype than the first of their windows: Dew's
+    packer lays each as Grain's does, copied as it is read, an empty one counted as a document, a
+    scalar as one entry, and each window at the dtype of the first document of its set."""
+    buffer = np.zeros(4, np.int32)
+
+    def refilled(index):
+        buffer[:] = index
+        return {"text": buffer, "text_roles": buffer, "score": np.float32(index)}
+
+    def mixed(index):
+        length = (4, 0, 3, 2, 0, 1)[index]
+        dtype = np.int32 if index % 2 else np.int64
+        return {"text": np.full(length, index, dtype), "text_roles": np.full(length, index, dtype),
+                "score": np.float32(index)}
+
+    for laid, bins in ((refilled, 1), (mixed, 2)):
+        pack = Pack(4, fields=FIELDS, bins=bins, along=(("score", 2),))
+        rooms = dict.fromkeys(FIELDS, 4) | {"score": 2}
+
+        def stream(laid=laid):
+            return grain.MapDataset.source(range(6)).map(laid).to_iter_dataset()
+
+        reference = list(FirstFitPackIterDataset(stream(), length_struct=rooms, num_packing_bins=bins,
+                                                 shuffle_bins=False, meta_features=FIELDS[1:]))
+        same(list(FirstFitPacked(stream(), pack)), reference)
 
 
 def test_a_stream_refuses_a_document_longer_than_its_windows():

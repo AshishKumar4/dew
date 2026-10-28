@@ -66,46 +66,75 @@ def chunk_lengths(lengths, chunk_len: int, overlap: int) -> np.ndarray:
     return np.minimum(chunk_len, np.asarray(lengths, np.int64)[documents] - starts)
 
 
-def packed_window(chunks: Sequence[Batch], window: int, along: Mapping[str, int] | None = None) -> Batch:
-    """`chunks`, each holding the same fields, laid end to end in zero-padded
-    windows, as grain's packer lays them: the token fields, which hold one
-    entry a token and so one length, in a window of `window` tokens, and each
-    field `along` an axis of its own in a window of its own length. Each field
-    keeps its trailing shape (a token's row of an aligned auxiliary field).
+def _dtype(value) -> np.dtype:
+    """The dtype grain's packer lays a field in: its array's, or int64 for a Python int."""
+    return np.dtype(np.int64) if isinstance(value, int) else np.asarray(value).dtype
 
-    `<field>_segment_ids` says which chunk of the window each entry came from,
-    counted from 1, and 0 for the padding at the end, and `<field>_positions`
-    the entry's place inside its chunk: one pair named after the first token
-    field, which describes every token field, as chunks are cut the same way in
-    each, and one for each field along an axis of its own, as grain's packer
-    writes one for each field it does not take for a meta feature
-    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:85-115`).
-    A block-diagonal mask and per-document RoPE read the token pair.
+
+def entries(value) -> int:
+    """How many entries of a window a document's field takes: its length, or one for a scalar, as
+    grain's packer counts it (`PackedBatch._get_element_lengths_flat`)."""
+    return 1 if np.ndim(value) == 0 else len(value)
+
+
+class PackedWindows:
+    """`bins` windows documents are laid into end to end, as grain's packer lays them
+    (`grain/_src/python/dataset/transformations/packing_packed_batch.py`, `PackedBatch`): each
+    field in a zero-padded window of its own length (`lengths`), allocated at the dtype and trailing
+    shape `template`, the first document of the set, holds (a token's row of an aligned auxiliary
+    field), and each document copied in as it is added, so nothing it reads from is held.
+
+    `<field>_segment_ids` says which document of the window each entry came from, counted from 1,
+    and 0 for the padding at the end, and `<field>_positions` the entry's place inside its
+    document, for each of the `paired` fields: the first token field, whose pair describes every
+    token field, as documents are cut the same way in each, and each field along an axis of its
+    own, as grain writes one for each field it does not take for a meta feature. A block-diagonal
+    mask and per-document RoPE read the token pair."""
+
+    def __init__(self, template: Batch, lengths: Mapping[str, int], paired: Sequence[str], bins: int):
+        self.values = {key: np.zeros((bins, lengths[key], *np.shape(template[key])[1:]),
+                                     _dtype(template[key])) for key in lengths}
+        self.segment_ids = {key: np.zeros((bins, lengths[key]), np.int32) for key in paired}
+        self.positions = {key: np.zeros((bins, lengths[key]), np.int32) for key in paired}
+        self.filled = {key: [0] * bins for key in lengths}
+        self.held = [0] * bins
+
+    def add(self, window: int, document: Batch) -> None:
+        """`document` laid after what window `window` holds."""
+        self.held[window] += 1
+        for key, values in self.values.items():
+            value = document[key]
+            start = self.filled[key][window]
+            end = self.filled[key][window] = start + entries(value)
+            values[window, start:end] = value
+            if key in self.segment_ids:
+                self.segment_ids[key][window, start:end] = self.held[window]
+                self.positions[key][window, start:end] = np.arange(end - start, dtype=np.int32)
+
+    def windows(self) -> list[Batch]:
+        """Every window that holds a document, in order: the first ones, since an empty window takes
+        any document a window has room for."""
+        return [{**{key: values[window] for key, values in self.values.items()},
+                 **{f"{key}_{part}": laid[key][window] for key in self.segment_ids
+                    for part, laid in (("segment_ids", self.segment_ids), ("positions", self.positions))}}
+                for window in range(sum(held > 0 for held in self.held))]
+
+
+def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
+    """`chunks`, each holding the same per-token fields, laid end to end in a
+    zero-padded window of `window` tokens as grain's packer lays them
+    (`PackedWindows`), with one pair of segment ids and positions named after
+    the first field.
 
     It is grain's assembly, held to it field for field (tests/test_grain_packing.py), and not grain's
-    own: on armada's CPUs grain's `PackedBatch` assembles a twelve-chunk window in 112 us and its
-    public packer in 3.6 ms where this takes 28 us, and an indexed read assembles a window a read
-    (row 1873).
+    own packer, whose public form lays a window in milliseconds where an indexed read assembles a
+    window a read (row 1873).
     """
-    lengths = {key: window if along is None else along.get(key, window) for key in chunks[0]}
-    fields = {key: np.zeros((lengths[key], *np.shape(value)[1:]), np.asarray(value).dtype)
-              for key, value in chunks[0].items()}
-    tokens = next(key for key in fields if along is None or key not in along)
-    paired = (tokens, *(() if along is None else (key for key in fields if key in along)))
-    segment_ids = {key: np.zeros(lengths[key], np.int32) for key in paired}
-    positions = {key: np.zeros(lengths[key], np.int32) for key in paired}
-    filled = dict.fromkeys(fields, 0)
-    for segment, chunk in enumerate(chunks, start=1):
-        for key, value in chunk.items():
-            start = filled[key]
-            filled[key] = start + len(value)
-            fields[key][start:filled[key]] = value
-            if key in segment_ids:
-                segment_ids[key][start:filled[key]] = segment
-                positions[key][start:filled[key]] = np.arange(filled[key] - start, dtype=np.int32)
-    described = {f"{key}_{part}": value for key in paired
-                 for part, value in (("segment_ids", segment_ids[key]), ("positions", positions[key]))}
-    return {**fields, **described}
+    laid = PackedWindows(chunks[0], dict.fromkeys(chunks[0], window), (next(iter(chunks[0])),), 1)
+    for chunk in chunks:
+        laid.add(0, chunk)
+    (packed,) = laid.windows()
+    return packed
 
 
 class FirstFit:
@@ -136,12 +165,17 @@ class FirstFit:
         if any(size > room for size, room in zip(sizes, self.rooms, strict=True)):
             raise ValueError(f"a document of {list(sizes)} entries is longer than the windows of "
                              f"{list(self.rooms)} it packs into; cut it first")
-        for window, (free, held) in enumerate(zip(self.free, self.held, strict=True)):
-            if (self.segments is None or held < self.segments) and all(
-                    size <= room for size, room in zip(sizes, free, strict=True)):
-                self.free[window] = [room - size for size, room in zip(sizes, free, strict=True)]
-                self.held[window] += 1
-                return window
+        # A plan of lengths places one field, compared as one number: a corpus is 200,000 chunks.
+        (size, *rest), cap = sizes, self.segments
+        for window, free in enumerate(self.free):
+            if free[0] < size or (cap is not None and self.held[window] >= cap):
+                continue
+            if rest and any(other > room for other, room in zip(rest, free[1:], strict=True)):
+                continue
+            for axis, taken in enumerate(sizes):
+                free[axis] -= taken
+            self.held[window] += 1
+            return window
         return None
 
     def holding(self) -> int:
