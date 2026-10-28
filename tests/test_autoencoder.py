@@ -336,9 +336,12 @@ def test_a_diffusers_flax_vae_loads_its_upsamplers_into_the_shared_upsampling(tm
     published = jax.tree.map(np.asarray, reference.params)
 
     def diffusers(tree):
-        return {name: ({"conv" if part == "Conv_0" else part: leaf for part, leaf in value.items()}
-                       if name.startswith("upsamplers_") else diffusers(value) if isinstance(value, dict) else value)
-                for name, value in tree.items()}
+        def renamed(name, value):
+            if name.startswith("upsamplers_"):
+                return {"conv" if part == "Conv_0" else part: leaf for part, leaf in value.items()}
+            return diffusers(value) if isinstance(value, dict) else value
+
+        return {name: renamed(name, value) for name, value in tree.items()}
 
     (tmp_path / "config.json").write_text(json.dumps({
         "_class_name": "FlaxAutoencoderKL", "block_out_channels": [8, 16, 16], "layers_per_block": 1,

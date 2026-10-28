@@ -503,7 +503,8 @@ def test_a_named_kernel_runs_the_calls_derivative_too():
     w = jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, WIDTH)), jnp.bfloat16)
     with generation.assumed("sm80"), generation.routes() as found:
         with generation.chosen(grouped_matmul="xla"):
-            y, pull = jax.vjp(lambda x, w: template.gemm(x, w, jnp.asarray(SIZES), out_dtype=jnp.bfloat16), x, w)
+            y, pull = jax.vjp(lambda x, w: template.gemm(x, w, jnp.asarray(SIZES), out_dtype=jnp.bfloat16),
+                              x, w)
         pull(jnp.ones_like(y))
     assert {route.kernel for route in found if route.choice == "grouped_matmul"} == {"xla"}
 

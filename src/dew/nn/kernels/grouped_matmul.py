@@ -1227,8 +1227,8 @@ other cell: the template, then Triton by legality, run those."""
 
 
 DENSE_MEASURED = _Need('dense', lambda case: not case.kind.startswith('dense'),
-                      "Triton's dense launches measured slower than XLA's dot on every generation timed (DENSE1, "
-                      "10 projections at 8192 tokens: A100 1.735x to 1.947x, H100 1.149x to 1.738x)",
+                      "Triton's dense launches measured slower than XLA's dot on every generation timed "
+                      "(DENSE1, 10 projections at 8192 tokens: A100 1.735x to 1.947x, H100 1.149x to 1.738x)",
                       row='bible da64ae5', kind='measured')
 """What keeps Triton's launches off a dense product the template's own launches cannot run: XLA's dot runs it,
 as it measured faster than Triton's on every generation timed; a call naming Triton still runs them."""
@@ -1237,9 +1237,12 @@ as it measured faster than Triton's on every generation timed; a call naming Tri
 _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
 _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
 
+_NEEDS = {'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}
+"""Each old route's requirements beyond its launch's own: CUTLASS on its declared cells alone, Triton off the
+dense products the template's launches cannot run."""
+
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
-    *(_launch_kernel(launch.name, *{'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}.get(launch.name, ()))
-      for launch in _GMMS),
+    *(_launch_kernel(launch.name, *_NEEDS.get(launch.name, ())) for launch in _GMMS),
     selection.Kernel[GroupedCase]('xla', (), generic=True)), declared=DECLARED)
 """The grouped selector, in a fixed order, the template first (owner, bible da64ae5): Mosaic GPU's launch
 where it takes the call, the TPU's launch on a TPU, Triton's where they refuse, else XLA's program, but a
