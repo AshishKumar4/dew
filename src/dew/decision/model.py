@@ -5,36 +5,22 @@ from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from flax import linen as nn
-from flax.typing import Dtype
 
 from dew.batch import Variables, part, thaw
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
-from dew.nn.protocols import (
-    CrossAttending,
-    HiddenStates,
-    LogitsFromHidden,
-    OutputTable,
-    TokenModel,
-    VocabularyRows,
-    head_table,
-)
+from dew.nn.protocols import TokenModel, VocabularyRows
+from dew.nn.scatter import gather_positions
 from dew.nn.visibility import block_ends, block_starts
+from dew.nn.wrapping import HeadedModel
 from dew.objectives.base import joined
 
 
 @dataclass(frozen=True)
-class DecisionModel:
-    """Any backbone with final states (`HiddenStates`), read by a decision head.
-
-    The variables hold the two under `backbone` and `head` in every collection
-    (`dew.objectives.base.joined`). Each is applied as its own module over its
-    part, so a backbone that `Pretrained.adapt` gave LoRA factors runs with its
-    own adapter, with its base weights under `frozen`.
+class DecisionModel(HeadedModel):
+    """Any backbone with final states, read by a decision head (`HeadedModel`).
 
     The rows a window packs reach the backbone as its documents (`Coordinates`).
     In the parallel layout an option attends to no other option's tokens, and the
@@ -42,17 +28,11 @@ class DecisionModel:
     (`attention_pairwise_mask`, `attention_key_positions`).
     """
 
-    backbone: nn.Module
     head: Head
     context_encoder: ContextEncoder = "table"
     """How a row's context becomes the states its cross-attention reads (`encode_context`): `table`, its
     tokens through the backbone's own embedding table, or `backbone`, the backbone's final states over
     it in a pass of its own, as a schema read in context always is."""
-
-    def __post_init__(self):
-        if not isinstance(self.backbone, HiddenStates):
-            raise TypeError(f"a decision head reads its backbone's final states (`HiddenStates`), "
-                            f"which a {type(self.backbone).__name__} does not give")
 
     def initialize_head(self, key: jax.Array, backbone: Variables, tokens: jax.Array) -> Variables:
         """Draw the head over a held backbone, at `tokens`' shape, without running the backbone.
@@ -152,41 +132,6 @@ class DecisionModel:
                                           attention_key_positions=inputs.positions, method="hidden_states",
                                           conditioning=conditioning, rngs=rngs)), spanned
 
-    @property
-    def context_length(self) -> int | None:
-        """The most context tokens a row carries: the backbone's cross-attention's (`CrossAttending`),
-        or None for a backbone that reads no context."""
-        if not isinstance(self.backbone, CrossAttending) or self.backbone.cross_attention is None:
-            return None
-        return self.backbone.cross_attention.context_length
-
-    def table(self, variables: Variables) -> jax.Array | np.ndarray:
-        """Return the backbone's head as `[V, D]` rows (`VocabularyRows`), which a head may read."""
-        if not isinstance(self.backbone, VocabularyRows):
-            raise TypeError(f"the head reads its backbone's vocabulary rows (`VocabularyRows`), which a "
-                            f"{type(self.backbone).__name__} does not give")
-        rows = self.backbone.apply(thaw(part(variables, "backbone")), method="vocabulary_rows")
-        if not isinstance(rows, (jax.Array, np.ndarray)):
-            raise TypeError(f"vocabulary_rows must return an array, got {type(rows).__name__}")
-        return rows
-
-    @staticmethod
-    def head_size(backbone: nn.Module) -> tuple[int, Dtype | None]:
-        """Return the width of `backbone`'s final states, and the dtype a head over them computes in.
-
-        The backbone is traced, not run, so this costs no compute. A backbone that
-        computes in reduced precision has its head compute in it too; over
-        full-precision states a head computes at its parameters' precision.
-        """
-        tokens = jnp.zeros((1, 2), jnp.int32)
-
-        def states(key: jax.Array) -> jax.Array:
-            return backbone.init_with_output(key, tokens, method="hidden_states")[0]
-
-        shape = jax.eval_shape(states, jax.random.key(0))
-        reduced = jnp.finfo(shape.dtype).bits < 32
-        return shape.shape[-1], shape.dtype if reduced else None
-
     def logits(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
                train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
         """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
@@ -196,7 +141,7 @@ class DecisionModel:
             if spanned is not None:
                 raise TypeError("a readout of labels reads its questions in the row, not in its context")
             labels = self.head.tied_labels()
-            tied = None if labels is None else self.label_logits(variables, states, inputs, labels)
+            tied = None if labels is None else self.readout_logits(variables, states, inputs, labels)
             # A head drawn from the vocabulary rows reads no table after its draw.
             table = None if self.head.draws_from_rows else self.output_table(variables)
             logits = _array(self.head.apply(head, states, inputs, table, train=train, tied=tied, rngs=rngs))
@@ -209,34 +154,15 @@ class DecisionModel:
                             self.head.apply(head, states, inputs, table, train, spanned, rngs=rngs))
         return jnp.where(inputs.options, logits, -jnp.inf)
 
-    def output_table(self, variables: Variables) -> OutputTable | None:
-        """The backbone's head as one matrix (`AffineHead`), or None where no matrix alone is it."""
-        return head_table(self.backbone, thaw(part(variables, "backbone")))
-
-    def label_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
-                     labels: tuple[tuple[int, ...], ...]) -> jax.Array:
+    def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
+                       labels: tuple[tuple[int, ...], ...]) -> jax.Array:
         """The backbone's own logits `[B, Q, K, V]` at each label's ids of each question's answer
-        state (`DecisionInputs.readout`): its output table at the labels' columns alone, computed in
-        fp32 (`OutputTable.columns`), where one matrix is its head; else its exact head over the
-        answer states, a few rows (`LogitsFromHidden`), the labels' columns taken. No product is
-        rebuilt from the vocabulary's rows, which carry no bias and no softcap."""
+        state (`DecisionInputs.readout`), its first `K` labels as many as its option slots
+        (`HeadedModel.label_logits`)."""
         if inputs.readout is None:
             raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
-        answers = jnp.take_along_axis(states, inputs.readout[..., None], axis=1)
-        ids = np.asarray(labels, np.int64)
-        width = inputs.options.shape[-1]
-        table = self.output_table(variables)
-        if table is not None:
-            return table.columns(answers, ids.reshape(-1).tolist(), exact=True).reshape(
-                *answers.shape[:2], *ids.shape)[:, :, :width]
-        if not isinstance(self.backbone, LogitsFromHidden):
-            raise TypeError(f"a readout of labels reads its backbone's exact head, which a "
-                            f"{type(self.backbone).__name__} does not give (AffineHead, LogitsFromHidden)")
-        full = jnp.asarray(self.backbone.apply(thaw(part(variables, "backbone")), answers,
-                                               method="logits_from_hidden"))
-        picked = jnp.take(full, jnp.asarray(ids.reshape(-1)), axis=-1)
-        return picked.astype(jnp.promote_types(picked.dtype, jnp.float32)).reshape(
-            *answers.shape[:2], *ids.shape)[:, :, :width]
+        answers = gather_positions(states, inputs.readout)
+        return self.label_logits(variables, answers, labels)[:, :, :inputs.options.shape[-1]]
 
 
 def key_runs(slots: jax.Array, segments: jax.Array, options: int, *, causal: bool = False) -> jax.Array:

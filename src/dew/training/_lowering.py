@@ -56,16 +56,15 @@ class TritonCall:
     stages: int
 
 
-def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
-    """What `read` makes of each custom call a lowered program makes, given its target and its
-    operation, in program order: the calls it makes something of."""
+def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each operation of a lowered program's StableHLO module, in program order: the
+    operations it makes something of."""
     found: list[T] = []
 
     def visit(operation: ir.Operation) -> ir.WalkResult:
-        if operation.name == "stablehlo.custom_call":
-            made = read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
-            if made is not None:
-                found.append(made)
+        made = read(operation)
+        if made is not None:
+            found.append(made)
         return ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir(dialect="stablehlo")
@@ -73,6 +72,23 @@ def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operatio
     with module.context:
         module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
     return found
+
+
+def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each custom call a lowered program makes, given its target and its
+    operation, in program order: the calls it makes something of."""
+    def call(operation: ir.Operation) -> T | None:
+        if operation.name != "stablehlo.custom_call":
+            return None
+        return read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
+
+    return _read(lowered, call)
+
+
+def operations(lowered: jax.stages.Lowered) -> list[str]:
+    """The name of every operation a lowered program's StableHLO module holds, in program order (a
+    collective a `shard_map` body issues among them, `stablehlo.all_gather`)."""
+    return _read(lowered, lambda operation: operation.name)
 
 
 def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:

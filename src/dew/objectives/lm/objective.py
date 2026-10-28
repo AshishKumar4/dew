@@ -508,9 +508,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         if capacity is not None and seq_len > capacity:
             raise ValueError(f"{seq_len}-token rows read past the {capacity} places {type(model).__name__}'s "
                              "positions cover")
-        # A schedule's later stage may read longer rows, up to what the model declares it holds.
+        # A schedule's later stage may read longer rows, up to what the model declares it holds and no
+        # further than its learned positions cover: a cache resized past a learned table
+        # (`with_cache_capacity`) keeps the table's rows.
         declared = model.max_seq_len if isinstance(model, Bounded) else None
-        self.context = seq_len if declared is None else max(seq_len, declared)
+        context = seq_len if declared is None else max(seq_len, declared)
+        self.context = context if capacity is None else min(context, capacity)
         self.use_head(head_chunks, head_tile)
         self.samples = samples
         self.balance = balance
@@ -1305,6 +1308,42 @@ class LMObjective(TokenScorer):
         """The training loss takes a tiled head's gradient in its forward (`token_scores`' `z_loss`),
         outside an indexer's warm-up, which scores no head."""
         return not self._warmup
+
+    def scored_units(self, variables: Variables, batch: Batch,
+                     step: Step) -> tuple[Ratio | RoutedStatistics, jax.Array] | None:
+        """The loss's statistics, scored as `loss` scores them (its mode, its draws, its configured
+        terms), with each token's share of the prediction's total, `[B, seq_len]`: its counted cross
+        entropy and z-loss, the prediction depths' terms at the position that predicts them, and the
+        indexer's KL at its query, each weighted as the total weighs it. The router terms of a routed
+        decoder are statistics of their own. None in an indexer's warm-up, whose KL is no token's
+        prediction: its whole statistics credit every unit."""
+        if self._warmup:
+            return None
+        statistics, _, scores = self._scored_loss(variables, batch, step, train=step.training)
+        width = at_least_fp32(scores.losses.dtype)
+        weights = scores.weights.astype(width)
+        # A target of weight 0 is selected away before its product, as `row_mean` selects it.
+        counted = jnp.where(weights > 0, scores.losses.astype(width), 0) * weights
+        if self.z_loss:
+            counted = counted + self.z_loss * jnp.where(weights > 0, jnp.square(scores.log_z.astype(width)),
+                                                        0) * weights
+        length = counted.shape[1]
+
+        def placed(terms: jax.Array) -> jax.Array:
+            # A term of the leading positions, a depth's or a query's, at the positions that score it.
+            return jnp.pad(terms.astype(width), ((0, 0), (0, length - terms.shape[1])))
+
+        if self.mtp_weight is not None and scores.depths:
+            counted = counted + self.mtp_weight / len(scores.depths) * sum(
+                placed(jnp.where(depth_weights > 0, depth_losses, 0) * depth_weights)
+                for depth_losses, depth_weights, _ in scores.depths)
+        if self.indexer is not None:
+            assert scores.indexer is not None, "an indexer's scores hold its KL"
+            kls = _indexer_kls(scores.indexer)
+            queries = self._query_weights(self._text(batch), width)
+            counted = counted + self.indexer.weight / len(kls) * sum(
+                placed(kl.astype(width) * queries[:, :kl.shape[1]]) for kl in kls)
+        return statistics, counted * self.row_weights(batch, counted.shape[0])[:, None]
 
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | RoutedStatistics, Aux[Variables]]:
         if self._warmup:

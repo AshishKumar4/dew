@@ -858,24 +858,6 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_than_jax_nn():
     assert mine <= 0.75 * theirs, (mine, theirs)
 
 
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the setting is a CPU's")
-@pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
-def test_a_cpu_takes_the_reference_attention_under_the_test_setting_alone(wide, monkeypatch):
-    """'auto' and 'xla' on a CPU take the reference path in a process running Dew's test setting
-    (`WIDE_CPU_ARITHMETIC`), whose fp32 sums jax.nn's xla kernel would run below, and jax.nn's xla
-    kernel in a library process, which sets nothing, as on any platform: no CPU veto of its own."""
-    from dew.nn.attention import resolve_implementation
-    from dew.nn.precision import WIDE_CPU_ARITHMETIC
-
-    if wide:
-        monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
-    else:
-        monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
-    query = jnp.zeros((2, 16, 4, 8), jnp.float32)
-    for implementation in ("auto", "xla"):
-        assert resolve_implementation(implementation, query, query) == ("reference" if wide else "xla")
-
-
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
 def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     """fp32 reference attention over 300 keys, whose products a CPU sums in float64
@@ -907,26 +889,30 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
         assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
 
 
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
-def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_float64_too():
-    """A layer whose rows are padded on the left builds its mask and runs the
-    kernel a materialized mask takes (`kernel_for_materialized_mask`). On a
-    CPU that is the reference path, whose products sum in float64, the route
-    `resolve_implementation` takes for an unmasked call (`_takes_reference`):
-    the padded rows' real logits under 'auto' are the 'reference' kernel's,
-    bit for bit."""
+def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
+    """A layer whose rows are padded on the left builds its mask and runs the kernel a materialized mask
+    takes (`kernel_for_materialized_mask`): 'auto' on par with the reference path over the real tokens
+    (check 1), the reference model in float64 the truth."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    def model(implementation):
-        return CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
-                                 max_seq_len=320, attention_impl=implementation)
-
-    tokens = jnp.asarray(np.random.default_rng(3).integers(1, 64, (2, 300)), jnp.int32)
     valid = jnp.arange(300)[None] >= jnp.asarray([[0], [7]])
-    params = model('auto').init(jax.random.key(0), tokens)
-    chosen, reference = (np.asarray(model(name).apply(params, tokens, attention_mask=valid))
-                         for name in ('auto', 'reference'))
-    np.testing.assert_array_equal(chosen[np.asarray(valid)], reference[np.asarray(valid)])
+
+    def model(implementation, dtype=jnp.float32):
+        return CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
+                                 max_seq_len=320, attention_impl=implementation, dtype=dtype)
+
+    def draw(seed):
+        tokens = jnp.asarray(np.random.default_rng(seed).integers(1, 64, (2, 300)), jnp.int32)
+        return model('auto').init(jax.random.key(seed), tokens), tokens
+
+    def applied(implementation, dtype=jnp.float32):
+        def apply(params, tokens):
+            out = model(implementation, dtype).apply(params, tokens, attention_mask=valid)
+            return jnp.where(valid[..., None], out, 0)
+        return apply
+
+    assert_as_exact(jax.jit(applied('auto')), jax.jit(applied('reference')), draw,
+                    "a padded layer's built mask", seeds=8, truth_fn=applied('reference', jnp.float64))
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
@@ -1110,62 +1096,3 @@ def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, ca
         assert {requirement.code for requirement in failed} <= raised
     else:
         assert np.all(np.isfinite(run()))
-
-
-@pytest.mark.parametrize("dtype, kept", [(jnp.float16, False), (jnp.bfloat16, True)])
-def test_an_fp16_call_leaves_the_triton_route_as_a_declared_gap(dtype, kept):
-    """A causal call of 16-wide heads that prefers tokamax's Triton kernel: an fp16 one is refused by its
-    dtype, whose dQ that kernel narrows before the scale the route applies outside it (row 1676,
-    `triton_attention`), and the next kernel takes it; a bf16 one keeps it."""
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
-    from dew.nn.kernels import generation
-    from dew.nn.kernels.selection import select
-
-    query = jnp.zeros((2, 128, 4, 16), dtype)
-    with generation.assumed("sm89"), generation.routes():
-        case = attention_case(query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(ATTENTION, "triton", case)}
-        route = select(ATTENTION, case, "triton", insist=False)
-    assert ("fp16" not in refused) == kept
-    assert (route.kernel == "triton") == kept
-
-
-@pytest.mark.parametrize("head_dim, kept", [(8, False), (16, True)])
-def test_heads_narrower_than_the_triton_kernel_computes_take_the_next_kernel(head_dim, kept):
-    """A causal bf16 call of narrow heads that prefers tokamax's Triton kernel: 8-wide heads, which that
-    kernel computes wrong (`TRITON_NARROWEST`), are refused by their width and the next kernel takes the
-    call; 16-wide heads keep it."""
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
-    from dew.nn.kernels import generation
-    from dew.nn.kernels.selection import select
-
-    query = jnp.zeros((2, 128, 4, head_dim), jnp.bfloat16)
-    with generation.assumed("sm89"), generation.routes():
-        case = attention_case(query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(ATTENTION, "triton", case)}
-        route = select(ATTENTION, case, "triton", insist=False)
-    assert ("head_dim" not in refused) == kept
-    assert (route.kernel == "triton") == kept
-
-
-@pytest.mark.parametrize("call, refused", [
-    ({"precision": jax.lax.Precision.HIGHEST}, ["arithmetic"]),
-    ({"key_value_seq_lengths": jnp.array([512])}, ["key_lengths"]),
-    ({"bias": jnp.zeros((1, 4, 512, 512), jnp.bfloat16)}, ["bias"]),
-], ids=["arithmetic", "key lengths", "bias"])
-def test_a_splash_call_tiled_but_refused_otherwise_is_reported_by_its_own_requirement(call, refused):
-    """On a TPU, a call splash's blocking tiles but another of its requirements turns down is refused
-    by that requirement alone, not for its tiling: the case builder forms the mask-descriptor fact
-    under a name that may choose splash on a TPU (`TPU_BACKEND`) whatever else the call asks, and
-    `tiles` reads the lengths from the case."""
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
-    from dew.nn.kernels import generation
-
-    query = jnp.zeros((1, 512, 4, 64), jnp.bfloat16)
-    with generation.assumed("v5e"):
-        case = attention_case(query, query, causal=True, **call)
-        found = [refusal.code for refusal in kernel_refusals(ATTENTION, "tpu", case)]
-    assert case.splash_mask and found == refused

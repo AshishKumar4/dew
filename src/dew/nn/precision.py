@@ -358,6 +358,23 @@ L2NORM_EPS = 1e-6
 """The epsilon `l2norm` adds under its square root: FLA's, and Dory's `justnorm`'s."""
 
 
+def span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
+    """The mean of `values` `[B, L, D]` over each `[..., 2]` (start, end) span of its row.
+
+    `spans` is `[B, ...]`; an empty span, a padding slot's, gives zeros. A token no span of its row
+    reads is selected away before the product, so padding's NaN or infinity never reaches a mean (the
+    rule of `weighted_total`), and the sum is the product's `accumulated` one.
+    """
+    positions = jnp.arange(values.shape[1])
+    inside = (positions >= spans[..., :1]) & (positions < spans[..., 1:])
+    counts = jnp.maximum(jnp.sum(inside, axis=-1, keepdims=True), 1)
+    flat = inside.reshape(inside.shape[0], -1, inside.shape[-1])
+    read = jnp.where(jnp.any(flat, axis=1)[..., None], values, 0)
+    summed = accumulated(functools.partial(jnp.einsum, "bnl,bld->bnd"), flat.astype(values.dtype), read)
+    summed = summed.reshape(*inside.shape[:-1], values.shape[-1])
+    return summed / counts.astype(values.dtype)
+
+
 def l2norm(x: jax.Array, eps: float = L2NORM_EPS) -> jax.Array:
     """`x` over its L2 length along the last axis, `x * rsqrt(sum(x**2) + eps)` with `eps` added under
     the root, computed in at least fp32 (`at_least_fp32`, a float64 input's in float64) and rounded
