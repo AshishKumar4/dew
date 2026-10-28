@@ -8,6 +8,7 @@ import functools
 import os
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import fla_gdn_support as support
 import jax
@@ -19,7 +20,7 @@ from generation_support import COMPILES_FOR_TPU, generations, lowers
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
-from dew.nn.kernels.templates import bundles
+from dew.nn.kernels.templates import bundles, resources
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
@@ -256,8 +257,8 @@ def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = F
             ba = launch.bind(*args, **options)
             if not launch.eligible(ba, target):
                 continue
-            config = launch.derived(ba, target)
-            configs = {f"{name} {config}": config}
+            config, refused = _derived_and_refused(launch, ba, target)
+            configs = {f"{name} {config}": config, **{f"{name} refused {tile}": tile for tile in refused}}
             if every_consumer_count:
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
@@ -269,11 +270,45 @@ def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = F
                                                cluster=config.cluster if consumers > 1 else 1)
                     if launch.legal(ba, tile, target):
                         configs[f"{name} x{consumers} {tile}"] = tile
+            kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
             for label, config in configs.items():
-                configured = functools.partial(launch.replace(config=config), **options)
+                configured = (functools.partial(launch.replace(config=config), **options)
+                              if launch.legal(ba, config, target) else
+                              # A tile the launch refuses runs its kernel unpinned (`KernelOp.pinnable`).
+                              lambda *arrays, config=config, options=options, launch=launch:
+                              launch._fwd(*arrays, **options, config=config)[0])
+                bundle = mosaic_gpu.family_of(config, jnp.bfloat16)
+                producer = bundle.warpgroups(config.warpgroups) > config.warpgroups
+                model = {"registers": launch.registers(ba, config), "budget": launch.register_budget(config),
+                         "consumers": config.warpgroups, "most": bundle.programs(config.warpgroups),
+                         "producer": resources.PRODUCER_REGISTERS if producer else 0}
                 cases.append(support.KernelCase(label,
-                                                lambda configured=configured, args=args: (configured, args)))
+                                                lambda configured=configured, args=args: (configured, args),
+                                                {kernel: model}))
     return cases
+
+
+def _derived_and_refused(launch, ba, target) -> tuple:
+    """A launch's derived tile, and the tiles its derivation asked about and its model refused for their
+    registers alone (`Template._held`: legal with every register held, not legal as they are), whose need
+    the gate checks refuses them too: a model over the need throws tiles away (`kernel_compile.decisions`).
+    Each is the largest such of its rows and columns, the one a derivation would take had it held."""
+    legal, asked = type(launch).legal, []
+
+    def recorded(self, ba, tile, target):
+        asked.append(tile)
+        return legal(self, ba, tile, target)
+
+    with mock.patch.object(type(launch), "legal", recorded):
+        config = launch.derived(ba, target)
+    with mock.patch.object(type(launch), "_held", lambda *_: True):
+        fitting = [tile for tile in dict.fromkeys(asked) if launch.legal(ba, tile, target)]
+    refused: dict = {}
+    for tile in fitting:
+        if not launch.legal(ba, tile, target):
+            shape = (tile.block_m, tile.block_n, tile.block_k, tile.warpgroups)
+            refused[shape] = max(refused.get(shape, tile), tile, key=lambda each: each.stages)
+    return config, list(refused.values())
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
@@ -294,7 +329,7 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     if family is not None and family.counts_hooks:
         # Hooked and exactly summed calls run where the bundle's register model counts what they hold.
         forms |= {"kernel gradient exact fp32", "normed biased forward", "normed kernel gradient"}
-    assert {case.name.split(" Tiles(")[0] for case in cases} == forms
+    assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
     found = compile_mosaic_kernels(cases, generation_name)
     # A spill is the register estimate's defect: the tile was derived to hold them.
     failed = mosaic_failures(found)
