@@ -1066,7 +1066,8 @@ class _Rate(optax.schedules.StatefulSchedule):
                  **extra_args) -> jax.typing.ArrayLike:
         del extra_args
         if isinstance(state, ProgressState):
-            assert progress is not None, "a schedule on a run's progress is handed it at each update"
+            # Optax reads the rate once as it builds its state, where the run has consumed nothing.
+            progress = jnp.zeros([], jnp.float32) if progress is None else progress
             at, marks = jnp.asarray(progress), self._marked(state, progress)
             if not self.rate.rates():
                 return state.rates[CONSTANT] * self.rate.progressed({}, at, state.updates, marks)

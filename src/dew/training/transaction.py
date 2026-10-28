@@ -352,7 +352,7 @@ class Transaction:
         """
         self.fetch = fetch
         self.record = record
-        self.examples = examples
+        self.bound = examples
         self.objective = objective
         self.optimizer = optimizer
         self.copies = copies or {}
@@ -528,8 +528,8 @@ class Transaction:
     def progress(self, current: TrainState) -> jax.Array:
         """The share of the run's bound in examples `current` has consumed, float32: what its dispatched
         batches consumed before this update (`TrainState.consumed`)."""
-        assert self.examples is not None and current.consumed is not None, "a clocked run counts examples"
-        return jnp.asarray(current.consumed, jnp.float32) / self.examples
+        assert self.bound is not None and current.consumed is not None, "a clocked run counts examples"
+        return jnp.asarray(current.consumed, jnp.float32) / self.bound
 
     def commit(self, current, gradient, effects, qk):
         """Apply the pooled native gradient and return its finiteness and global norm.
@@ -550,7 +550,7 @@ class Transaction:
             # (`Objective.projected`), and the step stores them projected again.
             stored = self.objective.projected(current.variables["params"], updated=False)
             if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
-                clocked = {} if self.examples is None else {"progress": self.progress(current)}
+                clocked = {} if self.bound is None else {"progress": self.progress(current)}
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk,
                                                           **clocked)
             else:

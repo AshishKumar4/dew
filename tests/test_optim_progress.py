@@ -33,12 +33,17 @@ def progressed(schedule, steps: int = STEPS) -> tuple[np.ndarray, int]:
 
 
 def stepped(schedule, steps: int = STEPS) -> tuple[np.ndarray, int]:
-    """`schedule`'s rate at each update of a run of `steps` updates, in float64, and its chain of
-    roundings (`chain_roundings`)."""
+    """`schedule`'s rate at each update of a run of `steps` updates, read as a run counted in steps reads
+    it (`_Rate`, `RateState`), in float64, and its chain of roundings (`chain_roundings`)."""
     with jax.enable_x64(new_val=True):
-        built = schedule.schedule(steps)
-        values = np.asarray([float(built(update)) for update in range(steps)])
-        return values, chain_roundings(jax.make_jaxpr(built)(0))
+        rate = _Rate(schedule, steps, np.float64)
+        state = rate.init()
+        roundings = chain_roundings(jax.make_jaxpr(rate)(state))
+        values = []
+        for _ in range(steps):
+            values.append(float(rate(state)))
+            state = rate.update(state)
+        return np.asarray(values), roundings
 
 
 @pytest.mark.parametrize("schedule", [
