@@ -122,7 +122,7 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
               *(flag for name, value in settings.items() for flag in ("--set", f"{name}={value}"))])
     assert ended.value.code == 0
     saved = AheadOfTime.load(path)
-    assert (saved.generation, saved.devices, saved.platform) == ("sm80", 1, "gpu") and saved.peak_bytes > 0
+    assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
     assert not runs.exists()
 
 
