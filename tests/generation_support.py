@@ -13,8 +13,11 @@ import importlib.util
 
 import jax
 import pytest
+from flax.linen.dtypes import canonicalize_dtype
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates.gemm import template
+from dew.nn.precision import float32_products
 
 INTERPRETS = pytest.mark.skipif(jax.default_backend() != "cpu",
                                 reason="interprets the Mosaic GPU kernels, which a CPU process alone does")
@@ -64,3 +67,12 @@ process cannot: a GPU host's process has no TPU toolchain."""
 def generations(*names: str) -> list:
     """`names` as parameters, each marked `runs`, for a test parametrized over assumed generations."""
     return [pytest.param(name, marks=runs(name)) for name in names]
+
+
+def interpreted_projection(x, kernel, group_sizes, dtype, precision=None):
+    """`moe.expert_projection` on the GEMM template's kernels, which a CPU process interprets as the GPU
+    `generation.assumed` names (the template's explicit interpreter, `interpret_on_cpu`; product code
+    never asks for it): the projection's law, its launches each selected as on that GPU."""
+    compute = canonicalize_dtype(x, kernel, dtype=dtype)
+    return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute,
+                         precision=float32_products(compute, precision), interpret_on_cpu=True)
