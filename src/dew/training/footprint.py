@@ -49,12 +49,11 @@ class Footprint:
         """The temporaries the derivation names: the residuals and the gradient."""
         return self.residuals + self.gradients
 
-    def fits(self, free: int) -> bool:
-        """Whether a device with `free` bytes in one block holds the derived terms."""
-        return free - self.held - self.temporaries >= 0
-
     def record(self) -> dict[str, JSON]:
-        return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held}
+        """The terms traced so far, not an admission decision: workspace and scheduled liveness are
+        not known from the pullback alone. XLA's fit check remains authoritative."""
+        return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held,
+                "workspace": None, "admission": "unknown"}
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence) -> int:
@@ -70,11 +69,22 @@ def residual_bytes(loss: Callable, params, arguments: Sequence) -> int:
     closed, shapes = jax.make_jaxpr(pullback, return_shape=True)(params, *arguments)
     program = closed.jaxpr
     seen = {*program.invars, *program.constvars}
+    # Flattening an operand for a dot is still retained input storage. Only a shape-only reshape
+    # carries this provenance: a transpose, slice or other operation can need separate storage.
+    aliases = {}
+    for equation in program.eqns:
+        if equation.primitive.name == "reshape" and equation.params.get("dimensions") is None:
+            source = equation.invars[0]
+            if not isinstance(source, jcore.Literal):
+                aliases[equation.outvars[0]] = aliases.get(source, source)
     total = 0
     for value, shape in zip(program.outvars, jax.tree.leaves(shapes), strict=True):
-        if isinstance(value, jcore.Literal) or value in seen:
+        if isinstance(value, jcore.Literal):
             continue
-        seen.add(value)
+        storage = aliases.get(value, value)
+        if storage in seen:
+            continue
+        seen.add(storage)
         aval = value.aval
         if not isinstance(aval, ShapedArray):
             raise TypeError(f"a pullback keeps {aval}, which is no array")
