@@ -27,7 +27,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
-from dew.nn.kernels.templates import mosaic, report
+from dew.nn.kernels.templates import mosaic, report, resources
 from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
@@ -237,11 +237,21 @@ OCCUPANCY = re.compile(r"\.minnctapersm[^\n]*\n")
 RAISE = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 \d+;")
 
 
-def _ptxas(ptx: str, generation: str, *, cap: int, raised: int | None = None) -> tuple[int, int, bool]:
-    """ptxas's registers a thread and spilled bytes for the kernel `ptx` on the CUDA `generation`, its entry
-    capped at `cap` registers (`.maxnreg`, its occupancy hint dropped) and, where its consumers raise their
-    registers (`setmaxnreg.inc`), that raise rewritten to `raised`; and whether ptxas took it."""
-    capped = OCCUPANCY.sub("", ENTRY.sub(lambda entry: f"{entry.group(1)}.maxnreg {cap}\n", ptx, count=1))
+RELOCATABLE = not resources.RAISES_HONORED
+"""Whether the GPU compiles a Mosaic GPU kernel's PTX relocatably, as jaxlib's Mosaic GPU does through
+nvJitLink, where ptxas ignores a warpgroup's register raise (`resources.RAISES_HONORED`). The gate compiles
+the PTX as the GPU does: a container without nvJitLink compiles Mosaic's whole-program, honoring raises the
+GPU ignores."""
+
+
+def _ptxas(ptx: str, generation: str, *, cap: int | None, raised: int | None = None,
+           relocatable: bool = RELOCATABLE) -> tuple[int, int, bool]:
+    """ptxas's registers a thread and spilled bytes for the kernel `ptx` on the CUDA `generation` compiled
+    relocatably or whole-program (`relocatable`: the GPU's, `RELOCATABLE`), its entry capped at `cap`
+    registers (`.maxnreg`, its occupancy hint dropped; None: as Mosaic emitted it) and, where its consumers
+    raise their registers (`setmaxnreg.inc`), that raise rewritten to `raised`; and whether ptxas took it."""
+    capped = ptx if cap is None else OCCUPANCY.sub(
+        "", ENTRY.sub(lambda entry: f"{entry.group(1)}.maxnreg {cap}\n", ptx, count=1))
     if raised is not None:
         capped = RAISE.sub(f"setmaxnreg.inc.sync.aligned.u32 {raised};", capped)
     major, minor = capability(generation) or (0, 0)
@@ -249,7 +259,8 @@ def _ptxas(ptx: str, generation: str, *, cap: int, raised: int | None = None) ->
     with tempfile.NamedTemporaryFile("w", suffix=".ptx") as source:
         source.write(capped)
         source.flush()
-        ran = subprocess.run([str(PTXAS), f"-arch={arch}", "-v", source.name, "-o", os.devnull],
+        relocating = ("--compile-only",) if relocatable else ()
+        ran = subprocess.run([str(PTXAS), f"-arch={arch}", "-v", *relocating, source.name, "-o", os.devnull],
                              capture_output=True, text=True, check=False)
     text = ran.stdout + ran.stderr
     used = [int(count) for count in report.REGISTERS.findall(text)]
@@ -257,20 +268,28 @@ def _ptxas(ptx: str, generation: str, *, cap: int, raised: int | None = None) ->
     return max(used, default=0), max(spilled, default=0), ran.returncode == 0
 
 
-def register_need(ptx: str, generation: str) -> int | None:
+def _assembled(ptx: str, generation: str, cap: int, honored: bool) -> tuple[int, int, bool]:
+    """`_ptxas` at `cap`: a raise's where the kernel `ptx` raises its consumers' registers and the compile
+    takes it (`honored`), its entry's in a relocatable compile otherwise."""
+    if honored and RAISE.search(ptx):
+        return _ptxas(ptx, generation, cap=255, raised=cap, relocatable=False)
+    return _ptxas(ptx, generation, cap=cap, relocatable=not honored)
+
+
+def register_need(ptx: str, generation: str, honored: bool = resources.RAISES_HONORED) -> int | None:
     """The registers a thread of the kernel `ptx` needs without spilling, by ptxas itself, in the allocator's
     steps of 8: the least cap at which it spills nothing (ptxas's own count fills whatever a cap leaves it,
     201 or 255 at one tile by the output's width, GEMMMODEL2), or, for one whose consumer warpgroups raise
-    their registers (warpgroup MMA's `setmaxnreg`), the least raise at which it spills nothing, or its use
+    their registers (warpgroup MMA's `setmaxnreg`) where the compile takes the raise (`honored`), the
+    least raise at which it spills nothing, or its use
     there where ptxas compiles past a raise below it. A cap holds only if its actual use fits too:
     C7507 can ignore a small raise entirely. Scan in order, since ptxas's spill decisions are not
     monotone even once ignored raises are excluded. None where nothing holds it."""
-    raising = bool(RAISE.search(ptx))
+    raising = honored and bool(RAISE.search(ptx))
     steps = [*range(64, 256, 8), *(() if raising else (255,))]
 
     def holds(step: int) -> bool:
-        used, spilled, took = (_ptxas(ptx, generation, cap=255, raised=step) if raising
-                               else _ptxas(ptx, generation, cap=step))
+        used, spilled, took = _assembled(ptx, generation, step, honored)
         return took and not spilled and used <= step
 
     # ptxas may ignore a too-small setmaxnreg, and allocation/spill heuristics
@@ -278,17 +297,18 @@ def register_need(ptx: str, generation: str) -> int | None:
     least = next((step for step in steps if holds(step)), None)
     if least is None or not raising:
         return least
-    return max(least, _ptxas(ptx, generation, cap=255, raised=least)[0])
+    return max(least, _assembled(ptx, generation, least, honored)[0])
 
 
-def register_decisions(ptx: str, generation: str, model: dict) -> dict:
+def register_decisions(ptx: str, generation: str, model: dict,
+                       honored: bool = resources.RAISES_HONORED) -> dict:
     """Direct assembly evidence at the launch budget and each possible residency's register cap.
 
     Neither spills nor actual use are monotone in a requested cap: ptxas can ignore a small raise
     (C7507), or spill at a larger cap after fitting at a smaller one. A least spill-free cap therefore
     cannot decide whether the actual launch holds, or how many copies fit a multiprocessor.
     """
-    raising = bool(RAISE.search(ptx))
+    raising = honored and bool(RAISE.search(ptx))
     budget = model["budget"]
     limit = 256 if raising else 255
     step = model.get("register_step", mosaic.Family.register_step)
@@ -299,8 +319,7 @@ def register_decisions(ptx: str, generation: str, model: dict) -> dict:
         if cap <= 0:
             return False
         if cap not in checked:
-            used, spilled, took = (_ptxas(ptx, generation, cap=255, raised=cap) if raising
-                                   else _ptxas(ptx, generation, cap=cap))
+            used, spilled, took = _assembled(ptx, generation, cap, honored)
             checked[cap] = {"cap": cap, "registers": used, "spilled": spilled, "compiled": took,
                             "holds": took and not spilled and used <= cap}
         return checked[cap]["holds"]
@@ -310,10 +329,7 @@ def register_decisions(ptx: str, generation: str, model: dict) -> dict:
     programs = 0
     refusal_programs = 0
     for count in range(model["most"], 0, -1):
-        # Each block's producer keeps its own registers; the remaining words are shared by
-        # its consumers in the family's allocation steps.
-        cap = min(budget, ((REGISTER_FILE // (128 * count) - model["producer"])
-                          // model["consumers"] // step * step))
+        cap = min(budget, _residency_cap(model, count, step, honored))
         if admitted and not programs and holds(cap):
             programs = count
         if refusal_holds and not refusal_programs and holds(cap - step):
@@ -321,6 +337,18 @@ def register_decisions(ptx: str, generation: str, model: dict) -> dict:
     return {"admitted": admitted, "programs": programs, "budget": budget,
             "refusal_holds": refusal_holds, "refusal_programs": refusal_programs,
             "caps": list(checked.values())}
+
+
+def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
+    """Each kernel's registers a thread and spilled bytes as the GPU compiles the PTX Mosaic dumped into
+    `directory` (`_ptxas` at its own entry), by the kernel's name less Mosaic's counter: Mosaic's own
+    report is its compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
+    found = {}
+    for path in Path(directory).glob("*.ptx"):
+        registers, spilled, _ = _ptxas(path.read_text(), generation, cap=None)
+        found[report.KERNEL_COUNTER.sub("", path.name.removesuffix(".ptx"))] = {
+            "registers": registers, "spilled": spilled, "ptxas": "the GPU's compile of its PTX"}
+    return found
 
 
 def _needs(directory: str, generation: str, models: dict | None = None) -> dict[str, int | dict | None]:
@@ -348,7 +376,9 @@ def _compiled_here(cases, generation: str) -> list[dict]:
               report.reported(directory, ptx=True)):
             _compiled(case, generation, record)
             needs = _needs(directory, generation, record["models"])
-            record["kernels"] = [needed(inherited(kernel), needs) for kernel in mosaic_kernels(directory)]
+            compiled = _compiled_reports(directory, generation)
+            record["kernels"] = [needed(inherited({**kernel, **compiled.get(kernel["kernel"], {})}), needs)
+                                 for kernel in mosaic_kernels(directory)]
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
     return found
@@ -358,7 +388,25 @@ REGISTER_FILE = 64 * 1024
 """A multiprocessor's 32-bit registers (every CUDA generation the templates claim)."""
 
 
-def decisions(registers: int | dict | None, model: dict) -> tuple[bool, int]:
+def _program_registers(model: dict, registers: int, honored: bool) -> int:
+    """A program's registers where each consumer thread holds `registers`: its consumers' and its
+    producer's (`model['producer']`, none without one), which holds its own lowered registers where the
+    compile honors raises and a consumer's where it ignores them (every warpgroup at its entry's)."""
+    producer = model["producer"] if honored or not model["producer"] else registers
+    return (model["consumers"] * registers + producer) * 128
+
+
+def _residency_cap(model: dict, count: int, step: int, honored: bool) -> int:
+    """The most registers a consumer thread holds with `count` programs a multiprocessor
+    (`_program_registers` within its register file), in the family's allocation steps."""
+    share = REGISTER_FILE // (128 * count)
+    if honored or not model["producer"]:
+        return (share - model["producer"]) // model["consumers"] // step * step
+    return share // (model["consumers"] + 1) // step * step
+
+
+def decisions(registers: int | dict | None, model: dict,
+              honored: bool = resources.RAISES_HONORED) -> tuple[bool, int]:
     """What a launch decides from a consumer thread's `registers`: whether they fit its budget (admitted, or
     refused for a smaller tile), and the programs a multiprocessor runs by registers, the family's most at
     most, each program's consumers at `registers` in the allocator's steps of 8 beside its producer's.
@@ -367,7 +415,7 @@ def decisions(registers: int | dict | None, model: dict) -> tuple[bool, int]:
         if registers["budget"] != model["budget"]:
             raise ValueError("register evidence belongs to another launch budget")
         if "registers" in model:
-            predicted = decisions(model["registers"], model)
+            predicted = decisions(model["registers"], model, honored)
             if not predicted[0]:
                 return ((True, registers["refusal_programs"]) if registers["refusal_holds"]
                         else predicted)
@@ -381,8 +429,8 @@ def decisions(registers: int | dict | None, model: dict) -> tuple[bool, int]:
     if registers is None or registers > model["budget"]:
         return False, 0
     step = model.get("register_step", mosaic.Family.register_step)
-    program = (model["consumers"] * -(-registers // step) * step + model["producer"]) * 128
-    return True, min(model["most"], REGISTER_FILE // program)
+    return True, min(model["most"], REGISTER_FILE // _program_registers(model, -(-registers // step) * step,
+                                                                       honored))
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:

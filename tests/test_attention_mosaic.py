@@ -59,13 +59,12 @@ output gate, and all at once; each `(score hooks, gate)`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
               "bfloat16-natural": (jnp.bfloat16, True), "float16-natural": (jnp.float16, True)}
 """The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
-BACKWARD_FORMS = {"default": (False, attention_mosaic.BackwardTiles(64, 64, 2, 2)),
+BACKWARD_FORMS = {"default": (False, attention_mosaic.BackwardTiles(64, 64, 2, 1)),
                   "fused": (False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)),
                   "accurate": (True, attention_mosaic.BackwardTiles(64, 64, 2, 1))}
-"""The backward's forms and schedules, `(accurate, config)`: the fast form in two launches of two consumers
-and in one of one consumer (the dK/dV program adding dQ, its derived default: two consumers' staged
-cotangents and queries pass an H100's shared memory at a width of 128), and the accurate form, one consumer's
-(its keyed sums beside dQ's hold a consumer's registers, `MosaicBackward.register_budget`)."""
+"""The backward's forms and schedules, `(accurate, config)`: the fast form in two launches and in one (the
+dK/dV program adding dQ), and the accurate form, each one consumer's: two consumers beside a producer hold
+168 registers a thread, which no 64 x 64 backward's live set fits (`MosaicBackward.register_budget`)."""
 FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
@@ -598,13 +597,13 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("tiles", [attention_mosaic.Tiles(64, 128, 2, 2),
+@pytest.mark.parametrize("tiles", [attention_mosaic.Tiles(64, 128, 2, 1),
                                    attention_mosaic.Tiles(64, 192, 2, 1)], ids=["128-keys", "192-keys"])
 def test_a_guarded_launch_walks_its_own_key_tiles(tiles):
     """A spans call (four documents over 256 keys, their ids from 1: 0 is padding) whose weighted values
-    pass fp32's largest, at forward tiles whose consumers' registers hold the guarded launch's live set
-    over a narrower key tile (`guarded_tiles`), 128 keys halved, 192 keys cut to a whole tile of the
-    family's rows that divides it: the guarded launch runs on tiles its program takes, reads each block's
+    pass fp32's largest, at a launch of 128-key tiles whose guarded walk takes its own key tiles
+    (`guarded_tiles`), and at 192 keys cut to a whole tile of the family's rows that divides it: the
+    guarded launch runs on tiles its program takes, reads each block's
     keys from its own block map, not the plain launch's, and every row's output is on par with jax's own
     attention, which normalizes its weights before their product (bf16 values near their largest, equal
     logits)."""
@@ -726,9 +725,9 @@ def test_the_backward_is_on_par_interpreted(call, form):
 
 @INTERPRETS
 def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
-    """A causal call of 64 queries over 256 keys, whose last key tiles no query sees: the fast form's two
-    consumers each take a key block, one wholly past the queries' diagonal, and walk no query tile, the
-    producer loading none for them."""
+    """A causal call of 64 queries over 256 keys, whose last key tiles no query sees: the fast form's
+    programs each take a key block, the last ones wholly past the queries' diagonal, and walk no query tile,
+    the producer loading none for them."""
     for form in ("default", "fused"):
         _check_backward("causal", (1, 64, 2, 1), form=form, interpret=True, keys=256)
 

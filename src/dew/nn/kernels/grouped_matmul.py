@@ -47,7 +47,7 @@ from jax.extend import core as jax_core
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic, resources
+from .templates import base, bundles, cost, mosaic, resources, tail as tail_of
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import Product
 
@@ -91,7 +91,8 @@ class Hooks:
     the epilogue's outputs where it returns several, and the dtypes a kernel traces each hook at (its tile's
     then each side tile's: `prologue_dtypes`, `epilogue_dtypes`). The side operands themselves are the
     launch's `prologue_operands` and `epilogue_operands`. A launch's picks key each hook by what it
-    computes (`_GroupedLaunch.traced`), never by the function object."""
+    computes (`_GroupedLaunch.traced`), never by the function object. A `paired` product's epilogue takes its
+    two accumulators before its side tiles (`templates.gemm.template.gemm`'s `paired`)."""
     prologue: object = None
     prologue_axes: tuple = ()
     epilogue: object = None
@@ -101,6 +102,12 @@ class Hooks:
     epilogue_broadcast: tuple = ()
     prologue_dtypes: tuple = ()
     epilogue_dtypes: tuple = ()
+    paired: bool = False
+
+    @property
+    def accumulators(self) -> int:
+        """The accumulator tiles the epilogue takes before its side tiles."""
+        return 2 if self.paired else 1
 
     def before(self):
         """The prologue as a kernel traces it: on the squeezed side tiles."""
@@ -108,24 +115,27 @@ class Hooks:
 
     def after(self):
         """The epilogue as a kernel traces it: on the squeezed side tiles."""
-        return _unsqueezing(self.epilogue, self.epilogue_broadcast)
+        return _unsqueezing(self.epilogue, self.epilogue_broadcast, self.accumulators)
 
     def kernel_options(self) -> dict:
         return {'prologue': self.before(), 'prologue_axes': self.prologue_axes, 'epilogue': self.after(),
                 'epilogue_axes': self.epilogue_axes, 'out_dtypes': self.out_dtypes}
 
 
-def _unsqueezing(hook, positions: tuple):
-    """`hook` given its side tiles' dimensions of one back at `positions` (one tuple per side operand)."""
+def _unsqueezing(hook, positions: tuple, tiles: int = 1):
+    """`hook` given its side tiles' dimensions of one back at `positions` (one tuple per side operand), its
+    first `tiles` arguments the launch's tiles."""
     if hook is None or not any(positions):
         return hook
-    return functools.partial(_unsqueezed, hook, positions)
+    return functools.partial(_unsqueezed, hook, positions, tiles)
 
 
-def _unsqueezed(hook, positions: tuple, tile, *sides):
-    """`hook` on `tile` and its side tiles with their dimensions of one back at `positions`."""
-    return hook(tile, *(jnp.expand_dims(side, where) if where else side
-                        for side, where in zip(sides, positions, strict=True)))
+def _unsqueezed(hook, positions: tuple, tiles: int, *arguments):
+    """`hook` on its first `tiles` arguments and the side tiles after them with their dimensions of one
+    back at `positions`."""
+    sides = arguments[tiles:]
+    return hook(*arguments[:tiles], *(jnp.expand_dims(side, where) if where else side
+                                      for side, where in zip(sides, positions, strict=True)))
 
 
 NO_HOOKS = Hooks()
@@ -146,14 +156,26 @@ def _equations(jaxpr):
         yield from _equations(inner)
 
 
-def _lowers(hook, tile, sides, rules) -> bool:
-    """Whether a Pallas lowering's `rules` hold a rule for every primitive of `hook` on `tile` and its
+def _priced(hooks: Hooks) -> bool:
+    """Whether the Mosaic launches' register model prices `hooks`, so a derivation decides their tiles as the
+    GPU's compile does (the compile gate holds it to that): no prologue, an epilogue whose side operands are
+    vectors (a bias's, a column or row scale's: `Family.column_registers`), one output (a paired product's
+    epilogue's one). A prologue's rewrite (its nonlinear primitives' lowering workspace, the allocation
+    cliff between stages), an epilogue's side tile and a second output the model does not yet price, off
+    by 16 to 48 registers either way at the GPU's compile (FS-K01 model2, CAUSE-HOOK, CAUSE-SSA, K01-2):
+    such a call takes another launch until its row prices it."""
+    return (hooks.prologue is None and len(hooks.out_dtypes or ()) <= 1
+            and all(len(axes) == 1 for axes in hooks.epilogue_axes))
+
+
+def _lowers(hook, tiles: tuple, sides, rules) -> bool:
+    """Whether a Pallas lowering's `rules` hold a rule for every primitive of `hook` on its `tiles` and its
     side tiles: Mosaic GPU's, at warpgroup semantics, have none for a transpose, which Triton's lowering
     takes."""
     if hook is None:
         return True
     return all(equation.primitive in rules
-               for equation in _equations(jax.make_jaxpr(hook)(tile, *sides).jaxpr))
+               for equation in _equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
 
 
 def _hooks_lower(ba, dtype, rules) -> bool:
@@ -165,9 +187,9 @@ def _hooks_lower(ba, dtype, rules) -> bool:
         return [jax.ShapeDtypeStruct((128,) * len(axes), side.dtype)
                 for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)]
 
-    return (_lowers(hooks.before(), jax.ShapeDtypeStruct((128, 128), dtype),
+    return (_lowers(hooks.before(), (jax.ShapeDtypeStruct((128, 128), dtype),),
                     tiles('prologue_operands', hooks.prologue_axes), rules)
-            and _lowers(hooks.after(), jax.ShapeDtypeStruct((128, 128), jnp.float32),
+            and _lowers(hooks.after(), (jax.ShapeDtypeStruct((128, 128), jnp.float32),) * hooks.accumulators,
                         tiles('epilogue_operands', hooks.epilogue_axes), rules))
 
 
@@ -232,18 +254,19 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
         if not isinstance(value, Hooks):
             return value if isinstance(value, str) else None
 
-        def program(hook, axes_of: tuple, dtypes: tuple) -> str | None:
+        def program(hook, axes_of: tuple, dtypes: tuple, tiles: int = 1) -> str | None:
             if hook is None:
                 return None
             tile, *sides = dtypes
-            return tuning.program(hook, jax.ShapeDtypeStruct((TRACED_TILE, TRACED_TILE), tile),
+            return tuning.program(hook, *(jax.ShapeDtypeStruct((TRACED_TILE, TRACED_TILE), tile),) * tiles,
                                   *(jax.ShapeDtypeStruct((TRACED_TILE,) * len(axes), dtype)
                                     for axes, dtype in zip(axes_of, sides, strict=True)))
 
         return "hooks:" + repr((program(value.before(), value.prologue_axes, value.prologue_dtypes),
-                                program(value.after(), value.epilogue_axes, value.epilogue_dtypes),
+                                program(value.after(), value.epilogue_axes, value.epilogue_dtypes,
+                                        value.accumulators),
                                 value.prologue_axes, value.epilogue_axes, value.out_dtypes,
-                                value.prologue_broadcast, value.epilogue_broadcast))
+                                value.prologue_broadcast, value.epilogue_broadcast, value.paired))
 
     def keyed(self, ba):
         """`tuning.KernelOp.keyed`, each side operand's dimension that follows the rows bucketed with the
@@ -279,8 +302,10 @@ class _Triton(_GroupedLaunch[Tile]):
 
     def eligible(self, ba, target) -> bool:
         # Every CUDA GPU the template sends the kernels to (`templates.gemm.template`), and
-        # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU.
-        return generation.capability(target.generation) is not None and self.derived(ba, target) is not None
+        # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU;
+        # a paired product's second matrix is Mosaic GPU's alone.
+        return (generation.capability(target.generation) is not None and ba.arguments.get('paired') is None
+                and self.derived(ba, target) is not None)
 
     def derived(self, ba, target) -> Tile | None:
         """The one tile the launch runs on `target`, from facts (the ranked set and its cost model deleted,
@@ -438,9 +463,11 @@ class Gmm(_Triton):
 
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
+             *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS,
+             exact_sums: bool = False,
              dense: bool = False, config: Tile, return_residuals: bool = False):
+        del paired  # a second matrix is Mosaic GPU's alone (`eligible`)
         # Imported at first use: the kernels need jax's Pallas Triton backend,
         # which jax 0.11.2 deprecates, and importing a model must not load it.
         if dense:
@@ -537,21 +564,6 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     STAGED_ROWS: ClassVar[bool] = False
     """Whether a consumer prepares its share of each step's rows stage itself (the kernel gradient's
     prologue and group zeroing, `registers`)."""
-    TILED_PROLOGUE: ClassVar[bool] = True
-    """Whether the launches take a prologue reading a side tile of the stage's shape (SwiGLU's gate times
-    its up rows: `[rows, depth]`). The rewrite's live phase follows its orientation and side axes
-    (`_prologue_registers`), measured at the launch's actual register cap."""
-    MOST_OUTPUTS: ClassVar[int] = 2
-    """The most outputs an epilogue gives that the launches take: the epilogue computes its outputs whole
-    before the stores (the compiler merges each output's arithmetic however the kernel orders it), and a
-    third output's tile held beside the accumulator needed 253 registers at 128 x 192 on sm90, against 122
-    for one and 162 for two (HOOKS3/4), past the budget at the tiles the derivation takes."""
-    MIXED_OUTPUTS: ClassVar[bool] = False
-    """Whether an epilogue may return different output dtypes. A model gap: sm90's mixed bf16/fp32
-    outputs at a 128-register accumulator spill at 232 registers for 256, 512 and 768 output columns
-    in the probe's schedule, but hold at 1024 and above; same-dtype outputs hold. Splitting the wide
-    WGMMA register tuple removes the 256-column spill, but no rule over the launch facts yet decides
-    its epilogue allocation. Such a call runs another launch until a rule does."""
 
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
@@ -562,25 +574,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return (first == second and jnp.dtype(first).itemsize == 2
                 and family is not None
                 and (family.counts_hooks or not special)
-                and len(ba.arguments['hooks'].out_dtypes or ()) <= self.MOST_OUTPUTS
-                and (self.MIXED_OUTPUTS
-                     or len({jnp.dtype(dtype) for dtype in ba.arguments['hooks'].out_dtypes or ()}) <= 1)
-                and (self.TILED_PROLOGUE
-                     or all(len(axes) < 2 for axes in ba.arguments['hooks'].prologue_axes))
                 and self._hooks_lower(ba, first, target)
+                and _priced(ba.arguments['hooks'])
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
                 and self.derived(ba, target) is not None)
 
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
         # A consumer thread's live set (`resources.tile_registers`: the accumulator it carries, a step's
-        # fragments, an output's copy), and beside the accumulator the largest of a step's phases, each
-        # done before the next starts: the rows' stage a kernel gradient's consumer prepares itself, the
-        # prologue's rewrite of its share of a stage, and under exact sums the step's own accumulator,
-        # which its product starts after the stage is ready (the running sum is carried). Phases take the
-        # largest, not the sum: the prologue completes its writes before the staged rows are zeroed
-        # (`mosaic_gpu._staged_halves`), and a step's product starts after both. The compile gate tests
-        # the actual launch and residency caps: ptxas can ignore a small setmaxnreg (C7507), and its
-        # spill decisions are not monotone, so a least spill-free cap cannot decide a launch.
+        # fragments, an output's copy), and beside the accumulator the larger of its phases, each done
+        # before the next starts: the rows' stage a kernel gradient's consumer prepares itself, and the
+        # epilogue's side values (`_epilogue_registers`); under exact sums the running sum beside each
+        # step's own product. The hooks it prices are `_priced`'s. The compile gate tests the actual
+        # launch and residency caps: ptxas's spill decisions are not monotone, so a least spill-free cap
+        # cannot decide a launch.
         dtype = ba.arguments['tokens'].dtype
         family, block = mosaic_gpu.family_of(config, dtype), (config.block_m, config.block_n, config.block_k)
         hooks = ba.arguments['hooks']
@@ -597,52 +603,35 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             words = -(-config.block_k * config.block_m // config.warpgroups * jnp.dtype(dtype).itemsize
                       // 4 // resources.THREADS)
             staged = max(0, words - family.held_registers)
-        phases = [staged, self._prologue_registers(ba, config), self._epilogue_registers(ba, config)]
+        phases = [staged, self._epilogue_registers(ba, config)]
+        # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`).
+        plain += accumulator if ba.arguments.get('paired') is not None else 0
         if ba.arguments.get('exact_sums'):
-            # The running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is carried beside
-            # the walk's, which each step starts at its product: an exact kernel gradient needs 96, 149-152
-            # and 216-224 at 128 x 64, 128 x 128 and 128 x 192 on sm90 (DECIDE1), two accumulators and the
-            # held registers.
-            return plain + max(accumulator, *phases)
+            # The running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is carried as a
+            # loop value beside each step's scoped product, awaited before its add: the two accumulators and
+            # the walk's control, no step's descriptors beside them (`resources.CONTROL_REGISTERS`), else the
+            # staged rows above them (FS-K01 model2: 144 at 64 a thread over stages 2-5, 208 at 96).
+            return max(2 * accumulator + resources.CONTROL_REGISTERS, plain + max(phases))
         return plain + max(phases)
-
-    @classmethod
-    def _prologue_registers(cls, ba, config: mosaic_gpu.Tiles) -> int:
-        """The rewrite phase beyond the plain mainloop's held set: a share's wide result, its packed
-        stage where a row-vector broadcast overlaps it, and the side tiles held by a transposed
-        kernel-gradient rewrite. A forward's side tile streams into the wide result. No phase without
-        a prologue; `_rewritten` publishes it before the product reads the shared stage."""
-        hooks = ba.arguments['hooks']
-        if hooks.prologue is None:
-            return 0
-        share = config.block_m * config.block_k // config.warpgroups
-        wide = -(-share // resources.THREADS)
-        packed = -(-share * jnp.dtype(ba.arguments['tokens'].dtype).itemsize
-                   // 4 // resources.THREADS)
-        tiles = sum(len(axes) == 2 for axes in hooks.prologue_axes)
-        rows = any(axes == ('rows',) for axes in hooks.prologue_axes)
-        # A rows-stage rewrite streams a side tile into the converted stage. A kernel gradient's
-        # [rows, depth] stage has its consumer share on the other axis: both tiles and the packed
-        # result overlap. A row-vector broadcast also keeps the packed stage beside the wide result.
-        phase = wide * (1 + tiles if cls.STAGED_ROWS else max(1, tiles))
-        if rows or tiles:
-            phase += packed
-        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        # This is the complete rewrite phase beside the accumulator, not another complete copy of
-        # the plain mainloop's held set. `registers` adds only the part exceeding that plain phase.
-        return max(0, phase - family.held_registers)
 
     @staticmethod
     def _epilogue_registers(ba, config: mosaic_gpu.Tiles) -> int:
-        """The decision model's side-tile charge: one product's row slab per rows-by-columns operand.
-        Packed side values and converted results overlap in the emitted schedule, not a complete
-        additional fp32 tile. Charging the consumer's full fp32 tile wrongly refuses residuals at
-        256x64 and 128x128 on sm90; the slab charge agrees with those direct cap decisions."""
+        """The epilogue's side values beyond the mainloop's held set, its side operands vectors
+        (`_priced`)."""
         hooks = ba.arguments['hooks']
-        tiles = sum(len(axes) == 2 for axes in hooks.epilogue_axes) if hooks.epilogue is not None else 0
+        if hooks.epilogue is None:
+            return 0
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        rows = min(config.block_m // config.warpgroups, family.rows)
-        return -(-rows * config.block_n * tiles // resources.THREADS)
+        # Column vectors beside the accumulator, in its column layout (`Family.column_registers`), and a
+        # paired product's combination of its two accumulators, which holds a row of its results, one fp32
+        # column vector's worth (its SwiGLU spilled 32 bytes at 128 x 192 at 232, PAIRED-9, and fit 224 at
+        # 384 x 64, PAIRED-11): each with the walk's control alone (`resources.CONTROL_REGISTERS`), their
+        # excess over the mainloop's held set.
+        vectors = sum(family.column_registers(config.block_n, side.dtype)
+                      for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
+                                            strict=True) if axes == ('columns',))
+        vectors += family.column_registers(config.block_n, jnp.float32) if hooks.paired else 0
+        return max(0, vectors + resources.CONTROL_REGISTERS - family.held_registers)
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).
@@ -654,6 +643,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         `generation.assumed` names it)."""
         return bundles.of(target.generation, ba.arguments['tokens'].dtype)
 
+    def _families(self, ba, target) -> tuple[mosaic.Family, ...]:
+        """The bundles the launch may run on `target`, in preference order (`bundles.layouts`)."""
+        return bundles.layouts(target.generation, ba.arguments['tokens'].dtype)
+
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         """A group's output rows (`rows`, on average), the depth the steps run over (None: a group's rows,
@@ -661,11 +654,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         `mosaic_gpu.derived` reads them."""
 
     def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
-        family = self._family(ba, target)
-        if family is None:
+        layouts = self._families(ba, target)
+        if not layouts:
             return None
         rows, depth, width = self._generated_extents(ba)
-        return mosaic_gpu.derived(family, rows=rows, depth=depth, width=width,
+        return mosaic_gpu.derived(layouts, rows=rows, depth=depth, width=width,
                                   dtype=ba.arguments['tokens'].dtype,
                                   multiprocessors=_multiprocessors(target), target=target,
                                   candidate=lambda tile: self.candidate(ba, tile, target),
@@ -728,15 +721,15 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` is a tile of the call on `target` apart from its resources: of the launch's
-        family there, in its granularity (whole roles of rows for each consumer, whole column units, one of
+        family there (a layout of it, `bundles.layouts`), in its granularity (whole roles of rows for each
+        consumer, whole column units, one of
         its depths, at most its consumers, at most the programs its registers hold) with a ring of two
         stages at least (a walk keeping one step's products in flight holds its slot while the next step's
         loads fill another), its blocks dividing the call's extents, its cluster at most the family's
         (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
         copy's extent along its axis (`mosaic.Family.copy_extent`)."""
-        family = self._family(ba, target)
-        if (family is None or config.family != family.name or config.cluster > family.cluster
-                or not self._divides(ba, config)):
+        family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
+        if family is None or config.cluster > family.cluster or not self._divides(ba, config):
             return False
         dtype = ba.arguments['tokens'].dtype
         if (config.warpgroups > family.consumers or config.programs > family.programs(config.warpgroups)
@@ -798,11 +791,16 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # The programs a multiprocessor runs at once share its shared memory.
         return resources.program_shared(super().program_shared(config, target), config.programs)
 
+    def _programs(self, config: mosaic_gpu.Tiles) -> int:
+        """The programs the persistent kernel's schedule spreads its tiles over: the tile's programs on each
+        multiprocessor (`Tiles.programs`)."""
+        return _multiprocessors(generation.gpu_target()) * config.programs
+
     def _launched(self, config: mosaic_gpu.Tiles, interpret: bool) -> int:
-        """The programs the persistent kernel launches: the tile's programs on each multiprocessor
-        (`Tiles.programs`); the interpreter runs one cluster (jax/_src/pallas/mosaic_gpu/interpret), one
-        program alone or a pair's two (`Tiles.cluster`)."""
-        return config.cluster if interpret else _multiprocessors(generation.gpu_target()) * config.programs
+        """The programs the persistent kernel launches: its schedule's (`_programs`); the interpreter runs
+        one cluster (jax/_src/pallas/mosaic_gpu/interpret), one program alone or a pair's two
+        (`Tiles.cluster`)."""
+        return config.cluster if interpret else self._programs(config)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -819,7 +817,8 @@ class MosaicGmm(_Mosaic):
             prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
             epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
-            dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],))
+            dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
+            paired=ba.arguments.get('paired') is not None)
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
@@ -837,8 +836,9 @@ class MosaicGmm(_Mosaic):
 
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
+             *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS,
+             exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         # Exact sums are ineligible for this launch.
         del exact_sums
@@ -846,7 +846,7 @@ class MosaicGmm(_Mosaic):
                               out_dtype=out_dtype, multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              dense=dense, **hooks.kernel_options()), None
+                              dense=dense, paired=paired, **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -876,13 +876,26 @@ class MosaicTgmm(_Mosaic):
         # (`mosaic_gpu.split_count`) at the tile the split's own call, writing fp32 partials, derives; an
         # exact sum's order is its contract, so it takes no split.
         tile = super().derived(ba, target)
-        if tile is None or ba.arguments['exact_sums'] or self._splits(ba, tile, target) == 1:
+        if (tile is None or ba.arguments['exact_sums'] or self._balances(ba, tile, target)
+                or self._splits(ba, tile, target) == 1):
             return tile
         partials = self._partials(ba)
         sliced = super().derived(partials, target)
         if sliced is None or (splits := self._splits(partials, sliced, target)) == 1:
             return tile
         return dataclasses.replace(sliced, splits=splits)
+
+    def _balances(self, ba, tile: mosaic_gpu.Tiles, target) -> bool:
+        """Whether the call's last wave runs balanced over the programs (`tail.balanced`), which it
+        takes no split beside: a dense one, not of exact sums, on a family that fixes a tile up across
+        programs, its tail balanced."""
+        family = mosaic_gpu.family_of(tile, ba.arguments['tokens'].dtype)
+        if not (ba.arguments['dense'] and not ba.arguments['exact_sums'] and family.fixes_up):
+            return False
+        depth, _, width = self._generated_extents(ba)
+        tiles = depth // tile.block_m * (width // tile.block_n)
+        steps = -(-ba.arguments['tokens'].shape[0] // tile.block_k)
+        return tail_of.balanced(tiles, steps, _multiprocessors(target)) is not None
 
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
         depth, _, width = self._generated_extents(ba)
@@ -942,12 +955,11 @@ class MosaicTgmm(_Mosaic):
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: mosaic_gpu.Tiles,
              return_residuals: bool = False):
-        del dense  # a dense call is one group, as any
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=config, out_dtype=out_dtype,
-                               multiprocessors=self._launched(config, interpret),
+                               multiprocessors=self._programs(config),
                                interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
-                               exact_sums=exact_sums), None
+                               exact_sums=exact_sums, dense=dense), None
 
 
 @functools.cache
@@ -987,7 +999,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
                 and ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('exact_sums')
-                and not ba.arguments['interpret'])
+                and ba.arguments.get('paired') is None and not ba.arguments['interpret'])
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         return (self.TILE,)
@@ -1009,12 +1021,13 @@ class CutlassGmm(_Cutlass):
     TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
+             *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS,
+             exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
-        # No hooks, side operands or exact sums: the launch is not eligible for them; a dense call is one
-        # group, as any.
-        del prologue_operands, epilogue_operands, interpret, hooks, exact_sums, dense, config
+        # No hooks, side operands, second matrix or exact sums: the launch is not eligible for them; a dense
+        # call is one group, as any.
+        del prologue_operands, epilogue_operands, paired, interpret, hooks, exact_sums, dense, config
         _cutlass_registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
@@ -1062,7 +1075,7 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         return (generation.tpu(target) and target.scoped_vmem is not None
                 and first == second == jnp.bfloat16
                 and self.derived(ba, target) is not None and _hooks_lower(ba, first, rules)
-                and not ba.arguments.get('exact_sums'))
+                and not ba.arguments.get('exact_sums') and ba.arguments.get('paired') is None)
 
     @abc.abstractmethod
     def spans(self, ba) -> tuple[int, int, int]:
@@ -1217,11 +1230,13 @@ class MosaicTpuGmm(_MosaicTpu):
 
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
+             *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS,
+             exact_sums: bool = False,
              dense: bool = False, config: mosaic_tpu.Blocks, return_residuals: bool = False):
-        # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
-        del exact_sums, dense
+        # Never set: the launch is not eligible for exact sums or a second matrix; a dense call is one group,
+        # as any.
+        del exact_sums, dense, paired
         return mosaic_tpu.gmm(tokens, kernel, sizes, blocks=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, interpret=TPU_INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
@@ -1418,15 +1433,17 @@ def launched(launches, arguments, options, *, product: Product, whole: bool):
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
 
 
-def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (), *,
-             out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
-             dense: bool = False) -> tuple:
+def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
+             paired: jax.Array | None = None, *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS,
+             interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` times its matrix of `kernel`,
     both of one dtype, with the template's hooks (`templates.gemm.template.gemm`). `promoted`,
     the declared product's (`templates.product.Product`), adds each depth step's partial apart
     (`exact_sums`); `dense`, one group of every row (a dense product), the plain tiled kernel where Triton
-    runs it."""
-    arguments = (tokens, kernel, sizes, tuple(prologue_operands), tuple(epilogue_operands))
+    runs it; `paired`, a second matrix of `kernel`'s shape multiplied by the same rows (Mosaic GPU's
+    launch alone takes it)."""
+    arguments = (tokens, kernel, sizes, tuple(prologue_operands), tuple(epilogue_operands),
+                 *(() if paired is None else (paired,)))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'hooks': hooks,
                'interpret': interpret, 'exact_sums': promoted, 'dense': dense}
     return _GMMS, arguments, options

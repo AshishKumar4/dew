@@ -93,15 +93,15 @@ def assert_matches(outputs, reference, name: str):
     assert largest(state, reference[f"{name}.state"]) < 1e-5
 
 
-def decode_operands(rng, rows: int, heads: int, width: int):
+def decode_operands(rng, rows: int, heads: int, width: int, held=jnp.float32):
     """A decode token's operands from `rng`: unit queries and keys, values, a log decay in (-3, 0], a
-    write gate in [0, 1) and a memory of scale 0.1, each fp32."""
+    write gate in [0, 1), each fp32, and a memory of scale 0.1 held in `held`."""
     unit = [rng.normal(size=(rows, 1, heads, width)) for _ in range(2)]
     query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
     value = jnp.asarray(rng.normal(size=(rows, 1, heads, width)), jnp.float32)
     g = jnp.asarray(-rng.random((rows, 1, heads)) * 3, jnp.float32)
     beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, held)
     return query, key, value, g, beta, state
 
 
@@ -637,30 +637,43 @@ def test_a_right_padded_row_convolves_as_the_masked_conv(case, history, packed):
             assert largest(gradient, wanted) < 1e-6
 
 
+RIGHT_PADDED_SEEDS = 8
+"""The right-padded layer's declared draws against the masked call (check 1), sized by `seeds_for`
+paired with the declared call on the CPU."""
+
+
 def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
     """The mixer told its rows are right-padded gives the masked call's
-    outputs, zero at the padding: as close
-    to float64 as the masked call is (tests/reference_error.py), the two
-    being separate programs, which a GPU rounds apart (1.7e-6 on an H100)."""
+    outputs, zero at the padding: on par with the masked call from its
+    float64 run over drawn hidden states (check 1), the two being separate
+    programs, which a GPU rounds apart (1.7e-6 on an H100)."""
     module = layer(geometry)
     variables = layer_params(reference)
-    hidden = jnp.asarray(reference["layer.hidden"])[:, :9]
+    shape = jnp.asarray(reference["layer.hidden"])[:, :9].shape
     valid = jnp.arange(9)[None, :] < jnp.asarray([[6], [9]])
 
     def call(metadata, variables=variables):
-        return jax.jit(lambda hidden: module.apply(variables, hidden, MixerCall(metadata)))
+        return lambda hidden: module.apply(variables, hidden, MixerCall(metadata))
 
     masked = AttentionMetadata(coordinates=coordinates(valid=valid))
     declared = AttentionMetadata(coordinates=coordinates(valid=valid, right_padded=True))
-    mine, theirs = call(declared)(hidden), call(masked)(hidden)
 
-    assert jnp.array_equal(mine[0, 6:], jnp.zeros_like(hidden[0, 6:]))
-    cpu = jax.devices("cpu")[0]
-    with jax.enable_x64(new_val=True), jax.default_device(cpu):
-        wide = jax.tree.map(lambda x: jax.device_put(np.asarray(x, np.float64), cpu), variables)
-        truth = call(AttentionMetadata(coordinates=coordinates(valid=jax.device_put(np.asarray(valid), cpu))),
-                     wide)(jax.device_put(np.asarray(hidden, np.float64), cpu))
-    assert_as_exact_as_the_reference(mine, theirs, truth, "right-padded output")
+    def draw(seed):
+        return (jnp.asarray(np.random.default_rng(seed).standard_normal(shape), jnp.float32),)
+
+    def truth(hidden):
+        # On the host, as a GPU's float64 is not every one's.
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            wide = jax.device_put(widened(variables), cpu)
+            on_host = jax.device_put(np.asarray(valid), cpu)
+            metadata = AttentionMetadata(coordinates=coordinates(valid=on_host))
+            return call(metadata, wide)(jax.device_put(hidden, cpu))
+
+    (hidden,) = draw(0)
+    assert jnp.array_equal(jax.jit(call(declared))(hidden)[0, 6:], jnp.zeros_like(hidden[0, 6:]))
+    assert_as_exact(call(declared), call(masked), draw, "right-padded output", seeds=RIGHT_PADDED_SEEDS,
+                    truth_fn=truth)
 
 
 @pytest.mark.parametrize("chunk", [4, 16, 64])
@@ -751,38 +764,50 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     np.testing.assert_allclose(state, want_state, atol=2e-4)
 
 
+DECODE_SEEDS = {("small", jnp.float32): 64, ("small", jnp.bfloat16): 64, ("0.8b-3", jnp.float32): 8,
+                ("0.8b-3", jnp.bfloat16): 8, ("0.8b-32", jnp.float32): 8, ("0.8b-32", jnp.bfloat16): 8}
+"""Each decode kernel case's declared draws against the recurrence (check 1), by its geometry's id and
+the dtype its state is held in: sized by `seeds_for` paired with the kernel on an A100."""
+DECODE_GEOMETRIES = {"small": (3, 2, 64), "0.8b-3": (3, 16, 128), "0.8b-32": (32, 16, 128)}
+
+
 @pytest.mark.parametrize("held", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("rows, heads, width", [
-    pytest.param(3, 2, 64, id="small"),
-    pytest.param(3, 16, 128, marks=pytest.mark.gpu(reason="the 0.8B's widths are a GPU's"), id="0.8b-3"),
-    pytest.param(32, 16, 128, marks=pytest.mark.gpu(reason="the 0.8B's widths are a GPU's"), id="0.8b-32"),
-])
-def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held):
+@pytest.mark.gpu(reason="the kernel compiled, as a GPU runs it: a CPU's decode takes the portable step "
+                        "(`decode_kernel`), and its interpretation of the kernel judges its own arithmetic")
+@pytest.mark.parametrize("geometry", ["small", "0.8b-3", "0.8b-32"])
+def test_the_decode_kernel_steps_as_the_recurrence_does(geometry, held):
     """One decode token through `dew.nn.kernels.recurrence.step` (one read and one write of the state)
-    gives the recurrence's output and state: an fp32 state's within the float64 gate of the fp32
-    recurrence's, at Qwen3.5-0.8B's widths (16 heads, 128 wide) on a GPU and interpreted at a small width.
-    A state held in bf16 is read and stepped in fp32 and written back rounded once, stochastically: within
-    one bf16 step of the fp32 one."""
+    gives the recurrence's output and state, on par with the fp32 recurrence's from float64 over drawn
+    tokens (check 1), at a small width and at Qwen3.5-0.8B's (16 heads, 128 wide), compiled on a GPU:
+    an fp32 state's output and state. A state held in bf16 is read and stepped in fp32 and written back
+    rounded once, stochastically: its output on par, and its state within one bf16 step of the fp32
+    one. A CPU interprets the kernel, whose output there sat 1.63 times the recurrence's error from
+    float64 over 320 draws, all on par on an A100: what a CPU's arithmetic makes of the kernel, not the
+    kernel's, and no CPU decode runs it."""
     from dew.nn.linear import decode_gated_delta_rule
 
-    rng = np.random.default_rng(0)
-    unit = [rng.normal(size=(rows, 1, heads, width)) for _ in range(2)]
-    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
-    value = jnp.asarray(rng.normal(size=(rows, 1, heads, width)), jnp.float32)
-    g = jnp.asarray(-rng.random((rows, 1, heads)) * 3, jnp.float32)
-    beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, held)
-    operands = (query, key, value, g, beta, state.astype(jnp.float32))
-    want, want_state = recurrent_gated_delta_rule(*operands)
-    with jax.enable_x64(new_val=True):
-        truth = [np.asarray(x) for x in recurrent_gated_delta_rule(*widened(operands))]
-    got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
+    rows, heads, width = DECODE_GEOMETRIES[geometry]
+
+    def draw(seed):
+        return decode_operands(np.random.default_rng(seed), rows, heads, width, held)
+
+    def decoded(*operands):
+        out, state = decode_gated_delta_rule(*operands)
+        return (out, state) if held == jnp.float32 else (out,)
+
+    def recurrent(query, key, value, g, beta, state):
+        # The held state read as fp32 at least: a bf16 one widened as the kernel reads it, the truth's as is.
+        state = state.astype(jnp.promote_types(state.dtype, jnp.float32))
+        out, stepped = recurrent_gated_delta_rule(query, key, value, g, beta, state)
+        return (out, stepped) if held == jnp.float32 else (out,)
+
+    assert_as_exact(decoded, recurrent, draw, f"the decode kernel, {geometry} held in {jnp.dtype(held).name}",
+                    seeds=DECODE_SEEDS[geometry, held])
+    operands = draw(0)
+    got_state = jax.jit(decode_gated_delta_rule)(*operands)[1]
     assert got_state.dtype == held
-    assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), truth[0], "decode out")
-    if held == jnp.float32:
-        assert_as_exact_as_the_reference(np.asarray(got_state), np.asarray(want_state), truth[1],
-                                         "decode state")
-    else:
+    if held == jnp.bfloat16:
+        want_state = recurrent_gated_delta_rule(*operands[:5], operands[5].astype(jnp.float32))[1]
         np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state, atol=2e-6, rtol=2 ** -7)
 
 

@@ -332,6 +332,46 @@ def test_the_mosaic_launches_state_their_work(training):
     assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
 
 
+def test_each_launch_lowers_once_however_many_layers_call_it():
+    """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
+    test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the
+    lowered program, which both layers call (`mainloop._lowered_once`), as many as one layer's. Each call
+    site traced, lowered and serialized its own kernel: a Qwen3.5-4B step's first update waited 30 minutes
+    on its layers' identical kernels (row 2102)."""
+    import re
+
+    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 128
+    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+
+    def layers(count: int):
+        def run(query, key, value, g, beta):
+            total = jnp.float32(0.0)
+            for layer in range(count):
+                # Each layer's own queries, as each layer projects its own.
+                scaled = query * (layer + 1)
+                out = mosaic_rule(scaled, key, value, g, beta, tiles=mainloop.Tiles(32, 1))[0]
+                total = total + out.astype(jnp.float32).sum()
+            return total
+
+        return jax.grad(run, argnums=(0, 1, 2))
+
+    # The GPU the test runs on where its family takes the call, else an H100 (Mosaic GPU lowers no Hopper
+    # copy for an A100's device).
+    lowered_for = generation.device_generation() if mainloop.family_of() is not None else "sm90"
+
+    def kernels(count: int) -> int:
+        with generation.assumed(lowered_for):
+            text = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(
+                dialect="hlo")
+        return len([line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)])
+
+    one = kernels(1)
+    assert one > 0 and kernels(2) == one
+
+
 def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
     """A layer naming the template (`generation.chosen(gated_delta_rule='mosaic_gpu')`): its output on par
     from float64 with the portable rule's (the layer's own float64 forward the truth). The layer computes
@@ -405,7 +445,7 @@ def _model(launch: mainloop.Launch, family: mosaic.Family) -> dict:
     producer = family.warpgroups(roles) > roles
     return {"registers": launch.registers, "budget": family.registers(roles), "consumers": roles,
             "most": family.programs(roles), "register_step": family.register_step,
-            "producer": resources.PRODUCER_REGISTERS if producer else 0}
+            "producer": resources.producer_registers(roles) if producer else 0}
 
 
 class Unbudgeted(template.Mosaic):
@@ -472,8 +512,18 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
                              kind='refused ')]
         assert variants[0] == derived, f"{name} on {target}: variants {variants} lead with no {derived}"
         derived_tiles = [(tiles, '') for tiles in (variants[:1] if training or packed else variants)]
+        # The walks at two consumer roles a program (`Tiles.walkers`), which the derivation gives a call
+        # whose walks fill more than a wave and these shapes never do: a role's registers are its share
+        # of the program's.
+        value_width = RESOURCE_SHAPES[name][3]
+        two = (template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
+                                       wide=derived.block_o or derived.block_v)
+               if family.consumers >= 2 and not packed and value_width // derived.block_v % 2 == 0 else None)
+        walked = [] if two is None else [(two, 'two roles ')]
+        # A forward without a gradient at its own tiles (`Tiles.forward`), which no fast backward narrows.
+        alone = [] if training or derived.forward is None else [(derived.forward, 'alone ')]
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
-                for tiles, kind in derived_tiles + ([] if training else unheld)]
+                for tiles, kind in derived_tiles + walked + alone + ([] if training else unheld)]
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]

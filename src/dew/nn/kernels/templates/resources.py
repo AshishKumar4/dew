@@ -21,6 +21,13 @@ if TYPE_CHECKING:
     from dew.nn.kernels.templates.mosaic import Family
 
 
+CONTROL_REGISTERS = 16
+"""The registers a consumer thread keeps for its walk's control (indices, barrier phases, addresses) beside
+its accumulators where no step's operand descriptors are live: in an epilogue, or between a step's scoped
+products. The relocatable compile's needs at sm90 (FS-K01 model2 and CAUSE-VECTOR, ptxas's least spill-free
+cap): a plain mainloop the accumulator and 32 (its step's descriptors too), exact sums two accumulators and
+16, an epilogue with a column vector the accumulator, the vector and 16."""
+
 PRODUCER_REGISTERS = 40
 """The registers a thread of a cooperative block's producer warpgroup holds: it only issues loads."""
 
@@ -152,18 +159,45 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
     return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
 
 
-def consumer_registers(consumers: int) -> int:
-    """The registers a thread of each of `consumers` consumer warpgroups holds: the program's launch pool
-    less the producer's, shared among them in setmaxnreg's steps of 8 and at most its 256 (two consumers'
-    232, JAX's warp-specialized pipeline's `_compute_registers(40, 2)`). The pool is what the program
-    launches with, its threads' share of the multiprocessor's 64K in the allocator's steps of 8, which
-    setmaxnreg moves between a program's warps and never past ("The total number of registers allocated to
-    all warps in the CTA cannot exceed the initial CTA launch", NVIDIA forums 302068): four consumers' 640
-    threads launch at 96 a thread, so they hold 104, where the multiprocessor's share would ask 112 and wait
-    for registers no warp gives back."""
-    threads = (consumers + 1) * THREADS
-    pool = min(255, 64 * 1024 // threads) // 8 * 8 * threads
+RAISES_HONORED = False
+"""Whether the GPU's compile of a Mosaic GPU kernel honors its warpgroups' register raises (setmaxnreg). It
+does not today: jaxlib's Mosaic GPU compiles each kernel's PTX through nvJitLink wherever it is installed
+(jaxlib/mosaic/gpu/target.cc, NvJitLinkMode::kAuto; the pip wheels without libnvptxcompiler), which
+compiles it relocatably, and ptxas ignores setmaxnreg there (C7504): every warpgroup of a program holds its
+entry's registers (`entry_registers`). SAMECOMPILE1-h100: two consumers' attention dK/dV spilled 504 bytes
+at 168 registers where a whole-program compile holds its 232."""
+
+
+def entry_registers(warpgroups: int) -> int:
+    """The registers a thread of a program of `warpgroups` warpgroups launches with: its threads' share of
+    the multiprocessor's 64K in the allocator's steps of 8, at most 255 (168 at three warpgroups)."""
+    return min(255, 64 * 1024 // (warpgroups * THREADS) // 8 * 8)
+
+
+def raised_registers(consumers: int) -> int:
+    """The registers each of `consumers` consumer warpgroups raises a thread's to (`roles`' setmaxnreg): the
+    program's launch pool less the producer's, shared among them in setmaxnreg's steps of 8 and at most its
+    256 (two consumers' 232, JAX's warp-specialized pipeline's `_compute_registers(40, 2)`). The pool is what
+    the program launches with (`entry_registers`), which setmaxnreg moves between a program's warps and
+    never past ("The total number of registers allocated to all warps in the CTA cannot exceed the initial
+    CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a thread, so they hold 104,
+    where the multiprocessor's share would ask 112 and wait for registers no warp gives back."""
+    pool = entry_registers(consumers + 1) * (consumers + 1) * THREADS
     return min(256, (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS) // 8 * 8)
+
+
+def consumer_registers(consumers: int) -> int:
+    """The registers a thread of each of `consumers` consumer warpgroups holds: its raise
+    (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its program's entry's
+    otherwise."""
+    return raised_registers(consumers) if RAISES_HONORED else entry_registers(consumers + 1)
+
+
+def producer_registers(consumers: int) -> int:
+    """The registers a thread of a program's producer beside `consumers` consumer warpgroups holds: its
+    lowered `PRODUCER_REGISTERS` where the GPU's compile honors the program's raises, its entry's
+    otherwise."""
+    return PRODUCER_REGISTERS if RAISES_HONORED else entry_registers(consumers + 1)
 
 
 CONSUMER_REGISTERS = consumer_registers(2)
@@ -245,6 +279,22 @@ class LaunchPlan:
     stages: int
     programs: int
     shared: int
+
+
+def placed(launches_of: Callable, layouts: tuple["Family", ...], target, *,
+           programs: int | None = None) -> tuple["Family", tuple[LaunchPlan, ...]] | None:
+    """The layout a program runs on, and its launches' plans: the first of `layouts` (an instruction family's
+    bundles in `bundles.layouts`' order, a producer's first) whose plan holds every launch it takes there
+    (`launches_of(layout)`, None where the layout takes none of them; `plan`). A program whose consumers'
+    registers a producer's layout holds keeps its producer, whose loads overlap no consumer's issue; one
+    whose consumers need more than a producer leaves them runs on a layout without it, its first consumer
+    issuing the loads (`mosaic.ConsumerFed`). None where no layout holds them."""
+    for layout in layouts:
+        launches = launches_of(layout)
+        planned = None if launches is None else plan(launches, layout, target, programs=programs)
+        if planned is not None:
+            return layout, planned
+    return None
 
 
 def plan(launches, family: "Family", target, *, programs: int | None = None) -> tuple[LaunchPlan, ...] | None:

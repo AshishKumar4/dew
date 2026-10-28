@@ -44,6 +44,12 @@ class Wgmma(mosaic.RingFamily):
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
 
+    def column_registers(self, columns: int, dtype) -> int:
+        # The column layout repeats a vector over the warpgroup's four warps and eight lanes of each, so a
+        # thread holds a quarter of its columns: FS-K01-CAUSE-VECTOR, an fp32 column vector's epilogue at
+        # 128 and 256 columns needs 104 and 200 against a row vector's 96 and 160.
+        return -(-columns * jnp.dtype(dtype).itemsize // 16)
+
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
@@ -126,5 +132,17 @@ class Wgmma(mosaic.RingFamily):
 
 WGMMA = Wgmma()
 """The wgmma family's bundle."""
+
+
+class WgmmaFed(mosaic.ConsumerFed, Wgmma):
+    """wgmma's bundle without a producer: its consumers feed their own rings (`mosaic.ConsumerFed`), each
+    at its program's entry registers, the layout a tile whose consumers need more than a producer leaves
+    them takes."""
+
+    name = "wgmma.fed"
+
+
+FED = WgmmaFed()
+"""wgmma's bundle without a producer."""
 
 

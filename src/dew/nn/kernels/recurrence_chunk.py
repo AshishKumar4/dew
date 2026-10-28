@@ -37,7 +37,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
-from dew.nn.precision import at_least_fp32, float32_einsum, l2norm
+from dew.nn.precision import at_least_fp32, l2norm
 from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
@@ -817,10 +817,11 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     each shard's summary is `rule`'s final memory over its slice from `[0 | I]` with values `[v | 0]`, in
     at least fp32 (rounding the identity block's products to the operands' dtype would round the
     transfer): `Z` the write its last document leaves from zero, `F` its transfer, zero where that document
-    starts inside the slice. The summaries are gathered over `axis` and composed in order, `E_r = F_{r-1}
-    E_{r-1} + Z_{r-1}` from the row's `state` (zero where None) on the first shard; a slice that starts a
-    document (its first token's `starts`) enters from zero. `rule(query, key, value, g, beta, state, *,
-    starts)` returns `(output, final memory)`."""
+    starts inside the slice. The summaries are each shard's span (`recurrence_algebra.Span`), whose exclusive
+    prefix over `axis` (`recurrence_algebra.entering`) from the row's `state` (zero where None) on the first
+    shard is the memory each enters, `E_r = F_{r-1} E_{r-1} + Z_{r-1}`; a slice that starts a document (its
+    first token's `starts`) enters from zero. `rule(query, key, value, g, beta, state, *, starts)` returns
+    `(output, final memory)`."""
     batch, _, heads, columns = value.shape
     width = key.shape[-1]
     wide = at_least_fp32(value.dtype)
@@ -832,12 +833,8 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     widened = jnp.concatenate([value.astype(wide), jnp.zeros((*value.shape[:-1], width), wide)], axis=-1)
     _, summary = rule(query.astype(wide), key.astype(wide), widened, g, beta.astype(wide),
                       jnp.concatenate([zero, identity], axis=-1), starts=starts)
-    writes, transfers = (jax.lax.all_gather(part, axis) for part in (summary[..., :columns],
-                                                                        summary[..., columns:]))
-    memory = zero if state is None else state.astype(wide)
-    for earlier in range(writes.shape[0]):
-        composed = float32_einsum('bhij,bhjv->bhiv', transfers[earlier], memory) + writes[earlier]
-        memory = jnp.where(earlier < shard, composed, memory)
+    span = algebra.Span(summary[..., columns:], summary[..., :columns])
+    memory = algebra.entering(span, axis, None if state is None else state.astype(wide))
     return jnp.where(begins[:, None, None, None], 0.0, memory)
 
 
@@ -982,8 +979,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     # tracer).
     @jax.custom_vjp
     def rule(query, key, value, g, beta, state, starts, firsts):
+        # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
+        alone = {**run, "tiles": tiles.forward or tiles}
         return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
-                                max_segments=max_segments, scale=scale, delta=delta, wide=wide, **run)
+                                max_segments=max_segments, scale=scale, delta=delta, wide=wide, **alone)
 
     def forward(*operands):
         if not fast:
