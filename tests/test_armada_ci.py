@@ -1866,6 +1866,31 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
         assert [word for word in words if word.startswith("--priority")] == priority
 
 
+def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci, tmp_path, monkeypatch):
+    """A suite the test cache's policy turns off (a lock, JAX's build or the recorder changed) runs every file
+    cold: each task pays the compiles and imports no warm run did, so its weight carries COLD_SECONDS beside its
+    estimate, which sizes armada's pool to the fleet rather than to the longest task, and its deadline is 5400 s,
+    not 2700 (Main, 2026-10-28: train 254's cold suite, 2,169 tasks planned on 242 containers, about 470 s a task
+    against an estimated 120, left 780 tasks unstarted at its 2,698 s deadline). A warm suite keeps both."""
+    for name in ("test_a", "test_b"):
+        (tmp_path / "tests" / f"{name}.py").write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_a.py::test_x": 30.0, "tests/test_b.py::test_y": 30.0}))
+    timings = {"files": {"3.12:tests/test_a.py": 30.0, "3.12:tests/test_b.py": 30.0}}
+    monkeypatch.setenv("DEW_TEST_CACHE", "on")
+    warm = {entry["tests"]: entry["weight"] for entry in ci.plan(120.0, timings) if entry["python"] == "3.12"}
+    monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    cold = {entry["tests"]: entry["weight"] for entry in ci.plan(120.0, timings) if entry["python"] == "3.12"}
+    assert cold == {tests: weight + ci.COLD_SECONDS for tests, weight in warm.items()}
+
+    def deadline(policy: str) -> list[str]:
+        calls = suite_step(tmp_path / f"cold-{policy}", "ci/batch-abc-1", "", policy, 2)
+        [run] = [call for call in calls if call[0] == "run"]
+        return [word for word in run if word.startswith("--deadline")]
+
+    assert deadline("off") == ["--deadline=5400"] and deadline("on") == ["--deadline=2700"]
+
+
 def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
     """A push to base/kernels, a base/<producer> promote and the background whole suite run their suite
     at a lane's whole-suite priority, -10 as verdict.sh's, so they never take containers from a train (10)
