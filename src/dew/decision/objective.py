@@ -228,7 +228,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
-                 consistency: float = 0.0):
+                 consistency: float = 0.0, context_window: int | None = None):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -286,6 +286,15 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
         self.segments = segments
+        held_context = self.context_length
+        if context_window is not None and (held_context is None or context_window < held_context):
+            raise ValueError(f"context_window={context_window} holds a window's contexts, at least one row's "
+                             f"context_length ({held_context}), which rows that read a context carry")
+        # The most context tokens a packed window holds, its rows' contexts end to end (`packing`): as
+        # given, or as many as its own tokens, `max_len`, or one row's `context_length` where that is
+        # longer; none where its rows carry no context.
+        self.context_window = (None if held_context is None
+                               else context_window or max(self.layout.max_len, held_context))
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
@@ -331,13 +340,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     @functools.cached_property
     def bounds(self) -> Bounds:
         """The most rows, questions and options a window packs (`Layout.bounds`),
-        at most `segments` rows; rows that carry a context pack as any do, each reading its own
-        (`DecisionInputs.context_segments`)."""
-        bounds = self.layout.bounds(self.tokenizer, self.specials, self.context_length)
-        most = self.segments
-        if most is None:
-            return bounds
-        return dataclasses.replace(bounds, segments=min(most, bounds.segments))
+        at most `segments` rows; rows that carry a context, an example's or their schema, pack as any
+        do, each reading its own (`DecisionInputs.context_segments`)."""
+        return self.layout.bounds(self.tokenizer, self.specials, self.context_length, self.segments,
+                                  self.context_window)
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
@@ -407,6 +413,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             targets=batch["targets"],
             ordinal=inputs.kinds == _SCORE,
             scored=batch["scored"],
+            classes=batch.get("classes"),
         )
 
     @property
@@ -426,8 +433,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                                    grouped=grouped)
         evaluating = dataclasses.replace(training, train=False)
         fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
-                  self.bounds, self.none_of_the_above)
-        held = dataclasses.replace(fit, none_of_the_above=0.0)
+                  self.bounds, self.none_of_the_above, self.context_window)
+        held = dataclasses.replace(fit, none_of_the_above=0.0, scored=True)
         # Rows a record spreads into: a layout of a question a row's, or grouped examples' apart.
         expand = (QuestionRows(),)
         options = self.bounds.options if self.layout.joint else None
@@ -435,8 +442,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         return ObjectiveData(
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
             evaluate=(held, *expand, Configured(evaluating, needs=("slots",), scope="run")),
-            pack=packing(self.layout, self.bounds, self.context_length, grouped),
-            packed=(PackedRows(self.layout.max_len, compact),),
+            pack=packing(self.layout, self.bounds, self.context_window, grouped),
+            packed=(PackedRows(self.layout.max_len, compact, self.schema_in_context),),
         )
 
     def task_settings(self) -> DecideSettings:

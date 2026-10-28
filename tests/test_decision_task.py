@@ -419,7 +419,7 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
                     truth_fn=lambda variables: tempered(variables, lambda logits, scale: softmax(
                         logits.astype(np.float64), scale)))
     scores = decide.score(examples)
-    assert set(scores) == {"accuracy", "ece", "aurc", "log_loss"}
+    assert set(scores) == {"accuracy", "macro_f1", "ece", "aurc", "log_loss", "brier", "scored_questions"}
     assert scores["accuracy"] == pytest.approx(np.mean([int(np.argmax(answer.probabilities)) == 0
                                                         for answer in answers]))
     # A second score runs the forward the first compiled.
@@ -609,9 +609,17 @@ def test_a_released_checkpoint_keeps_its_option_budget(decide, tmp_path):
 
 
 def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_path):
+    """A gated task, and a task whose row order or blocks Laya's config cannot state, are refused before
+    anything is written; Laya's own order, named, saves as the release's."""
     gated = decide.gated(0.5)
     with pytest.raises(ValueError):
         gated.save_pretrained(tmp_path)
+    for chosen in ({"order": "state_first"}, {"order": "re_read"}, {"blocks": True}):
+        with pytest.raises(ValueError):
+            replace(decide, layout=replace(decide.layout, **chosen)).save_pretrained(tmp_path / "chosen")
+        assert not (tmp_path / "chosen").exists()
+    replace(decide, layout=replace(decide.layout, order="question_first")).save_pretrained(tmp_path / "own")
+    assert Decide.from_pretrained(tmp_path / "own", attention_impl="xla").layout == decide.layout
 
 
 MESH_SEEDS = 8

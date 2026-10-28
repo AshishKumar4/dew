@@ -99,6 +99,15 @@ def held_keys(segment_ids: CrossDocuments) -> jax.Array:
     return _searched(ordered, wanted, "right") - _searched(ordered, wanted, "left")
 
 
+def holds_keys(segment_ids: CrossDocuments) -> jax.Array:
+    """Whether each query's document holds any key in its row, `[B, Q]`, whatever order the keys stand
+    in: the keys sorted first (`held_keys` reads them in ascending order), a padding query (0) holding
+    none."""
+    queries, keys = document_ids(segment_ids)
+    ordered, wanted = jnp.sort(_padding_last(keys), axis=-1), _padding_last(queries)
+    return (queries != 0) & (_searched(ordered, wanted, "right") > _searched(ordered, wanted, "left"))
+
+
 def aligned_places(segment_ids: CrossDocuments) -> jax.Array:
     """Each query's place among its document's keys under causality or a window, `[B, Q]`: a document's
     query of rank r among its Q queries sits at rank K - Q + r among its K keys (`CrossDocuments`)."""

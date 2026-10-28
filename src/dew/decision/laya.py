@@ -100,8 +100,18 @@ class LayaCheckpoint:
         tokenizer under `tokenizer/`, and `rl_agent_config.json` with the head's
         depth, the layout's budgets and the temperatures. The backbone must be a
         ModernBERT encoder and the head Laya's. A backbone under LoRA is written
-        with its factors merged into their kernels (`Pretrained.bound`).
+        with its factors merged into their kernels (`Pretrained.bound`). Laya's config states a layout's
+        window, question budgets and option layout alone, so a layout that chooses more (an order, labels,
+        segments, blocks) is refused before anything is written; a run saved by `Decide.save` keeps it.
         """
+        layout = self.layout
+        # Laya's own order is the question first, however the layout names it.
+        stated = MarkerLayout(max_len=layout.max_len, head_max_len=layout.head_max_len,
+                              option_tokens=layout.option_tokens, parallel=layout.parallel,
+                              order="question_first" if layout.order == "question_first" else None)
+        if layout != stated:
+            raise ValueError(f"Laya's config states a layout's window, budgets and option layout alone, not "
+                             f"this one's other choices ({layout}); save the task into a run with `save`")
         head = from_record(DecisionHead, self.model.head)
         tensors, config = laya_tensors(self.model, self.variables)
         root = Path(directory)
