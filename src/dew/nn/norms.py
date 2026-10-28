@@ -1,6 +1,8 @@
 """The normalizations Dew's modules share: RMS (`rms_normalized`, a residual stream's
-`stream_rms_normalized`, a gated one), group, L2 and unweighted RMS forms, each computed in at least
-float32, and their modules (`RMSNorm`, `LayerNorm`, `GroupNorm`).
+`stream_rms_normalized`, a gated one), group, L2 and unweighted RMS forms, and their modules (`RMSNorm`,
+`LayerNorm`, `GroupNorm`). The RMS and group forms take their statistics in at least float32 by default
+(`normalized_in_fp32`), the RMS ones in the input's dtype where a caller asks; L2 computes in its
+input's.
 """
 
 import functools
