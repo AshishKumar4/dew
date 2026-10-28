@@ -94,7 +94,8 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
 
 
 BLOCK_SEEDS = 8
-"""The quick_gelu tower's blocks' declared draws against transformers' blocks (check 1)."""
+"""The quick_gelu tower's blocks' declared draws against transformers' blocks (check 1), sized by
+`seeds_for` paired with Dew's blocks on the CPU."""
 
 
 def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_reference_does():

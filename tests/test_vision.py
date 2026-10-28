@@ -102,7 +102,8 @@ def test_a_tower_matches_the_reference_implementation(name, family, translate, p
 
 
 SIGLIP_SEEDS = 8
-"""The quick_gelu SigLIP tower's declared draws against transformers' (check 1)."""
+"""The quick_gelu SigLIP tower's declared draws against transformers' (check 1), sized by `seeds_for`
+paired with Dew's tower on the CPU."""
 
 
 def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the_reference_does():

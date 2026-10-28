@@ -32,7 +32,8 @@ def dots(function, *args) -> int:
 JOINED_SEEDS = {("gate_up", jnp.float32, False): 8, ("gate_up", jnp.float32, True): 8,
                 ("gate_up", jnp.bfloat16, False): 8, ("gate_up", jnp.bfloat16, True): 8,
                 ("delta_gates", jnp.float32): 8, ("delta_gates", jnp.bfloat16): 8, "promoted bias": 8}
-"""Each joined row's declared draws against its projections apart (check 1)."""
+"""Each joined row's declared draws against its projections apart (check 1), sized by `seeds_for` paired
+with the joined row on the CPU and an A100."""
 
 
 def assert_joined_as_exact(choice: str, run, draw, wide_run, label: str, *, seeds: int):

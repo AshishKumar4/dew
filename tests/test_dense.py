@@ -286,7 +286,7 @@ class _Host(nn.Module):
 
 BIASED_SEEDS = {False: 8, True: 8}
 """The biased bf16 projection's declared draws against torch's nn.Linear (check 1), Dense and
-DenseGeneral."""
+DenseGeneral, sized by `seeds_for` paired with Dew's projection on the CPU and an A100."""
 
 
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])

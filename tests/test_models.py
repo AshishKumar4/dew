@@ -50,7 +50,8 @@ def small_inputs(rng, res=RES, channels=3):
 
 
 VAE_BLOCK_SEEDS = {(32, 32): 8, (32, 64): 8}
-"""Each bf16 residual block's declared draws against Diffusers' Flax block (check 1)."""
+"""Each bf16 residual block's declared draws against Diffusers' Flax block (check 1), sized by `seeds_for`
+paired with Dew's block on the CPU and an A100."""
 
 
 @pytest.mark.parametrize("channels", [(32, 32), (32, 64)], ids=["same", "widening"])
@@ -84,7 +85,8 @@ def test_a_bf16_vae_block_rounds_where_diffusers_flax_vae_does(channels):
 
 
 ENCODER_SEEDS = 8
-"""The VAE encoder's declared draws, the device's run against the host's (check 1)."""
+"""The VAE encoder's declared draws, the device's run against the host's (check 1), sized by `seeds_for`
+paired with the device's run on the CPU."""
 
 
 @pytest.mark.parametrize("batch", [1, 4])
@@ -206,7 +208,7 @@ def test_a_vae_encoder_is_as_exact_as_diffusers(batch, backward):
 
 LINEARIZATION_SEEDS = 8
 """The strided convolutions' declared draws for each linearization, the device's run against the host's
-(check 1)."""
+(check 1), sized by `seeds_for` paired with the device's run on the CPU."""
 
 
 @pytest.mark.parametrize("transform", ["jvp", "transpose", "forward_over_reverse", "reverse_over_forward"])
@@ -330,7 +332,8 @@ def test_a_scan_order_is_a_permutation_joint_attention_cannot_see(rng, architect
 
 
 UVIT_SEEDS = 8
-"""The Hilbert UViT's declared draws against the raster one (check 1)."""
+"""The Hilbert UViT's declared draws against the raster one (check 1), sized by `seeds_for` paired with
+it on the CPU and an A100."""
 
 
 def test_a_hilbert_uvit_computes_the_raster_uvits_image(rng):
