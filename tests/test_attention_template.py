@@ -711,8 +711,8 @@ def test_a_window_holding_no_key_keeps_its_lower_bound_against_an_image():
 
 
 SLOTS = np.asarray([[3, 4, 5], [1, 2, -1]], np.int32)
-"""A cache call's queries' own keys in a 6-key cache: a row of three tokens appended at slots 3 to 5, and one of
-two at slots 1 and 2 beside a padding query (-1)."""
+"""A cache call's queries' own keys in a 6-key cache: a row of three tokens appended at slots 3 to 5, and one
+of two at slots 1 and 2 beside a padding query (-1)."""
 SLOT_CASES = {
     "causal": ({"causal": True},
                [[[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1]],
