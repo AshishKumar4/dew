@@ -654,7 +654,7 @@ def _split_delta_forward(length: int, devices: int) -> jax.stages.Lowered:
     x = jax.ShapeDtypeStruct((1, length, 256), jnp.bfloat16)
     variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
     device = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90").abstract_device
-    mesh = AbstractMesh((devices,), ("sequence",), axis_types=(AxisType.Explicit,), abstract_device=device)
+    mesh = AbstractMesh((devices,), ("sequence",), axis_types=(AxisType.Auto,), abstract_device=device)
     with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         return jax.jit(layer.apply).trace(variables, x).lower(lowering_platforms=("cuda",))
 
