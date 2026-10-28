@@ -1140,29 +1140,23 @@ class Trainer(Generic[Loss, Effects]):
                        out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
                        donate_argnums=0)
 
-    def _lowered_for(self, state: TrainState, batch: Batch, generation: str | None,
+    def _lowered_for(self, state: TrainState, batch: Batch, generation: str,
                      devices: Mesh | None = None) -> tuple[jax.stages.Lowered, CompilerOptions | None]:
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for
         one (`dew.training._lowering`) on this process's devices, and, lowered over `devices`, the
         options its compile there takes (`step_options`). It traces on an abstract mesh of that GPU's
         devices, from which JAX's Pallas lowering reads the GPU, or on `devices`, compile-only GPUs
-        XLA compiles it for, or no GPU's where `generation` is None (`dew.training.ahead`), there as the
-        plan's first candidate lowers (`_candidate`), so a run that loads it lowers the same program;
+        XLA compiles it for (`dew.training.ahead`), there as the plan's first candidate lowers
+        (`_candidate`), so a run that loads it lowers the same program;
         at the base rung and the plan's first split: a run that does not fit splits its batch or
         recomputes more, no other kernel. A CPU-owned state's step realizes its parameters on the host
         as it runs, and is not lowered."""
         if self.host_master:
             raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                              "the variables on the host")
-        if devices is not None:
-            mesh = devices
-        elif generation is not None:
-            mesh = gpu_mesh(self.device_mesh, generation)
-        else:
-            raise ValueError("a step lowered for no device mesh names the GPU generation it lowers for")
+        mesh = gpu_mesh(self.device_mesh, generation) if devices is None else devices
         self._at_base_rung(batch)
-        with contextlib.nullcontext() if generation is None else assumed(generation), \
-                self._traced_on(mesh) as schedule:
+        with assumed(generation), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
             split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
             placement = batch_shardings(mesh, batch)

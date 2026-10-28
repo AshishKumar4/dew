@@ -26,8 +26,9 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def fine_tune(mesh, *, ahead=None, width: int | None = None) -> Trainer:
-    fields = TINY_DECODER if width is None else {**TINY_DECODER, "emb_features": width}
+def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False) -> Trainer:
+    fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
+              **({"attention_impl": "xla"} if xla else {})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                    layout=Layout(min_shard=TINY_SHARD), split=1, ahead=ahead)
@@ -74,26 +75,32 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_run_given_its_step_compiled_ahead_runs_it_and_trains_as_one_that_compiled_it(tmp_path):
-    """Compiled ahead over this host's own eight devices and saved, the step runs as a fresh run's first
-    step in place of its compile (`Trainer(ahead=...)`): the run trains to the parameters the same run
-    that compiled its own step trains to, bit for bit, one program having run both. A step compiled
-    ahead for a wider model is another program, refused before the run trains (row 1915)."""
-    from dew.training.ahead import AheadOfTime, compile_ahead
+def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
+    """A trainer whose mesh is this host's own devices runs its step here; compiling it ahead is
+    refused, as XLA's CPU executable, loaded again, finds none of its fused functions."""
+    from dew.training.ahead import compile_ahead
+
+    with pytest.raises(ValueError):
+        compile_ahead(fine_tune(MeshSpec(fsdp=8).build()), token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+
+
+def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tmp_path):
+    """Two trainers of one config compile ahead one program, the digest a run lowers its first step
+    to (`AheadOfTime.program`); a wider model's is another. A run handed another program's step
+    refuses it before it trains, as the executable would not be its step (row 1915)."""
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    compile_ahead(fine_tune(MeshSpec(fsdp=8).build()), batch).save(tmp_path / "step.dew-aot")
-    compile_ahead(fine_tune(MeshSpec(fsdp=8).build(), width=48), batch).save(tmp_path / "wide.dew-aot")
 
-    def trained(ahead):
-        trainer = fine_tune(MeshSpec(fsdp=8).build(), ahead=ahead)
-        return trainer.fit(batch, steps=2, log_every=1).variables["params"]
+    def ahead(width=None):
+        return compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus("sm80", 1)), width=width), batch)
 
-    taken, compiled = trained(AheadOfTime.load(tmp_path / "step.dew-aot")), trained(None)
-    for ours, theirs in zip(jax.tree.leaves(taken), jax.tree.leaves(compiled), strict=True):
-        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    first, again, wide = ahead(), ahead(), ahead(width=48)
+    assert first.program == again.program != wide.program
+    wide.save(tmp_path / "wide.dew-aot")
     with pytest.raises(ValueError):
-        trained(AheadOfTime.load(tmp_path / "wide.dew-aot"))
+        fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "wide.dew-aot")).fit(
+            batch, steps=1, log_every=1)
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_nothing(tmp_path):
@@ -207,3 +214,25 @@ def test_a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_
     initial = jax.tree.leaves(state.variables["params"])
     assert any(not np.array_equal(np.asarray(new), np.asarray(old))
                for new, old in zip(jax.tree.leaves(moving.variables["params"]), initial, strict=True))
+
+
+@pytest.mark.gpu(reason="runs a step compiled ahead as a run's first step on this host's own GPU")
+def test_a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
+    """A step compiled ahead for one compile-only GPU of this GPU's generation, saved and handed to
+    the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
+    trains from it: its steps advance, its parameters move, its loss is finite (row 1915). The model's
+    attention takes XLA's path, which a step compiled with no GPU attached traces too."""
+    from dew.nn.kernels.generation import chosen, device_generation
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    with chosen(narrow_copies="off"):
+        compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1)), xla=True),
+                      batch).save(tmp_path / "step.dew-aot")
+        saved = AheadOfTime.load(tmp_path / "step.dew-aot")
+        run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=saved, xla=True)
+        initial = jax.tree.leaves(run.initial_state().variables["params"])
+        state = run.fit(batch, steps=2, log_every=1)
+    assert int(state.step) == 2
+    assert any(not np.array_equal(np.asarray(new), np.asarray(old))
+               for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))
