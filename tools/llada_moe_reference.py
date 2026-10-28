@@ -23,9 +23,7 @@ padding.json beside it; it runs the release's code alone, so the Python running 
 """
 
 import argparse
-import io
 import json
-import struct
 import subprocess
 import sys
 import tempfile
@@ -34,7 +32,14 @@ from pathlib import Path
 import numpy as np
 import torch
 from reference_source import config_lookups, record_padding
-from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_classes, released_model
+from remote_code_reference import (
+    FIXTURES,
+    RELEASES as REGISTERED,
+    received,
+    released_classes,
+    released_model,
+    send,
+)
 from safetensors.torch import save_file
 from torch_precision import float64, float64_twin
 
@@ -70,19 +75,6 @@ def draw(model, directory):
               str(directory / 'model.safetensors'))
 
 
-def _send(stream, arrays: dict) -> None:
-    buffer = io.BytesIO()
-    np.savez(buffer, **arrays)
-    stream.write(struct.pack('<Q', len(buffer.getvalue())) + buffer.getvalue())
-    stream.flush()
-
-
-def _received(stream) -> dict:
-    size = struct.unpack('<Q', stream.read(8))[0]
-    with np.load(io.BytesIO(stream.read(size))) as arrays:
-        return dict(arrays)
-
-
 def released_logits(model, ids, visible):
     """The release's forward of `ids` `[2, 16]`, under `visible` `[16, 16]` as an additive mask where
     one is given (LLaDA2's block-causal mask)."""
@@ -101,13 +93,13 @@ def serve(name: str) -> None:
         # Its float64 twin (`float64_twin`): built inside `float64`, its constructor's tables float64's.
         wide = float64_twin(native, lambda: released_model(name, Path(workspace) / 'f64'))
         while True:
-            request = _received(sys.stdin.buffer)
+            request = received(sys.stdin.buffer)
             ids = torch.from_numpy(request['ids'].astype(np.int64))
             visible = request.get('visible')
             reference = released_logits(native, ids, visible)
             with float64():
                 truth = released_logits(wide, ids, visible)
-            _send(sys.stdout.buffer, {'reference': reference, 'truth': truth})
+            send(sys.stdout.buffer, {'reference': reference, 'truth': truth})
 
 
 def record(name: str, release_python: str) -> None:
@@ -128,8 +120,8 @@ def record(name: str, release_python: str) -> None:
     mask = {} if not fields else {'visible': np.asarray(fields['attention_pairwise_mask'])[0]}
 
     def evaluate(inputs):
-        _send(worker.stdin, {'ids': inputs['ids'], **mask})
-        returned = _received(worker.stdout)
+        send(worker.stdin, {'ids': inputs['ids'], **mask})
+        returned = received(worker.stdout)
         return {'logits': returned['reference']}, {'logits': returned['truth']}
 
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
