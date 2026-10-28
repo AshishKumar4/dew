@@ -552,6 +552,9 @@ class FitSearch[LossT, EffectsT]:
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`)."""
+    capacity: int | None = None
+    """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
+    compiled ahead for it states them (`AheadTarget.capacity`)."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
@@ -623,7 +626,7 @@ class FitSearch[LossT, EffectsT]:
             executable, self.ahead = self.ahead.taken(candidate.lowered), None
         else:
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
-        fit, headroom = step_fits(executable, self.mesh, candidate.held)
+        fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity)
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
         return options, executable, dataclasses.replace(probe, ahead=taken)
 
@@ -646,6 +649,16 @@ class FitSearch[LossT, EffectsT]:
             self.resumed = None
         return False
 
+
+    def told(self, admitted: Planned) -> None:
+        """Tell a run that kept the remat it set itself how to learn what else fits: a run compiles its
+        own rung alone (row 2111), and planning it ahead at each policy, with each GPU's memory stated
+        (`--trainer.compile-ahead.capacity-gib`), compiles the others offline."""
+        remat = admitted.rung["remat"]
+        if remat is not None and json.dumps(remat, sort_keys=True) == self.started:
+            _log.info("the run sets remat %r and compiles at it alone; --trainer.compile-ahead with "
+                      "--trainer.compile-ahead.capacity-gib plans it on its GPUs offline, at each remat "
+                      "policy asked, to tell what else fits", remat)
 
     def climb(self) -> bool:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.

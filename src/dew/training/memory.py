@@ -248,12 +248,14 @@ def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defa
             'remat': recompute_record(objective), 'xla_defaults': xla_defaults, 'narrow': narrow}
 
 
-def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
+def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0,
+                  capacity: int | None = None) -> int | None:
     """Return the bytes the tightest of `devices` has to spare once the step's memory is placed.
 
     The step's temporaries and new outputs are placed next to `held` more bytes
     that the loop keeps outside the step. The result is None if the executable or
-    a device reports no memory. The arguments (the state and the batch) are
+    a device reports no memory, a device stated `capacity` bytes reading as one
+    that holds them (`compile_only_gpus`' devices state none). The arguments (the state and the batch) are
     already resident and counted as in use, and the donated state's buffers are
     reused for the outputs that alias them.
 
@@ -262,8 +264,13 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     the allocator `strands_temporaries`, they need room twice.
     """
     stats = executable.memory_analysis()
-    memory = [device.memory_stats() or {} for device in devices]
-    if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
+    if stats is None:
+        return None
+    # A device that states no memory, one compiled for and absent (`compile_only_gpus`), holds the
+    # `capacity` it is stated to, the step's arguments in it as they would be.
+    memory = [device.memory_stats() or ({} if capacity is None else {
+        'bytes_limit': capacity, 'bytes_in_use': stats.argument_size_in_bytes}) for device in devices]
+    if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
     return min(placeable(m, unclaimed(d, m)) - beside
@@ -397,7 +404,8 @@ def fits_everywhere(headroom: int | None) -> bool:
     return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
 
 
-def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0) -> tuple[bool, int | None]:
+def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
+              capacity: int | None = None) -> tuple[bool, int | None]:
     """Whether the compiled step fits in the free memory of every device of `mesh`,
     and this process's headroom (`step_headroom`), None where it reads none.
 
@@ -407,7 +415,7 @@ def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0)
     agreement.
     """
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    headroom = None if executable is None else step_headroom(executable, local, held=held)
+    headroom = None if executable is None else step_headroom(executable, local, held=held, capacity=capacity)
     return fits_everywhere(-1 if executable is None else headroom), headroom
 
 

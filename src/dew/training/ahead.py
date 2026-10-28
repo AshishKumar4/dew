@@ -27,8 +27,10 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import json
 import logging
 import pickle
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -36,8 +38,9 @@ import jax
 import jax.experimental.topologies as topologies
 from jax.experimental import serialize_executable
 
+from dew._records import JSON, record
 from dew.batch import Batch
-from dew.nn.kernels.generation import capability, gpu_target
+from dew.nn.kernels.generation import assumed, capability, gpu_target
 from dew.telemetry.instrumentation import StepFlops, step_flops
 
 if TYPE_CHECKING:
@@ -122,6 +125,13 @@ class AheadOfTime:
     alias_bytes: int
     temp_bytes: int
     code_bytes: int
+    plan: JSON = None
+    """Where a capacity was stated (`compile_ahead`), the plan the run's own fit search makes on those
+    GPUs (`Trainer.plan`): every program it compiled, each with the footprint derived for it beside
+    XLA's memory of it, and the plan it took; None where none was stated."""
+    planned_seconds: float | None = None
+    """The seconds that search took, its derivations and every compile: the time a run spends planning
+    before its first step on those GPUs."""
 
     @property
     def peak_bytes(self) -> int:
@@ -176,11 +186,14 @@ def program_of(lowered: jax.stages.Lowered) -> str:
 class AheadTarget:
     """Where a configured run compiles its first step ahead and saves it, then exits, training nothing
     (`TrainerConfig.compile_ahead`): for `devices` GPUs of the CUDA `generation` (`compile_only_gpus`),
-    which this host need not have, written to `path` (`AheadOfTime.save`)."""
+    which this host need not have, written to `path` (`AheadOfTime.save`). Where `capacity_gib` states
+    each GPU's memory, the run's own plan there is made and reported with it (`compile_ahead`): the
+    offline answer to what fits, a run with its remat set told of no rung but its own."""
 
     generation: str
     devices: int
     path: str
+    capacity_gib: float | None = None
 
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
                                   steps: int | None) -> CompiledAhead:
@@ -195,7 +208,8 @@ class AheadTarget:
                              "its rollout's, which it makes only as it trains")
         trainer.reading(loader)
         trainer.validate(steps=steps)
-        ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh))
+        capacity = None if self.capacity_gib is None else int(self.capacity_gib * 2**30)
+        ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh), capacity)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -210,6 +224,9 @@ class CompiledAhead(SystemExit):
         self.path, self.ahead = path, ahead
         _log.info("the step compiled ahead for %s %s GPUs holds %s bytes a device at its peak; saved to "
                   "%s", ahead.devices, ahead.generation, ahead.peak_bytes, path)
+        if ahead.plan is not None:
+            _log.info("planned on them in %.1f s, %d programs compiled, the plan %s", ahead.planned_seconds,
+                      len(record(ahead.plan, "plan")["probes"]), json.dumps(ahead.plan))
 
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> Batch:
@@ -224,14 +241,18 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch)
     return device
 
 
-def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> AheadOfTime:
+def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
+                                   capacity: int | None = None) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only GPUs its
     mesh is built over (`compile_only_gpus`) and never run: the step `fit` would compile there, as its
     plan's first candidate lowers it (`Trainer._candidate`), traced as on those GPUs
     (`dew.nn.kernels.generation.assumed`), at the base rung and the first split, its state the fresh
     one the trainer builds, abstract and placed by its layout, its batch `batch` as `fit` hands it to
     the step (`step_batch`), compiled with the options the run's compile there takes. Only GPUs: XLA's
-    CPU executable, loaded again, finds none of its fused functions."""
+    CPU executable, loaded again, finds none of its fused functions. Where each GPU is stated
+    `capacity` bytes, the run's own fit search plans the step on them after (`Trainer.compile`), as a
+    run there plans it, every program it compiles reported (`AheadOfTime.plan`) with the seconds it
+    took: what fits those GPUs, and what planning costs a run before its first step, without them."""
     devices = list(trainer.device_mesh.devices.flat)
     generations = {gpu_target(device.device_kind).generation for device in devices}
     if {device.platform for device in devices} != {"gpu"} or len(generations) != 1:
@@ -247,10 +268,16 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     memory = compiled.memory_analysis()
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
+    plan, seconds = None, None
+    if capacity is not None:
+        began = time.perf_counter()
+        with assumed(generation):
+            trainer.compile(start.abstract, step_batch(trainer, batch), capacity=capacity)
+        plan, seconds = trainer.plan, time.perf_counter() - began
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), program_of(lowered), executable,
         (in_tree, out_tree),
         flops=step_flops(compiled),
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
-        code_bytes=memory.generated_code_size_in_bytes)
+        code_bytes=memory.generated_code_size_in_bytes, plan=plan, planned_seconds=seconds)

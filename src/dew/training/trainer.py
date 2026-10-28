@@ -903,7 +903,8 @@ class Trainer(Generic[Loss, Effects]):
         return run
 
     @ruled
-    def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
+    def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *,
+                capacity: int | None = None) -> CompiledStep:
         """Compile a transaction over the state and one already-produced global batch.
 
         The step consumes the state it is given. The returned state takes over its
@@ -926,7 +927,8 @@ class Trainer(Generic[Loss, Effects]):
         is on (`jax_enable_pgle`), the plan admitted runs its first runs on a trial, `trials`' or, where
         none are given, a copy of the state beside it, refused where the devices hold no room for it
         (`Trials.profiled`), and its program compiles again guided by their profile (`Planned.guided`),
-        the executable it replaces released with its program (`Planned.released`).
+        the executable it replaces released with its program (`Planned.released`). A device that states
+        no memory, a compile-only GPU's, holds `capacity` bytes, as a step compiled ahead states them.
         """
         if (target := self.lower_for) is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
@@ -949,7 +951,7 @@ class Trainer(Generic[Loss, Effects]):
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule:
-            planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials)
+            planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
@@ -1007,12 +1009,13 @@ class Trainer(Generic[Loss, Effects]):
         return run
 
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
-                 trials: Trials | None) -> tuple[Planned, StepFlops | None]:
+                 trials: Trials | None, capacity: int | None) -> tuple[Planned, StepFlops | None]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the
         faster on `trials` of a frontier of two, guided under AutoPGLE (`Planned.guided`) and released
         (`Planned.released`), with `plan` its record and the objective at its rung, and a microbatch's
         FLOPs (`plan_flops`). A plan recorded beside the compilation cache (`recorded_rung`) is the first
-        candidate, kept untimed; `resumed` is a checkpoint's rung."""
+        candidate, kept untimed; `resumed` is a checkpoint's rung; `capacity` the bytes a device that
+        states none holds (`FitSearch.capacity`)."""
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
@@ -1035,7 +1038,8 @@ class Trainer(Generic[Loss, Effects]):
             lower, lambda candidate: step_options(self.objective, candidate.micro,
                                                   candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow,
-            None if self._base_rung is None else self._base_rung[1], resumed, ahead=self._ahead)
+            None if self._base_rung is None else self._base_rung[1], resumed, ahead=self._ahead,
+            capacity=capacity)
         plans, probes = search.plans(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
@@ -1061,6 +1065,7 @@ class Trainer(Generic[Loss, Effects]):
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
         self.plan = settled(planned, plans, seconds, probes)
+        search.told(planned)
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned.released(), flops
