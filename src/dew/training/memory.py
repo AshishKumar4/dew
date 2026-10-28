@@ -24,7 +24,7 @@ from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
-from dew.nn.backbones.decoder_block import DECODER_REMAT, remat_record
+from dew.nn.backbones.decoder_block import DECODER_REMAT, REMAT_POLICIES, remat_record
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.protocols import Recomputing, RematChoosing, TritonGemm
@@ -511,6 +511,24 @@ def remat_below[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list[
     depth = max((len(rungs) for rungs in prefixes if rungs is not None), default=0)
     return [[entry.module if not rungs else rungs[min(index, len(rungs) - 1)]
              for entry, rungs in zip(entries, prefixes, strict=True)] for index in range(depth)]
+
+
+def offloaded_full[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list | None:
+    """The modules the objective trains, each one at remat 'full' moved to its sibling that keeps what
+    'minimal' keeps in pinned host memory where 'full' recomputes it ('minimal_offloaded'): the list
+    `objective.substitute` takes; None where no trained module stands at 'full'. The sibling keeps as
+    many bytes on the device as 'full' does (`test_model_protocols`' `_saved`: a decoder's 107,720
+    both), so it fits where 'full' fits, and only timing it tells whether moving the residuals over
+    the host link costs less than recomputing them."""
+    full = remat_record(REMAT_POLICIES['full'])
+    entries = objective.program_key()
+    moved = [entry.module.with_remat(REMAT_POLICIES['minimal_offloaded'])
+             if entry.trained and isinstance(entry.module, Recomputing)
+             and isinstance(entry.module, RematChoosing) and entry.module.recompute_record() == full
+             else None for entry in entries]
+    if all(module is None for module in moved):
+        return None
+    return [entry.module if module is None else module for module, entry in zip(moved, entries, strict=True)]
 
 
 def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:

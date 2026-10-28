@@ -43,6 +43,7 @@ from dew.training.memory import (
     compiled_if_it_fits,
     head_fused_of,
     head_tile_of,
+    offloaded_full,
     recompute_more,
     recompute_record,
     remat_below,
@@ -529,7 +530,8 @@ class FitSearch[LossT, EffectsT]:
     TL-a100-offload-1338-c); a run keeps them there by its layout (`Layout.host`) alone. A remat policy
     that keeps its residuals in pinned host memory ('minimal_offloaded') keeps as many on the device as
     'full' does (`test_model_protocols`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
-    132,296), so it fits nowhere 'full' does not, and a run takes it by its own remat."""
+    132,296), so it fits nowhere 'full' does not: a plan that reaches 'full' is timed against it at its
+    split where the frontier is timed (`plans`), and a run takes it by its own remat otherwise."""
     lower: Callable[[int, bool], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
     objective: Objective[LossT, EffectsT]
@@ -559,15 +561,28 @@ class FitSearch[LossT, EffectsT]:
     def plans(self, candidates: Sequence[int], first: int, frontier: bool
               ) -> tuple[list[Planned], tuple[Probe, ...]]:
         """The plans to time, the first kept where none is timed, with every compile made: the ladder's
-        first of `candidates` from `candidates[first]` and, where `frontier` asks and it opens a frontier
-        (`opens_frontier`), the batch whole a remat rung up (`remat_more`), the head tiled and unfused,
-        above any rung that dropped the copies."""
+        first of `candidates` from `candidates[first]` and, where `frontier` asks, beside a plan at remat
+        'full' its sibling that offloads to the host at the same split (`offloaded_full`), and beside
+        any other where it opens a frontier (`opens_frontier`) the batch whole a remat rung up
+        (`remat_more`), the head tiled and unfused, above any rung that dropped the copies."""
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
         if split is None or self.fitted is None:
             raise RuntimeError(unplanned(self.probes)) from (self.refusals[-1] if self.refusals else None)
         plans = [self.found(split)]
-        if (frontier and opens_frontier(split, candidates[0], self.mesh)
+        offloaded = offloaded_full(self.objective) if frontier else None
+        if offloaded is not None:
+            # 'full' recomputes what its sibling moves over the host link instead, at the same bytes on
+            # the device: the two are timed at the plan's split, and an untimed run keeps 'full'.
+            held = [entry.module for entry in self.objective.program_key()]
+            self.objective.substitute(offloaded)
+            _log.info("timing the plan at remat 'full' against its sibling that offloads 'minimal''s "
+                      "residuals to the host")
+            if self.fits_here(split):
+                plans.append(self.found(split))
+            else:
+                self.objective.substitute(held)
+        elif (frontier and opens_frontier(split, candidates[0], self.mesh)
               and self.onward(lambda: remat_more(self.objective))):
             self.objective.tile_head()
             self.objective.unfuse_head()
