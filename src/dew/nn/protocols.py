@@ -624,7 +624,7 @@ class Recomputing(Protocol):
     own: a resumed run never compiles a lighter rung than it trained on.
     `recompute_half` is the model one rung up where that rung recomputes only
     the few values it names, a half rung the planner tries at each split
-    (`dew.training.planning.plan_step`), else None."""
+    (`dew.training.planning.FitSearch`), else None."""
 
     def recompute_record(self) -> JSON: ...
 
