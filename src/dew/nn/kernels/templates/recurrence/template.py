@@ -183,9 +183,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
         start = next((index for index in range(len(blocks)) if staged(index) is not None), None)
         if start is None:
             return None
-        trained = next((index for index in range(start, len(blocks))
-                        if staged(index) is not None and self._backward_holds(ba, staged(index), target)),
-                       start)
+        def trains(index: int) -> bool:
+            tiles = staged(index)
+            return tiles is not None and self._backward_holds(ba, tiles, target)
+
+        trained = next((index for index in range(start, len(blocks)) if trains(index)), start)
         chosen = staged(trained)
         assert chosen is not None
         if target.multiprocessors is None:
@@ -205,12 +207,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return self._walked(ba, chosen, target,
                                 programs // (multiprocessors * self.states_held(ba, chosen, target)))
         # Narrower only while the fast backward holds where it held at the block given way from.
-        trains = self._backward_holds(ba, chosen, target)
+        held = trains(trained)
         for index in range(trained + 1, len(blocks)):
             tiles = staged(index)
-            if tiles is None or not one_wave(tiles):
-                break
-            if trains and not self._backward_holds(ba, tiles, target):
+            if tiles is None or not one_wave(tiles) or (held and not trains(index)):
                 break
             chosen = tiles
         return chosen
