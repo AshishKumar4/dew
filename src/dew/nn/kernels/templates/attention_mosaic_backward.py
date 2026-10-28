@@ -456,9 +456,8 @@ def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple,
     out_smem, dv_smem, rows_smem = stages
     dk, dv, *key_sums = sums
     dk_view, dv_view, *key_views = views
-    holder = 0 if consumers > 1 else index
-    dk_stage = out_smem.at[holder, pl.ds(0, dk.shape[0])]
     if consumers == 1:
+        dk_stage = out_smem.at[index, pl.ds(0, dk.shape[0])]
         if dv_smem is out_smem:
             family.stored((dk, dv), (dk_view, dv_view), smem=dk_stage)
         else:
@@ -468,14 +467,19 @@ def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple,
             # Each key gradient, the walk's row sums, to the `[B, H, Kp]` outputs.
             family.stored(tuple(key_sums), tuple(key_views), smem=rows_smem.at[index])
         return
-    stages_of = (dk_stage, dk_stage if dv_smem is out_smem else dv_smem.at[0],
-                 *[rows_smem.at[0]] * len(key_sums))
+    # Each sum's output stage holds the other consumer's part first (`mosaic.summed_across`'s `parts`): the
+    # first consumer reads it into its own before it stages the total there, so the sums take no shared
+    # memory past the walk's (a width of 256's two shares' parts passed an H100's block, 263256 bytes).
+    rows = dk.shape[0]
+    stages_of = (out_smem.at[pl.ds(0, 1), pl.ds(0, rows)],
+                 out_smem.at[pl.ds(0, 1), pl.ds(0, rows)] if dv_smem is out_smem else dv_smem.at[pl.ds(0, 1)],
+                 *[rows_smem.at[pl.ds(0, 1)]] * len(key_sums))
     for value, view, stage in zip(sums, views, stages_of, strict=True):
-        def total(parts, ready, value=value, view=view, stage=stage):
-            mosaic.summed_across(value, parts, ready, index, consumers,
-                                 lambda summed: family.stored((summed,), (view,), smem=stage))
+        def total(ready, value=value, view=view, stage=stage):
+            mosaic.summed_across(value, stage, ready, index, consumers,
+                                 lambda summed: family.stored((summed,), (view,), smem=stage.at[0]))
 
-        pl.run_scoped(total, **mosaic.summing(value.shape, consumers), collective_axes="wg")
+        pl.run_scoped(total, plgpu.Barrier(num_arrivals=consumers - 1, num_barriers=1), collective_axes="wg")
 
 
 def _dkv_scoped(refs, *, fused: bool, widths: bool) -> tuple:
