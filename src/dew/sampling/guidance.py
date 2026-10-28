@@ -142,7 +142,8 @@ def guide(conditional: jax.Array, unconditional: jax.Array, scale) -> jax.Array:
     outside its guidance interval takes, it is the conditional prediction exactly, as the sources
     return it unguided there: the affine form would round it through their difference (float32's
     1 against 2**30 gives 0)."""
-    return _guided(conditional, unconditional, expand(scale, conditional))
+    # The scale in the predictions' dtype, so an integer scale (CFG++ at 1) has a tangent.
+    return _guided(conditional, unconditional, expand(jnp.asarray(scale, conditional.dtype), conditional))
 
 
 @jax.custom_jvp
