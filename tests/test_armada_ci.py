@@ -1106,7 +1106,7 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
 
 
-def test_a_durations_change_reruns_only_the_groups_whose_tests_it_moves(ci, tmp_path, monkeypatch, cache_worker):
+def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
     """The durations record is no file's input but a split file's groups', which are cut from that file's
     own entries: a change to another file's entries reuses every row, and so does one to the split file's
     seconds that leaves each of its tests in its group, as a group's key holds the tests it runs, not their
@@ -1120,7 +1120,8 @@ def test_a_durations_change_reruns_only_the_groups_whose_tests_it_moves(ci, tmp_
             + "".join(f"def test_{name}_{index}():\n"
                       f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
                       for index in range(tests)))
-    heavy = {f"tests/test_heavy.py::test_heavy_{index}": seconds for index, seconds in enumerate((300.0, 1.0, 1.0))}
+    heavy = {f"tests/test_heavy.py::test_heavy_{index}": seconds
+             for index, seconds in enumerate((300.0, 1.0, 1.0))}
     record = {**heavy, "tests/test_light.py::test_light_0": 1.0, "tests/test_light.py::test_light_1": 1.0}
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(record))
     verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
