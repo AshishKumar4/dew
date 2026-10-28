@@ -7,7 +7,6 @@ under one placement, whichever backend compiles it. What it costs and its execut
 a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import dataclasses
-import json
 
 import jax
 import jax.numpy as jnp
@@ -87,7 +86,8 @@ def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
 def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tmp_path):
     """Two trainers of one config compile ahead one program, the digest a run lowers its first step
     to (`AheadOfTime.program`); a wider model's is another. A run handed another program's step
-    refuses it before it trains, as the executable would not be its step (row 1915)."""
+    refuses it before it trains, and refuses it again on its next fit, rather than compiling its own
+    (row 1915)."""
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -98,15 +98,17 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     first, again, wide = ahead(), ahead(), ahead(width=48)
     assert first.program == again.program != wide.program
     wide.save(tmp_path / "wide.dew-aot")
-    with pytest.raises(ValueError):
-        fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "wide.dew-aot")).fit(
-            batch, steps=1, log_every=1)
+    run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"))
+    for _ in range(2):
+        with pytest.raises(ValueError):
+            run.fit(batch, steps=1, log_every=1)
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_nothing(tmp_path):
-    """`dew train` with `trainer.compile_ahead` set compiles the run's first step for one compile-only
-    A100, writes it where it names, and ends with status 0, the step loadable and what it costs
-    stated; it writes no checkpoint or tracking, as it trains nothing (row 1915)."""
+    """`dew train` with `--trainer.compile-ahead.generation`, `.devices` and `.path` compiles the run's
+    first step for one compile-only A100, writes it where it names, and ends with status 0, the step
+    loadable and what it costs stated; it writes no checkpoint or tracking, as it trains nothing
+    (row 1915)."""
     from test_run_options import lm
 
     from dew.cli.main import main
@@ -114,12 +116,12 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
 
     record, runs, path = tmp_path / "record", tmp_path / "runs", tmp_path / "step.dew-aot"
     lm(tmp_path, drawn=False).save(str(record))
-    target = {"generation": "sm80", "devices": 1, "path": str(path)}
-    settings = {"trainer.name": "ahead", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
-                "trainer.compile_ahead": json.dumps(target)}
+    settings = {"trainer.name": "ahead", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2"}
     with pytest.raises(CompiledAhead) as ended:
         main(["train", str(record / "run.json"),
-              *(flag for name, value in settings.items() for flag in ("--set", f"{name}={value}"))])
+              *(flag for name, value in settings.items() for flag in ("--set", f"{name}={value}")),
+              "--trainer.compile-ahead.generation", "sm80", "--trainer.compile-ahead.devices", "1",
+              "--trainer.compile-ahead.path", str(path)])
     assert ended.value.code == 0
     saved = AheadOfTime.load(path)
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
@@ -220,19 +222,24 @@ def test_a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_
 def test_a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
     """A step compiled ahead for one compile-only GPU of this GPU's generation, saved and handed to
     the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
-    trains from it: its steps advance, its parameters move, its loss is finite (row 1915). The model's
-    attention takes XLA's path, which a step compiled with no GPU attached traces too."""
+    trains from it, its plan's first compile the step compiled ahead: its steps advance and its
+    parameters move (row 1915). A wider model's step for this GPU is another program, refused. The
+    model's attention takes XLA's path, which a step compiled with no GPU attached traces too."""
     from dew.nn.kernels.generation import chosen, device_generation
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     with chosen(narrow_copies="off"):
-        compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1)), xla=True),
-                      batch).save(tmp_path / "step.dew-aot")
-        saved = AheadOfTime.load(tmp_path / "step.dew-aot")
-        run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=saved, xla=True)
+        for name, width in (("step", None), ("wide", 48)):
+            compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1)), xla=True,
+                                    width=width), batch).save(tmp_path / f"{name}.dew-aot")
+        here = MeshSpec().build(jax.devices()[:1])
+        run = fine_tune(here, ahead=AheadOfTime.load(tmp_path / "step.dew-aot"), xla=True)
         initial = jax.tree.leaves(run.initial_state().variables["params"])
         state = run.fit(batch, steps=2, log_every=1)
-    assert int(state.step) == 2
+        other = fine_tune(here, ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"), xla=True)
+        with pytest.raises(ValueError):
+            other.fit(batch, steps=1, log_every=1)
+    assert int(state.step) == 2 and run.plan["probes"][0]["ahead"] is True
     assert any(not np.array_equal(np.asarray(new), np.asarray(old))
                for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))

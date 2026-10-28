@@ -509,7 +509,7 @@ class TrainerConfig:
     compile of the whole step still needs one. The program exits with status
     0 once the step lowers, and opens no W&B run.
     """
-    compile_ahead: AheadTarget | None = None
+    compile_ahead: Annotated[AheadTarget, tyro.conf.subcommand("ahead")] | None = None
     """Compile the run's first step for GPUs this host lacks, save it, then exit without training.
 
     `--trainer.compile-ahead.generation sm90 --trainer.compile-ahead.devices 8
@@ -947,7 +947,8 @@ class RunConfig:
     """
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
-                                                   "trainer.cooldowns": "cooldowns"}
+                                                   "trainer.cooldowns": "cooldowns",
+                                                   "trainer.compile_ahead": "ahead"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
     RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
@@ -1507,14 +1508,9 @@ class RunConfig:
             # The trainer holds mesh, microbatches, layout, accumulation, split, dynamic_scale, profile and
             # tune_kernels; prepare_process read the process fields, and the rest are fit's arguments or
             # built the checkpoints and the tracker.
-            state = Trainer(
-                objective, self.optim, key=trainer.key, mesh=trainer.mesh,
-                microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
-                split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
-                tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
-                ahead=None if trainer.ahead is None else AheadOfTime.load(trainer.ahead),
-                tune_kernels=trainer.tune_kernels,
-            ).fit(
+            state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
+                               profile=trainer.profile, lower_for=trainer.lower_for,
+                               ahead=None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)).fit(
                 dataset, steps=steps, tokens=trainer.tokens,
                 log_every=trainer.log_every,
                 eval_every=trainer.eval_interval(dataset),
@@ -1546,15 +1542,23 @@ class RunConfig:
         """The run's first step compiled for its `compile_ahead` target and saved
         (`AheadTarget.compiled`), its trainer built as `train` builds it, over that target's
         compile-only GPUs, with no checkpoints or tracker: what ends a run that compiles ahead."""
-        trainer, target = self.trainer, self.trainer.compile_ahead
+        target = self.trainer.compile_ahead
         assert target is not None
-        devices = compile_only_gpus(target.generation, target.devices)
-        built = Trainer(
-            objective, self.optim, key=trainer.key, mesh=trainer.mesh.build(devices),
-            microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
-            split=trainer.split, dynamic_scale=trainer.dynamic_scale, rollout=rollout,
-            tune_kernels=trainer.tune_kernels)
-        return target.compiled(built, dataset, steps)
+        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices))
+        return target.compiled(self.built(objective, mesh, rollout), dataset, steps)
+
+    def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
+                               mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
+                               **resources) -> Trainer[LossT, EffectsT]:
+        """The run's trainer over `mesh`: how it steps, every numeric choice its `TrainerConfig`
+        holds (key, microbatches, layout, accumulation, split, loss scale, kernel tuning), and the
+        `resources` its mode adds (checkpoints, tracker, profile, a lowering or a step compiled
+        ahead), so a run that trains and one that compiles ahead build the one trainer."""
+        trainer = self.trainer
+        return Trainer(objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
+                       layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
+                       dynamic_scale=trainer.dynamic_scale, rollout=rollout,
+                       tune_kernels=trainer.tune_kernels, **resources)
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
               tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:

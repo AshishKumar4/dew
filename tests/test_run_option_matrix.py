@@ -67,14 +67,18 @@ def recorded(run: Path, kind: str) -> list[dict]:
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_pauses_splits_and_ranks_as_set(kind, tmp_path):
     """Four steps paused halfway (`stop`), each batch stepped as two microbatches (`split`), a
-    checkpoint each step, ranked by the training loss (`best`): the run saves steps one and two and
-    stops there, its compiled step's plan splits in two, and its best checkpoint is one of its own."""
+    checkpoint each step, ranked as the run asks, the highest training loss best (`best`): the run
+    saves steps one and two and stops there, its compiled step's plan splits in two, and its best
+    checkpoint is the saved step whose logged training loss is the higher, as no default ranking
+    picks."""
+    best = {"metric": "train/loss", "mode": "max"}
     run = trained(kind, tmp_path, "paused", **{"trainer.steps": 4, "trainer.stop": {"fraction": 0.5},
                                                  "trainer.split": 2, "trainer.checkpoint_every": 1,
-                                                 "trainer.keep": 4, "trainer.best": "train/loss"})
+                                                 "trainer.keep": 4, "trainer.best": best})
     assert saved(run) == [1, 2]
     assert {plan["plan"]["split"] for plan in recorded(run, "StepCompiled")} == {2}
-    assert Checkpoints(str(run)).resolve("best") in {1, 2}
+    losses = {step: row["train/loss"] for step, row in scalars(run).items() if step in (1, 2)}
+    assert Checkpoints(str(run)).resolve("best") == max(losses, key=losses.__getitem__)
 
 
 @pytest.mark.parametrize("kind", list(KINDS))

@@ -440,6 +440,11 @@ class Trainer(Generic[Loss, Effects]):
                 self._key = request_key(self._given_key)
         return self._key
 
+    def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH) -> None:
+        """Take `loader`'s device steps, which the step runs on each batch it reads, and the batches to
+        prefetch, as `fit` does before it compiles, and a step compiled ahead (`dew.training.ahead`)."""
+        self._device, self._prefetch = loader.device, prefetch
+
     @functools.cached_property
     def device_mesh(self) -> Mesh:
         """The device mesh (`device_mesh`), built on first use."""
@@ -944,6 +949,9 @@ class Trainer(Generic[Loss, Effects]):
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
         if self.host_master:
+            if self._ahead is not None:
+                raise ValueError("a step compiled ahead runs where the devices hold the state; this "
+                                 "layout keeps the variables on the host")
             return self._compile_host(state, batch)
         mesh = self.device_mesh
         links = self._links(mesh)
@@ -1037,11 +1045,12 @@ class Trainer(Generic[Loss, Effects]):
                                                   candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow,
             None if self._base_rung is None else self._base_rung[1], resumed, ahead=self._ahead)
-        self._ahead = None
         plans, probes = search.plans(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
             frontier=trials is not None and trials.frontier and recorded is None and resumed is None)
+        # Consumed once its first compile took it; a refusal leaves it for the next fit to refuse.
+        self._ahead = search.ahead
         seconds = ([] if trials is None or len(plans) == 1
                    else trials.seconds([self._runner(plan, mesh) for plan in plans]))
         # Every process runs the plan process zero timed clearly faster (`faster`).
@@ -1320,7 +1329,7 @@ class Trainer(Generic[Loss, Effects]):
         loader, held, tokens, steps = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
             examples=examples, accumulation=self.accumulation, startup=self._startup)
-        self._device, self._prefetch = loader.device, device_prefetch
+        self.reading(loader, device_prefetch)
         self._schedule(None if steps is None else steps // self.accumulation)
         plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
                           written=(log_every, eval_every, checkpoint_every),

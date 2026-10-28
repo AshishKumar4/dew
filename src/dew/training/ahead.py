@@ -185,9 +185,15 @@ class AheadTarget:
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
                                   steps: int | None) -> CompiledAhead:
         """`trainer`, built over this target's devices (`compile_only_gpus`), its first step over
-        `loader`'s first batch compiled ahead (`compile_ahead`) and saved, as what ends the run."""
+        `loader`'s first batch, through the loader's device steps as `fit` reads it
+        (`Trainer.reading`), compiled ahead (`compile_ahead`) and saved, as what ends the run. A run
+        whose step reads a rollout's batches, which it makes as it trains, is refused."""
         from dew.training._fit import first_batch
 
+        if trainer.rollout is not None:
+            raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
+                             "its rollout's, which it makes only as it trains")
+        trainer.reading(loader)
         trainer.validate(steps=steps)
         ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh))
         ahead.save(self.path)
