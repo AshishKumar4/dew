@@ -406,9 +406,9 @@ def column_order_case():
     (`test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_orders`) and that site's
     null runs (tools/gate_null_runs.py) take it: the draw of an order, its columns permuted and its
     targets relabelled, with one cotangent for every order (so the orbit moves only the order of the
-    sums) and the inverse relabelling last; and the scoring of a head's terms through it, each token's loss
-    and log Z and the gradients for the states, the head, the scale and the bias under the cotangent, at
-    the highest matmul precision."""
+    sums) and the inverse relabelling last; the scoring of a head's terms through it, each token's loss and
+    log Z and the gradients for the states, the head, the scale and the bias under the cotangent, at the
+    highest matmul precision; and the reference so scored, the whole logits' (`scaled_whole_head`)."""
     states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
     states, matrix = eighths(states, matrix)
     scale, bias = columns(512)
@@ -424,7 +424,7 @@ def column_order_case():
     def scored(head):
         return under('highest', pulled(head, 4))
 
-    return draw, scored
+    return draw, scored, scored(scaled_whole_head)
 
 
 def scaled_whole_head(states, matrix, scale, bias, targets):
@@ -443,7 +443,7 @@ def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_
     relabelled, which reorders every row's sum of exponentials and moves no value). A row summed in
     one loop of XLA's CPU reduction with a combine of its own, and a share divided out and then
     scaled, held the whole head's state gradient 3.9 times as far."""
-    ordered, scored = column_order_case()
+    ordered, scored, reference = column_order_case()
 
     def draw(seed):
         return ordered(seed)[:-1]
@@ -453,7 +453,7 @@ def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_
         losses, _, log_z = chunked_cross_entropy(states, head, targets, 4, tile=tile)
         return losses, log_z
 
-    assert_as_exact(jax.jit(scored(terms)), jax.jit(scored(scaled_whole_head)), draw, f'{tile} column orders',
+    assert_as_exact(jax.jit(scored(terms)), jax.jit(reference), draw, f'{tile} column orders',
                     seeds=SEEDS['column orders'])
 
 

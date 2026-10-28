@@ -41,10 +41,9 @@ def cross_entropy_columns():
     states, the head, the scale and the bias under the site's cotangent, `jax.nn.logsumexp`'s whole logits
     the reference, its column-wise gradients relabelled back so every order's are the same values."""
     import jax
-    from test_chunked_cross_entropy import column_order_case, scaled_whole_head
+    from test_chunked_cross_entropy import column_order_case
 
-    draw, scored = column_order_case()
-    whole = scored(scaled_whole_head)
+    draw, _, whole = column_order_case()
 
     def reference(*drawn):
         *arguments, relabel = drawn
