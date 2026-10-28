@@ -311,29 +311,30 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
         x_T = source.task.grid(3)[0].noise(jax.random.split(key)[0], (rows, *objective.latent_shape))
         return Step(jnp.asarray(0), key, None), x_T
 
-    def walked(source, objective, variables, seed, dtype=jnp.float32):
-        """The pipeline's solver over its own grid from the seed's noise, with no closing denoise,
-        decoded."""
-        step, x_T = stepped(seed)
+    def walked(source, objective, variables, step, x_T):
+        """The pipeline's solver over its own grid from `x_T`, with no closing denoise, decoded."""
         process, times = source.task.grid(3)
         denoise = objective.denoiser(variables, objective.encoded_conditions(variables, batch), None, process)
-        latents = sample(denoise, jnp.asarray(x_T, dtype), solver=source.schedule.solver,
-                         key=jax.random.split(step.key)[1], times=np.asarray(times), final_denoise=False)
+        latents = sample(denoise, x_T, solver=source.schedule.solver, key=jax.random.split(step.key)[1],
+                         times=np.asarray(times), final_denoise=False)
         return jnp.clip(source.autoencoder.decode(variables["autoencoder"], latents), -1.0, 1.0)
 
     def evaluation(seed):
         return objective.evaluate(variables, batch, stepped(seed)[0]).images
 
     def reference(seed):
-        return walked(source, objective, variables, seed)
+        return walked(source, objective, variables, *stepped(seed))
 
     def truth(seed):
-        # The denoiser in float64 over its weights widened; the text encoder and the decoder, whose
-        # roundings the evaluation and the reference make alike, stay as they are.
+        # The seed's noise drawn once in float32, as the arms draw it, then widened: drawn under x64, the
+        # process would draw other noise and walk another trajectory. The denoiser in float64 over its
+        # weights widened; the text encoder and the decoder, whose roundings the evaluation and the
+        # reference make alike, stay as they are.
+        step, x_T = stepped(seed)
         with jax.enable_x64(new_val=True):
             wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64))
-            return np.asarray(walked(wide, DiffusionObjective(wide, **settings), widened(variables), seed,
-                                     jnp.float64))
+            return np.asarray(walked(wide, DiffusionObjective(wide, **settings), widened(variables), step,
+                                     jnp.asarray(x_T, jnp.float64)))
 
     # On par with the solver's own walk from the same noise over the seeds' step keys (check 1).
     assert_as_exact(as_given(evaluation), as_given(reference), lambda seed: (np.int32(seed),),
