@@ -58,12 +58,6 @@ TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4
             "num_kv_heads": 2, "mlp_features": 64, "max_seq_len": 16}
 
 
-def pulled_back(function, cotangent, *operands):
-    """`function`'s value at `operands`, then each operand's cotangent for `cotangent` (`jax.vjp`)."""
-    out, transpose = jax.vjp(jax.jit(function), *operands)
-    return out, *transpose(cotangent)
-
-
 def tiny(**overrides):
     return models.build("causal_transformer", **{**TINY, **overrides})
 
@@ -409,7 +403,7 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
         return grouped.apply({"params": {"kernel": kernel}}, x)
 
     def value_and_gradients(function):
-        return pulled_back(function, cotangent, kernel, x)
+        return with_gradients(jax.jit(function))(kernel, x, cotangent)
 
     def dequantized(array, for_lhs):
         how = conv_general.get_how_to_quantize(
@@ -533,7 +527,7 @@ def test_a_bf16_convolution_under_weight_only_quantization_trains_as_qwix_does()
         module_path=".*", weight_qtype=jnp.int8, op_names=("dot_general", "einsum", "dot"))]))
 
     def value_and_gradients(module):
-        return pulled_back(module.apply, cotangent, variables, x)
+        return with_gradients(jax.jit(module.apply))(variables, x, cotangent)
 
     got = value_and_gradients(Quantization(weight_only=True).apply(conv))
     assert got[0].dtype == jnp.bfloat16
@@ -577,7 +571,7 @@ def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(
         [qwix.QtRule(module_path=pattern, weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
 
     def value_and_gradients(module, variables):
-        return pulled_back(module.apply, cotangent, variables, x)
+        return with_gradients(jax.jit(module.apply))(variables, x, cotangent)
 
     plain = value_and_gradients(block, variables)
     jax.tree.map(np.testing.assert_array_equal, value_and_gradients(spec.apply(block), variables), plain)
