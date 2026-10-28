@@ -657,11 +657,24 @@ CORE_CASES = {
                                                  "positions": (jnp.asarray([[0, 1, 0, 1]]),) * 2},
                                         [[1, 0, 0, 0], [1, 1, 0, 0], [0, 0, 1, 0], [0, 0, 1, 1]]),
     "two runs": ((1, 4), {"runs": jnp.asarray([[[[0, 1], [2, 3]]]])}, [[1, 0, 1, 0]]),
+    "a cache call's document within key lengths and starts": (
+        (2, 4), {"causal": True, "lengths": jnp.asarray([3]), "starts": jnp.asarray([1]),
+                 "segment_ids": CrossDocuments(jnp.asarray([[1, 1]]), jnp.asarray([[1, 1, 1, 1]]))},
+        [[0, 1, 1, 0], [0, 1, 1, 0]]),
+    "a cache call's document in chunks": (
+        (2, 4), {"causal": True, "chunk": 2,
+                 "segment_ids": CrossDocuments(jnp.asarray([[1, 1]]), jnp.asarray([[1, 1, 1, 1]]))},
+        [[0, 0, 1, 0], [0, 0, 1, 1]]),
+    "a window over places beside an invalid key": (
+        (4, 4), {"causal": True, "sliding_window": 2, "valid": jnp.asarray([[True, False, True, True]]),
+                 "positions": (jnp.asarray([[0, 1, 1, 2]]),) * 2},
+        [[1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 1, 0], [0, 0, 1, 1]]),
 }
 """Call forms of one row and the keys each query sees, `(queries, keys)`, `template.spans`' keywords and the
 keep written out by hand: causality and windows on the indices, documents of the call and of a cache call
-(its queries aligned to their document's last keys), padding's id, key lengths and starts, chunks on the
-indices and on places that restart at a document, and a query's two runs."""
+(its queries aligned to their document's last keys, under key lengths and starts and in chunks counted from
+its slots), padding's id, key lengths and starts, chunks on the indices and on places that restart at a
+document, a window over places beside an invalid key, and a query's two runs."""
 
 
 @pytest.mark.parametrize("case", CORE_CASES.values(), ids=CORE_CASES)
@@ -670,6 +683,15 @@ def test_each_coordinate_keeps_the_keys_written_out(case):
     (queries, keys), keywords, expected = case
     spans = template.spans(queries, keys, 1, **keywords)
     np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray([expected], bool))
+
+
+@pytest.mark.parametrize(("query", "key", "kept"), [(2, 1, True), (1, 2, True), (2, 2, True), (4, 1, False),
+                                                    (1, 4, False)])
+def test_a_two_sided_window_over_unsigned_places_keeps_its_neighbours(query, key, kept):
+    """A two-sided window of two (`windowed`) over unsigned coordinates keeps the keys one place either side
+    and the query's own, and none further: no distance wraps."""
+    found = windowed(jnp.asarray(query, jnp.uint32), jnp.asarray(key, jnp.uint32), 2, causal=False)
+    assert bool(found) == kept
 
 
 SLOTS = np.asarray([[3, 4, 5], [1, 2, -1]], np.int32)

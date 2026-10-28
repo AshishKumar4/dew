@@ -240,10 +240,10 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     # run, and each query's least and greatest it keeps (`_within_runs`).
     by_places = []
     if chunk is not None:
-        # Without places a chunk counts a query by its slot where the call gives one, else by its index.
+        # Without places a chunk counts a query by its own key's index (`slots`, a cross call's aligned
+        # place, else its own index).
         query_places, key_places = (
-            (index if slots is None else place,
-             jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
+            (place, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else positions)
         wanted = _chunk_of(query_places, chunk)
         by_places.append((_chunk_of(key_places, chunk), wanted, wanted))

@@ -128,5 +128,11 @@ def _spanned(segment_ids, *, causal: bool, sliding_window: int | None) -> jax.Ar
     from dew.nn.kernels.templates import attention as template
 
     queries, keys = document_ids(segment_ids)
-    return template.dense(template.spans(queries.shape[1], keys.shape[1], queries.shape[0], causal=causal,
-                                         sliding_window=sliding_window, segment_ids=segment_ids))
+    rows, length, count = queries.shape[0], queries.shape[1], keys.shape[1]
+    if not causal and sliding_window is None:
+        # Documents alone: every key in reach, the ids keeping each query to its own, padding none; no
+        # document bounds, so nothing sorts the keys.
+        end = jnp.where(queries == 0, 0, count).astype(jnp.int32)
+        return template.dense(template.KeySpans(jnp.zeros_like(end), end, queries, keys, count, "spans"))
+    return template.dense(template.spans(length, count, rows, causal=causal, sliding_window=sliding_window,
+                                         segment_ids=segment_ids))

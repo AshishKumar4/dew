@@ -208,10 +208,13 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
     cache call, -1 for padding (`template.spans`' `slots`). `rows` is the call's batch, by default the
     coordinates' own, or one where none carries it, which every row shares."""
     pair = places if isinstance(places, tuple) else (places, places)
-    given = [None if segment_ids is None else document_ids(segment_ids)[0], key_value_seq_lengths,
-             key_value_seq_starts, block_groups, image_groups, key_valid, key_runs, pair[0], query_slots]
     if rows is None:
-        rows = next((jnp.shape(x)[0] for x in given if x is not None), 1)
+        # The batch the coordinates broadcast to: a row's lengths and starts `[B]`, every other one's
+        # leading axis where it has a row axis.
+        rowed = [None if segment_ids is None else document_ids(segment_ids)[0], block_groups, image_groups,
+                 key_valid, key_runs, pair[0], query_slots]
+        rows = max([jnp.shape(x)[0] for x in (key_value_seq_lengths, key_value_seq_starts) if x is not None]
+                   + [jnp.shape(x)[0] for x in rowed if x is not None and jnp.ndim(x) >= 2], default=1)
     lengths, starts = (None if x is None else jnp.asarray(x, jnp.int32)
                        for x in (key_value_seq_lengths, key_value_seq_starts))
     positions = None
@@ -219,10 +222,11 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
         positions = (jnp.broadcast_to(jnp.atleast_2d(pair[0]), (rows, query_length)),
                      jnp.broadcast_to(jnp.atleast_2d(pair[1]), (rows, key_length)))
     valid = None if key_valid is None else jnp.broadcast_to(key_valid, (rows, key_length))
+    slots = None if query_slots is None else jnp.broadcast_to(query_slots, (rows, query_length))
     return template.spans(query_length, key_length, rows, causal=causal, sliding_window=sliding_window,
                           chunk=chunk, positions=positions, segment_ids=segment_ids, lengths=lengths,
                           starts=starts, block_groups=block_groups, image_groups=image_groups, valid=valid,
-                          runs=key_runs, slots=query_slots)
+                          runs=key_runs, slots=slots)
 
 
 def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_window: int | None, mask=None,

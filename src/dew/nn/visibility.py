@@ -22,8 +22,11 @@ def windowed(query, key, window: int, *, causal: bool):
     (`dew.nn.kernels.templates.attention.spans`), for coordinates no span holds: a stated mask's places,
     which need not run in order, and a banded layout's rows."""
     before, after = window_sides(causal, window)
-    distance = query - key
-    return (distance <= before) if causal else ((distance <= before) & (-distance <= after))
+    behind = query - key
+    if causal:
+        return behind <= before
+    # Each side's distance taken in its own order, so no unsigned coordinate wraps.
+    return jnp.where(query >= key, behind <= before, key - query <= after)
 
 
 def visible(query, key, *, causal: bool, window: int | None = None):
