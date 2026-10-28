@@ -868,6 +868,8 @@ class Trainer(Generic[Loss, Effects]):
                 stated = self._stated_links[axis]
                 links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
                 continue
+            if not all(device in jax.devices() for device in devices):
+                raise ValueError(f"compile-only {axis} axes require stated links; no GPU can measure them")
             if (mesh, axis) not in self._bandwidths:
                 # A resumed run takes the figure its checkpoint traced with, on this very placement.
                 self._bandwidths[mesh, axis] = None if peak is None else (
@@ -945,9 +947,8 @@ class Trainer(Generic[Loss, Effects]):
     @ruled
     def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None,
               capacity: int | None) -> Planned:
-        """The device step's plan, shared by `compile` and `compile_ahead`: the search, its record and
-        the trainer at its chosen rung. Its lowering stays alive until the caller has read it;
-        `compile` releases it before keeping the executable, `compile_ahead` serializes it."""
+        """The shared device-step planner: its record and chosen rung. The caller reads its lowering
+        before releasing it (`compile`) or serializing its executable (`compile_ahead`)."""
         mesh = self.device_mesh
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)

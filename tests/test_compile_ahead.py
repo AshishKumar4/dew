@@ -27,12 +27,12 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False):
+def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, links=None):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
               **({"attention_impl": "xla"} if xla else {})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), split=1, ahead=ahead)
+                   layout=Layout(min_shard=TINY_SHARD), split=1, ahead=ahead, links=links)
 
 
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch, caplog):
@@ -72,7 +72,13 @@ def test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_e
     from dew.training.ahead import compile_ahead, compile_only_gpus, step_batch
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    ahead = compile_ahead(fine_tune(spec.build(compile_only_gpus("sm90", 8))), batch)
+    links = None
+    if spec.tensor == 2:
+        from dew.nn.sharding import Link
+
+        links = {"tensor": Link(None, None)}
+    absent = fine_tune(spec.build(compile_only_gpus("sm90", 8)), links=links)
+    ahead = compile_ahead(absent, batch)
     run = fine_tune(spec.build())
     state, _, _ = run.place()
     run.compile(state, step_batch(run, batch))

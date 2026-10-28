@@ -15,6 +15,7 @@ measured.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Callable, Sequence
 
 import jax
@@ -79,7 +80,8 @@ def residual_bytes(loss: Callable, params, arguments: Sequence) -> int:
             raise TypeError(f"a pullback keeps {aval}, which is no array")
         if aval.memory_space != jax.memory.Space.Device:
             continue
-        total += placed_bytes(shape)
+        total += (math.prod(shape.shape) * shape.dtype.itemsize if shape.sharding is None
+                  else placed_bytes(shape))
     return total
 
 
