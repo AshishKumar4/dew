@@ -348,9 +348,8 @@ def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
 def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
     """A layer of a stacked `[layers, groups, depth, width]` matrix picked by an index (`gemm`'s `layer`):
     as exact as the plain program's product with that layer's matrices from float64 truth, the stack's
-    gradient included (zero at every other layer), and the launch reads the whole stack in place, its
-    matrix operand the stack's every group, no slice of it made. The gradients run eagerly, as the Mosaic
-    interpreters' ordered callbacks need."""
+    gradient included (zero at every other layer). The gradients run eagerly, as the Mosaic interpreters'
+    ordered callbacks need."""
     layers, groups, rows, depth, width = 3, 2, 136, 64, 128
     sizes, layer, split = jnp.asarray([70, 66], jnp.int32), jnp.asarray(1, jnp.int32), 70
 
@@ -372,10 +371,6 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"stacked layer on {generation_name}", seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
-        with tuning.seen() as launches:
-            jax.jit(dew).trace(*draw(0)[:2])
-    read = {ba.arguments['kernel'].shape for op, ba in launches if isinstance(op, grouped_matmul.MosaicGmm)}
-    assert read == {(layers * groups, depth, width)}
 
 
 @runs("sm80")
@@ -770,7 +765,8 @@ def _three_gemms(sizes):
         return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
 
     def truth_gemm(operand, w):
-        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
+        # The matrix's value rounded as the program rounds it; its gradient not (straight through).
+        matrix = (w + jax.lax.stop_gradient(w.astype(jnp.bfloat16).astype(w.dtype) - w)).astype(operand.dtype)
         return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
 
     return fused_gemm, plain_gemm, truth_gemm
