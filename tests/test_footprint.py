@@ -7,18 +7,18 @@ from dew.training.footprint import residual_bytes
 
 
 def test_a_pullback_counts_new_residuals_not_input_storage():
-    """The cosine needed to differentiate sine is new storage. Squaring needs its input, which is
-    already resident and must not count again as residual storage."""
+    """The cosine needed to differentiate sine is new storage. A dot product needs the other
+    operand, already resident as an input, which must not count again as residual storage."""
     shape = jax.ShapeDtypeStruct((8, 16), jnp.float32)
 
     def sine(params):
         return jnp.sin(params).sum(), ()
 
-    def square(params):
-        return jnp.square(params).sum(), ()
+    def product(params, values):
+        return jnp.vdot(params, values), ()
 
     assert residual_bytes(sine, shape, ()) == 8 * 16 * 4
-    assert residual_bytes(square, shape, ()) == 0
+    assert residual_bytes(product, shape, (shape,)) == 0
 
 
 def test_a_custom_pullback_counts_one_buffer_shared_by_two_residual_slots():
