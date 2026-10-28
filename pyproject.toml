@@ -18,13 +18,13 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post31; a release sorts below it, so an
+    # first build with every fix is post32; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The accelerator builds the
     # cuda12, cuda13 and tpu extras name are 0.12.0.1's. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.12.0.1.post31,<0.12.1",
+    "jax>=0.12.0.1.post32,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
