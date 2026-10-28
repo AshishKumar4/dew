@@ -52,11 +52,13 @@ inverse's fp16 doubling (aligned keys, the write gate near one) and its pairs' c
 `PAIR_FLOOR`) over chunks spanning tens of e-folds."""
 
 
-def bf16(operands: Chunk) -> Chunk:
-    """`operands` as a 16-bit call takes them: its queries, keys, values and write gate in bf16, its log decay
-    and memory fp32."""
+def bf16(operands: Chunk, hooks) -> Chunk:
+    """`operands` as a 16-bit call under `hooks` takes them: its queries, keys and values in bf16, its write
+    gate in bf16 with the delta rule (as fla's layer holds it) and fp32 without (Mamba-2's step, which the
+    template takes unrounded), its log decay and memory fp32."""
+    names = ('query', 'key', 'value', 'beta') if hooks.delta else ('query', 'key', 'value')
     return dataclasses.replace(operands, **{name: getattr(operands, name).astype(jnp.bfloat16)
-                                            for name in ('query', 'key', 'value', 'beta')})
+                                            for name in names})
 
 
 def fast_backward(operands: Chunk) -> bool:
@@ -122,14 +124,14 @@ def test_the_template_stays_finite_and_on_par_where_chunked_forms_break(name, re
         dew, truth, seeds = mosaic, exact, SEEDS[name, regime]
 
         def draws(seed):
-            return (bf16(stressed(hooks, regime, seed)[0]),)
+            return (bf16(stressed(hooks, regime, seed)[0], hooks),)
     else:
         dew, reference, truth = (with_gradients(restarting(fn, regime)) for fn in (mosaic, reference, exact))
         seeds = GRADIENT_SEEDS[name, regime]
 
         def draws(seed):
             operands, (out, final) = cotangents(hooks, regime, seed)
-            return bf16(operands), (out.astype(jnp.bfloat16), final)
+            return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
     if not runs(dew, hooks, operands, draws(0), product):
@@ -148,7 +150,7 @@ def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted():
     portable math's distance, interpreted and on an H100."""
     hooks = SITES['rated']
     assert_as_exact(functools.partial(chunk, hooks, mainloop='mosaic'), reference_arm(hooks),
-                    lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0]),),
+                    lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0], hooks),),
                     'the template, rated under the decay bound, its forward', seeds=FEWEST_SEEDS,
                     truth_fn=functools.partial(token_by_token, hooks))
 
@@ -160,7 +162,7 @@ def test_each_form_the_template_takes_stays_finite_interpreted(name, regime):
     recurrence's is on the regime's first draw; a form it refuses is checked refused and skipped."""
     hooks = SITES[name]
     mosaic = functools.partial(chunk, hooks, mainloop='mosaic')
-    drawn = (bf16(stressed(hooks, regime, 0)[0]),)
+    drawn = (bf16(stressed(hooks, regime, 0)[0], hooks),)
     if not runs(mosaic, hooks, drawn[0], drawn, 'forward'):
         pytest.skip(f'the template refuses {name}: a refusal, not numerical coverage')
     assert_finite(jax.jit(mosaic), jax.jit(functools.partial(token_by_token, hooks)), drawn, regime)
@@ -173,7 +175,7 @@ def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(r
     its own; on an mma.sync GPU they do not, and the rule refuses the gradient (row 1926)."""
     operands, _ = cotangents(HOOKS, regime, 0)
     fast = generation.family(generation.device_generation()) != 'mma.sync'
-    assert fast_backward(restarting(lambda given: given, regime)(bf16(operands))) == fast
+    assert fast_backward(restarting(lambda given: given, regime)(bf16(operands, HOOKS))) == fast
 
 
 def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
@@ -185,7 +187,7 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     hold the fast backward (an mma.sync one's) the rule refuses the gradient (row 1926)."""
     regime = 'decays near zero'
     operands, (out, final) = cotangents(HOOKS, regime, 0)
-    drawn = (bf16(operands), (out.astype(jnp.bfloat16), final))
+    drawn = (bf16(operands, HOOKS), (out.astype(jnp.bfloat16), final))
     template = with_gradients(functools.partial(chunk, HOOKS, mainloop='mosaic'))
     if not fast_backward(restarting(lambda given: given, regime)(drawn[0])):
         with pytest.raises(NotImplementedError):
