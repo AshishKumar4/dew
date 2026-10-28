@@ -16,6 +16,11 @@ weights; --draw replaces the committed synthetic weights first.
       --release-python <a Python with transformers 4.57.1>
   python tools/llada_moe_reference.py llada21-tiny llada22-tiny --release-python <transformers 5.16.1>
 
+`--generate` records instead the release's own blockwise generation (its `generate`) of a few drawn
+prompts under `GENERATE`, as generate.json beside the fixture, which tests/test_blockwise_walk.py holds
+Dew's blockwise walk to; it runs the release's code alone, under the release's Python:
+  <a Python with transformers 4.57.1> tools/llada_moe_reference.py --generate llada2-tiny
+
 `--padding` records instead the rows each release's own token lookup leaves untrained under the
 fixture's config with its pad id stated, left out and null (`reference_source.record_padding`), as
 padding.json beside it; it runs the release's code alone, so the Python running it is the release's:
@@ -148,12 +153,57 @@ def record(name: str, release_python: str) -> None:
     print(save(FIXTURES / name / 'released.npz', arrays, reference=repo, license=LICENSES[name]), flush=True)
 
 
+GENERATE = {"block_length": 4, "steps": 4, "gen_length": 8, "top_k": 1, "threshold": 0.95, "eos_id": 1}
+"""The release's generation a recording runs (`generated`): blocks of four tokens over four steps each,
+eight tokens, its best token alone (`top_k` 1, its one setting that draws nothing, each block's every
+position then confident), token 1 its end."""
+
+PROMPTS = (3, 5, 8)
+"""The lengths of the prompts a generation recording draws: inside a block, across one, and whole blocks."""
+
+
+def generated(name: str, workspace: Path) -> None:
+    """The release's own `generate` of prompts drawn at `PROMPTS`' lengths (ids past the end token, the mask
+    token aside) under `GENERATE`, written as generate.json beside the fixture with the releases it ran.
+
+    Its head's mask-token logit is held at -inf (a forward hook on `lm_head`, which its forward calls): the
+    release's `generate` draws over the whole vocabulary, so a position whose best token is the mask token
+    keeps it, a mask in its output, where Dew's walk draws no mask token (`DiscreteDenoiser`, MDLM's
+    carry-over); with it held out, the two walks draw from one distribution, every block, visibility,
+    position and reveal the release's."""
+    import transformers
+
+    config = json.loads((FIXTURES / name / 'config.json').read_text())
+    model = released_model(name, workspace).float()
+    mask = config['mask_token_id']
+
+    def no_mask(module, inputs, logits):
+        return logits.index_fill(-1, torch.tensor([mask]), float('-inf'))
+
+    model.lm_head.register_forward_hook(no_mask)
+    ids = np.setdiff1d(np.arange(GENERATE["eos_id"] + 1, config['vocab_size']), [config['mask_token_id']])
+    rng = np.random.default_rng(1061)
+    rows = []
+    for length in PROMPTS:
+        prompt = rng.choice(ids, length)
+        tokens = model.generate(inputs=torch.from_numpy(prompt[None]).long(), temperature=0.0, mask_id=mask,
+                                **GENERATE)
+        rows.append({"prompt": prompt.tolist(), "generated": tokens[0].tolist()})
+    repo, revision = RELEASES[name][:2]
+    record = {"reference": f"{repo}@{revision}", "transformers": transformers.__version__,
+              "torch": torch.__version__, "command": f"tools/llada_moe_reference.py --generate {name}",
+              "settings": GENERATE, "mask_id": mask, "mask_logit": "held at -inf", "rows": rows}
+    (FIXTURES / name / 'generate.json').write_text(json.dumps(record, indent=1) + '\n')
+    print(name, rows, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('names', nargs='+', choices=RELEASES)
     parser.add_argument('--draw', action='store_true', help='redraw the committed synthetic checkpoint')
     parser.add_argument('--serve', action='store_true', help="the release's side of the pipe")
     parser.add_argument('--padding', action='store_true', help='record the rows each lookup leaves untrained')
+    parser.add_argument('--generate', action='store_true', help="record the release's blockwise generation")
     parser.add_argument('--release-python', default=sys.executable,
                         help="the Python that runs the release's code, with its transformers")
     args = parser.parse_args()
@@ -161,6 +211,11 @@ def main():
         serve(args.names[0])
         return
     REGISTERED.update(RELEASES)
+    if args.generate:
+        with tempfile.TemporaryDirectory() as workspace:
+            for name in args.names:
+                generated(name, Path(workspace))
+        return
     if args.padding:
         with tempfile.TemporaryDirectory() as workspace:
             for name in args.names:
