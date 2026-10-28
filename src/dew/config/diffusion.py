@@ -308,6 +308,7 @@ class DiffusionRunConfig(RunConfig):
     def _objective(self, variables: Variables | None) -> DiffusionObjective:
         """The configured objective over `variables`."""
         if self.pretrained is None:
+            self.built_fresh()
             model, conditions, autoencoder = self._scratch(variables)
             sample, convention = self.sample_field(), None
         else:

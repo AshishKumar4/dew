@@ -21,7 +21,7 @@ import json
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeGuard
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeGuard, get_args
 
 import jax.numpy as jnp
 import numpy as np
@@ -560,6 +560,11 @@ class QuestionLayout(Layout):
         _least("option_tokens", self.option_tokens, 1)
         if self.segments is not None:
             kinds = [type(segment) for segment in self.segments]
+            others = sorted({type(segment).__name__ for segment in self.segments
+                             if not isinstance(segment, QUESTION_KINDS)})
+            if others:
+                raise ValueError(f"a question row holds no schema and no images, so it has no place for "
+                                 f"{others}; its parts are {[kind.__name__ for kind in QUESTION_KINDS]}")
             if kinds.count(Instructions) != 1 or kinds.count(OptionLines) != 1 or kinds.count(AnswerCue) > 1:
                 raise ValueError("a question row's segments hold its instructions and its options once, and "
                                  f"its cue at most once, not {[kind.__name__ for kind in kinds]}")
@@ -634,7 +639,7 @@ class QuestionLayout(Layout):
                                                                            text=text)
                     chunks.extend([*([Chunk(segment.join)] if index else []),
                                    Chunk(line, marks=((("option", index), 0, len(line)),))])
-            else:
+            elif isinstance(segment, AnswerCue):
                 template = segment.template if len(names) <= segment.at else segment.many
                 chunks.append(Chunk(template.format(labels=segment.join.join(names))))
         copies = [segment for segment in self.segments if isinstance(segment, State)]
@@ -1156,6 +1161,12 @@ class AnswerCue:
 type QuestionSegment = Text | State | Instructions | OptionLines | AnswerCue
 """A part of a question row's text (`QuestionLayout.segments`)."""
 
+QUESTION_KINDS: tuple[type, ...] = get_args(QuestionSegment.__value__)
+"""The parts a question row renders (`QuestionSegment`), which its layout refuses any other of."""
+JOINT_KINDS: tuple[type, ...] = get_args(Segment.__value__)
+"""The parts a joint row renders (`Segment`), which its layout refuses any other of: its questions,
+their instructions and options, are its schema's, and it reads no cue."""
+
 type RowSegment = Text | Media | State | Schema | Instructions | OptionLines | AnswerCue
 """A part of either layout's row (`Segment`, `QuestionSegment`), as a run names its row's parts
 (`DecisionRunConfig.segments`); each layout refuses the parts it has none of."""
@@ -1213,6 +1224,11 @@ class JointLayout(Layout):
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
         kinds = [type(segment) for segment in self.segments]
+        others = sorted({type(segment).__name__ for segment in self.segments
+                     if not isinstance(segment, JOINT_KINDS)})
+        if others:
+            raise ValueError(f"a joint row writes its questions in its schema and reads no cue, so it has no "
+                             f"place for {others}; its parts are {[kind.__name__ for kind in JOINT_KINDS]}")
         if kinds.count(Schema) != 1 or kinds.count(Media) > 1:
             raise ValueError("a joint row's segments hold the schema once, and the images "
                              f"at most once each, not {[kind.__name__ for kind in kinds]}")
@@ -1259,6 +1275,9 @@ class JointLayout(Layout):
             elif isinstance(part, Media) and media:
                 chunk = Chunk(ids=tuple(media), marks=((MEDIA_MARK, 0, len(media)),))
             else:
+                # A state's place, filled once its copies share the room left (below); the schema read as
+                # the row's context; the images' place in a request that has none.
+                assert isinstance(part, (State, Schema, Media)), part
                 chunk = Chunk(ids=())
             laid_out.append((part, chunk))
         # The row without its state, each copy a chunk of no ids, rendered as the row is.

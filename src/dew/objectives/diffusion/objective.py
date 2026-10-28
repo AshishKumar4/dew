@@ -416,7 +416,7 @@ class DiffusionObjective(Objective[Ratio]):
 
         `ema_decay` is the EMA's decay, either a number or a schedule over the number
         of updates so far, such as EDM2's power EMA
-        (`dew.training.posthoc.power_decay`). None keeps no EMA.
+        (`dew.averaging.power_decay`). None keeps no EMA.
 
         `uncertainty` learns EDM2's loss weighting (equation 21 of Karras et al.
         2024). It adds a head u of the model time, `dew.nn.mp.Uncertainty` with this

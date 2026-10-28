@@ -1416,3 +1416,41 @@ def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypa
 
     assert ran("on") == [0, 1]
     assert ran("off") == [1, 2]
+
+
+
+def proven_step(tmp_path: Path, ref: str, runs: str, statuses: str) -> str:
+    """The run .github/actions/proven's step gives, its own script run in bash for a push of `ref`, with a
+    GitHub CLI that answers the successful-runs query with `runs` and the commit's statuses query with
+    `statuses`, each as its --jq filter gives it."""
+    import yaml
+
+    action = yaml.safe_load((ROOT / ".github/actions/proven/action.yml").read_text())
+    [step] = action["runs"]["steps"]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "gh").write_text('#!/bin/sh\ncase "$2" in\n  */statuses*) cat "$STATUSES" ;;\n'
+                                '  *) cat "$RUNS" ;;\nesac\n')
+    (bin_dir / "gh").chmod(0o755)
+    (tmp_path / "runs").write_text(runs)
+    (tmp_path / "statuses").write_text(statuses)
+    output = tmp_path / "output"
+    subprocess.run(["bash", "-c", step["run"]], check=True, capture_output=True, text=True,
+                   env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                        "RUNS": str(tmp_path / "runs"), "STATUSES": str(tmp_path / "statuses"),
+                        "GITHUB_OUTPUT": str(output),
+                        "GITHUB_REPOSITORY": "AshishKumar4/dew", "GITHUB_SHA": "a" * 40, "GITHUB_REF": ref,
+                        "GITHUB_SERVER_URL": "https://github.com", "WORKFLOW": "ci.yml"})
+    return output.read_text().strip().removeprefix("run=")
+
+
+def test_a_tip_the_land_queue_graded_green_is_proven_for_mains_push_alone(tmp_path):
+    """Main's push run proves nothing again at a tip the land queue graded green, which it posts before main
+    moves (a commit status, context land-queue): a train whose CI was red on a row its regrade passed has no
+    successful run at its tip, and main's run re-ran the suite for 11 minutes and held the next train's test
+    job (Main, 2026-10-27). Only main's push reads it: a lane's push of a commit carrying one runs as ever."""
+    status = "4242\n"
+    assert proven_step(tmp_path / "main", "refs/heads/main", "", status) == "4242"
+    assert proven_step(tmp_path / "lane", "refs/heads/fix/lane", "", status) == ""
+    # A successful run proves the commit for any push, as before.
+    assert proven_step(tmp_path / "run", "refs/heads/fix/lane", "77\n", "") == "77"

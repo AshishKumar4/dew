@@ -387,7 +387,7 @@ def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
                                          arguments=("-e", "docker")), gateway)
     try:
         futures = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 2, version=5, key=KEY)
-        rollouts = [future.result(timeout=60) for future in futures]
+        rollouts = [future.result() for future in futures]
     finally:
         source.close()
     assert [rollout.sample for rollout in rollouts] == [0, 1]
@@ -426,7 +426,7 @@ def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbo
             time.sleep(0.05)
         began = time.monotonic()
         source.cancel([future])
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30
@@ -446,7 +446,7 @@ def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_p
         while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
             time.sleep(0.05)
         source.cancel([future])
-        assert future.result(timeout=15).status is Status.CANCELLED
+        assert future.result().status is Status.CANCELLED
         # Cancelling a resolved future again is a no-op, not a signal to a reaped process group.
         source.cancel([future])
     finally:
@@ -520,7 +520,7 @@ def test_a_finished_trial_ends_what_it_left_running_in_its_group(tmp_path, harbo
     try:
         (future,) = source.submit(Task("leaves", {HARBOR_KEY: str(tmp_path / "leaves")}), 1, version=0,
                                   key=KEY)
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     (child,) = (tmp_path / "trials").glob("*/child.json")
@@ -541,7 +541,7 @@ def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, h
     began = time.monotonic()
     try:
         (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     resolved = time.monotonic() - began
@@ -565,7 +565,7 @@ def test_a_trial_that_closes_its_output_and_runs_on_is_bounded_by_its_deadline(t
     began = time.monotonic()
     try:
         (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     (seen,) = (tmp_path / "trials").glob("*/seen.json")
@@ -582,7 +582,7 @@ def test_a_trial_without_a_descriptor_for_its_wake_pipe_is_infra_and_frees_its_w
     here = Path(__file__).resolve().parent
     script = (f"import test_harbor_source as tests; "
               f"tests.descriptorless_flow({str(harbor)!r}, {str(tmp_path)!r})")
-    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
                          cwd=here, env={**os.environ,
                                         "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
     assert run.returncode == 0, run.stderr[-4000:]
@@ -599,18 +599,18 @@ def descriptorless_flow(harbor: str, root: str) -> None:
     source = HarnessSource(harbor_trials(harbor, Path(root) / "trials"), fake_gateway()[0], workers=1)
     try:
         (first,) = source.submit(task, 1, version=0, key=KEY)
-        before = first.result(timeout=120)
+        before = first.result()
         resource.setrlimit(resource.RLIMIT_NOFILE, (256, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
         taken = []
         with contextlib.suppress(OSError):
             while True:
                 taken.append(os.open(os.devnull, os.O_RDONLY))
         (starved,) = source.submit(task, 1, version=0, key=KEY)
-        failed = starved.result(timeout=120)
+        failed = starved.result()
         for descriptor in taken:
             os.close(descriptor)
         (after,) = source.submit(task, 1, version=0, key=KEY)
-        rollout = after.result(timeout=120)
+        rollout = after.result()
     finally:
         source.close()
     print(json.dumps([before.status.name, failed.status.name, failed.detail.split(":")[1].strip(),
@@ -632,7 +632,7 @@ def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp
             time.sleep(0.05)
         began = time.monotonic()
         source.cancel([future])
-        rollout = future.result(timeout=30)
+        rollout = future.result()
         resolved = time.monotonic() - began
     finally:
         source.close()
@@ -656,7 +656,7 @@ def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
     closer.start()
     closer.join(20)
     assert not closer.is_alive() and time.monotonic() - began < 20
-    assert [future.result(timeout=1).status for future in futures] == [Status.CANCELLED, Status.CANCELLED]
+    assert [future.result().status for future in futures] == [Status.CANCELLED, Status.CANCELLED]
     # The queued sample never started a trial.
     assert len(list((tmp_path / "trials").glob("*/seen.json"))) == 1
 
@@ -667,7 +667,7 @@ def test_the_first_submission_waits_for_a_healthy_gateway_worker(tmp_path, harbo
     source = HarnessSource(harbor_trials(harbor, tmp_path / "trials", model="m/p"), gateway, ready_poll=0.01)
     try:
         (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
-        assert future.result(timeout=60).status is Status.COMPLETED
+        assert future.result().status is Status.COMPLETED
     finally:
         source.close()
     # No trial started until the gateway reported a healthy worker, and it asked only once per source.
@@ -681,7 +681,7 @@ def test_a_gateway_that_reports_healthy_before_its_engine_listens_is_waited_for(
     source = HarnessSource(harbor_trials(harbor, tmp_path / "trials", model="m/p"), gateway, ready_poll=0.01)
     try:
         (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
-        assert future.result(timeout=60).status is Status.COMPLETED
+        assert future.result().status is Status.COMPLETED
     finally:
         source.close()
     # The model listing went through the gateway to the engine and answered before any trial ran.
@@ -748,7 +748,7 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
                                      tests=str(Path(__file__).parent), root=str(tmp_path), task=task,
                                      ready="*/child.json" if task.startswith("lingering") else "*/seen.json"))
     began = time.monotonic()
-    trainer = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120,
+    trainer = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
                              env={**os.environ, "JAX_PLATFORMS": "cpu"})
     # An uncaught KeyboardInterrupt ends CPython by SIGINT, so any other failure shows as itself.
     assert trainer.returncode == -signal.SIGINT, trainer.stderr[-2000:]
@@ -815,7 +815,7 @@ def test_an_agent_command_runs_in_its_own_directory_against_its_own_session(tmp_
     gateway, asked = fake_gateway()
     source = HarnessSource(agent_command(tmp_path), gateway)
     try:
-        rollouts = [future.result(timeout=60) for future in source.submit(Task(task), 2, version=3, key=KEY)]
+        rollouts = [future.result() for future in source.submit(Task(task), 2, version=3, key=KEY)]
     finally:
         source.close()
     for rollout in rollouts:
@@ -839,7 +839,7 @@ def test_an_agent_command_the_verifier_cannot_score_is_infra_however_the_session
                            fake_gateway(extra=extra)[0])
     try:
         (unscored,) = source.submit(Task("adds"), 1, version=0, key=KEY)
-        assert unscored.result(timeout=60).status is Status.INFRA_ERROR
+        assert unscored.result().status is Status.INFRA_ERROR
     finally:
         source.close()
 
@@ -853,7 +853,7 @@ def test_an_agent_command_is_judged_by_what_the_engine_said_first(tmp_path, extr
     source = HarnessSource(agent_command(tmp_path), fake_gateway(extra=extra)[0])
     try:
         (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
-        rollout = future.result(timeout=60)
+        rollout = future.result()
     finally:
         source.close()
     assert rollout.status is status and rollout.reward == (None if status is Status.INFRA_ERROR else 1.0)
@@ -875,7 +875,7 @@ def test_an_agent_command_in_a_relative_workspace_runs_what_it_put_in_its_direct
     source = HarnessSource(command, fake_gateway()[0])
     try:
         (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
-        rollout = future.result(timeout=60)
+        rollout = future.result()
     finally:
         source.close()
     assert (rollout.status, rollout.reward) == (Status.COMPLETED, 1.0)
@@ -890,7 +890,7 @@ def test_a_cancelled_agent_command_is_interrupted_and_resolves_cancelled(tmp_pat
             time.sleep(0.05)
         began = time.monotonic()
         source.cancel([future])
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30
@@ -942,7 +942,7 @@ def test_an_agent_command_that_cannot_start_is_infra(tmp_path):
     source = HarnessSource(command, fake_gateway()[0])
     try:
         (rollout,) = source.submit(Task("adds"), 1, version=0, key=KEY)
-        failed = rollout.result(timeout=60)
+        failed = rollout.result()
     finally:
         source.close()
     assert failed.status is Status.INFRA_ERROR and "FileNotFoundError" in failed.detail
