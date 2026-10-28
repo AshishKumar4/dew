@@ -1301,7 +1301,7 @@ class Trainer(Generic[Loss, Effects]):
         `tokens` stops at the first microbatch that reaches this real-token budget, from the same counter
         as `train/tokens`, persisted in checkpoints. Padding never counts. With both caps the first reached
         ends the run; with `steps=None`, a decaying schedule needs its own step horizon. `examples` trains
-        on the chain's first records, each once (`Loader.example_steps`).
+        on the chain's first source examples, each once with all its rows (`Loader.example_steps`).
 
         Every `eval_every` steps, and at the end, the validation split is scored. The objective's
         artifacts go to the tracker and to `metrics`, whose reductions are logged as `val/<name>`.
