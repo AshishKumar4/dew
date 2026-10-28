@@ -11,7 +11,7 @@ import numpy as np
 
 from dew._records import boolean, integer, record, text
 from dew.batch import Batch
-from dew.data.pipeline import Rejected
+from dew.data.pipeline import Rejected, cut
 
 
 @dataclasses.dataclass(frozen=True)
@@ -34,10 +34,10 @@ class LengthPolicy(grain.MapTransform):
         if self.long == "drop":
             return Rejected("over_length")
         span = slice(count - self.length, None) if self.side == "left" else slice(self.length)
-        return {
-            key: value[span] if key in (self.field, *self.aligned) else value
-            for key, value in element.items()
-        } | {"_dew_truncated": True, "_dew_length": self.length}
+        kept = {key: value[span] if key in (self.field, *self.aligned) else value
+                for key, value in element.items()}
+        # The cut's record, the field it cut and the tokens it removed, composed with earlier cuts'.
+        return {**cut(kept, {self.field: count - self.length}), "_dew_length": self.length}
 
 
 @dataclasses.dataclass(frozen=True)

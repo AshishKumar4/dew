@@ -34,7 +34,7 @@ The three layouts become three configurations of these segments. The proof: each
 
 Each segment names its stream: `main`, the row the backbone reads, or a named conditioning stream. A conditioning stream is an ordinary `dew.inputs.Condition`: an encoder over a batch field. The decision's data writes that field from the segments routed to the stream. The backbone itself is one such encoder: it embeds the stream's tokens with its own table, as the context does today, or runs its own forward over them (a second pass). The model's cross-attention layers read the stream's encoded sequence as their context (`CONTEXT`, `CONTEXT_LENGTHS`).
 
-So today's `Example.context` is one segment, `State`-like over the example's context, routed to a stream the token table encodes. "The schema on a separate path" is a `Schema` segment routed to a stream the backbone encodes. Neither needs code of its own. Packing keeps one row a window wherever a row has a conditioning stream (each window's stream is its row's).
+So today's `Example.context` is one segment, `State`-like over the example's context, routed to a stream the token table encodes. "The schema on a separate path" is a `Schema` segment routed to a stream the backbone encodes. Neither needs code of its own. Packing places every stream of a row together: a window holds rows while both its tokens (`max_len`) and its contexts (the objective's `context_window`, `max_len` or one row's `context_length` where that is longer) hold them, each row's context end to end after the rows before it (`context_segments`), each question carrying the row the packer placed it in (`question_rows`), and each span moved by its row's start along the stream it indexes: its tokens, or its context where the schema is the context. A row's tokens attend to its own context alone, and the backbone's pass over the contexts reads each as a document of its own.
 
 - **One backbone.** The backbone as a stream encoder is `dew.nn.cross_attention.encode_context`, which any model with cross-attention layers takes (`ContextEncoder`: its token table or its own pass), and holds no parameters of its own: it references the model's variables, its LoRA factors included where the model is adapted, and calls the model's public `hidden_states` with no conditioning, so a stream never reads itself. One optimizer update moves both passes; a save stores one backbone. A stream's own adapter waits for an experiment that needs it.
 - **Gradients.** A stream whose encoder trains nothing (a frozen trunk with no adapter) runs under `stop_gradient`: its backward would be pure cost.
@@ -44,7 +44,7 @@ So today's `Example.context` is one segment, `State`-like over the example's con
 
 ## 3. The head reads the main pass
 
-The joint head separates what it pools from what it attends to (`JointSchemaHead.__call__`). Question and option spans give its queries (`_span_means`). The row's normed states are the memory its routing and field layers read, and the row's last token is the readout.
+The joint head separates what it pools from what it attends to (`JointSchemaHead.__call__`). Question and option spans give its queries (`span_means`). The row's normed states are the memory its routing and field layers read, and the row's last token is the readout.
 
 With the schema in the main row nothing changes. With the schema on a stream, the spans index the stream's final-normed states, the same norm as the main pass's: the stream's encoder returns per-token states. The memory and the readout stay the main pass's states, which read the stream through cross-attention. Each prediction then depends on the main row's input, conditioned on the schema, and never on the schema alone. The head takes the spans' source as an input (`main` or a stream name) rather than assuming the row.
 
@@ -64,6 +64,6 @@ On the command line it is the same record (`--layout.segments ...`). The decisio
 ## Seams, invariants, rejected alternatives
 
 - **One owner of a row's tokens:** the segment pass. `Encoding`, `Decide._encoded` and `bounds` all read rows through it, so training and serving lay rows out alike, as they do today.
-- **Spans are positions in their stream.** Each `Laid` records which stream its spans index. A head refuses spans in a stream it is not handed (TypeError).
+- **Spans are positions in their stream.** Each row records whether its spans index its context (`Encoded.spans_in_context`), and a packed window moves them by the row's start along that stream. Laya's head, which reads its spans in the row, refuses spans in the context (TypeError); the joint head refuses spans in a stream it is not handed (ValueError).
 - **Rejected: a fourth layout class** (schema first, or a separate schema): each new arrangement would be another class and another registry entry.
 - **Rejected: schema-specific conditioning code.** A stream is a `Condition`, so the schema, a context and an image tower's sequence compose the same way.

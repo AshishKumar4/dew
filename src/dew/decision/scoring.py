@@ -25,7 +25,7 @@ import numpy as np
 
 from dew.artifacts import Artifact, Decisions
 from dew.batch import Batch
-from dew.decision.metrics import Answered
+from dew.eval.common import masked_total
 from dew.nn import categorical
 from dew.objectives.base import Metric, Shown, mean_of_totals, merge_totals
 
@@ -56,12 +56,14 @@ class ScoringRule(ABC):
     __rmul__ = __mul__
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
-        answered = Answered.of(artifact)
-        logits = np.log(np.clip(answered.probabilities, 1e-300, None))
-        charged = np.asarray(self.charge(jnp.asarray(logits), jnp.asarray(answered.targets),
-                                         jnp.asarray(answered.options), jnp.asarray(answered.ordinal)),
-                             np.float64)
-        return float(charged.sum()), float(charged.size)
+        """The rule's charge over the batch's answered questions, read at the batch's fixed shape, its
+        unanswered rows masked (`masked_total`): one program a shape, every validation split's."""
+        if not isinstance(artifact, Decisions):
+            raise TypeError(f"a decision metric reads Decisions, not {type(artifact).__name__}")
+        logits = np.log(np.clip(np.asarray(artifact.probabilities, np.float64), 1e-300, None))
+        return masked_total(type(self).charge, self, np.asarray(artifact.scored, bool), logits,
+                            np.asarray(artifact.targets, np.float64), np.asarray(artifact.options, bool),
+                            np.asarray(artifact.ordinal, bool))
 
     merge = staticmethod(merge_totals)
     finalize = staticmethod(mean_of_totals)
@@ -115,7 +117,8 @@ class RankedProbability(ScoringRule):
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
         total, _ = super().__call__(artifact, batch)
-        return total, float(np.sum(Answered.of(artifact).ordinal))
+        assert isinstance(artifact, Decisions)
+        return total, float(np.sum(np.asarray(artifact.scored, bool) & np.asarray(artifact.ordinal, bool)))
 
 
 @dataclass(frozen=True)
@@ -145,8 +148,9 @@ class Combined(ScoringRule):
 
 
 def default_metrics() -> list[Metric]:
-    """The held-out suite a decision run scores by default, fresh: accuracy, calibration error,
-    the risk-coverage area and the log loss, in that order."""
-    from dew.decision.metrics import AURC, ECE, Accuracy
+    """The held-out suite a decision run scores by default, fresh, in this order: accuracy, macro F1,
+    calibration error, the risk-coverage area, the log loss, the Brier score and the count of the
+    questions they are taken over."""
+    from dew.decision.metrics import AURC, ECE, Accuracy, MacroF1, ScoredQuestions
 
-    return [Accuracy(), ECE(), AURC(), LogLoss()]
+    return [Accuracy(), MacroF1(), ECE(), AURC(), LogLoss(), Brier(), ScoredQuestions()]

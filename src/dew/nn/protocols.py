@@ -117,6 +117,7 @@ __all__ = [
     "TimeScaled",
     "TokenModel",
     "TritonGemm",
+    "label_logits",
 ]
 
 

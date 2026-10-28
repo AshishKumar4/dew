@@ -524,6 +524,7 @@ def _prepared(
     provision: bool,
     training: bool = False,
     objective: ObjectiveData | None = None,
+    widths: Mapping[str, object] | None = None,
     counts: Sequence[dict[str, CorpusCounts]] | None = None,
     automatic: str | None = None,
     examples: int | None = None,
@@ -576,7 +577,9 @@ def _prepared(
             if training and not stored(branches[0]):
                 raise ValueError(f"no accepted rows of {_name(branches[0])}; raise the row budgets")
             metadata = _metadata(branches, read)
-        branches = tuple(_configured(branch, metadata, read) for branch in branches)
+        # A run's static widths, measured over every branch it reads, bind this one's run-scoped steps
+        # (`run_widths`): a validation split takes training's shapes, not its own.
+        branches = tuple(_configured(branch, {**metadata, **(widths or {})}, read) for branch in branches)
     if objective is not None:
         branches = tuple(_windowed(branch, objective) for branch in branches)
     if any(isinstance(stage, TokenBudget) for branch in branches for stage in branch.stages):
@@ -623,8 +626,10 @@ def compile(
     rejections: Literal["drop", "mask"] = "drop",
     resume: Literal["exact", "non-exact"] = "exact",
     examples: int | None = None,
+    widths: Mapping[str, object] | None = None,
 ) -> Loader:
-    """Check every leaf before opening readers, then build both branches.
+    """Check every leaf before opening readers, then build both branches; `widths` are the run's
+    static widths its steps bind to (`run_widths`).
     With no `read`, the sources choose it (`_preferred_read`). `examples` bounds the training read to
     its first that many source examples, before they are packed and before the objective makes rows
     of them (`_bounded`), a run's `examples=` budget."""
@@ -645,7 +650,7 @@ def compile(
             resume=resume,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
-                     seed=seed, rejections=rejections, examples=examples)
+                     seed=seed, rejections=rejections, examples=examples, widths=widths)
     loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
     return loader if examples is None else dataclasses.replace(loader, examples=examples)
 
@@ -676,6 +681,7 @@ def _staged(
     seed: int,
     rejections: Literal["drop", "mask"],
     examples: int | None = None,
+    widths: Mapping[str, object] | None = None,
 ) -> _Staged:
     from dew.data.cache import automatic_root
 
@@ -701,6 +707,7 @@ def _staged(
         counts=(counts,) if validation is None else (counts, validation_counts),
         automatic=automatic_root(loading) if read != "streamed" else None,
         examples=examples if written is None else None,
+        widths=widths,
     )
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
@@ -1247,6 +1254,30 @@ def iterate(
     return _as_iter(rows, loading)
 
 
+@compiling
+def run_widths(training: Pipeline | None, held: Sequence[Pipeline], objective: ObjectiveData,
+               ) -> Mapping[str, object]:
+    """A run's static widths: the facts its objective's run-scoped steps read (`Configured.scope`,
+    such as a decision's `slots`), measured over its `training` chain and every `held` one, each
+    prepared in its own role with the objective's steps in their places, as it is read, and merged as
+    a run reads them together (`merge_facts`: slots as their maxima). Training and every validation
+    split bind them alike (`fitted`), so every split reads in training's shapes, one program for them
+    all, where a split once took its own. None are measured where the objective's steps read none."""
+    needs = {need for step in (*objective.train, *objective.evaluate)
+             if isinstance(step, Configured) and step.scope == "run" for need in step.needs}
+    if not needs:
+        return {}
+    measured = []
+    for chain, training_role in ((training, True), *((chain, False) for chain in held)):
+        if chain is None:
+            continue
+        read = chain.mode or _preferred_read((chain,), provision=True)
+        prepared = _prepared((chain,), read, provision=True, training=training_role, objective=objective)
+        measured.append(_metadata(prepared, read))
+    merged = merge_facts(measured)
+    return {name: merged[name] for name in sorted(needs) if name in merged}
+
+
 def fitted[Entry](
     dataset: Dataset | Loader,
     validation: Dataset | Mapping[str, Dataset | Entry] | None,
@@ -1264,16 +1295,21 @@ def fitted[Entry](
     training batch, and is read and loaded as it asks. A Loader is already
     compiled, and an entry that is no Dataset (a reader, an evaluation suite)
     is passed on as it is."""
+    named = {"val": validation} if isinstance(validation, Dataset) else validation
+    # Every chain the run reads binds the widths measured over them all (`run_widths`).
+    scored = [entry._chain() for entry in (named or {}).values() if isinstance(entry, Dataset)]
     if isinstance(dataset, Dataset):
         chain = dataset._chain()
-        loader = compile(chain if examples is not None else _endless(chain), objective=objective,
-                         provision=True, seed=seed, examples=examples)
+        trained = chain if examples is not None else _endless(chain)
+        widths = run_widths(trained, scored, objective) if scored else {}
+        loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
+                         widths=widths)
     else:
+        widths = run_widths(None, scored, objective) if scored else {}
         loader = dataset
-    named = {"val": validation} if isinstance(validation, Dataset) else validation
     if named is None:
         return loader, None
-    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed)
+    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed, widths=widths)
                     if isinstance(entry, Dataset) else entry for name, entry in named.items()}
 
 
@@ -1307,7 +1343,7 @@ def _reads_on(chain: Pipeline) -> bool:
 
 
 def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,
-         seed: int = 0) -> Reader:
+         seed: int = 0, widths: Mapping[str, object] | None = None) -> Reader:
     """`dataset` read once to validate or evaluate on, in its own batches, else in batches of `batch`,
     read and loaded as it asks, its random steps drawing from `seed`; one that states neither batch is
     refused. A pass reads every record: a batch it fills only in part keeps the records it holds,
@@ -1323,7 +1359,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
         for stage in chain.stages))
     # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
     return validation(chain, batch=1, objective=objective, read=chain.mode,
-                      loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed)
+                      loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed, widths=widths)
 
 
 @compiling
@@ -1337,13 +1373,16 @@ def validation(
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
     seed: int = 0,
+    widths: Mapping[str, object] | None = None,
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
-    stream. With no `read`, the sources choose it (`_preferred_read`)."""
+    stream. With no `read`, the sources choose it (`_preferred_read`); `widths` are the run's static
+    widths its steps bind to (`run_widths`)."""
     read = read or _preferred_read((pipeline,), provision=provision)
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
-    prepared = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
+    prepared = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},),
+                         widths=widths)
     (pipeline,) = _made(prepared, read, ({},), training=False)
     packed = _coordinated(pipeline)
     # A token budget is fixed-length rows by now (`_budgeted`).

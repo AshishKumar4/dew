@@ -14,7 +14,7 @@ from dew._records import integer, record
 from dew.batch import Batch
 from dew.data.chat import ROLES_KEY, Role
 from dew.data.facts import shaped, unshaped
-from dew.data.pipeline import Rejected
+from dew.data.pipeline import Rejected, cut
 from dew.data.prompts import (
     FIELDS as PROMPT_FIELDS,
     INFO_KEY,
@@ -80,10 +80,13 @@ class ResponseCanvases:
             text[:min(start, self.prompt_length)] = ids[:min(start, self.prompt_length)]
             text[self.prompt_length:self.prompt_length + filled] = self.eos_id
             text[self.prompt_length:self.prompt_length + len(response)] = response
-            cut = start > self.prompt_length or end - start > capacity
-            rows.append({**kept, "text": text, "canvas_mask": np.arange(capacity) < filled,
-                         "prompt_mask": np.arange(self.prompt_length) < min(start, self.prompt_length),
-                         **({"_dew_truncated": True} if cut else {})})
+            # Each cut's record, composed with earlier cuts': the context's tokens past the prompt's
+            # length, the response's past its canvases.
+            removed = {"context": max(0, int(start) - self.prompt_length),
+                       "response": max(0, int(end - start) - capacity)}
+            rows.append(cut({**kept, "text": text, "canvas_mask": np.arange(capacity) < filled,
+                             "prompt_mask": np.arange(self.prompt_length) < min(start, self.prompt_length)},
+                            removed))
         return rows
 
 
@@ -128,9 +131,11 @@ class RenderPrompt(grain.MapTransform):
         if "prompt" not in element:
             raise ValueError("RenderPrompt needs a prompt column")
         ids = _prompt_ids(self.vocabulary, element["prompt"], element.get("tools"), "prompt", self.thinking)
-        if len(ids) > self.max_prompt_len:
+        removed = max(0, len(ids) - self.max_prompt_len)
+        if removed:
             if self.long == "drop":
                 return Rejected("over_length")
+            # The prompt keeps its end; its cut's record counts the start it removed.
             ids = ids[-self.max_prompt_len :]
         prompt = np.full(self.max_prompt_len, self.pad_id, np.int32)
         prompt[-len(ids) :] = ids
@@ -138,12 +143,12 @@ class RenderPrompt(grain.MapTransform):
         for name, value in context.items():
             if len(value.encode("utf-8")) > self.reward_bytes:
                 raise ValueError(f"prompt {name} exceeds reward_bytes={self.reward_bytes}")
-        return {
+        return cut({
             **{key: value for key, value in element.items() if key not in PROMPT_FIELDS},
             PROMPT_KEY: prompt,
             LENGTH_KEY: np.int32(len(ids)),
             **{name: _utf8(value, self.reward_bytes) for name, value in context.items()},
-        }
+        }, {"prompt": removed})
 
 
 @dataclasses.dataclass(frozen=True)
