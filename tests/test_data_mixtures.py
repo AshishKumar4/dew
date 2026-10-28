@@ -32,7 +32,7 @@ from token_support import write_token_corpus
 
 from dew import position
 from dew.batch import VALID_ROWS, freeze, thaw
-from dew.data import Files, Loading, Memory, phases, presets, schedule
+from dew.data import Files, Loading, Memory, from_grain, phases, presets, schedule
 from dew.data.compile import compile, held, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, PhasedStream, Ramp, Stage, ramped
 from dew.data.images import EncodeCaptions
@@ -1763,3 +1763,58 @@ def test_a_finite_mixture_resumed_after_a_member_ends_reads_what_the_uninterrupt
             resumed.close()
 
 
+
+
+@dataclasses.dataclass(frozen=True)
+class Kept:
+    """A filter that keeps every record."""
+
+    identity = "kept@1"
+
+    def __call__(self, row) -> bool:
+        return True
+
+
+class Seen:
+    """`rows` records of a corpus that marks itself in `touched` whenever one of them is read."""
+
+    def __init__(self, rows: int, corpus: int, touched: set[int]):
+        self.rows, self.corpus, self.touched = rows, corpus, touched
+
+    def __len__(self) -> int:
+        return self.rows
+
+    def __getitem__(self, index: int) -> dict:
+        self.touched.add(self.corpus)
+        return {"id": np.int64(self.corpus * 1000 + index)}
+
+
+@pytest.mark.parametrize("members", [300, 4])
+def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_corpora_it_draws(members):
+    """A mix of 300 corpora, or of 4 each with threads of its own, each shuffled, repeated and filtered
+    as a run's sources are, read with Loading's 16 threads and 16-batch read-ahead: its reader holds
+    no more threads than one read of them all, and opens and reads only the corpora it draws, here
+    the two that carry its weight. Before, each corpus read with the whole budget and the mix read
+    every corpus's first row before its first: 300 thread pools and every corpus read (row 2016)."""
+    import threading
+
+    touched: set[int] = set()
+    # Each corpus filters its records, as a run's sources drop what they reject, so the mix reads each
+    # as a stream of its own share (as a token-budget batch reads them too).
+    # Grain stores, each read by index as a run's files are: one held in memory is scanned for the
+    # records it holds before it is read (`_Present`).
+    corpora = [Pipeline(from_grain(pygrain.MapDataset.source(Seen(64, corpus, touched)), f"seen-{corpus}"))
+               .shuffle(corpus).repeat().filter(Kept()) for corpus in range(members)]
+    weights = [1.0, 1.0] + [1e-9] * (members - 2)
+    data = compile(mix(corpora, weights).batch(8), read="indexed", seed=0,
+                   loading=Loading(workers=0, threads=16, read_buffer=16, cache=False))
+    before = threading.active_count()
+    touched.clear()
+    reader = data.train(DataPartition())
+    try:
+        for _ in range(4):
+            next(reader)
+        assert threading.active_count() - before <= 16
+        assert touched == {0, 1}
+    finally:
+        reader.close()

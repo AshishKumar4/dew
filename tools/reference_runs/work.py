@@ -49,8 +49,9 @@ def measure(objective: Objective, batch: Batch) -> WorkloadWork:
 
 def lm(args) -> WorkloadWork:
     """The checkpoint translator builds the same native decoder as Pretrained.load."""
+    from dew.batch import TEXT_KEY
     from dew.interop import translate_config
-    from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.objectives.lm import LMObjective
 
     fields = translate_config(json.loads(Path(args.config).read_text()))
     fields.update(dtype=args.dtype, attention_impl=args.attention)

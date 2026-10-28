@@ -2,11 +2,13 @@
 
 import base64
 import binascii
+import contextlib
 import functools
 import io
 import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, overload
@@ -38,6 +40,7 @@ from dew.decision.head import Head
 from dew.decision.images import Images
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
+    OPTION_TILE,
     QUESTION_FIELDS,
     DecisionInputs,
     Encoded,
@@ -64,7 +67,7 @@ from dew.decision.questions import (
 )
 from dew.files import write_atomically
 from dew.inference import scoring
-from dew.inference.tasks import SavedRun, SavedRunTask, shape_bucket
+from dew.inference.tasks import SavedRun, SavedRunTask, length_ladder, shape_bucket
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
@@ -89,13 +92,21 @@ TASK_FILE = "decide.json"
 class Budget:
     """How much one forward pass may hold: at most `tokens` padded tokens and `rows` question rows.
 
-    Laya's `predict_items` uses 16384 and 256. A pass's row count is padded to a
-    power of two and its row length to one of at least 64, so passes share
-    compiled programs.
+    Laya's `predict_items` uses 16384 and 256. A pass pads to one of a few
+    lengths and row counts declared once (`Decide.pass_shapes`), and its
+    questions and options to `questions` and `options` where they are declared,
+    so every pass shares one of a few programs, compiled up front
+    (`Decide.compile_scoring`).
     """
 
     tokens: int = 16384
     rows: int = 256
+    questions: int | None = None
+    """The questions every row of a pass pads to, the run's widest (training's own static width); None
+    rounds each pass's widest up to a power of two, a program for each, compiled as it comes. A request
+    of more widens its pass, compiling it."""
+    options: int | None = None
+    """The options every question of a pass pads to, as `questions`."""
 
 
 @dataclass(frozen=True)
@@ -111,6 +122,18 @@ class Weights:
     averaged: tuple[tuple[str, int, bool], ...] = ()
     """The runs' checkpoints these weights are the fp32 mean of (`Decide.averaged`): each run's
     directory, step, and whether its own average was read; none for one run's weights."""
+
+
+@dataclass(frozen=True)
+class PassShape:
+    """The shape of one scoring pass (`Decide.pass_shapes`): `rows` rows of `length` tokens, each of
+    `questions` questions of `options` options (the budget's, None where it declares none: each pass's
+    own, rounded up to a power of two)."""
+
+    length: int
+    rows: int
+    questions: int | None
+    options: int | None
 
 
 @dataclass(frozen=True)
@@ -452,11 +475,61 @@ class Decide(SavedRunTask):
         return {name: answers[name] for name in questions}, usage_of(rows)
 
     def fits(self, rows: Sequence[Encoded]) -> bool:
-        """Whether `rows` are one of `logits`' passes: within the budget's rows, and its tokens at the
-        pass's bucketed shape (`shape_bucket`)."""
+        """Whether `rows` are one of `logits`' passes: as many as its shape holds (`pass_shapes`)."""
+        return len(rows) <= self._shape(rows).rows
+
+    @functools.cached_property
+    def pass_shapes(self) -> tuple[PassShape, ...]:
+        """The shapes a text pass pads to, declared once: the layout's window and its halvings
+        (`dew.inference.tasks.length_ladder`), each at a few row counts, one row (a lone request's pass),
+        the powers of 8 below the most the budget's tokens and rows allow, and that most, so a pass
+        pads to at most 8 times its rows; each with the budget's questions and options (`Budget`).
+        Where the budget declares both, each shape is one program, which `compile_scoring` compiles."""
+        shapes = []
+        for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens)):
+            most = max(1, min(self.budget.rows, self.budget.tokens // length))
+            counts = sorted({*(8 ** power for power in range(math.floor(math.log(most, 8)) + 1)), most})
+            shapes.extend(PassShape(length, count, self.budget.questions, self.budget.options)
+                          for count in counts)
+        return tuple(shapes)
+
+    def _shape(self, rows: Sequence[Encoded]) -> PassShape:
+        """The shape of the pass over `rows` (`pass_shapes`): of the shortest length that holds the
+        longest row, the fewest rows that hold them, or the most there are, which `fits` refuses past."""
         longest = max(len(row.tokens) for row in rows)
-        return (len(rows) <= self.budget.rows
-                and shape_bucket(longest, 64) * shape_bucket(len(rows), 1) <= self.budget.tokens)
+        # The layout refuses a row past its window (`_encoded`), which the last length is.
+        length = next(shape.length for shape in self.pass_shapes if shape.length >= longest)
+        sized = [shape for shape in self.pass_shapes if shape.length == length]
+        return next((shape for shape in sized if shape.rows >= len(rows)), sized[-1])
+
+    def compile_scoring(self, variables: Variables | None = None) -> tuple[PassShape, ...]:
+        """Compile every text pass's program (`pass_shapes`) over `variables` (the task's own by
+        default), in parallel, by one pass of the layout's shortest row at each shape that holds it, so
+        a scorer compiles none while it serves; returns the shapes compiled. Where the budget declares no
+        questions or options (`Budget`), a pass's own decide its program, which it compiles as it
+        comes, and none is compiled here."""
+        if self.budget.questions is None or self.budget.options is None:
+            return ()
+        mesh = mesh_of(self.variables if variables is None else variables)
+
+        def compiled(shape: PassShape) -> None:
+            # Each worker traces under the mesh a pass serves under: a thread's mesh is its own.
+            with contextlib.nullcontext() if mesh is None else jax.set_mesh(mesh):
+                self._pass(self._probe, variables, shape)
+
+        # A layout that keeps a schema whole lays the probe out past a window too small for it, and
+        # that window's shapes compile on their first pass.
+        held = tuple(shape for shape in self.pass_shapes
+                     if shape.length >= max(len(row.tokens) for row in self._probe))
+        with ThreadPoolExecutor(max_workers=max(1, len(held))) as pool:
+            list(pool.map(compiled, held))
+        return held
+
+    @functools.cached_property
+    def _probe(self) -> list[Encoded]:
+        """The layout's shortest row, one one-option question about an empty state, laid out in its
+        window, which the shortest length (`pass_shapes`) is."""
+        return self.layout.rows(self.tokenizer, self.specials, "", {"q": Choice("x", ["0"])})
 
     def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
               context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:
@@ -541,22 +614,29 @@ class Decide(SavedRunTask):
         scores = self._pass(rows, self.variables if variables is None else variables)
         return [scores[index, :len(row.questions)] for index, row in enumerate(rows)]
 
-    def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None) -> np.ndarray:
-        """One forward pass at bucketed shapes, its rows placed on the
-        weights' mesh (`RowPlan`)."""
-        questions = max(len(row.questions) for row in rows)
-        options = max(len(laid.options) for row in rows for laid in row.questions)
-        inputs = DecisionInputs.collate(rows, self.specials.pad, questions=shape_bucket(questions, 1),
-                                        options=shape_bucket(options, 1),
-                                        context_length=self.context_length)
-        length = shape_bucket(inputs.tokens.shape[1], 64)
+    def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None,
+              shape: PassShape | None = None) -> np.ndarray:
+        """One forward pass at its declared shape (`pass_shapes`, the shortest that holds `rows` unless
+        `shape` is given), its rows placed on the weights' mesh (`RowPlan`)."""
+        shape = self._shape(rows) if shape is None else shape
+        asked = max(len(row.questions) for row in rows)
+        offered = max(len(laid.options) for row in rows for laid in row.questions)
+        # A declared width holds a pass unless a row asks more, which widens it (a program of its own).
+        questions = shape_bucket(asked, 1) if shape.questions is None else max(shape.questions, asked)
+        options = shape_bucket(offered, 1) if shape.options is None else max(shape.options, offered)
+        # Declared widths fix the real options' slots too: as many as the grid holds.
+        slots = (None if shape.questions is None or shape.options is None
+                 else -(-questions * options // OPTION_TILE) * OPTION_TILE)
+        inputs = DecisionInputs.collate(rows, self.specials.pad, questions=questions, options=options,
+                                        option_slots=slots, context_length=self.context_length)
+        length = shape.length
         inputs = replace(
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
             segments=_widened(inputs.segments, length),
             positions=None if inputs.positions is None else _widened(inputs.positions, length),
             slots=None if inputs.slots is None else _widened(inputs.slots, length),
             blocks=None if inputs.blocks is None else _widened(inputs.blocks, length, -1))
-        count = shape_bucket(len(rows), 1)
+        count = shape.rows
         padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
         plan = RowPlan.over(mesh_of(held), count)
@@ -750,7 +830,8 @@ class Decide(SavedRunTask):
         """`systemone` over a list of bodies, served as a server serves them (`scoring`,
         `dew.inference.scoring.ScoringServer`): each body admitted on its own, so a refusal is its
         body's alone, and the admitted ones' rows scored together, a pass at a time."""
-        server = scoring.ScoringServer.from_task(*self.scoring(details=details, strict=strict, whole=whole))
+        # A call's server compiles the passes it runs as it runs them, not every shape up front.
+        server = scoring.ScoringServer(*self.scoring(details=details, strict=strict, whole=whole), rows=64)
         answered: dict[int, dict[str, JSON] | ValueError] = {}
         futures = {}
         for index, request in enumerate(requests):
@@ -871,6 +952,10 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
             return self.decide.scored([row.encoded for row in rows], variables)
         return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
                                       variables)
+
+    def compile(self, variables: Variables) -> tuple[PassShape, ...]:
+        # The text passes' programs (`Decide.pass_shapes`); a pass of images compiles on its first.
+        return self.decide.compile_scoring(variables)
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
         return self.decide._wire_response(payload.questions,

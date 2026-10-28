@@ -31,27 +31,42 @@ def apply_xla_flags(flags: str | None) -> None:
         return
     existing = os.environ.get('XLA_FLAGS', '')
     os.environ['XLA_FLAGS'] = f"{existing} {flags}".strip()
-    _loaded()
 
 
 _LOADED: str | None = None
-"""XLA_FLAGS as JAX's backend read them: their last value Dew saw while the backend was still closed
-(`_loaded`), at its import and at each flag it applied, or None where it saw none before the backend
-opened. The environment can change after the backend opened, to no effect on it."""
+"""XLA_FLAGS as JAX's backend read them as it opened (`_watch_opening`), None where it opened before
+Dew was imported. The environment can change before and after, to no effect on the backend."""
+
+
+def _watch_opening() -> None:
+    """Record XLA_FLAGS as JAX's backend opens (`_LOADED`): JAX opens it in `xla_bridge.backends`,
+    each of its callers looking the function up there, so Dew's import wraps it once to read the
+    environment as the backend does. A backend already open read flags Dew never saw."""
+    # Private JAX entry point pinned by jax<0.11.3, as `backend_open`'s query is.
+    bridge = importlib.import_module("jax._src.xla_bridge")
+    if bridge.backends_are_initialized():
+        return
+    opening = bridge.backends
+
+    def backends():
+        global _LOADED
+        if not bridge.backends_are_initialized():
+            _LOADED = os.environ.get('XLA_FLAGS', '')
+        return opening()
+    # The function its callers look up in the module's namespace (`xla_bridge.backends`).
+    vars(bridge)["backends"] = backends
 
 
 def _loaded() -> str | None:
-    """The flags the backend reads or read (`_LOADED`): the environment's, while it is closed."""
-    global _LOADED
-    if not backend_open():
-        _LOADED = os.environ.get('XLA_FLAGS', '')
-    return _LOADED
+    """The flags the backend reads: the environment's while it is closed, those it read as it opened
+    once it has (`_LOADED`)."""
+    return _LOADED if backend_open() else os.environ.get('XLA_FLAGS', '')
 
 
 def flags_hold(flags: str) -> bool:
     """Whether every flag of `flags` holds as JAX's backend reads its flags (`_loaded`), or read them
-    once it opened: each read as XLA reads `flags` alone, its last occurrence's value, a bare flag's
-    'true'. Flags Dew never saw before the backend opened hold nowhere."""
+    as it opened: each read as XLA reads `flags` alone, its last occurrence's value, a bare flag's
+    'true'. Where the backend opened before Dew could watch it, no flag holds."""
     loaded = _loaded()
     if loaded is None:
         return False
@@ -362,5 +377,4 @@ def gpu_free_bytes(ordinal: int) -> int | None:
         cuda.cuDevicePrimaryCtxRelease_v2(device)
 
 
-# What the backend will read, as `import dew` finds it (`_LOADED`).
-_loaded()
+_watch_opening()

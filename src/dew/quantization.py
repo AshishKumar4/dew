@@ -289,10 +289,12 @@ class QuantizedProducts:
     operand (MLA's absorbed kv_b_proj) needs it to be; a weight-only rule with float gradients leaves it
     linear, by its quantized matrix. `weights`: their weights quantize, so the submodule multiplies by
     no weight it holds, which a layer that moves its weights (an in-context memory's recurrence) needs
-    it to."""
+    it to. `stochastic`: their gradients quantize and round stochastically, so a call that runs their
+    backward draws the `stochastic_rounding` stream (an in-context memory's inner steps)."""
 
     inputs: bool
     weights: bool
+    stochastic: bool = False
 
 
 def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
@@ -305,13 +307,18 @@ def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
     policy = trace.policy
     if policy is None:
         # A trace that names no policy (a provider of the caller's own) may quantize anything.
-        return QuantizedProducts(inputs=True, weights=True)
+        return QuantizedProducts(inputs=True, weights=True, stochastic=True)
     scope = (*module.path, name)
     params = flatten_dict(dict(module.variables.get("params", {}).get(name, {})))
     scopes = {scope, *((*scope, *leaf[:-1]) for leaf in params)}
     if all(policy.rule_for(path) is None for path in scopes):
         return QuantizedProducts(inputs=False, weights=False)
-    return QuantizedProducts(inputs=not policy.weight_only or policy.bwd_qtype is not None, weights=True)
+    # Whether a product the rule selects rounds stochastically, a weight-only rule's matmuls among them,
+    # is its operation's, which no parameter states: a rule that rounds stochastically counts as
+    # drawing the stream (a weight-only rule over a convolution's products alone draws none).
+    return QuantizedProducts(inputs=not policy.weight_only or policy.bwd_qtype is not None, weights=True,
+                             stochastic=policy.bwd_qtype is not None
+                             and policy.bwd_stochastic_rounding is not None)
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
