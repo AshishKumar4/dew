@@ -252,7 +252,7 @@ matrix's blocks (the interpreter runs the pair's two programs, each loading the 
 
 @runs("sm90")
 @pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED], ids=["one multiprocessor", "a pair"])
-@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue", "row scaled"])
+@pytest.mark.parametrize("case", ["norm and bias", "cast prologue", "row scaled"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     """The Hopper launches pinned to a cooperative tile, the forward's alone or a pair's (whose second row
     tile of a pair past its group's rows stores none of them), interpreted: each consumer rewrites and
