@@ -89,8 +89,10 @@ from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
 from dew.quantization import decoded_frozen_fp8, decoded_stored, moving_weights, quantized_products
 
+from .activations import UNGATED
 from .attention import FORWARD_MODE, LayerNorm
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks
+from .mlp import GatedMLP
 from .precision import at_least_fp32, l2norm
 
 CARRY = MEMORY_RESIDUALS[0]
@@ -176,9 +178,10 @@ class LinearMemory(nn.Module):
 
 
 class ResidualMemory(nn.Module):
-    """`x + N(f_res(x))`: f_res linear (`hidden` None) or `Dense(D) . activation . Dense(hidden)`, N a
-    layer norm or none. TTT's f (Sec 2.7: LN and residual, f_lin or a 4x GELU MLP), Nested Learning's
-    memories (Eq 89, no norm) and Miras' (Sec 5.3)."""
+    """`x + N(f_res(x))`: f_res linear (`hidden` None) or `Dense(D) . activation . Dense(hidden)`, the
+    ungated `GatedMLP` (`up`, `down`), N a layer norm or none. TTT's f (Sec 2.7: LN and residual, f_lin
+    or a 4x GELU MLP), Nested Learning's memories (Eq 89, no norm) and Miras' (Sec 5.3). `activation`
+    names one of `dew.nn.activations.UNGATED`."""
 
     hidden: int | None = None
     activation: Literal["gelu", "silu", "relu"] = "gelu"
@@ -188,11 +191,13 @@ class ResidualMemory(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision)
-        branch = x
-        if self.hidden is not None:
-            branch = getattr(nn, self.activation)(dense(self.hidden, name="up")(branch))
-        branch = dense(x.shape[-1], name="down")(branch)
+        if self.hidden is None:
+            branch = Dense(x.shape[-1], dtype=self.dtype, precision=self.precision, name="down")(x)
+        else:
+            mlp = GatedMLP(self.hidden, x.shape[-1], self.activation, use_bias=True, linear=Dense,
+                           names=("up", "down"), dtype=self.dtype, precision=self.precision)
+            nn.share_scope(self, mlp)
+            branch = mlp(x)
         if self.norm:
             branch = LayerNorm(epsilon=1e-6, dtype=self.dtype, name="norm")(branch)
         return x + branch
@@ -200,7 +205,8 @@ class ResidualMemory(nn.Module):
 
 class MLPMemory(nn.Module):
     """Titans' deep memory: dense layers of the `hidden` widths, then one back to the view's width,
-    `activation` between them (Sec 3.1)."""
+    `activation` between them (Sec 3.1), `layers_{i}` each: each two layers in turn an ungated
+    `GatedMLP`, a last odd one a `Dense`. `activation` names one of `dew.nn.activations.UNGATED`."""
 
     hidden: tuple[int, ...]
     activation: Literal["gelu", "silu", "relu"] = "silu"
@@ -209,10 +215,18 @@ class MLPMemory(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        for index, width in enumerate((*self.hidden, x.shape[-1])):
-            if index:
-                x = getattr(nn, self.activation)(x)
-            x = Dense(width, dtype=self.dtype, precision=self.precision, name=f"layers_{index}")(x)
+        widths = (*self.hidden, x.shape[-1])
+        for first in range(0, len(widths), 2):
+            if first:
+                x = UNGATED[self.activation](x)
+            if first + 1 == len(widths):
+                return Dense(widths[first], dtype=self.dtype, precision=self.precision,
+                             name=f"layers_{first}")(x)
+            mlp = GatedMLP(widths[first], widths[first + 1], self.activation, use_bias=True, linear=Dense,
+                           in_features=x.shape[-1], names=(f"layers_{first}", f"layers_{first + 1}"),
+                           dtype=self.dtype, precision=self.precision)
+            nn.share_scope(self, mlp)
+            x = mlp(x)
         return x
 
 
