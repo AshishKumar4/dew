@@ -340,7 +340,8 @@ def flaxdiff_start(solver, x_T):
     grid is that grid moved within a hundredth of a spacing (the writer's JITTER), which these solvers'
     states start no different on."""
     process, _ = karras_process()
-    return solver.init(x_T, np.asarray(process.times(12)), process, key=jax.random.key(0))
+    with jax.ensure_compile_time_eval():
+        return solver.init(x_T, np.asarray(process.times(12)), process, key=jax.random.key(0))
 
 
 def flaxdiff_walk(solver, x_T, times):
