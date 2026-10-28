@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import sys
 import types
 from pathlib import Path
 
@@ -140,7 +139,6 @@ def draw(seed: int) -> dict[str, np.ndarray]:
 
 
 def main() -> None:
-    sys.path.insert(0, str(FIXTURE.parents[2] / "tests"))
     import jax
     from recorded_references import provenance, record_case, save
     from test_edm_loss import edm2_loss, edm_loss
