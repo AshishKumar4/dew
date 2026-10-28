@@ -1,5 +1,6 @@
 """Phi-3's fused GQA and LongRoPE against transformers 5.16.1."""
 
+import contextlib
 import dataclasses
 import json
 from pathlib import Path
@@ -7,7 +8,13 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, float64_forward
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    float64_forward,
+    widened,
+)
 
 from dew.interop import Pretrained
 from dew.interop.sources import load_shards
@@ -101,6 +108,10 @@ def test_a_kinds_longrope_rebuilds_the_cache_at_its_crossing_as_the_models_does(
     np.testing.assert_array_equal(walk(kinded), walk(loaded.model))
 
 
+MIXED_SEEDS = 8
+"""The mixed-table rows' declared draws of ids against each row's batch-one reference (check 1)."""
+
+
 def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule():
     import torch
     from transformers import AutoModelForCausalLM
@@ -108,32 +119,45 @@ def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64
     from tools.torch_precision import float64
 
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
-    ids = np.load(DIRECTORY / 'input_ids.npy')[:, :4]
+    shape = np.load(DIRECTORY / 'input_ids.npy')[:, :4].shape
     positions = np.stack((np.arange(12, 16), np.arange(4)))
-    actual = np.asarray(loaded.model.apply(loaded.variables, ids, positions=positions))
     reference = AutoModelForCausalLM.from_pretrained(DIRECTORY, attn_implementation='eager').float().eval()
-
-    def rows(model):
-        return np.concatenate([
-            model(torch.from_numpy(ids[row:row + 1]).long(),
-                  position_ids=torch.from_numpy(positions[row:row + 1]).long(),
-                  use_cache=False).logits.detach().numpy() for row in range(2)], axis=0)
-
-    with torch.no_grad():
-        expected = rows(reference)
-    with float64(), torch.no_grad():
+    with float64():
         truth_model = AutoModelForCausalLM.from_config(
             reference.config, dtype=torch.float64, attn_implementation='eager').eval()
-        truth_model.load_state_dict(reference.state_dict())
-        truth = rows(truth_model)
-    _, terms = float64_forward(loaded.model, loaded.variables, ids, positions=positions)
-    for row in range(2):
-        assert_as_exact_as_the_reference(actual[row], expected[row], truth[row], f'Phi-3 mixed row {row}',
-                                         terms=np.asarray(terms)[row])
+    truth_model.load_state_dict(reference.state_dict())
+    vocabulary = json.loads((DIRECTORY / 'config.json').read_text())['vocab_size']
+
+    def draw(seed):
+        return (np.random.default_rng(seed).integers(0, vocabulary, shape).astype(np.int32),)
+
+    def rows(model, precision):
+        """Each row's logits at batch one, the reference's own table per row."""
+        def run(ids):
+            ids = np.asarray(ids)
+            with torch.no_grad(), precision():
+                return {f'row {row}': model(torch.from_numpy(ids[row:row + 1]).long(),
+                                            position_ids=torch.from_numpy(positions[row:row + 1]).long(),
+                                            use_cache=False).logits.double().numpy()[0] for row in range(2)}
+        return as_given(run)
+
+    def ours(ids):
+        logits = loaded.model.apply(loaded.variables, ids, positions=positions)
+        return {f'row {row}': logits[row] for row in range(2)}
+
+    assert_as_exact(ours, rows(reference, contextlib.nullcontext), draw, 'Phi-3 mixed rows',
+                    seeds=MIXED_SEEDS, truth_fn=rows(truth_model, float64))
+    (ids,) = draw(0)
+    actual = np.asarray(loaded.model.apply(loaded.variables, ids, positions=positions))
+    expected = np.stack([rows(reference, contextlib.nullcontext)(ids)[f'row {row}'] for row in range(2)])
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
 
     uniform = loaded.model.apply(loaded.variables, ids, positions=np.stack((np.arange(4), np.arange(4))))
     np.testing.assert_array_equal(actual[1], uniform[1])
+
+
+PACKED_SEEDS = 8
+"""Each packing's declared draws of ids against each document alone (check 1)."""
 
 
 def test_phi3_packed_documents_each_take_their_own_longrope_table():
@@ -142,30 +166,49 @@ def test_phi3_packed_documents_each_take_their_own_longrope_table():
     document beside a 9-token one reads the short table, the 9-token one the long table. A slice
     of a packed row (`ModelInputs.slice_tokens`, as the LM objective cuts its inputs) keeps its
     documents' ids: the last two tokens of a fourth document, at places 7 and 8, are a two-token
-    row holding id 4, which reads the long table. Each document's logits are as exact as its
-    logits alone."""
+    row holding id 4, which reads the long table. Each document's logits are on par with its
+    logits alone from their float64 run over drawn ids (check 1)."""
     from dew.nn.inputs import ModelInputs
 
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
-    ids = np.load(DIRECTORY / 'input_ids.npy')[0].astype(np.int32)
+    vocabulary = json.loads((DIRECTORY / 'config.json').read_text())['vocab_size']
+    wide = loaded.model.clone(dtype=jnp.float64)
     for lengths, start in (((3, 9), None), ((6,), None), ((1, 1, 1, 9), -2)):
         fill = np.zeros(12 - sum(lengths), np.int32)
         segments = np.concatenate([np.full(n, i, np.int32) for i, n in enumerate(lengths, 1)] + [fill])
         places = np.concatenate([np.arange(n, dtype=np.int32) for n in lengths] + [fill])
-        tokens = np.concatenate([ids[:sum(lengths)], fill])
-        inputs = ModelInputs(jnp.asarray(tokens[None]), {'positions': jnp.asarray(places[None]),
-                                                         'segment_ids': jnp.asarray(segments[None])})
-        inputs = inputs.slice_tokens(start)
-        logits = np.asarray(loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs()))[0]
-        held = {name: np.asarray(value)[0] for name, value in inputs.token_fields.items()}
-        for document in np.unique(held['segment_ids'][held['segment_ids'] > 0]):
-            span = held['segment_ids'] == document
-            alone_ids, alone_places = np.asarray(inputs.tokens)[0][span][None], held['positions'][span][None]
-            alone = np.asarray(loaded.model.apply(loaded.variables, alone_ids, positions=alone_places))[0]
-            truth, terms = float64_forward(loaded.model, loaded.variables, alone_ids, positions=alone_places)
-            assert_as_exact_as_the_reference(logits[span], alone, np.asarray(truth)[0],
-                                             f'document {document} of {lengths} from {start}',
-                                             terms=np.asarray(terms)[0])
+
+        def packed(tokens, start=start, places=places, segments=segments):
+            """The packed row of `tokens`, sliced as the objective cuts it."""
+            return ModelInputs(jnp.asarray(tokens[None]), {'positions': jnp.asarray(places[None]),
+                                                           'segment_ids': jnp.asarray(segments[None])}
+                               ).slice_tokens(start)
+
+        fields = packed(np.zeros(12, np.int32)).token_fields
+        held = {name: np.asarray(value)[0] for name, value in fields.items()}
+        documents = np.unique(held['segment_ids'][held['segment_ids'] > 0])
+
+        def draw(seed, lengths=lengths, fill=fill):
+            drawn = np.random.default_rng(seed).integers(0, vocabulary, sum(lengths)).astype(np.int32)
+            return (np.concatenate([drawn, fill]),)
+
+        def in_place(tokens, packed=packed, held=held, documents=documents):
+            inputs = packed(tokens)
+            logits = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())[0]
+            return {f'document {document}': logits[held['segment_ids'] == document] for document in documents}
+
+        def by_itself(model, variables, packed=packed, held=held, documents=documents):
+            def run(tokens):
+                inputs = packed(tokens)
+                return {f'document {document}': model.apply(
+                    variables, inputs.tokens[0][held['segment_ids'] == document][None],
+                    positions=held['positions'][held['segment_ids'] == document][None])[0]
+                    for document in documents}
+            return run
+
+        assert_as_exact(in_place, by_itself(loaded.model, loaded.variables), draw,
+                        f'documents of {lengths} from {start}', seeds=PACKED_SEEDS,
+                        truth_fn=lambda tokens, by=by_itself: by(wide, widened(loaded.variables))(tokens))
 
 
 def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
