@@ -166,20 +166,6 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     if family.copy_extent is not None and widest > family.copy_extent:
         return (f"the Mosaic mainloop loads a head {widest} wide in one copy, past the "
                 f"{family.copy_extent} one moves (`Family.copy_extent`)")
-    # The hooks as a launch runs them: on its family's least tile, its values in whole swizzled rows.
-    unit = math.lcm(family.role_rows, family.column_unit(dtype))
-    return unlowered(hooks, (unit, unit), _width(value_width, family, dtype))
-
-
-def unlowered(hooks: Hooks, tile: tuple[int, int], value_width: int) -> str | None:
-    """Why Mosaic GPU cannot lower `hooks` on this mainloop's tiles (`tile`, its outputs `value_width` wide),
-    or None: a hook that forms an array of a unit axis beside a longer one (`q_pos[:, :1]`, a reshape), whose
-    every operation jax 0.11.2's Mosaic GPU layout inference finds no layout for. A legality rule, which
-    the route's chooser reads to send such a call to another route, until the fork's layout inference
-    takes unit axes (ledger row 1428)."""
-    if any(_unit_axis(jaxpr) for jaxpr in _hook_jaxprs(hooks, tile, value_width)):
-        return ("the Mosaic mainloop takes no hook that forms a unit axis beside a longer one (Mosaic GPU's "
-                "layout inference finds no layout for it)")
     return None
 
 
@@ -198,6 +184,14 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
     hook on par with exact math (the hooked backward, HOOKS-FIX-h100)."""
     traced = _hook_jaxprs(hooks, tile, value_width, differentiated=differentiated)
     return not any(_primitives(jaxpr) & APPROXIMATED for jaxpr in traced)
+
+
+def reducing(family: mosaic.Family, consumers: int, *hooks) -> int:
+    """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
+    reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a hook's
+    unit row, which the fork selects by a reduction across warps (ledger 1428), so every warpgroup of a
+    launch that runs a hook (`hooks`, its score and output hooks, None where it has none); none otherwise."""
+    return family.warpgroups(consumers) if any(hook is not None for hook in hooks) else 0
 
 
 def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
@@ -241,18 +235,6 @@ def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:
         for inner in jax_core.jaxprs_in_params(eqn.params):
             names |= _primitives(inner)
     return names
-
-
-def _unit_axis(jaxpr: jax_core.Jaxpr) -> bool:
-    """Whether any operation of `jaxpr`, or of a jaxpr inside it, gives a two-dimensional array of a unit
-    axis beside a longer one."""
-    for eqn in jaxpr.eqns:
-        shapes = [getattr(var.aval, "shape", ()) for var in eqn.outvars]
-        if any(len(shape) == 2 and 1 in shape and max(shape) > 1 for shape in shapes):
-            return True
-        if any(_unit_axis(inner) for inner in jax_core.jaxprs_in_params(eqn.params)):
-            return True
-    return False
 
 
 def _columns(array: jax.Array, unit: int) -> jax.Array:
@@ -342,13 +324,13 @@ class _Spans(NamedTuple):
 
 def reached(spec: algebra.Forward, queries: int) -> int | None:
     """The query and key pairs a call of `queries` queries (unpadded) reaches, by its form: every pair of a
-    full call; a causal call's, each query's keys up to its diagonal aligned to the last key (`algebra.seen`);
-    None for a spans call, whose pairs its arrays decide, which no launch states before it runs."""
+    full call; a causal call's, each query's keys up to its own place (`algebra.seen`'s `k_pos <= q_pos`,
+    the first key aligned to the first query); None for a spans call, whose pairs its arrays decide, which
+    no launch states before it runs."""
     if spec.form == "full":
         return queries * spec.keys
     if spec.form == "causal":
-        offset = spec.keys - queries
-        return sum(min(spec.keys, max(0, row + 1 + offset)) for row in range(queries))
+        return sum(min(spec.keys, row + 1) for row in range(queries))
     return None
 
 
