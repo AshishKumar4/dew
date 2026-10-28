@@ -866,6 +866,55 @@ class MosaicTgmm(_Mosaic):
         # steps (`mosaic_gpu.tgmm`).
         return ba.arguments['tokens'].shape[1], None, ba.arguments['cotangent'].shape[1]
 
+    def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
+        # The derived tile, its contraction split where its output tiles underfill a wave
+        # (`mosaic_gpu.split_count`) at the tile the split's own call, writing fp32 partials, derives; an
+        # exact sum's order is its contract, so it takes no split.
+        tile = super().derived(ba, target)
+        if tile is None or ba.arguments['exact_sums'] or self._splits(ba, tile, target) == 1:
+            return tile
+        partials = self._partials(ba)
+        sliced = super().derived(partials, target)
+        if sliced is None or (splits := self._splits(partials, sliced, target)) == 1:
+            return tile
+        return dataclasses.replace(sliced, splits=splits)
+
+    def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
+        depth, _, width = self._generated_extents(ba)
+        peak, multiprocessors = target.bf16_peak, _multiprocessors(target)
+        flops = 2 * tile.block_m * tile.block_n * tile.block_k
+        step = None if peak is None else flops / (peak / multiprocessors)
+        return mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0],
+                                      rows=ba.arguments['tokens'].shape[0], depth=depth, width=width,
+                                      multiprocessors=multiprocessors, step_seconds=step,
+                                      bandwidth=target.memory_bandwidth)
+
+    # A split tile runs the fp32 partials' call at its tile unsplit (`mosaic_gpu.tgmm`): its legality,
+    # registers and launch are that call's.
+    def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        if config.splits > 1 and ba.arguments['exact_sums']:
+            return False
+        ran, tile = self._ran(ba, config)
+        return super().legal(ran, tile, target)
+
+    def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
+        ran, tile = self._ran(ba, config)
+        return super().registers(ran, tile)
+
+    def launch_of(self, ba, config: mosaic_gpu.Tiles) -> resources.Launch:
+        ran, tile = self._ran(ba, config)
+        return super().launch_of(ran, tile)
+
+    def _partials(self, ba):
+        """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`)."""
+        return self.bind(*ba.args, **{**ba.kwargs, 'out_dtype': 'float32'})
+
+    def _ran(self, ba, config: mosaic_gpu.Tiles) -> tuple:
+        """The call and tile a launch at `config` runs: a split one's fp32 partials, unsplit."""
+        if config.splits == 1:
+            return ba, config
+        return self._partials(ba), dataclasses.replace(config, splits=1)
+
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
         rows, _, width = self._generated_extents(ba)
         return rows % config.block_m == 0 and width % config.block_n == 0
