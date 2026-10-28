@@ -196,6 +196,5 @@ for launch in ("plain", "peaks", "training", "dq", "dkv", "fused"):
         print("FAILED", launch)
         print("ERROR", type(sys.exception()).__name__, str(sys.exception()), flush=True)
         results.append((launch, type(sys.exception()).__name__, str(sys.exception())))
-        for frame in traceback.extract_tb(sys.exception().__traceback__)[-10:]:
-            print("FRAME", frame, flush=True)
-print("FINAL_RESULTS", results, flush=True)
+for result in results:
+    print("FINAL_RESULT", result, flush=True)

@@ -32,7 +32,7 @@ source = source.replace(needle, needle + '''
     transformed_shape = logical_shape
     for transform in gmem_transform:
       transformed_shape = transform.transform_shape(transformed_shape)
-    return ((1,) * len(squeezed_dims) + tuple(transformed_shape),
+    return (list((1,) * len(squeezed_dims) + tuple(transformed_shape)),
             untransformed_slice_shape, dyn_base_indices, squeezed_dims,
             gather_indices, gmem_transform)
 ''')
