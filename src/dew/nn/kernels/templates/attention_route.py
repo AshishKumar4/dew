@@ -90,8 +90,11 @@ class _Config:
 
 
 def _on_gpu() -> bool:
-    """Whether calls run on a GPU of sm80 or later, where the Triton mainloop runs (`bf16_dot_runs`)."""
-    return generation.gpu_placed() and generation.bf16_dot_runs()
+    """Whether calls are chosen for a GPU of sm80 or later, where the GPU mainloops run (`bf16_dot_runs`):
+    the target's backend (`generation.backend`), which an assumed GPU answers for, so a step a Trainer or an
+    AOT lowering traces under `generation.assumed` compiles the mainloop the GPU runs, not the host's (audit
+    K5: the host's placement, `gpu_placed`, sent such a step to the plain-JAX mainloop)."""
+    return generation.backend() == 'gpu' and generation.bf16_dot_runs()
 
 
 DROPS_NOT = ("the template's GPU mainloops draw no probability dropout yet (the Triton mainloop is frozen, "
@@ -164,10 +167,11 @@ route, so the kernel-route audit sees a call on a GPU that leaves the Mosaic tem
 reason."""
 
 
-def _mainloop(declined: str | None, spans: KeySpans) -> str:
-    """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass."""
+def _mainloop(declined: str | None, spans: KeySpans, hooks: Hooks) -> str:
+    """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
+    Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's)."""
     on_gpu = _on_gpu()
-    case = _Pass(on_gpu, declined, attention_triton.refused(spans) if on_gpu else None)
+    case = _Pass(on_gpu, declined, attention_triton.refused(spans, hooks) if on_gpu else None)
     return selection.select(MAINLOOP, case).kernel
 
 
@@ -177,7 +181,7 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     form = {"scale": config.scale, "natural": config.natural}
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=residuals,
                                                  **form) if _on_gpu() else None
-    mainloop = _mainloop(declined, spans)
+    mainloop = _mainloop(declined, spans, hooks)
     if mainloop == 'mosaic':
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=residuals, **form)
     if mainloop == 'triton':
@@ -207,7 +211,7 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     rounded = config.operand_dtype is None
     declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_gpu()
                 else None)
-    mainloop = _mainloop(declined, spans)
+    mainloop = _mainloop(declined, spans, hooks)
     if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
     if mainloop == 'triton':
