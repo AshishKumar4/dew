@@ -1496,11 +1496,11 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 def _():
                     for c, tile in enumerate(gated):
                         decays = (halves[c].value(), lows[c].value())
-                        family.staged(algebra.key_gated(queries[c].value(), decays), tile[0])
+                        family.staged(algebra.key_gated(queries[c].value(), decays, scale), tile[0])
 
                 out = algebra.key_decayed_output(
                     lambda c: _Parts(gated[c], call.given.dtype), entered, width // call.block,
-                    _tile(slots, "scores", held).value().astype(jnp.float32), value, scale,
+                    _tile(slots, "scores", held).value().astype(jnp.float32), value,
                     _Issuer(call, {"local": local}).summed)
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
