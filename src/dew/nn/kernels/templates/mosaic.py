@@ -36,15 +36,16 @@ Operand = Ref | jax.Array
 """A product's operand: a tile in shared memory (a ref) or in registers (an array)."""
 
 
-def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:
+def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0) -> plgpu.CompilerParams:
     """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
     and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
-    exp2 and FlashAttention's are). No shared memory is reserved for reductions across warps: a block's
-    warpgroups reduce at once, so each takes its own scratch, the consumers' from the kernel's allocations
-    (`Family.column_sums`), and a reduction that would take Mosaic GPU's implicit scratch fails to lower
-    rather than share it."""
+    exp2 and FlashAttention's are). A block's warpgroups reduce at once, so each takes its own scratch: a
+    consumer's planned reductions its share of the kernel's allocations (`Family.column_sums`), the
+    implicit ones its arithmetic forms (a unit row a hook slices) an equal share of `reduction_scratch`
+    bytes, which Mosaic GPU splits between the block's warpgroups; with none, such a reduction fails to
+    lower rather than share one."""
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
-                                reduction_scratch_bytes=0)
+                                reduction_scratch_bytes=reduction_scratch)
 
 
 CLUSTER = "cluster"
@@ -522,12 +523,15 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None) -> Callable:
+               cluster: int = 1, cost: pl.CostEstimate | None = None,
+               reducing_warpgroups: int = 0) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own, with
         `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
         `name` where given (Mosaic names its kernel and its compile reports by it); each of `grid`'s
         programs a cluster of `cluster` along `CLUSTER` (at most the family's `cluster`); its `cost`, the
-        work it states to XLA and to Dew's FLOP count (the custom call's `cost_estimate_json`)."""
+        work it states to XLA and to Dew's FLOP count (the custom call's `cost_estimate_json`); its
+        `reducing_warpgroups` (the block's, where its arithmetic may reduce across warps implicitly) each
+        reserving its share of reduction scratch (`warpgroup_reduction_scratch`)."""
 
     @abc.abstractmethod
     def scoped(self, body, *allocations, streams) -> None:
@@ -698,8 +702,13 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     reduction_scratch: int = 0
     """The bytes of shared memory the family's kernels reserve for Mosaic GPU's implicit reductions across
-    warps (its compiler parameters' `reduction_scratch_bytes`): none where a reduction takes the consumer's
-    own (`column_sums`)."""
+    warps (its compiler parameters' `reduction_scratch_bytes`) where they reduce (`resources.Scope.reduces`):
+    none where a reduction takes the consumer's own (`column_sums`)."""
+
+    warpgroup_reduction_scratch: int = 0
+    """The bytes of Mosaic GPU's reduction scratch a warpgroup of a kernel whose arithmetic reduces across
+    warps implicitly takes as its share (`kernel`'s `reducing_warpgroups`, `resources.Scope`'s): a family
+    whose kernels reserve no scratch by default (`reduction_scratch`)."""
 
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         """The sums of `value`'s columns `[columns]` in a column's layout, `value` `[rows, columns]` in the
@@ -733,6 +742,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     bounded_loads = True
     operands_in_registers = False
     products_overlap = True
+    # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).
+    warpgroup_reduction_scratch = 2048
     stores_through_registers = False
     copy_extent = 256
 
@@ -750,14 +761,17 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None) -> Callable:
+               cluster: int = 1, cost: pl.CostEstimate | None = None,
+               reducing_warpgroups: int = 0) -> Callable:
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
         per_shard(name or self.name)
         clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             num_threads=consumers + 1, thread_name="wg",
-                            compiler_params=compiler_params(approx_math=approx_math),
+                            compiler_params=compiler_params(
+                                approx_math=approx_math,
+                                reduction_scratch=self.warpgroup_reduction_scratch * reducing_warpgroups),
                             interpret=interpreted(interpret), kernel_name=name, cost_estimate=cost,
                             **clustered)
 

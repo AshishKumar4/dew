@@ -26,7 +26,8 @@ import numpy as np
 import optax
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.batch import TEXT_KEY
+from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import MeshSpec, Trainer
 

@@ -64,27 +64,28 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        # SLOP020's inventory ratchet reads the whole history; check.sh's duplicate-code gate, origin/main.
+        # The merge-base with main, which the gates that hold a checkout to main read (tools/base_history.sh).
         fetch-depth: 0
-    - uses: actions/setup-python@v5
-      with:
-        python-version-file: .python-version
-    - uses: astral-sh/setup-uv@v6
-      with:
-        enable-cache: true
-        cache-dependency-glob: locks/cpu.txt
-    - name: Install dependencies
+    - uses: oven-sh/setup-bun@v2
+    - name: Install the armada CLI
+      run: bun install --global "$ARMADA"
+    # tools/check_gates, each on an armada container of its own in the commit's environment, all failures
+    # reported, so the job lasts as long as its slowest gate, not their sum on this runner's 4 vCPUs (Main,
+    # 2026-10-28: the lint job set trains' wall at 35-41 min). SLOP020's ratchet among them holds the tolerance
+    # inventory to main's at the merge-base (BASE) and to every parent in the history, which the container's
+    # checkout carries (.armada.json's history), and the site's model list and examples to the code.
+    - name: Every cheap gate (tools/check.sh), each on armada
+      env:
+        ARMADA_URL: ${{ secrets.ARMADA_URL }}
+        ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        sh tools/install_environment.sh cpu --system
-    # tools/check_gates, side by side; SLOP020's ratchet among them holds the tolerance inventory to main's at
-    # the merge-base and to every parent in the history, and the site's model list and examples to the code.
-    - name: Every cheap gate (tools/check.sh), all failures reported
-      run: sh tools/check.sh
-    - name: Upload the complexity distribution
-      uses: actions/upload-artifact@v4
-      with:
-        name: complexity
-        path: complexity.json
+        base=$(git merge-base HEAD origin/main)
+        # A train's gates start before lanes' runs, as its suite does.
+        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; ci/stage-*) priority=--priority=5 ;; *) priority= ;; esac
+        grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
+          $priority --label="lint-$GITHUB_REF_NAME" -- \
+          sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
+          sh "$base" '{item}'
     - name: The site's toolchain and dependencies
       uses: ./.github/actions/site
     - name: Check site content
@@ -226,6 +227,7 @@ jobs:
       group: >-
         ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
         || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && 'armada-base')
+        || (startsWith(github.ref_name, 'ci/stage-') && 'armada-stage')
         || 'armada' }}
       cancel-in-progress: false
       queue: max
@@ -271,9 +273,12 @@ jobs:
         # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers. A push to
         # base/kernels, a base/<producer> promote and the background whole suite run at a lane's whole-suite priority
         # (-10, verdict.sh's) within their pool of 48, so they never take containers from a train, a precheck or a
-        # lane's targeted run (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger).
+        # lane's targeted run (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger). A train staged
+        # on the testing train's tip (ci/stage-*, its own concurrency group above) runs beside it, at 5: it publishes
+        # only after that train, so it takes what that train leaves (owner and Main, 2026-10-28).
         case "$GITHUB_REF_NAME" in
           ci/batch-*|ci/fix-*) priority=--priority=10 ;;
+          ci/stage-*) priority=--priority=5 ;;
           ci/base-*|base/kernels|ci/full-whole-*) priority=--priority=-10 ;;
           *) priority= ;;
         esac

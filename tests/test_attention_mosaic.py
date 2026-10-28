@@ -989,13 +989,18 @@ def test_the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     _check_hooked_backward(hooks, form=form, interpret=False)
 
 
-@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
-def test_the_mosaic_launches_state_the_models_attention_flops(causal):
+@pytest.mark.parametrize("causal, queries, keys, pairs", [
+    (True, 256, 256, 256 * 257 // 2), (True, 128, 256, 128 * 129 // 2),
+    (True, 256, 128, 128 * 129 // 2 + 128 * 128), (False, 256, 256, 256 * 256)],
+    ids=["causal", "causal-fewer-queries", "causal-more-queries", "full"])
+def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, keys, pairs):
     """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
     for an H100: every launch states its cost (`attention_mosaic_program.stated`), which Dew's FLOP count
     reads to size it (`instrumentation._stated_flops`: no launch unsized), and together they state the
-    library's fused attention's own count, a multiply-add a reached pair, head and product column: the
-    forward's two products, the training forward's two and the backward's four
+    library's fused attention's own count, a multiply-add a reached pair, head and product column (a causal
+    call's `pairs` each query's keys up to its own place, written out: the first key aligned to the first
+    query, as the mainloop masks them): the forward's two products, the training forward's two and the
+    backward's four
     (`instrumentation._fused_attention_flops`), a rerun (the guarded launch, the fold's natural walk) adding
     none. The launches' own statements are read: the training forward's overflowed rows rerun the plain-JAX
     walk in a conditional, whose products the count bounds apart."""
@@ -1003,15 +1008,18 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal):
 
     from dew.telemetry.instrumentation import _stated_flops
 
-    rows, tokens, heads, kv_heads, width = 1, 256, 4, 2, 64
-    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
-    spans = template.spans(tokens, tokens, rows, causal=causal)
-    pairs = tokens * (tokens + 1) // 2 if causal else tokens * tokens
+    rows, heads, kv_heads, width = 1, 4, 2, 64
+    query = jax.ShapeDtypeStruct((rows, queries, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), jnp.bfloat16)
+    spans = template.spans(queries, keys, rows, causal=causal)
     forward = 2 * rows * heads * pairs * (width + width)
 
+    # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
+    # of its own.
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+
     def counted(fn, *arrays):
-        with generation.assumed("sm90"):
+        with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
             text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
         launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
         assert launches and all(_stated_flops(line) is not None for line in launches)

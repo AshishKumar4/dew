@@ -34,6 +34,10 @@ class Named:
         weight = float(variables["w"])
         return [(row, weight) for row in rows][:len(rows) - self.short]
 
+    def compile(self, variables):
+        # Its passes compile nothing.
+        return ()
+
     def answer(self, payload: str, outputs):
         return self.name, payload, "".join(row for row, _ in outputs), *(outputs[0][1:] if outputs else ())
 
