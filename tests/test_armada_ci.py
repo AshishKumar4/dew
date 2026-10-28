@@ -1801,6 +1801,36 @@ def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
     assert ran("ci/full-whole-1", "4242", "off", 0) and ran("fix/lane", "", "on", 1)
 
 
+def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path):
+    """CI's lint job runs each gate of tools/check_gates on an armada container of its own, given the commit's
+    merge-base with main as BASE, so the job lasts as long as its slowest gate rather than their sum on the
+    runner (Main, 2026-10-28: the lint job set trains' wall at 35-41 min); a train's gates start at its
+    priority."""
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    [step] = [step for step in workflow["jobs"]["lint"]["steps"]
+              if step.get("name") == "Every cheap gate (tools/check.sh), each on armada"]
+    gates = [line.split("\t")[0] for line in (ROOT / "tools/check_gates").read_text().splitlines()
+             if line and not line.startswith("#")]
+    base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=ROOT, capture_output=True,
+                          text=True).stdout.strip()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
+    (bin_dir / "armada").chmod(0o755)
+    for ref, priority in (("fix/lane", []), ("ci/batch-abc-1", ["--priority=10"])):
+        ran = subprocess.run(["bash", "-c", step["run"].replace("${{ github.sha }}", "a" * 40)
+                              .replace("${{ github.ref_name }}", ref)], cwd=ROOT, capture_output=True, text=True,
+                             timeout=60, env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                                              "GITHUB_REF_NAME": ref})
+        assert ran.returncode == 0, ran.stderr
+        assert (tmp_path / "items").read_text().split() == gates
+        words = (tmp_path / "words").read_text().split()
+        assert words[:2] == ["map", f"--commit={'a' * 40}"] and words[-2:] == [base, "{item}"]
+        assert [word for word in words if word.startswith("--priority")] == priority
+
+
 def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
     """A push to base/kernels, a base/<producer> promote and the background whole suite run their suite
     at a lane's whole-suite priority, -10 as verdict.sh's, so they never take containers from a train (10)
