@@ -83,7 +83,7 @@ jobs:
         # A train's gates start before lanes' runs, as its suite does.
         case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; *) priority= ;; esac
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
-          $priority --label="lint-${{ github.ref_name }}" -- \
+          $priority --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
           sh "$base" '{item}'
     - name: The site's toolchain and dependencies
