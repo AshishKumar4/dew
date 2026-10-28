@@ -456,9 +456,9 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
                 return [case(name, dtype, args, starts, bound, derived, training=True, packed=packed,
                              kind='refused ')]
         assert variants[0] == derived, f"{name} on {target}: variants {variants} lead with no {derived}"
+        derived_tiles = [(tiles, '') for tiles in (variants[:1] if training or packed else variants)]
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
-                for tiles, kind in [(tiles, '') for tiles in (variants[:1] if training or packed else variants)]
-                + ([] if training else unheld)]
+                for tiles, kind in derived_tiles + ([] if training else unheld)]
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
@@ -500,8 +500,8 @@ def planned_failures(found: list, plans: dict) -> list[str]:
     which the tiles are derived): the recurrence's shared-memory model, beside the register model the shared
     gate holds to ptxas (`kernel_compile.mosaic_failures`)."""
     def planned(record: dict, kernel: dict) -> int:
-        return max((launch.shared for launch in plans[record['name']] if kernel['kernel'].startswith(launch.name)),
-                   default=0)
+        return max((launch.shared for launch in plans[record['name']]
+                    if kernel['kernel'].startswith(launch.name)), default=0)
 
     return [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes past its plan's "
             f"{planned(record, kernel)}" for record in found for kernel in record.get('kernels', ())

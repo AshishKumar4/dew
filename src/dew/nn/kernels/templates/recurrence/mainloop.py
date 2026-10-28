@@ -1324,7 +1324,8 @@ def _output_held(call: _Call, bv: int) -> _Held:
         call, (call.given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
     if call.per_key:
         return _Held(phases=(values + [_f32(CHUNK, call.block)] * 2 + [_f32(CHUNK, CHUNK)],))
-    scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK) + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
+    scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
+              + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
               + _fragments(call, (call.given, CHUNK, call.block), (call.given, CHUNK, call.block)))
     return _Held(phases=(values, scores))
 
