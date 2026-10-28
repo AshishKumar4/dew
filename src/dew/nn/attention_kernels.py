@@ -127,8 +127,8 @@ class AttentionCase:
     mask: bool
     bias: bool
     key_bias: bool
-    """Whether the call's bias is one term a key, `[B or 1, H or 1, 1, K]` (ALiBi's), which the template reads
-    as a key score hook (`attention.template_attention`)."""
+    """Whether the call's bias is one term a key, `[B or 1, H or 1, 1, K]` (ALiBi's), of at most fp32's width,
+    which the template reads as a key score hook in fp32 (`attention.template_attention`)."""
     sinks: bool
     softcap: float | None
     arithmetic: bool

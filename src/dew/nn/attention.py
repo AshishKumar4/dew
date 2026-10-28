@@ -1764,7 +1764,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                     or key_valid is not None or key_runs is not None
                     or (places is not None and sliding_window is not None)),
         mask=mask is not None, bias=bias is not None,
-        key_bias=bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] == 1,
+        key_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] == 1
+                  and jnp.dtype(bias.dtype).itemsize <= 4),
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
