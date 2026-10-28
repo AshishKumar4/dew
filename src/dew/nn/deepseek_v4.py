@@ -530,7 +530,7 @@ class DeepseekV4Attention(FakeQuantizing):
 
     `compressor` is None, 'hca', 'csa' or V4.1's 'csa2', with `compress_rate`
     its window; CSA needs `index_n_heads`, `index_head_dim` and `index_topk`.
-    `rope_theta` and `rope_scaling` are the layer's rope (`MixerContext.rotary_scaling`), shared by
+    `rope_theta` and `rope_scaling` are the layer's rope (`MixerContext.rope_scaling`), shared by
     its compressor and indexer. Compressed windows follow the physical row, so packed documents
     are refused. For 'csa2', `kv_shared` makes a Reuse layer and `reindex` a
     Reindex one, else a Full layer; `candidates` 'source' builds the candidate

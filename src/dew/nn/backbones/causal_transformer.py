@@ -628,7 +628,7 @@ class CausalTransformer(nn.Module):
                       kv_shared: bool) -> MixerContext:
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
-        `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
+        `head_dim`, `rope_theta`, `window`, the rope scaling, the partial
         rotary, the sinks and the query-key norm take the layer kind's resolved values
         (`kind_of`), and the precision the model's layers take (`products`). Every other field
         is the model's field of the same name. A kind builds its `DecoderBlock` factory

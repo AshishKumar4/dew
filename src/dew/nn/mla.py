@@ -300,7 +300,7 @@ class MultiHeadLatentAttention(nn.Module):
 
     decode=True runs against the cache like the standard mixer; `positions` and
     `segment_ids` behave as there. `rope_scaling`, the layer's one rope scaling
-    (`MixerContext.rotary_scaling`: YaRN, Llama 3.1's ramp or LongRoPE),
+    (`MixerContext.rope_scaling`: YaRN, Llama 3.1's ramp or LongRoPE),
     transforms `rope_theta`, the layer's base, at every rotation it makes, and
     a YaRN ramp's mscale pre-scales the query. The two latent norms are the model's RMSNorm, as the
     reference builds them from the layer's one norm class.
@@ -854,7 +854,7 @@ class MLAMixer(MixerBase):
 
     `mixer={"name": "mla", "fields": {...}}` takes a DeepSeek config.json's fields, so
     translation renames nothing. The rope base and its scaling are the layer's
-    (`MixerContext.rope_theta` and `rotary_scaling`, the model's or its kind's). The context's GQA
+    (`MixerContext.rope_theta` and `rope_scaling`, the model's or its kind's). The context's GQA
     geometry and `qk_norm` are not read (the latent norms are always present).
     A `kv_shared` layer is GLM's IndexShare layer, which shares its provider's
     selection and so needs the kind to select. Dials this cannot honour (a

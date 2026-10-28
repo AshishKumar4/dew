@@ -387,8 +387,8 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
     and refused where it holds more than its name and fields (ledger 1239),
     a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
-    fields (`_earlier_projectors`, ledger 1622), a model's or kind's YaRN field beside its rope scaling
-    (`_earlier_scalings`, ledger 1898), and a row of segments' question budgets, which it ignored and an
+    fields and a decoder's or kind's YaRN field beside its rope scaling (`_earlier_model`, ledgers 1622
+    and 1898), and a row of segments' question budgets, which it ignored and an
     earlier record wrote at their defaults (row 2006). A record in today's shapes passes
     as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
@@ -432,55 +432,56 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
     if "model" in current:
-        current = _earlier_scalings(_earlier_projectors(current))
+        current = _earlier_model(current)
     return current
 
 
-def _earlier_scalings(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A record whose model or layer kinds stated YaRN as its own `yarn` field beside `rope_scaling`
-    read as today's one `rope_scaling` (ledger 1898), wherever the model nests them. A record that sets
-    both fields is refused: they were two scalings of the same frequencies. Carried to 1.0 (ledger
-    1552)."""
+_EARLIER_PROJECTORS = ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector")
+_DECODER = "dew.nn.backbones.causal_transformer:CausalTransformer"
+
+
+def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A record's model with each component in today's fields (`earlier_shapes`), wherever the model
+    nests it through another recorded wrapper: a Qwen or MiMo projector's earlier fields (ledger 1622),
+    and a decoder's and its layer kinds' YaRN field beside their rope scaling (`_one_scaling`, ledger
+    1898). Carried until 1.0 (ledger 1552); current constructors and source codecs accept only their
+    current schema."""
     def current(value):
-        if isinstance(value, Mapping):
-            fields = {key: current(field) for key, field in value.items()}
-            if "yarn" in fields and "rope_scaling" in fields:
-                yarn = fields.pop("yarn")
-                if yarn is not None:
-                    if fields["rope_scaling"] is not None:
-                        raise ValueError("an earlier record sets yarn and rope_scaling, two rope scalings")
-                    # The record names its class and fields, or (written by hand) holds the fields alone.
-                    held = yarn.get("fields", yarn) if isinstance(yarn, Mapping) else yarn
-                    fields["rope_scaling"] = ({"rope_type": "yarn", **held} if isinstance(held, Mapping)
-                                              else held)
-            return fields
         if isinstance(value, list | tuple):
             return [current(field) for field in value]
-        return value
-
-    return {**record, "model": current(record["model"])}
-
-
-def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A record's earlier Qwen or MiMo projector fields read as today's (`earlier_shapes`), wherever the
-    model nests the projector through another recorded wrapper. Carried until 1.0 (ledger 1622);
-    current constructors and source codecs accept only their current schema."""
-    def current(value):
-        if isinstance(value, Mapping):
-            component = {key: current(field) for key, field in value.items()}
-            name, fields = component.get("class"), component.get("fields")
-            if name in ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector") \
-                    and isinstance(fields, dict) and "vision_width" in fields:
-                width, merge = fields.pop("vision_width"), fields.pop("merge_size")
-                component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
-                                     "width": width * merge ** 2,
-                                     "bias": name == "dew.nn.vision.qwen35:Qwen35Projector"}
+        if not isinstance(value, Mapping):
+            return value
+        component = {key: current(field) for key, field in value.items()}
+        name, fields = component.get("class"), component.get("fields")
+        if not isinstance(fields, dict):
             return component
-        if isinstance(value, list | tuple):
-            return [current(field) for field in value]
-        return value
+        if name in _EARLIER_PROJECTORS and "vision_width" in fields:
+            width, merge = fields.pop("vision_width"), fields.pop("merge_size")
+            component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
+                                   "width": width * merge ** 2, "bias": name == _EARLIER_PROJECTORS[0]}
+        elif name == _DECODER:
+            kinds = fields.get("kinds")
+            component["fields"] = {**_one_scaling(fields), **({"kinds": {
+                kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
+                       else _one_scaling(held)) if isinstance(held, Mapping) else held
+                for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {})}
+        return component
 
     return {**record, "model": current(record["model"])}
+
+
+def _one_scaling(fields: Mapping[str, object]) -> dict[str, object]:
+    """A decoder's or layer kind's fields with an earlier `yarn` field read as its `rope_scaling`: the
+    fields it wrote, as YaRN's record. Fields setting both are refused: they were two scalings."""
+    current = dict(fields)
+    yarn = current.pop("yarn", None)
+    if yarn is None:
+        return current
+    if current.get("rope_scaling") is not None:
+        raise ValueError("an earlier record sets yarn and rope_scaling, two rope scalings")
+    held = yarn.get("fields", yarn) if isinstance(yarn, Mapping) else yarn
+    current["rope_scaling"] = {"rope_type": "yarn", **held} if isinstance(held, Mapping) else held
+    return current
 
 
 def settings_fields(settings: type) -> frozenset[str]:
