@@ -659,6 +659,12 @@ class Objective(ABC, Generic[Loss, Effects]):
     def inputs(self, inputs: InputSpec | None) -> None:
         self._inputs = inputs
 
+    named_inputs: str | None = None
+    """The batch field an objective names as its sample alone, as `Supervised(inputs="x")` does, which a
+    run declares as `inputs` at the per-example shape its model reads of the run's first batch
+    (`Trainer.fit`); None where `inputs` declares the shapes in full, an explicit spec that overrides
+    any the data would give, or declares none."""
+
     ema: EMASpec | None = None
     saved_task: ClassVar[type[SavedTask] | None] = None
     settings: ClassVar[type[DataclassInstance] | None] = None
@@ -787,6 +793,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         own loss reads them (`dew.objectives.perturbation`). None, the default, where the objective states
         no units, whose whole statistics credit every unit; the model's other collections are left as they
         are."""
+        return None
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """The tokens each of `batch`'s rows holds, read from its shapes alone, so a placed batch
+        answers without a wait: the most a row's `scored_tokens` counts, and what a device steps of
+        it (`dew.training.memory.device_tokens`). None where rows hold no token geometry, an image's,
+        whose run reads its committed tokens off the devices at each step a count is due."""
         return None
 
     def real_lengths(self, batch: Batch) -> np.ndarray:

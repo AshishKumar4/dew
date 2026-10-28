@@ -501,6 +501,18 @@ class CausalTransformer(nn.Module):
         return hidden, output
 
     @property
+    def position_rows(self) -> int:
+        """The rows of the learned position table (`position_embedding_size`, else `max_seq_len`)."""
+        return self.position_embedding_size or self.max_seq_len
+
+    @property
+    def position_capacity(self) -> int | None:
+        """The places a row's learned positions cover, the table's rows past its reserved offset; None for
+        rotary or ALiBi positions, which cover any (`PositionCapacity`)."""
+        learned = self.position_embedding == 'learned'
+        return self.position_rows - self.position_embedding_offset if learned else None
+
+    @property
     def kv_heads(self) -> int:
         return self.num_heads if self.num_kv_heads is None else self.num_kv_heads
 
@@ -911,7 +923,7 @@ class CausalTransformer(nn.Module):
                 dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
-                num_embeddings=self.position_embedding_size or self.max_seq_len,
+                num_embeddings=self.position_rows,
                 features=self.emb_features, dtype=self.dtype, name='embed_positions',
                 embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                                 else nn.initializers.normal(self.initializer_range)))
