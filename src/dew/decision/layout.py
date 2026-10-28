@@ -560,7 +560,8 @@ class QuestionLayout(Layout):
         _least("option_tokens", self.option_tokens, 1)
         if self.segments is not None:
             kinds = [type(segment) for segment in self.segments]
-            others = sorted({kind.__name__ for kind in kinds if kind not in QUESTION_KINDS})
+            others = sorted({type(segment).__name__ for segment in self.segments
+                             if not isinstance(segment, QUESTION_KINDS)})
             if others:
                 raise ValueError(f"a question row holds no schema and no images, so it has no place for "
                                  f"{others}; its parts are {[kind.__name__ for kind in QUESTION_KINDS]}")
@@ -1223,7 +1224,8 @@ class JointLayout(Layout):
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
         kinds = [type(segment) for segment in self.segments]
-        others = sorted({kind.__name__ for kind in kinds if kind not in JOINT_KINDS})
+        others = sorted({type(segment).__name__ for segment in self.segments
+                     if not isinstance(segment, JOINT_KINDS)})
         if others:
             raise ValueError(f"a joint row writes its questions in its schema and reads no cue, so it has no "
                              f"place for {others}; its parts are {[kind.__name__ for kind in JOINT_KINDS]}")

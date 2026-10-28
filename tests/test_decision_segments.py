@@ -99,6 +99,19 @@ def test_a_joint_row_refuses_a_part_it_cannot_render(part):
         JointLayout(segments=(Schema(), State(), part))
 
 
+@dataclasses.dataclass(frozen=True)
+class KeptState(State):
+    """A state part of a kind of its own, which a joint row renders as the state it is."""
+
+
+def test_a_part_whose_kind_a_layout_renders_is_rendered_whatever_its_subclass():
+    """A joint row's part of a kind of its own, a state's subclass, is built and rendered as the state
+    itself, its row the same tokens."""
+    [own] = JointLayout(segments=(Schema(), KeptState())).rows(TOKENIZER, SPECIALS, "abc", QUESTIONS)
+    [plain] = JointLayout(segments=(Schema(), State())).rows(TOKENIZER, SPECIALS, "abc", QUESTIONS)
+    assert own.tokens == plain.tokens
+
+
 @pytest.mark.parametrize("part", [Schema(), Media()], ids=lambda part: type(part).__name__)
 def test_a_question_row_refuses_a_part_it_cannot_render(part):
     """A question row holds no schema and no images: a joint row's part among its segments is refused

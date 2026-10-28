@@ -607,17 +607,19 @@ def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_wher
 
 
 def test_a_joint_run_refuses_a_cue_its_rows_cannot_render():
-    """A joint head's run whose segments hold an answer cue, which a joint row has no place for, is
-    refused as it is prepared, never trained on rows that dropped it (row 1943)."""
+    """A fresh joint head's run whose segments hold an answer cue, which a joint row has no place for,
+    is refused as it is prepared, never trained on rows that dropped it; the same run without the cue
+    prepares (row 1943)."""
     from dew.decision.config import JointShape
     from dew.decision.layout import AnswerCue, Schema, State
 
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-    run = dataclasses.replace(default, trainer=trainer, head=JointShape(), max_len=128,
-                              segments=(Schema(), State(), AnswerCue()))
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, head=JointShape(), max_len=128,
+                              segments=(Schema(), State()))
+    run.prepare()
     with pytest.raises(ValueError):
-        run.prepare().train("x")
+        dataclasses.replace(run, segments=(Schema(), State(), AnswerCue())).prepare()
 
 
 def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
