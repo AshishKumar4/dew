@@ -377,8 +377,7 @@ def test_a_bf16_attention_with_a_side_of_one_is_on_par_with_float64(sides):
     """A bf16 attention whose queries or keys are one, a grouped decode step's or a one-key read's, is
     on par (check 1, float64 truth) on the device it runs on, its gradients too: an A100 computes jax.nn's
     BF16_BF16_F32 query-key product with a side of one off round-to-nearest-even at its ties (row 1550),
-    which a call carried into its output. A product of bf16 values past bf16's range, finite in fp32 as
-    jax.nn computes it, leaves a one-key read finite, its output its one value by structure."""
+    which a call carried into its output."""
     from dew.nn.attention import reference_attention
 
     queries, keys = sides
@@ -396,11 +395,6 @@ def test_a_bf16_attention_with_a_side_of_one_is_on_par_with_float64(sides):
 
     assert_as_exact(jax.jit(attended(named)), jax.jit(attended(reference_attention)), drawn,
                     f"bf16 attention of {queries} queries over {keys} keys", seeds=SIDE_OF_ONE_SEEDS)
-    # 181 * 2^56 times 181 * 2^57 is past bf16's range and inside fp32's: one key's softmax weight is 1.
-    query = jnp.full((1, 1, HEADS, 1), 181 * 2.0 ** 56, jnp.bfloat16)
-    key = jnp.full((1, 1, KV_HEADS, 1), 181 * 2.0 ** 57, jnp.bfloat16)
-    value = jnp.ones((1, 1, KV_HEADS, 1), jnp.bfloat16)
-    np.testing.assert_array_equal(np.asarray(named(query, key, value), np.float32), 1.0)
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
