@@ -386,6 +386,19 @@ def _global_qk_max(qk) -> jax.Array | None:
     return jnp.max(jnp.stack(found)) if found else None
 
 
+class _Scored(NamedTuple):
+    """One scoring of a batch (`LMObjective._scored_loss`): the loss's statistics and reports, the
+    token scores they came from, and each token's share of the prediction's total, `[B, seq_len]`,
+    before its row's weight: its counted cross entropy and z-loss, the prediction depths' terms at
+    the position that predicts them and the indexer's KL at its query, each weighted as the total
+    weighs it."""
+
+    statistics: Ratio | RoutedStatistics
+    aux: Aux[Variables]
+    scores: Scores
+    units: jax.Array
+
+
 class Scores(NamedTuple):
     """The per-token results `LMObjective.token_scores` computes over a `[B, seq_len + 1]` batch.
 
@@ -1316,37 +1329,14 @@ class LMObjective(TokenScorer):
         prediction: its whole statistics credit every unit."""
         if self._warmup:
             return None
-        statistics, _, scores = self._scored_loss(variables, batch, step, train=step.training)
-        width = at_least_fp32(scores.losses.dtype)
-        weights = scores.weights.astype(width)
-        # A target of weight 0 is selected away before its product, as `row_mean` selects it.
-        counted = jnp.where(weights > 0, scores.losses.astype(width), 0) * weights
-        if self.z_loss:
-            counted = counted + self.z_loss * jnp.where(weights > 0, jnp.square(scores.log_z.astype(width)),
-                                                        0) * weights
-        length = counted.shape[1]
-
-        def placed(terms: jax.Array) -> jax.Array:
-            # A term of the leading positions, a depth's or a query's, at the positions that score it.
-            return jnp.pad(terms.astype(width), ((0, 0), (0, length - terms.shape[1])))
-
-        if self.mtp_weight is not None and scores.depths:
-            counted = counted + self.mtp_weight / len(scores.depths) * sum(
-                placed(jnp.where(depth_weights > 0, depth_losses, 0) * depth_weights)
-                for depth_losses, depth_weights, _ in scores.depths)
-        if self.indexer is not None:
-            assert scores.indexer is not None, "an indexer's scores hold its KL"
-            kls = _indexer_kls(scores.indexer)
-            queries = self._query_weights(self._text(batch), width)
-            counted = counted + self.indexer.weight / len(kls) * sum(
-                placed(kl.astype(width) * queries[:, :kl.shape[1]]) for kl in kls)
-        return statistics, counted * self.row_weights(batch, counted.shape[0])[:, None]
+        scored = self._scored_loss(variables, batch, step, train=step.training)
+        return scored.statistics, scored.units * self.row_weights(batch, scored.units.shape[0])[:, None]
 
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | RoutedStatistics, Aux[Variables]]:
         if self._warmup:
             return self._warmup_loss(variables, batch, step)
-        statistics, aux, _ = self._scored_loss(variables, batch, step, train=step.training,
-                                               summed=step.training)
+        statistics, aux, _, _ = self._scored_loss(variables, batch, step, train=step.training,
+                                                  summed=step.training)
         return statistics, aux
 
     def predict(self, params, batch, step: Step, *, train: bool,
@@ -1368,16 +1358,18 @@ class LMObjective(TokenScorer):
                 "the balance loss's and the router z-loss's router terms normalize per router, and a "
                 "distillation mixes terms over the counted tokens; balance the "
                 "student's routers with balance_rate instead")
-        statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers,
-                                                    logits=True)
+        statistics, aux, scores, _ = self._scored_loss(params, batch, step, train=train, layers=layers,
+                                                       logits=True)
         assert isinstance(statistics, Ratio) and scores.logits is not None
         logits = constrain(scores.logits, LOGITS)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
-                     summed: bool = False, logits: bool = False, predict: bool | None = None
-                     ) -> tuple[Ratio | RoutedStatistics, Aux[Variables], Scores]:
-        """Compute the loss's statistics and reports, with the scores they came from.
+                     summed: bool = False, logits: bool = False, predict: bool | None = None) -> _Scored:
+        """Compute the loss's statistics and reports, with the scores they came from and each
+        token's share of the prediction's total (`_Scored.units`): each term's share is read from the
+        values and weights its total sums, weighted as the total weighs it, at the positions that
+        score it.
 
         `summed` takes the cross entropies, the z-loss and the depths' as
         their weighted sums alone (`token_scores`'s `z_loss`), which a
@@ -1395,6 +1387,15 @@ class LMObjective(TokenScorer):
             qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
             z_loss=self.z_loss if summed else None, logits=logits, predict=predict)
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _ = scores
+        width, length = at_least_fp32(losses.dtype), losses.shape[1]
+
+        def shares(values: jax.Array, counts: jax.Array) -> jax.Array:
+            # A target of weight 0 is selected away before its product, as `row_mean` selects it; a
+            # term of the leading positions, a depth's or a query's, at the positions that score it.
+            counted = jnp.where(counts > 0, values.astype(width), 0) * counts.astype(width)
+            return jnp.pad(counted, ((0, 0), (0, length - counted.shape[1])))
+
+        units = shares(losses, weights)
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         prediction = Ratio(self.row_mean(losses, batch, weights=weights).total, mass)
         ce, _ = prediction.mean()
@@ -1405,6 +1406,7 @@ class LMObjective(TokenScorer):
             # PaLM's auxiliary over the same counted targets as the cross
             # entropy, so one Ratio carries both.
             z_total = self.z_loss * self.row_mean(jnp.square(log_z), batch, weights=weights).total
+            units = units + self.z_loss * shares(jnp.square(log_z), weights)
             reported["z_loss"] = z_total / jnp.where(mass > 0, mass, 1)
             prediction = Ratio(prediction.total + z_total, mass)
         if sums is not None:
@@ -1416,6 +1418,8 @@ class LMObjective(TokenScorer):
                 self.row_mean(depth_losses, batch, weights=depth_weights).total if depth_sum is None
                 else depth_sum
                 for depth_losses, depth_weights, depth_sum in depths]))
+            units = units + self.mtp_weight / len(depths) * sum(
+                shares(depth_losses, depth_weights) for depth_losses, depth_weights, _ in depths)
             reported["mtp_ce"], _ = Ratio(mtp_total, mass).mean()
             prediction = Ratio(prediction.total + self.mtp_weight * mtp_total, mass)
         if self.indexer is not None:
@@ -1423,7 +1427,12 @@ class LMObjective(TokenScorer):
             # do, so one Ratio carries the step: the queries counted differ
             # from the targets only by the documents' last tokens. The
             # report is the KL per counted query, the paper's quantity.
+            assert kls is not None, "an indexer's scores hold its KL"
             total, queries = self._indexer_term(kls, prepared, batch)
+            counted = _indexer_kls(kls)
+            kl_queries = self._query_weights(prepared, width)
+            units = units + self.indexer.weight / len(counted) * sum(
+                shares(kl, kl_queries[:, :kl.shape[1]]) for kl in counted)
             reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
             prediction = Ratio(prediction.total + self.indexer.weight * total, mass)
         statistics: Ratio | RoutedStatistics = prediction
@@ -1438,7 +1447,7 @@ class LMObjective(TokenScorer):
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return statistics, Aux(reported, qk_stats=qk, effects=effects), scores
+        return _Scored(statistics, Aux(reported, qk_stats=qk, effects=effects), scores, units)
 
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present; the
@@ -1461,7 +1470,7 @@ class LMObjective(TokenScorer):
                                        predict=True)
             statistics, _ = self._warmup_statistics(scores.indexer, prepared, batch)
         else:
-            statistics, _, scores = self._scored_loss(params, batch, step, train=False, predict=True)
+            statistics, _, scores, _ = self._scored_loss(params, batch, step, train=False, predict=True)
         assert scores.correct is not None
         return statistics, TokenScores(scores.losses, scores.weights, scores.correct)
 

@@ -42,6 +42,7 @@ import jax.numpy as jnp
 
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.templates.attention_algebra import power2
+from dew.nn.kernels.templates.product import Exact, Transposed
 from dew.nn.precision import compensated_add, float32_einsum, float32_matmul
 
 from . import recurrence
@@ -81,30 +82,6 @@ PRODUCTS = {
 """The algebra's products by name. A decay a key dimension weighs each term of `intra`'s and `scores`'
 contractions (`paired`), which a mainloop issues as a product of the factored operands within the range its
 decay's bound keeps exact, or as the weighed sum."""
-
-
-class Transposed:
-    """A register operand a product takes transposed, `value^T`: a mainloop stages it and reads the tile
-    transposed, where a transpose of registers would move every element between threads."""
-
-    def __init__(self, value: jax.Array):
-        self.value = value
-
-    @property
-    def shape(self) -> tuple:
-        return (*self.value.shape[:-2], self.value.shape[-1], self.value.shape[-2])
-
-
-class Exact:
-    """A register operand exact in a 16-bit dtype (a mask of zeros and ones): a mainloop stages it as one
-    part, where an fp32 operand takes three."""
-
-    def __init__(self, value: jax.Array):
-        self.value = value
-
-    @property
-    def shape(self) -> tuple:
-        return self.value.shape
 
 
 def portable(name: str, left, right):

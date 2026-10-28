@@ -18,17 +18,11 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import cost, mosaic, resources
 from dew.nn.sharding import per_shard
 
-_TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
-_SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
-"""Mosaic GPU's tile transforms, which it declares as protocol classes (a type checker takes them for
-uninstantiable)."""
-
 
 def swizzled(shape: tuple[int, int], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
     bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
-    swizzle = plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8)
-    return _TILING((8, swizzle // jnp.dtype(dtype).itemsize)), _SWIZZLE(swizzle)
+    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8))
 
 
 class Slots:
@@ -187,7 +181,10 @@ class Mma(mosaic.Family):
         del producer
         consumer(0)
 
-    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = ()):
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
+                swizzles: dict[str, int] | None = None):
+        # emit_pipeline stages its blocks at the swizzle each read takes (`swizzled`).
+        del swizzles
         _one(consumers, clustered=bool(multicast))
         return Pipeline(blocks, stages)
 

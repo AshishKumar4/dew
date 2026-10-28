@@ -30,7 +30,7 @@ from test_recurrence_chunk import (
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, mosaic_rule
-from dew.nn.kernels.templates import bundles, mosaic, resources
+from dew.nn.kernels.templates import bundles, mosaic, product, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import mainloop, template
 
@@ -392,12 +392,12 @@ def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
 
 
 def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
-    """An fp32 operand's three bf16 parts (`mainloop._split`) are finite and sum to it exactly, at fp32's
+    """An fp32 operand's three bf16 parts (`product.formed`) are finite and sum to it exactly, at fp32's
     largest finite values too, past bf16's: its first part saturates there, where rounding would make it
     infinite and its remainder NaN."""
     largest = float(jnp.finfo(jnp.float32).max)
     x = jnp.array([largest, -largest, 1.0 + 2.0 ** -20, -3.0e-30, 0.0], jnp.float32)
-    parts = mainloop._split(x)
+    parts = product.formed(x, mainloop.PARTS)
     assert all(bool(jnp.all(jnp.isfinite(part))) for part in parts)
     total = sum(np.asarray(part, np.float64) for part in parts)
     np.testing.assert_array_equal(total, np.asarray(x, np.float64))

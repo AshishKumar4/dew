@@ -54,10 +54,8 @@ from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
 from dew.nn.sharding import logical_axes
+from dew.nn.text_checkpoints import DEFAULT_MODEL
 from dew.registry import resolve_dtype
-
-DEFAULT_MODEL = "openai/clip-vit-large-patch14"
-"""The CLIP checkpoint the native port follows and loads by default."""
 
 
 class CLIPTowerOutput(NamedTuple):
@@ -560,8 +558,6 @@ class CLIPModel:
         return self._text_features(self.variables, jnp.asarray(input_ids), attention_mask)
 
 # The T5 encoder.
-
-DEFAULT_T5_MODEL = "google-t5/t5-v1_1-xxl"
 
 
 def _t5_relative_position_bucket(relative_position, num_buckets, max_distance):
