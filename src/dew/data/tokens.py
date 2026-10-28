@@ -127,8 +127,8 @@ def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
     the first field.
 
     It is grain's assembly, held to it field for field (tests/test_grain_packing.py), and not grain's
-    own packer, whose public form lays a window in milliseconds where an indexed read assembles a
-    window a read (row 1873).
+    own packer, whose public form lays a twelve-chunk window in 3.6 ms on armada's CPUs where this
+    takes 35 us, and an indexed read assembles a window a read (rows 1873, 1064).
     """
     laid = PackedWindows(chunks[0], dict.fromkeys(chunks[0], window), (next(iter(chunks[0])),), 1)
     for chunk in chunks:
@@ -197,8 +197,9 @@ def first_fit(sizes: np.ndarray, window: int, bins: int,
     any process count.
 
     It is grain's placement, held to it window for window (tests/test_grain_packing.py), and not
-    grain's packer run over the lengths: over 200,000 chunks on armada's CPUs this plans in 0.15 s
-    and grain's packer, fed zero-strided stand-ins of each length, in 88 s, the same plan (row 1873).
+    grain's packer run over the lengths: over 200,000 chunks on armada's CPUs this plans in 0.15 to
+    0.22 s (windows of 2048 and 4096 tokens, 1 to 16 bins) and grain's packer, fed zero-strided
+    stand-ins of each length, in 88 s, the same plan (rows 1873, 1064).
 
     Returns the chunk indices grouped by window, in the order the packer
     added them, and where each window starts in that grouping. A window the
