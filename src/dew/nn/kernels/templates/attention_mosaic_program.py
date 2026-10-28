@@ -162,6 +162,9 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
         return f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}"
     if backward and width != value_width:
         return "the Mosaic backward stages dK and dV through one buffer: equal head widths"
+    if backward and callable(hooks.score_mod) and not pointwise(hooks):
+        return ("the Mosaic backward holds its tiles keys first, so it takes a score hook pointwise in its "
+                "entries; this one indexes, reduces or orders an axis of them")
     widest = max(_width(width, family, dtype), _width(value_width, family, dtype))
     if family.copy_extent is not None and widest > family.copy_extent:
         return (f"the Mosaic mainloop loads a head {widest} wide in one copy, past the "
@@ -226,6 +229,32 @@ def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
             jax.ShapeDtypeStruct((rows, value_width), jnp.float32),
             *(entries(param.kind, param.value.dtype, value_width) for param in hooks.output_params)).jaxpr)
     return traced
+
+
+ORDERED = frozenset({"iota", "rev", "sort", "cumsum", "cumprod", "cummax", "cummin", "cumlogsumexp"})
+"""The operations whose entries depend on their place along an axis though their shape is the tile's
+(`pointwise`)."""
+
+
+def pointwise(hooks: Hooks) -> bool:
+    """Whether the score hook and its pullback are pointwise in a tile's entries, so a program whose tiles
+    hold their keys as rows (`[bk, bq]`, the dK/dV program's) runs them as the reference's `[bq, bk]` ones
+    do: traced on a tile of unequal sides, every value of each operation is a scalar or the whole tile, and
+    none orders an axis (`ORDERED`). A hook that indexes, slices, reshapes or reduces an axis (a query's
+    coordinate read off its tile's first column) is not."""
+    tile = (16, 32)
+
+    def entire(jaxpr: jax_core.Jaxpr) -> bool:
+        for eqn in jaxpr.eqns:
+            shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
+            if eqn.primitive.name in ORDERED or any(shape not in ((), tile) for shape in shapes):
+                return False
+            if not all(entire(inner) for inner in jax_core.jaxprs_in_params(eqn.params)):
+                return False
+        return True
+
+    return all(entire(jaxpr) for jaxpr in _hook_jaxprs(Hooks(hooks.score_mod, hooks.score_params), tile, 1,
+                                                        differentiated=True))
 
 
 def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:

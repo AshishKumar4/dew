@@ -47,13 +47,25 @@ SEEDS = 8
 against the reference's own."""
 ALL_HOOKS_SEEDS = 32
 """The draws of a site with every hook at once (`test_attention_triton.ALL_HOOKS_SEEDS`)."""
-BACKWARD_HOOKS = list(SCORE_HOOKS)
-"""The backward's score hooks: every one the backward differentiates (`test_attention_triton.SCORE_HOOKS`),
-the hook indexed off the query's coordinates' column, which forms a unit axis, among them (ledger 1428)."""
-FORWARD_HOOKS = {**{name: (SCORE_HOOKS[name], False) for name in BACKWARD_HOOKS},
+
+
+def _backward_takes(hooks: str) -> bool:
+    """Whether the backward takes the score hooks `SCORE_HOOKS[hooks]`: a hook pointwise in its tile's
+    entries (`attention_mosaic_program.pointwise`), whose dK/dV tiles hold their keys first."""
+    score_mod, kinds, draw = score_hooks(SCORE_HOOKS[hooks], 16, 16)
+    params, _ = draw(0)
+    hooks_of = template.Hooks(score_mod, tuple(map(template.Param, params, kinds)))
+    return attention_mosaic_program.pointwise(hooks_of)
+
+
+BACKWARD_HOOKS = [hooks for hooks in SCORE_HOOKS if _backward_takes(hooks)]
+"""The backward's score hooks: every one it takes of those the template differentiates
+(`test_attention_triton.SCORE_HOOKS`); the hook indexed off the query's coordinates' column (ledger 1428),
+which reads an axis of its tile, the Triton mainloop's."""
+FORWARD_HOOKS = {**{name: (SCORE_HOOKS[name], False) for name in SCORE_HOOKS},
                  "gate": ((), True),
                  "all": (("softcap", "custom", "sinks", "alibi", "temperature", "key", "tile"), True)}
-"""The forward's hooks: each score hook the backward differentiates (`test_attention_triton.SCORE_HOOKS`:
+"""The forward's hooks: each score hook the template differentiates (`test_attention_triton.SCORE_HOOKS`:
 every kind of parameter, the initial state as sinks or a resumed partial, a hook through a custom VJP), an
 output gate, and all at once; each `(score hooks, gate)`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
