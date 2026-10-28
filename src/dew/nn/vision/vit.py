@@ -39,6 +39,7 @@ from dew.nn.flops import matching_lengths, patch_lengths, projection_flops
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
+from dew.nn.scatter import gather_positions
 from dew.nn.sharding import logical_axes
 from dew.nn.text_encoders import clip_layer
 
@@ -227,7 +228,7 @@ def _gather(x, index):
     """`x`'s rows `[B, L, ...]` taken in `index` `[B, L]` order; None takes them as they are."""
     if x is None or index is None:
         return x
-    return jnp.take_along_axis(x, index.reshape(*index.shape, *(1,) * (x.ndim - 2)), axis=1)
+    return gather_positions(x, index)
 
 
 @logical_axes({("patch_embed",): (None, None, None, "embed"),

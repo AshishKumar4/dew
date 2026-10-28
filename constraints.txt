@@ -34,13 +34,16 @@
 # the same kernel compiled from two checkouts keys alike; and a compile-only
 # Mosaic GPU target held to its own default shared memory limit; and a
 # transformation keeping a wide dtype its trace already holds, while a Python
-# type asked of a wide value still narrows as a user's request. Every CI and
-# development install takes this one build.
+# type asked of a wide value still narrows as a user's request; and Pallas's
+# Mosaic GPU interpreter transferring a thread map's constants and inputs to
+# the device once, shared by its threads, and checking at a device's kernel end
+# only that device's barriers, which a multi-device interpreted kernel needs
+# (ledger 1850, 1923). Every CI and development install takes this one build.
 # Return to a release once one ships the fixes.
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.12.0.1.post28
+jax==0.12.0.1.post29
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).

@@ -20,7 +20,6 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-import jax
 import numpy as np
 
 
@@ -42,22 +41,39 @@ def memory_images(pixels, loading):
 
 
 def digest(batch):
-    tree = jax.tree.structure(batch)
-    leaves = []
-    for value in jax.tree.leaves(batch):
-        array = np.asarray(value)
-        if array.dtype.hasobject:
-            encoded = json.dumps(array.tolist(), sort_keys=True).encode()
+    """The batch's public fields: each array's shape, dtype and content digest by its path, and each
+    record's static facts (`Coordinates`' `max_segments` and `right_padded`) by theirs, not the tree's
+    spelling. A field that is None holds nothing and adds no entry, where a renamed field or a changed
+    static fact still changes the digest (Main, 10-27: a field added to Coordinates once re-recorded
+    142 tree strings whose leaves had not moved). tests/test_pipeline_golden.py reads Dew's batches by
+    this digest, so a capture and the test's reading of it are one format."""
+    fields = {}
+
+    def walk(value, path):
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for key in sorted(value):
+                walk(value[key], f"{path}[{key!r}]")
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                walk(item, f"{path}[{index}]")
+        elif dataclasses.is_dataclass(value):
+            for field in dataclasses.fields(value):
+                item = getattr(value, field.name)
+                if field.metadata.get("pytree_node", True):
+                    walk(item, f"{path}.{field.name}")
+                else:
+                    fields[f"{path}.{field.name}"] = {"static": item}
         else:
-            encoded = array.tobytes()
-        leaves.append(
-            {
-                "shape": list(array.shape),
-                "dtype": array.dtype.str,
-                "sha256": hashlib.sha256(encoded).hexdigest(),
-            }
-        )
-    return {"tree": str(tree), "leaves": leaves}
+            array = np.asarray(value)
+            encoded = (json.dumps(array.tolist(), sort_keys=True).encode()
+                       if array.dtype.hasobject else array.tobytes())
+            fields[path] = {"shape": list(array.shape), "dtype": array.dtype.str,
+                            "sha256": hashlib.sha256(encoded).hexdigest()}
+
+    walk(batch, "")
+    return fields
 
 
 def _read(reader, count):
