@@ -1472,7 +1472,7 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     # A packed tensor's geometry is the model's, read as a translated config spells it.
     geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
                 'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
-    return layout_tensors(_packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
+    return layout_tensors(packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
 
 
 def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
@@ -1507,14 +1507,15 @@ def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
     return layouts
 
 
-def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
-                    config: Mapping[str, object]) -> dict[str, WeightLayout]:
-    """`layouts` with each `packed` source tensor built from its parts' layouts,
-    in the place of its first part."""
+def packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
+                   config: Mapping[str, object] | None = None) -> dict[str, WeightLayout]:
+    """`layouts` with each `packed` source tensor built from its parts' layouts (`Packed.layout`),
+    in the place of its first part, the rest as they are: what an export writes, whether its parts'
+    leaves are a decoder's tree or tensors held in memory. A part whose record's other parts nothing
+    writes, or a packed tensor written beside its parts, is refused."""
     source: dict[str, WeightLayout] = {}
     for name, layout in layouts.items():
-        found = next(((packing, part) for packing in packed for part in packing.parts
-                      if name.endswith(part)), None)
+        found = packed_part(packed, name)
         if found is None:
             source[name] = layout
             continue
@@ -1523,10 +1524,23 @@ def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packe
         missing = [stem + other for other in packing.parts if stem + other not in layouts]
         if missing:
             raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
+        if stem + packing.name in layouts:
+            raise ValueError(f'{stem}{packing.name} is written both whole and as its parts {packing.parts}')
         if part == packing.parts[0]:
             source[stem + packing.name] = packing.layout(
                 stem + packing.name, [layouts[stem + other] for other in packing.parts], config)
     return source
+
+
+def packed_part(packed: Sequence["Packed"], name: str) -> tuple["Packed", str] | None:
+    """The `packed` record one of whose parts the tensor `name` is, and that part's suffix."""
+    return next(((packing, part) for packing in packed for part in packing.parts if name.endswith(part)),
+                None)
+
+
+def packing_of(packed: Sequence["Packed"], name: str) -> "Packed | None":
+    """The `packed` record the source tensor `name` is, if any."""
+    return next((packing for packing in packed if name.endswith(packing.name)), None)
 
 
 def layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, object],
@@ -1649,28 +1663,14 @@ class Packed:
         back = tuple(range(ndim)) if self.transpose is None else tuple(
             int(k) for k in np.argsort(self.transpose))
         transpose = tuple(order[k] for k in back)
+        if self.chunks is not None and config is None:
+            raise ValueError(f'{name} needs translated geometry to interleave its projections')
         runs = None if self.chunks is None or config is None else self.chunks(config)
         return WeightLayout(name, tuple(path for part in parts for path in part.paths),
                             tuple(shape[k] for k in back),
                             None if transpose == tuple(range(ndim)) else transpose,
                             None if len(parts) == 1 else order[axis] - ndim,
                             chunks=None if runs == 1 else runs)
-
-
-def split_packed(tensors: Mapping[str, Stored], packed: Sequence[Packed],
-                 config: Mapping[str, object] | None = None) -> dict[str, Stored]:
-    """`tensors` with each one a `packed` record names split into its parts
-    (`Packed.split`), the rest as they are, each part held once
-    (`_held_twice`)."""
-    split: dict[str, Stored] = {}
-    for name, tensor in tensors.items():
-        packing = next((packing for packing in packed if name.endswith(packing.name)), None)
-        parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
-        for part, value in parts.items():
-            kept = split.setdefault(part, value)
-            if kept is not value:
-                _held_twice(name, part, kept, value)
-    return split
 
 
 def _held_twice(name: str, part: str, kept: Stored, value: Stored) -> None:
@@ -1722,31 +1722,31 @@ def held_parts(readings: Sequence[Reading]) -> dict[str, Part]:
     return held
 
 
-def joined_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed]) -> dict[str, np.ndarray]:
-    """`split_packed`'s inverse for parts held in memory: each `packed`
-    record's parts under one stem concatenated on its axis into the tensor it
-    names, the rest as they are. A record that transposes or interleaves its
-    parts in runs is exported through its layout (`Packed.layout`) instead."""
-    joined: dict[str, np.ndarray] = {}
-    held: dict[tuple[str, Packed], dict[str, np.ndarray]] = {}
+def split_packed(tensors: Mapping[str, Stored], packed: Sequence[Packed],
+                 config: Mapping[str, object] | None = None) -> dict[str, Stored]:
+    """`tensors` with each one a `packed` record names split into its parts
+    (`packed_readings`), the rest as they are, each part held once
+    (`held_parts`): the readings of a source no decoder's path map reads."""
+    return {name: part.tensor for name, part in held_parts(packed_readings(tensors, packed, config)).items()}
+
+
+def packed_readings(tensors: Mapping[str, Stored], packed: Sequence[Packed],
+                    config: Mapping[str, object] | None = None, *,
+                    stored: Mapping[str, Stored] | None = None,
+                    path: Callable[[str], tuple[str, ...] | None] | None = None) -> tuple[Reading, ...]:
+    """`tensors` as a path map reads them, in their order: each one a `packed` record names split into
+    its parts (`Packed.split`: views, or copies where parts interleave in runs), the rest whole, each
+    part with the leaf `path` says it fills (None without one). `stored` holds the tensors as the
+    checkpoint stores them where `tensors` are another's reading of them (`DecoderFamily.prepare`'s);
+    by default they are."""
+    held = tensors if stored is None else stored
+    readings = []
     for name, tensor in tensors.items():
-        found = next(((packing, part) for packing in packed for part in packing.parts if name.endswith(part)),
-                     None)
-        if found is None:
-            joined[name] = tensor
-        else:
-            packing, part = found
-            held.setdefault((name.removesuffix(part), packing), {})[part] = tensor
-    for (stem, packing), parts in held.items():
-        if packing.transpose is not None or packing.widths is not None or packing.chunks is not None:
-            raise ValueError(f"{stem}{packing.name} transposes or interleaves its parts; "
-                             "export it by its layout")
-        if set(parts) != set(packing.parts):
-            raise ValueError(f"{stem}{packing.name} needs {packing.parts}, "
-                             f"and the tensors hold {sorted(parts)}")
-        joined[stem + packing.name] = np.concatenate([parts[part] for part in packing.parts],
-                                                     axis=packing.axis)
-    return joined
+        packing = packing_of(packed, name)
+        parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
+        readings.append(Reading(name, held.get(name), packing, tuple(
+            Part(part, value, None if path is None else path(part)) for part, value in parts.items())))
+    return tuple(readings)
 
 
 _QKV = ('q_proj', 'k_proj', 'v_proj')
@@ -1914,13 +1914,8 @@ class DecoderFamily:
         # One read of each tensor: a lazy mapping builds a tensor on every access
         # (`LazyTensors`), and `prepare` and the stored tensors share these.
         stored = dict(tensors)
-        readings = []
-        for name, tensor in self.prepare(stored, config).items():
-            packing = self.packing(name)
-            parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
-            readings.append(Reading(name, stored.get(name), packing, tuple(
-                Part(part, value, self.source_path(part, config)) for part, value in parts.items())))
-        return tuple(readings)
+        return packed_readings(self.prepare(stored, config), self.packed, config, stored=stored,
+                               path=lambda part: self.source_path(part, config))
 
     def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
         """The source name the dew path `name` exports under."""
@@ -1930,7 +1925,7 @@ class DecoderFamily:
 
     def packing(self, name: str) -> Packed | None:
         """The `packed` entry the source tensor `name` is, if any."""
-        return next((packing for packing in self.packed if name.endswith(packing.name)), None)
+        return packing_of(self.packed, name)
 
     def stored_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
         """The leaf a tensor fills as the checkpoint stores it, before `readings` splits it: None
