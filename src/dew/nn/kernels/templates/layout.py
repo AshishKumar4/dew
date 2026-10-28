@@ -178,11 +178,11 @@ RULES: dict[str, Callable] = {
 held operands with each axis it names swapped."""
 
 ENTRYWISE = frozenset({
-    "abs", "acos", "acosh", "add", "add_any", "and", "asin", "asinh", "atan", "atan2", "atanh", "cbrt", "ceil",
-    "clamp", "convert_element_type", "copy", "copy_p", "cos", "cosh", "div", "eq", "erf", "erf_inv", "erfc", "exp",
-    "exp2", "expm1", "floor", "ge", "gt", "integer_pow", "is_finite", "le", "lgamma", "digamma", "log",
-    "log1p", "logistic", "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or", "pow",
-    "population_count", "rem", "round", "rsqrt", "select_n", "shift_left", "shift_right_arithmetic",
+    "abs", "acos", "acosh", "add", "add_any", "and", "asin", "asinh", "atan", "atan2", "atanh", "cbrt",
+    "ceil", "clamp", "convert_element_type", "copy", "copy_p", "cos", "cosh", "digamma", "div", "eq", "erf",
+    "erf_inv", "erfc", "exp", "exp2", "expm1", "floor", "ge", "gt", "integer_pow", "is_finite", "le",
+    "lgamma", "log", "log1p", "logistic", "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or",
+    "population_count", "pow", "rem", "round", "rsqrt", "select_n", "shift_left", "shift_right_arithmetic",
     "shift_right_logical", "sign", "sin", "sinh", "sqrt", "square", "stop_gradient", "sub", "tan", "tanh",
     "xor",
 })
