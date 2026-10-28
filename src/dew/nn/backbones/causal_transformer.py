@@ -36,7 +36,14 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
-from dew.batch import Coordinates, Variables, coordinates as build_coordinates, merge, shifted_span
+from dew.batch import (
+    Coordinates,
+    Variables,
+    coordinates as build_coordinates,
+    merge,
+    prefix_sum,
+    shifted_span,
+)
 from dew.mesh import LayoutRefused
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
@@ -1684,7 +1691,7 @@ class CausalTransformer(nn.Module):
             valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
             # Every cached call counts its real tokens, those at given places too, so a later call
             # without places continues after them.
-            counted = self.decode_cursor(valid) if decode else jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
+            counted = self.decode_cursor(valid) if decode else prefix_sum(valid, dtype=jnp.int32) - 1
             places = counted if tokens_at.positions is None else tokens_at.positions
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
         if self.embedding_norm and self.embedding_norm_reads == 'inputs':

@@ -25,6 +25,9 @@ from dew.batch import (
     document_ranks,
     document_starts,
     padded_rows,
+    prefix_max,
+    prefix_min,
+    prefix_sum,
     real_slots,
     token_ids,
     token_positions,
@@ -378,7 +381,7 @@ def counted_places(segments=None, valid=None, positions=None) -> jax.Array | Non
     count = document_ranks(real, starts)
     if given is None:
         return count
-    firsts = starts | (real & (jnp.cumsum(real, axis=1) == 1))
+    firsts = starts | (real & (prefix_sum(real, dtype=jnp.int32) == 1))
     slots = _last_marked(firsts)
     return jnp.take_along_axis(jnp.broadcast_to(given, shape), slots, axis=1) + count
 
@@ -394,7 +397,7 @@ def numbered_blocks(tokens: Coordinates, shape: tuple[int, int], block: int) -> 
     if tokens.segments is not None:
         real = jnp.ones(shape, bool) if tokens.valid is None else jnp.broadcast_to(tokens.valid, shape)
         opens = opens | document_starts(jnp.broadcast_to(jnp.asarray(tokens.segments), shape), real)
-    numbered = jnp.cumsum(opens, axis=1, dtype=jnp.int32) - 1
+    numbered = prefix_sum(opens, dtype=jnp.int32) - 1
     if tokens.valid is None:
         return numbered
     return jnp.where(jnp.broadcast_to(tokens.valid, shape), numbered, -1)
@@ -415,14 +418,14 @@ def document_reach(segments, valid, places) -> jax.Array:
     starts = document_starts(segments, real)
     # Each real token's document, numbered per row from its first real token, and that document's
     # largest place; a padding slot's number reaches no document.
-    numbered = jnp.cumsum(starts | (real & (jnp.cumsum(real, axis=1) == 1)), axis=1, dtype=jnp.int32)
+    numbered = prefix_sum(starts | (real & (prefix_sum(real, dtype=jnp.int32) == 1)), dtype=jnp.int32)
     documents = jnp.where(real, numbered + jnp.arange(shape[0])[:, None] * (shape[1] + 1), -1)
     furthest = jax.ops.segment_max(jnp.where(real, places, jnp.iinfo(jnp.int32).min).ravel(),
                                    documents.ravel(), num_segments=shape[0] * (shape[1] + 1))
     held = jnp.take(furthest, jnp.maximum(documents, 0)).reshape(shape)
     # The slot of the next document's first real token after each slot, the row's length past the last.
     following = jnp.where(starts, index, shape[1])
-    following = jnp.flip(jax.lax.cummin(jnp.flip(following, axis=1), axis=1), axis=1)
+    following = prefix_min(following, reverse=True)
     following = jnp.pad(following[:, 1:], ((0, 0), (0, 1)), constant_values=shape[1])
     # The last real token before it, which ends the slot's document.
     ends = jnp.take_along_axis(_last_marked(real), following - 1, axis=1)
@@ -433,7 +436,7 @@ def _last_marked(marked: jax.Array) -> jax.Array:
     """Each slot's last `marked` slot at or before it `[B, S]`, 0 before any: a document's first
     slot where `marked` holds its starts (`counted_places`), its last real one where it holds the
     real tokens (`document_reach`)."""
-    return jax.lax.cummax(jnp.where(marked, jnp.arange(marked.shape[1]), 0), axis=1)
+    return jnp.asarray(prefix_max(jnp.where(marked, jnp.arange(marked.shape[1]), 0)))
 
 
 CONTEXT = "context"

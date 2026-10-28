@@ -40,7 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
 
-from dew.batch import Coordinates, valid_order
+from dew.batch import Coordinates, prefix_sum, valid_order
 from dew.mesh import MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
@@ -229,7 +229,7 @@ def _stream_order(valid):
     every real token writes its own column, so no two writers meet."""
     length = valid.shape[1]
     order, counts = valid_order(valid)
-    rank = jnp.cumsum(jnp.asarray(valid, bool), axis=1, dtype=jnp.int32) - 1
+    rank = prefix_sum(jnp.asarray(valid, bool), dtype=jnp.int32) - 1
     return rank, jnp.where(jnp.arange(length)[None, :] < counts[:, None], order, length).astype(jnp.int32)
 
 

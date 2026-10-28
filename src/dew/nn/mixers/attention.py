@@ -18,7 +18,7 @@ from flax import linen as nn
 from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
-from dew.batch import Coordinates
+from dew.batch import Coordinates, prefix_sum
 from dew.nn.attention import (
     RMSNorm,
     alibi_bias,
@@ -1018,7 +1018,7 @@ class CausalSelfAttention(nn.Module):
         rows, pieces = index.shape[0], admitted.slots.shape[0]
         valid = jnp.asarray(valid, bool)[0]
         prompt = valid[rows:].reshape(pieces, -1)
-        filled = admitted.cursors[:, None] + jnp.cumsum(prompt, axis=1, dtype=jnp.int32) - 1
+        filled = admitted.cursors[:, None] + prefix_sum(prompt, dtype=jnp.int32) - 1
         positions = jnp.concatenate([jnp.where(valid[:rows], index, -1),
                                      jnp.where(prompt, filled, -1).reshape(-1)])
         return positions[None]

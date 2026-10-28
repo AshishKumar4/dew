@@ -7,11 +7,10 @@ states its own sides."""
 
 from typing import Literal
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.batch import BLOCKS_FIELD, coordinates, document_starts
+from dew.batch import BLOCKS_FIELD, coordinates, document_starts, prefix_max, prefix_min, prefix_sum
 
 
 def windowed(query, key, window: int, *, causal: bool):
@@ -67,16 +66,10 @@ def role_blocks(segments, roles, assistant: int, *, starts=None, xp=jnp):
     places = xp.broadcast_to(xp.arange(segments.shape[-1], dtype=xp.int32), segments.shape)
     opens = starts if starts is not None else xp.concatenate(
         [xp.ones_like(segments[..., :1], bool), segments[..., 1:] != segments[..., :-1]], axis=-1)
-    start = _cummax(xp.where(opens, places, 0), xp)
-    spoken = _cummax(xp.where((segments > 0) & (roles == assistant), places, -1), xp) >= start
+    last = segments.ndim - 1
+    start = prefix_max(xp.where(opens, places, 0), last, xp=xp)
+    spoken = prefix_max(xp.where((segments > 0) & (roles == assistant), places, -1), last, xp=xp) >= start
     return xp.where((segments > 0) & ~spoken, segments, -1).astype(xp.int32)
-
-
-def _cummax(values, xp):
-    """The running maximum along the last axis, in `xp`."""
-    if xp is np:
-        return np.maximum.accumulate(values, axis=-1)
-    return jax.lax.cummax(values, axis=values.ndim - 1)
 
 
 def prefix_groups(documents, real, prefix: int | Literal["prompt"], *, positions=None, roles=None,
@@ -109,7 +102,7 @@ def prompt_blocks(valid, prefix: int | Literal["prompt"], *, xp=jnp):
     valid = xp.asarray(valid, bool)
     if prefix == "prompt":
         return xp.where(valid, 1, -1).astype(xp.int32)
-    return prefix_blocks(valid.astype(xp.int32), xp.cumsum(valid, axis=1, dtype=xp.int32) - 1, prefix, xp=xp)
+    return prefix_blocks(valid.astype(xp.int32), prefix_sum(valid, dtype=np.int32, xp=xp) - 1, prefix, xp=xp)
 
 
 def served_blocks(real, prefix: int | Literal["prompt"]):
@@ -139,7 +132,7 @@ def block_starts(groups):
     batch, length = groups.shape
     index = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
     opens = jnp.concatenate([jnp.ones((batch, 1), bool), groups[:, 1:] != groups[:, :-1]], axis=1)
-    return jax.lax.cummax(jnp.where(opens, index, 0), axis=1)
+    return prefix_max(jnp.where(opens, index, 0))
 
 
 def block_ends(groups):
@@ -150,7 +143,7 @@ def block_ends(groups):
     index = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
     # A run's last token: the next one's id differs, or the row ends there.
     last = jnp.concatenate([groups[:, 1:] != groups[:, :-1], jnp.ones((batch, 1), bool)], axis=1)
-    return jax.lax.cummin(jnp.where(last, index, length), axis=1, reverse=True) + 1
+    return prefix_min(jnp.where(last, index, length), reverse=True) + 1
 
 
 def window_sides(causal: bool, sliding_window: int) -> tuple[int, int]:

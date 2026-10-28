@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 
-from dew.batch import Variables, part, thaw
+from dew.batch import Variables, part, prefix_sum, thaw
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
@@ -177,7 +177,7 @@ def key_runs(slots: jax.Array, segments: jax.Array, options: int, *, causal: boo
     index = jnp.arange(length, dtype=jnp.int32)
     first, last = block_starts(segments), block_ends(segments)
     # Each document's number in its row, which the per-document reductions key by.
-    documents = jnp.cumsum(index[None, :] == first, axis=1) - 1
+    documents = prefix_sum(index[None, :] == first, dtype=jnp.int32) - 1
 
     def spans(slot_row, document_row):
         # Each option's span in each token's document, `[options, L]` twice, empty past the keys.

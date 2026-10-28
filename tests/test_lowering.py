@@ -895,3 +895,76 @@ def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():
         with routes() as found:
             jax.block_until_ready(outer(x))
         assert [found_route.choice for found_route in found] == ["ssd"]
+
+
+@pytest.mark.parametrize("scan", ["sum", "max", "min"])
+def test_a_blocked_prefix_scan_is_the_running_scan(scan):
+    """`prefix_sum`, `prefix_max` and `prefix_min` (forward and from the end) are numpy's running sum,
+    maximum and minimum, integer for integer, along either axis, over lengths short of one block, short of
+    whole blocks and of whole ones (`SCAN_BLOCKS`)."""
+    from dew.batch import SCAN_BLOCKS, prefix_max, prefix_min, prefix_sum
+
+    rng = np.random.default_rng(0)
+    for length in (5, SCAN_BLOCKS * 3 + 7, SCAN_BLOCKS * 8):
+        for axis in (0, 1):
+            values = rng.integers(-50, 50, (3, length) if axis else (length, 3)).astype(np.int32)
+            if scan == "sum":
+                np.testing.assert_array_equal(prefix_sum(values, axis), np.cumsum(values, axis))
+            elif scan == "max":
+                np.testing.assert_array_equal(prefix_max(values, axis), np.maximum.accumulate(values, axis))
+            else:
+                np.testing.assert_array_equal(prefix_min(values, axis), np.minimum.accumulate(values, axis))
+                reversed_min = np.flip(np.minimum.accumulate(np.flip(values, axis), axis), axis)
+                np.testing.assert_array_equal(prefix_min(values, axis, reverse=True), reversed_min)
+    empty = np.zeros((2, 0), np.int32)
+    for scanned in (prefix_sum(empty), prefix_max(empty), prefix_min(empty), prefix_min(empty, reverse=True)):
+        assert scanned.shape == (2, 0)
+
+
+def test_a_blocked_prefix_scan_keeps_cumsums_dtype_and_infinities():
+    """A blocked running sum sums in `cumsum`'s dtype throughout, so a requested int8 wraps as `cumsum`'s
+    does and a bool counts in the default integer; a running maximum or minimum of infinities is
+    infinite, as numpy's is."""
+    import jax.numpy as jnp
+
+    from dew.batch import prefix_max, prefix_min, prefix_sum
+
+    wrapped = prefix_sum(np.full((1, 200), 1, np.int8), dtype=jnp.int8)
+    expected = jnp.cumsum(jnp.full((1, 200), 1, jnp.int8), axis=1, dtype=jnp.int8)
+    np.testing.assert_array_equal(wrapped, expected)
+    assert wrapped.dtype == jnp.int8
+    counted = prefix_sum(np.ones((1, 130), bool))
+    assert counted.dtype == jnp.cumsum(jnp.ones((1, 130), bool), axis=1).dtype and int(counted[0, -1]) == 130
+    lows, highs = np.full((1, 130), -np.inf, np.float32), np.full((1, 130), np.inf, np.float32)
+    np.testing.assert_array_equal(prefix_max(lows), lows)
+    np.testing.assert_array_equal(prefix_min(highs), highs)
+    np.testing.assert_array_equal(prefix_min(highs, reverse=True), highs)
+
+
+def test_a_batchs_token_layout_split_over_its_tokens_compiles_no_loop_a_token():
+    """The token layout a step builds from a packed, padded batch (its documents' starts, each token's
+    rank in its document and in its row, the layers' counted places, block numbers and ends, and learned
+    positions' places), compiled by XLA's CUDA pipeline for two H100s with the batch's token axis split
+    between them (`compile_only_gpus`, no GPU attached), runs no loop: a running scan along a split axis
+    became a loop of one iteration a token in XLA's GPU partitioner, a 2xH100 training step's tenfold
+    slowdown (ledger 1905); each runs in blocks no mesh splits (`dew.batch.prefix_sum`)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.batch import coordinates, real_places
+    from dew.decision.model import key_runs
+    from dew.nn.inputs import counted_places, numbered_blocks
+    from dew.nn.visibility import block_ends
+    from dew.training.ahead import compile_only_gpus
+
+    def layout(segments, valid):
+        tokens = coordinates(segments=segments, valid=valid, max_segments=4)
+        return (tokens.positions, tokens.starts, real_places(valid), counted_places(segments, valid, None),
+                numbered_blocks(tokens, segments.shape, 16), block_ends(segments),
+                key_runs(jnp.minimum(segments, 2), segments, 2))
+
+    mesh = Mesh(np.array(compile_only_gpus("sm90", 2)), ("sequence",))
+    split = NamedSharding(mesh, PartitionSpec(None, "sequence"))
+    shapes = (jax.ShapeDtypeStruct((4, 8192), jnp.int32, sharding=split),
+              jax.ShapeDtypeStruct((4, 8192), jnp.bool_, sharding=split))
+    program = jax.jit(layout, in_shardings=(split, split)).lower(*shapes).compile().as_text()
+    assert not re.findall(r"\bwhile\(", program), re.findall(r"known_trip_count[^\n]*", program)[:4]

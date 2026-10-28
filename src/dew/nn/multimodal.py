@@ -13,7 +13,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew._model_types import GEMMA4_TYPES
-from dew.batch import Coordinates, coordinates as build_coordinates
+from dew.batch import Coordinates, coordinates as build_coordinates, prefix_sum
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
@@ -434,7 +434,7 @@ class MultimodalTransformer(DecoderWrapper):
                      else coordinates.valid)
             positions = None if coordinates is None else coordinates.positions
             if rotary_positions is None and positions is None:
-                positions = cursor.value[:, None] + jnp.cumsum(valid, axis=1) - 1
+                positions = cursor.value[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
                 coordinates = (build_coordinates(tokens.shape, positions=positions) if coordinates is None
                                else dataclasses.replace(coordinates, positions=positions))
             # The response's rule (`next_position`): past the last real token's position, or past
