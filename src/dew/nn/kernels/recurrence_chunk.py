@@ -1163,32 +1163,41 @@ against a 0/1 triangle, where an infinity times 0 is a NaN; and it stays small e
 of resets in one shard's total decay are nowhere near fp32's range."""
 
 
-def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work):
-    """The rated scan on a TPU's Pallas kernel (`dew.nn.kernels.ssd`), on its operands: `x`, `B` and
-    `C` in `work`, the groups expanded, the length padded to whole chunks, `x` scaled by `dt`, the
-    log decay `A dt` with `RESET_DECAY` at each document's first token; per shard of rows and heads
-    (`manual_map`). The skip `D x` is added after. Returns the output and the memory `[B, H, P, N]`."""
+def ssd_operands(x, dt, A, B, C, chunk_size: int, starts=None):
+    """A layer's SSD operands as the chunk scan takes them (`dew.nn.kernels.ssd.ssd_chunk_scan`):
+    `(x dt, B, C, A dt)`, the groups of `B` and `C` expanded over the heads, the sequence padded to whole
+    chunks of `chunk_size`, `x` scaled by its step and the log decay `A dt` a step, `RESET_DECAY` at each
+    packed document's first token (`starts`)."""
     heads, length = x.shape[2], x.shape[1]
-    x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
     # The `H // G` heads of one group read the same B and C, the reference's `repeat_interleave`.
     B, C = repeat_kv_heads(B, heads), repeat_kv_heads(C, heads)
     pad = (chunk_size - length % chunk_size) % chunk_size
     x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
     dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
-    skip = D[None, None, :, None] * x
     a = A[None, None, :] * dt
     if starts is not None:
         a = jnp.where(jnp.pad(starts, ((0, 0), (0, pad)))[..., None], RESET_DECAY, a)
+    return x * dt[..., None], B, C, a
+
+
+def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work):
+    """The rated scan on a TPU's Pallas kernel (`dew.nn.kernels.ssd`), on its operands in `work`
+    (`ssd_operands`), per shard of rows and heads (`manual_map`). The skip `D x` is added after. Returns
+    the output and the memory `[B, H, P, N]`."""
+    length = x.shape[1]
+    x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
+    skip = D[None, None, :, None] * x
+    scaled, B, C, a = ssd_operands(x, dt, A, B, C, chunk_size, starts)
 
     def kernel(x, B, C, a, carried):
         return ssd_chunk_scan(x, B, C, a, carried, chunk_size, platform)
 
     # The groups are expanded, so any split of the heads divides them.
-    rows, split = grouped_heads(x.shape, heads)
+    rows, split = grouped_heads(scaled.shape, scaled.shape[2])
     four, held = P(rows, None, split, None), P(rows, split, None, None)
     scanned, final = manual_map(kernel, (four, four, four, P(rows, None, split), held),
-                                (four, held))(x * dt[..., None], B, C, a, carried)
-    return (scanned + skip)[:, :length], final
+                                (four, held))(scaled, B, C, a, carried)
+    return scanned[:, :length] + skip, final
 
 
 @dataclasses.dataclass(frozen=True)
