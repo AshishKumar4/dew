@@ -969,7 +969,7 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
         "    assert not os.environ.get('FAIL')\n"
         "    if os.environ.get('EXIT'): os._exit(3)\n")
     fixture = tmp_path / "tests/fixture.json"
-    fixture.write_text("{}")
+    fixture.write_text("[]")
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
     cached(monkeypatch, url)
@@ -1001,17 +1001,19 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     monkeypatch.delenv("EXIT")
     assert run("GenuineIntel-6-143") == 8
     # Another commit's run between a commit's run and its retry: the fixture the test reads is its input.
-    fixture.write_text('{"changed": true}')
-    assert run("GenuineIntel-6-143") == 9
     fixture.write_text("{}")
     assert run("GenuineIntel-6-143") == 9
-    monkeypatch.setenv("FAIL", "1")
-    assert run("GenuineIntel-6-143", policy="off") == 10
-    monkeypatch.delenv("FAIL")
     fixture.write_text('{"changed": true}')
     assert run("GenuineIntel-6-143") == 10
     fixture.write_text("{}")
+    assert run("GenuineIntel-6-143") == 10
+    monkeypatch.setenv("FAIL", "1")
+    assert run("GenuineIntel-6-143", policy="off") == 11
+    monkeypatch.delenv("FAIL")
+    fixture.write_text('{"changed": true}')
     assert run("GenuineIntel-6-143") == 11
+    fixture.write_text("{}")
+    assert run("GenuineIntel-6-143") == 12
 
 
 
