@@ -9,6 +9,7 @@ import pytest
 from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import (
     CASES,
+    ONE_RUN,
     ROWS,
     RUN_CASES,
     SINKS,
@@ -125,10 +126,13 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
     pin = tuning.pinned({attention_triton.TritonForward: config})
 
-    # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), taken
-    # to the reference's natural ones as the algebra takes them (`algebra.Forward.naturalized`).
-    spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=width ** -0.5,
-                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None)
+    # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), the
+    # query's taken by its scale's power of two (`template.prescale`), taken to the reference's natural ones
+    # as the algebra takes them (`algebra.Forward.naturalized`).
+    power, scale = template.prescale(dtype, width, width ** -0.5)
+    spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=scale,
+                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None,
+                           prescale=power)
 
     def ours(query, key, value):
         if mainloop == "portable":
@@ -189,6 +193,14 @@ def test_the_frozen_mainloop_refuses_runs():
         attention_triton.forward(query, key, key, spans, interpret=True)
     with pytest.raises(NotImplementedError):
         attention_triton.backward(query, key, key, spans, None, query, interpret=True)
+
+
+@pytest.mark.parametrize("config", PINNED[:2], ids=str)
+def test_one_run_a_query_is_the_interval_the_frozen_mainloop_walks(config):
+    """One run a query (`test_attention_template.ONE_RUN`, a chunked or banded local-attention layer's runs)
+    is one key interval, which the frozen Triton mainloop walks forward and backward (ledger 1991)."""
+    check(ONE_RUN, HOOKS["none"], jnp.float32, config)
+    check_backward(ONE_RUN, (), jnp.float32, config)
 
 
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])

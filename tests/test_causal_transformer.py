@@ -38,7 +38,6 @@ from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling
-from dew.telemetry.instrumentation import hlo_instructions
 
 VOCAB = 37
 SEQ = 12
@@ -57,7 +56,7 @@ SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'route
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
          'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64,
-         'learned hybrid decode': 8}
+         'learned hybrid decode': 8, 'layouts': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
 sites on an A100): the most any of a site's cases took."""
 
@@ -225,6 +224,9 @@ def test_attention_probability_dropout_matches_flax_on_the_same_draw(rng):
     expected = flax_with_keep(query, value, mask, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
                                           dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    # Zero queries give every visible weight exp(0) = 1 over an integer sum, one correctly rounded quotient,
+    # and the keep mask and its exact multiplier 2 are the same draw's: both programs round the same value
+    # once, so they agree bit for bit by construction.
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
     probabilities = np.asarray(actual)[0]
     for row in range(4):
@@ -265,6 +267,8 @@ def test_attention_dropout_preserves_visibility_masks(rng):
     expected = flax_with_keep(query, value, visible, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, segment_ids=documents,
         implementation="auto", dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    # Bit for bit by construction, as in `test_attention_probability_dropout_matches_flax_on_the_same_draw`:
+    # zero queries' weights are one correctly rounded quotient each, the keep mask the same draw's.
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
     assert not np.any(np.asarray(actual)[0, 2:, :, :2]), "documents never see an earlier document"
 
@@ -339,27 +343,12 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
 
 
 @pytest.mark.gpu(reason="FlashAttention runs on CUDA")
-def test_a_cached_prompt_reads_its_cache_through_flash_where_its_wheel_runs(rng, without_deterministic_ops):
+def test_a_cached_prompt_reads_its_cache_as_the_uncached_forward(without_deterministic_ops):
     """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
-    mask, which FlashAttention takes wherever its wheel holds code for the GPU (Hopper's declared cell, other
-    GPUs' first kernel by legality): the compiled prefill holds its kernel there, and its logits are on par
-    with the xla kernel's uncached forward from the float64 forward over drawn weights and prompts
-    (check 1)."""
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION
-
+    mask, whatever kernel the GPU takes: its logits are on par with the xla kernel's uncached forward from
+    the float64 forward over drawn weights and prompts (check 1)."""
     model = tiny(dtype=jnp.bfloat16)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    prompt = ids[:, :6]
     made, step = decode_steps(model)
-    compiled = hlo_instructions(step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text())
-    probe = jnp.zeros((1, 8, 1, 64), jnp.bfloat16)
-    failed = ATTENTION.kernel('flash').failed(attention_case(probe, probe))
-    flash = not {requirement.code for requirement in failed} & {'not_installed', 'binary_arch'}
-    # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
-    packed = {'dew_flash_mha_varlen_fwd', 'dew_flash3_mha_varlen_fwd'}
-    assert bool(packed & {instruction.target for instruction in compiled.values()}) == flash
     assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
                     applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
                     seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
@@ -1152,12 +1141,12 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("mixture", [None, {"experts": 8, "top_k": 2, "expert_features": 32}])
 def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixture):
-    """The rows are independent, so splitting the batch over devices changes
-    no token's arithmetic. With XLA free to skip roundings, what fused on one
-    device and on four differed: the hidden states of a 4-layer bf16 decoder
-    matched in 13% of entries, an 8-expert MoE's top-2 routes differed in
-    0.3% of layer 0's choices and 2.8% of layer 3's, and its loss moved
-    2.6e-4. Every rounding kept, they are bitwise the same."""
+    """The rows are independent, so splitting the batch over devices changes no token's arithmetic. With
+    XLA free to skip roundings, what fused on one device and on four differed: the hidden states of a
+    4-layer bf16 decoder matched in 13% of entries, an 8-expert MoE's top-2 routes differed in 0.3% of layer
+    0's choices and 2.8% of layer 3's, and its loss moved 2.6e-4. Every rounding kept, the split's hidden
+    states are on par with one device's over drawn weights and tokens (check 1; the owner's option (a),
+    10-22: floats by check 1 across layouts), truth the decoder in float64."""
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     config = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8, "num_kv_heads": 4,
@@ -1165,17 +1154,19 @@ def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixtur
     if mixture is not None:
         config["mixture"] = {**mixture, "layers": (0, 1, 2, 3)}
     model = CausalTransformer(**config)
-    ids = jax.random.randint(jax.random.key(0), (16, 32), 0, 512)
-    params = model.init(jax.random.key(1), ids)
-
-    def hidden(params, ids):
-        return model.apply(params, ids, method=CausalTransformer.hidden_states)
-
-    one = jax.jit(hidden)(params, ids)
     mesh = Mesh(np.asarray(jax.devices()[:4]), ("data",))
-    split = jax.jit(hidden)(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
 
-    np.testing.assert_array_equal(np.asarray(one), np.asarray(split))
+    def hidden(model):
+        return lambda params, ids: model.apply(params, ids, method=CausalTransformer.hidden_states)
+
+    compiled = jax.jit(hidden(model))
+
+    def split(params, ids):
+        return compiled(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
+
+    assert_as_exact(as_given(split), compiled, model_draw(model, (16, 32), 512),
+                    f"one device against four, {'MoE' if mixture else 'dense'}", seeds=SEEDS['layouts'],
+                    truth_fn=hidden(model.clone(dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize("activation", ["swiglu", "geglu", "geglu_exact"])

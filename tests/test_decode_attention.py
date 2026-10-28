@@ -480,6 +480,7 @@ def test_key_starts_attend_as_the_mask_they_mean(options):
     np.testing.assert_array_equal(np.asarray(got[0]), 0)
     # A mask, the starts folded into it here, is one path: the two calls agree bitwise.
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    # The same one path differentiated: the gradients agree bitwise by the same construction.
     grads = [jax.grad(lambda *a, f=f: jnp.sum(f(*a) ** 2), argnums=(0, 1, 2))(query, key, value)
              for f in (spans, masked)]
     for mine, theirs in zip(*grads, strict=True):
@@ -666,7 +667,6 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
     heads (`manual_map`), the shapes its call names: a Pallas call has no partitioning rule, and
     launched on the whole batch it had XLA gather every row's cache to every device each token."""
     import math
-    import re
 
     from jax.sharding import AxisType
     from sharded import placed
@@ -692,15 +692,20 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
     # The decode kernel named for the step (`generation.chosen`), whose launches' operands this reads.
     with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh), chosen(decode="decode"):
         lowered = jax.jit(step).trace(placed(params, mesh), placed(cache, mesh),
-                                      placed(tokens, mesh, "data" if "data" in axes else None))
-        text = lowered.lower(lowering_platforms=("cuda",)).as_text(debug_info=False)
-    # Each launch's operand types: the rows' key spans, the padded queries, the cache's keys and values.
-    called = r'custom_call @__gpu\$xla\.gpu\.triton\(.*?name = "decode_attention".*?: \((.*?)\) ->'
-    launches = re.findall(called, text)
+                                      placed(tokens, mesh, "data" if "data" in axes else None)).lower(
+            lowering_platforms=("cuda",))
+    # Each decode launch's operands, read from the lowered program's custom calls: the rows' key spans and
+    # the padded queries a shard's own (`custom_calls`, `triton_calls`, in program order).
+    from dew.telemetry.instrumentation import custom_call_kind
+    from dew.training._lowering import custom_calls, triton_calls
+
+    calls = [call for call in custom_calls(lowered) if custom_call_kind(call.target) == "triton"]
+    launches = [call for call, kernel in zip(calls, triton_calls(lowered), strict=True)
+                if kernel.name == "decode_attention"]
     assert launches
-    for types in launches:
-        spans, query = types.split(", ")[:2]
-        assert spans == f"tensor<{rows}x2xi32>" and query.startswith(f"tensor<{rows}x16x{heads}x"), types
+    for call in launches:
+        spans, query = call.operands[:2]
+        assert spans == (rows, 2) and call.operand_types[0] == "i32" and query[:3] == (rows, 16, heads), call
 
 
 def paged_case(page_size, windowed=False):
@@ -884,7 +889,10 @@ def test_a_cache_calls_documents_aligned_to_their_last_keys_are_its_mask(window)
 @pytest.mark.parametrize("window", [None, 4])
 def test_a_cache_call_read_as_documents_attends_as_its_mask(implementation, window):
     """Attention of a cache call over its documents (causal, windowed, `CrossDocuments`) is bitwise
-    the attention over the cache's mask on the kernels that build it, a padding row's output zero."""
+    the attention over the cache's mask on the kernels that build it, a padding row's output zero: by
+    construction, those kernels building the documents' very mask (`cross_document_mask`, which
+    `test_a_cache_calls_documents_aligned_to_their_last_keys_are_its_mask` holds equal to the cache's)
+    before the call, so the two calls run one program over one mask."""
     positions, filled, mask = cache_call(window)
     rng = np.random.default_rng(7)
     query = jnp.asarray(rng.normal(size=(4, 6, 2, 32)), jnp.float32)
