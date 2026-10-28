@@ -252,13 +252,13 @@ def real_tail(x, valid, segments, width: int):
 
 
 def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_padded: bool = False,
-                parts=None, dtype=None):
+                parts=None, dtype=None, activation: bool = True):
     """`[B, S, D]` convolved causally after the `held` history, `[B, K - 1, D]`
     or None for none, and the history the next call holds: a linear-attention
     or state-space layer's conv over its decode cache, padded slots read and
     advanced by none (`_masked_conv1d`). `bias` is added before the silu, and
-    packed `segments` convolve each document alone; `parts` and `dtype` are
-    `causal_conv1d`'s.
+    packed `segments` convolve each document alone; `parts`, `dtype` and
+    `activation` are `causal_conv1d`'s.
 
     `right_padded` says each row's `valid` slots are its first
     (`AttentionMetadata.right_padded`), as they all are where `valid` is
@@ -277,7 +277,8 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_
         x = jax.lax.optimization_barrier(x)
     width = kernel.shape[-1] - 1
     if valid is not None and not right_padded:
-        return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments, parts=parts, dtype=dtype)
+        return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments, parts=parts, dtype=dtype,
+                              activation=activation)
     batch, length, channels = x.shape
     empty = jnp.zeros((batch, width, channels), x.dtype)
     stream = jnp.concatenate([rows_like(empty, x) if held is None else held, x], axis=1)
@@ -294,7 +295,7 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_
         last = jnp.take_along_axis(owners, ends[:, None] + width - 1, axis=1)
         history = jnp.where((jnp.take_along_axis(owners, rows, axis=1) == last)[:, :, None], history, 0)
     return _behind(x, kernel=kernel, held=held, bias=bias, valid=valid, segments=segments, parts=parts,
-                   dtype=dtype), history
+                   dtype=dtype, activation=activation), history
 
 
 def _held_first(segments, width: int):
@@ -304,19 +305,20 @@ def _held_first(segments, width: int):
     return jnp.concatenate([jnp.broadcast_to(segments[:, :1], (segments.shape[0], width)), segments], axis=1)
 
 
-def _behind(x, *, kernel, held, bias, valid=None, segments=None, parts=None, dtype=None):
+def _behind(x, *, kernel, held, bias, valid=None, segments=None, parts=None, dtype=None, activation=True):
     """`causal_conv1d` of `x` after the `held` history `[B, K - 1, D]`, or
     after the conv's own zeros where None; the history is the first of
     packed `segments`' documents."""
     if held is None:
-        return causal_conv1d(x, kernel, bias=bias, valid=valid, segments=segments, parts=parts, dtype=dtype)
+        return causal_conv1d(x, kernel, activation, bias=bias, valid=valid, segments=segments, parts=parts,
+                             dtype=dtype)
     width = held.shape[1]
     if valid is not None:
         valid = jnp.pad(valid, ((0, 0), (width, 0)), constant_values=True)
     if segments is not None:
         segments = _held_first(segments, width)
-    out = causal_conv1d(jnp.concatenate([held, x], axis=1), kernel, bias=bias, valid=valid, segments=segments,
-                        parts=parts, dtype=dtype)
+    out = causal_conv1d(jnp.concatenate([held, x], axis=1), kernel, activation, bias=bias, valid=valid,
+                        segments=segments, parts=parts, dtype=dtype)
     return jax.tree.map(lambda piece: piece[:, width:], out)
 
 
@@ -368,7 +370,8 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
-def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts=None, dtype=None):
+def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts=None, dtype=None,
+                   activation=True):
     """Convolve real tokens without advancing a paused row's history.
 
     The j-th real token of a row reads the K-1 real tokens before it, whatever
@@ -409,7 +412,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
         history = jnp.where(((kept == last) | (rank[:, -1:] < 0))[:, :, None], history, 0)
     # The history in front carries the K-1 taps the first real token reads, so row width + j of the
     # convolution is the output of real token j.
-    convolved = causal_conv1d(stream, kernel, bias=bias, segments=owners,
+    convolved = causal_conv1d(stream, kernel, activation, bias=bias, segments=owners,
                               dtype=at_least_fp32(x.dtype))[:, width:]
     output = jnp.take_along_axis(convolved, jnp.maximum(rank, 0)[:, :, None], axis=1)
     output = jnp.where(valid[:, :, None], output, 0)

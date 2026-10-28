@@ -59,7 +59,7 @@ PADDED = {"llama-tiny", "mistral-tiny", "mixtral-tiny", "ministral-tiny",
                 "muse-glimmer-text-tiny", "qwen35-moe-text", "kimi-k25-tiny",
                 "kimi-linear-tiny", "kimi-k3-tiny", "ouro-tiny", "dream-tiny",
                 "llada-moe-tiny", "llada-moe-v2-tiny", "llada2-tiny", "llada21-tiny",
-                "llada22-tiny"}
+                "llada22-tiny", "lfm3-tiny"}
 """Families whose source pads a stated pad id, by fixture."""
 
 UNPADDED = {"gpt-neox-tiny", "falcon-tiny", "llada-tiny", "mimo-v2-tiny", "k2-horizon-tiny",
@@ -78,7 +78,8 @@ RECORDED = {
     "ouro-tiny": "tools/ouro_reference.py --padding",
     "k2-horizon-tiny": "tools/k2_horizon_reference.py --padding",
     "deepseek-v41-tiny": "tools/deepseek_v41_reference.py --padding",
-    **dict.fromkeys(("llada-tiny", "dream-tiny", "mimo-v2-tiny"), "tools/remote_code_reference.py --padding"),
+    **dict.fromkeys(("llada-tiny", "dream-tiny", "mimo-v2-tiny", "lfm3-tiny"),
+                    "tools/remote_code_reference.py --padding"),
     **dict.fromkeys(("llada-moe-tiny", "llada-moe-v2-tiny", "llada2-tiny", "llada21-tiny", "llada22-tiny"),
                     "tools/llada_moe_reference.py --padding"),
 }
