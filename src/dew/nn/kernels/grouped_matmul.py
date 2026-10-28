@@ -840,13 +840,13 @@ class MosaicGmm(_Mosaic):
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
-        # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
-        del exact_sums, dense
+        # Exact sums are ineligible for this launch.
+        del exact_sums
         return mosaic_gpu.gmm(tokens, kernel, sizes, tiles=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              **hooks.kernel_options()), None
+                              dense=dense, **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
