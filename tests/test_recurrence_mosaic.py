@@ -333,10 +333,11 @@ def test_the_mosaic_launches_state_their_work(training):
 
 
 def test_each_launch_lowers_once_however_many_layers_call_it():
-    """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for an H100: each of
-    the template's distinct launches is one Mosaic GPU call in the lowered program, which both layers call
-    (`mainloop._lowered_once`), as many as one layer's. Each call site traced, lowered and serialized its own
-    kernel: a Qwen3.5-4B step's first update waited 30 minutes on its layers' identical kernels (row 2102)."""
+    """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
+    test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the
+    lowered program, which both layers call (`mainloop._lowered_once`), as many as one layer's. Each call
+    site traced, lowered and serialized its own kernel: a Qwen3.5-4B step's first update waited 30 minutes
+    on its layers' identical kernels (row 2102)."""
     import re
 
     rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 128
@@ -357,8 +358,12 @@ def test_each_launch_lowers_once_however_many_layers_call_it():
 
         return jax.grad(run, argnums=(0, 1, 2))
 
+    # The GPU the test runs on where its family takes the call, else an H100 (Mosaic GPU lowers no Hopper
+    # copy for an A100's device).
+    lowered_for = generation.device_generation() if mainloop.family_of() is not None else "sm90"
+
     def kernels(count: int) -> int:
-        with generation.assumed("sm90"):
+        with generation.assumed(lowered_for):
             text = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(
                 dialect="hlo")
         return len([line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)])

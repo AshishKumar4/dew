@@ -43,6 +43,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import inspect
 import math
 from collections.abc import Callable, Sequence
 
@@ -585,35 +586,24 @@ _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned"
 """Where `planned` collects its launches; None where they run."""
 
 
+STATIC = ("call", "tiles", "scale", "keeps", "out_dtype")
+"""A launch's static arguments, by name (`_lowered_once`): its call's geometry, bundle and target, its tiles
+and its constants; its every other argument an array or None."""
+
+
 def _lowered_once(launch: Callable) -> Callable:
-    """`launch` run through one jitted function a configuration of its call, its every argument but its arrays
-    (which the function takes): each call site of a configuration traces the same program, which JAX lowers
-    once a program (its lowering caches a jaxpr's function), however many layers, passes and recomputations
-    call it. A launch's program closes over its call, so each call traced its own and each kernel was lowered
-    and serialized again a call: a hybrid model's step lowered its layers' identical kernels one by one.
-    Planning (`planned`) traces every call, each launch recording itself (`_kernel`)."""
-
-    @functools.cache
-    def jitted(layout: tuple, keywords: tuple) -> Callable:
-        def run(*arrays):
-            given = iter(arrays)
-            args = [next(given) if traced else value for traced, value in layout]
-            kwargs = {name: next(given) if traced else value for name, (traced, value) in keywords}
-            return launch(*args, **kwargs)
-
-        return jax.jit(run)
-
-    def placed(value) -> tuple:
-        return (True, None) if isinstance(value, jax.Array) else (False, value)
+    """`launch` jitted, its static arguments (`STATIC`) those of its signature: each call site of a
+    configuration traces the same program, which JAX lowers once a program (its lowering caches a jaxpr's
+    function), however many layers, passes and recomputations call it. A launch's program closes over its
+    call, so each call traced its own and each kernel was lowered and serialized again a call: a hybrid
+    model's step lowered its layers' identical kernels one by one. Planning (`planned`) traces every call,
+    each launch recording itself (`_kernel`)."""
+    parameters = inspect.signature(launch).parameters
+    jitted = jax.jit(launch, static_argnames=tuple(name for name in STATIC if name in parameters))
 
     @functools.wraps(launch)
     def called(*args, **kwargs):
-        if _PLANNED.get() is not None:
-            return launch(*args, **kwargs)
-        keywords = tuple(sorted((name, placed(value)) for name, value in kwargs.items()))
-        arrays = [value for value in (*args, *(kwargs[name] for name, _ in keywords))
-                  if isinstance(value, jax.Array)]
-        return jitted(tuple(placed(value) for value in args), keywords)(*arrays)
+        return launch(*args, **kwargs) if _PLANNED.get() is not None else jitted(*args, **kwargs)
 
     return called
 
