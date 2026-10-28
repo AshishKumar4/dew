@@ -34,11 +34,13 @@ from dew.nn.memory import CARRY, Gate, InContextMemory, MLPMemory, Objective
 from dew.nn.mlp import GatedMLP
 
 SEEDS = {"memory decoder gradient": 512, "memory decoder decode": 16, "adapted memory": 8, "rows split": 256,
-         "rows split cms": 512}
+         "rows split cms": 512, "served memory moving": 8, "served memory projections": 8,
+         "served memory convolved": 8}
 """The sites' declared seeds where `seeds_for` on armada, each reference compared with itself, sizes them
 apart from `MEMORY_SEEDS`: the memory decoder's gradients, every parameter's leaf, and the
 continuum-memory level's rows split over a data axis at 512; the other memories' rows split at 256; the
-decoder's last logits after a cached decode at 16; an adapted memory decoder at 8."""
+decoder's last logits after a cached decode at 16; an adapted memory decoder at 8; each served memory
+(`SERVED`) at 8, paired with quantized training (`seeds_for(..., dew_fn=)`)."""
 
 
 def decoder(memory: InContextMemory | None = None, **fields):
