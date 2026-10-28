@@ -14,9 +14,13 @@ import numpy as np
 import pytest
 from fla_gdn_support import CONV_SHAPES
 from reference_error import (
+    FACTOR,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_rounds_where_the_reference_does,
+    chain_roundings,
+    distance,
+    widened,
     with_gradients,
     within,
 )
@@ -32,7 +36,7 @@ SHARDED_SEEDS = 8
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
 REFUSED_SEEDS = 8
 """The declared draws of a conv the kernels do not take against XLA's conv (check 1), sized by `seeds_for`
-paired with the kernels' arm on armada: the most any of its geometries took."""
+paired with the kernels' arm on armada: the most any of its 16-bit geometries took."""
 """A delta rule's queries, keys and values on two 16-wide heads: the keys and queries normalised."""
 
 
@@ -169,7 +173,9 @@ def test_padding_tokens_are_zero_and_pass_no_gradient():
 def test_a_conv_the_kernels_do_not_take_runs(dtype, out, parts, taps):
     """On a GPU whose row names the kernels, a conv they do not take (`short_conv.CONV`: float64, a piece
     off its block, more taps than they hold) runs: its value and its gradients, in their operands'
-    dtypes, on par with XLA's conv over the draws (check 1), truth XLA's conv in float64."""
+    dtypes, on par with XLA's conv over the draws (check 1), truth XLA's conv in float64. A float64 conv
+    has no truth finer than itself, so it is held by the oracle rule on a draw: each leaf within its own
+    dtype's rounding over the conv's chain of roundings of XLA's conv on the inputs widened."""
     width, channels = sum(width for width, _ in parts), taps
 
     def draw(seed):
@@ -192,6 +198,15 @@ def test_a_conv_the_kernels_do_not_take_runs(dtype, out, parts, taps):
         x, weights, probe = draw(0)
         _, gradients = jax.jit(loss(causal_conv1d))(x, weights, probe)
         assert [gradient.dtype for gradient in gradients] == [x.dtype, weights.dtype]
+        if out == jnp.float64:
+            found = jax.jit(loss(causal_conv1d))(x, weights, probe)
+            oracle = loss(xla_conv1d)(*widened((x, weights, probe)))
+            roundings = chain_roundings(jax.make_jaxpr(loss(causal_conv1d))(x, weights, probe))
+            for mine, exact in zip(jax.tree.leaves(found), jax.tree.leaves(oracle), strict=True):
+                scale = float(np.sqrt(np.mean(np.square(np.asarray(exact, np.float64)))))
+                bound = FACTOR * roundings * float(jnp.finfo(mine.dtype).eps) * scale
+                assert within(distance(mine, exact), bound), (distance(mine, exact), bound)
+            return
         assert_as_exact(jax.jit(loss(causal_conv1d)), jax.jit(loss(xla_conv1d)), draw,
                         f"a conv the kernels do not take: {jnp.dtype(dtype)}, {parts}, {taps} taps",
                         seeds=REFUSED_SEEDS, truth_fn=loss(xla_conv1d, out=jnp.float64))
