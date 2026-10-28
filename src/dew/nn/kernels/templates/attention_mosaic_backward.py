@@ -37,9 +37,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
                     stages: int) -> tuple[list, dict]:
     """The dQ program's allocations as `Family.scoped` takes them, in `_dq_launch`'s order: its consumers'
-    query and output-cotangent stages, their dQ output stage (fp32, a share of its columns where the
-    config's `columns` split the dK/dV program's widths too, the sums stored a share at a time) and their
-    rows' stage, the two loads' barriers, and its key and value streams in `stages` slots
+    query and output-cotangent stages, their dQ output stage (fp32, its share of the config's `columns`) and
+    their rows' stage, the two loads' barriers, and its key and value streams in `stages` slots
     (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     scoped = [plgpu.SMEM((consumers, block_q, width), dtype),
@@ -147,8 +146,8 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     return exponentials, weights, cotangents, slopes, seen
 
 
-def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, index, slots, rows,
-             accumulators):
+def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, index, slots,
+             rows, accumulators):
     """A dQ consumer's key tile `index`: its scores and score cotangents from the key and value slots
     (`slots`) and its queries and output cotangents (`operands`) under its rows' statistics (`stats`), the
     tile's coordinates (`coords_of(k_first)`), its hook parameters (`params_of(like, k_first=k_first)`) and
@@ -189,29 +188,49 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     # dQ's parts formed past the choice, as each product is issued (`algebra.formed_parts`): the choice's
     # branches yield the scaled cotangents alone, not every part.
     parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate)
-    dq_acc = family.register_products(dq_acc, parts, k_slot, walk.interpret)
+    # dQ's (and the keyed sums') products against the program's share of the keys' columns (`share`).
+    k_columns = k_slot.at[:, pl.ds(*share)]
+    dq_acc = family.register_products(dq_acc, parts, k_columns, walk.interpret)
     if keyed is None:
         return rows, (dq_acc,)
     factor, keyed_parts = keyed
     if factor is None:
-        keyed_acc = family.register_products(keyed_accs[0], keyed_parts, k_slot, walk.interpret)
+        keyed_acc = family.register_products(keyed_accs[0], keyed_parts, k_columns, walk.interpret)
     else:
         # The keyed sums rescaled by their row factor, then the tile's products added in place.
         def rescale(value):
             return value * algebra.expand(factor, value)
 
-        keyed_acc = family.rescaled_products(keyed_accs[0], rescale, keyed_parts, k_slot, walk.interpret)
+        keyed_acc = family.rescaled_products(keyed_accs[0], rescale, keyed_parts, k_columns, walk.interpret)
     return rows, (dq_acc, keyed_acc)
 
 
 def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, spans: _Spans | None,
                score_params: tuple, *, walk: _Backward):
+    """`_dq_columns`' launch of each of the config's `columns`, its share of dQ's (and the keyed sums')
+    columns, the rows the first's, the sums joined along their widths."""
+    columns = walk.program.tiles.columns
+    width = query.shape[-1] // columns
+    launched = [_dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, spans,
+                            score_params, walk=walk, share=(column * width, width))
+                for column in range(columns)]
+    if columns == 1:
+        return launched[0]
+    dq = jnp.concatenate([out[0] for out in launched], axis=-1)
+    keyed_parts = [out[1] for out in launched if out[1] is not None]
+    keyed = jnp.concatenate(keyed_parts, axis=-1) if keyed_parts else None
+    return dq, keyed, launched[0][2]
+
+
+def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, spans: _Spans | None,
+                score_params: tuple, *, walk: _Backward, share: tuple[int, int]):
     """The dQ program's sums over its key tiles (`algebra.dq_issued`), unfinished: dQ's and, in the accurate
     form, the keys' product with the weights (`DqSums.keyed`), `[B, Qp, H, D]` fp32 each; and the rows
     `[4 + 2n, B, H, Qp]` fp32 (n the dQ parameters, `walk.summed`): the cotangents' and weights' row sums, the
     keyed sums' mass and exponent, then each dQ parameter's gradient and its weights' pullback, which
     `dq_finish` takes past the launch. Each query block of a pair is a consumer's, the key and value tiles
-    streamed through a ring each. Returns dQ, the keyed sums (None in the fast form) and the rows."""
+    streamed through a ring each. Its sums are its `share` of their columns (`(first, count)`). Returns dQ,
+    the keyed sums (None in the fast form) and the rows."""
     batch, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
     program, consumers, kinds = walk.program, walk.consumers, walk.kinds
@@ -250,22 +269,20 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
             # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
             coords_of = functools.partial(_coords, family, spans_of, row, first, shape=shape)
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head, first)
-            step = functools.partial(_dq_step, walk, operands, stats, coords_of, params_of, whole)
+            step = functools.partial(_dq_step, walk, operands, stats, coords_of, params_of, whole, share)
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
                      nothing + algebra.NO_SHIFT)
             # The tiles before this block's first its partner reads.
             family.passed(streams, streamed[0], lo, first=streamed[0])
             (residual, mass, grads, weighed, keyed_mass, keyed_shift), accumulated = family.walk(
-                streams, ((step, lo, hi),), start, ((block_q, width),) * (2 if walk.accurate else 1),
+                streams, ((step, lo, hi),), start, ((block_q, share[1]),) * (2 if walk.accurate else 1),
                 walk.interpret, first=streamed[0])
             # The tiles past this block's last (a causal block whose diagonal ends first) its partner reads.
             family.passed(streams, hi, streamed[1], first=streamed[0])
             dq, *keyed = accumulated
-            # Each sum through the output stage a share of its columns at a time (`_dq_allocations`).
-            share = out_smem.shape[-1]
-            sums = [(dq, dq_ref)] + ([(keyed[0], keyed_ref)] if keyed_ref is not None else [])
-            written = [(total[:, column:column + share], ref.at[(*rows, pl.ds(column, share))])
-                       for total, ref in sums for column in range(0, width, share)]
+            written = [(dq, dq_ref.at[rows])]
+            if keyed_ref is not None:
+                written.append((keyed[0], keyed_ref.at[rows]))
             family.stored(*zip(*written, strict=True), smem=out_smem.at[index])
             # Each row in a row's layout whatever its own (a call without a hook's keyed mass is a constant).
             summed_grads = tuple(part for part, on in zip(grads, summed, strict=True) if on)
@@ -286,15 +303,17 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
 
-    sums = jax.ShapeDtypeStruct((batch, queries, heads, width), jnp.float32)
+    sums = jax.ShapeDtypeStruct((batch, queries, heads, share[1]), jnp.float32)
     stats_shape = jax.ShapeDtypeStruct((rows_count, batch, heads, queries), jnp.float32)
     out = family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
-        interpret=walk.interpret, approx_math=walk.approx_math, name="attention_dq",
+        interpret=walk.interpret, approx_math=walk.approx_math,
+        name="attention_dq" + ("" if share[1] == width else f"_columns{share[0] // share[1]}"),
         reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
-        # dQ's product, the model's this launch owns (`stated`): its `S` and `dP` recomputed.
-        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, width, query, key, value, dout))(
+        # Its share of dQ's product, the model's this launch owns (`stated`): its `S` and `dP` recomputed.
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, share[1], query, key, value,
+                    dout))(
             query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
     return dq, keyed, rows
