@@ -151,8 +151,13 @@ def test_an_option_a_kinds_mesh_or_data_cannot_take_is_refused(kind, option, tmp
 
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_is_tracked_on_wandb_offline_and_publishes_only_there(kind, tmp_path, monkeypatch):
-    """A run tracked on W&B offline (`wandb`) writes its W&B run beside where it runs; publishing its
-    final checkpoint (`publish`) without W&B to publish to is refused before the run trains."""
+    """A run tracked on W&B offline (`wandb`) writes its W&B run where W&B is told to keep it; publishing
+    its final checkpoint (`publish`) without W&B to publish to is refused before the run trains."""
+    import wandb
+
+    # W&B settles its directory once a process; each case starts it afresh under its own.
+    wandb.teardown()
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     trained(kind, tmp_path, "tracked", **{"trainer.steps": 2,
                                             "trainer.wandb": {"project": "dew-tests", "offline": True}})
