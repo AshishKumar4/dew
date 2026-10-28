@@ -11,7 +11,7 @@ import pytest
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 
-from dew.batch import VALID_ROWS
+from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
 from dew.data import Memory
 from dew.data.compile import compile
@@ -316,12 +316,15 @@ def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_row
     # In order, no stage stands between the chain's records and the objective's eager steps.
     chain = chain.shuffle(3) if shuffled else chain
     loader = compile(chain.batch(BATCH), read="memory", objective=objective.data(), examples=EXAMPLES)
-    rows = 0
+    rows = consumed = 0
     for batch in loader.train(DataPartition()):
         # A short last batch is filled with windows it marks as no rows of its own (`VALID_ROWS`).
         real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["segments"]), bool)), bool)
         rows += sum(len(set(window[window > 0].tolist())) for window in np.asarray(batch["segments"])[real])
+        consumed += int(np.sum(batch.get(EXAMPLES_CONSUMED, 0)))
     assert rows == 2 * EXAMPLES
+    # A read no plan counts ahead keeps its progress in the examples its batches consume, each once.
+    assert loader.example_steps(EXAMPLES) is not None or consumed == EXAMPLES
 
 
 def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_sizes():
