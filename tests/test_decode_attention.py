@@ -627,38 +627,35 @@ def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_ten
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
 def test_attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
     """A decode step's attention, its value the kernel's, differentiates as the folded attention it
-    stands in for, in both modes: the value, query, key and value gradients, and the tangent, on par with
-    the folded attention's over drawn operands, tangents and cotangents (check 1), truth the attention in
-    float64."""
+    stands in for, in both modes: the value, query, key and value gradients, and the tangent, within
+    tests/reference_error.py's rule of the folded attention's against float64 attention."""
+    rng = np.random.default_rng(1)
     lengths = jnp.asarray([1, 20, 64], jnp.int32)
     attended, folded = decode_step(lengths)
+    query, key, value, *tangents = (jnp.asarray(rng.normal(size=shape), jnp.float32) for shape in (
+        (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64), (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64)))
+    cotangent = jnp.asarray(rng.normal(size=query.shape), jnp.float32)
 
-    def draw(seed):
-        rng = np.random.default_rng([1, seed])
-        return tuple(jnp.asarray(rng.normal(size=shape), jnp.float32) for shape in (
-            (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64), (3, 4, 2, 64), (3, 64, 2, 64), (3, 64, 2, 64),
-            (3, 4, 2, 64)))
+    def derivatives(attend, *arrays):
+        def pulled(*a):
+            return jnp.sum(attend(*a) * cotangent.astype(a[0].dtype))
 
+        out, tangent = jax.jvp(attend, arrays, tuple(t.astype(arrays[0].dtype) for t in tangents))
+        return (out, *jax.grad(pulled, argnums=(0, 1, 2))(*arrays), tangent)
+
+    found = jax.jit(lambda *a: derivatives(attended, *a))(query, key, value)
+    reference = jax.jit(lambda *a: derivatives(folded, *a))(query, key, value)
     def exact(query, key, value):
         # Each row over its first `lengths` keys, every step in the operands' float64.
         return exact_attention(query, key, value,
                                keep=np.arange(key.shape[1]) < np.asarray(lengths)[:, None, None, None])
 
-    def derivatives(attend):
-        def run(query, key, value, *tangents_and_cotangent):
-            *tangents, cotangent = tangents_and_cotangent
-            arrays = (query, key, value)
-
-            def pulled(*a):
-                return jnp.sum(attend(*a) * cotangent)
-
-            out, tangent = jax.jvp(attend, arrays, tuple(tangents))
-            return (out, *jax.grad(pulled, argnums=(0, 1, 2))(*arrays), tangent)
-        return run
-
-    assert_as_exact(jax.jit(derivatives(attended)), jax.jit(derivatives(folded)), draw,
-                    "the decode kernel's value, gradients and tangent", seeds=FEWEST_SEEDS,
-                    truth_fn=derivatives(exact))
+    with jax.enable_x64(new_val=True):
+        truth = derivatives(exact, *(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
+    names = ("value", "dq", "dk", "dv", "tangent")
+    for name, got, want, exact in zip(names, found, reference, truth, strict=True):
+        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact),
+                                         f"the decode kernel's {name}")
 
 
 @pytest.mark.mesh(devices=2)
