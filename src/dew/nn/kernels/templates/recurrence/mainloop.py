@@ -2109,18 +2109,30 @@ def _gradient_stored(call: _Call, kind: str, block: int, grad, *, weights: Seque
         family.added(grad, sums[kind], call.interpret, smem=landing["sums"])
 
 
+def _memory_sum(call: _Call, issue: _Issuer, entered: _Parts, leaving: _Parts) -> jax.Array:
+    """`sum(S dS)` over the value columns of a block of the memories entered and left, `[rows]`: the
+    diagonal of their product `S^T dS` where the family's products read registers, else their elementwise
+    product's rows (`_query_key`)."""
+    if call.family.operands_in_registers:
+        traced = issue("memory_trace", entered.T, leaving)
+        return jnp.sum(jnp.where(_diagonal(traced.shape[0], call.family), traced, 0.0), axis=1)
+    return jnp.sum(entered.value().astype(jnp.float32) * leaving.value().astype(jnp.float32), axis=1)
+
+
 def _query_key_held(call: _Call) -> _Held:
     """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum,
     its memory product and its scores' product, and a block's queries or keys in fp32 for the range terms;
-    then `sum(S dS)`'s product of the memories entered and left, its diagonal's mask; where products read
-    registers, a block of each operand."""
+    then `sum(S dS)` (`_memory_sum`): the memories' product and its diagonal's mask where products read
+    registers, with a block of each operand, else the memories in fp32."""
     held, memories, given = call.held, call.memories, call.given
+    summed = ([_f32(call.block, call.block)] + _masks(call.block, call.block)
+              + _fragments(call, (memories, call.block, call.block), (memories, call.block, call.block))
+              if call.family.operands_in_registers else [_f32(call.block, call.block)] * 2)
     return _Held(phases=(
         [_f32(CHUNK, call.block)] * 4
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block), (memories, call.block,
                                                                                       call.block)),
-        [_f32(call.block, call.block)] + _masks(call.block, call.block)
-        + _fragments(call, (memories, call.block, call.block), (memories, call.block, call.block))))
+        summed))
 
 
 def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *, scale: float):
@@ -2180,13 +2192,13 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
                 emit=stored)
             after_ref.at[c, h, span][...] = after
             leaving_ref.at[c, h, span][...] = leaving
-            # `sum(S dS)` over the block, read here rather than both memories again: each value block's
-            # `S^T dS` diagonal, a product of the memories as they lie in shared memory (their elementwise
-            # product in registers held two fp32 tiles beside the step's, past an A100's 255 registers).
-            diagonal = _diagonal(call.block, family)
+            # `sum(S dS)` over the block's rows, read here rather than both memories again: where products
+            # read registers (mma.sync's), each value block's `S^T dS` diagonal, a product of the memories
+            # as they lie in shared memory (their elementwise product held two fp32 tiles beside the step's
+            # fragments, past an A100's 255 registers); where they read shared memory, that elementwise
+            # product (the product's accumulator spilled 44 bytes a thread on an H100's).
             memory_ref.at[c, h, pl.ds(n * call.block, call.block)][...] = functools.reduce(jnp.add, (
-                jnp.sum(jnp.where(diagonal, issue("memory_trace", column("entered", memories, j).T,
-                                                  column("leaving", memories, j)), 0.0), axis=1)
+                _memory_sum(call, issue, column("entered", memories, j), column("leaving", memories, j))
                 for j in range(blocks)))
             # The step's reduce-adds ('dq', 'dk', `Family.added`) waited on by design, not by 'dw''s store
             # being emitted after them: Mosaic GPU waits on no copy at a kernel's exit (template numerics
@@ -2438,11 +2450,11 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: _Call):
     out_type = (held.shape(call.heads * width), terms, terms, terms)
     # The key block's products through `w` and the system, and its keys' own pairs.
     work = Work(2 * CHUNK * CHUNK * (4 * call.block))
-    # The system's gradient narrow and scaled by beta beside the key block's gradient terms and their sum;
-    # then its keys' own pairs, the pair terms, and the pairs' sums' masks and product
-    # (`algebra.keys_gradient`).
+    # The system's gradient narrow and scaled by beta beside the key block's terms: through `w`, the keys in
+    # fp32, the product being issued and the sum it joins (`algebra.keys_gradient`: each term dies as the next
+    # forms); then its keys' own pairs, the pair terms, and the pairs' sums' masks and product.
     held_tiles = _Held(phases=(
-        _held(held, CHUNK, CHUNK) * 2 + [_f32(CHUNK, call.block)] * 5
+        _held(held, CHUNK, CHUNK) * 2 + [_f32(CHUNK, call.block)] * 4
         + _fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, call.block), (held, CHUNK, call.block)),
         _held(held, CHUNK, CHUNK) + [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK)))
     return _kernel(program, call, out_type=out_type, grid=(blocks, call.chunks, call.heads),
