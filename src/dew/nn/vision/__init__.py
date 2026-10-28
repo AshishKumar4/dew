@@ -49,9 +49,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 from dew.batch import Variables
+from dew.interop.unread import Stored
 
 from .common import (
     ProjectorBase as ProjectorBase,
@@ -88,14 +87,14 @@ if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
 
-def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+def tower_variables(kind: str, hf_tensors: Mapping[str, Stored], param_dtype: str
                     ) -> tuple[Variables, tuple[WeightLayout, ...]]:
     """One vision tower's variables, in the requested storage (`tower_layout`), and the layouts
     that write its tensors back from them."""
     return tower_layout(kind).variables(hf_tensors, param_dtype)
 
 
-def projector_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+def projector_variables(kind: str, hf_tensors: Mapping[str, Stored], param_dtype: str
                         ) -> tuple[Variables, tuple[WeightLayout, ...]]:
     """One projector kind's parameters, in the requested storage (`projector_layout`), and the
     layouts that write its tensors back from them."""

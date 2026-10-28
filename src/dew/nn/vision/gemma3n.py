@@ -10,12 +10,12 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew.interop.config_records import NativeFields
+from dew.interop.unread import Stored
 from dew.interop.weights import in_params, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.blocks import TokenEmbedding
@@ -166,7 +166,7 @@ GEMMA3N_PROJECTOR_TENSORS = {
 
 
 def translate_gemma3n_projector_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
 ) -> tuple[Mapping[str, object], tuple[WeightLayout, ...]]:
     """A Gemma 3n vision embedder's parameter tree, with the layouts that write it back."""
     paths = GEMMA3N_PROJECTOR_TENSORS
