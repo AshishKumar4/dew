@@ -1199,8 +1199,8 @@ def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, mon
     commit(tmp_path, "the workflow changes")
     assert ci.policy(base) == "on"
     assert run() == [2, 1]
-    # A change to the recorder keys every file anew, the cache on though it is: a record it took before may lack
-    # a dependency it now finds, so no old record is reused.
+    # A change to the recorder keys every file anew, the cache on though it is: a record it took before may
+    # lack a dependency it now finds, so no old record is reused.
     (tmp_path / "tools/armada").mkdir(parents=True, exist_ok=True)
     (tmp_path / "tools/armada/executed.py").write_text("# the recorder, as it records now\n")
     git(tmp_path, "add", "tools/armada/executed.py")

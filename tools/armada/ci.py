@@ -553,10 +553,11 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
     return [(held, sorted(names)) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])]
 
 
-PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/")
-"""Where a changed file is placed by the records (executed.py): a Python file a test ran, a page or a
-notebook it read, a fixture every key covers (`shared`). A change elsewhere is placed by none, and runs
-the whole suite (`policy`)."""
+PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/", ".github/")
+"""Where a changed file is placed by the records (executed.py): a Python file a test ran, a page, a
+notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A change
+elsewhere is placed by none, and runs the whole suite (`policy`): a workflow change reran every file while
+no record placed it (Main, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows reused)."""
 PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
 """The checkout's own files at its root that tests read as a page is read, and the changelog, which
 no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
