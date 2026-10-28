@@ -56,6 +56,7 @@ pytestmark = pytest.mark.mesh
 # tests/test_parallelism.py's tolerance for the same step on another topology.
 PARITY = {"rtol": 2e-4, "atol": 2e-5}
 
+
 # The preempted runs: nine steps, a checkpoint every three, killed two steps
 # past the first one.
 STEPS = 9
@@ -756,6 +757,48 @@ def test_a_pool_fetching_its_shares_online_resumes_where_it_stopped(tmp_path, on
                                     dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
+def replicated_flags(run_dir: Path, steps: int) -> dict:
+    """A fit over a filtered stream read elastically (`Pipeline.elastic`): every process reads the
+    order one reads, and keeps its rows."""
+    return {"name": "replicated", "replicated": True, "run_dir": run_dir, "fsdp_size": 1, "steps": steps,
+            "records": RECORDS}
+
+
+@pytest.fixture(scope="module")
+def replicated_checkpoint(tmp_path_factory):
+    """Two processes' elastic fit over a filtered stream, saved after `POOL_STEPS` steps."""
+    from dew.position import REPLICATED
+
+    directory = tmp_path_factory.mktemp("replicated-checkpoint")
+    reports = run_pool("fit", directory / "out", 2, **replicated_flags(directory / "run", POOL_STEPS))
+    positions = {report["dataset_state"] for report in reports}
+    assert len(positions) == 1, "the processes saved different elastic positions"
+    assert REPLICATED in json.loads(positions.pop())
+    return directory / "run"
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("processes", [1, 4])
+def test_an_elastic_filtered_stream_resumes_on_another_process_count(tmp_path, replicated_checkpoint,
+                                                                      processes):
+    """A filtered stream read per share resumes only on the shares that saved it. Read elastically,
+    the position two processes saved is every process's, and one process or four resume from it:
+    they land where a pool of their own size that nobody stopped lands, its data position and its
+    parameters, since both read the batches one process reads."""
+    directory = tmp_path / "resumed-run"
+    shutil.copytree(replicated_checkpoint, directory)
+    resumed = run_pool("fit", tmp_path / "resumed", processes,
+                       **replicated_flags(directory, 2 * POOL_STEPS))
+    whole = run_pool("fit", tmp_path / "whole", processes,
+                     **replicated_flags(tmp_path / "whole-run", 2 * POOL_STEPS))
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
+        assert report["step"] == 2 * POOL_STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
 PACKED_SEQ_LEN = 15
 
 
@@ -1111,6 +1154,31 @@ def test_a_killed_pool_resumes_from_the_newer_local_checkpoint(tmp_path, killed_
     assert {name: after[name] for name in before} == before
 
 
+@pytest.mark.distributed
+def test_a_process_that_lost_its_local_copy_recovers_it_from_a_replica(tmp_path, killed_local_pool):
+    """Process 1's local directory is gone, as a replaced host's is. Its shards each have a copy on
+    process 0 (the data axis runs across the two processes, fsdp within each), so the pool still
+    resumes from local step eight, not persistent step six: process 0 from its own disk, process 1
+    from process 0's copy over the mesh. Both land on the data position and the parameters of the
+    run nobody killed, byte for byte."""
+    directory = tmp_path / "lost"
+    shutil.copytree(killed_local_pool, directory)
+    shutil.rmtree(directory / "local" / "process1")
+    whole = run_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
+
+    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory))
+
+    assert [report["restored_step"] for report in resumed] == [LOCAL_KILL_AFTER] * 2
+    assert resumed[0]["restored_from"] == str(directory / "local" / "process0")
+    assert resumed[1]["restored_from"] == f"{directory / 'local' / 'process0'} (a replica)"
+    for index, report in enumerate(resumed):
+        assert shard_of(report["restored_dataset_state"]) == index
+        assert report["step"] == STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                                    dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
 # --------------------------------------------------------------------------
 # Validation and artifacts in a pool
 # --------------------------------------------------------------------------
@@ -1141,8 +1209,8 @@ def test_a_pool_scores_a_diffusion_validation_pass(tmp_path):
     assert np.isfinite(score)
     # A metric that reads the whole field sees the global batch, not the rows
     # this rank happens to hold.
-    assert reports[0]["scores"]["val/global_mean"] == pytest.approx(
-        float(worker.global_images().mean()), rel=1e-6)
+    # The field is integers, so its sum is exact and its mean one division: the same number either way.
+    assert reports[0]["scores"]["val/global_mean"] == float(worker.global_images().mean())
 
     single = run_worker("validate", tmp_path / "single.json", steps=1)
     assert single["scores"]["val/clip_similarity"] == pytest.approx(
@@ -1226,8 +1294,7 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
     for report in reports:
         assert report["resident_addressable"] is False
         assert report["resident_tokens"] == report["direct_tokens"]
-        np.testing.assert_allclose(report["resident_behavior"], report["direct_behavior"],
-                                   rtol=1e-5, atol=1e-6)
+        np.testing.assert_array_equal(report["resident_behavior"], report["direct_behavior"])
     assert reports[0]["resident_tokens"] + reports[1]["resident_tokens"] == single["resident_tokens"]
     assert_same_parameters(dumped_params(tmp_path / "process0.json"),
                            dumped_params(tmp_path / "single.json"))
@@ -1285,7 +1352,8 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     pooled = dumped_params(tmp_path / "pool" / "process0.json", ".update.npz")
     reference = dumped_params(tmp_path / "single.json", ".update.npz")
     scale = max(float(np.max(np.abs(leaf))) for leaf in reference.values())
-    assert scale == pytest.approx(single["update_scale"]) and scale > 1e-3
+    # The single run's own record of the scale it dumped.
+    assert scale == single["update_scale"] and scale > 1e-3
     assert relative_difference(pooled, reference) < 1e-4
 
     # A step that ignored validity is a different gradient, so the comparison

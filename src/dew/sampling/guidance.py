@@ -138,8 +138,35 @@ def guide(conditional: jax.Array, unconditional: jax.Array, scale) -> jax.Array:
     """Classifier-free guidance's affine combination, unconditional + scale (conditional -
     unconditional), of two predictions of one sample: `scale` one value, or one per row. Every
     guidance here combines through it: the samplers' (CFG, CFG++, autoguidance's weaker model in
-    the unconditional's place) and the distillations' teacher targets."""
-    return unconditional + expand(scale, conditional) * (conditional - unconditional)
+    the unconditional's place) and the distillations' teacher targets. At a unit scale, which a step
+    outside its guidance interval takes, it is the conditional prediction exactly, as the sources
+    return it unguided there: the affine form would round it through their difference (float32's
+    1 against 2**30 gives 0)."""
+    # The scale in the predictions' dtype, so an integer scale (CFG++ at 1) has a tangent.
+    return _guided(conditional, unconditional, expand(jnp.asarray(scale, conditional.dtype), conditional))
+
+
+@jax.custom_jvp
+def _guided(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
+    """`guide`'s value: the conditional prediction exactly at a unit scale, the affine combination
+    elsewhere."""
+    return jnp.where(scale == 1, conditional, unconditional + scale * (conditional - unconditional))
+
+
+@_guided.defjvp
+def _guided_jvp(primals, tangents):
+    """The affine combination's derivative at every scale, a unit one's included, where the exact
+    conditional the value selects would leave the scale's out."""
+    conditional, unconditional, scale = primals
+    along_conditional, along_unconditional, along_scale = tangents
+    # The predictions' direction in the affine order, the conditional's own at a unit scale.
+    predicted = jnp.where(scale == 1, along_conditional,
+                          along_unconditional + scale * (along_conditional - along_unconditional))
+    # The scale's: the predictions' difference, halved first only where it would pass float32's largest,
+    # so two finite predictions of opposite sign stay finite where the scale does not move.
+    wide = jnp.maximum(jnp.abs(conditional), jnp.abs(unconditional)) > jnp.finfo(conditional.dtype).max / 2
+    spread = jnp.where(wide, 0.5 * conditional - 0.5 * unconditional, conditional - unconditional)
+    return _guided(*primals), predicted + jnp.where(wide, 2, 1) * (spread * along_scale)
 
 
 @struct.dataclass

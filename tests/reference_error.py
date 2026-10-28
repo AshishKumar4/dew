@@ -1384,8 +1384,8 @@ takes larger inputs or fewer shared factors, not more seeds."""
 
 def recorded_pilots(reference_fn, draw, count: int):
     """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
-    from SIZING_FROM on, disjoint from every verdict's seeds and recorded with Dew's arm and the truth
-    from the same inputs: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
+    from SIZING_FROM on, disjoint from every verdict's seeds, the reference and its truth recorded on the
+    inputs Dew's arm takes live: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
     own; `reference_fn` is left as it is. Every pilot is read now (`draw`'s inputs at each), so a
     recording that does not hold them all is refused here, not at the doubling that reaches one."""
     if not getattr(reference_fn, "recorded", False):
@@ -1405,7 +1405,11 @@ def recorded_pilots(reference_fn, draw, count: int):
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
-    interval is no wider than PARITY in every leaf. Of the reference compared with itself, its errors on
+    interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
+    (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
+    are heavy-tailed across draws those draws may hold none of the tail the verdict's will (ledger 1824:
+    a site sized at 16 left Inconclusive at 160), so a second block of the count's size must resolve
+    too. Of the reference compared with itself, its errors on
     two disjoint seed sets resampled apart (`_interval`'s control), by default; with `dew_fn`, paired:
     Dew's errors against the reference's on the same draws, the two resampled by the same seeds as the
     verdict resamples them (`_interval`), on draws from SIZING_FROM on that no verdict takes. A pair
@@ -1418,20 +1422,22 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
     verdict's inputs at SIZING_FROM and needs a pilot stream of its own first. A recorded reference
     (`indexed_recording`), which holds its recorded seeds alone, is refused, its site keeping its
-    recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, recorded
-    with Dew's arm and the truth (`recorded_pilots`): its paired sizing then takes those pilots alone,
+    recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, the
+    reference and its truth on the inputs Dew's arm takes live (`recorded_pilots`, or a summarized
+    recording's pilots, `indexed_recording`): its paired sizing then takes those pilots alone,
     up to as many as are held. Fails past `most`, where the site needs larger inputs or fewer shared
     factors, not more seeds.
 
     Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
-    predecessor's and the seeds it adds, the reference compared with itself takes its seeds 0 to twice
-    the count (the first half against the second), and the reference on the same inputs runs once."""
+    predecessor's and the seeds it adds, twice the count of them with the confirming block, the
+    reference compared with itself takes its seeds 0 to four times the count (each block's first half
+    against its second), and the reference on the same inputs runs once."""
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         pilots = getattr(reference_fn, "pilots", None)
         if pilots is None:
             raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                              f"sizing's from SIZING_FROM; its site keeps its recorded count")
-        most = min(most, len(pilots))
+        most = min(most, len(pilots) // 2)
     paired = dew_fn is not None
     _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
     dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
@@ -1444,21 +1450,34 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
         held = 0 if drawn is None else len(drawn.theirs)
-        fresh = _drawn(dew_fn or reference_fn, reference_fn, draw,
-                       range(first + held, first + (2 * count if dew_fn is None else count)), truth_fn)
+        block = 2 * count if dew_fn is None else count
+        fresh = _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + held, first + 2 * block),
+                       truth_fn)
         drawn = fresh if drawn is None else drawn.joined(fresh)
-        if dew_fn is None:
-            wide = _unresolved_against_itself(drawn.theirs, drawn.names, count)
-        else:
-            wide = [name for index, name in enumerate(drawn.names)
-                    if np.sum(drawn.theirs[:, index]) > 0
-                    and not _resolves(*_interval(drawn.mine[:, index], drawn.theirs[:, index]))]
+        wide = _confirmed(drawn.names, drawn.theirs, count, None if dew_fn is None else drawn.mine)
         if not wide:
             return count
         count *= 2
     compared = "the reference compared with itself" if dew_fn is None else "Dew paired with the reference"
     raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
                          f"give the site larger inputs or fewer shared factors")
+
+
+def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None) -> list[str]:
+    """The leaves `seeds_for` leaves unresolved at `count`: on the count's own block of draws or on the
+    next block of as many (`seeds_for`'s confirmation), each judged as the sizing judges it: paired,
+    `mine` Dew's squared errors against the reference's (`theirs`, seed by leaf) on the same draws, or
+    the reference compared with itself (`_unresolved_against_itself`, each block twice the count)."""
+    wide: list[str] = []
+    for start in (0, count) if mine is not None else (0, 2 * count):
+        if mine is not None:
+            held, ours = theirs[start:start + count], mine[start:start + count]
+            unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
+                          and not _resolves(*_interval(ours[:, index], held[:, index]))]
+        else:
+            unresolved = _unresolved_against_itself(theirs[start:start + 2 * count], names, count)
+        wide += [name for name in unresolved if name not in wide]
+    return wide
 
 
 def _unresolved_against_itself(errors: np.ndarray, names, count: int) -> list[str]:
@@ -1476,11 +1495,12 @@ def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWES
     """`seeds_for`'s count for the reference compared with itself, from its errors already measured:
     `errors` holds its squared errors a seed (rows, from seed 0) and a leaf (columns), such as a
     recording's merged shards, and the count is the fewest, doubling from `start` to `most`, that
-    resolves every leaf (`_unresolved_against_itself`), as `seeds_for` doubles. Fails past `most`, as
-    `seeds_for` does, and where the rows held run out first: the recording then holds too few seeds."""
+    resolves every leaf on its own block and the next (`_confirmed`), as `seeds_for` doubles. Fails past
+    `most`, as `seeds_for` does, and where the rows held run out first: the recording then holds too
+    few seeds."""
     count, wide = max(start, FEWEST_SEEDS), []
-    while count <= most and 2 * count <= len(errors):
-        wide = _unresolved_against_itself(errors, names, count)
+    while count <= most and 4 * count <= len(errors):
+        wide = _confirmed(names, errors, count)
         if not wide:
             return count
         count *= 2
@@ -1489,7 +1509,7 @@ def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWES
                              f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared "
                              f"factors")
     raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within the "
-                         f"{len(errors)} seeds recorded, {len(errors) // 2} a half")
+                         f"{len(errors)} seeds recorded, {len(errors) // 4} a half of each block")
 
 
 def recording(path) -> dict[str, np.ndarray]:
@@ -1601,7 +1621,9 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     check 1 never judges Dew against its own float64 path where that path is not the reference's, as
     far as a wrong truth's move is independent of the sketch's signs (SKETCH). A seed whose recomputed
     truth has a row of float64 zero the recording's had not is refused. Its reference and truth are
-    host functions, called as check 1 calls them, not traced."""
+    host functions, called as check 1 calls them, not traced. Where it holds pilots (`<site>.pilot.`,
+    `merge_shards`), seeds from SIZING_FROM on read them, and its reference carries them
+    (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone (`seeds_for`)."""
     if any(name.startswith(f"{site}.sketch.") for name in stored):
         return _summarized(stored, site, seeds, inputs_of, truth_fn)
 
@@ -1659,15 +1681,18 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
                 if name.startswith(prefix)}
 
-    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets", "shape", "dtype")
-    mse, worst, finite, sketch, zero_rows, zero_errors, zero_offsets, shapes, dtypes = (
-        tree(kind) for kind in kinds)
+    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets")
+    verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
+    mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
+                                                ("mse", "worst", "finite", "sketch", "zero_offsets"))
+    shapes, dtypes = tree("shape"), tree("dtype")
     if truth_fn is None or inputs_of is None:
         raise AssertionError(f"{site}: a recording of the reference's evidence alone takes `truth_fn`, "
                              f"Dew's float64 path, and `inputs_of`, its inputs drawn again")
     if int(stored.get(f"{site}.redraw", -1)) != REDRAW:
         raise AssertionError(f"{site}: the recording holds no `{site}.redraw` of {REDRAW}")
     digests = stored[f"{site}.input_digest"]
+    pilots = len(stored.get(f"{site}.pilot.input_digest", ()))
     count = min([len(value) for part in (mse, worst, finite, sketch) for value in part.values()]
                 + [len(value) - 1 for value in zero_offsets.values()])
     if min(count, len(digests)) < (1 + REDRAW) * seeds:
@@ -1675,25 +1700,38 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
                              f"may draw {(1 + REDRAW) * seeds}")
     roundings = {}
 
+    def held(seed):
+        """`seed`'s evidence, its input digests and its row in them: a verdict seed's, or a pilot's."""
+        if seed < SIZING_FROM:
+            return verdict, digests, seed
+        if seed >= SIZING_FROM + pilots:
+            raise AssertionError(f"{site}: seed {seed} is past the recording's {pilots} pilots from "
+                                 f"SIZING_FROM")
+        return pilot, stored[f"{site}.pilot.input_digest"], seed - SIZING_FROM
+
     def draw(seed):
         drawn = inputs_of(seed)
-        if input_digest(drawn) != digests[seed]:
+        _, recorded, row = held(seed)
+        if input_digest(drawn) != recorded[row]:
             raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "
                                  f"digest differs); the generator's draw changed since the recording")
         return np.int32(seed), drawn
 
     def reference(index, inputs):
-        index = int(index)
+        evidence, _, row = held(int(index))
 
         def leaf(name):
-            start, stop = zero_offsets[name][index], zero_offsets[name][index + 1]
-            return RecordedLeaf(float(mse[name][index]), float(worst[name][index]),
-                                zero_rows[name][start:stop], zero_errors[name][start:stop],
-                                finite=bool(finite[name][index]), dtype=str(dtypes[name]))
+            start, stop = evidence["zero_offsets"][name][row], evidence["zero_offsets"][name][row + 1]
+            return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
+                                evidence["zero_rows"][name][start:stop],
+                                evidence["zero_errors"][name][start:stop],
+                                finite=bool(evidence["finite"][name][row]), dtype=str(dtypes[name]))
 
         return {name: leaf(name) for name in mse}
 
     reference.recorded = True
+    if pilots:
+        reference.pilots = range(SIZING_FROM, SIZING_FROM + pilots)
 
     # The truth recomputed, compiled as the gate compiles a truth; its roundings are counted on its trace.
     live = _truth_program(truth_fn)
@@ -1715,7 +1753,8 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
             if value.shape != tuple(shapes[name].tolist()):
                 raise AssertionError(f"{site}: the truth of {name!r} recomputed is {value.shape}, the "
                                      f"recorded reference's {tuple(shapes[name].tolist())}")
-            recorded = sketch[name][index]
+            evidence, _, row = held(index)
+            recorded = evidence["sketch"][name][row]
             if not np.isfinite(value).all():
                 raise AssertionError(f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not "
                                      f"finite")
@@ -1824,11 +1863,22 @@ def float64_forward(module, variables, *args, **kwargs):
     (`float64_terms`): the module computing in float64 over its variables
     widened, integer inputs as they are, `kwargs` given as they are. A
     reference's float64 truth written elsewhere (a fixture's) is sized by
-    these terms, what Dew's own float64 sums add."""
+    these terms, what Dew's own float64 sums add.
+
+    Only `module`'s own `dtype` is widened: a module holding another (a
+    multimodal wrapper's language model) that keeps its own dtype computes
+    that part in it, so an output that is not float64 is refused, and such a
+    model is passed widened whole (`ModelConfig.with_dtype`)."""
     with jax.enable_x64(new_val=True):
         wide = module.clone(dtype=jnp.float64)
-        return float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
-                             *widened((variables, *args)))
+        outputs, terms = float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
+                                       *widened((variables, *args)))
+    narrow = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(outputs)
+                     if jnp.issubdtype(leaf.dtype, jnp.floating) and leaf.dtype != jnp.float64})
+    if narrow:
+        raise ValueError(f"{type(module).__name__} widened to float64 still gives {', '.join(narrow)} "
+                         "outputs: a module it holds keeps its own dtype; widen the whole model")
+    return outputs, terms
 
 
 def float64_terms(fn, *args):

@@ -126,9 +126,9 @@ def test_video_scores_equal_the_flattened_frame_batch(rng, metric_fn):
     video = _ramp_image((2 * 3, 32, 32, 3), key_x).reshape(2, 3, 32, 32, 3)
     degraded = video + 0.1 * jax.random.normal(key_noise, video.shape)
     frames = video.reshape(6, 32, 32, 3)
-    assert float(metric_fn(video, degraded, data_range=2.0)) == pytest.approx(
-        float(metric_fn(frames, degraded.reshape(6, 32, 32, 3), data_range=2.0)), rel=1e-5
-    )
+    # A video is scored as its frames' batch, the same operations on the same values.
+    assert float(metric_fn(video, degraded, data_range=2.0)) == float(
+        metric_fn(frames, degraded.reshape(6, 32, 32, 3), data_range=2.0))
 
 
 @pytest.mark.parametrize("factory,raw", [(PSNR, psnr), (SSIM, ssim)],
@@ -147,5 +147,5 @@ def test_frame_factories_read_a_video_grid_when_asked(rng, factory, raw):
 
     scores = raw(degraded, reference, data_range=2.0, per_example=True)
     assert scores.shape == (6,)
-    assert float(jnp.mean(scores)) == pytest.approx(
-        float(raw(degraded, reference, data_range=2.0)), rel=1e-5)
+    # The aggregate is the mean of the per-frame scores, the same operation.
+    assert float(jnp.mean(scores)) == float(raw(degraded, reference, data_range=2.0))

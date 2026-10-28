@@ -83,6 +83,13 @@ PROMOTIONS = {
     "a factory named as a method elsewhere": (
         "import torch\ndef build():\n    return torch.nn.Linear(4, 4)\nclass Case:\n"
         "    def build(self):\n        return torch.zeros(3)\nbuild().double()", 1),
+    "a tensor function named as a module-returning method elsewhere": (
+        "import torch\ndef build():\n    return torch.zeros(3)\nclass Network:\n"
+        "    def build(self):\n        return torch.nn.Linear(4, 4)\nbuild().double()", 0),
+    "a method promoting its parameter, beside a function of its name that does not": (
+        "import torch\ndef walk(model, dtype):\n    return model\nclass Case:\n"
+        "    def walk(self, model, dtype):\n        return model.to(dtype)\n"
+        "walk(torch.nn.Linear(4, 4), torch.float64)", 0),
     "a factory returning a module before rebinding the name": (
         "import torch\ndef build(flag):\n    net = torch.nn.Linear(4, 4)\n    if flag:\n"
         "        return net\n    net = torch.zeros(4)\n    return net\nbuild(True).double()", 1),

@@ -238,3 +238,15 @@ def logged_losses(run_directory) -> list[float]:
     rows = (Path(run_directory) / "tracking" / "scalars.jsonl").read_text().splitlines()
     scalars = [json.loads(row)["scalars"] for row in rows]
     return [row["train/loss"] for row in scalars if "train/loss" in row]
+
+
+def running(pid: int) -> bool:
+    """Whether process `pid` runs: it exists and has not ended. A zombie has ended: it waits only for its
+    reaper, which for an orphan may be a child subreaper that reaps when its own job ends, as a GPU node's
+    job runner does. One that ends between the open of its state and the read fails the read with ESRCH,
+    and has ended too."""
+    try:
+        status = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return status.rsplit(")", 1)[1].split()[0] != "Z"

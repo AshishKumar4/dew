@@ -188,6 +188,35 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-4, rtol=0)
 
 
+def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_states_them(tmp_path):
+    """Nanbeige4.3's Llama configs repeat five fields under Megatron's names (ffn_hidden_size,
+    num_query_groups, rotary_base, kv_channels, seq_length) beside the ones LlamaConfig reads, and
+    state its embedding and residual dropout, which LlamaModel never applies: the release loads as
+    the model its own fields state, the same model and variables bit for bit, and a repeat that
+    states another value than its field is refused by name (ledger 1883)."""
+    from shutil import copytree
+
+    original = FIXTURES / "llama-tiny"
+    plain = Pretrained.load(original, dtype="float32")
+    config = fixture_config("llama-tiny")
+    head_dim = config.get("head_dim", config["hidden_size"] // config["num_attention_heads"])
+    theta = config["rope_parameters"]["rope_theta"]
+    repeats = {"ffn_hidden_size": config["intermediate_size"],
+               "num_query_groups": config["num_key_value_heads"], "rotary_base": theta,
+               "kv_channels": head_dim, "seq_length": config["max_position_embeddings"]}
+    directory = tmp_path / "checkpoint"
+    copytree(original, directory)
+    stated = {**config, "head_dim": head_dim, **repeats, "embd_pdrop": 0.0, "resid_pdrop": 0.0}
+    (directory / "config.json").write_text(json.dumps(stated))
+    loaded = Pretrained.load(directory, dtype="float32")
+    assert loaded.model == plain.model
+    for got, want in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(plain.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    (directory / "config.json").write_text(json.dumps({**stated, "rotary_base": 2 * theta}))
+    with pytest.raises(ValueError):
+        Pretrained.load(directory, dtype="float32")
+
+
 @pytest.mark.parametrize("name, head", [("llama-tiny", "causal"), ("nemotron-h-tiny", "causal"),
                                         ("modernbert-tiny", "masked")])
 def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name, head, tmp_path):
@@ -632,8 +661,8 @@ def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path, na
     """The mixin replaces rope_parameters with a stated rope_scaling whole,
     so an explicit plain rope_scaling over a ramp is plain rope at the
     family's default base, as that spelling stated alone is. A family
-    whose mixer reads only one plain or YaRN entry refuses other ramps
-    and per-kind records through the same loader."""
+    whose mixer reads one rope entry refuses per-kind records through the
+    same loader, and GPT-OSS, whose mixer reads YaRN alone, other ramps."""
     plain = {"rope_type": "default"}
     conflicting = _respelled(name, tmp_path / "conflicting",
                              lambda config: {**config, "rope_scaling": plain})
@@ -648,11 +677,11 @@ def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path, na
     if name == "llama31-tiny":
         assert np.max(np.abs(logits[0] - reference)) > 1e-3
     else:
-        for index, entry in enumerate((
-            {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,
-             "high_freq_factor": 4.0, "original_max_position_embeddings": 16},
-            {"full_attention": plain, "sliding_attention": plain},
-        )):
+        llama3 = {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,
+                  "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
+        # DeepSeek's latent attention takes Llama 3.1's ramp beside YaRN's; GPT-OSS's reads YaRN alone.
+        for index, entry in enumerate((*(llama3,) * name.startswith("gpt-oss"),
+                                       {"full_attention": plain, "sliding_attention": plain})):
             unsupported = _respelled(name, tmp_path / f"unsupported-{index}",
                                       lambda config, entry=entry: {**config, "rope_scaling": entry})
             with pytest.raises(ValueError):

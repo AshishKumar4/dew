@@ -22,6 +22,7 @@ from dew.registry import dtype_name, from_record, import_path
 from .calibration import Calibration
 from .head import Head, LabelReadout, SlotReadout
 from .layout import (
+    LABEL_NAMES,
     LETTERS,
     AnswerCue,
     Framing,
@@ -39,8 +40,7 @@ SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the liste
                "its uppercase letter, with no explanation or reasoning.")
 _NOT_ONE_TOKEN = frozenset(["BQ", "BZ", "CJ", "CQ", "CZ", "DQ", "DZ", "EJ", "EY", "FJ", "FQ", "FV", "FZ",
                             "GJ", "GK", "GQ", "GZ", "HJ", "IY", "JF", "JG", "JH", "JL", "JN", "JQ"])
-SLOT_LABELS = (*LETTERS, *[first + second for first in LETTERS for second in LETTERS
-                           if first + second not in _NOT_ONE_TOKEN][:256 - 26])
+SLOT_LABELS = tuple(name for name in LABEL_NAMES if name not in _NOT_ONE_TOKEN)[:256]
 """OneJev qev/prompt.py's 256 labels at 81ce62f1597c91e46767d4d02d6ac2e18534fe94."""
 _PATHS = {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)}
 _LABELS = Labels(variants=("{}",), names=SLOT_LABELS)

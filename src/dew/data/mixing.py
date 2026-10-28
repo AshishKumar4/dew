@@ -29,8 +29,9 @@ _log = logging.getLogger(__name__)
 class CorpusCounts:
     """What one corpus's read counted, under its identity (`name`, which plans and saved positions
     key it by) and the short name its metrics go by (`label`). `accepted` counts the rows it
-    delivered and `truncated` those of them cut short; a rejection counts what the step that drops
-    it reads, a record or a piece or window a step made of one. `attempted` counts what its last
+    delivered and `truncated` those of them cut short, its source examples where an objective makes
+    several rows of each, counted before it does (`FlatMap.examples`); a rejection counts what the step
+    that drops it reads, a record or a piece or window a step made of one. `attempted` counts what its last
     filter read, for its own warning; it describes no one unit of the corpus, so no metric shows it."""
 
     name: str
@@ -92,8 +93,9 @@ _WARN_OVER = 0.01
 drops more than one record in a hundred is worth a look."""
 
 class _KeepAccepted:
-    def __init__(self, counts: CorpusCounts, tokens: Callable[[Batch], int] | None):
-        self.counts, self.tokens = counts, tokens
+    def __init__(self, counts: CorpusCounts, tokens: Callable[[Batch], int] | None,
+                 certain_after: int | None = None):
+        self.counts, self.tokens, self.certain_after = counts, tokens, certain_after
         self.consecutive = 0
         self.warned = False
 
@@ -118,6 +120,14 @@ class _KeepAccepted:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
                          self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
+        if self.certain_after is not None and self.consecutive >= self.certain_after:
+            reasons = ", ".join(f"{name} {count}" for name, count in self.counts.rejected.most_common(3))
+            raise ValueError(
+                f"corpus {self.counts.label} rejected its last {self.consecutive} records, every record of "
+                f"two whole passes of what it reads ({reasons}), and its steps reject the same records each "
+                "pass, so the read would read nothing forever. A read per share filters each share's own "
+                "records: read it with fewer shares, or elastically (`.elastic()`), every reader filtering "
+                "every record")
         if logged_run(self.consecutive, LONG_RUN):
             reasons = ", ".join(f"{name} {count}" for name, count in self.counts.rejected.most_common(3))
             _log.warning("corpus %s rejected its last %d records and has kept %d; the read goes on until "
@@ -189,7 +199,9 @@ class _AcceptedIterator(_CountedIterator[Batch]):
 
 
 class Accepted(pygrain.IterDataset[Batch]):
-    """Grain's filter, with checkpointed counts."""
+    """Grain's filter, with checkpointed counts. A filter of an endless repeat whose passes it
+    rejects alike refuses a run of `certain_after` rejections, two whole passes, as reading nothing
+    forever; any other run of rejections it logs and reads on, a fetch that failed for now say."""
 
     def __init__(
         self,
@@ -198,14 +210,15 @@ class Accepted(pygrain.IterDataset[Batch]):
         label: str,
         *,
         tokens: Callable[[Batch], int] | None = None,
+        certain_after: int | None = None,
     ):
         super().__init__(parent)
         self._records, self._name, self._label = parent, name, label
-        self._tokens = tokens
+        self._tokens, self._certain_after = tokens, certain_after
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         counts = CorpusCounts(self._name, self._label)
-        predicate = _KeepAccepted(counts, self._tokens)
+        predicate = _KeepAccepted(counts, self._tokens, self._certain_after)
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
 

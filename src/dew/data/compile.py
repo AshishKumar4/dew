@@ -380,9 +380,11 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
 
 
 def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
-    """`pipeline`'s training read bounded to its first `examples` records as they reach the first
-    stage that packs or windows them, or its batch where none does: the records the objective's
-    steps make, not the windows a pack lays them in. A repeat without end goes before the bound
+    """`pipeline`'s training read bounded to its first `examples` source examples: the records as they
+    reach the first of the objective's steps that makes several rows of one (`FlatMap.examples`, which
+    run after the chain's own record order, `_objective_branch`), or where none does, the first stage that
+    packs or windows them, or its batch: never the rows an objective makes of an example or the windows
+    a pack lays them in. A repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
     bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`).
     Refuses a bound it cannot place: a repeat with a count before it, or any repeat after it, the
@@ -398,7 +400,8 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     batched = _until(pipeline.stages, (BatchStage, TokenBudget))
     if batched == len(pipeline.stages):
         return pipeline
-    at = _until(pipeline.stages[:batched], (Pack, Windows))
+    at = next((index for index, stage in enumerate(pipeline.stages[:batched])
+               if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
     repeats = [stage for stage in pipeline.stages[:at] if isinstance(stage, Repeat)]
     if any(stage.epochs is not None for stage in repeats) or any(
             isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
@@ -408,6 +411,12 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
                                                  batch, *pipeline.stages[batched + 1:]))
+
+
+def _expands(stage: Stage) -> bool:
+    """Whether `stage` is an objective's step that makes, or once it binds will make, several rows of a
+    source example (`FlatMap.examples`, `Configured.examples`)."""
+    return isinstance(stage, (FlatMap, Configured)) and stage.examples
 
 
 def _lays_out(pipeline: Pipeline) -> bool:
@@ -509,6 +518,7 @@ def _prepared(
     objective: ObjectiveData | None = None,
     counts: Sequence[dict[str, CorpusCounts]] | None = None,
     automatic: str | None = None,
+    examples: int | None = None,
 ) -> tuple[Pipeline, ...]:
     """The one preparation compile, iterate, validation and publish lower from.
 
@@ -520,7 +530,9 @@ def _prepared(
     source-scoped steps run and materialize first, so run-scoped steps bind
     to measured facts; publication passes no counts and reads nothing before
     its fill. The caller materializes what remains. A training read caches
-    each corpus's leading deterministic steps under `automatic` (`_automatic`).
+    each corpus's leading deterministic steps under `automatic` (`_automatic`). A training read bounded
+    to `examples` source examples takes its bound as the objective's steps are placed, before any step
+    runs, so no eager pass expands an example the bound counts (`_bounded`).
     """
     if read not in ("memory", "indexed", "streamed"):
         raise ValueError(f"unknown read mode {read!r}")
@@ -539,6 +551,8 @@ def _prepared(
             _objective_branch(branch, objective, train=not scored, read=read)
             for branch, scored in zip(branches, held, strict=True)
         )
+    if examples is not None and training:
+        branches = (_bounded(branches[0], examples), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
         def stored(branch: Pipeline) -> bool:
             return any(len(source.records(read)) for _, source in _leaves(branch))
@@ -584,7 +598,7 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise."""
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
-    return _Build(read, loading, seed, batch, lowered, training=training)
+    return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic)
 
 
 @compiling
@@ -604,7 +618,8 @@ def compile(
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches.
     With no `read`, the sources choose it (`_preferred_read`). `examples` bounds the training read to
-    its first that many records before they are packed (`_bounded`), a run's `examples=` budget."""
+    its first that many source examples, before they are packed and before the objective makes rows
+    of them (`_bounded`), a run's `examples=` budget."""
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _DEFAULT_LOADING
@@ -677,11 +692,10 @@ def _staged(
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
         automatic=automatic_root(loading) if read != "streamed" else None,
+        examples=examples if written is None else None,
     )
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    if examples is not None and written is None:
-        branches = (_bounded(branches[0], examples), *branches[1:])
     original = branches[0]
     train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
     validation = scored[0] if scored else None
@@ -995,6 +1009,12 @@ def _training_reader(
     partition.rows(build.batch)
     if plan.volatile and partition.readers > 1:
         raise ValueError("volatile pipeline requires one reader per share until its bytes are persisted")
+    if plan.volatile and build.elastic and partition.count > 1:
+        # Every share reads an elastic order's prefix whole on its own (`_elastic_cut`), so a source
+        # whose rows can differ between reads (a fetch that drops failed records) orders them apart.
+        raise ValueError(f"an elastic read's {partition.count} shares each read its whole order, which this "
+                         "pipeline's volatile source can read differently on each; persist its bytes first "
+                         "(`Pipeline.cache`), or read it without `.elastic()`")
     _one_shape(host, partition)
     opened: Iterator[Batch]
     if build.global_order:
@@ -1007,9 +1027,12 @@ def _training_reader(
             endless=build.lowering.endless,
         )
     else:
+        if build.elastic:
+            _refuse_inelastic(pipeline, build)
         own_plan = dataclasses.replace(
             plan,
-            topology={
+            # An elastic read's order is one reader's at any count, its position every reader's.
+            topology={"elastic": True} if build.elastic else {
                 "shares": partition.count,
                 "share": partition.index,
                 "workers": _workers(pipeline, build.loading),
@@ -1028,9 +1051,27 @@ def _training_reader(
             resume,
             stop_seconds=build.loading.stop_seconds,
             endless=build.lowering.endless,
+            replicated=build.elastic,
         )
         statistics.observe(opened)
     return _Host(opened, host) if host else opened
+
+
+def _refuse_inelastic(pipeline: Pipeline, build: _Build) -> None:
+    """Refuse an elastic read (`Pipeline.elastic`) streamed in loading workers, which read a stream's
+    shards each its own, so its order and position would hold only at their count; or whose batch
+    is a token budget's, which takes no fixed share of rows. Indexed, its workers read its inputs
+    in their order (`dew.data.lowering._InputOrder`)."""
+    written = any(isinstance(stage, Workers) for stage in _steps(pipeline))
+    if (_workers(pipeline, build.loading) or written) and build.read == "streamed":
+        raise ValueError(
+            f"{pipeline.name or 'this chain'} is read elastically and streamed, and loading workers read a "
+            "stream's shards each their own, so its order would change with their count: read it by "
+            "index (`.read(\"indexed\")`), or with Loading(workers=0) (elastic streams in workers are "
+            "ledger row 1896)")
+    if any(isinstance(stage, TokenBudget) for stage in pipeline.stages):
+        raise ValueError("an elastic read keeps a share of each batch's rows, and a token budget's batch "
+                         "holds no fixed count of them; batch it by rows")
 
 
 def _validation_reader(
@@ -1088,16 +1129,25 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
 def _objective_records(
     pipeline: Pipeline, steps: Sequence[RecordStep | pygrain.RandomMapTransform | Expansion | Configured]
 ) -> Pipeline:
-    """Append objective record steps at the caller's preparation boundary."""
-    return pipeline._then(*(step if isinstance(step, Configured) else record_stage(step) for step in steps))
+    """Append objective record steps at the caller's preparation boundary, each step that makes several
+    rows of a source example marked as one (`FlatMap.examples`)."""
+    def staged(step) -> Stage:
+        if isinstance(step, Configured):
+            # One stated to expand records binds to an expansion that carries the mark (`_bind`).
+            return dataclasses.replace(step, examples=True) if step.expands else step
+        stage = record_stage(step)
+        return dataclasses.replace(stage, examples=True) if isinstance(stage, FlatMap) else stage
+    return pipeline._then(*(staged(step) for step in steps))
 
 
 def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
-    """Prepare each corpus, then attach objective randomness after the user's record order."""
+    """Prepare each corpus, then attach objective randomness, and the steps from the first that makes
+    several rows of a record on, after the user's record order: the user's order (its shuffle and
+    mixture) is of source examples, and a run's `examples=` bound counts them there (`_bounded`)."""
     steps = objective.train if train else objective.evaluate
     random = next((index for index, step in enumerate(steps)
-                   if isinstance(step, pygrain.RandomMapTransform)
-                   or (isinstance(step, Configured) and step.random)), len(steps))
+                   if isinstance(step, (pygrain.RandomMapTransform, Expansion))
+                   or (isinstance(step, Configured) and (step.random or step.expands))), len(steps))
     prefix = dataclasses.replace(objective, train=objective.train[:random],
                                  evaluate=objective.evaluate[:random])
     branch = objective_steps(pipeline, prefix, train=train, read=read)
