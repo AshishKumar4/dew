@@ -99,12 +99,14 @@ def muon_partition(params) -> dict[str, str]:
     AdamW takes a parameter of rank below two, a bias, and a parameter that
     maps into or out of a discrete index: the vocabulary, the model's output
     space, or the expert a router picks. That is the split four labs
-    cross-confirmed. It takes too, by rule, a parameter Muon cannot
-    orthogonalize as one matrix: one whose declared axes are not one contracted
-    side and one output side (a depthwise convolution's taps, Gated
-    DeltaNet's conv1d of rank 3), and an undeclared one of rank above two,
-    whose matrix axes no declaration names. Everything else is a matrix and
-    goes to Muon.
+    cross-confirmed. It takes too a per-channel filter, rank 3 with an input
+    dimension of 1 (a depthwise convolution's `[channels, 1, taps]`, Gated
+    DeltaNet's conv1d), a vector a channel. Everything else is a matrix, its
+    stacked axes (an expert's) batched and its head axes one side, and goes to
+    Muon through optax's dimension numbers; a parameter that is none of these,
+    declared axes that are not one contracted and one output side or an
+    undeclared tensor of rank above two, is refused, as which of its axes form
+    the matrix is what the split cannot guess.
 
     Which group a parameter lands in is read off the logical axes its module
     declares (`dew.nn.sharding`), the same table the sharding derivation
@@ -134,19 +136,27 @@ def _placements(params) -> dict[jax.tree_util.KeyPath, tuple[optax.contrib.MuonD
     def leaf(path: jax.tree_util.KeyPath, param: jax.Array, decays: bool):
         if not decays:
             return None, "adamw: a bias or of rank below two"
+        if param.ndim == 3 and param.shape[1] == 1:
+            return None, "adamw: a per-channel filter, [channels, 1, taps], a vector a channel"
         axes = declared_axes(path, param.ndim, declared)
         # A declaration that names no axis says how the parameter shards (whole, on every device),
         # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
         if axes is None or all(axis is None for axis in axes):
             if param.ndim > 2:
-                return None, f"adamw: of rank {param.ndim} and no declared axes, so not one matrix"
+                raise ValueError(
+                    f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no declared logical axes, so "
+                    "Muon cannot tell which of its axes form the matrix. Declare it with @logical_axes on "
+                    "its module.")
             return optax.contrib.MuonDimensionNumbers(), "muon"
         named = {axis for axis in axes if axis is not None}
         if SELECTION_AXES & named or axes[-1] in BATCH_AXES:
             return None, "adamw: a lookup into or out of a discrete index"
         sides = _matrix_sides(axes)
         if sides is None:
-            return None, f"adamw: declared {tuple(axes)}, not one contracted and one output side"
+            raise ValueError(
+                f"{jax.tree_util.keystr(path)} is declared {axes}, which is not one contracted side and one "
+                "output side, so Muon cannot tell what its matrix is. An axis that stacks matrices rather "
+                "than being part of one belongs in BATCH_AXES.")
         return optax.contrib.MuonDimensionNumbers(*sides), "muon"
 
     placed = jax.tree_util.tree_map_with_path(leaf, params, weight_decay_mask(params),

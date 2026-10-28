@@ -213,13 +213,16 @@ def test_weight_decay_spares_the_biases_and_the_norms_unless_a_group_claims_them
         np.testing.assert_array_equal(at(spared, path), at(grouped, path), err_msg=str(path))
 
 
-def test_muon_takes_qwen35s_matrices_and_gives_adamw_what_is_no_matrix_by_rule():
+def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lookups():
     """Qwen3.5-0.8B's parameter tree, built from its released config with no weights: Muon takes its
-    projections and its MLP, and AdamW, by rule, beside the embedding and the norms, its Gated
-    DeltaNet conv1d, whose rank-3 taps are no one matrix Muon could orthogonalize, where the split
-    once refused the model. The split records where each parameter went and why (`muon_partition`),
-    and the combined optimizer takes the tree (row 2087)."""
+    hidden matrices, every rank-2 projection of its attention, its Gated DeltaNet and its MLP, as the
+    reference setups do, and AdamW its embedding, its norms, its gates' vectors and its Gated DeltaNet
+    conv1d, whose `[channels, 1, taps]` are a filter a channel, where the split once refused the
+    model. The Muon share by parameter count is the hidden matrices' alone, the split records each
+    parameter's group and why (`muon_partition`), and the combined optimizer takes the tree (row
+    2087)."""
     import json
+    import math
 
     from dew.interop.hf_decoders import translate_config
     from dew.registry import models
@@ -227,13 +230,18 @@ def test_muon_takes_qwen35s_matrices_and_gives_adamw_what_is_no_matrix_by_rule()
     config = json.loads((FIXTURES / "hf" / "qwen35-0.8b" / "config.json").read_text())["text_config"]
     model = models.build("causal_transformer", {**translate_config(config), "dtype": "float32"})
     variables = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32)))
-    placed = muon_partition(variables["params"])
-    convolutions = {path: reason for path, reason in placed.items() if "conv1d" in path}
-    assert convolutions and all(reason.startswith("adamw: ") and "not one" in reason
-                                for reason in convolutions.values())
-    for name in ("q_proj", "k_proj", "o_proj", "up_proj", "down_proj"):
-        assert any(name in path and reason == "muon" for path, reason in placed.items()), name
-    assert all(reason.startswith("adamw: ") for path, reason in placed.items() if "embed_tokens" in path)
+    params = variables["params"]
+    placed = muon_partition(params)
+    shapes = {jax.tree_util.keystr(path): leaf.shape
+              for path, leaf in jax.tree_util.tree_leaves_with_path(params)}
+    sizes = {path: math.prod(shape) for path, shape in shapes.items()}
+    hidden = {path for path, shape in shapes.items()
+              if len(shape) == 2 and "embed_tokens" not in path and "lm_head" not in path}
+    assert {path for path, reason in placed.items() if reason == "muon"} == hidden
+    total = sum(sizes.values())
+    assert sum(sizes[path] for path in hidden) / total > 0.5
+    convolutions = [reason for path, reason in placed.items() if "conv1d" in path and len(shapes[path]) == 3]
+    assert convolutions and all(reason.startswith("adamw: a per-channel filter") for reason in convolutions)
     state = jax.eval_shape(OptimConfig(optimizer="muon", learning_rate=1e-3).build(4).init, variables)
     assert jax.tree.leaves(state)
 
