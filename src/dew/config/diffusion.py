@@ -10,7 +10,6 @@ returns for the same file.
 from __future__ import annotations
 
 import dataclasses
-import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar, TypedDict
 
@@ -391,10 +390,7 @@ class DiffusionRunConfig(RunConfig):
         from dew.interop import sources
 
         def pin(source: str) -> str:
-            if os.path.isdir(source):
-                return source
-            reference = sources.SourceReference.parse(source)
-            return f"{reference.name}@{reference.metadata().name}"
+            return sources.SourceReference.parse(source).pinned().spelled()
 
         objective = self.objective
         stated = objective.fields.get("alignment")

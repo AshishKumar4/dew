@@ -1469,3 +1469,64 @@ def test_an_imported_adapter_binds_to_its_bundle_as_a_fresh_one_does(decoder, tm
     with pytest.raises(ValueError):
         decoder.adapt(LoRA(rank=4, modules=("q_proj", "v_proj", "down_proj"), alpha=8, dropout=0.1,
                            source=str(ADAPTER)), key=0)
+
+
+TRAIN_IMPORTED = """
+import sys
+from dew.config.lm import LMRunConfig
+from dew.data import Loading, presets
+from dew.data.sources.tokens import TokenFiles
+from dew.registry import ModelConfig
+
+tokens, root, name = sys.argv[1:4]
+chain = TokenFiles(tokens).pipe(presets.lm, None, seq_len=8, batch=8, pack=None).loading(Loading(workers=0))
+model = ModelConfig("causal_transformer",
+                    {"emb_features": 16, "num_layers": 1, "num_heads": 2, "dtype": "float32"})
+LMRunConfig.cli([*sys.argv[4:], "--trainer.name", name, "--trainer.checkpoint-dir", root,
+                 "--trainer.steps", "1",
+                 "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+                 "--trainer.eval-every", "None", "--trainer.checkpoint-every", "1", "--max-new-tokens", "0",
+                 "--optim.learning-rate", "0"], default=LMRunConfig(data=chain, model=model)).run()
+"""
+"""A recorded LM run in a process of its own, which reads `HF_ENDPOINT` as it imports the Hub client:
+`tokens`, the runs' root and the run's name, then its own flags."""
+
+
+def test_a_recorded_run_imports_its_adapter_from_the_hub_and_replays_it_offline(tmp_path):
+    """A run whose `--lora.source` names a Hub repo (here on the loopback) starts from that adapter's
+    factors and records the repo at the commit it read (`RunConfig.pinned`); with the Hub gone, the same
+    command reads the cached commit and records it alike. At a zero learning rate each run's factors
+    are the served adapter's, bit for bit."""
+    import json
+    import subprocess
+    import sys
+
+    from local_hub import LocalHub, hub_environment
+    from token_support import write_token_corpus
+
+    ids = np.random.RandomState(0).randint(1, 250, 640).astype(np.uint8)
+    tokens = write_token_corpus(tmp_path / "tokens", ids)
+    spec = ["--lora.rank", "2", "--lora.modules", "q_proj", "v_proj", "--lora.alpha", "4.0"]
+
+    def trained(name, *flags, hub=None, offline=False):
+        done = subprocess.run([sys.executable, "-c", TRAIN_IMPORTED, tokens.train, str(tmp_path / "runs"),
+                               name, *spec, *flags], env=hub_environment(hub, tmp_path, offline=offline),
+                              capture_output=True, text=True, check=False)
+        assert done.returncode == 0, done.stderr[-3000:]
+        return tmp_path / "runs" / name
+
+    # A fresh adapter's run writes the factors the Hub then serves, moved off zero so they compute.
+    fresh = Adapter.from_run(trained("fresh"))
+    moved = {**fresh.variables, "params": jax.tree.map(lambda leaf: leaf + 0.05, fresh.variables["params"])}
+    fresh.save(moved, tmp_path / "served")
+    served = {name: tmp_path / "served" / name for name in (lora.PEFT_CONFIG, lora.PEFT_WEIGHTS)}
+    with LocalHub({"local/adapter": served}) as hub:
+        online = trained("online", "--lora.source", "local/adapter", hub=hub)
+        commit = hub.commit("local/adapter")
+    offline = trained("offline", "--lora.source", "local/adapter", offline=True)
+    for run in (online, offline):
+        recorded = json.loads((run / "run.json").read_text())["fields"]["lora"]
+        assert recorded["source"] == f"local/adapter@{commit}"
+        restored = Adapter.from_run(run, step=1)
+        jax.tree.map(np.testing.assert_array_equal, thaw(restored.variables)["params"],
+                     thaw(moved)["params"])
