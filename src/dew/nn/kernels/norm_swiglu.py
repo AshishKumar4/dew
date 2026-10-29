@@ -79,7 +79,15 @@ from jax.experimental.pallas import triton as plgpu
 
 from dew.mesh import logical_spec
 
-from ..precision import at_least_fp32, compensated_add, compensated_total, rounded_to, two_product
+from ..precision import (
+    activation_and_slope,
+    at_least_fp32,
+    compensated_add,
+    compensated_total,
+    rms_weighted,
+    rounded_to,
+    two_product,
+)
 from ..sharding import automatic_axes, manual_map
 from . import generation, tuning
 from .generation import INHERENT, device_generation
@@ -467,19 +475,6 @@ def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: boo
     return _round(weight + 1.0, stored, interpret) if offset else weight
 
 
-def activation_and_slope(gate, activation: str) -> tuple[jax.Array, jax.Array]:
-    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid'.
-
-    silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
-    zero near g = -1.28; formed as the product rule forms it, `s + g (s (1 - s))`,
-    its worst element there is half `(g s)(1 - s) + s`'s, as XLA's is."""
-    sigmoid = jax.nn.sigmoid(gate)
-    slope = sigmoid * (1.0 - sigmoid)
-    if activation == 'sigmoid':
-        return sigmoid, slope
-    return gate * sigmoid, sigmoid + gate * slope
-
-
 def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean_square_ref, *,
                  row_block: int, epsilon: float, offset: bool, stored, after_cast: bool,
                  inverse_rounded: bool, activation: str, interpret: bool):
@@ -497,15 +492,14 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean
     # XLA's mean multiplies by the fp32 reciprocal, not an fp32 division.
     mean_square = jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon
     inverse = jax.lax.rsqrt(mean_square)
-    y = x * _rounded_inverse(inverse, inverse_rounded, y_ref.dtype, interpret)[:, None]
-    if scale_ref is not None:
-        if after_cast:
-            y = _round(y, y_ref.dtype, interpret)
-        y = y * _weight(scale_ref, columns, width, offset, stored, interpret)[None, :]
-    if gate_ref is not None:
-        # The gate multiplies the weighted norm in fp32, before the one cast.
-        y = y * activation_and_slope(plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32),
-                                     activation)[0]
+    weight = (None if scale_ref is None
+              else _weight(scale_ref, columns, width, offset, stored, interpret)[None, :])
+    gate = None if gate_ref is None else plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32)
+    # The gate multiplies the weighted norm in fp32, before the one cast.
+    y = rms_weighted(x, _rounded_inverse(inverse, inverse_rounded, y_ref.dtype, interpret)[:, None],
+                     weight=weight, gate=gate, activation=activation,
+                     rounded=functools.partial(_round, dtype=y_ref.dtype, interpret=interpret) if after_cast
+                     else None)
     plgpu.store(y_ref.at[at], y.astype(y_ref.dtype), mask=mask)
     plgpu.store(mean_square_ref.at[row], mean_square, mask=row < rows)
 

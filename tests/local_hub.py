@@ -8,6 +8,7 @@ or file's too (`LocalHub.served`), so a test counts what a load fetched. A proce
 
 import hashlib
 import json
+import os
 import re
 import threading
 from collections.abc import Mapping
@@ -239,3 +240,16 @@ def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
     """The request handler of `hub`'s server (`_Handler`)."""
     return type("Handler", (_Handler,), {"hub": hub})
 
+
+def hub_environment(hub: LocalHub | None, root: Path, *, offline: bool = False) -> dict[str, str]:
+    """A child process's environment against `hub` (none: the Hub gone), its Hub cache, recorded Hub answers
+    and caches under `root`, Dew's sources on its path, offline where asked; neither of the Hub client's
+    offline switches is inherited."""
+    from tool_support import REPO_ROOT
+
+    kept = {name: value for name, value in os.environ.items()
+            if name not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_ENDPOINT")}
+    return {**kept, **({} if hub is None else {"HF_ENDPOINT": hub.endpoint}),
+            **({"HF_HUB_OFFLINE": "1"} if offline else {}),
+            "HF_HUB_CACHE": str(root / "hub"), "DEW_HUB_ANSWERS": str(root / "answers"),
+            "XDG_CACHE_HOME": str(root / "cache"), "PYTHONPATH": str(REPO_ROOT / "src")}

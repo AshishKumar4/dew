@@ -539,6 +539,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         prices such a vector (a hook's, a template's per-row statistics) states it."""
         raise NotImplementedError(f"{self.name}'s register model takes no column vector")
 
+    def row_registers(self, rows: int, dtype) -> int:
+        """The registers a consumer thread holds for a vector of `rows` entries of `dtype` in the
+        accumulator's row layout (`row`), broadcast over its columns: a family whose register model prices
+        such a vector (a template's per-row statistics) states it."""
+        raise NotImplementedError(f"{self.name}'s register model takes no row vector")
+
     def narrowest_columns(self, dtype) -> int:
         """The fewest columns a staged operand block of `dtype` takes: a row of the narrowest swizzle
         (`NARROWEST_SWIZZLE_BYTES`), 16 bf16 columns, which both families' products read (wgmma's N in
