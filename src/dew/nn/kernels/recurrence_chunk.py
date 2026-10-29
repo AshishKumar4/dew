@@ -463,7 +463,7 @@ def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype)
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
                            starts=None, max_segments: int | None = None, floor: float | None = None,
-                           firsts=None):
+                           write_bound: float | None = None, firsts=None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
@@ -487,10 +487,11 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     by that bound, and the portable math resets its recurrence at each start,
     which needs none. `floor` is the least log decay a token the layer declares (`recurrence.Hooks.floor`:
     Kimi delta attention's lower bound), which the recurrence template's factored form of a decay a key
-    dimension reads.
+    dimension reads; `write_bound` the largest write gate it declares of keys it l2-normalized
+    (`recurrence.Hooks.write_bound`), which the template's 16-bit solve needs (`template.inverse_refusal`).
     """
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
-                             floor=floor)
+                             floor=floor, write_bound=write_bound)
     return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts,
                               firsts=firsts), chunk_size=chunk_size, max_segments=max_segments)
 
@@ -564,7 +565,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # Unrounded where an epilogue follows, as on the portable math.
         out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
                                    max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
-                                   floor=hooks.floor)
+                                   floor=hooks.floor, bound=hooks.inverse_bound)
         out = recurrence.skipped(hooks, out, value, given, work)
     elif hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
@@ -575,14 +576,15 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # over to the portable math there, reported as the call's route.
         def product_kernel(product: str) -> str:
             return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                               scale=scale, wide=epilogue, floor=hooks.floor, product=product,
+                               scale=scale, wide=epilogue, floor=hooks.floor, bound=hooks.inverse_bound,
+                               product=product,
                                delta=hooks.delta, decayed=hooks.decay != 'none')
 
         def run(kernel, query, key, value, g, beta, state, starts, firsts):
             if kernel == 'mosaic_gpu':
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
                                      max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
-                                     floor=hooks.floor)
+                                     floor=hooks.floor, bound=hooks.inverse_bound)
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
@@ -610,7 +612,8 @@ class PortCase:
     instruction family of the device it runs on (`family`, `generation.family`; None off a GPU), and the
     product it is selected for (`product`: 'forward' where no gradient is taken, 'training' where one is,
     `_by_product`), and the recurrence's form: whether it is the delta rule (`delta`) and decays
-    (`decayed`)."""
+    (`decayed`), and the largest entry of its chunk inverse the form proves (`bound`,
+    `recurrence.Hooks.inverse_bound`; None where it proves none)."""
 
     reverse: bool
     varying: bool
@@ -621,6 +624,7 @@ class PortCase:
     product: str = 'forward'
     delta: bool = True
     decayed: bool = True
+    bound: float | None = None
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -728,12 +732,26 @@ call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Tem
 widths, a decay a key dimension's floor, a bundle for the device's family, a config that fits), a GPU, and for
 a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no other, row 1926)."""
 
-MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (*PORT_SUPPORTS[1:3], *TEMPLATE_SUPPORTS)
+def _inverse_range(case: PortCase) -> bool:
+    """Whether the template's solve holds the call's chunk inverse (`template.inverse_refusal`)."""
+    from .templates.recurrence import template
+
+    return template.inverse_refusal(case.dtype, case.delta, case.bound) is None
+
+
+MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
+    *PORT_SUPPORTS[1:3],
+    Requirement('range', _inverse_range,
+                "a 16-bit delta rule's solve stages its chunk inverse in fp16, whose range holds it where "
+                "the layer declares keys of unit norm and write gates at most two, its entries then at most "
+                "that bound (`recurrence.Hooks.inverse_bound`); unnormalized keys grow it past fp16's "
+                "largest, which the port's TF32 merges and the portable math hold", row='ledger 2381'),
+    *TEMPLATE_SUPPORTS)
 """What the recurrence template needs of a delta rule's call: the port's trace and placement (its custom VJP,
-a Pallas call's results) and `TEMPLATE_SUPPORTS`, in every form its mainloop implements, the delta rule with
-a decay or without one and the forms without the delta rule alike (row 1963: the port's 'gated' form was the
-template's too). A declared port cell runs the port first where the port takes the call (`PORT_CELLS`,
-`GATED_DELTA`'s declared cells)."""
+a Pallas call's results), a 16-bit solve's range (`template.inverse_refusal`) and `TEMPLATE_SUPPORTS`, in
+every form its mainloop implements, the delta rule with a decay or without one and the forms without the
+delta rule alike (row 1963: the port's 'gated' form was the template's too). A declared port cell runs the
+port first where the port takes the call (`PORT_CELLS`, `GATED_DELTA`'s declared cells)."""
 
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
@@ -749,10 +767,11 @@ portable math."""
 
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
                 scale: float | None = None, wide: bool = False, floor: float | None = None,
-                product: str = 'forward', report: bool = True, delta: bool = True,
+                bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
                 decayed: bool = True) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
-    ('forward', 'training'), of the form `delta` and `decayed` state (`PortCase`), the template's
+    ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
+    proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
     implementations bound to it, on the target (`generation`'s, an assumed one's within `assumed`):
     reported as its route, or not where not `report` (`selected`). A kernel a call names
     (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over varying operands),
@@ -760,9 +779,9 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor)
+                     max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor, bound=bound)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
-    case = PortCase(reverse=_reverse_mode(query, key, value, g, beta, state),
+    case = PortCase(bound=bound, reverse=_reverse_mode(query, key, value, g, beta, state),
                     varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
                     family=family, product=product, delta=delta, decayed=decayed)
@@ -847,11 +866,14 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     return jnp.where(begins[:, None, None, None], 0.0, memory)
 
 
-def kernel_routed(query, key, value, g, beta, *, floor: float | None = None) -> bool:
+def kernel_routed(query, key, value, g, beta, *, floor: float | None = None,
+                  write_bound: float | None = None) -> bool:
     """Whether the delta rule's selector gives a call over these operands a kernel, its forward's
-    (`port_kernel`, unreported: the call reports its own): what a layer rounds its operands for, the
-    projections' dtype for a kernel, as fla's layer hands them over, the wide one for the portable math."""
-    return port_kernel(query, key, value, g, beta, floor=floor, report=False) != 'xla'
+    (`port_kernel`, unreported: the call reports its own), under the layer's declared `floor` and
+    `write_bound` (`chunk_gated_delta_rule`'s): what a layer rounds its operands for, the projections' dtype
+    for a kernel, as fla's layer hands them over, the wide one for the portable math."""
+    bound = recurrence.Hooks(write_bound=write_bound).inverse_bound
+    return port_kernel(query, key, value, g, beta, floor=floor, bound=bound, report=False) != 'xla'
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
@@ -929,7 +951,8 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     (`manual_map`), placed as `fla_rule`: its tiles derived from each shard's shapes, its forward and its
     gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
     its launches on the global batch, layer 0's solve over 4 rows for its 2, beside 40 GB of gathers a
-    microbatch (row 1897). `options` are the op's (`max_segments`, `scale`, `delta`, `wide`, `floor`)."""
+    microbatch (row 1897). `options` are the op's (`max_segments`, `scale`, `delta`, `wide`, `floor`,
+    `bound`)."""
     from .templates.recurrence import template
 
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
@@ -947,7 +970,8 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
 
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
-                wide: bool = False, family=None, floor: float | None = None, firsts=None):
+                wide: bool = False, family=None, floor: float | None = None, bound: float | None = None,
+                firsts=None):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
     (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their
@@ -961,10 +985,14 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     (ledger 1926: no kernel falls back inside itself). Its states and output launches take `tiles`
     (`mainloop.Tiles`, the template's config, `templates.recurrence.template`); a `family` given is the bundle
     it issues by, interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's
-    declared `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`)."""
+    declared `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit
+    delta rule the chunk inverse's `bound` its form proves, which its solve's range needs
+    (`template.inverse_refusal`)."""
     from .templates.recurrence import mainloop, template
 
     dtype = jnp.result_type(query, key, value)
+    if refused := template.inverse_refusal(dtype, delta, bound):
+        raise NotImplementedError(refused)
     query, key, value = (x.astype(dtype) for x in (query, key, value))
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
     # call's own, as the portable math takes it (Mamba-2's fp32 `dt`).
