@@ -1331,8 +1331,6 @@ class Trainer(Generic[Loss, Effects]):
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
             examples=examples, accumulation=self.accumulation, startup=self._startup)
         self.reading(loader, device_prefetch)
-        # The widths the data bound, which a saved run of the objective records (`bind_widths`).
-        self.objective.bind_widths(loader.widths)
         self._schedule(None if steps is None else steps // self.accumulation)
         plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
                           written=(log_every, eval_every, checkpoint_every),
