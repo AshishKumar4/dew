@@ -1593,7 +1593,7 @@ def test_a_leaf_in_any_layout_reads_as_its_c_ordered_copy():
     truth's, as its C-ordered copy, bit for bit (`_evidence`, `leaf_summary`): every leaf lies in C order
     beside the others of its width (`_LaidTruths`), so its sums run alike whatever its layout. The leaves
     hold rows of float64 zero and leaves of every rank."""
-    from reference_error import _evidence, leaf_summary
+    from reference_error import _evidence, _prepared, leaf_summary
 
     rng = np.random.default_rng(2201)
     shapes = [(70, 129), (9, 33), (5, 4, 9), (40,), (3, 2, 1), (12, 9), ()]
@@ -1619,7 +1619,11 @@ def test_a_leaf_in_any_layout_reads_as_its_c_ordered_copy():
                    for value in tree.values() if np.ndim(value) >= 2)
     ordered = [{name: np.ascontiguousarray(value) for name, value in tree.items()}
                for tree in (dew, reference, laid)]
-    assert _bits(_evidence(dew, reference, laid, laid)) == _bits(_evidence(*ordered, ordered[2]))
+
+    def evidence(dew, reference, truth):
+        return _evidence(_prepared(dew, truth), reference, truth, shared=True)
+
+    assert _bits(evidence(dew, reference, laid)) == _bits(evidence(*ordered))
     for name in truth:
         assert _bits(leaf_summary(dew[name], laid[name])) == _bits(
             leaf_summary(ordered[0][name], ordered[2][name])), name

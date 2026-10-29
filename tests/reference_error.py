@@ -1122,12 +1122,14 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
                                      for leaf in jax.tree.leaves(dew))
+            # Dew's side read once for every reference (`_prepared`).
+            prepared = _prepared(dew, truth)
             for at_arm, arm in enumerate(arms):
                 # The reference against itself on the same inputs is one evaluation (`seeds_for`'s
                 # sizing); the library arm runs on Dew's own inputs.
                 here, true_here = (theirs_at, their_truth) if arm is reference_fn else (mine_at, truth)
                 other = dew if dew_fn is arm and here is mine_at else arm(*here)
-                evidence = _evidence(dew, other, truth, true_here)
+                evidence = _evidence(prepared, other, true_here, shared=true_here is truth)
                 rows[at_arm] = evidence if rows[at_arm] is None else [
                     (first[0], first[1], float(np.fmax(first[2], later[2])),
                      float(np.fmax(first[3], later[3])), first[4], first[5] and later[5])
@@ -1149,41 +1151,62 @@ def _leaf_paths(tree) -> list[str]:
     return [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(tree)]
 
 
-def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
-    """One draw's `_paired` evidence of every leaf of `dew` and `reference` against their truths. The
-    trees are held alike first: Dew's, the reference's (a recorded one's leaves `RecordedLeaf`) and
-    both truths the same leaves at the same paths, and each leaf the shape of its truth, so no leaf is
-    paired with another's truth or compared through broadcasting. Every leaf's summary is read at once
-    (`_summaries`)."""
-    # Every leaf on the host in one transfer a tree, not one a leaf (`_summaries` reads them on the host);
-    # one truth stays one tree, as the draw gave it.
-    shared = their_truth is truth
-    dew, reference, truth = jax.device_get((dew, reference, truth))
-    their_truth = truth if shared else jax.device_get(their_truth)
+@dataclasses.dataclass(frozen=True)
+class _Prepared:
+    """Dew's side of a draw's evidence, read once for every reference (`_evidence`): its leaves and its
+    truth's on the host, their paths, the truth's laid rows and Dew's summaries against them."""
+    truth: object
+    paths: list
+    leaves: list
+    truths: list
+    held: object
+    mine: list
+
+
+def _prepared(dew, truth) -> _Prepared:
+    """Dew's leaves and its truth's on the host in one transfer a tree, held alike (the same leaves at the
+    same paths, each the shape of its truth), the truth's rows laid once and Dew's summaries read against
+    them (`_summaries`)."""
+    dew, truth = jax.device_get((dew, truth))
     paths = _leaf_paths(truth)
-    for name, tree in (("dew", dew), ("the reference", reference), ("the reference's truth", their_truth)):
+    if _leaf_paths(dew) != paths:
+        raise AssertionError(f"dew's leaves are {_leaf_paths(dew)}, the truth's {paths}")
+    leaves, truths = jax.tree.leaves(dew), jax.tree.leaves(truth)
+    for path, leaf, true in zip(paths, leaves, truths, strict=True):
+        if np.shape(leaf) != np.shape(true):
+            raise AssertionError(f"{path}: dew's shape is {np.shape(leaf)}, the truth's {np.shape(true)}")
+    held = _LaidTruths.of(truths)
+    return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held))
+
+
+def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool) -> list[tuple]:
+    """One draw's `_paired` evidence of every leaf of Dew (`prepared`, read once a draw) and `reference`
+    against their truths: the reference's leaves (a recorded one's `RecordedLeaf`) and its truth held to
+    Dew's truth's leaves, paths and shapes, so no leaf is paired with another's truth or compared through
+    broadcasting; its truth the same tree as Dew's where `shared`."""
+    reference = jax.device_get(reference)
+    their_truth = prepared.truth if shared else jax.device_get(their_truth)
+    paths, leaves, truths = prepared.paths, prepared.leaves, prepared.truths
+    for name, tree in (("the reference", reference), ("the reference's truth", their_truth)):
         if _leaf_paths(tree) != paths:
             raise AssertionError(f"{name}'s leaves are {_leaf_paths(tree)}, the truth's {paths}")
-    leaves, references, truths, their_truths = (jax.tree.leaves(tree)
-                                                for tree in (dew, reference, truth, their_truth))
+    references, their_truths = jax.tree.leaves(reference), jax.tree.leaves(their_truth)
     recorded = [isinstance(their_leaf, RecordedLeaf) for their_leaf in references]
-    for path, leaf, their_leaf, true, their_true, was in zip(paths, leaves, references, truths, their_truths,
-                                                             recorded, strict=True):
-        shapes = {"dew": np.shape(leaf), "the reference's truth": np.shape(their_true)}
+    for path, their_leaf, true, their_true, was in zip(paths, references, truths, their_truths, recorded,
+                                                       strict=True):
+        shapes = {"the reference's truth": np.shape(their_true)}
         if not was:
             shapes["the reference"] = np.shape(their_leaf)
         for name, shape in shapes.items():
             if shape != np.shape(true):
                 raise AssertionError(f"{path}: {name}'s shape is {shape}, the truth's {np.shape(true)}")
     # The truths' rows are read once a draw, for both arms where the two truths are the same values.
-    held = _LaidTruths.of(truths)
     same = all(their_true is true for their_true, true in zip(their_truths, truths, strict=True))
-    mine = _summaries(leaves, held)
     theirs = _summaries([None if was else leaf for leaf, was in zip(references, recorded, strict=True)],
-                        held if same else _LaidTruths.of(their_truths))
+                        prepared.held if same else _LaidTruths.of(their_truths))
     row = []
     for path, leaf, their_leaf, true, their_true, was, summary, their_summary in zip(
-            paths, leaves, references, truths, their_truths, recorded, mine, theirs, strict=True):
+            paths, leaves, references, truths, their_truths, recorded, prepared.mine, theirs, strict=True):
         their = their_leaf if was else their_summary
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
@@ -1194,8 +1217,7 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
             row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
-        paired = (was or their_truth is truth
-                  or np.array_equal(np.asarray(true), np.asarray(their_true)))
+        paired = was or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
         row.append(_paired(path, summary, their, paired=paired))
     return row
 
