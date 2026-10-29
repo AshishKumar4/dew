@@ -268,10 +268,10 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     """`lowered` compiled, read through Mosaic's reports (`reported`): where a kernel of a template's launch
     spills, that launch's config is refused (`refused`), the miss recorded (`misses`, logged), and the
     program `relower`ed once and compiled; `relower` traces afresh, so each refused launch's derivation
-    takes the next config by its own rule. A kernel spilling again is refused and recorded, not stepped
-    again; a relowering whose derivations find no config left (`Exhausted`) keeps the first program, its
-    misses recorded as not stepped. A program loaded from the persistent compilation cache runs no ptxas
-    and reports nothing."""
+    takes the next config by its own rule. A kernel spilling again is recorded, neither refused nor stepped
+    again, so every process derives the program this compile keeps; a relowering whose derivations find no
+    config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. A program loaded
+    from the persistent compilation cache runs no ptxas and reports nothing."""
     executable, spilling = _compiled_reported(lowered, options)
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
@@ -288,11 +288,9 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
         return executable
     _recorded(found, stepped=True)
     executable, spilling = _compiled_reported(relowered, options)
-    again = _misses_of(spilling)
-    for refusal, report, _ in again:
-        if refusal is not None:
-            _record(refusal, None, frozenset({report.kernel}))
-    _recorded(again, stepped=False)
+    # The kept program's own spills are misses alone: refused, they would have every process seeded with
+    # them derive a third program, not the one this compile keeps and runs.
+    _recorded(_misses_of(spilling), stepped=False)
     return executable
 
 
