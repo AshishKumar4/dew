@@ -379,14 +379,16 @@ first (`_backward_registers`)."""
 
 
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
-                        accurate: bool, dq: bool) -> int:
+                        accurate: bool, dq: bool, split: bool = False) -> int:
     """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
     consumer's dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums) and its per-query rows,
     beside a step's logits and output cotangents' products fp32, then its score cotangents fp32 and one part
     of them in the operands' dtype at a time (`algebra.formed_parts`; ptxas held the accurate form's three at
     width 128 in 255 registers, unspilled, where all three would be 262); a dK/dV consumer's dK and dV sums
     `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products (a fused launch's queries first, its dQ
-    tile `[bq, D]` fp32 too) and its per-query statistics; every sum its share of the `columns`. A
+    tile `[bq, D]` fp32 too) and its per-query statistics, each of a consumer's share of a slot's queries
+    where its consumers `split` them (`split_queries`), else of the slot's; every sum its share of the
+    `columns`. A
     queries-first step's masked tile holds its predicates beside its products (`algebra.seen` of its places'
     int tiles, `_coords`, a byte an entry), from its logits' mask to its cotangents' (ptxas: the fused
     launch at 128 x 64 and width 64 spills 60 bytes, its model 252 without them; 64 x 64 at width 128 holds
@@ -403,13 +405,13 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         return resources.live_registers(family, carried, products, cotangents) + rows
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
-    if config.fused and not split_queries(family):
-        # Queries first (`attention_mosaic_backward._fused_launch`): its statistics row vectors.
+    if config.fused and not split:
+        # Queries first (`attention_mosaic_backward._fused_launch`), on either layout: its statistics row
+        # vectors.
         statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
         dq_tile = [(block_q, width, jnp.float32)]
         return resources.live_registers(family, carried, products, dq_tile) + statistics
-    # A consumer's share of a slot's queries where the consumers share its keys (`split_queries`).
-    queries = block_q // config.consumers if split_queries(family) else block_q
+    queries = block_q // config.consumers if split else block_q
     step = [(queries, block_k, jnp.float32)] * 2
     # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`); a fused
     # launch's dQ tile of its share `[queries, D]` fp32 beside its score cotangents.
@@ -565,14 +567,17 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     def _launch_registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> tuple[int, int]:
         """Each launch's registers a consumer holds (`_backward_registers`): the dQ launch's at `config` (none
-        runs where `fused`), the dK/dV launch's at its own tiles (`BackwardTiles.dkv`)."""
+        runs where `fused`), the dK/dV launch's at its own tiles (`BackwardTiles.dkv`), its consumers
+        splitting a slot's queries where it runs keys first on a layout whose consumers feed their rings
+        (`split_queries`), not the fused launch queries first on that layout (`_fused_launch`)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         counts = []
         for tiles, dq in ((config, True), (config.dkv, False)):
             family = bundle_of(tiles, query.dtype)
             width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
+            split = split_queries(family) and not (config.fused and not config.dkv_apart)
             counts.append(_backward_registers(family, tiles, width, value_width, query.dtype,
-                                              accurate=self.accurate, dq=dq))
+                                              accurate=self.accurate, dq=dq, split=split))
         return counts[0], counts[1]
 
     def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
