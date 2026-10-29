@@ -673,10 +673,10 @@ class _SubChunk:
     compensated), and the difference of two positions' decays over both halves (`apart`)."""
 
     refs: dict
-    start: jax.Array
-    taken: jax.Array
-    i: jax.Array
-    first: jax.Array
+    start: jax.Array | int
+    taken: jax.Array | int
+    i: jax.Array | int
+    first: jax.Array | int
     aligned: bool
     count: int
     exact: bool
