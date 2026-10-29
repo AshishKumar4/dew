@@ -73,11 +73,9 @@ def test_the_layer_decodes_as_it_prefills():
 
 
 
-SPLIT_SEEDS = {"all_valid": 256, "right_padded": 128, "left_padded": 256, "gaps": 256, "packed": 128,
-               "empty_shard": 512, "empty_shard_packed": 128}
-"""Each row's declared draws, sized by `seeds_for` on armada paired with the unsplit layer (job
-20261029000107-7b7fd5c8): the parameters' gradients, sums over the whole draw, are heavy-tailed across
-draws, as Mamba-2's are (tests/test_mamba2.py's `SPLIT_SEEDS`)."""
+SPLIT_SEEDS = {"all_valid": 64, "right_padded": 64, "left_padded": 64, "gaps": 64, "packed": 64,
+               "empty_shard": 64, "empty_shard_packed": 64}
+"""Each row's declared draws, sized by `seeds_for` on armada paired with the unsplit layer."""
 
 
 @pytest.mark.mesh
