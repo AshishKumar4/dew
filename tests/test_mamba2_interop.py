@@ -141,7 +141,7 @@ MAMBA2_130M = "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"
 MAMBA2_130M_HF = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
 
 
-HUB_BF16_SEEDS = 0
+HUB_BF16_SEEDS = 8
 """The released checkpoint's declared draws of ids against the port's bfloat16 forward (check 1), sized
 by `seeds_for` paired with Dew's bfloat16 logits on the CPU."""
 

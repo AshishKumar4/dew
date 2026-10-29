@@ -17,6 +17,16 @@
    "tool": "tools/joint_checkpoint_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
+  "hf/deepseek-v3-tiny/numerics.npz": {
+   "tool": "tools/numerics_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ]
+  },
   "hf/k2-horizon-tiny/padding.json": {
    "tool": "tools/k2_horizon_reference.py",
    "sources": [{"repo": "IFM/K2-Horizon-0.9B", "version": "383cb66347be", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}]

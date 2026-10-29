@@ -39,7 +39,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_ids, transformers_arms, transformers_model
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
@@ -50,11 +50,12 @@ DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek
             "mamba2-tiny")
 
 
-DECODER_SEEDS = {"float32": {"mixtral-tiny": 16},
-                 "bfloat16": {"mixtral-tiny": 512, "deepseek-v3-tiny": 0}}
+DECODER_SEEDS = {"float32": {"mixtral-tiny": 16}, "bfloat16": {"mixtral-tiny": 512}}
 """Each decoder's declared draws of ids against transformers' forward in the same precision (check 1),
-sized by `seeds_for` paired with Dew's logits on the CPU: 8 where a decoder is not named. DeepSeek V3's
-bfloat16 logits do not resolve within the 512-seed cap, a finding its site reports Inconclusive."""
+sized by `seeds_for` paired with Dew's logits on the CPU: 8 where a decoder is not named."""
+ONE_DRAW = {("deepseek-v3-tiny", "bfloat16")}
+"""The decoders whose check 1 does not resolve within the 512-seed cap, paired (G02's open row): held on
+their recorded draw by the one-draw rule, as before, until it does."""
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
@@ -65,6 +66,12 @@ def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     from the float64 twin of the stored weights, over drawn ids (check 1)."""
     directory = FIXTURES / name
     pretrained = Pretrained.load(str(directory), dtype=dtype, attention_impl="reference")
+    if (name, dtype) in ONE_DRAW:
+        ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+        logits = np.asarray(pretrained.model.apply(pretrained.variables, ids), np.float32)
+        with np.load(directory / "numerics.npz") as exact:
+            assert_as_exact_as_the_reference(logits, exact["bf16"], exact["f64"], f"{name} {dtype}")
+        return
     source = transformers_model(directory)
     narrow = source if dtype == "float32" else transformers_model(directory, dtype=dtype)
     reference, truth = transformers_arms(narrow, lambda model, ids: model(ids, use_cache=False).logits,
@@ -150,7 +157,7 @@ def denoise(model, variables, prompt, canvas, **conditioning):
     return model.apply({**variables, "cache": cache}, canvas, **conditioning).astype(jnp.float32)
 
 
-WORKFLOW_SEEDS = 0
+WORKFLOW_SEEDS = 8
 """The denoiser's declared draws of prompts, canvases, previous logits and pixels against transformers'
 bfloat16 forwards (check 1), sized by `seeds_for` paired with Dew's forwards on the CPU."""
 
@@ -228,7 +235,7 @@ MAMBA2_REVISION = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
 PROMPT_TOKENS = 44
 """The drawn prompts' length, the 44 tokens of the prose prompt the port was first held to."""
 
-REAL_MAMBA2_SEEDS = {"float32": 0, "bfloat16": 0}
+REAL_MAMBA2_SEEDS = {"float32": 8, "bfloat16": 8}
 """The released port's declared draws of ids against transformers' forward in each precision (check 1),
 sized by `seeds_for` paired with Dew's logits on the CPU."""
 

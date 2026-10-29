@@ -406,7 +406,7 @@ def assert_transformers_reads_the_run(export, task, ids, *, seeds: int = RUN_EXP
                     "run export logits", seeds=seeds, truth_fn=read(wide=True))
 
 
-TRAINED_EXPORT_SEEDS = 0
+TRAINED_EXPORT_SEEDS = 8
 """The trained run's export's declared draws of ids against transformers' read of it (check 1), sized by
 `seeds_for` paired with the run's packed logits on the CPU: one draw's ratio could flake, which the
 pooled seeds resolve."""

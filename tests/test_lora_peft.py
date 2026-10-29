@@ -35,11 +35,11 @@ STEP = Step(step=jnp.int32(0), key=jax.random.key(1), ema=None)
 """The training step whose loss the checks' gradients are, and whose draw `dew_masks` gives PEFT's
 dropout."""
 
-TRAINING_SEEDS = {"rslora": 0, "dropout": 0}
+TRAINING_SEEDS = {"rslora": 8, "dropout": 8}
 """Each case's declared draws of ids against PEFT's training steps (check 1), sized by `seeds_for`
 paired with Dew's steps on the CPU."""
 
-LOGITS_SEEDS = 0
+LOGITS_SEEDS = 8
 """The rsLoRA adapter's declared draws of ids against PEFT's adapted logits (check 1), sized by
 `seeds_for` paired with Dew's logits on the CPU."""
 
