@@ -13,7 +13,10 @@ import numpy as np
 import pytest
 from reference_error import widened
 
+from dew.nn import precision
+from dew.nn.blocks import table_rows
 from dew.nn.kernels import recurrence_chunk
+from dew.nn.kernels.templates.gemm import template
 
 TINY, LARGEST = float(np.finfo(np.float32).tiny), float(np.finfo(np.float32).max)
 
@@ -77,6 +80,11 @@ def assert_contract(fn, primals, direction, cotangent, label: str) -> None:
                                       f"where float64's are normal float32s, e.g. {value[broken][:3]}")
 
 
+EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
+"""The draws' scales: unit values, and values whose products (a squared distance, a second derivative's
+pairs) reach float32's largest or its least normal."""
+
+
 @pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
 def test_the_chunked_delta_rule_holds_every_order(packed):
     """`recurrence_chunk.chunk_delta_rule` (the portable rule's custom derivative through
@@ -96,3 +104,64 @@ def test_the_chunked_delta_rule_holds_every_order(packed):
     direction = tuple(jax.random.normal(keys[6], x.shape) for x in primals)
     cotangent = jax.random.normal(keys[7], query.shape)
     assert_contract(rule, primals, direction, cotangent, "the chunked delta rule")
+
+
+def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
+    """Standard normal float32 arrays of `shapes` at `scale`, from `seed`."""
+    rng = np.random.default_rng(seed)
+    return tuple(jnp.asarray(rng.standard_normal(shape) * scale, jnp.float32) for shape in shapes)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_embedding_lookup_holds_every_order(edge):
+    """`blocks.table_rows` (a gather whose reverse mode sums each token's cotangent into its row, row
+    1869): every order runs in the table, the ids not differentiable, and each is finite wherever float64
+    is a normal float32."""
+    (table,) = normal_draw(1869, (11, 6), scale=EDGES[edge])
+    ids = jnp.asarray([[0, 3, 3, 10], [7, 0, 2, 2]], jnp.int32)
+    (direction,) = normal_draw(1870, table.shape, scale=EDGES[edge])
+    (cotangent,) = normal_draw(1871, (2, 4, 6))
+    assert_contract(lambda table: table_rows(table, ids, jnp.float32), (table,), (direction,), cotangent,
+                    f"an embedding lookup {edge}")
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_bf16_dot_holds_every_order(edge):
+    """`precision.bf16_dot_general` (the BF16_BF16_F32 algorithm's dot and its cotangent's one rounding
+    to bf16): every order runs, finite wherever float64 is a normal float32, at values whose products
+    near float32's ends."""
+    primals = normal_draw(956, (5, 8), (8, 3), scale=EDGES[edge])
+    direction = normal_draw(957, (5, 8), (8, 3), scale=EDGES[edge])
+    (cotangent,) = normal_draw(958, (5, 3))
+
+    def dot(lhs, rhs):
+        return precision.bf16_dot_general(lhs, rhs, (((1,), (0,)), ((), ())))
+
+    assert_contract(dot, primals, direction, cotangent, f"a bf16 dot {edge}")
+
+
+def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch):
+    """`precision.accumulated` in a process running wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, its own
+    custom derivative of the float64-summed product): every order runs, finite wherever float64 is a
+    normal float32."""
+    monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "1")
+    primals = normal_draw(343, (4, 16), (16, 5))
+    direction = normal_draw(344, (4, 16), (16, 5))
+    (cotangent,) = normal_draw(345, (4, 5))
+    assert_contract(lambda lhs, rhs: precision.accumulated(jnp.matmul, lhs, rhs), primals, direction,
+                    cotangent, "a wide CPU sum of products")
+
+
+def test_a_grouped_gemm_holds_every_order():
+    """The GEMM template's grouped product (`template.gemm`, its custom derivative through
+    `generation.linear_tangent`): every order runs in the rows and the matrices, the group sizes not
+    differentiable, finite wherever float64 is a normal float32."""
+    sizes = jnp.asarray([3, 0, 5], jnp.int32)
+    primals = normal_draw(146, (8, 16), (3, 16, 4))
+    direction = normal_draw(147, (8, 16), (3, 16, 4))
+    (cotangent,) = normal_draw(148, (8, 4))
+    def grouped(rows, matrices):
+        return template.gemm(rows, matrices, sizes, out_dtype=rows.dtype)
+
+    assert_contract(grouped, primals, direction, cotangent, "a grouped GEMM")
+
