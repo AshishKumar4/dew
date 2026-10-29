@@ -317,13 +317,25 @@ def _llada_moe_v2_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
     return _llada_moe_config(hf_config, used, v2=True)
 
 
+def _llada2_walk(config: Mapping[str, object]) -> MaskedWalk | None:
+    """LLaDA2's own generation, where Dew runs it: 2.0's `generate` walks blocks of 32 over 32 steps
+    each at temperature 0, revealing past 0.95 (modeling_llada2_moe.py:1233-1247 at dad945c). 2.1's
+    configs read as 2.0's and take the same walk, without the release's editing of revealed tokens,
+    which Dew does not run; 2.2's (its DELETE and SPLIT ids) generates with editing past another
+    threshold, and unmasks the whole response with Dew's MDLM instead."""
+    if config.get("delete_token_id") is not None or config.get("split_token_id") is not None:
+        return None
+    return MaskedWalk(block=32, steps=32, threshold=0.95, temperature=0.0)
+
+
 def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """DeepSeek's grouped sigmoid router, or 2.2's block-level expert shortlist.
 
     The 2.0 forward requires a 4-D additive block mask. 2.1 and 2.2 accept
     it through create_bidirectional_mask too. Without an explicit mask Dew
     exposes their full bidirectional view, as the other masked LMs do;
-    sampling is Dew's MDLM procedure, not the release's block-wise recipe.
+    a 2.0 or 2.1 source generates by 2.0's blockwise walk (`_llada2_walk`), a
+    2.2 one by Dew's MDLM procedure.
 
     2.2's block routing departs from the release in one respect: the release
     cuts its `block_size` blocks from the batch flattened into one stream (and
@@ -629,7 +641,5 @@ LLADA2_MOE = DecoderFamily(
     # is 126081.
     defaults={'pad_token_id': 126081},
     padding_idx=True,
-    # LLaDA2's generate walks blocks of 32 over 32 steps each, revealing past 0.95
-    # (modeling_llada2_moe.py:1233-1247 at dad945c).
-    masked_walk=MaskedWalk(block=32, steps=32, threshold=0.95),
+    masked_walk=_llada2_walk,
 )

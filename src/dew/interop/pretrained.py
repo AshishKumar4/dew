@@ -78,6 +78,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.diffusion.discrete import Confident
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
@@ -713,35 +714,47 @@ class PretrainedMaskedDecoder(Pretrained):
     """A masked-diffusion decoder (LLaDA, Dream).
 
     It is a non-causal decoder with a mask id that generates by unmasking a whole
-    response.
+    response, or, where its family declares its release's walk (LLaDA2.0's), a
+    block at a time as the release does (`masked_recipe`).
     """
 
     model: CausalTransformer
+
+    @property
+    def masked_recipe(self) -> tuple[Confident, int, int] | None:
+        """The release's own walk this source generates by, its solver, steps and block
+        (`DecoderFamily.masked_walk` of its config, LLaDA2.0's; `Confident`), or None for a source
+        whose family declares none, an unregistered one among them, which unmasks the whole response
+        with Dew's MDLM. Its task (`text_generation`) and an objective over it
+        (`MaskedDiffusionObjective`) take it alike."""
+        from dew.diffusion.discrete import Confident
+        from dew.interop.hf_decoders import families
+
+        family = families().get(str(self.config.get("model_type")))
+        walk = None if family is None or family.masked_walk is None else family.masked_walk(self.config)
+        if walk is None:
+            return None
+        return Confident(threshold=walk.threshold, temperature=walk.temperature), walk.steps, walk.block
 
     def pipeline(self):
         return self.packed().text_generation()
 
     def text_generation(self) -> MaskedGeneration:
-        """Build the masked generation task this source describes.
-
-        A family whose release walks in blocks (`DecoderFamily.masked_walk`, LLaDA2's) generates as
-        its release does: blocks of its size over its steps each, revealing past its threshold
-        (`Confident`, temperature 0 taking each position's best token). Any other refines a whole
-        response with Dew's MDLM sampler (`Unmask`), not its family's own recipe.
+        """Build the masked generation task this source describes, walking as its release does where
+        its family declares the walk (`masked_recipe`), else refining a whole response with Dew's MDLM
+        sampler (`Unmask`), not its family's own recipe.
         """
-        from dew.diffusion.discrete import MDLM, Confident
-        from dew.interop.hf_decoders import family_entry
+        from dew.diffusion.discrete import MDLM
 
         config, generation = self.config, self.generation_config
         mask_id = self.model.mask_token_id
         if mask_id is None:
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
         audit_masked(config, generation)
-        walk = family_entry(str(config["model_type"])).masked_walk
-        recipe = {} if walk is None else {"solver": Confident(threshold=walk.threshold, temperature=0.0),
-                                          "steps": walk.steps, "block": walk.block}
+        recipe = self.masked_recipe
+        walked = {} if recipe is None else {"solver": recipe[0], "steps": recipe[1], "block": recipe[2]}
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
-                                self.text_processor, **recipe,
+                                self.text_processor, **walked,
                                 eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),

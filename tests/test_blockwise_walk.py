@@ -134,6 +134,43 @@ def test_llada2s_task_continues_stops_and_takes_a_zero_budget():
     np.testing.assert_array_equal(empty.decoder_steps, 0)
 
 
+def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
+    """An objective over a loaded LLaDA2.0 source takes its walk by default (`masked_recipe`); a run of
+    it saves the walk in its record, and the run's task (`MaskedGeneration.from_run`, `dew.pipeline` of
+    the run) holds the same solver, block and steps and generates the live task's tokens, as
+    `dew.pipeline` of the source itself walks (ledger 2174)."""
+    import grain.python as grain
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data import ByteTokenizer
+    from dew.data.dataset import Loader
+    from dew.diffusion.discrete import MDLM
+    from dew.inference import RunProcessor, pipeline
+    from dew.inference.tasks import MaskedGeneration
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.training import Trainer
+
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="xla")
+    solver, steps, block = source.masked_recipe
+    assert isinstance(pipeline(str(FIXTURES / "llada2-tiny")).solver, Confident)
+    objective = MaskedDiffusionObjective(source, MDLM(mask_id=source.model.mask_token_id)(), 8,
+                                         ema_decay=None, processor=RunProcessor(ByteTokenizer()))
+    assert (objective.solver, objective.steps, objective.block) == (solver, steps, block)
+    rows = jax.device_count()
+    stream = grain.MapDataset.source([{"text": np.full((rows, 8), 7, np.int32)}]).repeat().to_iter_dataset()
+    data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
+    state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(19),
+                    checkpoints=Checkpoints(str(tmp_path / "run"))).fit(data, steps=1, checkpoint_every=1,
+                                                                         log_every=1)
+    live = objective.pipeline(state)
+    prompt = jnp.asarray([[3, 5, 6]], jnp.int32)
+    expected = live(prompt, 8, key=7).host().tokens
+    for restored in (MaskedGeneration.from_run(str(tmp_path / "run")), pipeline(str(tmp_path / "run"))):
+        assert (restored.solver, restored.steps, restored.block) == (solver, steps, block)
+        np.testing.assert_array_equal(restored(prompt, 8, key=7).host().tokens, expected)
+
+
 def test_confident_spreads_a_fixed_quota_where_no_block_is_walked():
     """Without a block, `Confident`'s quota spreads the slots masked at the walk's first step over its
     steps, fixed: eight masked slots over three steps reveal 3, 3 and 2 at a threshold no draw passes,
