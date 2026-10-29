@@ -21,17 +21,15 @@ def test_a_flow_runs_every_cell_and_raises_every_failure_together():
         run_cells([Cell("first", failing("first")), Cell("passing", lambda: ran.append("passing")),
                    Cell("last", failing("last"))])
     assert ran == ["first", "passing", "last"]
-    assert "first is off" in str(raised.value) and "last is off" in str(raised.value)
-    assert "passing" not in str(raised.value)
+    assert raised.value.labels == ["first", "last"]
 
 
-def test_a_cell_that_skips_itself_is_reported_and_the_cells_after_it_run(capsys):
-    """A cell's own skip is printed with its reason and ends neither the flow nor the cells after it."""
+def test_a_cell_that_skips_itself_is_reported_and_the_cells_after_it_run():
+    """A cell's own skip is reported by its label and ends neither the flow nor the cells after it."""
     ran = []
-    run_cells([Cell("absent", lambda: pytest.skip("its package is missing")),
-               Cell("present", lambda: ran.append("present"))])
-    assert ran == ["present"]
-    assert "cell skipped: absent: its package is missing" in capsys.readouterr().out
+    skipped = run_cells([Cell("absent", lambda: pytest.skip("its package is missing")),
+                         Cell("present", lambda: ran.append("present"))])
+    assert ran == ["present"] and skipped == ["absent"]
 
 
 def test_a_flow_of_no_cell_that_runs_is_skipped():
