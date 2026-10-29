@@ -147,8 +147,9 @@ def test_a_kinds_run_lowered_for_a_gpu_lowers_its_step_and_trains_nothing(kind, 
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_handed_a_step_compiled_ahead_for_other_devices_refuses_it(kind, tmp_path):
     """A kind's run compiled ahead for eight A100s it lacks (`compile_ahead`) writes its first step and
-    ends with status 0; the same run handed that step (`ahead`) on this host's CPUs lowers another
-    program, which it refuses before it trains, saving and stepping nothing (train 286's review)."""
+    ends with status 0; the same run handed that step (`ahead`) on this host's CPUs reaches the step's
+    own check, which refuses it before the run trains, saving and stepping nothing (train 286's review).
+    Which refusal is the program's is tests/test_compile_ahead.py's to show, on the GPU a step runs on."""
     from dew.training.ahead import CompiledAhead
 
     step = tmp_path / "step.dew-aot"

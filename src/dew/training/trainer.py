@@ -77,7 +77,6 @@ from dew.distributed.placement import (
     Placement,
     Validation,
     device_mesh,
-    link_topology,
     placed_bytes,
     placed_shapes,
 )
@@ -141,7 +140,7 @@ from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
     check_stream,
-    link_bandwidth,
+    link_figure,
     link_figures,
     marked,
     microbatch,
@@ -325,8 +324,9 @@ class Trainer(Generic[Loss, Effects]):
         # The links the last compiled step decided its projections by, which say whether one spread over
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
-        # A step compiled ahead is the program its own links decided, so a run handed it traces with them.
-        self._stated_links = {**dict(links or {}), **({} if ahead is None else ahead.links)}
+        self._stated_links = dict(links or {})
+        # A step compiled ahead is the program its own links decided: a run handed it traces with them.
+        self._ahead_links = {} if ahead is None else ahead.links
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
         self._refusal: str | None = None
@@ -346,7 +346,7 @@ class Trainer(Generic[Loss, Effects]):
         self._base_rung = None
         self._shape_rungs: dict[str, JSON] = {}
         self._resumed_shapes: dict[str, JSON] = {}
-        self._resumed_links: dict[str, float] = {}
+        self._resumed_links: dict[str, float | None] = {}
         # The microbatches a step's batch is read in, once decided (`split`,
         # 1 where `whole`, a pooling state's window, or the first plan), which
         # cut every batch the run reads (`_rows`, read off `fit`'s data).
@@ -880,9 +880,8 @@ class Trainer(Generic[Loss, Effects]):
                 links[axis] = Link(None, peak)
                 continue
             if (mesh, axis) not in self._bandwidths:
-                # A resumed run takes the figure its checkpoint traced with, on this very placement.
-                self._bandwidths[mesh, axis] = None if peak is None else (
-                    self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
+                self._bandwidths[mesh, axis] = None if peak is None else link_figure(
+                    mesh, axis, self._ahead_links, self._resumed_links)
             links[axis] = Link(self._bandwidths[mesh, axis], peak)
         return links
 

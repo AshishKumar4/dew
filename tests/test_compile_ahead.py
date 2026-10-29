@@ -355,7 +355,7 @@ def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     target = MeshSpec(tensor=2).build(compile_only_gpus("sm90", 2))
     saved = compile_ahead(latent(target), batch)
-    assert saved.links["tensor"].bytes_per_second is None
+    assert saved.links == {"tensor": None}
     assert compile_ahead(latent(target, links=FAST), batch).program != saved.program
 
 
