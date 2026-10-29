@@ -805,20 +805,30 @@ def paired_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
     return jnp.zeros((3, *shape), dtype)
 
 
-def added_to(running: jax.Array, term: jax.Array) -> jax.Array:
-    """`running` (`running_sum`) with `term` added: through `compensated_add` where it is a pair."""
-    term = term.astype(running.dtype)
-    if running.shape[0] == 1:
-        return running + term[None]
-    pair = compensated_add((running[0], running[1]), (term, jnp.zeros_like(term)))
-    return jnp.stack((*pair, running[2] + term))
+type Running = jax.Array | tuple[jax.Array, ...]
+"""A running sum (`running_sum`), stacked along its leading axis or held as that axis's parts."""
 
 
-def running_total(running: jax.Array) -> jax.Array:
-    """A running sum's value (`running_sum`): a pair's rounded once (`compensated_total`), else the sum."""
-    if running.shape[0] == 1:
-        return running[0]
-    return compensated_total((running[0], running[1]), running[2])
+def added_to(running: Running, term: jax.Array) -> Running:
+    """`running` (`running_sum`) with `term` added: through `compensated_add` where it is a pair. A running
+    sum held as its leading axis's parts (a tuple) stays one, as a kernel whose layouts hold no unit axis
+    carries it."""
+    held = running if isinstance(running, tuple) else tuple(running)
+    term = term.astype(held[0].dtype)
+    if len(held) == 1:
+        added = (held[0] + term,)
+    else:
+        added = (*compensated_add((held[0], held[1]), (term, jnp.zeros_like(term))), held[2] + term)
+    return added if isinstance(running, tuple) else jnp.stack(added)
+
+
+def running_total(running: Running) -> jax.Array:
+    """A running sum's value (`running_sum`, or its leading axis's parts): a pair's rounded once
+    (`compensated_total`), else the sum."""
+    held = running if isinstance(running, tuple) else tuple(running)
+    if len(held) == 1:
+        return held[0]
+    return compensated_total((held[0], held[1]), held[2])
 
 
 def compensated_total(pair: tuple[jax.Array, jax.Array], plain: jax.Array) -> jax.Array:

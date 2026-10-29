@@ -41,6 +41,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     reducing,
     stated,
 )
+from dew.nn.precision import running_sum
 
 
 def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
@@ -549,8 +550,8 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
     """Dropout's first pass on this mainloop (`algebra.dropout_centre`): each query tile's walk over its keys
     (a consumer's, as the dQ program's), each tile's logits `exp(s - m)` and dropped products
     (`algebra.dropped_products` of `dO Vᵀ` and the call's draw) taken into the query's `Centre`
-    (`algebra.centre_step`). Returns each field `[B, H, Qp]`, which `algebra.centre_finish` takes past the
-    launch."""
+    (`algebra.centre_step`). Returns the centre and its seen keys `[B, H, Qp]` and each running sum
+    `[k, B, H, Qp]` (`precision.running_sum`), which `algebra.centre_finish` takes past the launch."""
     batch, queries, heads, width = query.shape
     kv_heads = key.shape[2]
     program, consumers, kinds = walk.program, walk.consumers, walk.kinds
@@ -559,7 +560,9 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
     pair = consumers * block_q
     exponent = algebra.centre_scale(walk.spec.keys)
     leaves, treedef = jax.tree.flatten((spans, score_params, drop))
-    fields = len(jax.tree.leaves(algebra.centre_start(1)))
+    # The centre, whether a key is seen, and each running sum's parts (`precision.running_sum`).
+    parts = running_sum((1,), jnp.float32).shape[0]
+    fields = 2 + 2 * parts
 
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, peak_ref), refs = refs[:5], refs[5:]
@@ -602,13 +605,15 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
                 return centred, accumulators
 
             family.passed(streams, streamed[0], lo, first=streamed[0])
-            # Every field a row vector of zeros (`algebra.centre_start`), `seen` false.
-            start = jax.tree.map(lambda field: family.zeros((block_q,)).astype(field.dtype),
-                                 algebra.centre_start(1))
+            # Every field a row vector of zeros (`algebra.centre_start`), `seen` false, each running sum
+            # its leading axis's parts (`precision.added_to`): the layouts hold no unit axis.
+            zero = family.zeros((block_q,))
+            parts = running_sum((1,), jnp.float32).shape[0]
+            start = algebra.Centre(zero, zero > 0, (zero,) * parts, (zero,) * parts)
             centred, _ = family.walk(streams, ((step, lo, hi),), start, (), walk.interpret, first=streamed[0])
             family.passed(streams, hi, streamed[1], first=streamed[0])
-            parts = [part.astype(jnp.float32) for part in jax.tree.leaves(centred)]
-            family.stored(tuple(family.as_row(part) for part in parts),
+            rows_of = [part.astype(jnp.float32) for part in jax.tree.leaves(centred)]
+            family.stored(tuple(family.as_row(part) for part in rows_of),
                           tuple(centre_ref.at[place, row, head, pl.ds(first, block_q)]
                                 for place in range(fields)), smem=row_smem.at[index])
 
@@ -634,9 +639,7 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
         interpret=walk.interpret, approx_math=False, name="attention_centre",
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 0, query, key, value, dout)
     )(query, key, value, dout, peak, *leaves)
-    template_fields = jax.tree.leaves(algebra.centre_start(1))
-    return jax.tree.unflatten(jax.tree.structure(algebra.centre_start(1)),
-                              [out[place].astype(field.dtype) for place, field in enumerate(template_fields)])
+    return algebra.Centre(out[0], out[1] > 0, out[2:2 + parts], out[2 + parts:])
 
 
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,

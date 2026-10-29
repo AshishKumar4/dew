@@ -44,6 +44,7 @@ from dew.nn.kernels.templates.attention import (
     within,
 )
 from dew.nn.precision import (
+    Running,
     added_to,
     compensated_sum,
     compensates_loops,
@@ -1895,8 +1896,8 @@ class Centre(NamedTuple):
 
     centre: jax.Array
     seen: jax.Array
-    residual: jax.Array
-    mass: jax.Array
+    residual: Running
+    mass: Running
 
 
 def centre_scale(keys: int) -> float:
@@ -1929,16 +1930,18 @@ def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: ja
     nearest = jnp.min(jnp.where(seen, jnp.abs(products), jnp.inf), axis=-1)
     first = jnp.min(jnp.where(seen & (jnp.abs(products) == expand(nearest, products)), positions,
                               jnp.iinfo(jnp.int32).max), axis=-1)
-    picked = seen & (positions == first[:, None])
+    picked = seen & (positions == expand(first, products))
     tile_centre = jnp.sum(jnp.where(picked, products, 0.0), axis=-1)
     centre = jnp.where(state.seen, state.centre, tile_centre)
+    # Whether a key of the tile counts, a row's maximum (a kernel's rows reduce no booleans).
+    counted = jnp.max(jnp.where(seen, 1, 0), axis=-1) > 0
     scaled = power2(products, k) - expand(power2(centre, k), products)
 
     def row_sum(values):
         return (compensated_sum(values, (values.ndim - 1,)) if compensates_loops()
                 else values.sum(axis=-1))
 
-    return Centre(centre, state.seen | jnp.any(seen, axis=-1),
+    return Centre(centre, state.seen | counted,
                   added_to(state.residual, row_sum(jnp.where(seen, weights * scaled, 0.0))),
                   added_to(state.mass, row_sum(jnp.where(seen, weights, 0.0))))
 
