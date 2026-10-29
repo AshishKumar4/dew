@@ -1,0 +1,10 @@
+{
+ "bytes": 6113,
+ "kind": "release",
+ "license": "lfm1.0",
+ "path": "releases/176cced35657aedfea7d7002221360582d1c05fcaca882c21508bc3a73b282e5/configuration_lfm3.py",
+ "reference": "LiquidAI/LFM3-1.7B@40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd/configuration_lfm3.py",
+ "repo": "dewml/fixtures",
+ "revision": "d7bd880a95674d977b59baba8f664a8bf9be80a0",
+ "sha256": "176cced35657aedfea7d7002221360582d1c05fcaca882c21508bc3a73b282e5"
+}

@@ -387,10 +387,10 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
     and refused where it holds more than its name and fields (ledger 1239),
     a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
-    fields and a decoder's or kind's YaRN field beside its rope scaling (`_earlier_model`, ledgers 1622
-    and 1898), and a row of segments' question budgets, which it ignored and an
-    earlier record wrote at their defaults (row 2006). A record in today's shapes passes
-    as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    fields, a decoder's or kind's YaRN field beside its rope scaling and a decoder's cross-attention
+    by its fields alone (`_earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
+    question budgets, which it ignored and an earlier record wrote at their defaults (row 2006). A
+    record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     for key in ("head", "layout"):
         held = record.get(key)
@@ -492,12 +492,16 @@ def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, 
 
 def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
     """A decoder's fields and its layer kinds' with an earlier YaRN field read as their rope scaling
-    (`_one_scaling`)."""
-    kinds = fields.get("kinds")
+    (`_one_scaling`), and an earlier cross-attention, IDEFICS's block recorded by its fields alone
+    when the field declared that class, as its class record (`dew.nn.cross_attention.CrossBlocks`,
+    ledger 2320)."""
+    kinds, cross = fields.get("kinds"), fields.get("cross_attention")
     return {**_one_scaling(fields), **({"kinds": {
         kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
                else _one_scaling(held)) if isinstance(held, Mapping) else held
-        for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {})}
+        for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {}),
+        **({"cross_attention": {"class": "dew.nn.cross_attention:CrossAttention", "fields": dict(cross)}}
+           if isinstance(cross, Mapping) and "class" not in cross else {})}
 
 
 def _one_scaling(fields: Mapping[str, object]) -> Mapping[str, object]:
