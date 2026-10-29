@@ -52,6 +52,11 @@ Scope is per rule, because the rules are not all about the same thing:
   construction, which keeps what its constructor computed in float32; its
   twin is built inside tools/torch_precision.py's `float64`
   (`lint_promotions`).
+- SLOP023 is about `src/<package>`: a JAX array is never divided by a literal
+  that is no power of two, which XLA computes as a product with the literal's
+  rounded reciprocal, not correctly rounded (rows 1402, 1403); `precision.
+  divided` divides as IEEE does. It reports only an operand it proves is an
+  array (`_array`), so a Python number or a name it cannot prove passes.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -88,6 +93,7 @@ import functools
 import hashlib
 import io
 import json
+import math
 import re
 import subprocess
 import sys
@@ -663,6 +669,94 @@ def jax_private(module: Module) -> Iterator[Finding]:
         if isinstance(node, ast.Attribute) and node.attr in JAX_PRIVATE:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP021",
                           f"reads JAX's private {node.attr}; {JAX_PRIVATE[node.attr]}")
+
+
+ARRAY_MODULES = ("jax.numpy", "jax.lax", "jax.nn", "jax.random", "jax.scipy")
+"""The modules whose functions return JAX arrays (but `ARRAY_FACTS`), which SLOP023 proves an operand by."""
+ARRAY_FACTS = {"dtype", "finfo", "iinfo", "issubdtype", "result_type", "promote_types", "can_cast", "shape",
+               "ndim", "size", "isdtype"}
+"""The functions of `ARRAY_MODULES` that return no array: a dtype, its facts, a shape or a count."""
+ARRAY_TYPES = {"jax.Array", "jax.numpy.ndarray"}
+"""The annotations that make a parameter an array."""
+
+
+def _modules_bound(tree: ast.Module) -> dict[str, str]:
+    """Each name a module binds by import to a module or a member, with what it names (`jnp` -> jax.numpy,
+    `Array` -> jax.Array)."""
+    bound = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound[alias.asname or alias.name.split(".")[0]] = alias.name if alias.asname else \
+                    alias.name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                bound[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return bound
+
+
+def _resolved(node: ast.expr, bound: dict[str, str]) -> str:
+    """The dotted name `node` spells, its first part read through the module's imports (`_modules_bound`)."""
+    named = _named(node)
+    head, _, rest = named.partition(".")
+    return f"{bound.get(head, head)}.{rest}" if rest else bound.get(head, head)
+
+
+def _array(node: ast.expr, bound: dict[str, str], arrays: set[str]) -> bool:
+    """Whether SLOP023 proves `node` a JAX array: a call of a function of `ARRAY_MODULES` but its facts, a
+    method or subscript of an array, arithmetic with one, or a name in `arrays` (a parameter annotated as
+    one)."""
+    if isinstance(node, ast.Call):
+        called = _resolved(node.func, bound)
+        module, _, function = called.rpartition(".")
+        if module in ARRAY_MODULES or any(module.startswith(f"{each}.") for each in ARRAY_MODULES):
+            return function not in ARRAY_FACTS
+        return (isinstance(node.func, ast.Attribute) and node.func.attr not in ("item", "tolist")
+                and _array(node.func.value, bound, arrays))
+    if isinstance(node, ast.Subscript):
+        return _array(node.value, bound, arrays)
+    if isinstance(node, ast.BinOp):
+        return _array(node.left, bound, arrays) or _array(node.right, bound, arrays)
+    if isinstance(node, ast.UnaryOp):
+        return _array(node.operand, bound, arrays)
+    return isinstance(node, ast.Name) and node.id in arrays
+
+
+def _rounded_divisor(node: ast.expr) -> float | None:
+    """The literal `node` is, where it is a number no power of two divides exactly by (its reciprocal is
+    no float), else None."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        value = _rounded_divisor(node.operand)
+        return None if value is None else -value
+    if (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+            and not isinstance(node.value, bool) and node.value and math.frexp(node.value)[0] != 0.5):
+        return node.value
+    return None
+
+
+def divisions(module: Module) -> Iterator[Finding]:
+    """SLOP023: a JAX array (`_array`) divided by a literal no power of two (`_rounded_divisor`)."""
+    bound = _modules_bound(module.tree)
+    for function in ast.walk(module.tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            continue
+        parameters = function.args.posonlyargs + function.args.args + function.args.kwonlyargs \
+            if not isinstance(function, ast.Module) else []
+        arrays = {parameter.arg for parameter in parameters if parameter.annotation is not None
+                  and _resolved(parameter.annotation, bound) in ARRAY_TYPES}
+        body = function.body if isinstance(function, ast.Module) else [function]
+        for node in (inner for statement in body for inner in ast.walk(statement)):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+                numerator, divisor = node.left, node.right
+            elif isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Div):
+                numerator, divisor = node.target, node.value
+            else:
+                continue
+            value = _rounded_divisor(divisor)
+            if value is not None and _array(numerator, bound, arrays):
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP023",
+                              f"divides a JAX array by {value!r}, which XLA computes as a product with its "
+                              "rounded reciprocal, not correctly rounded; divide with precision.divided")
 
 
 def size(module: Module) -> Iterator[Finding]:
@@ -2111,7 +2205,7 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
     rules = (*rules, mocks, wording, skips) if module.relative.startswith("tests/") else (*rules, patches)
-    rules = (*rules, tolerances) if module.is_source else (*rules, tolerances, promotions)
+    rules = (*rules, tolerances, divisions) if module.is_source else (*rules, tolerances, promotions)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
         findings += boundaries(module, models or ModelIndex.build([module]))

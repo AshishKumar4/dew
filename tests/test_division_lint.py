@@ -20,8 +20,8 @@ DIVISIONS = {
     "a jax.numpy call's result": ("import jax.numpy as jnp\ndef f(x):\n    return jnp.mean(x) / 3.0", 1),
     "jax.numpy imported from jax": ("from jax import numpy as jnp\ndef f(x):\n    return jnp.sum(x) / 10", 1),
     "a lax call, through jax": ("import jax\ndef f(x):\n    return jax.lax.rsqrt(x) / 255.0", 1),
-    "a method of one": ("import jax.numpy as jnp\ndef f(x):\n    return jnp.asarray(x).astype(jnp.float32) / 6",
-                        1),
+    "a method of one": ("import jax.numpy as jnp\ndef f(x):\n"
+                        "    return jnp.asarray(x).astype(jnp.float32) / 6", 1),
     "arithmetic with one": ("import jax.numpy as jnp\ndef f(x, y):\n    return (y - jnp.exp(x)) / 1000.0", 1),
     "a subscript of one": ("import jax.numpy as jnp\ndef f(x):\n    return jnp.cumsum(x)[1:] / 3", 1),
     "a parameter annotated as an array": ("import jax\ndef f(x: jax.Array):\n    return x / 7.0", 1),
@@ -32,10 +32,12 @@ DIVISIONS = {
                        0),
     "a Python number": ("def f(seconds: float):\n    return seconds / 60 + float(seconds) / 3 + 1 / 3", 0),
     "a name the rule cannot prove": ("def f(x):\n    return x / 3.0", 0),
-    "an array's dtype facts": ("import jax.numpy as jnp\ndef f(x):\n    return jnp.finfo(x.dtype).eps / 3", 0),
+    "an array's dtype facts": ("import jax.numpy as jnp\ndef f(x):\n"
+                               "    return jnp.finfo(x.dtype).eps / 3", 0),
     "a non-literal divisor": ("import jax.numpy as jnp\ndef f(x, n):\n    return jnp.sum(x) / n", 0),
-    "the correctly rounded division": ("import jax.numpy as jnp\nfrom dew.nn.precision import divided\n"
-                                       "def f(x):\n    return divided(jnp.mean(x), 3.0)", 0),
+    "the correctly rounded division": (
+        "import jax.numpy as jnp\nfrom dew.nn.precision import divided\n"
+        "def f(x):\n    return divided(jnp.mean(x), 3.0)", 0),
 }
 
 
