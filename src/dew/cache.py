@@ -299,7 +299,8 @@ def hub_commit(repo: str, revision: str | None, *, repo_type: str = "model") -> 
                 else (f"{repo_type} commit", repo, revision or "HEAD"))
 
     def ask() -> str:
-        listing = (HfApi().model_info if repo_type == "model" else HfApi().dataset_info)(repo, revision=revision)
+        listed = HfApi().model_info if repo_type == "model" else HfApi().dataset_info
+        listing = listed(repo, revision=revision)
         if listing.sha is None:
             raise ValueError(f"HF {repo!r} did not resolve {branch} to a commit")
         return listing.sha
