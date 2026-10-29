@@ -282,8 +282,11 @@ def _prologue(hooks: Hooks, given: dict, work):
         token, held = given['token'], given['held']
         key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
         window = jnp.concatenate([held.astype(token.dtype), token[:, None]], axis=1).astype(work)
-        taps = given['taps'].astype(work)
-        pre = short_conv.preactivation(list(jnp.swapaxes(window, 0, 1)), list(jnp.swapaxes(taps, 0, 1)), None)
+        taps, width = given['taps'].astype(work), window.shape[1]
+        # Each tap's inputs a slice of the window and its weights a column of the taps, the conv's one
+        # multiply and add a tap.
+        pre = short_conv.preactivation([window[:, tap:tap + 1] for tap in range(width)],
+                                       [taps[:, tap] for tap in range(width)], None)[:, 0]
         query, key, value = _split(_activated(pre, hooks.conv), key_heads, value_heads, key_width,
                                    value_width)
         # The history and the token, then all but the oldest: a one-tap conv holds none.

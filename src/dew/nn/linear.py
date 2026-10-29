@@ -200,7 +200,7 @@ def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, seg
         before = jnp.pad(segments, ((0, 0), (K - 1, 0)))[:, tap:tap + length]
         return jnp.where((before == segments)[..., None], window, 0)
 
-    windows = short_conv.preactivation([read(tap) for tap in range(K)], list(jnp.swapaxes(taps, 0, 1)),
+    windows = short_conv.preactivation([read(tap) for tap in range(K)], [taps[:, tap] for tap in range(K)],
                                        None if bias is None else bias.astype(wide))
     if activation:
         windows = nn.silu(windows)
