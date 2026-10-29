@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import Annotated, ClassVar, NamedTuple, cast
+from typing import Annotated, ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -98,13 +98,22 @@ class PromptRollout:
 
     def build(self, objective, decode):
         """The scheduler drawing over `objective`'s policy, decoding completions with `decode`."""
-        from dew.objectives.rl import Reward, RolloutScheduler
+        from numbers import Real
+
+        from dew.data.prompts import PromptRecord
+        from dew.objectives.rl import RolloutScheduler
         from dew.objectives.rl.methods import Rollout, method
         from dew.registry import imported
 
         # An import path names a function or a class, which an instance of at its defaults is a reward.
         named = imported(self.reward)
-        reward = cast("Reward", named() if isinstance(named, type) else named)
+        scorer = named() if isinstance(named, type) else named
+
+        def reward(text: str, record: PromptRecord) -> float:
+            score = scorer(text, record)
+            if not isinstance(score, Real):
+                raise ValueError(f"the reward {self.reward} scored {type(score).__name__}, not a number")
+            return float(score)
         settings = (Rollout(estimator=self.estimator or "group") if self.method is None
                     else method(self.method).rollout(self.max_new_tokens))
         return RolloutScheduler.sampled(objective, reward,
