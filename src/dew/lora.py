@@ -255,9 +255,9 @@ class LoRA:
         return adapter
 
     def resolved(self) -> LoRA:
-        """This spec with a Hub `source` named at the commit the Hub resolves it to, as a run records
-        it, the answer recorded so the same run resolves it offline (`hub_answer`); a local source, a
-        source named at a commit, or none, as it is."""
+        """This spec with a Hub `source` at the commit its revision resolves to now
+        (`SourceReference.pinned`; offline the commit the cache holds), as a run records it; a local
+        source, or none, as it is."""
         return self if self.source is None else dataclasses.replace(self, source=_pinned(self.source))
 
     def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
@@ -353,8 +353,10 @@ def _adapter_files(source: str, weight_name: str | None) -> FilePath:
         return folder / _adapter_selection(held, None)[0]
     from dew.interop.sources import SourceReference, repo_files
 
-    reference = SourceReference.parse(source)
-    root = reference.metadata()
+    # The commit's own files alone are read: a cache holding the adapter's and none of the repo's other
+    # files serves it offline.
+    reference = SourceReference.parse(source).pinned()
+    root = reference.cached()
     loaded, read = _adapter_selection(repo_files(reference.name, root), weight_name)
     for name in read:
         reference.file(root, name)
