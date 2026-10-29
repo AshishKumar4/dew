@@ -370,6 +370,9 @@ class DiffusionRunConfig(RunConfig):
         (`pinned`), on its data, whose captions the objective's conditions
         tokenize. `val_metrics` score each validation, and Flow-GRPO samples
         the batches it trains on (`rollout`)."""
+        if (pinned := self.pinned_adapter()) is not self:
+            # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
+            return pinned.prepare()
         from dew.objectives.rl.flow import FlowGRPOObjective
 
         run = self.pinned()

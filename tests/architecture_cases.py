@@ -95,7 +95,8 @@ CASES = [
         **LM, "mlp": "swigluoai", "attention_sinks": True, "qk_norm": False,
         "layer_types": ("sliding_attention", "full_attention"),
         "kinds": {"sliding_attention": {"window": 4}},
-        "yarn": {"factor": 4.0, "original_max_position_embeddings": 8, "truncate": False},
+        "rope_scaling": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 8,
+                         "truncate": False},
         "mixture": {"experts": 8, "top_k": 2},
     }, seq_len=SEQ_LEN, label="gpt_oss"),
     # DeepSeek V3.2's stack at toy width: the mla mixer with its sparse

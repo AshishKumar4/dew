@@ -818,7 +818,7 @@ def refuse_block_reading(model: nn.Module, reading: str) -> None:
     chunks = block_chunks_of(model)
     if not chunks:
         raise ValueError(f"{reading} needs a trunk layer that reads blocks "
-                         f"(AttentionMixer.bidirectional_blocks), and {type(model).__name__} has none")
+                         f"(MixerBase.reads_blocks), and {type(model).__name__} has none")
     if not whole_block(chunks):
         raise ValueError(f"{reading} is read whole only by a layer with no attention chunk, and every layer "
                          f"of {type(model).__name__} that reads blocks has one ({list(chunks)}), which cuts "
