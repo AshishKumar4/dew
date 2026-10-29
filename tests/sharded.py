@@ -21,7 +21,6 @@ to remove. A CPU interprets Pallas kernels, so there only the first two
 hold; the third needs the GPU.
 """
 
-import functools
 import math
 
 import jax
@@ -130,7 +129,7 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     runs at is compared with the shapes its shards run. A caller passing `arm` also asserts the split
     against the reference path (check 1 against float64), so the comparison with `arm` alone is not the
     whole contract: `also`, `(label, arm)`, is that second arm, compared with the same split runs (each
-    draw's split run once)."""
+    draw's split run once, `assert_as_exact`'s further references)."""
     run = without_ynn(fn, donate_argnums=donate)
 
     def put(args):
@@ -148,29 +147,16 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
         # A donated argument is consumed; the draw's own array goes on to the other arm and the truth.
         return [jnp.copy(arg) if index in donate else arg for index, arg in enumerate(args)]
 
-    # With `also`, each draw's split run once though two comparisons read it: the draws and the split's
-    # outputs held for the second (row 2208: a caller without `also` holds none).
-    drawn = functools.lru_cache(maxsize=None)(draw) if also is not None else draw
-    outputs: dict = {}
-
     def split(*args):
-        if also is None:
-            with jax.set_mesh(mesh):
-                return compiled(*put(kept(args)))
-        if id(args[0]) not in outputs:
-            with jax.set_mesh(mesh):
-                outputs[id(args[0])] = compiled(*put(kept(args)))
-        return outputs[id(args[0])]
+        with jax.set_mesh(mesh):
+            return compiled(*put(kept(args)))
 
     def one_device(*args):
         return run(*kept(args))
 
-    assert_as_exact(as_given(split), as_given(one_device) if arm is None else arm, drawn, label, seeds=seeds,
-                    truth_fn=truth_fn)
-    if also is not None:
-        also_label, also_arm = also
-        assert_as_exact(as_given(split), also_arm, drawn, f"{label}, {also_label}", seeds=seeds,
-                        truth_fn=truth_fn)
+    # Each draw's split run once, against `also`'s arm too (`assert_as_exact`'s further references).
+    assert_as_exact(as_given(split), as_given(one_device) if arm is None else arm, draw, label, seeds=seeds,
+                    truth_fn=truth_fn, also=None if also is None else dict([also]))
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})

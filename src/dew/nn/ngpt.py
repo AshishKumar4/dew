@@ -15,7 +15,7 @@ import jax.numpy as jnp
 
 from dew.nn.precision import at_least_fp32, l2norm
 
-"""The floor under a unit norm's squared length (dory.py's EPS)."""
+__all__ = ["NGPT"]
 
 
 @dataclasses.dataclass(frozen=True)

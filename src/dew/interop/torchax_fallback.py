@@ -48,7 +48,17 @@ from flax.core.scope import Variable
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
-from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, Variables, real_slots, token_coordinates
+from dew.batch import (
+    COORDINATES_FIELD,
+    POSITIONS_FIELD,
+    SEGMENTS_FIELD,
+    TOKEN_LAYOUT_FIELDS,
+    VALIDITY_FIELD,
+    Coordinates,
+    Variables,
+    real_slots,
+    token_coordinates,
+)
 from dew.distributed.placement import Layout
 from dew.interop import sources, verify
 from dew.interop.decoder_parts import context_lengths
@@ -278,7 +288,7 @@ class _Attending:
     token's index where None) only where the call states its keys' positions (`key_places`), as Dew's
     own attention reads a stated visibility (`AttentionMetadata.key_positions`)."""
 
-    implementation: str
+    implementation: AttentionImpl
     documents: jax.Array | None
     valid: jax.Array | None
     max_segments: int
@@ -1275,7 +1285,7 @@ class TorchCausalLM(nn.Module):
         if self.graph.attention_impl is None:
             _refuse_packing(packing)
             return None
-        unknown = sorted(set(packing) - {COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids", "positions"})
+        unknown = sorted(set(packing) - {COORDINATES_FIELD, *TOKEN_LAYOUT_FIELDS})
         if unknown:
             raise Lacks("packing", f"a tier-3 model reads its rows' documents, positions and validity, "
                                    f"not {unknown}")
@@ -1284,8 +1294,8 @@ class TorchCausalLM(nn.Module):
         laid = packing.get(COORDINATES_FIELD)
         batch, length = jnp.shape(tokens)[:2]
         return token_coordinates((batch, length), laid if isinstance(laid, Coordinates) else None,
-                                 segments=packing.get("segment_ids"), valid=packing.get(VALIDITY_FIELD),
-                                 positions=packing.get("positions"))
+                                 segments=packing.get(SEGMENTS_FIELD), valid=packing.get(VALIDITY_FIELD),
+                                 positions=packing.get(POSITIONS_FIELD))
 
     def _run(self, tokens, train: bool, laid: Coordinates | None = None, *, visible=None, key_places=None,
              head_input=None) -> tuple[jax.Array, jax.Array]:
