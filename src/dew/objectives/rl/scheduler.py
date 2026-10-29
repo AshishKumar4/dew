@@ -555,7 +555,17 @@ class RolloutScheduler:
                 log: Callable[[SchedulerRecord], None] | None = None) -> RolloutScheduler:
         """Draw `groups` completions of each prompt row from `objective`'s policy at every call and
         train on them (`PolicyCollector` over `prompt_tasks`; GRPO's synchronous loop). A completion
-        that runs out of `max_new_tokens` trains on its reward, as `truncation='score'` says."""
+        that runs out of `max_new_tokens` trains on its reward, as `truncation='score'` says.
+
+        The calls' raw likelihoods are the proximal policy's (`Synchronous.rescore`), the policy at
+        temperature 1 over the whole vocabulary: a GRPO objective whose ratio reads its policy at another
+        `sampling_temperature` is refused, since its unchanged weights would not give a ratio of 1."""
+        if isinstance(objective, GRPOObjective) and objective.sampling_temperature != 1.0:
+            raise ValueError(
+                "a synchronous collection's proximal likelihoods are the policy's raw ones, at temperature "
+                f"1, and this objective reads its ratio at sampling_temperature="
+                f"{objective.sampling_temperature}; set it to 1.0, or collect asynchronously, where the "
+                "proximal policy is rescored")
         collector = PolicyCollector(objective, reward, decode, max_new_tokens,
                                     Sampling() if sampling is None else sampling)
         return cls(Synchronous(collector), tasks=prompt_tasks, groups=groups, estimator=estimator,

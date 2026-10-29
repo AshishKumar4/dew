@@ -230,3 +230,18 @@ def test_a_small_log_ratios_k3_estimate_keeps_its_leading_term():
     assert_as_exact_as_the_reference(estimate, np.expm1(log_ratio) - log_ratio, np.expm1(wide) - wide,
                                      "k3 at small log ratios")
     np.testing.assert_array_equal(np.asarray(sampled_kl(jnp.asarray(log_ratio))), estimate)
+
+
+def test_a_synchronous_collection_refuses_a_ratio_read_at_another_temperature():
+    """A synchronous collection's proximal likelihoods are the sampler's raw ones, the policy at
+    temperature 1 (`Synchronous.rescore`): a GRPO objective reading its ratio at another
+    `sampling_temperature` is refused, where its unchanged weights would not give a ratio of 1; one at
+    1.0 is taken, whatever temperature and truncation the sampler draws at."""
+    def collected(objective):
+        return RolloutScheduler.sampled(objective, lambda *args: 1.0, groups=2, max_new_tokens=RESPONSE_WIDTH,
+                                        sampling=Sampling(temperature=1.3, top_k=5))
+
+    with pytest.raises(ValueError):
+        collected(GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1,
+                                sampling_temperature=0.7))
+    collected(GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1))
