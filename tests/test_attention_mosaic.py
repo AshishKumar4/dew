@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import attention_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import Mesh
 from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
@@ -319,7 +320,20 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form} {kept}",
-                    seeds=SEEDS, terms=kept == template.OUTPUT)
+                    seeds=SEEDS, terms=_gradient_terms(spans) if kept == template.OUTPUT else False)
+
+
+def _gradient_terms(spans: template.KeySpans):
+    """The float64 terms of the query's, key's and value's gradients over `spans` (`attention_terms`): a
+    logit's gradient `P (dP - D)` sized by `P (|dP| + sum |out dout|)`, the rounding a D formed from the
+    rounded output carries (`template.OUTPUT`'s, FlashAttention's), so a row that cancels to zero in float64
+    is held to it, not to its own zero."""
+    keep = template.dense(spans)[:, None]
+
+    def terms(query, key, value, dout):
+        return tuple(attention_terms(query, key, value, dout, keep)[1:])
+
+    return terms
 
 
 @INTERPRETS
@@ -354,7 +368,7 @@ def test_the_plain_jax_backward_takes_the_kept_outputs_residuals():
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(shape, jnp.bfloat16, 128),
-                    "plain-JAX backward from the kept output", seeds=SEEDS, terms=True)
+                    "plain-JAX backward from the kept output", seeds=SEEDS, terms=_gradient_terms(spans))
 
 
 @INTERPRETS
