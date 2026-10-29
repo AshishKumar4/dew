@@ -897,7 +897,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        splash_mask=False, shards=sequence_shards(), dropout=dropout)
+        splash_mask=False, shards=sequence_shards(), dropout=dropout,
+        form=generation.chosen_kernel("attention_form", "fast"))
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).

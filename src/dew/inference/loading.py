@@ -112,13 +112,17 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
               step: int | str | None, trust: Sequence[str]) -> SavedTask:
     """The task the run's recorded objective declares (`Objective.saved_task`), built from the checkpoint
     pinned here (`SavedTask.from_saved`), which nothing pins again."""
-    from dew.inference.tasks import SavedRun
+    from dew.inference.tasks import SavedRun, SavedRunTask
 
     run = SavedRun.pinned(str(root), step, trust)
     task = run.objective.saved_task
     if task is None:
         raise TypeError(f"a run of {run.objective.__name__} loads as no task: its class declares no "
                         "`saved_task`")
+    # A Dew task may load another step than the latest where none is asked (`SavedRunTask.default_step`).
+    chosen = task.default_step(str(root)) if step is None and issubclass(task, SavedRunTask) else None
+    if chosen is not None:
+        run = SavedRun.pinned(str(root), chosen, trust)
     return task.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
 
 

@@ -603,9 +603,6 @@ class TrainerConfig:
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
             object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
-        if isinstance(self.stop, Mapping) and "class" not in self.stop:
-            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
-            object.__setattr__(self, 'stop', from_record(Pause, self.stop, dtypes=False))
         if isinstance(self.keep, Keep) and self.keep.where is not None:
             raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
         if self.best is not None:
@@ -1081,6 +1078,14 @@ class RunConfig:
         recorded as unrecorded, or a recipe's record written before runs
         recorded chains, is refused by name."""
         rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        trainer = rest.get("trainer")
+        fields = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else {}
+        stop = fields.get("stop")
+        if isinstance(trainer, Mapping) and isinstance(stop, Mapping) and "class" not in stop:
+            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
+            # Carried until 1.0 (ledger 1552).
+            fields = {**fields, "stop": {"class": f"{Pause.__module__}:Pause", "fields": stop}}
+            rest = {**rest, "trainer": {**trainer, "fields": fields} if "class" in trainer else fields}
         chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 

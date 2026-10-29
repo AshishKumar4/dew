@@ -356,13 +356,22 @@ class SavedRunTask:
                        param_dtype: DTypeLike | None = None) -> Self: ...
 
     @classmethod
+    def default_step(cls, directory: str) -> int | None:
+        """The step this task loads of the run in `directory` where none is asked: its latest (None),
+        unless the task names one it was fitted on (`Decide`'s calibration, of a run that ended on its
+        best step)."""
+        del directory
+        return None
+
+    @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> Self:
-        """Load the run in `directory` as this task (`from_saved`), at its latest checkpoint or at
-        `step`. `trust` names the packages outside Dew the run's record may import, as
-        `trust_remote_code` does in transformers."""
+        """Load the run in `directory` as this task (`from_saved`), at the step it loads by default
+        (`default_step`) or at `step`. `trust` names the packages outside Dew the run's record may
+        import, as `trust_remote_code` does in transformers."""
+        step = cls.default_step(directory) if step is None else step
         return cls.from_saved(SavedRun.pinned(directory, step, trust), ema=ema, mesh=mesh, layout=layout,
                               dtype=dtype, param_dtype=param_dtype)
 

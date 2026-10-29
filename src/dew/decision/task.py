@@ -187,6 +187,18 @@ class DecideSettings:
 
 
 @dataclass(frozen=True)
+def _calibrated(directory: str) -> tuple[Mapping[str, object], Weights] | None:
+    """The calibration `Decide.save` wrote into the run in `directory` (`TASK_FILE`) and the weights it
+    was fitted on; None where it wrote none."""
+    from dew.registry import from_record
+
+    saved = epath.Path(directory) / TASK_FILE
+    if not saved.exists():
+        return None
+    settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
+    return settings, from_record(Weights, _records.json_value(settings["weights"], "weights"))
+
+
 class Decide(SavedRunTask):
     """Answers typed questions about a state, with one forward pass per batch.
 
@@ -267,6 +279,13 @@ class Decide(SavedRunTask):
                    name=str(epath.Path(directory).name), weights=weights, processor=processor)
 
     @classmethod
+    def default_step(cls, directory: str) -> int | None:
+        """The step the run's calibration (`TASK_FILE`) was fitted on, where `save` wrote one: a run that
+        ended on its best step (`restore_best`) calibrates that step and loads it; else its latest."""
+        saved = _calibrated(directory)
+        return None if saved is None else saved[1].step
+
+    @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
                    layout: "Placement | None" = None, dtype: DTypeLike | None = None,
                    param_dtype: DTypeLike | None = None) -> Self:
@@ -291,11 +310,10 @@ class Decide(SavedRunTask):
             averaged = ema
         task = cls._recorded(directory, record, saved_model(record, dtype).build(), variables,
                              Weights(step, averaged), dtype)
-        saved = epath.Path(directory) / TASK_FILE
-        if not saved.exists():
+        saved = _calibrated(directory)
+        if saved is None:
             return task
-        settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
-        fitted = from_record(Weights, _records.json_value(settings["weights"], "weights"))
+        settings, fitted = saved
         # An average's own directory names the runs it averages beside the step it holds (`save`).
         if (fitted.step, fitted.ema) != (step, averaged):
             raise ValueError(
