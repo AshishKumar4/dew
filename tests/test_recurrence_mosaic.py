@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, float64_forward
 from test_recurrence_chunk import (
     FORMED,
     HOOKS,
@@ -372,34 +372,23 @@ def test_each_launch_lowers_once_however_many_layers_call_it():
     assert one > 0 and kernels(2) == one
 
 
-NAMED_SEEDS = 8
-"""A layer named onto the template's declared draws against the portable rule (check 1), sized by
-`seeds_for` paired with the template's launches, interpreted."""
-
-
 def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
     """A layer naming the template (`generation.chosen(gated_delta_rule='mosaic_gpu')`): its output on par
-    (check 1) from float64 with the portable rule's, the layer's own float64 forward the truth, over drawn
-    inputs and weights. The layer computes in bf16, the call the template's launches hold on every family
-    (an fp32 call's solve holds more registers than a thread has)."""
+    from float64 with the portable rule's (the layer's own float64 forward the truth). The layer computes
+    in bf16, the call the template's launches hold on every family (an fp32 call's solve holds more
+    registers than a thread has)."""
     from dew.nn.linear import GatedDeltaNet
 
+    x = jax.random.normal(jax.random.key(23), (1, 72, 64)).astype(jnp.bfloat16)
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
                           dtype=jnp.bfloat16)
-
-    def draw(seed):
-        x = jax.random.normal(jax.random.key(23 + 2 * seed), (1, 72, 64)).astype(jnp.bfloat16)
-        with generation.chosen(gated_delta_rule='xla'):
-            return layer.init(jax.random.key(29 + 2 * seed), x), x
-
-    def named(rule):
-        def apply(params, x):
-            with generation.chosen(gated_delta_rule=rule):
-                return layer.apply(params, x)
-        return apply
-
-    assert_as_exact(named('mosaic_gpu'), named('xla'), draw, 'a layer named onto the template',
-                    seeds=NAMED_SEEDS, truth_fn=layer.clone(dtype=jnp.float64).apply)
+    with generation.chosen(gated_delta_rule='xla'):
+        params = layer.init(jax.random.key(29), x)
+        want = layer.apply(params, x)
+    with generation.chosen(gated_delta_rule='mosaic_gpu'):
+        got = layer.apply(params, x)
+    truth, terms = float64_forward(layer, params, x)
+    assert_as_exact_as_the_reference(got, want, truth, 'a layer named onto the template', terms=terms)
 
 
 def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
