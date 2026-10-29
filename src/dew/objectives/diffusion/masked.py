@@ -103,9 +103,10 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         `CausalTransformer(causal=False)`'s do. `solver`, `steps` and `block`
         set how generation unmasks in the task `pipeline` returns, and `solver`
         and `steps` how the preview does, which walks whole rows; None for
-        `solver` or `steps` and an omitted `block` take a loaded source's own
-        walk where its family declares one (`masked_recipe`, LLaDA2.0's
-        blocks), else `Unmask` over MDLM's steps and the whole response.
+        `solver` or `steps` takes a loaded source's own walk where its family
+        declares one (`masked_recipe`, LLaDA2.0's blocks), else `Unmask` over
+        MDLM's steps, and an omitted `block` the source's walk's where the
+        solver is omitted too, else the whole response.
         `samples` is how many rows the preview draws. `decode` turns a row of ids into the text the artifact
         shows;
         with None, the artifact shows the ids alone.
@@ -118,9 +119,10 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         # The source's own walk, where its family declares one, for what the caller omits.
         recipe = model.masked_recipe if isinstance(model, Walking) else None
         own_solver, own_steps, own_block = (_DEFAULT_SOLVER, MDLM_STEPS, None) if recipe is None else recipe
+        # A walk the caller names (its solver) keeps the block it names, none where it names none.
+        block = (own_block if solver is None else None) if block is OMITTED else block
         solver = own_solver if solver is None else solver
         steps = own_steps if steps is None else steps
-        block = own_block if block is OMITTED else block
         model = self.bind_model(model, variables=variables, processor=processor)
         if not isinstance(model, TokenModel) or model.causal:
             raise Lacks("bidirectional",

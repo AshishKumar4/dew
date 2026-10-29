@@ -50,6 +50,12 @@ class Wgmma(mosaic.RingFamily):
         # 128 and 256 columns needs 104 and 200 against a row vector's 96 and 160.
         return -(-columns * jnp.dtype(dtype).itemsize // 16)
 
+    def row_registers(self, rows: int, dtype) -> int:
+        # Each warp's 16 rows of an MMA, a thread two of them, so a thread holds a 32nd of a consumer's rows:
+        # the fast attention backward's dQ consumer carries seven fp32 row vectors, 4 registers each at 128
+        # rows (DQROWPROOF64: 260 against ptxas's 255 and 512 bytes spilled; DQROWPROOF128: 184 at 64 rows).
+        return -(-rows * jnp.dtype(dtype).itemsize // 128)
+
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
