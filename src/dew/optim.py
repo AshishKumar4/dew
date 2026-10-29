@@ -207,6 +207,12 @@ def _dict_names(path: jax.tree_util.KeyPath) -> tuple[str, ...]:
                  if isinstance(entry, jax.tree_util.DictKey))
 
 
+def parameter_name(path: jax.tree_util.KeyPath) -> str:
+    """A parameter's path under `params` as a pattern matches it: its dict keys joined by '/'
+    (`layers_0/attn/q_proj/kernel`), as a `ParamGroup`'s and an inspection's patterns read it."""
+    return "/".join(_dict_names(path))
+
+
 def _sown(node, name: str):
     """Read the array a sowed collection holds under `name`, past its one-tuple."""
     value = node.get(name) if isinstance(node, Mapping) else None
@@ -1375,7 +1381,7 @@ def param_labels(groups: Sequence[ParamGroup]):
     # 45b6b57b.
     def labels(params):
         def label(path: jax.tree_util.KeyPath, _) -> str:
-            name = "/".join(_dict_names(path))
+            name = parameter_name(path)
             for group in groups:
                 if any(fnmatch.fnmatchcase(name, pattern) for pattern in group.patterns):
                     return group.name
