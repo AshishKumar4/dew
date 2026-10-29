@@ -39,7 +39,7 @@ import json
 import math
 import numbers
 import re
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path as FilePath
@@ -155,8 +155,11 @@ class LoRA:
     `source` starts the adapter from an imported one's factors instead of a fresh
     draw (`--lora.source`): a PEFT adapter directory or a Diffusers file, local or
     a Hub repo as `repo` or `repo@revision`, which a run records as `repo@commit`
-    (`resolved`). The spec states what the file holds, and an adapter whose ranks,
-    alpha, targets, rslora or dropout differ from it is refused.
+    (`resolved`). `weight_name` names its file, or a folder of PEFT's files, as
+    Diffusers' does (`--lora.weight-name`); without it a source's PEFT files, its
+    Diffusers file or its one root `.safetensors` file is read. The spec states what
+    the file holds, and an adapter whose ranks, alpha, targets, rslora or dropout
+    differ from it is refused.
     """
 
     rank: int
@@ -165,6 +168,7 @@ class LoRA:
     rslora: bool = False
     dropout: float = 0.0
     source: str | None = None
+    weight_name: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.modules, str):
@@ -173,6 +177,9 @@ class LoRA:
         _rank("LoRA", self.rank)
         if self.alpha is not None:
             finite(self.alpha, "LoRA: alpha")
+        if self.weight_name is not None and self.source is None:
+            raise ValueError("LoRA: weight_name names a file of the imported adapter `source`, which is "
+                             "unset")
         _dropout("LoRA", self.dropout)
         if not self.modules or any(not isinstance(module, str) or not module for module in self.modules):
             raise ValueError("modules names at least one projection")
@@ -230,7 +237,8 @@ class LoRA:
         one, refused unless it binds the projections `modules` selects at this spec's rank, alpha,
         rslora and dropout."""
         # The commit the run records (`resolved`), so what it loads is what it names.
-        adapter = LoRA.load(model, variables, _adapter_files(_pinned(source)), layouts=layouts, base=base)
+        adapter = LoRA.load(model, variables, _adapter_files(_pinned(source), self.weight_name),
+                            layouts=layouts, base=base)
         wanted = set(_named(bound_layouts(model, thaw(variables), layouts or {}), self.modules))
         stated = {"targets": sorted(wanted), "rank": self.rank, "alpha": scaling, "rslora": self.rslora,
                   "dropout": self.dropout}
@@ -302,31 +310,55 @@ class LoRA:
 
 
 def _pinned(source: str) -> str:
-    """`source` as a run records it: a Hub repo at the commit its revision resolves to, the answer
-    recorded so an offline run resolves it alike (`hub_answer`); a local path, or a repo named at a
-    commit, as it is."""
-    repo, _, revision = source.partition("@")
-    if FilePath(source).exists() or re.fullmatch(r"[0-9a-f]{40}", revision):
-        return source
-    from huggingface_hub import HfApi
+    """`source` as a run records it, at the commit its revision resolves to (`SourceReference.pinned`);
+    a local path as it is."""
+    from dew.interop.sources import SourceReference
 
-    from dew.cache import hub_answer
-
-    commit = hub_answer(("adapter commit", repo, revision),
-                        lambda: HfApi().model_info(repo, revision=revision or None).sha).value
-    return f"{repo}@{commit}"
+    return source if FilePath(source).exists() else SourceReference.parse(source).pinned().spelled()
 
 
-def _adapter_files(source: str) -> FilePath:
-    """`source`'s adapter files: a local PEFT directory or Diffusers file as it is, else a Hub repo
-    (`repo` or `repo@revision`) with its adapter files fetched."""
-    if FilePath(source).exists():
-        return FilePath(source)
-    from huggingface_hub import snapshot_download
+def _adapter_selection(listed: Collection[str], weight_name: str | None) -> tuple[str, tuple[str, ...]]:
+    """What `LoRA.load` reads of an adapter whose files are `listed` (relative names): the path it
+    loads and the files it reads there. Inside `weight_name` where given (a Diffusers file, or a folder
+    of PEFT's files), else at the root: PEFT's pair, Diffusers' file, or the one `.safetensors` file.
+    Several such files with none named are refused."""
+    folder = "" if weight_name is None or weight_name in listed else weight_name.strip("/")
+    if weight_name is not None and not folder:
+        return weight_name, (weight_name,)
+    prefix = f"{folder}/" if folder else ""
+    here = {name.removeprefix(prefix) for name in listed if name.startswith(prefix)}
+    if PEFT_WEIGHTS in here and PEFT_CONFIG in here:
+        return folder, (prefix + PEFT_CONFIG, prefix + PEFT_WEIGHTS)
+    single = [DIFFUSERS_WEIGHTS] if DIFFUSERS_WEIGHTS in here else sorted(
+        name for name in here if "/" not in name and name.endswith(".safetensors"))
+    if len(single) != 1:
+        where = folder or "its root"
+        raise FileNotFoundError(f"the adapter holds no file Dew takes for it ({PEFT_WEIGHTS} with its "
+                                f"config, {DIFFUSERS_WEIGHTS} or one .safetensors file) at {where}: "
+                                f"{single}; name the file with --lora.weight-name")
+    return prefix + single[0], (prefix + single[0],)
 
-    repo, _, revision = source.partition("@")
-    return FilePath(snapshot_download(repo, revision=revision or None,
-                                      allow_patterns=[PEFT_CONFIG, PEFT_WEIGHTS, DIFFUSERS_WEIGHTS]))
+
+def _adapter_files(source: str, weight_name: str | None) -> FilePath:
+    """The path `LoRA.load` reads of `source`, a local directory or file or a Hub repo at its pinned
+    commit, chosen alike from either's files (`_adapter_selection`); a Hub repo's selected files alone
+    are fetched."""
+    local = FilePath(source)
+    if local.exists():
+        # The folder itself is listed, through a link to it too.
+        folder = local if weight_name is None else local / weight_name
+        if folder.is_file():
+            return folder
+        held = [path.name for path in folder.iterdir() if path.is_file()]
+        return folder / _adapter_selection(held, None)[0]
+    from dew.interop.sources import SourceReference, repo_files
+
+    reference = SourceReference.parse(source)
+    root = reference.metadata()
+    loaded, read = _adapter_selection(repo_files(reference.name, root), weight_name)
+    for name in read:
+        reference.file(root, name)
+    return root / loaded
 
 
 @dataclass(frozen=True)

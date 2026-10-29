@@ -176,19 +176,13 @@ class DecisionRunConfig(DecoderRunConfig):
     """How a context becomes the states its cross-attention reads
     (`DecisionModel.context_encoder`): the backbone's token table, or the
     backbone's own pass over it. With `context_layers` alone."""
-    def prepare(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
         run after it trains. The checkpoint decides the backbone; the model
         flags choose only its compute dtype and attention kernel;
         `param_dtype` chooses the loaded checkpoint's storage dtype. `remat`
         chooses its layer recomputation before looping or attaching LoRA."""
-        pinned = self.pinned_adapter()
-        # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
-        return pinned.prepare() if pinned is not self else self._prepared()
-
-    def _prepared(self) -> Prepared:
-        """`prepare`'s run, its imported adapter pinned."""
         from dew.interop import Pretrained
 
         self.sourced_model()

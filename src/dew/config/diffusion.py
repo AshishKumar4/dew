@@ -10,7 +10,6 @@ returns for the same file.
 from __future__ import annotations
 
 import dataclasses
-import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar, TypedDict
 
@@ -365,17 +364,14 @@ class DiffusionRunConfig(RunConfig):
             given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
         return given
 
-    def prepare(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The objective `build` makes, with the run's Hub sources pinned
         (`pinned`), on its data, whose captions the objective's conditions
         tokenize. `val_metrics` score each validation, and Flow-GRPO samples
         the batches it trains on (`rollout`)."""
-        if (pinned := self.pinned_adapter()) is not self:
-            # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
-            return pinned.prepare()
         from dew.objectives.rl.flow import FlowGRPOObjective
 
-        run = self.pinned()
+        run = self
         objective = run.build()
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
@@ -387,18 +383,14 @@ class DiffusionRunConfig(RunConfig):
                                                     rollout=rollout, validation=held))
 
     def pinned(self) -> DiffusionRunConfig:
-        """Return this run with its Hub sources pinned to the commits they resolve to now.
-
-        The sources are `pretrained` and the alignment's encoder, so the record names
+        """Return this run with its Hub sources pinned to the commits they resolve to now: an imported
+        adapter's (`RunConfig.pinned`), `pretrained` and the alignment's encoder, so the record names
         the weights the run started from.
         """
         from dew.interop import sources
 
         def pin(source: str) -> str:
-            if os.path.isdir(source):
-                return source
-            reference = sources.SourceReference.parse(source)
-            return f"{reference.name}@{reference.metadata().name}"
+            return sources.SourceReference.parse(source).pinned().spelled()
 
         objective = self.objective
         stated = objective.fields.get("alignment")
@@ -407,8 +399,8 @@ class DiffusionRunConfig(RunConfig):
             if alignment.source is not None:
                 objective = dataclasses.replace(objective, fields={**objective.fields, "alignment": to_record(
                     dataclasses.replace(alignment, source=pin(alignment.source)), Alignment)})
-        return dataclasses.replace(self, pretrained=None if self.pretrained is None else pin(self.pretrained),
-                                   objective=objective)
+        return dataclasses.replace(super().pinned(), objective=objective,
+                                   pretrained=None if self.pretrained is None else pin(self.pretrained))
 
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its
