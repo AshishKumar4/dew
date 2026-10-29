@@ -1837,7 +1837,8 @@ def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
-def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(ci, tmp_path, monkeypatch, cache_worker):
+def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
+        ci, tmp_path, monkeypatch, cache_worker):
     """The files a plan keeps for reuse, their rows green on any class the tasks are pinned to, are reused by
     the task that holds them on whichever pinned class it lands on, as the plan counted them: a task that
     looked up its own class alone ran every kept file itself, in one task, past its deadline (2026-10-29: a
