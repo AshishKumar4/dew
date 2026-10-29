@@ -358,8 +358,32 @@ def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     target = MeshSpec(tensor=2).build(compile_only_gpus("sm90", 2))
     saved = compile_ahead(latent(target), batch)
-    assert saved.links == {"tensor": None}
+    assert saved.links["tensor"].bytes_per_second is None
     assert compile_ahead(latent(target, links=FAST), batch).program != saved.program
+
+
+def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run_traces_with(caplog):
+    """A step compiled ahead over a link its trainer states, as `--trainer.compile-ahead.links` states
+    one, records that link whole, bandwidth and peak, and is the program a stated link spreads by; a run
+    handed it that states another traces with the step's, and says so once (train 300's review: the
+    step recorded the bandwidth alone, so a run stating the same link traced with its own peak)."""
+    from dew.config.lm import LMRunConfig
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    target = MeshSpec(tensor=2).build(compile_only_gpus("sm90", 2))
+    stated = compile_ahead(latent(target, links=FAST), batch)
+    assert stated.links == FAST
+    assert stated.program != compile_ahead(latent(target), batch).program
+    other = {"tensor": Link(1.0, 1.0)}
+    with caplog.at_level("WARNING", logger="dew.training.ahead"):
+        assert stated.over(other) == FAST and stated.over(FAST) == FAST
+    assert len(caplog.records) == 1
+    parsed = LMRunConfig.cli(["trainer.compile-ahead:ahead", "--trainer.compile-ahead.generation", "sm90",
+                              "--trainer.compile-ahead.devices", "2", "--trainer.compile-ahead.path", "step",
+                              "--trainer.compile-ahead.links",
+                              '{"tensor": {"bytes_per_second": 1e18, "flops_per_second": 1e9}}'])
+    assert parsed.trainer.compile_ahead is not None and parsed.trainer.compile_ahead.links == FAST
 
 
 @pytest.mark.gpu(reason="loads a step compiled ahead over a tensor axis onto two GPUs")
