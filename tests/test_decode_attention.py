@@ -804,9 +804,18 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
                                          f"paged decode kernel, natural {natural}, {config}")
 
 
-@pytest.mark.parametrize("kernel", ["dense", "natural", "paged"])
+COMPILED = [(kernel, variant, splits) for kernel, variants in
+            (("dense", ("bfloat16", "float32")), ("natural", ("raw", "sinks")), ("paged", (16, 32)))
+            for variant in variants for splits in (1, 2, 4, 8, 16, 32)]
+"""The decode compile gate's cases: each kernel's variants at every slice count (`decode_attention.SPLITS`),
+a program shape each, so every case compiles one kernel (row 2123: a kernel's twelve together took 228 to
+263 s of a CPU task)."""
+
+
+@pytest.mark.parametrize(("kernel", "variant", "splits"), COMPILED)
 @pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
-def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, kernel):
+def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, kernel, variant,
+                                                                              splits):
     """The dense kernel under a decode step's attention and its gradient, in bf16 and fp32 at
     Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256, a 1024-slot cache), and the
     paged kernel at Qwen3-0.6B's (16 query heads over 8 of 128) with pages of 16 and 32 keys over 1024
@@ -814,8 +823,8 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     every GPU here, lowered for each GPU on this CPU and compiled by Triton
     within its block's shared memory; and the dense kernel in the accurate form (`natural`), raw without
     sinks and scaled with them, which the interpreted suite lowers for no GPU. A first filter: the A100
-    runs them; the H100 and the RTX PRO 6000 have this check alone. Each kernel a case of its own, so none
-    holds a CPU task past the suite's target (row 1849: 420 to 460 s a GPU together)."""
+    runs them; the H100 and the RTX PRO 6000 have this check alone. One kernel at one slice count a case
+    (`COMPILED`)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
@@ -859,20 +868,11 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
                                                jax.ShapeDtypeStruct((8, per_row), jnp.int32),
                                                jax.ShapeDtypeStruct((8,), jnp.int32))
 
-    # Every slice count the kernels may take, each a program shape of its own.
-    cases = [KernelCase(f"dense/{jnp.dtype(dtype).name}/{splits}",
-                        lambda dtype=dtype, splits=splits: pinned(lambda: dense(dtype),
-                                                                  decode_attention.DecodeAttention, splits))
-             for dtype in (jnp.bfloat16, jnp.float32) for splits in decode_attention.SPLITS]
-    cases += [KernelCase(f"natural/{'sinks' if sinks else 'raw'}/{splits}",
-                         lambda sinks=sinks, splits=splits: pinned(lambda: natural(sinks),
-                                                                   decode_attention.DecodeAttention, splits))
-              for sinks in (False, True) for splits in decode_attention.SPLITS]
-    paged_op = decode_attention.PagedDecodeAttention
-    cases += [KernelCase(f"paged/{size}/{splits}",
-                         lambda size=size, splits=splits: pinned(lambda: paged(size), paged_op, splits))
-              for size in (16, 32) for splits in decode_attention.SPLITS]
-    cases = [case for case in cases if case.name.startswith(f"{kernel}/")]
+    assert splits in decode_attention.SPLITS
+    built = {"dense": lambda: dense(jnp.dtype(variant)), "natural": lambda: natural(variant == "sinks"),
+             "paged": lambda: paged(variant)}[kernel]
+    op = decode_attention.PagedDecodeAttention if kernel == "paged" else decode_attention.DecodeAttention
+    cases = [KernelCase(f"{kernel}/{variant}/{splits}", lambda: pinned(built, op, splits))]
     found = compile_kernels(cases, target)
     assert len(found) == len(cases)
     assert not failures(found), "\n".join(failures(found))

@@ -867,10 +867,12 @@ def assert_finite(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None
                                     "values not finite where the reference's are")
 
 
-ACCURATE_ARMS = [(family, name) for family in TEMPLATE_FAMILIES
+ACCURATE_ARMS = [pytest.param(family, name, marks=pytest.mark.whole_suite) if name == "triton"
+                 else (family, name) for family in TEMPLATE_FAMILIES
                  for name in _mainloops(FAMILIES[family], ACCURATE)]
 """Each template family beside each mainloop that takes it in the accurate form (`_mainloops`): a case of
-its own, so none holds a CPU task past the suite's target (row 1849)."""
+its own, so none holds a CPU task past the suite's target (row 1849); the frozen Triton mainloop's,
+interpreted, run past it at fp32's edges (row 2117: 250 to 453 s), so the whole suite's run holds them."""
 
 
 @pytest.mark.parametrize(("family", "name"), ACCURATE_ARMS)
@@ -954,6 +956,7 @@ def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at
     _default_is_finite(family, "triton")
 
 
+@pytest.mark.whole_suite
 @pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].overflows])
 def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass(family):
     """The Triton mainloop's default backward asked for its unsplit first pass (`split=False`) over sums that
