@@ -10,8 +10,8 @@ real vLLM engine: asked for the model's own argmax, the server reproduces
 Dew's greedy draw token for token, and the vLLM-only controls the client
 places in `extra_body` change what the server's sampler does. The launch:
 
-    vllm serve <export> --host 127.0.0.1 --port <port> --dtype float32 \
-        --enforce-eager --gpu-memory-utilization 0.2 --max-num-seqs 8 \
+    NVIDIA_TF32_OVERRIDE=0 vllm serve <export> --host 127.0.0.1 --port <port> \
+        --dtype float32 --enforce-eager --gpu-memory-utilization 0.2 --max-num-seqs 8 \
         --trust-request-chat-template
     OPENAI_BASE_URL=http://127.0.0.1:<port>/v1 pytest tests/test_vllm_interop.py
 
@@ -22,6 +22,10 @@ FlashInfer's sampling kernels at startup.
 
 `--dtype float32` is what the logprob check below holds the server to: its
 logprobs as exact as Dew's own fp32 ones, the truth Dew's float64 forward.
+On an Ampere or Hopper GPU the server's float32 matmuls run in TF32 unless
+cuBLAS is told otherwise (`NVIDIA_TF32_OVERRIDE=0`): in TF32 its logprobs
+sat 1.2e-3 from float64 against Dew's 3.7e-6, and the greedy draw parted at
+its first token (ledger 2101).
 The export records no `torch_dtype`, so vLLM's own default serves it in
 bfloat16 through FlashAttention instead of fp32 through Triton: the argmax
 survives that on these prompts, but the reported logprobs move from within
@@ -36,6 +40,7 @@ the same weights. Without `OPENAI_BASE_URL` the SDK would address
 api.openai.com, so an unset variable skips.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -268,16 +273,23 @@ def test_the_server_refuses_impossible_controls_but_ignores_unknown_ones(client)
 
     `Sampling` admits top-p zero and Dew's own sampler keeps the argmax
     under it; vLLM's sampler rejects the value outright, so a policy that
-    runs natively is a 400 here. The context the export declares and the
-    server's logprob cap are refused the same way. An unrecognised control
+    runs natively is a 400 here, as is the server's logprob cap. A request
+    past the context the export declares draws nothing past it: refused, or
+    (as vLLM's later servers do) cut at the context. An unrecognised control
     is not: vLLM's request models allow extra fields, so a misspelled
     vLLM-only key in `extra_body` is dropped silently, which is why the
     client builds the controls it supports itself.
     """
     with pytest.raises(openai.BadRequestError):
         client(PROMPTS[0], DRAWN, sampling=Sampling(temperature=1.0, top_p=0.0))
-    with pytest.raises(openai.BadRequestError):
-        client(PROMPTS[0], 200, sampling=GREEDY)
+    try:
+        past = client(PROMPTS[0], 200, sampling=GREEDY, extra_body={"return_token_ids": True})
+    except openai.BadRequestError:
+        pass
+    else:
+        choice = past.responses[0].choices[0]
+        context = json.loads((Path(client.model) / "config.json").read_text())["max_position_embeddings"]
+        assert len(choice.prompt_token_ids) + len(choice.token_ids) <= context, past.finish_reasons
     with pytest.raises(openai.BadRequestError):
         client(PROMPTS[0], DRAWN, sampling=GREEDY, logprobs=1000)
 
