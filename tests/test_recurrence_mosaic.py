@@ -213,7 +213,7 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
     def rule(given: Chunk, max_segments: int | None = None):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
                            tiles=narrowest, starts=given.starts, max_segments=max_segments, scale=hooks.scale,
-                           floor=hooks.floor)
+                           floor=hooks.floor, bound=hooks.inverse_bound)
 
     return rule
 
@@ -287,7 +287,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
 
     def dew(given: Chunk, tiles: mainloop.Tiles):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
-                           tiles=tiles, starts=given.starts, scale=hooks.scale,
+                           tiles=tiles, starts=given.starts, scale=hooks.scale, bound=hooks.inverse_bound,
                            family=bundles.of('sm80', jnp.bfloat16))
 
     truth = jax.jit(functools.partial(token_by_token, hooks))
@@ -320,7 +320,8 @@ def test_the_mosaic_launches_state_their_work(training):
         jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
 
     def rule(*operands):
-        return mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1))[0].astype(jnp.float32).sum()
+        # The bound a layer declares of its sigmoid write gates (`recurrence.Hooks.write_bound`).
+        return mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1), bound=1.0)[0].astype(jnp.float32).sum()
 
     lowered_for = generation.device_generation() if mainloop.family_of() is not None else "sm90"
     with generation.assumed(lowered_for):
@@ -352,7 +353,7 @@ def test_each_launch_lowers_once_however_many_layers_call_it():
             for layer in range(count):
                 # Each layer's own queries, as each layer projects its own.
                 scaled = query * (layer + 1)
-                out = mosaic_rule(scaled, key, value, g, beta, tiles=mainloop.Tiles(32, 1))[0]
+                out = mosaic_rule(scaled, key, value, g, beta, tiles=mainloop.Tiles(32, 1), bound=1.0)[0]
                 total = total + out.astype(jnp.float32).sum()
             return total
 

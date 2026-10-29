@@ -160,7 +160,8 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
 
     def walked(given: Chunk):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
-                           tiles=tiles, scale=hooks.scale, family=bundles.of('sm90', jnp.bfloat16))
+                           tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound,
+                           family=bundles.of('sm90', jnp.bfloat16))
 
     reference = functools.partial(chunk_on, 'fla', hooks)
     truth = functools.partial(token_by_token, hooks)
