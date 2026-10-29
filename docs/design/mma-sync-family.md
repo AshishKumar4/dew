@@ -155,9 +155,10 @@ Lifting the eligibility gate is not enough. The hooked paths today assume TMA an
   two-axis sides, partial final tiles included, and native on the A100.
 - **dW.** `xᵀ·dy` reads its left operand transposed out of shared memory. Mosaic already lowers a transposed
   ref load (`lowering.py:1785-1806`, `TransposeTransform`, then the vector load at :1999-2024). The tiled loader
-  takes transposed ldmatrix layouts (`fragmented_array.py:4550-4568`), and `Mma.staged_products` builds a
-  transposed left ref today. The open question is only whether the dW tiling compiles and holds native
-  accuracy, so a ptxas compile probe comes first, with fork work only for a concrete failure.
+  takes transposed ldmatrix layouts (`fragmented_array.py:4550-4568`), and the attention backward's fused
+  launch reads transposed left refs today, its dK and dV products' (`attention_mosaic_backward._fused_step`).
+  The open question is only whether the dW tiling compiles and holds native accuracy, so a ptxas compile
+  probe comes first, with fork work only for a concrete failure.
   `MosaicTgmm._families` then includes mma.sync.
 - **Exact sums.** These come on mma.sync too. `_walked_gradient`'s exact loop is generic
   (`running + family.product(...)`). The wgmma-only part is `MosaicTgmm.legal`'s register formula, which is

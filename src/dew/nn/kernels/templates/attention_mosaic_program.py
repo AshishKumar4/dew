@@ -16,8 +16,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, bundles, mosaic, mosaic_sm90
+from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
 from dew.nn.kernels.templates.attention import (
+    Draw,
+    Dropout,
     Hooks,
     KeySpans,
     Kind,
@@ -30,10 +32,12 @@ from dew.nn.kernels.templates.attention import (
     whole,
 )
 
-QUALIFIED = frozenset({mosaic_sm90.WGMMA.name})
-"""The instruction families the attention mainloop is qualified on: wgmma's. mma.sync's bundle
-(`bundles.of`) does not yet pass Mosaic GPU's layout inference in the attention programs (its MMA layouts'
-stores and transposed views), so its calls take the frozen Triton mainloop by legality."""
+QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
+"""The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
+feed their own rings (`mosaic_sm90.FED`). mma.sync's lowers and holds check 1 on an A100 (row 2078,
+ET-2078-A100CHECK3), but its natural, guarded and backward launches spill at every tile its model admits and
+no register fact yet decides them (the toolkit's sm80 matrix), so its calls take FA2 or the frozen Triton
+mainloop by legality."""
 
 
 def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
@@ -44,12 +48,22 @@ def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
     return family if family is not None and family.name in QUALIFIED else None
 
 
+def layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family, ...]:
+    """The bundles a launch of the attention mainloop takes on a device of `generation_name` for operands of
+    `dtype`, in preference order (`bundles.layouts`: a producer's layout, then on warpgroup MMA the layout
+    whose consumers feed their own rings, `mosaic_sm90.FED`), where its family is qualified (`bundle`)."""
+    if generation_name is None or bundle(generation_name, dtype) is None:
+        return ()
+    return tuple(family for family in bundles.layouts(generation_name, dtype) if family.name in QUALIFIED)
+
+
 def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
-    """The bundle `tiles` run on: the current device's (`generation.gpu_target`), whose family their legality
-    matched (`MosaicForward.legal`)."""
-    family = bundle(generation.gpu_target().generation, dtype)
-    if family is None or family.name != tiles.family:
-        raise ValueError(f"{tiles}: this device's attention bundle is {family.name if family else None}")
+    """The bundle `tiles` run on: the current device's (`generation.gpu_target`) layout their family names,
+    which their legality matched (`MosaicForward.legal`)."""
+    found = {family.name: family for family in layouts(generation.gpu_target().generation, dtype)}
+    family = found.get(tiles.family)
+    if family is None:
+        raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
     return family
 """The instruction families this mainloop runs on (`generation.family`), each by its bundle: wgmma's. A
 family without one (mma.sync's, until its thin mainloop) takes another mainloop (`MosaicForward.eligible`,
@@ -79,7 +93,10 @@ class BackwardTiles:
     """A backward's config, one for its launches: the query block a dQ consumer takes and the key block a
     dK/dV consumer takes (`block_q`, `block_k`, so both launches' logits are one tile's), the tiles in
     flight (`stages`), the consumers a program (`consumers`), whether the fast form runs as one launch
-    (`fused`, `_launch_backward`) and the instruction family whose bundle runs it (`family`)."""
+    (`fused`, `_launch_backward`), the instruction family whose bundle runs it (`family`) and the dK/dV
+    programs a key block's head widths split among (`columns`: each its share of dK's and dV's columns, its
+    logits and their cotangents its own, where a whole width's sums pass a consumer's registers) and the
+    dK/dV launch's own layout and consumers (`dkv`)."""
 
     block_q: int
     block_k: int
@@ -87,6 +104,27 @@ class BackwardTiles:
     consumers: int
     fused: bool = False
     family: str = mosaic_sm90.WGMMA.name
+    columns: int = 1
+    dkv_family: str | None = None
+    dkv_consumers: int | None = None
+    staged_logits: bool = False
+    """Whether the keys-first dK/dV launch stages its logits' queries (the call's taken by its power) a
+    step from the call's own in its consumers' shared memory, where a stream of them beside the call's
+    passes the block (width 256's)."""
+
+    @property
+    def dkv(self) -> "BackwardTiles":
+        """The dK/dV launch's own tiles: its layout and consumers (`dkv_family`, `dkv_consumers`, the
+        config's where None), each launch's layout its own (`bundles.layouts`)."""
+        return dataclasses.replace(self, family=self.dkv_family or self.family,
+                                   consumers=self.dkv_consumers or self.consumers, dkv_family=None,
+                                   dkv_consumers=None)
+
+    @property
+    def dkv_apart(self) -> bool:
+        """Whether the dK/dV launch runs on a layout or a count of consumers of its own (`dkv`): its tiles
+        other than the config's own, overrides naming the config's own aside."""
+        return self.dkv != dataclasses.replace(self, dkv_family=None, dkv_consumers=None)
 
     def __post_init__(self):
         if self.stages < 2:
@@ -120,9 +158,9 @@ def _parts(accurate: bool, dtype) -> int:
     return len(jax.eval_shape(lambda c: algebra.cotangent_parts(c, dtype, accurate=accurate), tile))
 
 
-DROPPING = ("the Mosaic mainloop takes no probability dropout yet (the route runs a dropping call on the "
-            "reference path, ledger row 1521)")
-"""Why this mainloop refuses a dropping call (`refused`): its ops carry no draw."""
+DROPPING = ("the Mosaic mainloop draws dropout at its own places; a sequence exchange's slice draws at its "
+            "global places, a table gather a tile (`DropPlaces`)")
+"""Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 
 
 def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
@@ -154,14 +192,19 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     suite read."""
     hooks = Hooks() if hooks is None else hooks
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
-    if hooks.drop is not None:
+    if hooks.drop is not None and (hooks.drop.queries is not None or hooks.drop.keys is not None):
         return DROPPING
+    if hooks.drop is not None and jnp.dtype(dtype) == jnp.dtype(jnp.float16):
+        # fp16's dropped weights take scaled parts (`algebra.weights_parts`), which the mainloop's register
+        # products do not take back (`mosaic.unscaled_part`).
+        return "the Mosaic mainloop's dropping walk takes bf16 operands, not float16"
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
         return f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}"
     if jnp.dtype(dtype) not in sixteen:
         return f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}"
-    if backward and width != value_width:
-        return "the Mosaic backward stages dK and dV through one buffer: equal head widths"
+    if backward and not transposable(hooks):
+        return ("the Mosaic backward holds its tiles keys first, and its score hook takes an axis of them by "
+                "an operation no layout rule takes (`layout.RULES`)")
     widest = max(_width(width, family, dtype), _width(value_width, family, dtype))
     if family.copy_extent is not None and widest > family.copy_extent:
         return (f"the Mosaic mainloop loads a head {widest} wide in one copy, past the "
@@ -198,34 +241,104 @@ def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
                  differentiated: bool = False) -> list[jax_core.Jaxpr]:
     """`hooks` traced as a launch runs them on `tile`, its outputs `value_width` wide: the score hook (and,
     `differentiated`, its pullback along the logits and its floating parameters) and the output hook."""
-    rows, columns = tile
-
-    def entries(kind: Kind, dtype, width: int) -> jax.ShapeDtypeStruct:
-        # A parameter as `_param` gives it: a head's scalar, else the tile's entries.
-        return jax.ShapeDtypeStruct(() if kind == Kind.HEAD else (rows, width), kept_dtype(dtype))
-
     traced = []
     # A keyed launch's hook is its fingerprint (`tuning.program`), whose lowering its live call established.
-    score_mod = hooks.score_mod if callable(hooks.score_mod) else None
-    if score_mod is not None:
-        positions = jax.ShapeDtypeStruct(tile, jnp.int32)
-        params = [entries(param.kind, param.value.dtype, columns) for param in hooks.score_params]
-        logits = jax.ShapeDtypeStruct(tile, jnp.float32)
-        traced.append(jax.make_jaxpr(score_mod)(logits, positions, positions, *params).jaxpr)
-        if differentiated:
-            floating = floating_params(params)
-
-            def pulled(s, q_pos, k_pos, *values):
-                hooked = differentiable(score_mod, q_pos, k_pos, values, floating)
-                out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
-                return pull(jnp.ones_like(out))
-
-            traced.append(jax.make_jaxpr(pulled)(logits, positions, positions, *params).jaxpr)
+    if callable(hooks.score_mod):
+        traced += _score_jaxprs(hooks.score_mod, tuple((param.kind, param.value.dtype)
+                                                       for param in hooks.score_params),
+                                tile, differentiated=differentiated)
     if callable(hooks.output_mod):
         traced.append(jax.make_jaxpr(hooks.output_mod)(
-            jax.ShapeDtypeStruct((rows, value_width), jnp.float32),
-            *(entries(param.kind, param.value.dtype, value_width) for param in hooks.output_params)).jaxpr)
+            jax.ShapeDtypeStruct((tile[0], value_width), jnp.float32),
+            *(_entries(param.kind, param.value.dtype, (tile[0], value_width))
+              for param in hooks.output_params)).jaxpr)
     return traced
+
+
+def _entries(kind: Kind, dtype, tile: tuple[int, int]) -> jax.ShapeDtypeStruct:
+    """A hook parameter as `_param` gives it on `tile`: a head's scalar, else the tile's entries."""
+    return jax.ShapeDtypeStruct(() if kind == Kind.HEAD else tile, kept_dtype(dtype))
+
+
+def _score_jaxprs(score_mod, params: tuple, tile: tuple[int, int], *,
+                  differentiated: bool) -> list[jax_core.Jaxpr]:
+    """`score_mod` under parameters of `params`' kinds and dtypes traced on `tile`, and with `differentiated`
+    its pullback along the logits and its floating parameters."""
+    positions, logits = jax.ShapeDtypeStruct(tile, jnp.int32), jax.ShapeDtypeStruct(tile, jnp.float32)
+    values = [_entries(kind, dtype, tile) for kind, dtype in params]
+    traced = [jax.make_jaxpr(score_mod)(logits, positions, positions, *values).jaxpr]
+    if differentiated:
+        floating = floating_params(values)
+
+        def pulled(s, q_pos, k_pos, *values):
+            hooked = differentiable(score_mod, q_pos, k_pos, values, floating)
+            out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
+            return pull(jnp.ones_like(out))
+
+        traced.append(jax.make_jaxpr(pulled)(logits, positions, positions, *values).jaxpr)
+    return traced
+
+
+TILE_SIDES = (32, 64, 128, 192, 256)
+"""The sides a program's score tile may take, at every shape of which a hook's legality traces it
+(`transposable`): a consumer's share of a slot's queries (32 of a 64-row slot, `split_queries`) among
+them."""
+
+
+def transposable(hooks: Hooks) -> bool:
+    """Whether the score hook and its pullback run on a tile held keys first (`[bk, bq]`, the dK/dV
+    program's) as written for the reference's `[bq, bk]` (`layout.transposed`): traced, never run, at every
+    tile shape a program takes (`TILE_SIDES`), which no operation it has no rule for refuses
+    (`layout.Untransposable`), and at each one entry at a time in the logits and its floating parameters
+    (`_entrywise`), as the slopes the backward multiplies its cotangents by assume (`algebra.scored`)."""
+    if not callable(hooks.score_mod):
+        return True
+    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    return _transposable(hooks.score_mod, params)
+
+
+@functools.lru_cache(maxsize=256)
+def _transposable(score_mod, params: tuple) -> bool:
+    """`transposable` of `score_mod` under parameters of `params`' kinds and dtypes."""
+    try:
+        for tile in ((rows, columns) for rows in TILE_SIDES for columns in TILE_SIDES):
+            _score_jaxprs(layout.transposed(score_mod), params, tile, differentiated=True)
+    except layout.Untransposable:
+        return False
+    for tile in ((rows, columns) for rows in TILE_SIDES for columns in TILE_SIDES):
+        canonical = _score_jaxprs(score_mod, params, tile, differentiated=False)[0]
+        floating = floating_params([_entries(kind, dtype, tile) for kind, dtype in params])
+        if not _entrywise(canonical, {0, *(3 + index for index in floating)}, tile):
+            return False
+    return True
+
+
+def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -> bool:
+    """Whether every operation of `jaxpr` that reads its `inputs` (by place) acts one entry at a time
+    (`layout.ENTRYWISE`, a scalar's broadcast, a nested call's own operations so), each value it reads of them
+    and each it gives a scalar or the `tile`."""
+    tainted = {jaxpr.invars[index] for index in inputs}
+    for eqn in jaxpr.eqns:
+        read = [index for index, var in enumerate(eqn.invars)
+                if not isinstance(var, jax_core.Literal) and var in tainted]
+        if not read:
+            continue
+        # Its other operands (coordinates, integer parameters) any shape that broadcasts against the tile.
+        shapes = [getattr(var.aval, "shape", ())
+                  for var in (*(eqn.invars[index] for index in read), *eqn.outvars)]
+        if any(shape not in ((), tile) for shape in shapes):
+            return False
+        name = eqn.primitive.name
+        nested = list(jax_core.jaxprs_in_params(eqn.params))
+        if nested:
+            # A call or a custom derivative's primal (whose rule `layout.transposed` checks).
+            if name not in (*layout.CALLS, "custom_jvp_call", "custom_vjp_call") or not all(
+                    _entrywise(inner, set(read), tile) for inner in nested):
+                return False
+        elif name not in layout.ENTRYWISE and not (name == "broadcast_in_dim" and shapes[0] == ()):
+            return False
+        tainted.update(eqn.outvars)
+    return True
 
 
 def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:
@@ -247,11 +360,13 @@ class _Hooked(NamedTuple):
     """A call's hooks as its programs read them: the score hook's parameters and the output hook's, as their
     kinds lay them out (`Hooks.score_params`', `[H]`, `[B, H, Qp]`, `[B, H, Kp]`, `[B, H, Qp, Kp]` or
     `[B, Qp, H, Dv]`), and the softmax's initial state, its maximum and denominator `[B, H, Qp]` and sums
-    `[B, H, Qp, Dv]` (None where it starts from none)."""
+    `[B, H, Qp, Dv]` (None where it starts from none), and probability dropout's draws (`Dropout`, None where
+    the call drops nothing)."""
 
     score: tuple[jax.Array, ...]
     output: tuple[jax.Array, ...]
     initial: tuple[jax.Array, jax.Array, jax.Array] | None
+    drop: Dropout | None = None
 
 
 def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
@@ -265,7 +380,7 @@ def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
         initial = call.rows(state.m, -jnp.inf), call.rows(state.total), _columns(acc, unit)
     output = tuple(_columns(value, unit) if param.kind == Kind.OUTPUT else value
                    for value, param in zip(call.output_params, hooks.output_params, strict=True))
-    return _Hooked(call.score_params, output, initial)
+    return _Hooked(call.score_params, output, initial, hooks.drop)
 
 
 class _Guard(NamedTuple):
@@ -277,7 +392,8 @@ class _Guard(NamedTuple):
     largest: jax.Array
 
 
-def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None):
+def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,
+           keys_first: bool = False):
     """A hook parameter's values for a tile `like` of queries from `first` (and keys from `k_first`, a score
     tile's), as `kind` lays them out: the head's scalar, else the tile's entries (a score tile's `[bq, bk]`,
     an output tile's `[bq, Dv]`) in the accumulator's layout, its queries' and keys' broadcast. A score hook
@@ -285,17 +401,24 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     query's and a key's as `[bq, 1]` and `[1, bk]`: Mosaic GPU's layouts hold no singleton axis an elementwise
     operation takes (jax 0.11.2's layout inference finds none for a `[64, 1]` or `[1, 64]` array's convert or
     compare, a lowering probe for an H100), so a hook that reshapes or indexes an axis fails to lower here,
-    never silently; a pointwise hook is the same function of either."""
-    rows = pl.ds(first, like.shape[0])
+    never silently; a pointwise hook is the same function of either. A score tile whose rows are its keys
+    (`keys_first`, `[bk, bq]`) reads a tile parameter's entries from its keys-first copy `[B, H, Kp, Qp]`."""
+    queries, keys = like.shape[::-1] if keys_first else like.shape
+    rows, columns = pl.ds(first, queries), pl.ds(k_first, keys)
     match kind:
         case Kind.HEAD:
             return ref[head]
         case Kind.QUERY:
+            if keys_first:
+                return algebra.across(family.columns_of(ref.at[row, head, rows]), like)
             return algebra.expand(family.rows_of(ref.at[row, head, rows]), like)
         case Kind.KEY:
-            return algebra.across(family.columns_of(ref.at[row, head, pl.ds(k_first, like.shape[1])]), like)
+            if keys_first:
+                return algebra.expand(family.rows_of(ref.at[row, head, columns]), like)
+            return algebra.across(family.columns_of(ref.at[row, head, columns]), like)
         case Kind.TILE:
-            return family.tile_of(ref.at[row, head, rows, pl.ds(k_first, like.shape[1])])
+            tile = (row, head, columns, rows) if keys_first else (row, head, rows, columns)
+            return family.tile_of(ref.at[tile])
         case Kind.OUTPUT:
             return family.tile_of(ref.at[row, rows, head])
 
@@ -473,29 +596,38 @@ def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
 
 
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
-            q_pos=None, columns=None) -> algebra.Coords:
+            q_pos=None, columns=None, *, keys_first: bool = False,
+            draw: Draw | None = None) -> algebra.Coords:
     """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`, the
     tile's entries in the accumulator's layout (`q_pos` the query places and `columns` the tile's key
     offsets, where the caller holds them; a hook reads them so, `_param`), and a spans call's queries'
-    intervals and, with documents, both blocks' ids."""
-    q_pos = first + family.iota(shape, 0) if q_pos is None else q_pos
-    k_pos = k_first + (family.iota(shape, 1) if columns is None else columns)
+    intervals and, with documents, both blocks' ids, and a dropping call's `draw`. A tile whose rows are its
+    keys (`keys_first`, `shape` `[bk, bq]`) holds its queries' vectors in a column's layout and its keys' in
+    a row's."""
+    query_axis, key_axis = (1, 0) if keys_first else (0, 1)
+    q_pos = first + family.iota(shape, query_axis) if q_pos is None else q_pos
+    if keys_first:
+        # The keys' places a row vector broadcast, no int tile held (a query's column vector does not lower:
+        # Mosaic GPU's layout inference finds no layout for it beside the tile's).
+        k_pos = lax.broadcast_in_dim(k_first + family.iota((shape[0],), 0), shape, (0,))
+    else:
+        k_pos = k_first + (family.iota(shape, key_axis) if columns is None else columns)
     if spans is None:
-        return algebra.Coords(q_pos, k_pos)
-    rows = pl.ds(first, shape[0])
+        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first)
+    rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
+    of_queries, of_keys = ((family.columns_of, family.rows_of) if keys_first
+                           else (family.rows_of, family.columns_of))
 
     def bounds_of(*run):
-        # A query's interval, or a call's run's, one row of bounds a run (`_spans_of`).
-        return (family.rows_of(spans.start.at[(row, *run, rows)]),
-                family.rows_of(spans.end.at[(row, *run, rows)]))
+        # A query's interval, or a call's run's, one vector of bounds a run (`_spans_of`).
+        return of_queries(spans.start.at[(row, *run, rows)]), of_queries(spans.end.at[(row, *run, rows)])
 
     runs = [(run,) for run in range(spans.start.shape[1])] if spans.start.ndim == 3 else [()]
     bounds = tuple(bounds_of(*run) for run in runs)
     ids = None
     if spans.query_ids is not None and spans.key_ids is not None:
-        ids = (family.rows_of(spans.query_ids.at[row, rows]),
-               family.columns_of(spans.key_ids.at[row, pl.ds(k_first, shape[1])]))
-    return algebra.Coords(q_pos, k_pos, bounds, ids)
+        ids = of_queries(spans.query_ids.at[row, rows]), of_keys(spans.key_ids.at[row, keys])
+    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first)
 
 
 def _rows(family: mosaic.Family, ref, row, head, first, count: int):

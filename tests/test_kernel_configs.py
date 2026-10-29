@@ -254,7 +254,7 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once():
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.refuse(refused)
         lowered()
-    refused_configs = {config for _, config in refused}
+    refused_configs = {config for _, config, _ in refused}
     assert first in refused_configs and traced[2] not in refused_configs
     if stepped not in refused_configs:
         assert traced[2] == stepped
@@ -688,3 +688,23 @@ def test_splash_compiles_for_a_v5e_with_libtpu():
 
     found = compile_tpu_kernels([support.KernelCase("splash fp32", call)], "v5e")
     assert not [record for record in found if "error" in record], found
+
+
+def test_a_refusal_holds_in_every_process_sharing_its_records(tmp_path):
+    """A process's refusal (`report.refuse`, as a compile's spill records it) kept beside the compilation
+    cache (`report.records`) holds in the next process reading them, which so derives the stepped-down
+    config without compiling the spilling one."""
+    import subprocess
+    import sys
+
+    tile = "mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)"
+    preamble = ("from dew.nn.kernels.templates import report\n"
+                "from dew.nn.kernels.templates.gemm import mosaic_gpu\n")
+    environment = {**os.environ, "DEW_REFUSAL_RECORDS": str(tmp_path / "refusals.jsonl")}
+    seeded = preamble + f"report.refuse([('a launch', {tile}, {{'dew_gmm'}})])"
+    subprocess.run([sys.executable, "-c", seeded], check=True, env=environment)
+    expected = f"(('a launch', {tile}, frozenset({{'dew_gmm'}})),)"
+    reading = preamble + f"print(report.refused_launches() == {expected})"
+    read = subprocess.run([sys.executable, "-c", reading], check=True, env=environment, capture_output=True,
+                          text=True)
+    assert read.stdout.strip() == "True"
