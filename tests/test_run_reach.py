@@ -146,9 +146,10 @@ def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run
 def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
     """`trainer.attention_form` is the form every attention of the run trains in (row 2245), on the
     default route ('auto'): a run recorded "accurate" runs each attention it traces on the template or
-    the reference path, which compute the form (row 2350), as its step's own kernel report records,
-    where a run recorded with none runs them on the host's default kernel; `dew train` of the accurate
-    run's own record, under a new name, runs them as it did."""
+    the reference path, which compute the form (row 2350), as its step's own kernel report records, and
+    `dew train` of its own record, under a new name, runs them as it did. That the fast form keeps a
+    GPU's old routes is the selector's (tests/test_attention_route.py); a CPU runs fp32 attention on
+    the reference path in either form."""
     run = lm(tmp_path, drawn=False)
 
     def kernels(name: str) -> set[str]:
@@ -157,12 +158,10 @@ def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
                 if route["choice"] == "attention"}
 
     trained(run, tmp_path, "accurate", trainer={"attention_form": "accurate"})
-    trained(run, tmp_path, "default")
     recorded_run = tmp_path / "runs" / "accurate" / "run.json"
     assert main(["train", str(recorded_run), "--set", "trainer.name=again"]) == 0
     assert kernels("accurate") <= {"template", "reference"} and kernels("accurate")
     assert kernels("again") == kernels("accurate")
-    assert not kernels("default") <= {"template", "reference"}
 
 
 def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_called(tmp_path):
