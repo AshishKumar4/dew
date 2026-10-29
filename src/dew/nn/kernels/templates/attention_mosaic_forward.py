@@ -501,7 +501,7 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
 def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, peak_views: tuple, q_smem,
                    q_loaded, row_smem, keys_smem, streams, turn, streamed: tuple, first,
                    spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks,
-                   interpret: bool) -> None:
+                   interpret: bool, fed: bool = False) -> None:
     """A peak walk's query block (batch row and head `place`): each row's keys' largest logit, in the walk's
     units, and the first key that holds it (`algebra.argmax`, the training walk's anchor, `algebra.anchored`),
     over the key tiles it reads through the family's key stream, the logits under the score hook as the
@@ -513,7 +513,11 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
     pl.when(consumer == 1)(turn)
-    family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
+    if fed:
+        # Every consumer walks the program's tiles over the stream they feed (`_consumer`'s).
+        lo, hi = streamed
+    else:
+        family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
 
     def step(index, slots, arg, accumulators):
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place, whole,
@@ -526,7 +530,8 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     start = algebra.Argmax(family.full((tiles.block_q,), -jnp.inf),
                            family.full((tiles.block_q,), 0, jnp.int32))
     arg, _ = family.walk(streams, ((step, lo, hi),), start, (), interpret, first=streamed[0])
-    family.passed(streams, hi, streamed[1], first=streamed[0], between=lambda: (turn(), turn()))
+    if not fed:
+        family.passed(streams, hi, streamed[1], first=streamed[0], between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
     family.stored((family.as_row(arg.peak),), (peak_views[0],), smem=row_smem)
     family.stored((family.as_row(arg.key),), (peak_views[1],), smem=keys_smem)
@@ -585,12 +590,14 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
         def consumer(index):
             first = pair_first + index * block_q
             rows, state_rows = (row, pl.ds(first, block_q), head), (row, head, pl.ds(first, block_q))
+            fed = isinstance(family, mosaic.ConsumerFed)
+            walked = family.fed(streams, views, *streamed, index) if fed else streams
             if peaks:
                 peak_views = tuple(ref.at[state_rows] for ref in written)
                 _peak_consumer(program, spec, index, q_ref.at[rows], peak_views, q_smem.at[index],
                                q_loaded.at[index], row_smem.at[index], stages[0].at[index],
-                               streams, turn, streamed, first, spans_of, hooked_of, (row, head), hooks=hooks,
-                               interpret=interpret)
+                               walked, turn, streamed, first, spans_of, hooked_of, (row, head), hooks=hooks,
+                               interpret=interpret, fed=fed)
                 return
             status_ref, *outputs = written
             status = tuple(status_ref.at[place, *state_rows] for place in range(2))
@@ -604,8 +611,6 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                 out_view = outputs[0].at[rows]
             finished = None if training or not finishes else tuple(outputs[1].at[place, *state_rows]
                                                                         for place in range(2))
-            fed = isinstance(family, mosaic.ConsumerFed)
-            walked = family.fed(streams, views, *streamed, index) if fed else streams
             _consumer(program, spec, index, q_ref.at[rows], out_view, status, q_smem.at[index],
                       q_loaded.at[index], out_smem.at[index], row_smem.at[index], walked, turn, streamed,
                       first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)), hooks=hooks,
