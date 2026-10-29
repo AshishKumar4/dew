@@ -60,6 +60,7 @@ from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_route
+from dew.nn.sharding import Link
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
 from dew.quantization import Quantization
@@ -612,6 +613,13 @@ class TrainerConfig:
     program, on a host of the topology it was compiled for; another program, from another config,
     data shape, Dew or a plan recorded for another rung, is refused before the run trains.
     """
+    links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
+        default_factory=dict)
+    """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
+    measures them as they are or should not: a step spreads an axis's projections as its stated link
+    would, `--set trainer.links='{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`.
+    Unnamed, an axis's link is measured on its devices. A step compiled ahead states its target's own
+    (`AheadTarget.links`)."""
     tune_kernels: bool = False
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
@@ -1728,7 +1736,8 @@ class RunConfig:
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
             layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
             dynamic_scale=trainer.dynamic_scale, rollout=rollout, tune_kernels=trainer.tune_kernels,
-            **resources)
+            dynamic_scale=trainer.dynamic_scale, rollout=rollout, tune_kernels=trainer.tune_kernels,
+            **{"links": trainer.links, **resources})
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
               tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:
