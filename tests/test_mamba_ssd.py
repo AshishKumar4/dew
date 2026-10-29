@@ -27,6 +27,7 @@ from reference_error import (
 from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
 from tool_support import load
+from whole_suite import timed
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -108,13 +109,12 @@ def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
                         and value.tobytes() == other.tobytes()), f"{case}: {name} differs"
 
 
-WHOLE_SUITE_CASES = {"bf16": 256, "ragged-documents": 130, "wide-state-documents": 297}
+PAST_TARGET = {"port": {"bf16": 256, "ragged-documents": 130, "wide-state-documents": 297}}
 """The port's cases whose interpreted seeds take a group past its two minutes (seconds, train 270's CI on
-f58abb8a3, ledger 2119), which the whole suite runs."""
+f58abb8a3, ledger 2119), which the whole suite runs (`timed`)."""
 
 
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.whole_suite)
-                                  if case in WHOLE_SUITE_CASES else case for case in CASES])
+@pytest.mark.parametrize("case", timed(PAST_TARGET, "port", list(CASES)))
 def test_the_port_is_as_exact_as_mamba_ssm(case):
     """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
 

@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
-from dew.batch import Variables, real_slots, thaw
+from dew.batch import SEGMENTS_FIELD, Variables, real_slots, thaw
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
@@ -346,7 +346,7 @@ class GRPOObjective(TokenScorer):
         if self.balance is not None:
             # The router positions that count are the response tokens the policy's forward reads: a token's
             # input (`[:, :-1]`) whose own target is trained, in a real chain.
-            fields = {"segment_ids": terms.segments}
+            fields = {SEGMENTS_FIELD: terms.segments}
             queries = (real_slots(fields, mask.shape)[:, :-1] & (mask[:, :-1] != 0)
                        & (self.row_weights(batch, mask.shape[0]) > 0)[:, None])
             statistics, effects, router_metrics = self.balance.compose(

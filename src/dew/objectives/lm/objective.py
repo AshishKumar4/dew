@@ -45,6 +45,8 @@ from dew.batch import (
     BLOCKS_FIELD,
     COORDINATES_FIELD,
     FROZEN,
+    POSITIONS_FIELD,
+    SEGMENTS_FIELD,
     TEXT_KEY,
     VALID_ROWS,
     Batch,
@@ -262,7 +264,7 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     the packing off what this returns (`dew.batch.token_layout`).
     """
     prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
-    columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids),
+    columns = {name: column for name, column in ((POSITIONS_FIELD, positions), (SEGMENTS_FIELD, segment_ids),
                                                  (COORDINATES_FIELD, coordinates),
                                                  (BLOCKS_FIELD, block_groups))
                if column is not None}
@@ -344,7 +346,7 @@ def prefixed_fields(fields: Mapping[str, jax.Array | Coordinates], shape: tuple[
         raise ValueError(f"a prompt prefix run reads each row's roles ({ROLES_KEY}) to find its "
                          "prompt, and this batch has none")
     laid = fields.get(COORDINATES_FIELD)
-    positions = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
+    positions = laid.positions if isinstance(laid, Coordinates) else fields.get(POSITIONS_FIELD)
     groups = prefix_groups(xp.ones(shape, xp.int32) if documents is None else documents, real, prefix,
                            positions=positions, roles=roles, assistant=Role.ASSISTANT, xp=xp)
     return {**fields, BLOCKS_FIELD: groups}

@@ -26,6 +26,7 @@ from test_recurrence_mosaic import (
     on_the_mainloop,
     template_call,
 )
+from whole_suite import timed
 
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import recurrence
@@ -70,17 +71,15 @@ def restarted(fn, case: str):
     return lambda drawn: fn(dataclasses.replace(drawn, starts=operands.starts))
 
 
-WHOLE_SUITE_INTERPRETED = {('packed documents', 'bf16', 'kept'): 225,
-                           ('a ragged length', 'bf16', 'kept'): 161, ('one sequence', 'bf16', 'kept'): 122}
-"""The interpreted gradient's cases past a group's two minutes (seconds, train 270's CI on f58abb8a3, ledger
-2127), which the whole suite runs."""
+PAST_TARGET = {"interpreted": {'packed documents-bf16-kept': 225, 'a ragged length-bf16-kept': 161,
+                               'one sequence-bf16-kept': 122}}
+"""The interpreted gradient's cases past a group's two minutes, by id (seconds, train 270's CI on f58abb8a3,
+ledger 2127), which the whole suite runs (`timed`)."""
 
 
-@pytest.mark.parametrize(('case', 'dtype', 'remat'), [
-    pytest.param(*case.values, id=case.id, marks=(*case.marks, pytest.mark.whole_suite))
-    if case.id in {'-'.join(each) for each in WHOLE_SUITE_INTERPRETED} else case
-    for case in interpreted([(case, dtype, remat) for remat in REMATS for dtype in DTYPES
-                             for case in GRADIENT_CASES], INTERPRETED_GRADIENT)])
+@pytest.mark.parametrize(('case', 'dtype', 'remat'), timed(PAST_TARGET, "interpreted", interpreted(
+    [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in GRADIENT_CASES],
+    INTERPRETED_GRADIENT)))
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast

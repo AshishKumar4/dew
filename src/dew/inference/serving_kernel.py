@@ -20,7 +20,7 @@ from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
 
-from dew.batch import Variables
+from dew.batch import VALIDITY_FIELD, Variables
 from dew.inference.tasks import cache_sized
 from dew.mesh import logical_spec
 from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
@@ -115,7 +115,7 @@ def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacit
     prompt, which leave the cursors at zero and the validity false."""
     ops = decode_ops(model, params, pad_id, None)
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
-                        {"attention_mask": jnp.zeros((slots, 1), bool)})
+                        {VALIDITY_FIELD: jnp.zeros((slots, 1), bool)})
     _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops)[0],
                                                   errors=checkify.user_checks))
     keys = jax.random.key_data(jax.random.key(0))
@@ -290,7 +290,7 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     mixed = admission is not None and placement.mixed
     if mixed:
         assert admission is not None
-        real = jnp.any(admission.prompts.token_fields["attention_mask"], axis=1)
+        real = jnp.any(admission.prompts.token_fields[VALIDITY_FIELD], axis=1)
         state = _seated(state, state.decoder, real, admission, placement.groups)
     elif admission is not None:
         state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission), admission,
@@ -334,7 +334,7 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     step takes its last piece's. A piece continuing its row (a paged cache's
     shared prefix, a chunked prompt) reads the row's earlier keys."""
     rows = last.shape[0]
-    tokens, valid = admission.prompts.tokens, admission.prompts.token_fields["attention_mask"]
+    tokens, valid = admission.prompts.tokens, admission.prompts.token_fields[VALIDITY_FIELD]
     pieces, width = tokens.shape
     flat = jnp.concatenate([jnp.where(fed, last, pad_id), jnp.where(valid, tokens, pad_id).reshape(-1)])
     real = jnp.concatenate([fed, valid.reshape(-1)])

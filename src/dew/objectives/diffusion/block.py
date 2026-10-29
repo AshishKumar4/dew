@@ -24,7 +24,7 @@ from flax import linen as nn, struct
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.artifacts import TokenScores
-from dew.batch import FROZEN, Batch, Variables, real_places, shifted_span, thaw, token_layout
+from dew.batch import FROZEN, POSITIONS_FIELD, Batch, Variables, real_places, shifted_span, thaw, token_layout
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
@@ -438,7 +438,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         fields = prepared.token_fields
         positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
             full_valid, selected, self.prompt_length, self.canvas_size,
-            fields.get("positions"), fields.get("image_groups"))
+            fields.get(POSITIONS_FIELD), fields.get("image_groups"))
         model = self.training_model
         rngs = model_rngs(step.key, training=train)
         observed = ["qk"] if step.qk_stats else []

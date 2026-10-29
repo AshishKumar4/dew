@@ -117,7 +117,7 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     for index, (row, slot) in enumerate(zip(arrays, slots, strict=True)):
         tokens[index, slot] = row
         valid[index, slot] = True
-    padded = {"attention_mask": valid}
+    padded = {VALIDITY_FIELD: valid}
     for name, values in (fields or {}).items():
         aligned = [np.asarray(row) for row in values]
         if len(aligned) != len(arrays) or any(
@@ -131,8 +131,8 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
         for index, (row, slot) in enumerate(zip(aligned, slots, strict=True)):
             value[index, slot] = row
         padded[name] = value
-    if padded["attention_mask"].all():
-        del padded["attention_mask"]
+    if padded[VALIDITY_FIELD].all():
+        del padded[VALIDITY_FIELD]
     return tokens, padded
 
 

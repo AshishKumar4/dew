@@ -15,6 +15,7 @@ import numpy as np
 from dew import _records
 from dew._model_types import GEMMA4_TYPES, QWEN35_TYPES
 from dew._records import JSON
+from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD
 from dew.interop.sources import SourceReference
 from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
@@ -373,9 +374,9 @@ class Processor:
         # An unpadded batch carries no validity field. The host knows the rows
         # are whole here; the model would have to take an all-true mask on
         # trust and build one anyway.
-        token_fields = {"positions": jnp.asarray(positions)}
+        token_fields = {POSITIONS_FIELD: jnp.asarray(positions)}
         if not valid.all():
-            token_fields["attention_mask"] = jnp.asarray(valid)
+            token_fields[VALIDITY_FIELD] = jnp.asarray(valid)
         gemma = self.config.get("model_type") in GEMMA4_TYPES
         if gemma:
             for pixels, coordinates in (("pixel_values", "image_position_ids"),

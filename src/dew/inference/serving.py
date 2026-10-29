@@ -85,7 +85,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew._hashing import array_fingerprint
-from dew.batch import Variables
+from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD, Variables
 from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.pages import Pages, States, prefix_hashes
 from dew.inference.projections import pack_projections, packed_layout
@@ -823,14 +823,14 @@ class Server:
             if self.cross is not None and CONTEXT in conditioning:
                 context = self._request_context(conditioning.pop(CONTEXT),
                                                   conditioning.pop(CONTEXT_LENGTHS, None))
-            if set(inputs.token_fields) - {"attention_mask", "positions", *GROUPS} or conditioning:
+            if set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD, *GROUPS} or conditioning:
                 raise ValueError(
                     "a served prompt carries tokens, validity, positions, image and block groups and a "
                     "cross-attention decoder's context only; media and custom token fields do not slot"
                 )
             ids = np.asarray(inputs.tokens)
             fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
-            positions = fields.pop("positions", None)
+            positions = fields.pop(POSITIONS_FIELD, None)
         else:
             ids = host_token_rows(np.atleast_2d(np.asarray(prompt)))
             fields = {}
@@ -1096,7 +1096,7 @@ class Server:
             self._admitted,
         )
         conditioning = {} if cross is None else {CONTEXT: placed[10], CONTEXT_LENGTHS: placed[11]}
-        fields = {"attention_mask": placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
+        fields = {VALIDITY_FIELD: placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
                                                           strict=True))}
         return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:10])
 

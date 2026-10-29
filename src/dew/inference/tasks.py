@@ -29,7 +29,7 @@ from jax.typing import ArrayLike, DTypeLike
 
 from dew._coordination import agreed
 from dew._records import integer, record as named_fields, strings, text as named
-from dew.batch import PARAMETER_ROOTS, Variables, thaw
+from dew.batch import PARAMETER_ROOTS, POSITIONS_FIELD, VALIDITY_FIELD, Variables, thaw
 from dew.cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
@@ -213,8 +213,8 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
     """
     if ceiling is None or budget < 1:
         return inputs, budget, None
-    positions = inputs.token_fields.get("positions")
-    if (set(inputs.token_fields) - {"attention_mask", "positions"} or inputs.conditioning
+    positions = inputs.token_fields.get(POSITIONS_FIELD)
+    if (set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD} or inputs.conditioning
             or (positions is not None and positions.shape != inputs.tokens.shape)):
         return inputs, budget, None
     width = shape_bucket(inputs.tokens.shape[1], 64)
@@ -230,13 +230,13 @@ def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
     extra = width - inputs.tokens.shape[1]
     if extra < 1:
         return inputs
-    valid = inputs.token_fields.get("attention_mask")
+    valid = inputs.token_fields.get(VALIDITY_FIELD)
     if valid is None:
         valid = jnp.ones(inputs.tokens.shape, bool)
     left = ((0, 0), (extra, 0))
     fields = {name: jnp.pad(value, left) for name, value in inputs.token_fields.items()}
     return replace(inputs, tokens=jnp.pad(inputs.tokens, left),
-                   token_fields={**fields, "attention_mask": jnp.pad(valid, left)})
+                   token_fields={**fields, VALIDITY_FIELD: jnp.pad(valid, left)})
 
 
 @functools.cache
