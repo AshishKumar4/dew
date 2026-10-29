@@ -85,7 +85,7 @@ def test_a_loaded_bases_fresh_blocks_learn_at_the_fresh_rate_where_no_group_is_n
             yield rows(rng)
 
     data = Loader(train=lambda partition: stream(), val=None, records=None, batch=BATCH)
-    state = Trainer(objective, optimizer, key=jax.random.key(0)).fit(data, steps=1000, log_every=None)
+    state = Trainer(objective, optimizer, key=jax.random.key(0)).fit(data, steps=1000, log_every=1000)
     control = float(objective.loss(objective.variables, held, None, read=False)[0])
     answered = float(objective.loss(state.variables, held, None)[0])
     assert control > 4.0 and answered < control - 1.0, (answered, control)

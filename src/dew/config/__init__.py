@@ -260,15 +260,17 @@ def fresh_parameters(objective: Objective) -> tuple[str, ...]:
     name (`parameter_name`): each its objective trains that the held tree does not hold, a head or a
     projector it draws (`Objective.complete_variables`), and each of a cross-attention block, which a
     source draws beside its own weights (`Pretrained.with_cross_attention`, `crossing`). None for an
-    objective that holds no base, whose every parameter is drawn alike. An adapter's factors
-    (`Pretrained.adapt`) are the held tree's, and keep their rate."""
+    objective that holds no trained base, whose every trained parameter is drawn alike, a frozen
+    tower's beside them or not. An adapter's factors (`Pretrained.adapt`) are the held tree's, and
+    keep their rate."""
     from dew.nn.cross_attention import crossing
     from dew.optim import parameter_name
 
     held = objective.held_variables()
-    if held is None:
+    loaded = {path for path, _ in jax.tree_util.tree_leaves_with_path((held or {}).get("params", {}))}
+    # A run whose held trees train nothing, a frozen tower beside a model drawn whole, adds to no base.
+    if not loaded:
         return ()
-    loaded = {path for path, _ in jax.tree_util.tree_leaves_with_path(held.get("params", {}))}
     trained = jax.eval_shape(lambda: objective.init(jax.random.key(0)))["params"]
     return tuple(parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)
                  if path not in loaded or crossing(tuple(getattr(entry, "key", entry) for entry in path)))
