@@ -1224,22 +1224,39 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-BACKWARD_GATE = [(generation_name, width, accurate) for generation_name in ("sm90",)
+BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in ("sm90",)
                  for width in (64, 128, 256) for accurate in (False, True)]
+BACKWARD_GATE += [("sm90", width, False, hooks) for width in (64, 128) for hooks in BACKWARD_HOOKS
+                  if hooks != "none"]
 """The backward resource gate's cases: each GPU whose family the mainloop qualifies (an H100's; mma.sync's
-is not, `test_an_a100_derives_no_mosaic_backward`), a causal call's head widths, each form."""
+is not, `test_an_a100_derives_no_mosaic_backward`), a causal call's head widths, each form, hookless; and
+each score hook at the widths a hooked call's derivation takes whole (row 2281: its live set beside the
+step's)."""
 
 
-def _gated_backward(generation_name: str, width: int, accurate: bool):
+def _gated_hooks(hooks: str, queries: int, width: int):
+    """The gate's score hook `SCORE_HOOKS[hooks]` over `queries` queries and keys, four query heads, its
+    parameters' first draw (`score_hooks`), as `template.Hooks`; None for none."""
+    if hooks == "none":
+        return None
+    score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, queries, width, rows=1, heads=4)
+    params, initial = draw_hooks(0)
+    return template.Hooks(score_mod, tuple(template.Param(value, kind) for value, kind in zip(params, kinds,
+                                                                                               strict=True)),
+                          initial)
+
+
+def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str = "none"):
     """The resource gate's backward op, bound arguments and derived config: a causal call of 512 queries,
-    four query heads over two key heads `width` wide, bf16, in the form `accurate` names, for
-    `generation_name`."""
+    four query heads over two key heads `width` wide, bf16, in the form `accurate` names, under the score
+    hook `hooks` names (`_gated_hooks`), for `generation_name`."""
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
     query = jnp.zeros((1, queries, 4, width), jnp.bfloat16)
     key = jnp.zeros((1, queries, 2, width), jnp.bfloat16)
+    hooked = _gated_hooks(hooks, queries, width)
     with generation.assumed(generation_name):
-        op, args = attention_mosaic._backward_call(query, key, key, spans, None, query,
+        op, args = attention_mosaic._backward_call(query, key, key, spans, hooked, query,
                                                    _residuals(query.shape), accurate=accurate, scale=None,
                                                    natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, interpret=False)
@@ -1254,13 +1271,13 @@ def test_an_a100_derives_no_mosaic_backward(accurate):
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("generation_name", "width", "accurate"), BACKWARD_GATE)
-def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, width, accurate):
-    """The backward at its derived tiles of a causal call `width` wide in the form `accurate` names, lowered
-    and compiled by ptxas for `generation_name` on this CPU (tests/kernel_compile.py): every launch within its
-    shared memory, spilling nothing, and its register model's decision ptxas's (`mosaic_failures`, each
-    launch's model `resources.register_model` at its own layout and consumers,
-    `MosaicBackward._launch_registers`)."""
+@pytest.mark.parametrize(("generation_name", "width", "accurate", "hooks"), BACKWARD_GATE)
+def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, width, accurate, hooks):
+    """The backward at its derived tiles of a causal call `width` wide in the form `accurate` names under the
+    score hook `hooks` names, lowered and compiled by ptxas for `generation_name` on this CPU
+    (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
+    model's decision ptxas's (`mosaic_failures`, each launch's model `resources.register_model` at its own
+    layout and consumers, `MosaicBackward._launch_registers`)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1270,12 +1287,14 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
     key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
     residuals = _residuals(query.shape)
 
+    hooked = _gated_hooks(hooks, queries, width)
+
     def backward(query, key, value, dout, residuals):
-        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+        grads = attention_mosaic.backward(query, key, value, spans, hooked, dout, residuals=residuals,
                                           accurate=accurate)
         return grads.query, grads.key, grads.value
 
-    op, ba, config = _gated_backward(generation_name, width, accurate)
+    op, ba, config = _gated_backward(generation_name, width, accurate, hooks)
     assert config is not None, f"the Mosaic backward derives no config {width} wide on {generation_name}"
     with generation.assumed(generation_name):
         models = _backward_models(op, ba, config)
