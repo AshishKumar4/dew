@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unp
 
 import jax
 import numpy as np
-from jax._src import config as jax_config, core as jax_core
+from jax._src import api_util, config as jax_config, core as jax_core
 from jax.sharding import Sharding
 
 from dew.devices import xla_flag
@@ -166,9 +166,13 @@ class OuterProgram:
     def __init__(self, function: Callable, **arguments):
         self.function, self.arguments = function, arguments
         self.jitted = self._jitted()
-        # The static positions and names as jit resolved them, the ones given and those it inferred.
-        resolved = self.jitted._jit_info
-        self.numbers, self.names = resolved.static_argnums, frozenset(resolved.static_argnames)
+        # The static positions and names as jit resolves them, the ones given and those it infers.
+        numbers, names = arguments.get("static_argnums"), arguments.get("static_argnames")
+        signature = api_util.fun_signature(function)
+        if signature is not None:
+            numbers, names = api_util.infer_argnums_and_argnames(signature, numbers, names)
+        self.numbers = () if numbers is None else (numbers,) if isinstance(numbers, int) else tuple(numbers)
+        self.names = frozenset(() if names is None else (names,) if isinstance(names, str) else names)
         self._executables: collections.OrderedDict[Hashable, jax.stages.Compiled] = collections.OrderedDict()
         self._compiling = threading.Lock()
 
@@ -235,9 +239,11 @@ class OuterProgram:
 
 def _signature(leaf) -> Hashable:
     """What jit keys an argument on: an array's abstract value (shape, dtype, weak type), placement
-    and layout (its `format`, which holds its sharding), another value's type, shape and dtype."""
+    and layout (its `format`, which holds its sharding; a key array's sharding), another value's type,
+    shape and dtype."""
     if isinstance(leaf, jax.Array):
-        return leaf.aval, leaf.format, leaf.committed
+        # A typed key array states no format: its placement is its sharding.
+        return leaf.aval, getattr(leaf, "format", None) or leaf.sharding, leaf.committed
     return type(leaf), np.shape(leaf), np.result_type(leaf)
 
 
