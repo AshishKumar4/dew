@@ -16,7 +16,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    bundles,
+    layout,
+    mosaic,
+    mosaic_sm80,
+    mosaic_sm90,
+)
 from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
@@ -30,11 +37,10 @@ from dew.nn.kernels.templates.attention import (
     whole,
 )
 
-QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
+QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name, mosaic_sm80.Mma.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
-feed their own rings (`mosaic_sm90.FED`). mma.sync's bundle
-(`bundles.of`) does not yet pass Mosaic GPU's layout inference in the attention programs (its MMA layouts'
-stores and transposed views), so its calls take the frozen Triton mainloop by legality."""
+feed their own rings (`mosaic_sm90.FED`), and mma.sync's (row 2078: its programs lower on an sm80 since its
+rank-1 stores and the fork's squeezed cp.async copies)."""
 
 
 def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
