@@ -245,23 +245,38 @@ def attention_forms(monkeypatch):
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_saved_decision_and_image_run_trace_their_helpers_in_their_form(tmp_path, attention_forms):
-    """A decision run recorded "accurate" compiles its scoring passes, on its worker threads, in the
-    accurate attention form (`Decide.compile_scoring`), and an image run's prepared denoising inputs
-    encode its conditions in it (`TextToImage.prepare`), each through a numerical helper its call
-    shares (row 2255's review)."""
-    from dew.decision.task import Decide
-    from dew.inference.images import TextToImage
+def test_a_saved_decision_and_image_run_trace_their_helpers_in_their_form(tmp_path, monkeypatch):
+    """A decision run recorded "accurate" scores a batch of requests in the accurate attention form
+    (`Decide.batch`, which its call does not run through), and an image run's prepared denoising inputs
+    build their conditions' programs in it (`TextToImage.prepare`), each through a numerical helper
+    its call shares (row 2255's review): every program either builds (`program`) is built under it."""
+    import dew.decision.task as decision_task
+    import dew.inference.images as image_task
+    from dew.nn.kernels import generation
+
+    built: list[str] = []
+    for module in (decision_task, image_task):
+        def observed(*arguments, made=module.program, **keywords):
+            built.append(generation.chosen_kernel("attention_form", "fast"))
+            return made(*arguments, **keywords)
+        monkeypatch.setattr(module, "program", observed)
+
+    def forms(call) -> set[str]:
+        built.clear()
+        call()
+        return set(built)
 
     for kind, build in (("decision", decision), ("diffusion", diffusion)):
         (tmp_path / kind).mkdir()
         trained(build(tmp_path / kind, drawn=False), tmp_path, kind,
                 trainer={"attention_form": "accurate", "checkpoint_final": True})
-    decide = Decide.from_run(str(tmp_path / "runs" / "decision"))
-    assert attention_forms(decide.compile_scoring) == {"accurate"}
-    images = TextToImage.from_run(str(tmp_path / "runs" / "diffusion"))
-    assert attention_forms(lambda: images.prepare(["a cat"], steps=2, key=5)) <= {"accurate"}
-    assert attention_forms(lambda: images(["a cat"], steps=2, key=5)) == {"accurate"}
+    from dew.decision import Choice
+
+    decide = decision_task.Decide.from_run(str(tmp_path / "runs" / "decision"))
+    question = {"team": Choice("which team", ["billing", "technical", "sales"])}
+    assert forms(lambda: decide.batch([({"text": "the site is down"}, question)])) == {"accurate"}
+    images = image_task.TextToImage.from_run(str(tmp_path / "runs" / "diffusion"))
+    assert forms(lambda: images.prepare(["a cat"], steps=2, key=5)) == {"accurate"}
 
 
 def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_called(tmp_path):
