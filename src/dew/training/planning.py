@@ -35,7 +35,6 @@ from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
-from dew.telemetry.benchmark import samples
 from dew.telemetry.profile import active_profile, capture_options
 from dew.training.distributed import batch_divisor
 from dew.training.memory import (
@@ -45,7 +44,6 @@ from dew.training.memory import (
     recompute_more,
     recompute_record,
     remat_half,
-    remat_more,
     rung_record,
     step_fits,
     temporaries_factor,
@@ -306,42 +304,10 @@ class Planned:
         return dataclasses.replace(self, candidate=dataclasses.replace(self.candidate, program=None))
 
 
-TIMED_STEPS, TIMED_REPEATS, TIMED_WARMUP = 10, 3, 2
-"""A frontier's plans are each timed `TIMED_REPEATS` times over `TIMED_STEPS` steps (`step_seconds`),
-after the warmup ones, each plan's own: a split step's first call builds its window."""
-
-
-def step_seconds(step: Callable, state: TrainState, batch: Batch) -> list[float]:
-    """Seconds a step of `step` takes on `batch` from `state`, each of `TIMED_REPEATS` samples the mean
-    of `TIMED_STEPS` queued and synchronized once after `TIMED_WARMUP`
-    (`dew.telemetry.benchmark.samples`), each step consuming the state the one before it returned, as
-    training does."""
-    held = [state]
-
-    def stepped() -> TrainState:
-        held[0], *_ = step(held[0], batch)
-        return held[0]
-
-    return samples(stepped, warmup=TIMED_WARMUP, repeats=TIMED_REPEATS, calls=TIMED_STEPS)
-
-
-def faster(timings: Sequence[Sequence[float]]) -> int:
-    """The plan of a frontier's `timings` (each plan's samples, `step_seconds`) that runs faster: a later
-    one only where its slowest sample beats every sample of the first's, the first otherwise. A choice
-    within the timings' spread is the clock's noise, which would give two runs of one configuration
-    different plans, and so different models and steps, where neither runs faster."""
-    chosen = 0
-    for index, timing in enumerate(timings[1:], start=1):
-        if max(timing) < min(timings[chosen]):
-            chosen = index
-    return chosen
-
-
 @dataclasses.dataclass
 class Trials:
     """Trial runs of a plan's steps on `batch` from `state`, each on a copy of the state as it stood
-    (`run`): an offline frontier's timing (`seconds`), explicitly called by its tool, and AutoPGLE's
-    profile of the plan admitted (`profiled`). Live compilation never invokes `seconds`. A state the
+    (`run`), used to profile the admitted plan under AutoPGLE (`profiled`). A state the
     trials own (`owned`, `fit`'s) is stepped by the first trial
     and deleted, each later trial stepping a fresh copy from the host, so the devices hold one state at a
     time, and `state` is then a copy as it stood, for the run to go on from. One they borrow (a compile
@@ -370,10 +336,6 @@ class Trials:
         if self.owned:
             self.state = together(self.restored(), frozen)
         return outcome
-
-    def seconds(self, steps: Sequence[Callable]) -> list[list[float]]:
-        """Each of a frontier's `steps` timed on its own trial (`step_seconds`)."""
-        return [self.run(lambda state, step=step: step_seconds(step, state, self.batch)) for step in steps]
 
     def profiled(self, step: Callable, planned: Planned, mesh: Mesh, runs: int) -> bytes:
         """XLA's profile of `runs` runs of `planned`'s executable, each over the microbatches of `batch`
@@ -460,28 +422,12 @@ class Forecast:
         return min(guesses, default=None)
 
 
-def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[Sequence[float]],
-            probes: Sequence[Probe]) -> dict[str, JSON]:
-    """The record of `planned`, of `plans` a frontier timed at `seconds` a
-    step (none where one plan fit first): every compile the search made,
-    `probes`, each timed plan's split, rows, rung and seconds, and the planned
-    step's kernels (`KernelReport.record`: each dispatch's route and each
-    kernel's lowered launches), which the run log states."""
+def settled(planned: Planned, probes: Sequence[Probe]) -> dict[str, JSON]:
+    """The admitted plan, its kernel report and every compile needed to find it. There is no
+    alternative-policy timing or selection in the run's admission record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
-            "probes": [probe.record() for probe in probes],
-            "timed": [{**plan.record(), "seconds": min(took)}
-                      for plan, took in zip(plans, seconds, strict=True)] if seconds else None}
-
-
-def opens_frontier(split: int, whole: int, mesh: Mesh) -> bool:
-    """Whether a plan reading its batch in `split` microbatches is timed against the batch whole, in
-    `whole`, a remat rung up (`FitSearch.plans`' frontier): where it splits the batch, or spans accelerators,
-    whose collectives the rung's freed memory lets XLA's scheduler overlap with compute. Measured, not
-    ranked: Qwen3.5-0.8B on an A100-40 ran 1205.6 ms a step in four microbatches, 1174.1 whole under
-    'minimal'; Qwen3.5-9B by fsdp over two A100-80s left 168 of 169 ms of collectives exposed, 15 under
-    'minimal'."""
-    return split != whole or mesh.devices.size > 1
+            "probes": [probe.record() for probe in probes]}
 
 
 @dataclasses.dataclass
@@ -492,9 +438,9 @@ class FitSearch[LossT, EffectsT]:
     run's tile `base` at each remat rung (`recompute_more`). It holds what it lowered, compiled and
     measured, and where on the ladder it stands.
 
-    The first rung climbed drops the narrow copies, which a plan above it, the frontier's too, takes
+    The first rung climbed drops the narrow copies, which a plan above it takes
     back where its rung and split fit with them. A split missing at a rung with a half rung
-    (`remat_half`) is compiled there, the plan staying where it fits; climbing and the frontier pass
+    (`remat_half`) is compiled there, the plan staying where it fits; climbing passes
     every half rung asked (`onward`). Each compile's measure (`Forecast`) orders the splits; `resumed`, a
     checkpoint's rung, is warned of where it misses; where nothing fits it raises with the closest
     candidate's numbers. The objective is left at the last plan's rung.
@@ -531,29 +477,14 @@ class FitSearch[LossT, EffectsT]:
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
         self.required = compiler_options(*self.objective.towers()) or None
 
-    def plans(self, candidates: Sequence[int], first: int, frontier: bool
-              ) -> tuple[list[Planned], tuple[Probe, ...]]:
-        """The plans to time, the first kept where none is timed, with every compile made: the ladder's
-        first of `candidates` from `candidates[first]` and, where `frontier` asks and it opens a frontier
-        (`opens_frontier`), the batch whole a remat rung up (`remat_more`), the head tiled and unfused,
-        above any rung that dropped the copies."""
+    def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
+        """The first fitting plan found by the split-and-rung search, and every compile it made.
+        Once admission succeeds, no optional alternate policy is compiled."""
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
         if split is None or self.fitted is None:
             raise RuntimeError(unplanned(self.probes)) from (self.refusals[-1] if self.refusals else None)
-        plans = [self.found(split)]
-        if (frontier and opens_frontier(split, candidates[0], self.mesh)
-              and self.onward(lambda: remat_more(self.objective))):
-            self.objective.tile_head()
-            self.objective.unfuse_head()
-            self.xla_defaults, self.narrow = False, self.narrow and self.dropped is None
-            self.lowered.clear()
-            head = "the head tiled" if head_tile_of(self.objective) is not None else "the whole logits kept"
-            _log.info("timing the plan against its batch whole at remat %r, %s",
-                      recompute_record(self.objective), head)
-            if self.fits(candidates[0]):
-                plans.append(self.found(candidates[0]))
-        return plans, tuple(self.probes)
+        return self.found(split), tuple(self.probes)
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
