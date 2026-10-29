@@ -1,4 +1,5 @@
 """Shared model requests keep untrusted inputs away from model memory."""
+import ast
 import contextlib
 import sys
 from pathlib import Path
@@ -70,7 +71,7 @@ def test_the_live_sampler_cell_runs_whole_through_the_stand_ins_as_dew_runs_it(s
     (site/live/container/text-to-image), which serves that revision alone, and its image is the one Dew's
     own calls of the cell make, its solver and guidance included: a cell left on an earlier revision, or
     calling what the stand-ins bind otherwise than Dew, fails every unedited Run (ledger 1159, 2339). A
-    tiny run stands in for the pinned model, under the pinned name."""
+    tiny run stands in for the pinned model, under the pinned name, at 4 steps where the page takes 15."""
     import numpy as np
     from test_inference import make_run
 
@@ -99,7 +100,12 @@ def test_the_live_sampler_cell_runs_whole_through_the_stand_ins_as_dew_runs_it(s
 
     monkeypatch.setattr(client, "request", shared)
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
-    cell = compile((SITE / "src" / "data" / "sampler.py").read_text(), "sampler.py", "exec")
+    # The cell's calls as the page writes them, at 4 steps where it takes 15: the tiny run compiles each step.
+    tree = ast.parse((SITE / "src" / "data" / "sampler.py").read_text())
+    for keyword in ast.walk(tree):
+        if isinstance(keyword, ast.keyword) and keyword.arg == "steps":
+            keyword.value = ast.Constant(4)
+    cell = compile(tree, "sampler.py", "exec")
     # Dew's own run of the cell first: the stand-ins, once installed, refuse every other Dew module to the
     # rest of the test's process.
     native_namespace = {"dew": SimpleNamespace(pipeline=lambda *args, **kwargs: pipe)}
