@@ -93,11 +93,12 @@ class TrainState:
     scale: DynamicScale | None
     window_size: jax.Array
     accumulation: Accumulation | None = None
-    consumed: jax.Array | None = None
+    consumed: jax.Array | None = dataclasses.field(default=None, metadata={"optional": True})
     """The source examples the run's dispatched batches consumed, int32, in a run bounded in examples
     (`dew.batch.EXAMPLES_CONSUMED`): each step adds what its microbatch's real rows were the last rows of,
     whether or not the update it joins commits, so the run's schedules and cadences read its progress
-    exactly, the same on every process; None in a run counted otherwise."""
+    exactly, the same on every process; None in a run counted otherwise, which a checkpoint that holds
+    none restores (`OPTIONAL`)."""
     compute: Variables | None = struct.field(default=None,
                                              metadata={'checkpointed': False, 'variables': True})
     """The lower-precision copies of the parameters that the forward pass reads, such as bf16 copies
@@ -125,6 +126,9 @@ CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
 """The train-state fields a checkpoint holds, by their names; a field its
 declaration marks `checkpointed=False` is rebuilt on resume."""
 
+OPTIONAL = tuple(field.name for field in dataclasses.fields(TrainState) if field.metadata.get('optional'))
+"""The checkpointed train-state fields a run may hold none of, as a run on another clock holds no
+examples consumed: a checkpoint that holds none restores None (`dew.checkpoints`), whichever Dew wrote it."""
 
 MODEL_STATE = ("step", "microstep", "updates", "variables", "ema")
 """The train-state fields that say which model a step holds, its counters, variables and EMA:

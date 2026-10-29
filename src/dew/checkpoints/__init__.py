@@ -68,7 +68,7 @@ import hashlib
 import json
 import math
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
 
@@ -757,21 +757,6 @@ def _plane_template(ema, deltas):
     return jax.tree_util.tree_map_with_path(planes, ema), targets
 
 
-def _refuse_missing_fields(stored: Iterable[str]) -> None:
-    """Refuse a training checkpoint that lacks a field Dew's train state checkpoints, naming the cause:
-    one written before the field existed, such as the examples clock (`TrainState.consumed`), which no
-    run of this Dew resumes."""
-    from dew.state import CHECKPOINTED
-
-    missing = sorted(set(CHECKPOINTED).difference(stored))
-    if missing:
-        raise ValueError(
-            f"the training checkpoint lacks the state fields {missing}: it was written by a Dew before "
-            "them (the examples clock, `consumed`, among them), and this one keeps them, so a run cannot "
-            "resume it. Resume it with the Dew that wrote it, or start a fresh run from its weights in a "
-            "directory of its own.")
-
-
 RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
 """The hyperparameters Dew's optimizer injected before it held a schedule's own rate fields
 (`dew.optim.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
@@ -815,7 +800,10 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
             f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
             "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
             "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
-    _refuse_missing_fields(stored)
+    from dew.state import CHECKPOINTED, OPTIONAL
+    missing = set(CHECKPOINTED).difference(stored, OPTIONAL)
+    if missing:
+        raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
     if (metadata["scale"] is None) != (template.scale is None):
         raise ValueError("checkpoint dynamic-scaler configuration differs from this run")
     if (metadata["ema"] is None) != (template.ema is None):
@@ -877,11 +865,13 @@ def _filled(template, restored: dict, step: int):
     if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
             and int(restored["window_size"]) != int(template.window_size)):
         raise ValueError("checkpoint accumulation window_size differs from this run")
-    from dew.state import CHECKPOINTED
+    from dew.state import CHECKPOINTED, OPTIONAL
     # A field no checkpoint holds (the narrow copies) starts over: the
-    # template's are of its own parameters, not the restored ones.
+    # template's are of its own parameters, not the restored ones. An optional one the checkpoint
+    # holds none of is None (`OPTIONAL`).
     return template.replace(**restored, **{field.name: field.default for field in dataclasses.fields(template)
-                                           if field.name not in CHECKPOINTED})
+                                           if field.name not in CHECKPOINTED},
+                            **{name: None for name in OPTIONAL if name not in restored})
 
 
 def _split_axes(spec: jax.sharding.PartitionSpec) -> list[str]:
@@ -2013,9 +2003,11 @@ class Checkpoints:
 
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
-        from dew.state import Accumulation
+        from dew.state import CHECKPOINTED, OPTIONAL, Accumulation
         metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
-        _refuse_missing_fields(metadata.keys())
+        missing = set(CHECKPOINTED).difference(metadata.keys(), OPTIONAL)
+        if missing:
+            raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
         pending = metadata["accumulation"]
         if pending is None:
             return None
@@ -2108,9 +2100,10 @@ class Checkpoints:
         elif from_local and self._lost(step):
             restored, held = self._lost_shards(step, template, frozen, snapshot, metadata, where)
         else:
-            from dew.state import CHECKPOINTED
-            state_tree = ({name: getattr(template, name) for name in CHECKPOINTED}
-                          if not isinstance(template, Mapping) else dict(template))
+            from dew.state import CHECKPOINTED, OPTIONAL
+            state_tree = {name: getattr(template, name) for name in CHECKPOINTED
+                          if name in stored or name not in OPTIONAL} \
+                if not isinstance(template, Mapping) else dict(template)
             held = _held_apart(state_tree, frozen)
             if from_local:
                 self._check_placement(step, state_tree)
@@ -2231,9 +2224,10 @@ class Checkpoints:
         """What a process that lost its copy of local `step` restores before its replicas give it
         their shards (`_recovered`): zeros where its template places each leaf, the template checked
         against what the processes holding the step wrote; and the frozen trees held apart."""
-        from dew.state import CHECKPOINTED
-        state_tree = ({name: getattr(template, name) for name in CHECKPOINTED}
-                      if not isinstance(template, Mapping) else dict(template))
+        from dew.state import CHECKPOINTED, OPTIONAL
+        state_tree = {name: getattr(template, name) for name in CHECKPOINTED
+                      if name in metadata or name not in OPTIONAL} \
+            if not isinstance(template, Mapping) else dict(template)
         held = _held_apart(state_tree, frozen)
         self._check_recovered(step, state_tree)
         # The EMA is stored as byte planes of its difference from the weights, checked as such.
