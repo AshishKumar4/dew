@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from interop_support import respelled
 from safetensors.numpy import load_file, save_file
 
 from dew.interop import Pretrained, codecs
@@ -71,9 +72,7 @@ def test_a_window_named_by_sliding_window_size_alone_loads_the_same_model(tmp_pa
     config.pop('sliding_window')
     if stated == 'null':
         config['sliding_window'] = None
-    source = tmp_path / 'size'
-    shutil.copytree(TINY, source)
-    (source / 'config.json').write_text(json.dumps(config))
+    source = respelled(TINY, tmp_path / 'size', lambda _: config)
     expected, reference = logits(TINY)
     loaded, actual = logits(source)
     assert loaded.model == expected.model
@@ -177,10 +176,8 @@ def test_a_saved_release_opens_offline_through_its_own_code_as_the_release_does(
 
     repo, revision = 'XiaomiMiMo/MiMo-V2.6-Pro-MOPD', '6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8'
     released = json.loads(Path(hf_hub_download(repo, 'config.json', revision=revision)).read_text())
-    source = tmp_path / 'release'
-    shutil.copytree(TINY, source)
-    config = json.loads((source / 'config.json').read_text())
-    (source / 'config.json').write_text(json.dumps({**config, 'auto_map': released['auto_map']}))
+    source = respelled(TINY, tmp_path / 'release',
+                       lambda config: {**config, 'auto_map': released['auto_map']})
     for file in ('configuration_mimo_v2.py', 'modeling_mimo_v2.py'):
         shutil.copy(hf_hub_download(repo, file, revision=revision), source / file)
     Pretrained.load(source, dtype='float32', attention_impl='reference').save(tmp_path / 'saved')
