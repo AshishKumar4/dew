@@ -275,21 +275,6 @@ def repo_files(name: str, directory: Path) -> set[str]:
         return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
 
 
-def has_file(repo_id: str, filename: str, revision: str | None) -> bool:
-    """Whether the Hub repo `repo_id` holds `filename` at `revision`.
-
-    It asks the Hub; offline (`HF_HUB_OFFLINE`) it answers from the local
-    cache, where a file never fetched counts as absent.
-    """
-    from huggingface_hub import file_exists, try_to_load_from_cache
-    from huggingface_hub.errors import OfflineModeIsEnabled
-
-    try:
-        return file_exists(repo_id, filename, revision=revision)
-    except OfflineModeIsEnabled:
-        return isinstance(try_to_load_from_cache(repo_id, filename, revision=revision), str)
-
-
 def snapshot(name_or_dir: str, revision: str | None, *,
               weights: bool | tuple[str, ...] = True) -> Path:
     """Resolve a snapshot with the root's (True), no (False) or the named
@@ -329,21 +314,24 @@ def snapshot(name_or_dir: str, revision: str | None, *,
         from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
 
         selected = list(weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX))
-        if not selected:
-            raise FileNotFoundError(missing_weights(f"{name_or_dir} at {directory.name}", files))
         # The conversion a lookup found is recorded (`hub_answer`), so the same
         # load offline reads the conversion it cached rather than pickles it
-        # never fetched; a lookup the Hub refuses, or offline one never made,
-        # finds none.
-        try:
-            conversion = hub_answer(("conversion", name_or_dir, directory.name),
-                                    lambda: _conversion_revision(name_or_dir, directory.name)).value
-        except (HfHubHTTPError, OfflineModeIsEnabled):
-            conversion = None
+        # never fetched, which its commit's local listing then lacks; a lookup
+        # the Hub refuses, or offline one never made, finds none.
+        question = ("conversion", name_or_dir, directory.name)
+        conversion = None
+        if selected or recorded_hub_answer(question) is not None:
+            try:
+                conversion = hub_answer(
+                    question, lambda: _conversion_revision(name_or_dir, directory.name)).value
+            except (HfHubHTTPError, OfflineModeIsEnabled):
+                conversion = None
         if conversion is not None:
             _log.warning("%s at %s ships PyTorch pickles; loading SFconvertbot's safetensors conversion of "
                          "that commit at revision %s", name_or_dir, directory.name, conversion)
             return snapshot(name_or_dir, conversion)
+        if not selected:
+            raise FileNotFoundError(missing_weights(f"{name_or_dir} at {directory.name}", files))
     if selected:
         snapshot_download(name_or_dir, revision=directory.name, allow_patterns=selected)
     return directory

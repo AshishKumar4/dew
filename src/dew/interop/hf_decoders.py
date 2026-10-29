@@ -548,9 +548,13 @@ def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, objec
 def language_model_names(names: Collection[str], read: Callable[[str], Stored], record: WrapperFields,
                          checked: Checked = NOTHING_CHECKED) -> dict[str, str]:
     """Each tensor name of a wrapper's language model, as its text family reads it, to the wrapper's
-    name of it (`wrapper_route`). The media towers' names are not among them, nor read: only the
+    name of it (`wrapper_route`). The media towers' names are not among them, nor read, nor a bundle's
+    decoder tensors that serve its media alone (`DecoderFamily.wrapper_media_suffixes`): only the
     language model's spellings of one tensor are compared."""
-    own = [name for name in names if wrapper_route(name, record)[0] == "language_model"]
+    bundled = _bundled(record["model_type"])
+    media = () if bundled is None else bundled.wrapper_media_suffixes
+    own = [name for name in names if wrapper_route(name, record)[0] == "language_model"
+           and not name.endswith(media)]
     return _wrapper_sources(own, read, record, checked)[0]["language_model"]
 
 
@@ -1131,7 +1135,7 @@ def export_config(model) -> Mapping[str, object]:
     # nested rope_parameters (modeling_olmo3.py:277-291, the spelling
     # Olmo3Config.to_dict writes); a reference with one table for the whole
     # model cannot say it, so that is refused naming the kinds.
-    tables = {kind: model.kind_of(kind).yarn or model.kind_of(kind).rope_scaling
+    tables = {kind: model.kind_of(kind).rope_scaling
               for kind in sorted(set(types))}
     ramped = {kind: table for kind, table in tables.items() if table is not None}
     per_kind = bool(ramped) and (set(ramped) != set(tables)
@@ -1238,6 +1242,12 @@ def bundles(config: Mapping[str, object]) -> bool:
     model_type = config.get("model_type")
     return (isinstance(model_type, str) and _bundled(model_type) is not None
             and config.get("vision_config") is not None)
+
+
+def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:
+    """A media bundle's config as its family's text checkpoint states it: the same record without its
+    vision_config, which its decoder family reads as text alone."""
+    return {name: value for name, value in config.items() if name != "vision_config"}
 
 
 @functools.cache

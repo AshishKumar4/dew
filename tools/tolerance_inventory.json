@@ -285,10 +285,6 @@
    "comparisons": 18,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_hf_opt.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_hf_qwen35_moe_wrapper.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
