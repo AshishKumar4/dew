@@ -3,7 +3,7 @@ at a fixed commit, mixed by tokens and packed into rows a trainer reads.
 
     python recipes/lm/mixture.py --show 2000
 
-The sources are FineWeb-Edu (web text, `text`, its crawls in order), The Stack v1's filtered Python functions
+The sources are English Wikipedia's 2023-11-01 dump (prose, `text`), The Stack v1's filtered Python functions
 (`content`) and UltraChat 200k's SFT conversations (`messages`), each read as the Hub stores it, streamed from its
 own Parquet shards. Text and code are tokenized and ended by EOS; a conversation is rendered through the
 tokenizer's chat template, and keeps only its tokens, as a pretraining row does not weigh speakers apart. The
@@ -33,9 +33,10 @@ def tokenizer():
 
 
 def sources(tok) -> dict[str, Pipeline]:
-    """Each source at its pinned commit, read from its own shards as it streams (FineWeb-Edu holds 1.3T tokens,
-    more than a run's host need hold), as token documents under "text"."""
-    web = Hub("HuggingFaceFW/fineweb-edu", columns=("text",), revision="87f09149ef4734204d70ed1d046ddc9ca3f2b8f9")
+    """Each source at its pinned commit, read from its own shards as it streams, as token documents under
+    "text"."""
+    web = Hub("wikimedia/wikipedia", name="20231101.en", columns=("text",),
+              revision="b04c8d1ceb2f5cd4588862100d08de323dccfbaa")
     code = Hub("bigcode/python-stack-v1-functions-filtered", columns=("content",),
                revision="8e72b18ab4a29b52fbd6a39c1441f67d09633ade")
     conversations = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft", columns=("messages",),
