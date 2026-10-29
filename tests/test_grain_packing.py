@@ -14,7 +14,8 @@ from dew.batch import VALID_ROWS, Coordinates
 from dew.data import Loading, Memory
 from dew.data.compile import compile, validation
 from dew.data.dataset import DataPartition
-from dew.data.pipeline import Pipeline
+from dew.data.packing import FirstFitPacked
+from dew.data.pipeline import Pack, Pipeline
 from dew.data.plan import fingerprint
 from dew.data.text import Chunks
 
@@ -93,6 +94,95 @@ def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
     starts = np.cumsum([0, *(int(packed["text_segment_ids"].max()) for packed in reference)]).tolist()
     assert data.plan.derived["0/packing"] == fingerprint([order, starts])
     assert data.plan.derived["0/valid_targets"] == fingerprint(sum(targets))
+
+
+def same(got, expected):
+    """Windows field for field, in order, each field's dtype and values, the fields named in the
+    order grain hands them on."""
+    assert len(got) == len(expected)
+    for index, (window_got, window_expected) in enumerate(zip(got, expected, strict=True)):
+        assert list(window_got) == list(window_expected)
+        for key, value in window_expected.items():
+            assert window_got[key].dtype == value.dtype, (index, key)
+            np.testing.assert_array_equal(window_got[key], value, err_msg=f"window {index} {key}")
+
+
+@pytest.mark.parametrize("window, bins, segments", [(8, 3, None), (16, 4, 3), (5, 2, 2), (4, 1, None),
+                                                     *_drawn(8)])
+def test_a_stream_packs_first_fit_as_grain_does_and_resumes_where_grains_packer_left(window, bins, segments):
+    """Dew packs a stream of documents first-fit (`FirstFitPacked`) by the placement its plans of
+    lengths follow (`FirstFit`), and Grain's `FirstFitPackIterDataset`, its oracle, packs the same
+    windows field for field: ids and roles a token beside a field along an axis of its own, each
+    with its own room and the ids and that field each with its own segments and positions, at most
+    `segments` documents a window. Each saves its position as the other does, so a read of either
+    stopped after any window resumes on the other."""
+    rng = np.random.default_rng(window * 100 + bins)
+    along = 2 * window
+    documents = []
+    for index, length in enumerate(rng.integers(1, window + 1, 40).tolist()):
+        tokens = (np.arange(length) + 1000 * index).astype(np.int32)
+        documents.append({"text": tokens, "text_roles": np.full(length, index % 4, np.int32),
+                          "image": np.full(int(rng.integers(1, along + 1)), index, np.float32)})
+    pack = Pack(window, fields=FIELDS, bins=bins, segments=segments, along=(("image", along),))
+
+    def stream():
+        return grain.MapDataset.source(documents).to_iter_dataset()
+
+    rooms = dict.fromkeys(FIELDS, window) | {"image": along}
+    grains = FirstFitPackIterDataset(stream(), length_struct=rooms, num_packing_bins=bins, shuffle_bins=False,
+                                     max_sequences_per_bin=segments, meta_features=FIELDS[1:])
+    dews = FirstFitPacked(stream(), pack)
+    reference = list(grains)
+
+    same(list(dews), reference)
+    for stop in sorted({0, 1, bins, len(reference) // 2, len(reference) - 1}):
+        for saving, resuming in ((grains, dews), (dews, grains)):
+            read = iter(saving)
+            for _ in range(stop):
+                next(read)
+            resumed = iter(resuming)
+            resumed.set_state(read.get_state())
+            same(list(resumed), reference[stop:])
+
+
+def test_a_stream_lays_documents_as_grain_does_whatever_their_reader_hands_on():
+    """Documents a stream hands on in one buffer it fills again for each, of empty fields, of a
+    scalar along an axis of its own, and of another dtype than the first of their windows: Dew's
+    packer lays each as Grain's does, copied as it is read, an empty one counted as a document, a
+    scalar as one entry, and each window at the dtype of the first document of its set."""
+    buffer = np.zeros(4, np.int32)
+
+    def refilled(index):
+        buffer[:] = index
+        return {"text": buffer, "text_roles": buffer, "score": np.float32(index)}
+
+    def mixed(index):
+        length = (4, 0, 3, 2, 0, 1)[index]
+        dtype = np.int32 if index % 2 else np.int64
+        return {"text": np.full(length, index, dtype), "text_roles": np.full(length, index, dtype),
+                "score": np.float32(index)}
+
+    for laid, bins in ((refilled, 1), (mixed, 2)):
+        pack = Pack(4, fields=FIELDS, bins=bins, along=(("score", 2),))
+        rooms = dict.fromkeys(FIELDS, 4) | {"score": 2}
+
+        def stream(laid=laid):
+            # Read in turn, nothing ahead: each document is in the buffer only until the next is read.
+            return grain.MapDataset.source(range(6)).map(laid).to_iter_dataset(
+                grain.ReadOptions(num_threads=1, prefetch_buffer_size=0))
+
+        reference = list(FirstFitPackIterDataset(stream(), length_struct=rooms, num_packing_bins=bins,
+                                                 shuffle_bins=False, meta_features=FIELDS[1:]))
+        same(list(FirstFitPacked(stream(), pack)), reference)
+
+
+def test_a_stream_refuses_a_document_longer_than_its_windows():
+    """A document longer than the windows a stream packs into is refused, as Grain's packer refuses
+    it, where a cut would place its tokens in two windows no reader tells apart."""
+    documents = [{"text": np.arange(3, dtype=np.int32)}, {"text": np.arange(9, dtype=np.int32)}]
+    packed = FirstFitPacked(grain.MapDataset.source(documents).to_iter_dataset(), Pack(8, fields=("text",)))
+    with pytest.raises(ValueError):
+        list(packed)
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed"])

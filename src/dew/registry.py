@@ -73,7 +73,7 @@ if TYPE_CHECKING:
     from flax import linen as nn
 
     from dew.diffusion.presets import Preset
-    from dew.inputs.encoders import ConditionEncoder
+    from dew.inputs.condition import ConditionEncoder
     from dew.interop.composite import SourceKind
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
@@ -1395,7 +1395,7 @@ encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases(
     "qwen_image_text": "dew.inputs.diffusion:QwenImageConditioner",
     "t5": "dew.inputs.encoders:T5Text",
     "wan_text": "dew.inputs.diffusion:WanConditioner",
-}, base="dew.inputs.encoders:ConditionEncoder")
+}, base="dew.inputs.condition:ConditionEncoder")
 metrics: Aliases[Callable[..., Metric], Metric] = Aliases("metric", {
     "accuracy": "dew.decision.metrics:Accuracy",
     "aurc": "dew.decision.metrics:AURC",

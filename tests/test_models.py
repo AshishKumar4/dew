@@ -15,9 +15,9 @@ import pytest
 from flax import linen as nn
 from flax.core import freeze, unfreeze
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
-    float64_forward,
     float64_terms,
     torch_with_gradients,
     widened,
@@ -49,31 +49,44 @@ def small_inputs(rng, res=RES, channels=3):
     return x, temb, text()
 
 
+VAE_BLOCK_SEEDS = {(32, 32): 8, (32, 64): 8}
+"""Each bf16 residual block's declared draws against Diffusers' Flax block (check 1), sized by `seeds_for`
+paired with Dew's block on the CPU and an A100."""
+
+
 @pytest.mark.parametrize("channels", [(32, 32), (32, 64)], ids=["same", "widening"])
 def test_a_bf16_vae_block_rounds_where_diffusers_flax_vae_does(channels):
     """In bf16, the VAE's residual block, its two norms ahead of swish, is
-    within the float64 gate of Diffusers' own Flax block on the same
-    weights: each norm keeps its fp32 result into swish and the next
-    convolution casts (vae_flax.py:154-209)."""
+    on par with Diffusers' own Flax block on the same weights from the
+    float64 block over drawn inputs (check 1): each norm keeps its fp32
+    result into swish and the next convolution casts (vae_flax.py:154-209)."""
     from diffusers.models import vae_flax
 
     from dew.nn.autoencoders.vae import _resnet
 
     ours = _resnet(channels[1], 8, jnp.float32)
     theirs = vae_flax.FlaxResnetBlock2D(*channels, groups=8)
-    x = np.random.default_rng(5).standard_normal((2, 8, 8, channels[0])).astype(np.float32) * 3
-    params = theirs.init(jax.random.key(0), jnp.asarray(x))
-    assert jax.tree_util.tree_structure(ours.init(jax.random.key(0), jnp.asarray(x))) == \
+    shape = (2, 8, 8, channels[0])
+    params = theirs.init(jax.random.key(0), jnp.zeros(shape, jnp.float32))
+    assert jax.tree_util.tree_structure(ours.init(jax.random.key(0), jnp.zeros(shape, jnp.float32))) == \
         jax.tree_util.tree_structure(params)
     params = jax.tree.map(lambda leaf: leaf + 0.05 * jax.random.normal(jax.random.key(1), leaf.shape),
                           params)
-    narrow = jnp.asarray(x, jnp.bfloat16)
-    actual = np.asarray(ours.clone(dtype=jnp.bfloat16).apply(params, narrow), np.float32)
-    reference = np.asarray(theirs.clone(dtype=jnp.bfloat16).apply(params, narrow), np.float32)
-    with jax.enable_x64():
-        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf), jnp.float64), params)
-        truth = np.asarray(ours.clone(dtype=jnp.float64).apply(wide, jnp.asarray(x, jnp.float64)))
-    assert_as_exact_as_the_reference(actual, reference, truth, "bf16 VAE residual block")
+
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal(shape).astype(np.float32) * 3,)
+
+    def block(module):
+        return lambda x: module.clone(dtype=jnp.bfloat16).apply(params, jnp.asarray(x, jnp.bfloat16))
+
+    assert_as_exact(block(ours), block(theirs), draw, "bf16 VAE residual block",
+                    seeds=VAE_BLOCK_SEEDS[channels],
+                    truth_fn=lambda x: ours.clone(dtype=jnp.float64).apply(widened(params), x))
+
+
+ENCODER_SEEDS = 8
+"""The VAE encoder's declared draws, the device's run against the host's (check 1), sized by `seeds_for`
+paired with the device's run on the CPU."""
 
 
 @pytest.mark.parametrize("batch", [1, 4])
@@ -81,45 +94,46 @@ def test_a_bf16_vae_block_rounds_where_diffusers_flax_vae_does(channels):
 def test_a_vae_encoder_keeps_the_host_reference_precision(batch, backward):
     """The full jitted encoder, not an isolated downsampler, and its VJP.
 
-    XLA:TPU's stride-two rewrite moved the batch-one output by 40%. Compare
-    both paths to a float64 host evaluation, allowing only the host fp32
-    reference's rounding (the shared reference_error rule).
+    XLA:TPU's stride-two rewrite moved the batch-one output by 40%. The
+    device's run is on par with the host's fp32 run from the host's float64
+    run over drawn images and cotangents (check 1).
     """
     model = FlaxEncoder(out_channels=4, block_out_channels=(32, 64), layers_per_block=1,
                         norm_num_groups=8)
     host, device = jax.devices("cpu")[0], jax.devices()[0]
-    rng = np.random.default_rng(43)
-    image = rng.standard_normal((batch, 17, 17, 3)).astype(np.float32)
-    cotangent = rng.standard_normal((batch, 8, 8, 8)).astype(np.float32)
     with jax.default_device(host):
-        variables = jax.tree.map(np.asarray, model.init(jax.random.key(0), image[:1]))
+        variables = jax.tree.map(np.asarray, model.init(jax.random.key(0), np.zeros((1, 17, 17, 3),
+                                                                                   np.float32)))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (rng.standard_normal((batch, 17, 17, 3)).astype(np.float32),
+                rng.standard_normal((batch, 8, 8, 8)).astype(np.float32))
 
     def evaluate(dtype, target):
         network = model.clone(dtype=dtype)
-        arguments = jax.tree.map(lambda x: jax.device_put(np.asarray(x, dtype), target),
-                                  (variables, image, cotangent))
 
+        @jax.jit
         def run(params, x, cot):
             if backward:
                 return jax.grad(lambda p, a: jnp.sum(network.apply(p, a) * cot),
                                 argnums=(0, 1))(params, x)
             return network.apply(params, x)
 
-        with jax.default_device(target):
-            return jax.tree.map(np.asarray, jax.jit(run)(*arguments))
+        def evaluated(image, cotangent):
+            arguments = jax.tree.map(lambda x: jax.device_put(np.asarray(x, dtype), target),
+                                     (variables, image, cotangent))
+            with jax.default_device(target):
+                value = jax.tree.map(np.asarray, run(*arguments))
+            # The complete parameter and input VJP as one vector, not a cancelling bias leaf scaled by
+            # its near-zero norm.
+            return np.concatenate([x.reshape(-1) for x in jax.tree.leaves(value)]) if backward else value
 
-    reference = evaluate(np.float32, host)
-    with jax.enable_x64():
-        truth = evaluate(np.float64, host)
-    actual = evaluate(np.float32, device)
-    if backward:
-        # Treat the complete parameter/input VJP as one vector rather than
-        # scaling a cancelling bias leaf by its near-zero norm.
-        actual, reference, truth = [np.concatenate([x.reshape(-1) for x in jax.tree.leaves(value)])
-                                    for value in (actual, reference, truth)]
-    assert_as_exact_as_the_reference(
-        actual, reference, truth, "VAE encoder VJP" if backward else "VAE encode"
-    )
+        return as_given(evaluated)
+
+    assert_as_exact(evaluate(np.float32, device), evaluate(np.float32, host), draw,
+                    "VAE encoder VJP" if backward else "VAE encode", seeds=ENCODER_SEEDS,
+                    truth_fn=evaluate(np.float64, host))
 
 
 VAE_ENCODER = Path(__file__).resolve().parent / "fixtures" / "vae" / "encoder.npz"
@@ -192,6 +206,11 @@ def test_a_vae_encoder_is_as_exact_as_diffusers(batch, backward):
                                      terms=native_order(param_terms, image_terms))
 
 
+LINEARIZATION_SEEDS = 8
+"""The strided convolutions' declared draws for each linearization, the device's run against the host's
+(check 1), sized by `seeds_for` paired with the device's run on the CPU."""
+
+
 @pytest.mark.parametrize("transform", ["jvp", "transpose", "forward_over_reverse", "reverse_over_forward"])
 def test_strided_convolution_linearizations_keep_host_precision(transform):
     """Random filters expose a tangent chain just as they expose the primal.
@@ -207,17 +226,19 @@ def test_strided_convolution_linearizations_keep_host_precision(transform):
         ])
 
     host, device = jax.devices("cpu")[0], jax.devices()[0]
-    rng = np.random.default_rng(23)
-    image, direction = (rng.standard_normal((1, 17, 17, 3)).astype(np.float32) for _ in range(2))
-    cotangent = rng.standard_normal((1, 8, 8, 8)).astype(np.float32)
     with jax.default_device(host):
-        variables = jax.tree.map(np.asarray, network(np.float32).init(jax.random.key(0), image))
+        variables = jax.tree.map(np.asarray, network(np.float32).init(jax.random.key(0),
+                                                                      np.zeros((1, 17, 17, 3), np.float32)))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        image, direction = (rng.standard_normal((1, 17, 17, 3)).astype(np.float32) for _ in range(2))
+        return image, direction, rng.standard_normal((1, 8, 8, 8)).astype(np.float32)
 
     def evaluate(dtype, target):
         model = network(dtype)
-        args = jax.tree.map(lambda x: jax.device_put(np.asarray(x, dtype), target),
-                             (variables, image, direction, cotangent))
 
+        @jax.jit
         def run(params, x, tangent, cot):
             def forward(value):
                 return model.apply(params, value)
@@ -231,14 +252,16 @@ def test_strided_convolution_linearizations_keep_host_precision(transform):
             return jax.grad(lambda value: jnp.sum(
                 jax.jvp(forward, (value,), (tangent,))[1] * forward(value)))(x)
 
-        with jax.default_device(target):
-            return np.asarray(jax.jit(run)(*args))
+        def evaluated(image, direction, cotangent):
+            args = jax.tree.map(lambda x: jax.device_put(np.asarray(x, dtype), target),
+                                (variables, image, direction, cotangent))
+            with jax.default_device(target):
+                return np.asarray(run(*args))
 
-    reference = evaluate(np.float32, host)
-    with jax.enable_x64():
-        truth = evaluate(np.float64, host)
-    actual = evaluate(np.float32, device)
-    assert_as_exact_as_the_reference(actual, reference, truth, transform)
+        return as_given(evaluated)
+
+    assert_as_exact(evaluate(np.float32, device), evaluate(np.float32, host), draw, transform,
+                    seeds=LINEARIZATION_SEEDS, truth_fn=evaluate(np.float64, host))
 
 
 def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
@@ -308,15 +331,20 @@ def test_a_scan_order_is_a_permutation_joint_attention_cannot_see(rng, architect
     assert float(jnp.max(jnp.abs(out_hilbert - out_zigzag))) < 1e-5
 
 
+UVIT_SEEDS = 8
+"""The Hilbert UViT's declared draws against the raster one (check 1), sized by `seeds_for` paired with
+it on the CPU and an A100."""
+
+
 def test_a_hilbert_uvit_computes_the_raster_uvits_image(rng):
     """UViT's learned patch positions follow their patches into the scan
     order (`scan_ordered`), as the patches' tokens do, so on the same weights
     a Hilbert-ordered UViT computes the raster one's image, as exact as the
-    raster model computes it (`assert_as_exact_as_the_reference`, the truth
-    the raster model in float64), where positions added in raster order give
-    each moved patch another's (audit NN-A3). The grid is non-square, which a
+    raster model computes it (check 1 over drawn images, the truth the raster
+    model in float64), where positions added in raster order give each moved
+    patch another's (audit NN-A3). The grid is non-square, which a
     transposed permutation fails on."""
-    x = jax.random.normal(rng, (2, 16, 32, 3))
+    shape = (2, 16, 32, 3)
     temb = jnp.ones((2,))
     context = text(tokens=8, features=32)
     config = {"patch_size": 4, "emb_features": 64, "num_layers": 2, "num_heads": 2, "mlp_ratio": 2,
@@ -324,10 +352,20 @@ def test_a_hilbert_uvit_computes_the_raster_uvits_image(rng):
     raster = models.build("uvit", **config)
     hilbert = models.build("uvit", scan_order="hilbert", **config)
     params = jax.tree.map(lambda p: p + 0.05 * jax.random.normal(rng, p.shape),
-                          raster.init(rng, x, temb, context))
-    truth, terms = float64_forward(raster, params, x, temb, context)
-    scanned, rastered = (model.apply(params, x, temb, context) for model in (hilbert, raster))
-    assert_as_exact_as_the_reference(scanned, rastered, truth, "a Hilbert UViT's image", terms=terms)
+                          raster.init(rng, jnp.zeros(shape), temb, context))
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.key(seed), shape),)
+
+    def image(model):
+        return lambda x: model.apply(params, x, temb, context)
+
+    def truth(x):
+        held, steps, given = widened((params, temb, context))
+        return raster.clone(dtype=jnp.float64).apply(held, x, steps, given)
+
+    assert_as_exact(image(hilbert), image(raster), draw, "a Hilbert UViT's image", seeds=UVIT_SEEDS,
+                    truth_fn=truth)
 
 
 @pytest.mark.parametrize("scan_order", ["hilbert", "zigzag"])

@@ -32,7 +32,7 @@ from dew.diffusion.discrete import MDLM
 from dew.diffusion.process import DenoisingCondition
 from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
-from dew.inputs.encoders import ConditionEncoder
+from dew.inputs.condition import ConditionEncoder
 from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
@@ -425,8 +425,8 @@ class CompiledStep:
 @contextlib.contextmanager
 def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) -> Iterator[CompiledStep]:
     """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch
-    with the trials a run's compile takes (`Trials`), which time a frontier's plans and profile the
-    step where JAX's AutoPGLE asks, on a copy of the state, and yield it.
+    with the trials a run's compile takes (`Trials`), which profile only its admitted step where
+    JAX's AutoPGLE asks, on a copy of the state, and yield it.
 
     Each step reads the next placed batch, or with `fixed_batch` the first
     one again. The batches stay placed until the block ends.
