@@ -159,7 +159,7 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None, width: int = 64):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `FORM_TILES`
-    under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
+    (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
     (rows, queries, query and key heads, four and two under a hook) over the spans' keys in `dtype`, heads
     `width` wide, the forward's logits `natural` or folded. The backward differentiates the queries, keys,
@@ -182,7 +182,9 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
 
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
-        with _device(interpret), _pinned(FORM_TILES, config):
+        # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
+        # 128 wide pass their registers).
+        with _device(interpret), _pinned(FORM_TILES if width == 64 else None, config):
             if not backward:
                 return attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                                 interpret=interpret)
