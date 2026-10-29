@@ -125,6 +125,9 @@ def _parts(accurate: bool, dtype) -> int:
 DROPPING = ("the Mosaic mainloop draws dropout at its own places; a sequence exchange's slice draws at its "
             "global places, a table gather a tile (`DropPlaces`)")
 """Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
+DROPPING_BACKWARD = ("the Mosaic backward takes no dropout's D yet: a dropping call's D is its dropped "
+                     "products' own pass over the keys (`algebra.dropout_centre`), which no Mosaic launch runs")
+"""Why the Mosaic backward refuses a dropping call (`refused`); its forward draws it."""
 
 
 def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
@@ -158,6 +161,8 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if hooks.drop is not None and (hooks.drop.queries is not None or hooks.drop.keys is not None):
         return DROPPING
+    if hooks.drop is not None and backward:
+        return DROPPING_BACKWARD
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
         return f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}"
     if jnp.dtype(dtype) not in sixteen:

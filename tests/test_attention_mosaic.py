@@ -256,29 +256,27 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
 
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
                     residuals_from=None, target: generation.GpuTarget | None = None,
-                    config: attention_mosaic.BackwardTiles | None = None, drop: bool = False):
+                    config: attention_mosaic.BackwardTiles | None = None):
     """The backward in the form `form` names (`BACKWARD_FORMS`; None, the default form at `config`, else its
     derived one) over the call form `call` of `shape` (its keys `keys`) on `target` (`_device`), from the
     training forward's residuals at its pick: this mainloop's, or `residuals_from`'s (another mainloop's
-    `forward`, as the route feeds the Triton mainloop's), with `drop` under probability dropout
-    (`_dropping`)."""
+    `forward`, as the route feeds the Triton mainloop's)."""
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call])
-    hooks = _dropping(shape) if drop else None
     draw = _drawn(shape, jnp.bfloat16, keys=keys)
     accurate, config = (False, config) if form is None else BACKWARD_FORMS[form]
     trained = attention_mosaic.forward if residuals_from is None else residuals_from
 
     def ours(query, key, value, dout):
         with _device(interpret, target):
-            residuals = trained(query, key, value, spans, hooks, residuals=True, interpret=interpret)[1:]
+            residuals = trained(query, key, value, spans, residuals=True, interpret=interpret)[1:]
             with _pinned(backward=config):
-                grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
                                                   accurate=accurate, interpret=interpret)
         return grads.query, grads.key, grads.value
 
     def reference(query, key, value, dout):
-        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), query, key, value)
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form}", seeds=SEEDS)
@@ -343,13 +341,6 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training):
     (`template.Draw`), under the interpreter."""
     _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True,
                    training=training, drop=True)
-
-
-@INTERPRETS
-@pytest.mark.parametrize("form", BACKWARD_FORMS)
-def test_the_backward_is_on_par_dropping_interpreted(form):
-    """The backward in each form under probability dropout over a causal call, under the interpreter."""
-    _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True)
 
 
 @INTERPRETS
