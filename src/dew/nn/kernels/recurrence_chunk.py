@@ -678,11 +678,10 @@ PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
 port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
 shrinks as the template wins its cells, and no cell is picked or ranked at run time. Training is the
-template's: on an H100 its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff;
-2.56 against 3.14 on an H100 PCIe, SE-family-h100-e0de17766); on an A100 SXM4 40GB its forward and gradient
-4.56 ms against the port's 4.83 on Qwen3.5-27B's gated delta net and 3.44 against 4.69 on Qwen3-Next's, its
-keys launch a key block a program and its query/key launch's memory sum a product
-(JS-train80-a100-db2c4aca0)."""
+template's, its keys launch a key block a program and its query/key launch's memory sum a product: its
+forward and gradient on an H100 2.46 ms against the port's 3.12 on Qwen3.5-27B's gated delta net and 1.92
+against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an A100 SXM4 40GB 4.56 against 4.83 and
+3.44 against 4.69 (JS-train80-a100-db2c4aca0)."""
 
 def _trains(call: base.Call | None) -> bool:
     """Whether the recurrence template's gradient runs the call (`Mosaic.trains`)."""
