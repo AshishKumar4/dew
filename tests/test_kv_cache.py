@@ -226,7 +226,7 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
         return run
 
     assert_as_exact(derivatives(native), derivatives(gathered), draw, "paged decode kernel",
-                    seeds=PAGED_DERIVATIVE_SEEDS[width, windowed, softcap is not None, sunk],
+                    seeds=PAGED_DERIVATIVE_SEEDS,
                     truth_fn=derivatives(wide))
 
 
@@ -352,10 +352,10 @@ def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_head
     tpu_lowering(step, arguments, mesh)
 
 
-PAGED_DERIVATIVE_SEEDS = {(width, windowed, capped, sunk): 16 for width in (64, 256)
-                          for windowed in (False, True) for capped in (False, True) for sunk in (False, True)}
-"""The native paged kernel's declared seeds, by width, window, softcap and sinks, sized on an A100 and an H100
-by paired `seeds_for` (the test runs only on a GPU)."""
+PAGED_DERIVATIVE_SEEDS = 8
+"""The native paged kernel's declared seeds, each width, window, softcap and sinks alike: sized 8 on an A100
+and on an H100 by paired `seeds_for` (receipts ig-size1931@a100 and @h100 at 681226dd9; the test runs only
+on a GPU)."""
 
 SOFTCAP_PAGED_SEEDS = 8
 """The softcapped paged decode's declared draws (check 1)."""
