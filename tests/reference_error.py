@@ -1465,8 +1465,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     also = dict(also or {})
     mixed = not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in also.values())
     if also and mixed:
-        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's kind, "
-                         f"plain or as given, so one compilation of Dew's pairs with all")
+        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's "
+                         f"kind, plain or as given, so one compilation of Dew's pairs with all")
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
     further = [_arms(dew_fn, fn)[1] for fn in also.values()]
