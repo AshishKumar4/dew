@@ -430,11 +430,14 @@ class KernelOp(tokamax.Op):
                 collected.found.taken.append((config, ba))
         elif not self.pinnable(ba, config):
             raise Unpinnable(type(self).__name__, config, self.unpinnable(ba, config))
+        # The launch runs on its bound arguments, the facts its binding states from its operands (a
+        # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them.
         if cache.KERNEL_LAUNCHES.value:
             # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
             # each traced array for its devices (`keyed`).
-            return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *args, **kwargs)
-        return self._fwd(*args, config=config, **kwargs)[0]
+            return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *ba.args,
+                                       **ba.kwargs)
+        return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
 
     def chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         """The config a launch of `ba` takes where it traces now: the op's own `config` where it carries

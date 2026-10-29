@@ -672,17 +672,16 @@ PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('mma.sync', 'forward'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
                                      "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against "
                                      "0.942 on Qwen3-Next's (SE-family-a100-1a31d279a)"),
-    ('mma.sync', 'training'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward and gradient 4.77 ms "
-                                      "against the template's 5.53 on Qwen3.5-27B's gated delta net (its "
-                                      "gradient the port's, the fast backward's launches not holding an "
-                                      "A100's registers) (SE-family-a100-1a31d279a)"),
 }
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
 port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
-shrinks as the template wins its cells, and no cell is picked or ranked at run time. Training on an H100 is
-the template's: its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff; 2.56
-against 3.14 on an H100 PCIe, SE-family-h100-e0de17766)."""
+shrinks as the template wins its cells, and no cell is picked or ranked at run time. Training is the
+template's: on an H100 its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff;
+2.56 against 3.14 on an H100 PCIe, SE-family-h100-e0de17766); on an A100 SXM4 40GB its forward and gradient
+4.56 ms against the port's 4.83 on Qwen3.5-27B's gated delta net and 3.44 against 4.69 on Qwen3-Next's, its
+keys launch a key block a program and its query/key launch's memory sum a product
+(JS-train80-a100-db2c4aca0)."""
 
 def _trains(call: base.Call | None) -> bool:
     """Whether the recurrence template's gradient runs the call (`Mosaic.trains`)."""
