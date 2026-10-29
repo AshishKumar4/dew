@@ -944,7 +944,10 @@ def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | No
     word once, on its vector (`Draw.words`), its keys entry for entry: the same bits, half the hashing."""
     if coords.drop is None:
         return None
-    if queries is coords.q_pos and jnp.shape(queries) == jnp.shape(keys) and jnp.ndim(keys) == 2:
+    # A tile whose rows are its queries reduces along its own rows; one whose rows are its keys (the keys
+    # first, `Coords.keys_first`) would reduce across its warps, through scratch its launch holds none of.
+    if (queries is coords.q_pos and jnp.shape(queries) == jnp.shape(keys) and jnp.ndim(keys) == 2
+            and not coords.keys_first):
         words = coords.queries(coords.drop.words(coords.query_places()), keys)
         return coords.drop.multiplied(coords.drop.kept(words, keys))
     return coords.drop(queries, keys)
