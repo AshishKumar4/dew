@@ -4,15 +4,16 @@ source's own initialization: each loads through its family's reader and computes
 par with the source's own float32 run from its float64 twin (check 1)."""
 
 import json
+import shutil
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import transformers_arms, transformers_model
-from reference_error import assert_as_exact, seeds_for
+from interop_support import fixture_ids, transformers_arms, transformers_model
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, seeds_for, widened
 
 from dew.interop import Pretrained
-from dew.interop.hf_decoders import translate_config
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
@@ -50,23 +51,80 @@ def test_minicpm5_computes_transformers_logits_through_the_llama_reader(tmp_path
                     seeds=seeds, truth_fn=truth)
 
 
+def at_tiny_dims(release: str, tiny: str, dims: tuple[str, ...], directory: Path, **beside) -> Path:
+    """Fixture `release`'s released config at fixture `tiny`'s `dims` (and `beside`), over `tiny`'s weights,
+    written to `directory`: the release's every other field as it states it, its quantization left with
+    the weights it covers."""
+    stated = json.loads((FIXTURES / release / "config.json").read_text())
+    small = json.loads((FIXTURES / tiny / "config.json").read_text())
+    shutil.copytree(FIXTURES / tiny, directory)
+    config = {**{key: value for key, value in stated.items() if key != "quantization_config"},
+              **{key: small[key] for key in dims}, **beside}
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
+def assert_recorded_logits(directory: Path, tiny: Path, label: str) -> None:
+    """Check 1 of the checkpoint at `directory`'s logits against the source's recorded over `tiny`'s drawn
+    ids (its recorded_logits.npz, `indexed_recording`), Dew's float64 run held to the recording's sketch."""
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    path = tiny / "recorded_logits.npz"
+    seeds = declared_seeds(path)["logits"]
+    draw = fixture_ids(tiny)
+    wide, held = loaded.model.clone(dtype=jnp.float64), widened(loaded.variables)
+    drawn, reference, truth = indexed_recording(
+        recording(path), "logits", seeds, leaves=("logits",),
+        truth_fn=lambda inputs: {"logits": wide.apply(held, inputs["input_ids"])},
+        inputs_of=lambda seed: {"input_ids": draw(seed)[0]})
+    def ours(index, inputs):
+        return {"logits": loaded.model.apply(loaded.variables, inputs["input_ids"])}
+
+    assert_as_exact(ours, reference, drawn, label, seeds=seeds, truth_fn=truth)
+
+
+M2_DIMS = ("head_dim", "hidden_size", "intermediate_size", "max_position_embeddings", "num_attention_heads",
+           "num_experts_per_tok", "num_hidden_layers", "num_key_value_heads", "num_local_experts",
+           "rotary_dim", "vocab_size")
+"""The fields that size a MiniMax-M2 checkpoint, which its tiny states at its own small values."""
+
+
 @pytest.mark.parametrize("name", ["minimax-m2.5", "minimax-m2.7"])
-def test_a_later_minimax_release_reads_as_m2_at_its_own_context(name):
-    """MiniMax-M2.5's and M2.7's released configs leave out fields M2's states at the values M2's own
-    defaults give (dropout, the unread linear-attention betas, the shared-expert mode) and M2.7 widens the
-    context: each reads through the M2 reader as M2's model at its own context, the model whose
-    computation M2's source qualifies (tests/test_hf_decoder_moe.py)."""
-    later = json.loads((FIXTURES / name / "config.json").read_text())
-    m2 = json.loads((FIXTURES / "minimax-m2" / "config.json").read_text())
-    assert translate_config(later) == translate_config(
-        {**m2, "max_position_embeddings": later["max_position_embeddings"]})
+def test_a_later_minimax_release_computes_m2s_source_logits(name, tmp_path):
+    """MiniMax-M2.5's and M2.7's released configs (which leave out fields M2's states at the values the
+    family's defaults give, and M2.7 widens the context) at minimax-m2-tiny's sizes, over its weights:
+    each reads through the M2 reader and computes the logits MiniMax-M2's source computed over them
+    (transformers' MiniMaxM2ForCausalLM, recorded by tools/hf_reference.py), on par with them over the
+    recording's seeds (check 1). The released configs' prediction depths are absent from the weights, so
+    the checkpoint loads as its trunk."""
+    tiny = json.loads((FIXTURES / "minimax-m2-tiny" / "config.json").read_text())
+    directory = at_tiny_dims(name, "minimax-m2-tiny", M2_DIMS, tmp_path / name,
+                             attn_type_list=[1] * tiny["num_hidden_layers"])
+    assert_recorded_logits(directory, FIXTURES / "minimax-m2-tiny", f"{name} logits")
 
 
-def test_diffucoder_reads_through_the_dream_reader_as_dream():
-    """DiffuCoder-7B's released config is Dream-v0-7B's but for its stored dtype, and its model code is
-    Dream-v0's byte for byte (tools/hf_reference.py): it reads through the Dream reader as Dream's model,
-    whose logits Dream's own code qualifies (tests/test_hf_decoders.py, dream-tiny)."""
-    diffucoder = json.loads((FIXTURES / "diffucoder-7b" / "config.json").read_text())
-    dream = json.loads((FIXTURES / "dream-7b" / "config.json").read_text())
-    stored = {**dream, "torch_dtype": diffucoder["torch_dtype"]}
-    assert translate_config(diffucoder) == translate_config(stored)
+DREAM_DIMS = ("hidden_size", "intermediate_size", "max_position_embeddings", "mask_token_id",
+              "num_attention_heads", "num_hidden_layers", "num_key_value_heads", "pad_token_id", "vocab_size")
+"""The fields that size a Dream checkpoint, its token ids among them, which dream-tiny states small."""
+
+
+def test_diffucoder_computes_dreams_source_logits(tmp_path):
+    """DiffuCoder-7B's released config (Dream-v0-7B's but for its stored dtype; its configuration_dream.py
+    and modeling_dream.py are Dream-v0's at 6572adb byte for byte, tools/hf_reference.py) at dream-tiny's
+    sizes, over its weights, reads through the Dream reader and computes the logits Dream's own code
+    computed over them (tools/remote_code_reference.py --record), on par with them over the recording's
+    seeds (check 1). Its end tokens, ids past the tiny vocabulary, are left with its sizes."""
+    from model_support import remote_code_site
+    from remote_code_draws import draw
+
+    directory = at_tiny_dims("diffucoder-7b", "dream-tiny", DREAM_DIMS, tmp_path / "diffucoder",
+                             bos_token_id=None, eos_token_id=None)
+    source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    path, label = FIXTURES / "dream-tiny" / "released.npz", "dream-tiny logits"
+    seeds = declared_seeds(path)[label]
+    vocabulary = json.loads((directory / "config.json").read_text())["vocab_size"]
+    drawn, reference, truth = indexed_recording(
+        recording(path), label, seeds, inputs_of=lambda seed: draw("logits", seed, vocabulary),
+        truth_fn=remote_code_site(source, "logits", wide=True))
+    forward = remote_code_site(source, "logits")
+    assert_as_exact(lambda index, inputs: forward(inputs), reference, drawn, "DiffuCoder logits", seeds=seeds,
+                    truth_fn=truth)
