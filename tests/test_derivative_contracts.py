@@ -51,6 +51,14 @@ def orders(fn, primals, direction, cotangent):
     }
 
 
+def ran(order, label: str, name: str):
+    """`order()`'s leaves as arrays, a failure to run named by the seam and the order that raised it."""
+    try:
+        return jax.tree.map(np.asarray, order())
+    except Exception as error:
+        raise AssertionError(f"{label}: its {name} does not run: {type(error).__name__}: {error}") from error
+
+
 def assert_contract(fn, primals, direction, cotangent, label: str) -> None:
     """Every order of `fn` runs at the draw, and each leaf is finite wherever the same order's float64
     run is a normal float32."""
@@ -58,9 +66,9 @@ def assert_contract(fn, primals, direction, cotangent, label: str) -> None:
     with jax.enable_x64(new_val=True):
         wide_primals, wide_direction, wide_cotangent = widened((primals, direction, cotangent))
         wide = orders(fn, wide_primals, wide_direction, wide_cotangent)
-        truths = {name: jax.tree.map(np.asarray, order()) for name, order in wide.items()}
+        truths = {name: ran(order, f"{label} in float64", name) for name, order in wide.items()}
     for name, order in narrow.items():
-        values = jax.tree.leaves(jax.tree.map(np.asarray, order()))
+        values = jax.tree.leaves(ran(order, label, name))
         for index, (value, truth) in enumerate(zip(values, jax.tree.leaves(truths[name]), strict=True)):
             if not np.issubdtype(value.dtype, np.inexact):
                 continue
