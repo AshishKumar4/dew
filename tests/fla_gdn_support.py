@@ -13,6 +13,7 @@ import jax.numpy as jnp
 from gdn_cases import CASES
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
+from dew.nn.kernels.templates import resources
 from dew.nn.precision import l2norm
 
 COMPILED_SHAPES = {name: CASES[name] for name in ("0.8b", "9b", "27b", "wide keys")}
@@ -25,12 +26,10 @@ class KernelCase(NamedTuple):
 
     name: str
     call: Callable[[], tuple[Callable, tuple[jax.ShapeDtypeStruct, ...]]]
-    models: Mapping[str, Mapping[str, int]] | None = None
-    """Each of its Mosaic GPU kernels' resources by its template's model, by kernel name: the registers a
-    consumer thread holds (`registers`), the budget a launch holds them within (`budget`), its consumer
-    warpgroups (`consumers`), a producer warpgroup's registers a thread (`producer`, 0 without one) and the
-    most programs its family runs a multiprocessor (`most`), which the compile gate decides on as it decides
-    on ptxas's need (`kernel_compile.mosaic_failures`)."""
+    models: Mapping[str, resources.RegisterModel] | None = None
+    """Each of its Mosaic GPU kernels' register decision by its template's model, by kernel name
+    (`resources.RegisterModel`), which the compile gate decides on as it decides on ptxas's need
+    (`kernel_compile.mosaic_failures`)."""
 
 
 def _pinned(launch, tiles, *args, **kwargs):

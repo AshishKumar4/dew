@@ -199,8 +199,10 @@ def _sqrt(x, *, interpret: bool):
     return jnp.sqrt(x) if interpret else _inline("sqrt.rn.f32 $0, $1;", x)
 
 
-def _preactivation(window, taps, bias):
-    """The conv's sum in fp32, tap by tap from the oldest token, then the bias."""
+def preactivation(window, taps, bias):
+    """The conv's sum, tap by tap from the oldest token, then the bias: `window` and `taps` each tap's
+    inputs `[..., C]` and weights `[C]`, oldest first, in the sum's dtype (fp32 in the kernels; the portable
+    conv's and the decode reference's at least fp32), the one order every conv path adds in."""
     total = window[0] * taps[0][None, :]
     for inputs, tap in zip(window[1:], taps[1:], strict=True):
         total = total + inputs * tap[None, :]
@@ -251,7 +253,7 @@ def _forward_kernel(*refs, pieces: tuple[tuple[int, int, int, bool], ...], rows:
             columns = first + local
             taps, bias = _taps(w_ref, b_ref, columns, count)
             window = tuple(_rows(x_ref, tokens - count + 1 + tap, columns, length) for tap in range(count))
-            y = _preactivation(_alone(window, documents, documents[-1]), taps, bias)
+            y = preactivation(_alone(window, documents, documents[-1]), taps, bias)
             if activation:
                 y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
             if normalised:
@@ -294,7 +296,7 @@ def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: 
         ahead = load(tokens + 1)
         stream, documents = (*history, current), (*owners, document)
         window = _alone(stream, documents, document)
-        pre = _preactivation(window, taps, bias)
+        pre = preactivation(window, taps, bias)
         gate = _sigmoid(pre, interpret=interpret) if activation else None
         out = pre if gate is None else pre * gate
         if normalised:
