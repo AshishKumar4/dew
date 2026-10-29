@@ -84,6 +84,20 @@ def _schedule(value: Weight) -> optax.Schedule:
     return value if callable(value) else optax.constant_schedule(value)
 
 
+def _refuse_other_tokenizers(student: str, teacher: str) -> None:
+    """Refuse a teacher whose tokenizer's vocabulary, each string's id, differs from the student's."""
+    from dew.data.text import tokenizer_for
+
+    def vocabulary(name: str) -> dict[str, int]:
+        # Dew's byte tokenizer's ids are the bytes themselves; an HF tokenizer's are its vocabulary's.
+        held = tokenizer_for(name)
+        return {"byte": held.vocab_size} if name == "byte" else dict(held.tokenizer.get_vocab())
+
+    if student != teacher and vocabulary(student) != vocabulary(teacher):
+        raise ValueError(f"the teacher's tokenizer {teacher} maps strings to other ids than the student's "
+                         f"{student}: the term compares one id's probabilities on both sides")
+
+
 class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
     """Mixes the student's own loss with a frozen teacher's soft targets."""
 
@@ -97,6 +111,8 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         features: Sequence[tuple[int, int]] = (),
         beta: Weight = 0.0,
         feature_loss: FeatureLoss = "cosine",
+        divergence: Literal["full", "selected"] = "full",
+        tokenizers: tuple[str, str] | None = None,
     ):
         """Build a distillation of `teacher` into `student` over one batch.
 
@@ -112,10 +128,29 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         no pairs the term is left out, and a nonzero `beta` with no pairs
         raises `ValueError`.
 
+        `divergence` is the term the teacher's distribution enters by: `full`, the KL from the teacher
+        to the student over the whole vocabulary at every position; `selected`, on-policy
+        distillation's reverse KL at the tokens the batch holds, which the student sampled, each
+        position's log-ratio log pi_s(y) - log pi_t(y) the reward its score function is weighted by
+        (the gradient of the expected reverse KL, its estimate reported), at temperature 1.
+
+        `tokenizers` names the student's and the teacher's tokenizers (`dew.data.text.tokenizer_for`):
+        two whose vocabularies differ are refused, though their sizes match, since the term compares
+        one id's probabilities on both sides.
+
+        A position whose teacher scores are not finite is left out of the term, its count reported
+        (`distill/teacher_nonfinite`), never trained on.
+
         Each of `alpha`, `temperature` and `beta` is a constant or an
         `optax.Schedule` of the step. A constant outside its range (alpha in
         [0, 1], temperature above 0, beta at least 0) raises `ValueError`.
         """
+        if divergence not in ("full", "selected"):
+            raise ValueError(f"divergence is full or selected, not {divergence!r}")
+        if divergence == "selected" and (callable(temperature) or temperature != 1):
+            raise ValueError("selected distillation scores the sampled tokens at temperature 1")
+        if tokenizers is not None:
+            _refuse_other_tokenizers(*tokenizers)
         for name, value, ok in (("alpha", alpha, lambda v: 0 <= v <= 1),
                                 ("temperature", temperature, lambda v: v > 0),
                                 ("beta", beta, lambda v: v >= 0)):
@@ -131,6 +166,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
                 "beta weights the feature term over the (teacher, student) layer "
                 "pairs in features, and none were named")
         self.feature_loss: FeatureLoss = feature_loss
+        self.divergence = divergence
         self.inputs = student.inputs
         # The student's batches and their tokens, which the teacher scores too.
         self.counts_tokens = student.counts_tokens
@@ -272,13 +308,29 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         weights = student.weights.astype(jnp.float32)
         mass = statistics.mass
         counted = jnp.where(mass > 0, mass, 1)
-        divergence = categorical.kl_divergence(student.logits / temperature, teacher.logits / temperature)
-        soft = self.row_mean(divergence, batch, weights=weights).total
+        # A position the teacher scores non-finitely is left out, its scores made finite before any
+        # arithmetic so no NaN reaches a gradient through the masked branch.
+        finite = jnp.all(jnp.isfinite(teacher.logits), axis=-1) & jnp.isfinite(teacher.losses)
+        held = jnp.where(finite[..., None], teacher.logits, 0)
+        teacher_losses = jnp.where(finite, teacher.losses, 0)
+        scored = weights * finite
+        if self.divergence == "full":
+            divergence = categorical.kl_divergence(student.logits / temperature, held / temperature)
+            soft = self.row_mean(divergence, batch, weights=scored).total
+            estimate = soft
+        else:
+            # log pi_s(y) - log pi_t(y) at the sampled y, the reward the student's log-likelihood is
+            # weighted by (its score function); the estimate itself is reported.
+            ratio = teacher_losses - student.losses.astype(jnp.float32)
+            soft = self.row_mean(jax.lax.stop_gradient(ratio) * -student.losses.astype(jnp.float32), batch,
+                                 weights=scored).total
+            estimate = self.row_mean(jax.lax.stop_gradient(ratio), batch, weights=scored).total
         total = (1 - alpha) * statistics.total + alpha * temperature ** 2 * soft
         reported = {**aux.metrics, "distill/alpha": alpha, "distill/temperature": temperature,
-                    "distill/kl": soft / counted, "distill/soft_loss": temperature ** 2 * soft / counted,
-                    "distill/teacher_loss": (self.row_mean(teacher.losses, batch, weights=weights).total
-                                             / counted)}
+                    "distill/kl": estimate / counted, "distill/soft_loss": temperature ** 2 * soft / counted,
+                    "distill/teacher_loss": (self.row_mean(teacher_losses, batch, weights=scored).total
+                                             / counted),
+                    "distill/teacher_nonfinite": jnp.sum(weights * ~finite)}
         if self.features:
             projections = variables["params"].get(PROJECTIONS, {})
             distances = []

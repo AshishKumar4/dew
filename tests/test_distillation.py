@@ -13,6 +13,7 @@ refusal of a vocabulary mismatch, and a real trainer run on CPU where the
 teacher never moves and a resumed run lands where the straight one does.
 """
 
+import dataclasses
 import functools
 import itertools
 import json
@@ -496,3 +497,74 @@ def test_a_distillation_trains_for_a_count_of_its_students_tokens():
     alone = Trainer(objective.student, optax.sgd(0.0), key=0).fit(fixed(batch), tokens=3 * tokens,
                                                                   log_every=1)
     assert int(distilled.step) == int(alone.step) == 3
+
+
+def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_kl_reward():
+    """On-policy distillation at the tokens the batch holds (`divergence='selected'`, alpha 1): its
+    gradient is the score function of each sampled token weighted by its log-ratio
+    log pi_s(y) - log pi_t(y), the teacher frozen, as the hand formula over the two models' own
+    log-likelihoods gives it, bit for bit; the reported estimate is that log-ratio's mean."""
+    arrays = fixture()
+    objective, params = fixture_objective(arrays, alpha=1.0, temperature=1.0, beta=0.0, features=[],
+                                          divergence="selected")
+    batch = fixture_batch(arrays)
+    student, teacher = objective.student, objective.teacher
+
+    def by_hand(student_params):
+        _, _, own = student.predict(objective.student_variables({**params, "params": student_params}), batch,
+                                    step_at(), train=False)
+        _, _, held = teacher.predict(params[TEACHER], batch, step_at(), train=False)
+        ratio = jax.lax.stop_gradient(held.losses - own.losses)
+        weights = own.weights.astype(jnp.float32)
+        return jnp.sum(ratio * -own.losses * weights) / jnp.sum(weights)
+
+    found = jax.grad(lambda p: objective.scalar_loss({**params, "params": p}, batch, step_at()))(
+        params["params"])
+    expected = jax.grad(by_hand)(params["params"])
+    jax.tree.map(np.testing.assert_array_equal, objective.student_variables({"params": found})["params"],
+                 objective.student_variables({"params": expected})["params"])
+    with pytest.raises(ValueError):
+        DistillationObjective(student, teacher, divergence="selected", temperature=2.0)
+
+
+def test_a_teacher_position_scored_non_finitely_is_counted_and_never_trained_on():
+    """A teacher whose logits are NaN at one position leaves that position out of the distillation term:
+    the loss and its gradient are finite and equal the loss over the other positions alone, and the
+    excluded weight is reported."""
+    arrays = fixture()
+    objective, params = fixture_objective(arrays, alpha=1.0)
+    batch = fixture_batch(arrays)
+    original = objective.teacher.predict
+
+    def broken(variables, held, step, **kwargs):
+        statistics, aux, prediction = original(variables, held, step, **kwargs)
+        logits = prediction.logits.at[0, 1].set(jnp.nan)
+        return statistics, aux, dataclasses.replace(prediction, logits=logits,
+                                                    losses=prediction.losses.at[0, 1].set(jnp.nan))
+
+    objective.teacher.predict = broken
+    loss, aux = objective.loss(params, batch, step_at())
+    gradient = jax.grad(lambda p: objective.scalar_loss({**params, "params": p}, batch, step_at()))(
+        params["params"])
+    assert np.isfinite(float(loss.total))
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(gradient))
+    assert float(aux.metrics["distill/teacher_nonfinite"]) > 0
+
+
+def test_a_teacher_with_another_tokenizer_of_the_same_size_is_refused(tmp_path):
+    """Two tokenizers whose vocabularies are the same size but map two strings to each other's ids are
+    refused: the term compares one id's probabilities on both sides. The same tokenizer twice is not."""
+    import shutil
+
+    student, teacher = (LMObjective(model, SEQ, ema_decay=None) for model in models())
+    chat = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
+    swapped = tmp_path / "swapped"
+    shutil.copytree(chat, swapped)
+    spec = json.loads((swapped / "tokenizer.json").read_text())
+    vocabulary = spec["model"]["vocab"]
+    first, second = sorted(vocabulary, key=vocabulary.get)[100:102]
+    vocabulary[first], vocabulary[second] = vocabulary[second], vocabulary[first]
+    (swapped / "tokenizer.json").write_text(json.dumps(spec))
+    DistillationObjective(student, teacher, tokenizers=(str(chat), str(chat)))
+    with pytest.raises(ValueError):
+        DistillationObjective(student, teacher, tokenizers=(str(chat), str(swapped)))
