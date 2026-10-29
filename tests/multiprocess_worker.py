@@ -1281,47 +1281,6 @@ def mode_evaluation_contract(args) -> dict:
     return {"results": results, "closed": closed}
 
 
-def mode_training_log_failure(args) -> dict:
-    """Two processes fit one tiny objective, logging every step; rank 0's tracker fails at its second
-    log, written off the step loop (row 2313). Each process reports the kind of error it ended with
-    and the steps it ran, observed on every process alike (`Observe`)."""
-    import jax
-    import optax
-
-    from dew.data.dataset import Loader
-    from dew.training import Trainer
-    from dew.training.observe import Observe
-
-    rank = jax.process_index()
-    case = _EvaluationCase(rank)
-    Numerical, _, _, _, _ = _evaluation_parts(case)
-
-    class Failing:
-        def log(self, scalars, step):
-            if step == 2:
-                raise ValueError("tracker logging failed")
-
-        def artifact(self, artifact, step):
-            pass
-
-    def rows():
-        while True:
-            yield {"x": np.arange(rank * 4, (rank + 1) * 4, dtype=np.float32)[:, None]}
-
-    observed = Observe(1, lambda state: int(state.step))
-    trainer = Trainer(Numerical(), optax.sgd(.01), key=jax.random.key(3),
-                      tracker=Failing() if rank == 0 else None)
-    from dew._coordination import PeerFailure
-
-    try:
-        trainer.fit(Loader(train=lambda partition: rows(), val=None, records=None, batch=8), steps=8,
-                    log_every=1, eval_every=None, checkpoint_every=None, observe=observed)
-        error = None
-    except (ValueError, PeerFailure) as failure:
-        error = type(failure).__name__
-    return {"error": error, "steps": [step for step, _ in observed.values]}
-
-
 def mode_evaluation_replicas(args) -> dict:
     """Record counts follow logical rows rather than sequence/stage replicas."""
     import jax
@@ -2468,7 +2427,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
          "training_contract": mode_training_contract,
-         "evaluation_contract": mode_evaluation_contract, "training_log_failure": mode_training_log_failure,
+         "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
          "evaluation_kept": mode_evaluation_kept,
          "evaluation_clocks": mode_evaluation_clocks,

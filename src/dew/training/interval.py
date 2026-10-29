@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
-from typing import NamedTuple, Protocol, runtime_checkable
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -439,9 +439,9 @@ class LogWriter:
     point every process reaches alike (`raise_failure`), where it agrees on it, never on these threads."""
 
     def __init__(self) -> None:
-        self._reads: queue.SimpleQueue[tuple[Callable[[], object], Callable[[object], None], Future] | None]
+        self._reads: queue.SimpleQueue[tuple[Callable[[], Any], Callable[[Any], None], Future] | None]
         self._reads = queue.SimpleQueue()
-        self._reports: queue.SimpleQueue[tuple[object, Callable[[object], None], Future] | None]
+        self._reports: queue.SimpleQueue[tuple[Any, Callable[[Any], None], Future] | None]
         self._reports = queue.SimpleQueue()
         self._threads: tuple[threading.Thread, ...] = ()
         self._writes: collections.deque[tuple[Future, Callable[[], bool]]] = collections.deque()

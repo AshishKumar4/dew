@@ -315,22 +315,6 @@ class Trainer(Generic[Loss, Effects]):
         self.profile = profile
         self.lower_for, self._ahead, self.tune_kernels = lower_for, ahead, tune_kernels
         self.inspection = inspection
-        self._fresh_compile_state(links)
-        # The microbatches a step's batch is read in, once decided (`split`,
-        # 1 where `whole`, a pooling state's window, or the first plan), which
-        # cut every batch the run reads (`_rows`, read off `fit`'s data).
-        self._split: int | None = 1 if whole is not None else split
-        self._rows: tuple[int, ...] | None = None
-        # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
-        self._ramp: tuple[Stage, ...] = ()
-        self._stage_starts: frozenset[int] = frozenset()
-        # The training batch's device steps, which the compiled step runs (`Loader.device`).
-        self._device: tuple[DeviceStep, ...] = ()
-        self._prefetch = PREFETCH_DEPTH
-
-    def _fresh_compile_state(self, links: Mapping[str, Link] | None) -> None:
-        """The state a trainer's compiles and reports start from: no step compiled, planned or validated,
-        the links `links` states, no rung taken or resumed, and its display."""
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The executable is the step as compiled, whose memory analysis a
         # benchmark reads; the program it was lowered from is released with its plan (`Planned.released`).
@@ -348,6 +332,22 @@ class Trainer(Generic[Loss, Effects]):
         # The links the last compiled step decided its projections by, which say whether one spread over
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
+        self._fresh_compile_state(links)
+        # The microbatches a step's batch is read in, once decided (`split`,
+        # 1 where `whole`, a pooling state's window, or the first plan), which
+        # cut every batch the run reads (`_rows`, read off `fit`'s data).
+        self._split: int | None = 1 if whole is not None else split
+        self._rows: tuple[int, ...] | None = None
+        # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
+        self._ramp: tuple[Stage, ...] = ()
+        self._stage_starts: frozenset[int] = frozenset()
+        # The training batch's device steps, which the compiled step runs (`Loader.device`).
+        self._device: tuple[DeviceStep, ...] = ()
+        self._prefetch = PREFETCH_DEPTH
+
+    def _fresh_compile_state(self, links: Mapping[str, Link] | None) -> None:
+        """The private state a trainer's compiles and reports start from: the links `links` states, none
+        measured, no rung taken or resumed, and its display."""
         self._stated_links = dict(links or {})
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
@@ -577,7 +577,7 @@ class Trainer(Generic[Loss, Effects]):
         device's memory or a layout that replicates too much of the model, and ValueError for
         rules that name an axis the mesh lacks.
         """
-        self._schedule(None if steps is None else steps // self.accumulation)
+        self.scheduled(None if steps is None else steps // self.accumulation)
         state = jax.eval_shape(self.initial_state)
         if batch is None:
             return self._validated(state, capacity)[1]
@@ -1347,7 +1347,7 @@ class Trainer(Generic[Loss, Effects]):
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
             examples=examples, accumulation=self.accumulation, startup=self._startup)
         self.reading(loader, device_prefetch)
-        self._schedule(None if steps is None else steps // self.accumulation)
+        self.scheduled(None if steps is None else steps // self.accumulation)
         plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
                           written=(log_every, eval_every, checkpoint_every),
                           checkpoint_final=checkpoint_final, metrics=metrics, preview=preview,
@@ -1406,8 +1406,10 @@ class Trainer(Generic[Loss, Effects]):
             branches=() if cooldowns is None else cooldowns.branches(steps, tokens, self.accumulation),
         )
 
-    def _schedule(self, updates: int | None) -> None:
-        """The configured optimizer, built for `updates` updates; its state holds the rate it logs."""
+    def scheduled(self, updates: int | None) -> None:
+        """Build the configured optimizer (an `OptimConfig`) for `updates` updates, as `fit` and
+        `validate` do for their run's length; its state holds the rate it logs. A trainer given an Optax
+        transformation keeps it."""
         if self._config is None:
             return
         built = self._config.build(updates)

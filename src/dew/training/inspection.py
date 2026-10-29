@@ -19,6 +19,8 @@ import jax
 import jax.numpy as jnp
 import optax
 
+from dew.optim import parameter_name
+
 if TYPE_CHECKING:
     from dew.batch import Batch
     from dew.training.trainer import Trainer
@@ -34,12 +36,13 @@ from the update."""
 class Inspection:
     """What a run watches and how often (row 2317).
 
-    `paths` are globs over a parameter's path under `params`, its parts joined by '/'
-    (`layers_0/attn/q_proj/kernel`, `*norm*`); each leaf a glob selects is summarized on its own, for each
-    target: its mean, root mean square, largest magnitude, non-finite count and zero fraction. Every
-    sampled step also reports each target's global L2 norm, over every parameter, and the update-to-weight
-    ratio, ||update|| / ||params||. `every` is the steps between samples; the run's logs carry the latest
-    sample, so a cadence of the logs' or a multiple of it reports each sample once."""
+    `paths` are globs over a parameter's path under `params` (`dew.optim.parameter_name`:
+    `layers_0/attn/q_proj/kernel`, `*norm*`), as a `ParamGroup`'s patterns are; each leaf a glob
+    selects is summarized on its own, for each target: its mean, root mean square, largest magnitude,
+    non-finite count and zero fraction. Every sampled step also reports each target's global L2 norm,
+    over every parameter, and the update-to-weight ratio, ||update|| / ||params||. `every` is the steps
+    between samples; the run's logs carry the latest sample, so a cadence of the logs' or a multiple of
+    it reports each sample once."""
 
     paths: tuple[str, ...] = ()
     targets: tuple[Target, ...] = ("params", "grads", "updates", "deltas")
@@ -48,7 +51,7 @@ class Inspection:
     def __post_init__(self):
         if self.every < 1:
             raise ValueError(f"an inspection samples every positive number of steps, not {self.every}")
-        unknown = set(self.targets) - {"params", "grads", "updates", "deltas"}
+        unknown = {str(target) for target in self.targets} - {"params", "grads", "updates", "deltas"}
         if unknown:
             raise ValueError(f"an inspection's targets are params, grads, updates and deltas, not "
                              f"{sorted(unknown)}")
@@ -58,17 +61,14 @@ class Inspection:
         return step % self.every == 0
 
 
-def _path(path) -> str:
-    return "/".join(str(getattr(entry, "key", getattr(entry, "idx", entry))) for entry in path)
-
-
 def _leaf_statistics(leaf: jax.Array) -> dict[str, jax.Array]:
     """A leaf's summary, in float32 over its global array: mean, root mean square, largest magnitude,
     non-finite count and the fraction that is exactly zero. A non-finite entry makes the first three
     non-finite, as they are of the values, beside its count."""
     values = leaf.astype(jnp.float32)
     return {"mean": values.mean(), "rms": jnp.sqrt(jnp.square(values).mean()),
-            "abs_max": jnp.abs(values).max(), "non_finite": (~jnp.isfinite(values)).sum().astype(jnp.float32),
+            "abs_max": jnp.abs(values).max(),
+            "non_finite": (~jnp.isfinite(values)).sum().astype(jnp.float32),
             "zero_fraction": (values == 0).mean()}
 
 
@@ -84,7 +84,7 @@ def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[s
         tree = trees[target]
         found[f"{target}/l2"] = optax.global_norm(jax.tree.map(lambda leaf: leaf.astype(jnp.float32), tree))
         for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
-            name = _path(path)
+            name = parameter_name(path)
             if any(fnmatch.fnmatchcase(name, pattern) for pattern in inspection.paths):
                 found.update({f"{target}/{name}/{statistic}": value
                               for statistic, value in _leaf_statistics(leaf).items()})
@@ -94,7 +94,7 @@ def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[s
     return found
 
 
-def logged(inspected: Mapping[str, float]) -> dict[str, float]:
+def logged(inspected: Mapping[str, jax.typing.ArrayLike]) -> dict[str, float]:
     """A sample's scalars as a run logs them, under `inspect/`."""
     return {f"inspect/{name}": float(value) for name, value in inspected.items()}
 
@@ -106,7 +106,8 @@ def inspected(trainer: Trainer, batch: Batch, *, steps: int | None = None) -> di
     length, as `fit(steps=...)` builds it. The stepped state is discarded."""
     if trainer.inspection is None:
         raise ValueError("the trainer names no inspection (Trainer(inspection=...)) to report")
-    trainer._schedule(None if steps is None else steps // trainer.accumulation)
+    trainer.scheduled(None if steps is None else steps // trainer.accumulation)
     state, _, _ = trainer.place()
     *_, committed = trainer.compile(state, batch)(state, batch, sampled=True)
+    assert committed is not None, "a trainer that inspects runs its own transaction, which commits"
     return logged(jax.device_get(committed.inspected))
