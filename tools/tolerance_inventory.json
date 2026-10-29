@@ -394,7 +394,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kernels.py": {
-   "comparisons": 25,
+   "comparisons": 24,
    "lane": "Kernels"
   },
   "tests/test_kimi_k3.py": {
