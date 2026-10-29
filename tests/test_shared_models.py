@@ -104,7 +104,7 @@ def test_the_live_sampler_cell_runs_whole_through_the_stand_ins_as_dew_runs_it(s
     tree = ast.parse((SITE / "src" / "data" / "sampler.py").read_text())
     for keyword in ast.walk(tree):
         if isinstance(keyword, ast.keyword) and keyword.arg == "steps":
-            keyword.value = ast.Constant(4)
+            keyword.value = ast.copy_location(ast.Constant(4), keyword.value)
     cell = compile(tree, "sampler.py", "exec")
     # Dew's own run of the cell first: the stand-ins, once installed, refuse every other Dew module to the
     # rest of the test's process.
