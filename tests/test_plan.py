@@ -9,7 +9,6 @@ import contextlib
 import dataclasses
 import functools
 import gc
-import logging
 import struct
 import weakref
 from collections.abc import Callable, Iterator
@@ -41,10 +40,11 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
 from dew.state import TrainState, apart
+from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
 from dew.training.memory import climb_to, recompute_more, rung_record
-from dew.training.planning import TIMED_REPEATS, UNTIMED_FRONTIER, Trials, planned, splits
+from dew.training.planning import Trials, planned, splits
 
 ROWS, SEQ = 32, 16
 BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64, jnp.int32)}
@@ -219,10 +219,23 @@ def test_a_step_whose_rows_an_explicit_axis_types_is_read_whole():
     assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), 1, trainer._split) == [1]
 
 
-def lm(split=None, accumulation=1, **fields):
+EXECUTED: list[int] = []
+"""One entry for each time a compiled program ran a `Counted` objective's loss."""
+
+
+class Counted(LMObjective):
+    """An `LMObjective` whose loss reports each run of a program over it (`jax.debug.callback`): a
+    step's microbatch, or a trial's, counts once, which a compile alone does not."""
+
+    def loss(self, variables, batch, step):
+        jax.debug.callback(lambda: EXECUTED.append(1))
+        return super().loss(variables, batch, step)
+
+
+def lm(split=None, accumulation=1, objective=LMObjective, **fields):
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=SEQ, **fields)
-    return one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+    return one_device(Trainer(objective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
                               split=split, accumulation=accumulation))
 
 
@@ -358,18 +371,6 @@ def autopgle(runs: int) -> Iterator[None]:
 
 
 @dataclasses.dataclass
-class Timed(Trials):
-    """Trials whose frontier takes the `given` seconds, each frontier asked recorded in `asked`: the
-    frontier's choice at timings the clock would give by chance."""
-    given: list[list[float]] = dataclasses.field(default_factory=list)
-    asked: list[int] = dataclasses.field(default_factory=list)
-
-    def seconds(self, steps):
-        self.asked.append(len(steps))
-        return self.given
-
-
-@dataclasses.dataclass
 class Handed(Trials):
     """Trials that profile the plan admitted, keep a weak reference to the executable it was admitted with
     (`unguided`) and count the executables the backend holds then, it among them (`live`), and hand back
@@ -414,7 +415,7 @@ def test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle(tmp_path, s
     """Under JAX's AutoPGLE the step a plan compiles ahead of its run, which no jit call profiles, runs as
     many times as AutoPGLE profiles, each over the step's microbatches, on a trial: a copy of the state
     beside it, where its compile is given no trials, which the caller then steps as a run without
-    AutoPGLE does; and under `fit`, whose untimed frontier (Dew's tests' setting) keeps its first plan
+    AutoPGLE does; and under `fit`, whose admission keeps its first fitting plan
     and profiles it all the same. XLA's profile of a CPU holds nothing, so each plan keeps the executable
     it admitted."""
     unguided, _ = stepped(lm(split=split))
@@ -606,10 +607,10 @@ def windows(corpus):
                    loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
-def windowed(directory, split):
+def windowed(directory, split, remat=None, objective=LMObjective):
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
-                              max_seq_len=8)
-    return one_device(Trainer(LMObjective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
+                              max_seq_len=8, remat=remat)
+    return one_device(Trainer(objective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
                               split=split, layout=Layout(min_shard=1, tolerance=1.0),
                               checkpoints=Checkpoints(str(directory / "run"))))
 
@@ -632,12 +633,9 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_resumed_run_continues_the_plan_its_frontier_chose_untimed(tmp_path, monkeypatch):
-    """A run over two devices times its frontier, the batch whole as it fits and a rung up, and keeps one;
-    a run resumed from its checkpoint continues that plan without timing again, as the run it continues
-    compiled it, so the two train one program whatever a second timing would say."""
-    # The frontier timed, as the library times it: Dew's tests keep its first plan otherwise.
-    monkeypatch.delenv(UNTIMED_FRONTIER)
+def test_a_resumed_run_continues_its_admitted_plan_without_timing(tmp_path, monkeypatch):
+    """A run over two devices keeps its admitted plan, and a checkpoint resumed from it continues
+    that plan without compiling or timing optional alternatives."""
     corpus = token_files(tmp_path)
 
     def run(split):
@@ -647,76 +645,102 @@ def test_a_resumed_run_continues_the_plan_its_frontier_chose_untimed(tmp_path, m
 
     first = run(1)
     first.fit(windows(corpus), steps=2, checkpoint_every=2)
-    assert [timing["remat"] for timing in first.plan["timed"]] == [None, "minimal"]
+    assert first.plan["remat"] is None
     resumed = run(None)
     resumed.fit(windows(corpus), steps=4, checkpoint_every=2)
-    assert resumed.plan["timed"] is None
     assert (resumed.plan["split"], resumed.plan["remat"]) == (first.plan["split"], first.plan["remat"])
 
 
-@pytest.mark.parametrize("seconds, split, remat", [
-    ([[0.2, 0.21], [0.1, 0.12]], 1, "minimal"), ([[0.1, 0.12], [0.2, 0.21]], 2, None),
-    ([[0.2, 0.3], [0.1, 0.25]], 2, None)], ids=["whole", "split", "within-spread"])
-def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_kept(
-        monkeypatch, seconds, split, remat):
-    """Where the devices hold a byte less than the batch whole needs at the
-    least recomputation, it fits split there, and whole one remat rung up with
-    the head tiled: both are compiled and timed, and the plan is the whole one
-    only where its every sample beats the split one's (`faster`), the split one
-    where their samples overlap, the objective at its rung, each plan's fastest
-    sample recorded."""
+def test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling(monkeypatch):
+    """A batch that needs two microbatches keeps the first fitting plan, without compiling a
+    different remat to ask whether it is faster. Even explicitly supplied timing trials are not run:
+    the compile runs no program, and a step then runs its two microbatches alone (row 2230)."""
     free(monkeypatch, needs(monkeypatch, lm(split=1)) - 1)
-    trainer = lm()
+    trainer = lm(objective=Counted)
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH, given=seconds)
-    step = trainer.compile(state, BATCH, trials)
-    assert trials.asked == [2]
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (split, remat)
-    assert trainer.objective.model.remat == (None if remat is None else REMAT_POLICIES[remat])
-    assert [(plan["split"], plan["remat"], plan["seconds"]) for plan in trainer.plan["timed"]] == [
-        (2, None, min(seconds[0])), (1, "minimal", min(seconds[1]))]
+    trials = Trials(state, BATCH)
+    EXECUTED.clear()
+    with Compiles("step") as compiles:
+        step = trainer.compile(state, BATCH, trials)
+    jax.effects_barrier()
+    assert (trainer.plan["split"], trainer.plan["remat"], len(EXECUTED)) == (2, None, 0)
+    assert compiles.count == len(trainer.plan["probes"])
+    assert all(probe["remat"] is None for probe in trainer.plan["probes"])
     state, loss, *_ = step(state, BATCH)
-    assert np.isfinite(float(loss))
+    jax.effects_barrier()
+    assert np.isfinite(float(loss)) and len(EXECUTED) == 2
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_plan_over_several_devices_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
-    """Over two devices a plan that fits the batch whole without recomputing is timed against the batch
-    whole one rung up too, whose freed memory lets the scheduler overlap the collectives, and the faster
-    is kept; on one device the plan is never timed."""
+@pytest.mark.parametrize("remat", [None, "minimal", "full"], ids=["default", "nonterminal", "terminal"])
+@pytest.mark.parametrize("trials_given", [False, True], ids=["without-trials", "with-trials"])
+def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, remat, trials_given):
+    """Over two devices, an admitted policy compiles once, whether default, explicitly nonterminal,
+    or explicitly terminal, and whether or not supplied Trials would time another plan faster."""
     free(monkeypatch, LIMIT)
-    trainer = lm()
+    policy = None if remat is None else REMAT_POLICIES[remat]
+    trainer = lm(remat=policy, objective=Counted)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH, given=[[2.0], [1.0]])
-    trainer.compile(state, BATCH, trials)
-    assert trials.asked == [2]
-    timings = [(plan["split"], plan["remat"]) for plan in trainer.plan["timed"]]
-    assert timings == [(1, None), (1, "minimal")]
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (1, "minimal")
-    alone = lm()
-    state, _, _ = alone.place()
-    alone_trials = Timed(state, BATCH)
-    alone.compile(state, BATCH, alone_trials)
-    assert alone_trials.asked == [] and alone.plan["timed"] is None
+    trials = Trials(state, BATCH) if trials_given else None
+    EXECUTED.clear()
+    with Compiles("step") as compiles:
+        trainer.compile(state, BATCH, trials)
+    jax.effects_barrier()
+    assert compiles.count == 1 and not EXECUTED
+    assert trainer.plan["remat"] == remat
+    assert len(trainer.plan["probes"]) == 1
+
+
+def planner_branches() -> list[str]:
+    """One explicit policy of each branch the planner takes over an admitted one, by name the first of
+    `REMAT_POLICIES` whose model has a further remat rung (`Recomputing.recompute_more`), and the first
+    whose model is its ladder's last."""
+    found: dict[bool, str] = {}
+    for name in sorted(REMAT_POLICIES):
+        model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2,
+                                  mlp_features=32, max_seq_len=SEQ, remat=REMAT_POLICIES[name])
+        found.setdefault(model.recompute_more() is None, name)
+    return sorted(found.values())
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("remat", planner_branches())
+def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeypatch, remat):
+    """A real fit over two devices keeps the explicit policy it is given once admitted, whether the
+    policy has a further rung or is its ladder's last (`planner_branches`): its step compiles once and
+    runs its one microbatch alone, no optional compile or trial hidden in fit's internally created
+    Trials (row 2153; the compile-once gate, row 2286)."""
+    free(monkeypatch, LIMIT)
+    # 2153's head masked its frontier under the lane's environment; the gate runs as a user's process does.
+    monkeypatch.setenv("DEW_UNTIMED_FRONTIER", "0")
+    corpus = token_files(tmp_path)
+    trainer = windowed(tmp_path, 1, remat=REMAT_POLICIES[remat], objective=Counted)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
+    EXECUTED.clear()
+    with Compiles("step") as compiles:
+        state = trainer.fit(windows(corpus), steps=1, checkpoint_every=None, checkpoint_final=False,
+                            eval_every=None)
+    jax.effects_barrier()
+    # The one step's one microbatch, and no trial beside it.
+    assert compiles.count == 1 and int(state.step) == 1 and len(EXECUTED) == 1
+    assert [probe["remat"] for probe in trainer.plan["probes"]] == [remat]
 
 
 @pytest.mark.parametrize("split", [1, 2])
 def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, split):
-    """With room for the batch whole, or for two microbatches and not the
-    batch whole a rung up, there is one plan, and nothing is timed; the
-    frontier's compile that did not fit is in the plan's record."""
+    """With room for the batch whole or two microbatches, only the compiles needed to find the
+    admitted split appear in the plan. No optional remat candidate is compiled or timed."""
     free(monkeypatch, needs(monkeypatch, lm(split=split)))
     trainer = lm()
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH)
-    trainer.compile(state, BATCH, trials)
-    assert trials.asked == []
-    assert trainer.plan["timed"] is None
+    trials = Trials(state, BATCH)
+    with Compiles("step") as compiles:
+        trainer.compile(state, BATCH, trials)
+    assert compiles.count == len(trainer.plan["probes"])
     assert trainer.objective.model.remat is None
-    last = trainer.plan["probes"][-1]
-    assert (last["split"], last["remat"], last["fits"]) == ((1, None, True) if trainer.plan["split"] == 1
-                                                            else (1, "minimal", False))
+    assert (trainer.plan["split"], None, True) in asked(trainer)
+    assert all(remat is None for _, remat, _ in asked(trainer))
 
 
 def asked(trainer) -> list[tuple[int, str | None, bool]]:
@@ -724,16 +748,17 @@ def asked(trainer) -> list[tuple[int, str | None, bool]]:
     return [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]]
 
 
-def assert_searched(probes, chosen, below, frontier, *, half=None):
+def assert_searched(probes, chosen, below, *, half=None):
     """`probes`, a search that settled on `chosen` (split, remat): the batch whole asked first, no
     compile asked twice, every split that missed at no recomputation asked at the `half` rung next,
     `below`, the largest split under the plan, asked and missed at each rung it may fit at, a plan at
-    the half rung missed at no recomputation before, and the `frontier` asked last. Which splits
+    the half rung missed at no recomputation before, and no optional frontier is asked. Which splits
     between are asked, and in what order, follows the memory each compile measured, which differs
     between devices (`Forecast`)."""
     assert probes[0][:2] == (1, None) and not probes[0][2]
     assert len({probe[:2] for probe in probes}) == len(probes)
-    assert (*chosen, True) in probes and probes[-1] == (*frontier, False)
+    assert (*chosen, True) in probes
+    assert all(remat in (None, half) for _, remat, _ in probes)
     for index, (split, remat, fits) in enumerate(probes[:-1]):
         if half is not None and remat is None and not fits:
             assert probes[index + 1] == (split, half, probes[index + 1][2])
@@ -762,46 +787,41 @@ def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further
         free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
         trainer = lm(**DELTA)
         state, _, _ = trainer.place()
-        trials = Timed(state, BATCH)
+        trials = Trials(state, BATCH)
         trainer.compile(state, BATCH, trials)
-        assert trials.asked == []
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
+        assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    assert_searched(asked(trainer), (4, half), 2, (1, "minimal_with_scan_and_conv"), half=half)
+    assert_searched(asked(trainer), (4, half), 2, half=half)
 
 
-def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkeypatch):
+def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
     """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
-    fits it in fewer, so the plan is four at no recomputation, and the frontier, the batch whole one
-    rung up, is asked at the first rung past the half rung, whose every split asked missed."""
+    fits it in fewer, so the plan is four at no recomputation. The half rung's failed fit probes
+    remain in the record, but no optional full-batch frontier is compiled."""
     free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH)
+    trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
-    assert trials.asked == []
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
-    assert_searched(asked(trainer), (4, None), 2, (1, "minimal_with_scan_and_conv"),
-                    half="all_but_delta_memory")
+    assert_searched(asked(trainer), (4, None), 2, half="all_but_delta_memory")
 
 
 def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):
     """Without a delta rule no rung is a half rung: the search asks the batch whole and the splits
-    that find the fewest microbatches that fit, each at no recomputation, and the frontier one rung
-    up."""
+    that find the fewest microbatches that fit, each at no recomputation, and stops there."""
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
     trainer = lm()
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH)
+    trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
-    assert trials.asked == []
-    assert_searched(asked(trainer), (4, None), 2, (1, "minimal"))
-    assert all(remat is None for _, remat, _ in asked(trainer)[:-1])
+    assert_searched(asked(trainer), (4, None), 2)
+    assert all(remat is None for _, remat, _ in asked(trainer))
 
 
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "borrowed"])
 def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
-    """A frontier's timing runs each step on a trial of the state as it stood: trials that own the state
+    """An AutoPGLE trial runs a step on a copy of the state as it stood: trials that own the state
     (`fit`'s) step it and delete it, handing back a copy as it was; trials that borrow it (a compile given
     none) step a copy beside it and hand back the state itself, as it is. Either way the run trains on
     from where it stood."""
@@ -810,25 +830,23 @@ def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
     step = trainer.compile(state, BATCH)
     before = [raw(leaf).copy() for leaf in jax.tree.leaves(state)]
     trials = Trials(state, BATCH, owned=owned)
-    seconds = trials.seconds([step, step])
-    assert len(seconds) == 2
-    assert all(len(samples) == TIMED_REPEATS and min(samples) > 0 for samples in seconds)
+    for _ in range(2):
+        advanced = trials.run(lambda current: jax.block_until_ready(step(current, BATCH)[0]))
+        assert int(advanced.step) == int(trials.state.step) + 1
     assert all(leaf.is_deleted() == owned for leaf in jax.tree.leaves(state))
     assert all(np.array_equal(raw(left), right)
                for left, right in zip(jax.tree.leaves(trials.state), before, strict=True))
 
 
-def test_a_run_trains_on_from_the_state_its_plan_timed(monkeypatch, tmp_path):
-    """Under `fit`, a frontier is timed on the run's own state, and the run
-    trains on from a fresh copy of it: the timed steps count for nothing."""
-    # The frontier timed, as the library times it: Dew's tests keep its first plan otherwise.
-    monkeypatch.delenv(UNTIMED_FRONTIER)
+def test_a_run_trains_only_its_requested_steps_without_timing_a_frontier(monkeypatch, tmp_path):
+    """A fit trains its requested steps without spending extra updates on a speed comparison."""
     corpus, whole = token_files(tmp_path), windowed(tmp_path / "whole", 1)
     free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
                                                                   checkpoint_every=None)) - 1)
     trainer = windowed(tmp_path / "timed", None)
-    state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
-    assert [plan["seconds"] > 0 for plan in trainer.plan["timed"]] == [True, True]
+    with Compiles("step") as compiles:
+        state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
+    assert compiles.count == len(trainer.plan["probes"])
     assert int(state.step) == 3
 
 
@@ -859,17 +877,6 @@ def test_two_processes_name_one_run_alike():
         assert done.returncode == 0, done.stderr[-3000:]
         keys.append(json.loads(done.stdout.splitlines()[-1]))
     assert keys[0] == keys[1]
-
-
-def test_a_frontier_keeps_its_first_plan_unless_another_is_faster_beyond_the_spread():
-    """`faster` takes a later plan only where its slowest sample beats every sample of the plan it would
-    replace: timings that overlap are the clock's noise, and keep the first."""
-    from dew.training.planning import faster
-
-    assert faster([[2.0, 2.1], [1.0, 1.1]]) == 1
-    assert faster([[1.0, 1.1], [2.0, 2.1]]) == 0
-    assert faster([[1.0, 2.0], [0.9, 1.5]]) == 0
-    assert faster([[3.0], [2.0], [1.0]]) == 2
 
 
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():
@@ -946,19 +953,14 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
 
 
-def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, caplog, tmp_path):
-    """A run that sets remat 'full', with room for its step at every cheaper rung too, compiles its
-    training step once, at its own rung, and trains there: its plan holds that one compile and no
-    other rung's (row 2102). Each compile is the whole step's, which on a 4B's first step took most of
-    30 minutes where a run compiled the rungs below its own to advise it of them. JAX states each
-    compile it makes (`jax._src.dispatch`, "Finished XLA compilation of jit(step)")."""
+def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, tmp_path):
+    """An explicit full policy compiles one step, counted by the telemetry owner of JAX's public
+    monitoring events rather than a private log's spelling (rows 2111, 2154)."""
     free(monkeypatch, LIMIT)
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     trainer = lm(split=1, remat=REMAT_POLICIES["full"])
-    with caplog.at_level(logging.DEBUG, logger="jax._src.dispatch"):
+    with Compiles("step") as compiles:
         trained(trainer, steps=0)
-    steps = [record for record in caplog.records
-             if record.getMessage().startswith("Finished XLA compilation of jit(step)")]
-    assert len(steps) == 1
+    assert compiles.count == 1
     assert [probe["remat"] for probe in trainer.plan["probes"]] == ["full"]
     assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]
