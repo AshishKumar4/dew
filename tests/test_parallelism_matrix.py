@@ -104,11 +104,19 @@ def references(tmp_path_factory):
     return tool, tool.References(tmp_path_factory.mktemp("layout-draws"), prepare=True, reserve=4 << 30)
 
 
+WHOLE_SUITE: frozenset[tuple[str, str]] = frozenset({("edm2", "tensor4"), ("edm2", "fsdp2_tensor2")})
+"""The run-once cells the whole suite alone runs: compile-bound, each takes 123-132 s alone on an
+armada 25/17 worker and 113.8 and 98.4 s in a warm task there (2026-10-29), about 154 and 133 s on
+the fleet's 26/17 workers (1.35x), past a task's 120 s target, and no smaller model cuts the
+compile."""
+
+
 def cells(*, judged: bool) -> list:
     """The cells as a test's parameters, their layouts on every device but CELLS_ON_FOUR's, on four:
     for the accuracy test (`judged`) every cell but the run-once ones (`RUN_ONCE`), and for the
-    run-once test those alone."""
-    return [pytest.param(model, layout, devices, id=f"{model}-{layout}" + ("-on-four" if devices else ""))
+    run-once test those alone, WHOLE_SUITE's marked to run on the whole suite."""
+    return [pytest.param(model, layout, devices, id=f"{model}-{layout}" + ("-on-four" if devices else ""),
+                         marks=pytest.mark.whole_suite if (model, layout) in WHOLE_SUITE else ())
             for table, devices in ((CELLS, None), (CELLS_ON_FOUR, 4))
             for model, layouts in sorted(table.items()) for layout in layouts
             if judged != ((model, layout) in RUN_ONCE)]
