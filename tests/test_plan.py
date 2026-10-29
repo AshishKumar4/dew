@@ -44,7 +44,7 @@ from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
 from dew.training.memory import climb_to, recompute_more, rung_record
-from dew.training.planning import TIMED_REPEATS, Trials, planned, splits
+from dew.training.planning import Trials, planned, splits
 
 ROWS, SEQ = 32, 16
 BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64, jnp.int32)}
@@ -358,18 +358,6 @@ def autopgle(runs: int) -> Iterator[None]:
 
 
 @dataclasses.dataclass
-class Timed(Trials):
-    """Trials whose frontier takes the `given` seconds, each frontier asked recorded in `asked`: the
-    frontier's choice at timings the clock would give by chance."""
-    given: list[list[float]] = dataclasses.field(default_factory=list)
-    asked: list[int] = dataclasses.field(default_factory=list)
-
-    def seconds(self, steps):
-        self.asked.append(len(steps))
-        return self.given
-
-
-@dataclasses.dataclass
 class Handed(Trials):
     """Trials that profile the plan admitted, keep a weak reference to the executable it was admitted with
     (`unguided`) and count the executables the backend holds then, it among them (`live`), and hand back
@@ -644,24 +632,23 @@ def test_a_resumed_run_continues_its_admitted_plan_without_timing(tmp_path, monk
 
     first = run(1)
     first.fit(windows(corpus), steps=2, checkpoint_every=2)
-    assert first.plan["timed"] is None and first.plan["remat"] is None
+    assert first.plan["remat"] is None
     resumed = run(None)
     resumed.fit(windows(corpus), steps=4, checkpoint_every=2)
-    assert resumed.plan["timed"] is None
     assert (resumed.plan["split"], resumed.plan["remat"]) == (first.plan["split"], first.plan["remat"])
 
 
-@pytest.mark.parametrize("seconds", [[[2.0], [1.0]], [[1.0], [2.0]]])
-def test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling(monkeypatch, seconds):
+def test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling(monkeypatch):
     """A batch that needs two microbatches keeps the first fitting plan, without compiling a
     different remat to ask whether it is faster. Even explicitly supplied timing trials are not run."""
     free(monkeypatch, needs(monkeypatch, lm(split=1)) - 1)
     trainer = lm()
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH, given=seconds)
-    step = trainer.compile(state, BATCH, trials)
-    assert trials.asked == []
-    assert (trainer.plan["split"], trainer.plan["remat"], trainer.plan["timed"]) == (2, None, None)
+    trials = Trials(state, BATCH)
+    with Compiles("step") as compiles:
+        step = trainer.compile(state, BATCH, trials)
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (2, None)
+    assert compiles.count == len(trainer.plan["probes"])
     assert all(probe["remat"] is None for probe in trainer.plan["probes"])
     state, loss, *_ = step(state, BATCH)
     assert np.isfinite(float(loss))
@@ -678,12 +665,11 @@ def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, r
     trainer = lm(remat=policy)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH, given=[[2.0], [1.0]]) if trials_given else None
+    trials = Trials(state, BATCH) if trials_given else None
     with Compiles("step") as compiles:
         trainer.compile(state, BATCH, trials)
     assert compiles.count == 1
-    assert trials is None or trials.asked == []
-    assert (trainer.plan["remat"], trainer.plan["timed"]) == (remat, None)
+    assert trainer.plan["remat"] == remat
     assert len(trainer.plan["probes"]) == 1
 
 
@@ -692,7 +678,6 @@ def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, r
 def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeypatch, remat):
     """A real fit over two devices keeps its nonterminal or terminal explicit policy once admitted.
     No optional compile or timing is hidden in fit's internally created Trials (row 2153)."""
-    monkeypatch.setenv("DEW_UNTIMED_FRONTIER", "0")
     free(monkeypatch, LIMIT)
     corpus = token_files(tmp_path)
     trainer = windowed(tmp_path, 1, remat=REMAT_POLICIES[remat])
@@ -701,7 +686,6 @@ def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeyp
         state = trainer.fit(windows(corpus), steps=1, checkpoint_every=None, checkpoint_final=False)
     assert compiles.count == 1 and int(state.step) == 1
     assert [probe["remat"] for probe in trainer.plan["probes"]] == [remat]
-    assert trainer.plan["timed"] is None
 
 
 @pytest.mark.parametrize("split", [1, 2])
@@ -711,10 +695,10 @@ def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, split):
     free(monkeypatch, needs(monkeypatch, lm(split=split)))
     trainer = lm()
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH)
-    trainer.compile(state, BATCH, trials)
-    assert trials.asked == []
-    assert trainer.plan["timed"] is None
+    trials = Trials(state, BATCH)
+    with Compiles("step") as compiles:
+        trainer.compile(state, BATCH, trials)
+    assert compiles.count == len(trainer.plan["probes"])
     assert trainer.objective.model.remat is None
     assert (trainer.plan["split"], None, True) in asked(trainer)
     assert all(remat is None for _, remat, _ in asked(trainer))
@@ -764,10 +748,9 @@ def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further
         free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
         trainer = lm(**DELTA)
         state, _, _ = trainer.place()
-        trials = Timed(state, BATCH)
+        trials = Trials(state, BATCH)
         trainer.compile(state, BATCH, trials)
-        assert trials.asked == []
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
+        assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
     assert_searched(asked(trainer), (4, half), 2, half=half)
 
@@ -779,9 +762,8 @@ def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypat
     free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH)
+    trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
-    assert trials.asked == []
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
     assert_searched(asked(trainer), (4, None), 2, half="all_but_delta_memory")
 
@@ -792,16 +774,15 @@ def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monke
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
     trainer = lm()
     state, _, _ = trainer.place()
-    trials = Timed(state, BATCH)
+    trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
-    assert trials.asked == []
     assert_searched(asked(trainer), (4, None), 2)
     assert all(remat is None for _, remat, _ in asked(trainer))
 
 
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "borrowed"])
 def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
-    """A frontier's timing runs each step on a trial of the state as it stood: trials that own the state
+    """An AutoPGLE trial runs a step on a copy of the state as it stood: trials that own the state
     (`fit`'s) step it and delete it, handing back a copy as it was; trials that borrow it (a compile given
     none) step a copy beside it and hand back the state itself, as it is. Either way the run trains on
     from where it stood."""
@@ -810,9 +791,9 @@ def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
     step = trainer.compile(state, BATCH)
     before = [raw(leaf).copy() for leaf in jax.tree.leaves(state)]
     trials = Trials(state, BATCH, owned=owned)
-    seconds = trials.seconds([step, step])
-    assert len(seconds) == 2
-    assert all(len(samples) == TIMED_REPEATS and min(samples) > 0 for samples in seconds)
+    for _ in range(2):
+        advanced = trials.run(lambda current: jax.block_until_ready(step(current, BATCH)[0]))
+        assert int(advanced.step) == int(trials.state.step) + 1
     assert all(leaf.is_deleted() == owned for leaf in jax.tree.leaves(state))
     assert all(np.array_equal(raw(left), right)
                for left, right in zip(jax.tree.leaves(trials.state), before, strict=True))
@@ -824,8 +805,9 @@ def test_a_run_trains_only_its_requested_steps_without_timing_a_frontier(monkeyp
     free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
                                                                   checkpoint_every=None)) - 1)
     trainer = windowed(tmp_path / "timed", None)
-    state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
-    assert trainer.plan["timed"] is None
+    with Compiles("step") as compiles:
+        state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
+    assert compiles.count == len(trainer.plan["probes"])
     assert int(state.step) == 3
 
 
@@ -856,17 +838,6 @@ def test_two_processes_name_one_run_alike():
         assert done.returncode == 0, done.stderr[-3000:]
         keys.append(json.loads(done.stdout.splitlines()[-1]))
     assert keys[0] == keys[1]
-
-
-def test_a_frontier_keeps_its_first_plan_unless_another_is_faster_beyond_the_spread():
-    """`faster` takes a later plan only where its slowest sample beats every sample of the plan it would
-    replace: timings that overlap are the clock's noise, and keep the first."""
-    from dew.training.planning import faster
-
-    assert faster([[2.0, 2.1], [1.0, 1.1]]) == 1
-    assert faster([[1.0, 1.1], [2.0, 2.1]]) == 0
-    assert faster([[1.0, 2.0], [0.9, 1.5]]) == 0
-    assert faster([[3.0], [2.0], [1.0]]) == 2
 
 
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():
