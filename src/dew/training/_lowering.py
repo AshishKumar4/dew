@@ -173,7 +173,9 @@ def _named(location: ir.Location) -> str | None:
     if location.typeid == ir.CallSiteLoc.static_typeid:
         return _named(ir.CallSiteLoc(location).callee)
     if location.typeid == ir.FusedLoc.static_typeid:
-        return next(filter(None, map(_named, ir.FusedLoc(location).locations)), None)
+        # Its parts are locations, which the bindings' stubs type as objects.
+        parts = (part for part in ir.FusedLoc(location).locations if isinstance(part, ir.Location))
+        return next(filter(None, map(_named, parts)), None)
     return None
 
 

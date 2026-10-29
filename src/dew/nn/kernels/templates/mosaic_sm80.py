@@ -159,6 +159,11 @@ class Mma(mosaic.Family):
         per_thread = -(-columns * 2 // (4 // self.m_warps * 8))
         return -(-per_thread * jnp.dtype(dtype).itemsize // 4)
 
+    def row_registers(self, rows: int, dtype) -> int:
+        # Each of the `m_warps` row warps' 16-row tiles a thread's two rows (`MMALayouts`' accumulator
+        # tiling), so a thread holds two of each `m_warps * 16` rows.
+        return -(-rows * 2 * jnp.dtype(dtype).itemsize // (self.m_warps * 16 * 4))
+
     def column_unit(self, dtype) -> int:
         # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
         # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64

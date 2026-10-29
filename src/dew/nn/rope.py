@@ -170,10 +170,15 @@ class LongRopeScaling:
                 math.sqrt(1 + math.log(self.factor) / math.log(self.original_max_position_embeddings)))
 
 
-def rope_scaling_from_record(record: Mapping[str, object]) -> RopeScaling | LongRopeScaling:
-    """Build the ramp the record's rope_type names."""
-    return (from_record(LongRopeScaling, record) if record.get('rope_type') == 'longrope'
-            else from_record(RopeScaling, record))
+def rope_scaling_from_record(record: Mapping[str, object]) -> "Scaling":
+    """Build the scaling a record holds: a class record (`{"class", "fields"}`, as the registry writes a
+    union field) by its class, else the one its rope_type names, LongRoPE's, YaRN's or Llama 3.1's."""
+    if 'class' in record:
+        built = from_record(Scaling, record)
+        assert isinstance(built, RopeScaling | LongRopeScaling | YarnScaling)
+        return built
+    kinds = {'longrope': LongRopeScaling, 'yarn': YarnScaling}
+    return from_record(kinds.get(str(record.get('rope_type')), RopeScaling), record)
 
 
 @dataclasses.dataclass(frozen=True)
