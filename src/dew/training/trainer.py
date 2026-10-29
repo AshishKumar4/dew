@@ -1099,10 +1099,11 @@ class Trainer(Generic[Loss, Effects]):
         # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
         last = state.accumulation
         rebuilt = last is not None and not last.replays(prepared.accumulation)
-        built = placed_bytes([field for field, kept in ((prepared.compute, state.compute),
-                                                         (prepared.accumulation, None if rebuilt else last))
-                              if kept is None and field is not None])
-        held = prefetched_bytes(batch, placement, self._prefetch) + built
+        # A step lowered for other devices is checked against none of this process's.
+        built = 0 if mesh is not None else placed_bytes([field for field, kept in (
+            (prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last))
+            if kept is None and field is not None])
+        held = 0 if mesh is not None else prefetched_bytes(batch, placement, self._prefetch) + built
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
         lower = Routed(functools.partial(
@@ -1113,7 +1114,7 @@ class Trainer(Generic[Loss, Effects]):
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
             lowered, launches = lower(), launches or "[]"
-        footprint = None if self.step is not None else candidate_footprint(
+        footprint = None if self.step is not None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
                          lower.report(), footprint)
