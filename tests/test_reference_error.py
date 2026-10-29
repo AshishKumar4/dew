@@ -227,6 +227,13 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     assert min(seen[1:]) >= SIZING_FROM
 
 
+def noised_draw(seed):
+    """A draw of standard normal values beside three noises of 1e-7 of them, which arms add at chosen scales
+    (the further references' and the library arm's sites)."""
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+
+
 def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw():
     """`also`: one Dew arm against several references on the same draws, each judged by its own check 1
     under its own label, Dew and the truth evaluated once a draw for them all. A Dew arm on par with one
@@ -235,9 +242,7 @@ def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw(
     reference's is refused, as is a site with several and no named truth."""
     calls = {"dew": 0, "truth": 0}
 
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+    draw = noised_draw
 
     def arm(scale, noise, counted=None):
         @as_given
@@ -281,9 +286,7 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
     compile. Null runs judge as the site does."""
     from reference_error import null_runs
 
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+    draw = noised_draw
 
     def arm(scale, noise):
         @as_given
