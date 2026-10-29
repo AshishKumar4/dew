@@ -30,7 +30,7 @@ from typing_extensions import get_protocol_members
 
 from dew import _records
 from dew._records import JSON
-from dew.batch import Coordinates, coordinates
+from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD, Coordinates, coordinates
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
@@ -1805,13 +1805,13 @@ class DecisionInputs:
         blocked = rows[0].blocks is not None
         if any((row.blocks is not None) != blocked for row in rows):
             raise ValueError("one batch reads its rows one way, in blocks or in order")
-        fields = ({"positions": [row.positions or () for row in rows],
+        fields = ({POSITIONS_FIELD: [row.positions or () for row in rows],
                    "slots": [row.slots or () for row in rows]} if parallel else {})
         if blocked:
             fields["blocks"] = [row.blocks or () for row in rows]
         tokens, padded = pad_token_rows([row.tokens for row in rows], pad_id=pad, padding_side="right",
                                         fields=fields or None)
-        valid = padded.get("attention_mask", np.ones(tokens.shape, bool))
+        valid = padded.get(VALIDITY_FIELD, np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
         labelled = labelled_rows(rows)
@@ -1840,7 +1840,7 @@ class DecisionInputs:
             lengths = jnp.asarray([len(tokens) for tokens in held], jnp.int32)
         return cls(tokens=jnp.asarray(tokens), segments=jnp.asarray(valid, jnp.int32),
                    **along,
-                   positions=jnp.asarray(padded["positions"], jnp.int32) if parallel else None,
+                   positions=jnp.asarray(padded[POSITIONS_FIELD], jnp.int32) if parallel else None,
                    slots=jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
                    option_slots=slots_of, slotted=slotted,
                    context=context, context_lengths=lengths,
