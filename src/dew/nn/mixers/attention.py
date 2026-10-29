@@ -939,15 +939,10 @@ class CausalSelfAttention(nn.Module):
             if decode or self.ctx.attention_impl != 'auto':
                 implementation = masked
         runs = None
-        own = (None if attention_metadata is None else call_visibility(
-            attention_metadata, rotary_positions, batch=B, queries=S, keys=key.shape[-3],
-            key_places=key_places, sliding_window=self.ctx.sliding_window))
+        own, implementation = self._overridden(attention_metadata, rotary_positions, B, S, key.shape[-3],
+                                               key_places, implementation, masked, decode)
         if own is not None:
-            # A call's own mask takes the masked kernel, as does a cached call's or a named kernel's runs; an
-            # uncached call's runs take the one the layer chooses ('auto').
             mask, runs, window, key_places = own
-            if mask is not None or decode or self.ctx.attention_impl != 'auto':
-                implementation = masked
             causal, documents, groups, valid = False, None, _Groups(), None
         if self.ctx.attention_chunk is not None:
             mask = dense_visibility(mask, documents, causal, window, valid, runs, places, key_places, S,
@@ -959,6 +954,18 @@ class CausalSelfAttention(nn.Module):
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, starts, key_places, groups, valid, runs)
+
+    def _overridden(self, metadata: AttentionMetadata | None, rotary_positions, B: int, S: int, keys: int,
+                    key_places, implementation: str, masked: str, decode: bool):
+        """A call's own visibility (`call_visibility`), None where it states none, and the kernel it takes:
+        a mask's the masked one (`masked`), as a cached call's or a named kernel's runs do; an uncached
+        call's runs the one the layer chooses ('auto')."""
+        own = None if metadata is None else call_visibility(
+            metadata, rotary_positions, batch=B, queries=S, keys=keys, key_places=key_places,
+            sliding_window=self.ctx.sliding_window)
+        if own is not None and (own.mask is not None or decode or self.ctx.attention_impl != 'auto'):
+            implementation = masked
+        return own, implementation
 
     @property
     def _reads_places(self) -> bool:

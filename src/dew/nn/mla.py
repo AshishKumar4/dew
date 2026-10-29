@@ -726,8 +726,11 @@ class MultiHeadLatentAttention(nn.Module):
         if selecting and (self.sliding_window is not None or self.attention_chunk is not None):
             raise ValueError("an indexed mla layer selects its candidates among every key before it; "
                              "a window or chunk narrows a dense layer's keys")
-        own = None if metadata is None else [name for name in ("pairwise_mask", "key_runs", "position_bias")
-                                             if getattr(metadata, name) is not None]
+        own = None if metadata is None else [
+            name for name, given in (("pairwise_mask", metadata.pairwise_mask),
+                                     ("key_runs", metadata.key_runs),
+                                     ("key_positions", metadata.key_positions),
+                                     ("position_bias", metadata.position_bias)) if given is not None]
         if own and (selecting or call.decode):
             raise ValueError(f"an mla layer reads {', '.join(own)} on a dense layer's uncached call, its "
                              "keys the call's own")

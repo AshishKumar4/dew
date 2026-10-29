@@ -761,7 +761,7 @@ def test_a_bidirectional_dense_mla_windows_only_where_its_kind_keeps_both_sides(
     """A non-causal windowed layer reads its whole row, unless its kind keeps the window on both sides
     of a query (`bidirectional_window`), where it reads the keys within two places of it: on par with
     transformers' block under that mask (check 1)."""
-    near = np.abs(VIS_SLOTS[:, None] - VIS_SLOTS[None, :]) < 3
+    near = (VIS_SLOTS[:, None] < VIS_SLOTS[None, :] + 3) & (VIS_SLOTS[None, :] < VIS_SLOTS[:, None] + 3)
     rule = np.broadcast_to(near if both_sides else np.ones_like(near), (2, VIS_LENGTH, VIS_LENGTH))
     module = visibility_module(causal=False, sliding_window=3, bidirectional_window=both_sides)
     assert_masks_as_the_reference(lambda v, h: module.apply(v, h), rule, "mla bidirectional window")
@@ -840,8 +840,8 @@ def test_dense_mla_windows_its_key_runs_over_their_positions():
     computes under an explicit mask over those positions, on par with it (check 1)."""
     places = np.asarray([0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14], np.int32)
     runs = np.broadcast_to(np.asarray([[[0, VIS_LENGTH]]]), (2, VIS_LENGTH, 1, 2)).astype(np.int32)
-    rule = np.broadcast_to(np.abs(places[:, None] - places[None, :]) <= 1,
-                           (2, VIS_LENGTH, VIS_LENGTH))
+    within = (places[:, None] <= places[None, :] + 1) & (places[None, :] <= places[:, None] + 1)
+    rule = np.broadcast_to(within, (2, VIS_LENGTH, VIS_LENGTH))
     metadata = AttentionMetadata(key_runs=jnp.asarray(runs),
                                  key_positions=jnp.broadcast_to(places, (2, VIS_LENGTH)))
     module = visibility_module(sliding_window=2)
