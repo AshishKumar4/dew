@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.attention import AttentionImpl
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.dropout import Dropout
 
@@ -133,7 +134,7 @@ class NormalAttention(nn.Module):
     qkv_bias: bool | None = None
     force_fp32_for_softmax: bool = True
     qk_norm: QKNorm | None = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     flat: bool = False
     names: tuple[str, str, str, str] = ("to_q", "to_k", "to_v", "to_out_0")
     rotary_pairs: Literal["half", "adjacent"] = "half"
@@ -281,7 +282,7 @@ class BasicTransformerBlock(nn.Module):
     norm_epsilon: float = 1e-4
     dropout_rate: float = 0.0
     approximate_gelu: bool = True
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
@@ -361,7 +362,7 @@ class Stage:
     precision: PrecisionLike = None
 
 
-def stage_attention(stage: Stage, channels: int, attention_impl: str, dtype: Dtype | None,
+def stage_attention(stage: Stage, channels: int, attention_impl: AttentionImpl, dtype: Dtype | None,
                     precision: PrecisionLike, name: str) -> "TransformerBlock":
     """Build the block a `Stage` describes, at the stage's channel count.
 
@@ -396,7 +397,7 @@ class TransformerBlock(nn.Module):
     use_self_and_cross:bool = True
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4

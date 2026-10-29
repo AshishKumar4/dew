@@ -56,6 +56,7 @@ from dew.batch import coordinates
 from dew.nn.dropout import Dropout
 
 from .activations import GatedActivation
+from .attention import AttentionImpl
 from .attention_blocks import CROSS_KEY, CROSS_VALUE, NormalAttention
 from .documents import CrossDocuments, holds_keys
 from .flops import counted_flops
@@ -190,7 +191,7 @@ class GatedCrossAttention(nn.Module):
     head_dim: int
     ngpt: bool = False
     dropout_rate: float = 0.0
-    attention_impl: str = "auto"
+    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None

@@ -9,6 +9,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.attention import AttentionImpl
 from dew.nn.attention_blocks import BasicTransformerBlock
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
@@ -56,7 +57,7 @@ class _SpatialAttention(nn.Module):
     linear_projection: bool
     dtype: Dtype
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     norm_groups: int = 32
     norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
@@ -133,7 +134,7 @@ class _Level(nn.Module):
     dropout: float
     dtype: Dtype
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     norm_groups: int = 32
     norm_epsilon: float = 1e-5
     attention_norm_epsilon: float = 1e-5
@@ -209,7 +210,7 @@ class UNet2DCondition(nn.Module):
     dropout: float = 0.0
     dtype: Dtype = jnp.float32
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     norm_groups: int = 32
     norm_epsilon: float = 1e-5
     attention_norm_epsilon: float = 1e-5

@@ -46,6 +46,7 @@ from dew.batch import (
     token_coordinates,
 )
 from dew.mesh import LayoutRefused
+from dew.nn.attention import AttentionImpl
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
@@ -338,7 +339,7 @@ class CausalTransformer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     kv_cache: KVCache = KVCache()
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""

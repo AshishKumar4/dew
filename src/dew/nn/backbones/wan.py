@@ -30,6 +30,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import gelu_tanh
+from dew.nn.attention import AttentionImpl
 from dew.nn.attention_blocks import NormalAttention, QKNorm
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
@@ -81,7 +82,7 @@ class WanBlock(nn.Module):
     epsilon: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def _attention(self, name=None):
@@ -165,7 +166,7 @@ class WanTransformer(nn.Module):
     rope_max_seq_len: int = 1024
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @property
     def features(self) -> int:

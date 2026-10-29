@@ -21,6 +21,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
+from dew.nn.attention import AttentionImpl
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
@@ -453,7 +454,7 @@ class _BlockOptions(TypedDict):
     precision: PrecisionLike
     force_fp32_for_softmax: bool
     norm_epsilon: float
-    attention_impl: str
+    attention_impl: AttentionImpl
 
 
 class _AttentionBlockOptions(_BlockOptions):
@@ -474,7 +475,7 @@ class _TransformerOptions(nn.Module, kw_only=True):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
-    attention_impl: str = 'auto'
+    attention_impl: AttentionImpl = 'auto'
 
     @nn.nowrap
     def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
@@ -584,7 +585,7 @@ class ModulatedBlock(nn.Module):
     gelu_approximate: bool = True
     qkv_bias: bool = True
     qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     # ssm mixer options
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True

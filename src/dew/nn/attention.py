@@ -99,6 +99,15 @@ every choice is reported as the target's route (`dew.nn.kernels.generation.route
 """
 
 
+def attention_implementation(name: str) -> AttentionImpl:
+    """`name` as the `AttentionImpl` it names, a recorded or a user's value; refused unless it names
+    one."""
+    for implementation in get_args(AttentionImpl):
+        if name == implementation:
+            return implementation
+    raise ValueError(f"Unknown attention implementation: {name}; one of {', '.join(get_args(AttentionImpl))}")
+
+
 def widen_value_heads(query, value):
     """Zero-pad `value`'s head axis out to the query's width.
 
@@ -913,8 +922,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     of a decode step, unless `generation.chosen(decode='xla')` names the folded attention. What runs
     is what this host runs (`_hosted`): xla for a CUDA kernel a step traced for an assumed GPU on a
     CPU reports."""
-    if implementation not in get_args(AttentionImpl):
-        raise ValueError(f"Unknown attention implementation: {implementation}")
+    attention_implementation(implementation)
     case = attention_case(query, key, dtype=dtype, precision=precision,
                           force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
                           causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,

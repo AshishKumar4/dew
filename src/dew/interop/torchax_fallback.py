@@ -57,6 +57,7 @@ from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
 from dew.mesh import LogicalAxes
+from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
@@ -772,7 +773,7 @@ class TorchGraph:
 
     module: JittableModule
     persistent: tuple[str, ...]
-    attention_impl: str | None = None
+    attention_impl: AttentionImpl | None = None
     shapes: Mapping[str, Mapping[str, jax.ShapeDtypeStruct]] = field(default_factory=dict)
     """The source's variables, `params` and `buffers`, as shapes and dtypes: what an initialization,
     which holds none of them, traces the forward over (`TorchCausalLM._run`)."""
@@ -1353,7 +1354,7 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 
 def load(source: sources.SourceReference, root: Path, *, dtype: str,
-         param_dtype: str, attention_impl: str, max_seq_len: int | None,
+         param_dtype: str, attention_impl: AttentionImpl, max_seq_len: int | None,
          admission: TorchAdmission | None = None, weights: bool = True) -> PretrainedFallback:
     """Load the causal LM `source` selects through transformers and torchax.
 
