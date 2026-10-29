@@ -1,10 +1,14 @@
 """A mutation score measures killed tests, not broken workers or missing runs."""
 
+import ast
 import json
+from pathlib import Path
 
 import pytest
 
-from tools.mutation import FILE_TESTS, TARGETS, Target, collected, plan, run, source_digest, summarize
+from tools.mutation import FILE_TESTS, TARGETS, Target, plan, run, source_digest, summarize
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_nightly_plan_keeps_the_rotation_and_covers_every_shard():
@@ -43,11 +47,29 @@ def test_session_digest_changes_with_source_content_or_population(tmp_path):
     assert original != source_digest([first, second])
 
 
-def test_every_selection_collects_and_a_deleted_test_is_refused_before_the_baseline(tmp_path):
-    """Each target's tests and each file's collect under pytest, and a session whose selection
-    names a deleted file stops before anything runs, naming it."""
-    collected(tuple(sorted({test for selection in (*(target.tests for target in TARGETS.values()),
-                                                   *FILE_TESTS.values()) for test in selection})))
+def defined(test: str) -> bool:
+    """Whether `test`, a file or a `file::name` (a parametrized id's base), names a file of the
+    repository and, with a name, a function or class its module defines."""
+    path, _, name = test.partition("::")
+    source = ROOT / path
+    if not source.is_file():
+        return False
+    if not name:
+        return True
+    tree = ast.parse(source.read_text())
+    return name.split("[")[0] in {node.name for node in tree.body
+                                  if isinstance(node, ast.FunctionDef | ast.ClassDef)}
+
+
+def test_every_selection_names_its_tests_and_a_deleted_test_is_refused_before_the_baseline(tmp_path):
+    """Each target's tests and each file's name a test file the repository holds, and each
+    `::name` a test its module defines; and a session whose selection names a deleted file stops
+    before anything runs, naming it (`collected`, pytest's own collection). That every named file
+    imports and collects is the suite's own collection of it, which this need not repeat: a
+    collection of every selection's files took 123 s, past CI's group target (row 2150)."""
+    selections = {test for selection in (*(target.tests for target in TARGETS.values()),
+                                         *FILE_TESTS.values()) for test in selection}
+    assert selections and [test for test in sorted(selections) if not defined(test)] == []
     gone = Target("src/dew/diffusion/schedules", ("tests/test_schedulers.py", "tests/test_deleted.py"))
     with pytest.raises(ValueError):
         run(gone, tmp_path / "session", 0, 1, 60.0)

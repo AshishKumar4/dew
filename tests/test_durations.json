@@ -9912,7 +9912,7 @@
 "tests/test_muse_glimmer.py::test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits": 15.443,
 "tests/test_muse_glimmer.py::test_the_export_writes_back_the_source_tensors_and_config": 1.587,
 "tests/test_muse_glimmer.py::test_the_text_decoder_computes_the_reference_logits": 4.283,
-"tests/test_mutation_report.py::test_every_selection_collects_and_a_deleted_test_is_refused_before_the_baseline": 37.805,
+"tests/test_mutation_report.py::test_every_selection_names_its_tests_and_a_deleted_test_is_refused_before_the_baseline": 37.805,
 "tests/test_mutation_report.py::test_nightly_plan_keeps_the_rotation_and_covers_every_shard": 0.011,
 "tests/test_mutation_report.py::test_requested_target_overrides_the_nightly_rotation": 0.008,
 "tests/test_mutation_report.py::test_session_digest_changes_with_source_content_or_population": 0.01,
