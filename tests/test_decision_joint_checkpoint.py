@@ -372,7 +372,7 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
                                   layout=JointLayout(max_len=1024))
     data = decision_rows(examples, 8, examples, objective=objective.data())
-    start = objective.init(jax.random.key(0))
+    start = jax.jit(objective.init)(jax.random.key(0))
     runs, states = [], []
     for index, steps in enumerate((2, 1)):
         run = tmp_path / f"run{index}"

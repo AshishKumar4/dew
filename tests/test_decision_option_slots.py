@@ -223,9 +223,10 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     assert compact.option_slots.shape == (len(options), capacity) and capacity < bounds.questions * CLAUSES
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
     grid = laid_out(batch, bounds.segments)
-    variables = objective.init(jax.random.key(0))
+    # One program each, not the model's every operation compiled apart.
+    variables = jax.jit(objective.init)(jax.random.key(0))
     head = thaw(part(variables, "head"))
-    table = objective.model.table(variables)
+    table = jax.jit(objective.model.table)(variables)
     states_shape = (*np.shape(slotted["tokens"]), objective.model.head.hidden_size)
     features = scorer_features(objective, grid)
 
