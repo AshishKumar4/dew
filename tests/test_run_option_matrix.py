@@ -310,3 +310,16 @@ def test_an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
                                           "trainer.mesh": {}, "model.attention_impl": "triton",
                                           "model.head_dim": 16})
     assert [pick for pick in stored() if pick not in before]
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_a_kinds_run_spreads_its_split_axis_by_the_link_it_states(kind, tmp_path):
+    """A run that states its tensor axis's link (`links`) traces its step with that link as stated, not
+    one its devices would measure, and its checkpoint records the figure for a resume to trace with
+    again (ledger 2464, where only a step compiled ahead could state one)."""
+    stated = {"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}
+    run = trained(kind, tmp_path, "linked", **{"trainer.steps": 1, "trainer.checkpoint_every": 1,
+                                                "trainer.links": stated})
+    with Checkpoints(str(run)) as checkpoints:
+        figures = checkpoints.rung(checkpoints.latest)["links"]
+    assert list(figures.values()) == [4.5e11]
