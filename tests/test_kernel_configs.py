@@ -218,7 +218,8 @@ class _OnlyTile(_Uncounted):
     """A launch with one tile shape, so refusing that shape exhausts its derivation."""
 
     def candidate(self, ba, config, target):
-        return config.block_m == 128 and config.block_n == 128 and super().candidate(ba, config, target)
+        return (config.block_m == 128 and config.block_n == 128 and config.warpgroups == 2
+                and super().candidate(ba, config, target))
 
 
 @lowers("sm90")
