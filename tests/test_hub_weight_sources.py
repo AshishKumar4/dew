@@ -102,34 +102,57 @@ def test_a_directory_without_weights_dew_reads_is_refused(stored, tmp_path):
         Pretrained.load(tmp_path, dtype="float32")
 
 
-PINNED = """
-import json
+TRAIN_PRETRAINED = """
 import sys
 from dew.config.lm import LMRunConfig
+from dew.data import Loading, presets
+from dew.data.sources.tokens import TokenFiles
+
+tokens, root = sys.argv[1:3]
+chain = TokenFiles(tokens).pipe(presets.lm, None, seq_len=8, batch=8, pack=None).loading(Loading(workers=0))
+LMRunConfig.cli(["--pretrained", "local/llama", "--tokenizer", "local/llama", "--trainer.name", "run",
+                 "--trainer.checkpoint-dir", root,
+                 "--trainer.steps", "1", "--trainer.compilation-cache-dir", "None", "--trainer.multi-host",
+                 "False", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "1",
+                 "--max-new-tokens", "0"], default=LMRunConfig(data=chain)).run()
+"""
+"""A recorded LM run from a Hub backbone, through the command line, in a process of its own, which reads
+`HF_ENDPOINT` as it imports the Hub client: the token files and the runs' root."""
+
+PINNED_DECISION = """
 from dew.decision.config import DecisionRunConfig
 
-print(json.dumps({"lm": LMRunConfig(pretrained="local/llama").pinned().pretrained,
-                  "decision": DecisionRunConfig(pretrained="local/llama").pinned().revision}))
+print(DecisionRunConfig(pretrained="local/llama").pinned().revision)
 """
-"""Each run kind's pinned record of a Hub backbone, in a process of its own, which reads `HF_ENDPOINT` as
-it imports the Hub client."""
+"""A decision run's pinned backbone revision, in a process of its own."""
 
 
-def test_an_lm_and_a_decision_run_record_their_hub_backbone_at_its_commit(tmp_path):
-    """An LM run's and a decision run's backbone named by its Hub repo alone is recorded at the commit the
-    Hub serves (`RunConfig.pinned`, through `SourceReference.pinned`), as their run.json writes it, and
-    offline, with the Hub gone, at the commit the cache holds."""
+def test_a_run_records_its_hub_backbone_at_its_commit_online_and_from_the_cache_offline(tmp_path):
+    """An LM run whose `--pretrained` names a Hub repo alone, run from the command line, writes the
+    commit the Hub serves into its run.json; with the Hub gone and none of Dew's recorded answers, the
+    same command reads the Hub cache's ref the online run wrote and records the same commit. A decision
+    run pins its backbone's revision to that commit alike."""
     import json
 
+    from token_support import write_token_corpus
+
+    ids = np.random.RandomState(0).randint(1, 60, 640).astype(np.uint8)
+    # Written with the backbone's own tokenizer, by its name: the checkpoint carries no tokenizer files.
+    tokens = write_token_corpus(tmp_path / "tokens", ids, tokenizer="local/llama")
     files = {name: FIXTURE / name for name in ("config.json", "model.safetensors")}
+
+    def ran(name, environment):
+        root = tmp_path / name
+        done = subprocess.run([sys.executable, "-c", TRAIN_PRETRAINED, tokens.train, str(root)],
+                              env=environment, capture_output=True, text=True, check=False)
+        assert done.returncode == 0, done.stderr[-3000:]
+        return json.loads((root / "run" / "run.json").read_text())["fields"]["pretrained"]
+
     with LocalHub({"local/llama": files}) as hub:
         commit = hub.commit("local/llama")
-        online = subprocess.run([sys.executable, "-c", PINNED], env=hub_environment(hub, tmp_path),
-                                capture_output=True, text=True, check=False)
-    gone = hub_environment(None, tmp_path, offline=True)
-    offline = subprocess.run([sys.executable, "-c", PINNED], env=gone, capture_output=True, text=True,
-                             check=False)
-    for done in (online, offline):
-        assert done.returncode == 0, done.stderr[-3000:]
-        assert json.loads(done.stdout.strip().splitlines()[-1]) == {"lm": f"local/llama@{commit}",
-                                                                    "decision": commit}
+        assert ran("online", hub_environment(hub, tmp_path)) == f"local/llama@{commit}"
+        decided = subprocess.run([sys.executable, "-c", PINNED_DECISION], env=hub_environment(hub, tmp_path),
+                                 capture_output=True, text=True, check=False)
+    assert decided.stdout.strip().splitlines()[-1] == commit
+    gone = {**hub_environment(None, tmp_path, offline=True), "DEW_HUB_ANSWERS": str(tmp_path / "no-answers")}
+    assert ran("offline", gone) == f"local/llama@{commit}"
