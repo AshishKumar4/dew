@@ -110,11 +110,16 @@ def read_checkpoint(directory: str | os.PathLike, *, ema: bool = True, best: boo
     parameter dict under FlaxDiff's model names as host arrays. Only that
     copy is restored, without allocating the optimizer or other states.
 
-    The older 2024 aggregate format (`default/checkpoint`) is not supported.
+    The older 2024 aggregate format, one `default/checkpoint` file, is refused by name: its trees
+    predate the models Dew reads.
     """
     import orbax.checkpoint as ocp
     from etils import epath
 
+    if (Path(directory) / "default" / "checkpoint").is_file():
+        raise ValueError(f"{directory} holds FlaxDiff's 2024 aggregate checkpoint (default/checkpoint), "
+                         "whose models predate the simple_udit and hybrid_dit runs Dew reads; load it with "
+                         "FlaxDiff at the revision that wrote it")
     path = epath.Path((Path(directory) / "default").resolve())
     state = "best_state" if best else "state"
     weights = "ema_params" if ema else "params"
