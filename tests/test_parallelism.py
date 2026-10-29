@@ -192,6 +192,34 @@ def test_prefetch_iterator_preserves_order_and_terminates():
             next(it)
 
 
+def test_a_held_prefetcher_places_no_batch_until_its_hold_ends():
+    """A prefetcher held (`DevicePrefetchIterator.held`) reads on but places nothing until the hold ends,
+    then hands over every batch in order. A run holds its stream so while it compiles, evaluates or
+    saves: a batch placed during that work lands past the memory the work borrows, in the block the next
+    step's temporaries take whole (row 2088)."""
+    import threading
+
+    released, asked = threading.Event(), threading.Event()
+
+    def source():
+        for value in range(3):
+            if value == 1:
+                released.wait()
+            if value == 2:
+                # The worker asks for a third batch only once it has placed the second.
+                asked.set()
+            yield {"x": np.full((jax.device_count(), 2), value, np.float32)}
+
+    with DevicePrefetchIterator(source(), MeshSpec().build(), depth=4) as batches:
+        first = next(batches)
+        with batches.held():
+            released.set()
+            assert not asked.wait(timeout=1)
+        assert asked.wait(timeout=60)
+        seen = [float(np.asarray(batch["x"])[0, 0]) for batch in [first, *batches]]
+    assert seen == [0.0, 1.0, 2.0]
+
+
 def test_prefetch_iterator_tracks_checkpointable_source_state():
     """The position handed out must be the consumed batch's, not the thread's."""
     import grain.python as pygrain
@@ -539,6 +567,46 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
     assert len(scores) == 2 and all(np.isfinite(score) and score > 0 for score in scores)
     assert [step for step, value in tracker.artifacts if isinstance(value, Representations)] == [1, 2]
     assert Checkpoints(str(tmp_path)).latest == 2
+
+
+class Releasing(PeakToPeak):
+    """`PeakToPeak`, whose first call lets the training stream read on (`released`) and checks that the
+    stream places nothing before the pass it runs in ends: the stream asks for the batch after the one
+    released (`asked`) only once it has placed that one."""
+
+    def __init__(self, released, asked):
+        super().__init__([])
+        self.released, self.asked = released, asked
+
+    def __call__(self, artifact, batch):
+        if not self.released.is_set():
+            self.released.set()
+            assert not self.asked.wait(timeout=1), "the training stream placed a batch during the pass"
+        return super().__call__(artifact, batch)
+
+
+def test_a_run_places_no_training_batch_while_it_evaluates():
+    """A run whose training stream falls behind and catches up during a validation pass places the
+    caught-up batch after the pass, beside the step that reads it, never during it: on a GPU, a batch
+    placed while a pass holds memory lands past the pass's temporaries, inside the free block the next
+    step takes whole, and a 4B's step that fit before its first pass found its block split after it
+    (row 2088)."""
+    import threading
+
+    released, asked = threading.Event(), threading.Event()
+
+    def stream():
+        source = batches()
+        yield next(source)
+        released.wait()
+        yield next(source)
+        asked.set()
+        yield from source
+
+    state = make_trainer().fit(
+        Loader(lambda partition: stream(), lambda partition: val_stream(), batch=BATCH, records=None),
+        steps=2, log_every=1, eval_every=1, metrics=(Releasing(released, asked),))
+    assert int(state.step) == 2
 
 
 # --------------------------------------------------------------------------
