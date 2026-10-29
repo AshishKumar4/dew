@@ -4,7 +4,9 @@ one process, each cell a route's property on its generation (`Cell`).
 Each cell's label is printed before it runs, so a hang or a fatal device error names the cell it stopped
 in (the session's own deadline ends the process). Each cell's failure is kept, and every failure is raised
 together after the last cell (`CellsFailed`), so no failure hides another. A cell whose generation this
-device cannot run (`generation_support.runnable`) is reported skipped, never passed."""
+device cannot run (`generation_support.runnable`), or that skips itself (`pytest.skip`: a missing
+optional package, too little free device memory), is reported skipped with its reason, never passed,
+and the cells after it still run."""
 
 import dataclasses
 import traceback
@@ -29,7 +31,7 @@ class CellsFailed(AssertionError):
 
 def run_cells(cells: Iterable[Cell]) -> None:
     """Run every cell in order (`Cell`): each label printed first; every failure kept and raised together
-    after the last; the cells this device cannot run reported skipped."""
+    after the last; the cells this device cannot run, or that skip themselves, reported skipped."""
     failed, skipped, passed = [], [], 0
     for cell in cells:
         if cell.generation is not None and not runnable(cell.generation):
@@ -38,6 +40,9 @@ def run_cells(cells: Iterable[Cell]) -> None:
         print(f"cell: {cell.label}", flush=True)
         try:
             cell.run()
+        except pytest.skip.Exception as skip:
+            print(f"cell skipped: {cell.label}: {skip.msg}", flush=True)
+            skipped.append(cell.label)
         except Exception as error:
             # Kept with its label, and raised with every other cell's after the last.
             failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip()))
