@@ -99,14 +99,16 @@ def test_the_live_sampler_cell_runs_whole_through_the_stand_ins_as_dew_runs_it(s
 
     monkeypatch.setattr(client, "request", shared)
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
-    cell = (SITE / "src" / "data" / "sampler.py").read_text()
+    cell = compile((SITE / "src" / "data" / "sampler.py").read_text(), "sampler.py", "exec")
+    # Dew's own run of the cell first: the stand-ins, once installed, refuse every other Dew module to the
+    # rest of the test's process.
+    native_namespace = {"dew": SimpleNamespace(pipeline=lambda *args, **kwargs: pipe)}
+    exec(cell, native_namespace)
     namespace = {}
     with stood_in(client) as real:
-        exec(compile(cell, "sampler.py", "exec"), namespace)
+        exec(cell, namespace)
     assert asked == ["describe", "sample"]
     assert (namespace["pipe"].repo, namespace["pipe"].revision) == (native.repo, native.revision)
-    native_namespace = {"dew": SimpleNamespace(pipeline=lambda *args, **kwargs: pipe)}
-    exec(compile(cell, "sampler.py", "exec"), native_namespace)
     np.testing.assert_array_equal(namespace["result"].host().images, native_namespace["result"].host().images)
 
 
