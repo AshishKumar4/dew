@@ -165,6 +165,20 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 `mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. With `by="tokens"`, token stores' shares count valid targets, not padding. `phases((first, until_step), ..., (last, None))` reads datasets one after another, each until the training step it names and the last until the run ends; each phase is a whole chain of the same batch. `schedule([(first, tokens), ..., (last, None)])` reads them on the run's committed-token clock instead: each stage ends at the step whose commit brings the run's committed tokens, the count `fit(tokens=)` reads, to the stage's own. Each stage lays its rows out as it reads, so a context-extension schedule packs its later stage into longer rows than its first, which a language model trains at that length up to its `max_seq_len`.
 
+### A pinned text, code and chat mixture
+
+[recipes/lm/mixture.py](https://github.com/AshishKumar4/dew/blob/main/recipes/lm/mixture.py) mixes three public sources, each pinned to a Hub commit and streamed from its own Parquet shards: English Wikipedia's 2023-11-01 dump, The Stack v1's filtered Python functions and UltraChat 200k's SFT conversations. Text and code are tokenized, a conversation is rendered through the tokenizer's chat template (SmolLM2's, pinned), and the three are mixed at 70/20/10 by valid target tokens, then packed:
+
+```python
+parts = {"web": web.read("streamed").map(text.tokenize(tok, eos=True)),
+         "code": code.read("streamed").map(text.tokenize(tok, field="content", eos=True)),
+         "chat": conversations.read("streamed").map(chat.template(tok)).select_columns("text")}
+data = mix([parts["web"], parts["code"], parts["chat"]], [0.7, 0.2, 0.1], by="tokens")
+trainer.fit(data.pack(seq_len=2049).shuffle(seed=0, window=10_000).batch(64), tokens=...)
+```
+
+`python recipes/lm/mixture.py --show 2000` reads the first 2,000 mixed documents and prints each source's share of their tokens. On 2026-10-29 it read 906 Wikipedia articles, 1,027 functions and 67 conversations, 796,398 tokens in all, at 0.700, 0.200 and 0.100 of them.
+
 ## Token-budget batches
 
 `Pipeline.batch(tokens=24576)` takes as many rows as a token budget holds rather than a row count. Every row holds the same number of tokens, which the stage that lays the rows out states (`pack` and `windows`, each its inputs a row) or a record step declaring `TokenGeometry` (`FixedTokens` for rows a chain does not lay out itself, `PackedRows` for packed decision windows); the compiler does not guess from field names, and a budget that is not whole rows is refused.

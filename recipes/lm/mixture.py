@@ -5,8 +5,9 @@ at a fixed commit, mixed by tokens and packed into rows a trainer reads.
 
 The sources are English Wikipedia's 2023-11-01 dump (prose, `text`), The Stack v1's filtered Python
 functions (`content`) and UltraChat 200k's SFT conversations (`messages`), each read as the Hub stores it,
-streamed from its own Parquet shards. Text and code are tokenized and ended by EOS; a conversation is rendered through the
-tokenizer's chat template, and keeps only its tokens, as a pretraining row does not weigh speakers apart. The
+streamed from its own Parquet shards. Text and code are tokenized and ended by EOS; a conversation is rendered
+through the tokenizer's chat template, and keeps only its tokens, as a pretraining row does not weigh speakers
+apart. The
 tokenizer is SmolLM2's, whose template renders each message the same whatever follows it, as `chat.template`
 needs (Qwen3's drops an earlier turn's reasoning once a later one follows, which it refuses). The
 three are mixed at 70/20/10 by valid target tokens (`mix(by="tokens")`) and packed first-fit into rows of
