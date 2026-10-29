@@ -69,8 +69,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     is made (`_grouped`). Its gradient is the stack's, every other layer's zero. `paired`, a second matrix
     of `rhs`'s shape, the rows multiply into a second accumulator the epilogue takes before its side
     operands (`epilogue(acc, paired_acc, *sides)`: a gate's and an up projection's SwiGLU), else an output."""
-    if paired is not None and (compute is not None or layer is not None):
-        raise ValueError("a paired product takes its operands' own dtype and no stacked layer")
+    if paired is not None and layer is not None:
+        raise ValueError("a paired product takes no stacked layer")
     if compute is not None and prologue is not None:
         raise ValueError("a prologue's operand is multiplied in its own dtype, not a named `compute`")
     straight = compute is not None
@@ -167,7 +167,8 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
                                         dense=dense)
         launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
-        return portable(lhs, rhs, group_sizes, prologue_arrays) if launch is None else launch()
+        # A kernel gradient is one product: no launch takes it apart.
+        return launch() if callable(launch) else portable(lhs, rhs, group_sizes, prologue_arrays)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays):
         routed = _routed(group_sizes, lhs.shape[0])
@@ -262,16 +263,21 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
                                      tuple(dtype.name for dtype in dtypes) if several else None,
                                      prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast,
                                      prologue_dtypes=_dtypes(prologue, lhs, before_sides),
-                                     epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides),
-                                     paired=paired is not None)
+                                     epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides))
         product = declared(lhs.dtype, precision, outputs=summed_as or dtypes, operands=(lhs.dtype, rhs.dtype))
         call = grouped_matmul.gmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, before_sides, after_sides,
                                        None if paired is None else paired.astype(lhs.dtype),
                                        out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
                                        interpret=interpret, promoted=product.promoted, dense=dense)
-        # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program.
+        # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program; a paired one no
+        # launch takes whole its two products apart, each through the launches that take it (`_apart`).
         launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
-        if launch is None:
+        if launch is grouped_matmul.APART:
+            return _apart(lhs, (rhs, paired), group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
+                          epilogue_arrays, dtypes, several=several, summed_as=summed_as or dtypes,
+                          transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu, precision=precision,
+                          dense=dense)
+        if not callable(launch):
             return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired)
         return launch()
 
@@ -347,6 +353,25 @@ def _kernel_gradient(lhs, d_product, matrix, group_sizes, prologue, prologue_arr
     return jnp.swapaxes(gradient, 1, 2) if plain['transpose_rhs'] else gradient
 
 
+def _apart(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
+           epilogue_arrays, dtypes, *, several: bool, summed_as: tuple, **options):
+    """A paired product no launch takes whole (`grouped_matmul.APART`): each matrix's product through the
+    launches that take it (`_gemm`), summed as the call's outputs sum (`summed_as`), then the epilogue in
+    XLA on the two fp32 accumulators, as the paired launch's and XLA's program give it them (so a forward,
+    its recomputation and its tangent read the same values); without an epilogue, each product its own
+    output. Where XLA's ragged dot would run the pair instead, it ran 70 to 200 times the launches' time
+    (GMM-h100-2)."""
+    wide = at_least_fp32(lhs.dtype)
+    kept = (wide,) * len(matrices) if epilogue is not None else tuple(dtypes)
+    products = tuple(_gemm(lhs, matrix, group_sizes, prologue, prologue_arrays, prologue_axes, None, (), (),
+                           (dtype,), several=False, summed_as=summed_as, **options)
+                     for matrix, dtype in zip(matrices, kept, strict=True))
+    if epilogue is not None:
+        products = _tupled(epilogue, *products, *epilogue_arrays)
+    outs = tuple(out.astype(dtype) for out, dtype in zip(products, dtypes, strict=True))
+    return outs if several else outs[0]
+
+
 def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays, dtypes,
                    several: bool, transpose_rhs: bool, precision: PrecisionLike, compute=None,
                    paired: jax.Array | None = None):
@@ -360,7 +385,8 @@ def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, e
     if compute is not None:
         # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
         wide = at_least_fp32(compute)
-        accs = (grouped_matmul.portable_projection(lhs, matrices[0], group_sizes, compute, precision, wide),)
+        accs = tuple(grouped_matmul.portable_projection(lhs, matrix, group_sizes, compute, precision, wide)
+                     for matrix in matrices)
     else:
         product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         wide = at_least_fp32(lhs.dtype)

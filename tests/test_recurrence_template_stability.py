@@ -99,8 +99,8 @@ def template_trains(operands: Chunk, hooks) -> bool:
 
 def runs(fn, hooks, operands: Chunk, drawn, product: str) -> bool:
     """Whether the template runs the case `fn` traces over `drawn`: a form it does not take (`taken`), or a
-    gradient its fast backward does not (`Mosaic.trains`: an fp32 call's, a decay a key dimension's, an
-    mma.sync GPU's), checked refused as `fn` traces, where it does not."""
+    gradient its fast backward does not (`Mosaic.trains`: an fp32 call's, a decay a key dimension's, or one
+    whose launches the device does not hold), checked refused as `fn` traces, where it does not."""
     if not taken(operands, hooks):
         with pytest.raises(REFUSED):
             jax.eval_shape(fn, *drawn)
@@ -170,12 +170,12 @@ def test_each_form_the_template_takes_stays_finite_interpreted(name, regime):
 
 @pytest.mark.parametrize('regime', REGIMES)
 def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(regime):
-    """The template's gradient over each regime's draw takes its fast backward where its launches hold at the
-    call's derived tiles (`fast_backward`): off a GPU by the interpreted bundle, on a warpgroup-MMA GPU by
-    its own; on an mma.sync GPU they do not, and the rule refuses the gradient (row 1926)."""
+    """The template's gradient over each regime's draw takes its fast backward, its launches holding at the
+    call's derived tiles (`fast_backward`): off a GPU by the interpreted bundle, on a GPU by its own, an
+    A100's too (its keys launch a key block a program, its query/key launch's memory sum a product: their
+    loops' operand fragments spilled 64 to 200 bytes a thread past its 255 registers)."""
     operands, _ = cotangents(HOOKS, regime, 0)
-    fast = generation.family(generation.device_generation()) != 'mma.sync'
-    assert fast_backward(restarting(lambda given: given, regime)(bf16(operands, HOOKS))) == fast
+    assert fast_backward(restarting(lambda given: given, regime)(bf16(operands, HOOKS)))
 
 
 def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
@@ -184,7 +184,7 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     own order-one term added and taken away, which rounded away the `exp(-30)` terms before it (65 to 169
     times the port's distance on three draws, the H100's check 1 140 times, SE-numerics-h100-fd61e11eeb;
     0.98 to 1.00 times after), held on one draw by the gate's one-draw rule. On a GPU whose launches do not
-    hold the fast backward (an mma.sync one's) the rule refuses the gradient (row 1926)."""
+    hold the fast backward the rule refuses the gradient (row 1926)."""
     regime = 'decays near zero'
     operands, (out, final) = cotangents(HOOKS, regime, 0)
     drawn = (bf16(operands, HOOKS), (out.astype(jnp.bfloat16), final))
