@@ -821,6 +821,21 @@ def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callab
 
 
 @_lowered_once
+def _solving(call: _Call) -> mosaic.Family:
+    """The bundle the solve launch issues by: on a GPU of warpgroup MMA its layout without a producer
+    (`bundles.layouts`' last, `mosaic_sm90.FED`), whose consumers hold a program's entry registers and two
+    programs a multiprocessor (`ConsumerFed.programs`), else the call's. The solve's persistent programs walk
+    a chunk at a time on their products' latency, one a multiprocessor beside a producer leaving its tensor
+    cores idle: on an H100 PCIe the 27B gated delta net's took 0.235 ms on it against 0.356 beside a
+    producer, Qwen3-Next's 0.156 against 0.240, where the states launch's walk took 0.187 beside a producer
+    against 0.202 to 0.243 without one (JS-fed5-h100-d82eeb171). Interpreted, the interpreter's
+    (`INTERPRETED`)."""
+    if call.interpret:
+        return call.family
+    layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype))
+    return layouts[-1] if layouts and call.family is layouts[0] else call.family
+
+
 def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     """`(a [R, HV * C], w [R, HV * Dk], u [R, HV * Dv])` as `call.held` of each chunk and value head under a
     decay a head, fla's kkt_solve and recompute_w_u in one program (FlashQLA's first kernel): the keys'
@@ -831,6 +846,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     stored and loaded the inverse between them. Where it `keeps` no inverse (a forward no backward reads,
     `a` None), its store's landing tile goes: an A100's launch then holds two programs a multiprocessor
     (an inverse's 8 KB past half its shared memory kept it at one, SE-family-a100-0c8018352)."""
+    call = dataclasses.replace(call, family=_solving(call))
     width, value_width, family = call.width, call.value_width, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
 
