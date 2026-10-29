@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from dew.registry import read_arguments
 
 from ..mixer_base import MixerBase
-from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
+from ..rope import Scaling, rope_scaling_from_record
 
 if TYPE_CHECKING:
     # A layer's place in the depth mixture, which the plan carries and the block reads.
@@ -60,13 +60,9 @@ class LayerKind:
     """This kind's key/value head count; None takes the model's. Gemma 4's
     global layers have fewer than its sliding ones (num_global_key_value_heads)."""
     rope_theta: float | None = None  # set: this kind takes this base over the model's
-    rope_scaling: RopeScaling | LongRopeScaling | None = None
-    """This kind's llama3 ramp, or its record. None uses the model's."""
-    # OLMo 3's per-kind YaRN: configuration_olmo3.py:110-113.
-    yarn: YarnScaling | None = None
-    """This kind's YaRN ramp, or its record. None uses the model's. OLMo 3
-    scales only its full-attention layers, so a YaRN ramp can belong to a
-    kind as well as to the model."""
+    rope_scaling: Scaling | None = None
+    """This kind's rope scaling (Llama 3.1's, LongRoPE's or YaRN's), or its record. None uses the
+    model's. OLMo 3 scales only its full-attention layers by YaRN (configuration_olmo3.py:110-113)."""
     head_dim: int | None = None
     partial_rotary_factor: float | None = None
     """The fraction of this kind's head the rotary turns; None takes the
@@ -116,8 +112,7 @@ class ResolvedKind:
     chunk: int | None
     num_kv_heads: int
     rope_theta: float
-    rope_scaling: RopeScaling | LongRopeScaling | None
-    yarn: YarnScaling | None
+    rope_scaling: Scaling | None
     head_dim: int
     partial_rotary_factor: float | None
     sinks: bool

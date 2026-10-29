@@ -98,7 +98,7 @@ from ..precision import (
     scaled_logits,
 )
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
-from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
+from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
 from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
 from .decoder_block import (
     DECODER_REMAT,
@@ -222,7 +222,8 @@ class CausalTransformer(nn.Module):
     position_embedding_offset: int = 0
     """The number of reserved rows before learned position zero; OPT checkpoints have two."""
     rope_theta: float = 10000.0              # the base a kind does not override
-    rope_scaling: RopeScaling | LongRopeScaling | None = None
+    rope_scaling: Scaling | None = None
+    """The model's rope scaling: Llama 3.1's ramp, LongRoPE's factors or YaRN's record (`rotary_freqs`)."""
     partial_rotary_factor: float | None = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     narrow_rotary_tables: bool = False
@@ -269,7 +270,6 @@ class CausalTransformer(nn.Module):
     """The factor that multiplies the values as they are projected, before
     they are cached: MiMo-V2-Flash's `attention_value_scale`."""
     attention_sinks: bool = False
-    yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
@@ -553,18 +553,15 @@ class CausalTransformer(nn.Module):
 
     def kind_of(self, layer_type: str) -> "ResolvedKind":
         """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset.
-        A rope scaling is one setting, YaRN's record or a Llama 3.1 or LongRoPE ramp: a kind that gives
-        either takes it in place of the model's, never beside it (`MixerContext.rotary_scaling`)."""
+        A kind's rope scaling takes the model's place."""
         kind = (self.kinds or {}).get(layer_type, LayerKind())
-        scaled = kind.rope_scaling is not None or kind.yarn is not None
         return ResolvedKind(
             window=kind.window,
             bidirectional_window=kind.bidirectional_window,
             chunk=kind.chunk,
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
-            rope_scaling=kind.rope_scaling if scaled else self.rope_scaling,
-            yarn=kind.yarn if scaled else self.yarn,
+            rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
@@ -640,7 +637,7 @@ class CausalTransformer(nn.Module):
                       kv_shared: bool) -> MixerContext:
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
-        `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
+        `head_dim`, `rope_theta`, `window`, the rope scaling, the partial
         rotary, the sinks and the query-key norm take the layer kind's resolved values
         (`kind_of`), and the precision the model's layers take (`products`). Every other field
         is the model's field of the same name. A kind builds its `DecoderBlock` factory
@@ -649,7 +646,7 @@ class CausalTransformer(nn.Module):
         """
         resolved = {
             "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
-            "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling, "yarn": kind.yarn,
+            "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling,
             "sliding_window": kind.window, "bidirectional_window": kind.bidirectional_window,
             "attention_chunk": kind.chunk,
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
@@ -1278,13 +1275,15 @@ class CausalTransformer(nn.Module):
                  attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
                  right_padded: bool = False, coordinates: Coordinates | None = None,
                  conditioning: Mapping[str, jax.Array] | None = None):
+        # The call's token layout, converted once (`token_coordinates`): the trunk and the
+        # prediction depths read its coordinates alone.
+        coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
+                                        valid=attention_mask, positions=positions, right_padded=right_padded)
         x, prediction = self.hidden_and_mtp_inputs(
-            tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
+            tokens, train=train, decode=decode, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
             attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
-            attention_key_runs=attention_key_runs, right_padded=right_padded,
-            coordinates=coordinates, conditioning=conditioning)
+            attention_key_runs=attention_key_runs, coordinates=coordinates, conditioning=conditioning)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1292,9 +1291,7 @@ class CausalTransformer(nn.Module):
             # main forward never enters the prediction depths. Reaching them
             # here, during init only, makes the model's tree the model's
             # business: a plain init holds every depth.
-            self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
-                                   segment_ids=segment_ids, input_embeddings=input_embeddings,
-                                   attention_mask=attention_mask,
+            self.mtp_hidden_states(prediction, tokens, train=train, input_embeddings=input_embeddings,
                                    image_groups=image_groups, block_groups=block_groups,
                                    rotary_positions=rotary_positions, coordinates=coordinates)
         return self._logits(x)
@@ -1403,24 +1400,22 @@ class CausalTransformer(nn.Module):
             raise ValueError("prediction depths need a sequence longer than their depth count")
         coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
                                         positions=positions)
-        if coordinates is not None:
-            segment_ids, positions, attention_mask = (coordinates.segments, coordinates.positions,
-                                                     coordinates.valid)
+        documents, given, given_valid = ((None, None, None) if coordinates is None else
+                                         (coordinates.segments, coordinates.positions, coordinates.valid))
         embeds = self._prepared(self.token_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
         # and no validity says that: an all-true array would make the depth
         # build a mask and drop off the fused kernel.
         valid = None
-        if segment_ids is not None or attention_mask is not None:
-            valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
+        if documents is not None or given_valid is not None:
+            valid = jnp.ones(tokens.shape, bool) if given_valid is None else given_valid
         states = []
         for depth, block in enumerate(self.mtp, start=1):
             if valid is not None:
-                documents = None if segment_ids is None else segment_ids[:, depth - 1:]
-                valid = shifted_span(valid.shape, 1, valid=valid, segments=documents)
-            segments, places = (None if field is None else field[:, depth:]
-                                for field in (segment_ids, positions))
+                valid = shifted_span(valid.shape, 1, valid=valid,
+                                     segments=None if documents is None else documents[:, depth - 1:])
+            segments, places = (None if field is None else field[:, depth:] for field in (documents, given))
             metadata = AttentionMetadata(
                 # Cross-document pairs leave holes even when the token rows were right-padded.
                 coordinates=None if coordinates is None else build_coordinates(
@@ -1436,13 +1431,15 @@ class CausalTransformer(nn.Module):
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
                    segment_ids=None, input_embeddings=None,
                    attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
+                   coordinates: Coordinates | None = None,
                    conditioning: Mapping[str, jax.Array] | None = None):
         """Return the shared language head's logits for each prediction depth's hidden states; a
         call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
-            block_groups=block_groups, rotary_positions=rotary_positions, conditioning=conditioning)]
+            block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates,
+            conditioning=conditioning)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
@@ -1671,11 +1668,11 @@ class CausalTransformer(nn.Module):
           A cached call that carries it keeps its keys and values for the
           calls after it. A model without cross-attention takes none.
         """
+        coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
+                                        valid=attention_mask, positions=positions, right_padded=right_padded)
         attention_metadata = self._attention_metadata(
-            tokens, decode, positions, segment_ids, attention_mask, image_groups, block_groups,
-            rotary_positions, attention_pairwise_mask, attention_key_positions, attention_key_runs,
-            media_mask, admitted,
-            right_padded, coordinates, conditioning)
+            tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
+            attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1733,17 +1730,16 @@ class CausalTransformer(nn.Module):
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction
 
-    def _attention_metadata(self, tokens, decode: bool, positions, segment_ids, attention_mask, image_groups,
-                            block_groups, rotary_positions, pairwise_mask, key_positions, key_runs,
-                            media_mask, admitted=None,
-                            right_padded: bool = False,
+    def _attention_metadata(self, tokens, decode: bool, image_groups, block_groups, rotary_positions,
+                            pairwise_mask, key_positions, key_runs, media_mask, admitted=None,
                             coordinates: Coordinates | None = None,
                             conditioning: Mapping[str, jax.Array] | None = None) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
-        carries none of it: the masks and positions `hidden_and_mtp_inputs`
-        takes, the token ids a hash router selects by, the engram layers'
-        bucket ids, the media mask, which only a model with engram or a
-        router with a media bias reads, and the cross-attention's context."""
+        carries none of it: the tokens' layout `hidden_and_mtp_inputs`
+        converted (`coordinates`), the token ids a hash router selects by,
+        the engram layers' bucket ids, the media mask, which only a model
+        with engram or a router with a media bias reads, and the
+        cross-attention's context."""
         if conditioning and self.cross_attention is None:
             raise TypeError(f"this decoder has no cross-attention to read the conditioning "
                             f"{sorted(conditioning)}")
@@ -1764,8 +1760,6 @@ class CausalTransformer(nn.Module):
                              "visibility; pass one")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
-        coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
-                                        valid=attention_mask, positions=positions, right_padded=right_padded)
         if decode and coordinates is not None and coordinates.max_segments > 1:
             raise ValueError(
                 "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
@@ -2383,7 +2377,7 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def block_chunks(self) -> tuple[int | None, ...]:
         """The attention chunk of each trunk layer that reads a block whole
-        (`AttentionMixer.bidirectional_blocks`), None where a layer has none (`BlockReading`). Each layer's
+        (`MixerBase.reads_blocks`), None where a layer has none (`BlockReading`). Each layer's
         mixer is `_layer_specs`' own, the kind's or the model's layer mixer, so a prediction depth's or the
         drafter's kind, which the trunk never runs, reads none here."""
         types = self.per_layer_types
@@ -2391,8 +2385,7 @@ class CausalTransformer(nn.Module):
         default = self.layer_mixer
         built = [(spec.kind.mixer or default, spec.kind.chunk)
                  for spec in self._layer_specs(types, kinds, default)]
-        return tuple(chunk for mixer, chunk in built
-                     if isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks)
+        return tuple(chunk for mixer, chunk in built if mixer.reads_blocks)
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:

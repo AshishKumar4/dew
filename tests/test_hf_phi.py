@@ -2,13 +2,12 @@
 
 import contextlib
 import json
-import shutil
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from interop_support import fixture_ids, next_token_losses, transformers_arms, transformers_model
+from interop_support import fixture_ids, next_token_losses, respelled, transformers_arms, transformers_model
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
@@ -63,10 +62,7 @@ YARN_SEEDS = 64
 
 def yarn_source(tmp_path) -> Path:
     """phi-tiny's checkpoint under `YARN`."""
-    directory = shutil.copytree(DIRECTORY, tmp_path / 'phi-yarn')
-    config = json.loads((DIRECTORY / 'config.json').read_text())
-    (directory / 'config.json').write_text(json.dumps({**config, 'rope_parameters': YARN}))
-    return directory
+    return respelled(DIRECTORY, tmp_path / 'phi-yarn', lambda config: {**config, 'rope_parameters': YARN})
 
 
 def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_path):
@@ -80,11 +76,12 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
     from transformers import AutoModelForCausalLM
 
     from dew.interop import PretrainedDecoder
+    from dew.nn.rope import YarnScaling
     from tools.torch_precision import float64
 
     source = yarn_source(tmp_path)
     loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
-    assert loaded.model.yarn is not None and loaded.model.partial_rotary_factor == 0.5
+    assert isinstance(loaded.model.rope_scaling, YarnScaling) and loaded.model.partial_rotary_factor == 0.5
 
     def dew(ids):
         def loss(params):

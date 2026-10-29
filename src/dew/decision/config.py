@@ -184,6 +184,12 @@ class DecisionRunConfig(DecoderRunConfig):
         flags choose only its compute dtype and attention kernel;
         `param_dtype` chooses the loaded checkpoint's storage dtype. `remat`
         chooses its layer recomputation before looping or attaching LoRA."""
+        pinned = self.pinned_adapter()
+        # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
+        return pinned.prepare() if pinned is not self else self._prepared()
+
+    def _prepared(self) -> Prepared:
+        """`prepare`'s run, its imported adapter pinned."""
         from dew.interop import Pretrained
 
         self.sourced_model()
