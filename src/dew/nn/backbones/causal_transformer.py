@@ -57,6 +57,7 @@ from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks
 from ..deepseek_v4 import DeepseekV4Mixer
+from ..dex import DifferentialExtension, LayerDex
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
@@ -395,6 +396,8 @@ class CausalTransformer(nn.Module):
     the `constants` collection. A loaded checkpoint derives it from its
     tokenizer, and a fresh model fills it with each id modulo the compressed
     vocabulary's size."""
+    dex: DifferentialExtension | None = None
+    """The chosen heads whose attention outputs take a learned differential (`dew.nn.dex`), or None."""
     cross_attention: CrossBlocks | None = None
     """The layers that read a conditioning sequence through Flamingo's gated
     cross-attention (`dew.nn.cross_attention`), before their own sublayers; None
@@ -640,7 +643,7 @@ class CausalTransformer(nn.Module):
         return self.vocab_size if self.per_layer_input_vocab is None else self.per_layer_input_vocab
 
     def mixer_context(self, kind: "ResolvedKind", layer_type: str,
-                      kv_shared: bool) -> MixerContext:
+                      kv_shared: bool, dex: LayerDex | None = None) -> MixerContext:
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
         `head_dim`, `rope_theta`, `window`, the rope scaling, the partial
@@ -659,7 +662,7 @@ class CausalTransformer(nn.Module):
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.precision}
+            "precision": self.precision, "dex": dex}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -1041,7 +1044,8 @@ class CausalTransformer(nn.Module):
                        else None),
                 prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers
                                    else None),
-                attention_norm=index > 0 or self.first_attention_norm)
+                attention_norm=index > 0 or self.first_attention_norm,
+                dex=None if self.dex is None else self.dex.layer(index))
             for index, layer_type in enumerate(types))
 
     @nn.nowrap
@@ -1055,7 +1059,7 @@ class CausalTransformer(nn.Module):
         spec = specs[index]
         return DecoderBlock(
             mixer=(spec.kind.mixer or mixer_spec).build(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared)),
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex)),
             feedforward=(
                 functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
                 if spec.hash_routed and routed is not None else
@@ -1110,7 +1114,7 @@ class CausalTransformer(nn.Module):
         types = self.per_layer_types
         spec = self._layer_specs(types, self.layer_kinds(types), self.layer_mixer)[index]
         return (spec.kind.mixer or self.layer_mixer).build(
-            self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared))(parent=None)
+            self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex))(parent=None)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
@@ -2300,6 +2304,11 @@ class CausalTransformer(nn.Module):
         """This decoder with `cross` as its cross-attention layers (`CrossAttending`), None for none."""
         return self.clone(cross_attention=cross)
 
+    @nn.nowrap
+    def with_dex(self, extension: DifferentialExtension | None) -> Self:
+        """This decoder with `extension`'s differential on its chosen heads (`dew.nn.dex`), None for none."""
+        return self.clone(dex=extension)
+
     def with_remat(self, policy: RematPolicy | None) -> Self:
         """Start at `policy`, including policies outside `DECODER_REMAT`.
 
@@ -2433,7 +2442,7 @@ class CausalTransformer(nn.Module):
         default = self.layer_mixer
         for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
             refusal = (spec.kind.mixer or default).mixed_refusal(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared))
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex))
             if refusal is not None:
                 return f"layer {index}: {refusal}"
         return None

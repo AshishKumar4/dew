@@ -87,6 +87,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, backend, chosen_kernel, gpu_mesh, gpu_target
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
+from dew.nn.progress import training
 from dew.nn.sharding import (
     Link,
     Schedule,
@@ -482,8 +483,7 @@ class Trainer(Generic[Loss, Effects]):
         """The axes the objective's modules box on their own parameters
         (`nn.with_logical_partitioning`), which its init returns and the state
         unboxes: what `initial_state` last traced, else one abstract init, for
-        a state the trainer did not build. A checkpoint records them for its
-        restore."""
+        a state the trainer did not build. A checkpoint records them for its restore."""
         if self._boxed is None:
             self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
         return self._boxed
@@ -913,7 +913,7 @@ class Trainer(Generic[Loss, Effects]):
         def run(current, batch, part, tokens):
             advanced, loss, aux = custom(current, batch)
             return advanced, loss, aux, None
-        return run
+        return training(run)
 
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *,

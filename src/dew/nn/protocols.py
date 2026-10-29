@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.cross_attention import CrossBlocks
+    from dew.nn.dex import DifferentialExtension
     from dew.nn.dit import TextContext
     from dew.nn.dspark import DSpark
     from dew.nn.hyper_connections import HyperConnections
@@ -630,6 +631,14 @@ class CrossAttending(Protocol):
         ...
 
     def with_cross_attention(self, cross: CrossBlocks | None) -> Self: ...
+
+
+@runtime_checkable
+class Differential(Protocol):
+    """A decoder whose softmax layers can take DEX's differential on chosen heads (`dew.nn.dex`):
+    CausalTransformer, and a wrapper over one."""
+
+    def with_dex(self, extension: DifferentialExtension | None) -> Self: ...
 
 
 @runtime_checkable
