@@ -1,6 +1,6 @@
-"""Liquid's LFM3 text decoder (`lfm3`) against its own remote code at LiquidAI/LFM3-1.7B@40ebe0a:
-tools/remote_code_reference.py writes tests/fixtures/hf/lfm3-tiny, its six layers gated short
-convolutions between full and sliding attention layers."""
+"""Liquid's LFM3 text decoder (`lfm3`) at LiquidAI/LFM3-1.7B@40ebe0a: tools/remote_code_reference.py
+writes tests/fixtures/hf/lfm3-tiny, its six layers gated short convolutions between full and sliding
+attention layers, whose release outputs tests/test_remote_code_releases.py holds Dew to."""
 
 import json
 from pathlib import Path
@@ -9,44 +9,40 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import decode_steps
-from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained
+from dew.interop.families.lfm3 import LFM3
 
-TINY = Path(__file__).parent / 'fixtures' / 'hf' / 'lfm3-tiny'
+FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
+TINY = FIXTURES / 'lfm3-tiny'
 
 
 def fixture(name: str) -> np.ndarray:
     return np.load(TINY / f'{name}.npy')
 
 
-def test_the_text_decoder_computes_the_remote_codes_logits():
-    """Gated short convolutions of seven taps, attention with per-head q/k norms and a sigmoid gate a
-    head, the full layers turning half of each head at 1e6 and the sliding ones all of it at 1e4 over
-    a window of four, sandwich norms and a tied head: the release's logits, on par with its own
-    against float64 (check 1)."""
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
-    ours = np.asarray(loaded.model.apply(loaded.variables, fixture('input_ids')))
-    assert_as_exact_as_the_reference(ours, fixture('logits'), fixture('logits_f64'), 'LFM3 logits')
+RELEASED = {'configuration_lfm3.py': 'from transformers import PretrainedConfig\n',
+            'modeling_lfm3.py': 'from .lfm3_conv import conv\n', 'lfm3_conv.py': 'conv = None\n'}
+"""Stand-ins for LFM3's release modules: its config's two auto_map modules, the modeling one importing a
+third relatively, as the release's does (modeling_lfm3.py:48)."""
 
 
-def test_a_decode_through_the_cache_computes_the_remote_codes_logits():
-    """A prefill of four tokens, then one token a step: each convolution's last six inputs and each
-    attention layer's keys through the cache, the sliding window over the cached keys; every step's
-    logits on par with the release's (check 1)."""
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
-    ids = jnp.asarray(fixture('input_ids'), jnp.int32)
-    made, step = decode_steps(loaded.model)
-    logits, cache = step(loaded.variables, made(loaded.variables, ids.shape[0]), ids[:, :4])
-    steps = [logits[:, -1]]
-    for position in range(4, ids.shape[1]):
-        logits, cache = step(loaded.variables, cache, ids[:, position:position + 1])
-        steps.append(logits[:, -1])
-    ours = np.asarray(jnp.stack(steps, axis=1))
-    assert_as_exact_as_the_reference(ours, fixture('logits')[:, 3:], fixture('logits_f64')[:, 3:],
-                                     'LFM3 decoded logits')
+@pytest.fixture
+def release_cache(tmp_path, monkeypatch) -> Path:
+    """The hub's cache seeded with stand-ins for LFM3's release modules (`RELEASED`) at the commit Dew is
+    held to (`DecoderFamily.release_code`), which a native export reads from it without the network:
+    the snapshot directory. The network test fetches the release's own."""
+    import huggingface_hub.constants
+
+    code = LFM3.release_code
+    repository = f"models--{str(code.source).replace('/', '--')}"
+    snapshot = tmp_path / 'hub' / repository / 'snapshots' / code.revision
+    snapshot.mkdir(parents=True)
+    for file, text in RELEASED.items():
+        (snapshot / file).write_text(text)
+    monkeypatch.setattr(huggingface_hub.constants, 'HF_HUB_CACHE', str(tmp_path / 'hub'))
+    return snapshot
 
 
 def test_a_saved_decoder_writes_the_releases_tensors_back(tmp_path):
@@ -61,7 +57,7 @@ def test_a_saved_decoder_writes_the_releases_tensors_back(tmp_path):
 
 
 @pytest.mark.parametrize('sandwich', [True, False], ids=['sandwich', 'plain'])
-def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, sandwich):
+def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, sandwich, release_cache):
     """A model built in Dew (`PretrainedDecoder.from_model`) is an LFM3 by its convolution kind, ahead of
     the families that match its gated attention or its sliding layers, and saves a config and tensors
     that load back to it, its logits bit for bit, with sandwich norms or without and with its full and
@@ -77,6 +73,10 @@ def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, san
     expected = np.asarray(model.apply(variables, ids))
     PretrainedDecoder.from_model(model, variables).save(tmp_path / 'saved')
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['model_type'] == 'lfm3'
+    if sandwich:
+        # The release's own tensor names, its attention's gate_proj beside its feed-forward's w1.
+        written = load_file(tmp_path / 'saved' / 'model.safetensors')
+        assert sorted(written) == sorted(load_file(TINY / 'model.safetensors'))
     restored = Pretrained.load(tmp_path / 'saved', dtype='float32', attention_impl='reference')
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)), expected)
 
@@ -169,3 +169,83 @@ def test_the_released_lfm3_vl_and_d1_headers_load_their_language_model_or_refuse
     with pytest.raises(ValueError):
         Pretrained.load('LiquidAI/d1-2B', revision='cfe5760ff5d5998f91d9ac56bd4b2dbd96996d41', weights=False,
                         text_only=True)
+
+
+def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_path):
+    """A release whose config names its own code (`auto_map`), which Dew maps natively and never runs,
+    saves those modules and every module they import relatively, as transformers resolves them, beside
+    its config, which keeps the auto_map, and no other file of its: the directory opens through the
+    release's own transformers loader as the release does (ledger 2038). The modules here stand in for
+    the release's (`RELEASED`), which the network test loads through transformers."""
+    import shutil
+
+    source = tmp_path / 'release'
+    shutil.copytree(TINY, source)
+    config = json.loads((source / 'config.json').read_text())
+    code = LFM3.release_code
+    (source / 'config.json').write_text(json.dumps({**config, 'auto_map': dict(code.auto_map)}))
+    for file, text in {**RELEASED, 'unrelated.py': 'raise ImportError\n'}.items():
+        (source / file).write_text(text)
+    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    loaded.save(tmp_path / 'saved')
+    assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['auto_map'] == dict(code.auto_map)
+    assert {path.name for path in (tmp_path / 'saved').glob('*.py')} == set(RELEASED)
+    for file, text in RELEASED.items():
+        assert (tmp_path / 'saved' / file).read_text() == text
+
+
+def test_a_component_keeps_the_code_beside_its_config_and_none_outside_its_source(tmp_path):
+    """A release loaded from a component folder (`subfolder`) keeps the code beside that folder's config,
+    not the source root's; a module whose relative import names a path outside the source refuses the
+    save, which writes none of it (ledger 2038)."""
+    import shutil
+
+    code = LFM3.release_code
+    component = tmp_path / 'release' / 'decoder'
+    shutil.copytree(TINY, component)
+    config = json.loads((component / 'config.json').read_text())
+    (component / 'config.json').write_text(json.dumps({**config, 'auto_map': dict(code.auto_map)}))
+    for file, text in RELEASED.items():
+        (component / file).write_text(text)
+    (tmp_path / 'release' / 'modeling_lfm3.py').write_text('raise ImportError\n')
+    loaded = Pretrained.load(tmp_path / 'release', subfolder='decoder', dtype='float32',
+                             attention_impl='reference')
+    loaded.save(tmp_path / 'saved')
+    assert {path.name: path.read_text() for path in (tmp_path / 'saved').glob('*.py')} == RELEASED
+    (component / 'lfm3_conv.py').write_text('from .../victim import conv\n')
+    (tmp_path / 'victim.py').write_text('conv = None\n')
+    with pytest.raises(ValueError):
+        loaded.save(tmp_path / 'escaped' / 'saved')
+    assert not (tmp_path / 'escaped' / 'victim.py').exists()
+
+
+def test_a_native_export_writes_its_familys_release_code_beside_itself(tmp_path, release_cache):
+    """A model built in Dew of a family whose reference is a release's own code (`release_code`) exports
+    with that release's auto_map and the modules it names and imports, at the commit Dew is held to,
+    read through the hub's cache, so transformers opens the export with that code (ledger 2038)."""
+    from dew.interop import PretrainedDecoder
+
+    code = LFM3.release_code
+    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'saved')
+    assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['auto_map'] == dict(code.auto_map)
+    assert {path.name for path in (tmp_path / 'saved').glob('*.py')} == set(RELEASED)
+
+
+@pytest.mark.network
+def test_an_export_writes_the_releases_own_modules_at_its_commit(tmp_path):
+    """The network's half (ledger 2038): a model built in Dew exports with its release's own modules at the
+    commit, byte for byte: the two its auto_map names and lfm3_conv.py, which modeling_lfm3.py imports and
+    no entry names. (The release's code opens under transformers 5.18.0 on, which the fixture is recorded
+    under: tests/fixtures/hf/lfm3-tiny/source.json.)"""
+    from huggingface_hub import hf_hub_download
+
+    from dew.interop import PretrainedDecoder
+
+    code = LFM3.release_code
+    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'saved')
+    written = {path.name: path.read_bytes() for path in (tmp_path / 'saved').glob('*.py')}
+    released = {file: Path(hf_hub_download(str(code.source), file, revision=code.revision))
+                for file in ('configuration_lfm3.py', 'modeling_lfm3.py', 'lfm3_conv.py')}
+    assert written == {file: path.read_bytes() for file, path in released.items()}

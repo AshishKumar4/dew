@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file, save_file
 
 from dew.interop import Pretrained, codecs
@@ -41,14 +40,6 @@ def fused(tensors, config):
                  for part, width in zip('qkv', widths, strict=True)]
         out[f'{stem}qkv_proj.weight'] = np.concatenate(parts, axis=1).reshape(-1, parts[0].shape[-1])
     return out
-
-
-def test_the_text_decoder_computes_the_remote_codes_logits():
-    """Full and sliding layers, sinks on the sliding ones alone, 12-wide
-    queries and keys over 8-wide scaled values, a third of each head rotated
-    under each kind's base and grouped sigmoid routing after a dense layer."""
-    _, ours = logits(TINY)
-    assert_as_exact_as_the_reference(ours, fixture('logits'), fixture('logits_f64'), 'MiMo-V2 logits')
 
 
 def test_a_fused_qkv_source_loads_to_the_same_model_and_saves_back_fused(tmp_path):
@@ -150,3 +141,54 @@ def test_a_store_dtype_mxfp4_source_loads_its_decoded_weights_and_saves_its_code
         else:
             assert written[name].dtype == tensor.dtype, name
             np.testing.assert_array_equal(written[name].view(np.uint8), tensor.view(np.uint8), err_msg=name)
+
+
+OPENED = """import json, sys, torch
+from transformers import AutoModelForCausalLM
+models = []
+for directory in sys.argv[1:]:
+    model, info = AutoModelForCausalLM.from_pretrained(directory, trust_remote_code=True,
+                                                       dtype=torch.float32, output_loading_info=True)
+    report = {key: sorted(value) for key, value in info.items()}
+    models.append((type(model).__name__, report, model.state_dict()))
+(name, info, state), (other, other_info, other_state) = models
+same = sorted(state) == sorted(other_state) and all(torch.equal(state[key], other_state[key])
+                                                    for key in state)
+print(json.dumps({"classes": [name, other], "info": [info, other_info], "same": same}))
+"""
+"""A fresh interpreter's offline loads of two directories through their own code's transformers loader:
+the classes built, the loader's reports of the weights matched, and whether the two state dicts are
+equal, tensor for tensor."""
+
+
+@pytest.mark.network
+def test_a_saved_release_opens_offline_through_its_own_code_as_the_release_does(tmp_path):
+    """A release whose config names its own code (`auto_map`), here the tiny checkpoint beside MiMo's code
+    at the pinned commit, loads natively and saves its modules and their relative imports
+    (`sources.code_modules`; modeling_mimo_v2.py imports configuration_mimo_v2.py) beside its config; a
+    fresh interpreter opens the save offline through that code
+    (`AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)`) as it opens the release: the
+    release's class, every weight matched, and the same state, tensor for tensor (ledger 2038)."""
+    import os
+    import subprocess
+    import sys
+
+    from huggingface_hub import hf_hub_download
+
+    repo, revision = 'XiaomiMiMo/MiMo-V2.6-Pro-MOPD', '6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8'
+    released = json.loads(Path(hf_hub_download(repo, 'config.json', revision=revision)).read_text())
+    source = tmp_path / 'release'
+    shutil.copytree(TINY, source)
+    config = json.loads((source / 'config.json').read_text())
+    (source / 'config.json').write_text(json.dumps({**config, 'auto_map': released['auto_map']}))
+    for file in ('configuration_mimo_v2.py', 'modeling_mimo_v2.py'):
+        shutil.copy(hf_hub_download(repo, file, revision=revision), source / file)
+    Pretrained.load(source, dtype='float32', attention_impl='reference').save(tmp_path / 'saved')
+    run = subprocess.run([sys.executable, '-c', OPENED, str(tmp_path / 'saved'), str(source)], check=True,
+                         capture_output=True, text=True,
+                         env={**os.environ, 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
+                              'HF_MODULES_CACHE': str(tmp_path / 'modules')})
+    opened = json.loads(run.stdout.strip().splitlines()[-1])
+    assert opened['classes'] == ['MiMoV2ForCausalLM'] * 2
+    matched = {'missing_keys': [], 'unexpected_keys': [], 'mismatched_keys': [], 'error_msgs': []}
+    assert opened['info'] == [matched, matched] and opened['same']

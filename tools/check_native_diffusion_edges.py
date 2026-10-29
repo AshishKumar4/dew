@@ -17,7 +17,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
 from dew.nn.backbones.unet_condition import UNet2DCondition
-from dew.sampling.sample import sample
+from dew.sampling.walks import sample
 
 ROWS = 256
 """Each walk's independent rows, so its distance from float64 is an RMS over many roundings."""
