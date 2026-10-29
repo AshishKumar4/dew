@@ -37,7 +37,6 @@ so a new base Dew refuses is a row before a user meets it.
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import subprocess
 import sys
@@ -225,9 +224,22 @@ def classify(out: Path) -> None:
 HUB_EXIT = 3
 """The exit status of a load (`_LOAD`) the Hub refused, its error on its last line."""
 
+REFUSED_EXIT = 4
+"""The exit status of a load (`_LOAD`) Dew refused, the exception it raised on its last line."""
+
 _LOAD = f"""
 import sys
 import httpx
+
+
+def refused(kind, error, trace):
+    # An exception the load does not handle is Dew's refusal: its type and message, then its traceback.
+    print(f"{{kind.__name__}}: {{error}}".replace(chr(10), " "), flush=True)
+    sys.__excepthook__(kind, error, trace)
+    sys.exit({REFUSED_EXIT})
+
+
+sys.excepthook = refused
 import jax
 from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 from dew.interop import Pretrained
@@ -244,7 +256,8 @@ print(sum(leaf.size for leaf in leaves))
 """A model loaded without its weights in a process of its own, every leaf a shape alone: its parameter
 count on the last line; or the Hub's error, exiting `HUB_EXIT`: an HTTP error, a failed transport, or a
 file's metadata the Hub could not be reached for (`LocalEntryNotFoundError`, which huggingface_hub
-raises for a connection or server error on an uncached file)."""
+raises for a connection or server error on an uncached file); or any other exception, Dew's refusal,
+stated on the last line by the process's exception hook, exiting `REFUSED_EXIT`."""
 
 
 @dataclass(frozen=True)
@@ -264,26 +277,20 @@ class Load:
 def loaded(repo: str, commit: str, env: dict[str, str] | None = None) -> Load:
     """`repo` at `commit` loaded without its weights in a process of its own (`_LOAD`) under `env`
     (this process's by default), classified by how the process exited: its parameter count where it
-    loaded, the Hub's error where it refused the repo (`HUB_EXIT`), the signal where one ended it, else
-    Dew's refusal, an exception's exit, its text the exception the process ended on (`ended_on`)."""
+    loaded, the Hub's error where it refused the repo (`HUB_EXIT`), Dew's refusal as the process stated
+    it (`REFUSED_EXIT`), the signal where one ended it, else the exit status alone (an interpreter that
+    failed before the load ran)."""
     done = subprocess.run([sys.executable, "-c", _LOAD, repo, commit], env=env, capture_output=True,
                           text=True, check=False)
     if done.returncode == 0:
         return Load(repo, commit, "loads", parameters=int(done.stdout.split()[-1]))
     if done.returncode == HUB_EXIT:
         return Load(repo, commit, "hub", reason=done.stdout.strip().splitlines()[-1])
+    if done.returncode == REFUSED_EXIT:
+        return Load(repo, commit, "refused", reason=done.stdout.strip().splitlines()[-1])
     if done.returncode < 0:
         return Load(repo, commit, "killed", reason=f"signal {-done.returncode}")
-    return Load(repo, commit, "refused", reason=ended_on(done.stderr) or f"exit {done.returncode}")
-
-
-def ended_on(stderr: str) -> str:
-    """The exception a Python process's `stderr` ends on, as its last traceback states it: the first
-    unindented line after the traceback's frames, its type and message, the message's further lines
-    joined to it."""
-    tail = stderr.rsplit("Traceback (most recent call last):", 1)[-1].splitlines()
-    stated = itertools.dropwhile(lambda line: not line.strip() or line.startswith(" "), tail)
-    return " ".join(line.strip() for line in stated if line.strip())
+    return Load(repo, commit, "refused", reason=f"exit {done.returncode}")
 
 
 def loads(out: Path, jobs: int = 2, env: dict[str, str] | None = None) -> list[Load]:
