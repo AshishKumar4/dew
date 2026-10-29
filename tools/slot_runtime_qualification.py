@@ -307,12 +307,10 @@ def native(args, pool):
     decide = Decide.of(bundle)
     # Four rows a pass at the layout's shortest pass length (`Decide.pass_shapes`, its window's halvings),
     # so the server's passes batch: a slot release's 32768-token window pads every pass to 4096 or more.
-    # A row is one question (`ObservedScoring.admit`), its options padded to the pool's most, so every
-    # pass's program is declared and the server compiles each up front (`Decide.compile_scoring`).
+    # No widths are declared, so each pass compiles as it comes: compiled up front, every shape of the
+    # window would run a pass, to 32768 tokens, which the pool never asks (`Decide.compile_scoring`).
     shortest = min(shape.length for shape in decide.pass_shapes)
-    options = max(len(question["criteria"]) for body in pool["requests"].values()
-                  for question in body["questions"].values())
-    task = replace(decide, budget=Budget(tokens=4 * shortest, rows=4, questions=1, options=options))
+    task = replace(decide, budget=Budget(tokens=4 * shortest, rows=4))
     scoring, variables = task.scoring()
     observed = ObservedScoring(scoring)
     server = ScoringServer.from_task(observed, variables)
@@ -331,7 +329,7 @@ def native(args, pool):
     devices = {device for value in leaves for device in value.devices()}
     hidden = jax.eval_shape(lambda: task.model.backbone.apply(
         part(variables, "backbone"), jnp.zeros((1, 1), jnp.int32), method="hidden_states"))
-    return values, {"batch_rows": observed.batch_rows, "programs": len(server.programs),
+    return values, {"batch_rows": observed.batch_rows,
                     "compute_dtype": dtype_name(hidden.dtype),
                     "parameter_dtypes": sorted({str(value.dtype) for value in leaves
                                                 if jnp.issubdtype(value.dtype, jnp.floating)}),

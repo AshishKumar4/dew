@@ -308,7 +308,8 @@ def test_every_registered_solver_walks_a_float64_run_in_float64(name, case):
     """Each solver `dew.registry.solvers` names walks a float64 state over float64 times through
     `sample`'s scan in float64 on every continuous case it samples, a multistep history included
     (ledger 2063: their histories were float32 and the scan refused them), so its float64 walk is check
-    1's truth for its float32 one: from the same prior draw and key, not the float32 walk widened."""
+    1's truth for its float32 one: from the same prior draw and key, each step's innovations the float32
+    walk's widened (`_unit_noise`), not the float32 walk widened."""
     build, shape, _ = PROCESS_CASES[case]
     process, model = build()
     params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *shape)), jnp.ones((1,)))

@@ -11,7 +11,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.schedules.common import ancestral_variance
 from dew.nn.precision import divided
 
-from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
+from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator, _unit_noise
 
 
 def _euler_step(x, denoised, source, target):
@@ -36,11 +36,6 @@ def _euler_step(x, denoised, source, target):
     # the clean prediction itself. A step of no length leaves x exactly as it is.
     stepped = alpha_s * denoised + divided(x - alpha_t * denoised, sigma_t) * sigma_s
     return jnp.where(dt == 0, x, stepped), derivative, x_0_coeff, dt
-
-
-def _ancestral_noise(key: jax.Array, x: jax.Array) -> jax.Array:
-    """The unit normal an ancestral step draws from its key and scales by sigma_up."""
-    return jax.random.normal(key, x.shape)
 
 
 def _ancestral(sigma_t, sigma_s):
@@ -82,7 +77,7 @@ class EulerAncestral:
         _, sigma_s = process.rates(t_next, like=x)
         sigma_down, sigma_up = _ancestral(sigma_t, sigma_s)
         dx = (x - denoised) / sigma_t
-        dW = _ancestral_noise(key, x) * sigma_up
+        dW = _unit_noise(key, x) * sigma_up
         return x + dx * (sigma_down - sigma_t) + dW, state
 
 
@@ -136,7 +131,7 @@ class Heun:
             sigma = schedule.sigmas(t)
             gamma = jnp.where((sigma >= self.s_tmin) & (sigma <= self.s_tmax), state, 0.0)
             raised = sigma * (1 + gamma)
-            noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+            noise = _unit_noise(key, x)
             # sqrt(raised^2 - sigma^2), in a form that stays zero at gamma 0
             # under a fused multiply-add.
             spread = sigma * jnp.sqrt(gamma * (2 + gamma)) * self.s_noise
@@ -228,7 +223,7 @@ class KDPM2:
             denoised_mid, _ = denoise(x_mid, schedule.t_of_sigma(sigma_mid.reshape(-1)))
             stepped = x + (x_mid - denoised_mid) / sigma_mid * (target - sigma_t)
             if self.ancestral:
-                stepped = stepped + _ancestral_noise(key, x) * sigma_up
+                stepped = stepped + _unit_noise(key, x) * sigma_up
             return jnp.where(positive, stepped, denoised)
 
         return lax.cond(jnp.all(sigma_s == 0), lambda _: denoised, midpoint, None), state

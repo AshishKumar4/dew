@@ -21,6 +21,7 @@ from .common import (
     _multistep,
     _tapered_order,
     _tapered_orders,
+    _unit_noise,
 )
 
 Algorithm = Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++", "sde-dpmsolver"]
@@ -131,7 +132,7 @@ class DPMSolverMultistep:
         base = a * x + b * m0
         target_limit = alpha_t * denoised
         if self.algorithm.startswith("sde"):
-            noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+            noise = _unit_noise(key, x)
             base = base + n * noise
             source_limit = alpha_t * denoised + sigma_t * noise
             if self.algorithm == "sde-dpmsolver":
@@ -267,7 +268,7 @@ class DPMSolverSinglestep:
         anchor = jnp.where(order == 1, x, state.anchor)
         lambdas, outputs = history.lambdas, history.outputs
         m0 = outputs[-1]
-        noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+        noise = _unit_noise(key, x)
 
         def update(back: int):
             """The update's coefficients from the group's anchor, `back`

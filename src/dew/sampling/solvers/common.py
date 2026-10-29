@@ -134,6 +134,12 @@ def _sigma_integrator(name: str, process: Process) -> GeneralizedNoiseScheduler:
             f"so it needs a GeneralizedNoiseScheduler and not {type(schedule).__name__}")
     return schedule
 
+def _unit_noise(key, x):
+    """The unit normal a stochastic step draws from its key at `x`'s shape: in float32 whatever the
+    run's precision, so a float64 walk draws a float32 walk's innovations widened, and is its truth."""
+    return jax.random.normal(key, x.shape, dtype=jnp.float32)
+
+
 def _push(buffer, value):
     """`buffer` with its oldest entry dropped and `value` appended, so the
     most recent entry is last."""
