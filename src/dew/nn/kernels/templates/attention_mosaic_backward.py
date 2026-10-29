@@ -480,6 +480,14 @@ def _staged_logits(walk: _Backward, stage: tuple, q_slot, part: tuple):
     return ref if count == ref.shape[0] else ref.at[pl.ds(first, count)]
 
 
+def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index) -> tuple | None:
+    """A fused launch's consumer `index`'s dQ adds (`_dkv_step`'s `add_dq`): its score cotangents' stage and
+    its tiles' add into dQ at `place` (`_dq_added`); None where the launch adds none."""
+    if not walk.fused:
+        return None
+    return stages[0].at[index], functools.partial(_dq_added, walk, dq_ref, stages[1], place, index)
+
+
 def _logits_stage(family: mosaic.Family, consumers: int, allocated: list, index) -> tuple | None:
     """Consumer `index`'s staged logits' queries (`_staged_logits`' `stage`) from their `allocated` ref and
     turns (`Family.schedule`), its read turn's first arrival made (no step's stage is written before it);
@@ -844,8 +852,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[holder], v_smem.at[holder]
-            adds = None if not walk.fused else (fused_stages[0].at[index], functools.partial(
-                _dq_added, walk, dq_ref, fused_stages[1], (row, head), index))
+            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index)
             stage = _logits_stage(family, consumers, logits_stages, index)
             step = functools.partial(_dkv_step, walk, resident, rows_of, coords_of, params_of, store_tiles,
                                      shares, part, stage, adds)
