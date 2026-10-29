@@ -343,16 +343,21 @@ PADDED = np.asarray([[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 0]], bool)
 """Right-padded rows, each one document."""
 WHOLE_CASES = {
     "documents": ({"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}},
-                  {"segment_ids": SEGMENTS, "block_groups": WHOLE}),
+                  {"segment_ids": SEGMENTS, "block_groups": WHOLE}, True),
     "documents-past-a-window": ({"sliding_attention": {"window": 2,
                                                        "mixer": AttentionMixer(bidirectional_blocks=True)}},
-                                {"segment_ids": SEGMENTS, "block_groups": WHOLE}),
+                                {"segment_ids": SEGMENTS, "block_groups": WHOLE}, True),
     "right-padded-rows": ({"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}},
                           {"attention_mask": PADDED, "right_padded": True,
-                           "block_groups": np.where(PADDED, 0, -1).astype(np.int32)}),
+                           "block_groups": np.where(PADDED, 0, -1).astype(np.int32)}, True),
+    "a-non-causal-window": ({"sliding_attention": {"window": 2, "bidirectional_window": True,
+                                                   "mixer": AttentionMixer(bidirectional_blocks=True)}},
+                            {"segment_ids": SEGMENTS, "block_groups": WHOLE}, False),
 }
-"""Calls whose blocks are each a document's whole real tokens: packed documents, read under a window of two
-the blocks pass, and rows of one document each, right-padded, named by no segment ids."""
+"""Calls whose blocks are each a document's whole real tokens, each its kinds, fields and whether the decoder
+is causal: packed documents, read under a window of two the blocks pass, rows of one document each,
+right-padded, named by no segment ids, and a non-causal decoder's layer keeping its window both ways, which
+reads no blocks, whole or not."""
 
 
 @pytest.mark.parametrize("case", WHOLE_CASES.values(), ids=list(WHOLE_CASES))
@@ -361,8 +366,8 @@ def test_whole_blocks_read_as_their_block_causal_reading(case):
     decision row read whole), a block layer takes the non-causal call over the documents its blocks are:
     its states and its QK-Clip maxima are bitwise those of its block-causal reading of the same blocks,
     under a window the blocks pass and over padding the rows name by validity alike."""
-    kinds, fields = case
-    decoder = model(**kinds).clone(attention_impl="xla")
+    kinds, fields, causal = case
+    decoder = model(**kinds).clone(attention_impl="xla", causal=causal)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
     params = decoder.init(jax.random.key(1), ids)
     given = {name: jnp.asarray(value) if isinstance(value, np.ndarray) else value

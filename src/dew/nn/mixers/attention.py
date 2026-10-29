@@ -640,7 +640,8 @@ class CausalSelfAttention(nn.Module):
         kernel that takes one (FlashAttention's, cuDNN's) runs. A block's keys are past the window, so it
         bounds none, and its blocks go unread. A cached call reads its cache's groups as before."""
         uncached = prefix is None and append is None and not decode
-        return uncached and self.bidirectional_blocks and metadata is not None and metadata.whole_blocks
+        reads = "block_groups" in self._group_fields()  # a causal layer's blocks, a non-causal one's none
+        return uncached and reads and metadata is not None and metadata.whole_blocks
 
     def _key_groups(self, metadata: AttentionMetadata | None, history: dict[str, jax.Array], decode: bool,
                     length: int) -> _Groups:
