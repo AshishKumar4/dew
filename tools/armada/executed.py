@@ -115,13 +115,16 @@ def conftest(name: str) -> bool:
     return Path(name).name == "conftest.py"
 
 
+def kept(read: str | None) -> None:
+    # The durations record is split.py's, which cuts a split file from it, read or probed: the file's own
+    # entries are its groups' input (ci.py's `cache_key`), and no other file's.
+    if read is not None and read.removeprefix(followed.PROBED) != str(DURATIONS):
+        current[-1].add(read)
+
+
 def audited(event, args):
     if event in followed.READS:
-        read = followed.read(event, args, root)
-        # The durations record is split.py's, which cuts a split file from it: the file's own entries are its
-        # groups' input (ci.py's `cache_key`), and no other file's.
-        if read is not None and read != str(DURATIONS):
-            current[-1].add(read)
+        kept(followed.read(event, args, root))
         return
     kind = followed.start(event, args, str(children)) if running else None
     if kind == "followed":
@@ -139,7 +142,7 @@ followed.installed()
 os.environ |= {CHILDREN: str(children), "DEW_EXECUTED_ROOT": root,
                "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
                "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, "")}
-followed.opening(lambda read: current[-1].add(read), root)
+followed.opening(kept, root)
 
 
 sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
