@@ -31,7 +31,8 @@ from dew.interop import Pretrained
 def main(fixture: Path, out: Path, count: int, seed: int, group: int) -> None:
     loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
     drawn = orders(residual_width(loaded.variables), count, seed, group)
-    out.mkdir(parents=True, exist_ok=True)
+    # A new directory, so no order keeps a truth written for weights drawn before.
+    out.mkdir(parents=True)
     np.save(out / "orders.npy", drawn)
     for k, order in enumerate(drawn):
         loaded.save(out / str(k), variables=permuted(loaded.variables, order))
