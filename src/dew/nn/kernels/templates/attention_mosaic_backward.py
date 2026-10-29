@@ -544,6 +544,99 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     return jax.freeze(dq).sum(axis=0), dk, dv
 
 
+def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_params: tuple, drop: Dropout, *,
+                   walk: _Backward) -> algebra.Centre:
+    """Dropout's first pass on this mainloop (`algebra.dropout_centre`): each query tile's walk over its keys
+    (a consumer's, as the dQ program's), each tile's logits `exp(s - m)` and dropped products
+    (`algebra.dropped_products` of `dO Vᵀ` and the call's draw) taken into the query's `Centre`
+    (`algebra.centre_step`). Returns each field `[B, H, Qp]`, which `algebra.centre_finish` takes past the
+    launch."""
+    batch, queries, heads, width = query.shape
+    kv_heads = key.shape[2]
+    program, consumers, kinds = walk.program, walk.consumers, walk.kinds
+    family = program.family
+    block_q, block_k = program.tiles.block_q, program.tiles.block_k
+    pair = consumers * block_q
+    exponent = algebra.centre_scale(walk.spec.keys)
+    leaves, treedef = jax.tree.flatten((spans, score_params, drop))
+    fields = len(jax.tree.leaves(algebra.centre_start(1)))
+
+    def body(*refs, streams):
+        (q_ref, k_ref, v_ref, do_ref, peak_ref), refs = refs[:5], refs[5:]
+        (spans_of, score_refs, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
+        centre_ref, (q_smem, do_smem, row_smem, q_loaded, do_loaded) = refs[0], refs[1:]
+        row, head = lax.axis_index("batch"), lax.axis_index("heads")
+        views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
+        streams = family.opened(streams, views)
+        pair_first = program.query_tile(queries // pair) * pair
+        streamed = _streamed([program.reach(pair_first + index * block_q, spans_of, row)[:2]
+                              for index in range(consumers)])
+
+        def consumer(index):
+            first = pair_first + index * block_q
+            rows = (row, pl.ds(first, block_q), head)
+            family.loaded(((q_ref.at[rows], q_smem.at[index], q_loaded.at[index]),
+                           (do_ref.at[rows], do_smem.at[index], do_loaded.at[index])))
+            peak = _rows(family, peak_ref, row, head, first, block_q)
+            lo, hi, _ = program.reach(first, spans_of, row)
+            shape = (block_q, block_k)
+            draw = drop_of.draw(row, head)
+            q, do = family.held(q_smem.at[index]), family.held(do_smem.at[index])
+
+            def step(index, slots, state, accumulators):
+                k_first = index * block_k
+                s = family.product(q, slots["keys"].transpose((1, 0)), shape)
+                dp = family.product(do, slots["values"].transpose((1, 0)), shape)
+                slots.release("values")
+                coords = _coords(family, spans_of, row, first, k_first, shape, draw=draw)
+                params = _score_params(family, score_refs, kinds, row, head, first, s, k_first)
+                seen = algebra.seen(walk.spec, coords, s)
+                logits, _ = algebra.tile_logits(walk.spec.score_mod, s, seen, coords.q_pos, coords.k_pos,
+                                                params, scale=walk.spec.scale if walk.how.factor is None
+                                                else 1.0, slopes=False)
+                weights = algebra.below(logits, algebra.expand(peak, logits), walk.how)
+                products = algebra.dropped_products(dp, algebra.drawn(coords, coords.q_pos, coords.k_pos))
+                centred = algebra.centre_step(state, weights, products, seen, coords.k_pos, exponent)
+                return centred, accumulators
+
+            family.passed(streams, streamed[0], lo, first=streamed[0])
+            # Every field a row vector of zeros (`algebra.centre_start`), `seen` false.
+            start = jax.tree.map(lambda field: family.zeros((block_q,)).astype(field.dtype),
+                                 algebra.centre_start(1))
+            centred, _ = family.walk(streams, ((step, lo, hi),), start, (), walk.interpret, first=streamed[0])
+            family.passed(streams, hi, streamed[1], first=streamed[0])
+            parts = [part.astype(jnp.float32) for part in jax.tree.leaves(centred)]
+            family.stored(tuple(family.as_row(part) for part in parts),
+                          tuple(centre_ref.at[place, row, head, pl.ds(first, block_q)]
+                                for place in range(fields)), smem=row_smem.at[index])
+
+        def producer():
+            family.stream(streams, views, *streamed)
+
+        family.roles(consumers, consumer, producer)
+
+    scoped = [plgpu.SMEM((consumers, block_q, width), query.dtype),
+              plgpu.SMEM((consumers, block_q, dout.shape[-1]), dout.dtype),
+              plgpu.SMEM((consumers, block_q), jnp.float32),
+              plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
+    rings = family.streams({"keys": ((block_k, width), key.dtype), "values": ((block_k, value.shape[-1]),
+                                                                              value.dtype)},
+                           program.stages, consumers)
+
+    def entry(*refs):
+        family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
+
+    out = family.kernel(
+        entry, out_type=jax.ShapeDtypeStruct((fields, batch, heads, queries), jnp.float32),
+        grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
+        interpret=walk.interpret, approx_math=False, name="attention_centre",
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 0, query, key, value, dout)
+    )(query, key, value, dout, peak, *leaves)
+    template_fields = jax.tree.leaves(algebra.centre_start(1))
+    return jax.tree.unflatten(jax.tree.structure(algebra.centre_start(1)),
+                              [out[place].astype(field.dtype) for place, field in enumerate(template_fields)])
+
+
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
                      score_params, *, score_mod, score_kinds, score_dtypes, scale: float, prescale: float,
@@ -584,6 +677,14 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      approx_math)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
+    if drop is not None:
+        # A dropping call's D its dropped products' own, centred about each query's least one
+        # (`algebra.dropout_centre`): no anchor, and no key chosen.
+        centre = _centre_launch(by_power(query, prescale), key, value, dout, maximum, spans, score_params,
+                                drop, walk=walk)
+        anchor = jnp.zeros_like(anchor)
+        delta = algebra.centre_finish(centre, state_total, initial_term, algebra.centre_scale(spec.keys))
+        chosen = jnp.full_like(chosen, -1)
     if walk.fused:
         dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
                                  spans, score_params, drop, walk=walk)
