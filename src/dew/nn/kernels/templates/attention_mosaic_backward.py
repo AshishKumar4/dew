@@ -404,10 +404,13 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     shape = (tiles.block_k, count)
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
-    logits_slot = None if logits_stage is not None else slots["logits"]
+    if logits_stage is not None:
+        logits_slot = _staged_logits(walk, logits_stage, q_slot, part)
+    else:
+        logits_slot = slots["logits"]
+        logits_slot = logits_slot if count == tiles.block_q else logits_slot.at[pl.ds(first_row, count)]
     if count != tiles.block_q:
         q_slot, do_slot = q_slot.at[pl.ds(first_row, count)], do_slot.at[pl.ds(first_row, count)]
-        logits_slot = None if logits_slot is None else logits_slot.at[pl.ds(first_row, count)]
     q_first = index * tiles.block_q + first_row
     # The logits from the queries taken by the call's power, the forward's `(Q 2^p) Kᵀ` bit for bit (the
     # power taken after the product passes fp32's largest where the forward's does not, Q 2^120 over keys of
@@ -415,8 +418,6 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # 2^-10): a stream of their own, or where one passes the block staged a step from the call's own
     # (`BackwardTiles.staged_logits`; a third of the launch at Qwen3-8B, ET-SWAPABL-h100). dK from the call's
     # own, which the power would flush where a query is 2^-126 at the scale 2^-10.
-    if logits_stage is not None:
-        logits_slot = _staged_logits(walk, logits_stage, slots["queries"], part)
     s = family.product(k_smem, logits_slot.transpose((1, 0)), shape)
     if logits_stage is not None:
         # Its share of the staged queries read (the product waited): the next step's stage may be written.
@@ -451,7 +452,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
         ((part_tile, _),) = algebra.cotangent_parts(logits * walk.grad_scale, q_slot.dtype, accurate=False)
         dk_acc = family.register_products(dk_acc, ((part_tile, None),), q_columns, walk.interpret)
         staged_part, dq_stage = add_dq
-        staged_part = family.staged(part_tile, staged_part)
+        family.staged(part_tile, staged_part)
         dq_stage(q_first, family.product(staged_part.transpose((1, 0)), k_smem, (count, k_smem.shape[-1])))
     if _grading(shares):
         store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
@@ -553,9 +554,10 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
                                                  functools.partial(scores, masked=True))
     ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
     narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
-    dv_acc = family.products(dv_acc, family.staged(narrowed, staged.at[0]).transpose((1, 0)), do_slot,
-                             walk.interpret)
-    cotangents_staged = family.staged(part, staged.at[1])
+    family.staged(narrowed, staged.at[0])
+    dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot, walk.interpret)
+    cotangents_staged = staged.at[1]
+    family.staged(part, cotangents_staged)
     dk_acc = family.products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot, walk.interpret)
     # The tile's dQ, its staged cotangents times the resident keys (`algebra.cotangent_product`'s `a @ b`),
     # added into dQ: the query tile's other key blocks add theirs.
@@ -819,7 +821,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         (spans_of, score_refs, drop_of, l_ref), (dq_ref, dk_ref, dv_ref) = unflattened, outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
-        fused_stages, logits_stages = (rest[:2], rest[2:]) if walk.fused else ((), rest)
+        fused_stages, logits_stages = (rest[:2], rest[2:]) if walk.fused else ([], rest)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
@@ -1073,15 +1075,15 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     dkv_walk = dataclasses.replace(walk, program=dataclasses.replace(
         program, family=bundles.named(dkv_tiles.family, query.dtype), tiles=dkv_tiles),
         consumers=dkv_tiles.consumers)
-    if walk.fused and tiles.dkv_apart:
-        # The fused launch keys first on its own layout (`BackwardTiles.dkv`): its consumers' shares of a
-        # slot's queries each a warpgroup MMA's rows, dQ added a tile at a time.
-        dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                 spans, score_params, drop, scaled, walk=dkv_walk)
-    elif walk.fused:
-        dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                   spans, walk=walk)
     if walk.fused:
+        if tiles.dkv_apart:
+            # The fused launch keys first on its own layout (`BackwardTiles.dkv`): its consumers' shares of a
+            # slot's queries each a warpgroup MMA's rows, dQ added a tile at a time.
+            dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
+                                     spans, score_params, drop, scaled, walk=dkv_walk)
+        else:
+            dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
+                                       spans, walk=walk)
         mass = algebra.split_mass(own, others_total, forward_total, shift)
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])
