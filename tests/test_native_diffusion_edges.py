@@ -16,8 +16,10 @@ def edges(tmp_path_factory):
                            tmp_path_factory.mktemp("native-diffusion-edges"))
 
 
+# DPM-Karras's schedule runs in the whole suite alone (171 s, ledger 2133); every train still walks the
+# same native-source path under DDIM, DDIM-clip, Euler and PNDM, row 647's proof.
 @pytest.mark.parametrize(
-    "case", [pytest.param(case, marks=pytest.mark.whole_suite) if case in ("dpm-karras", "pndm-linspace")
+    "case", [pytest.param(case, marks=pytest.mark.whole_suite) if case == "dpm-karras"
              else case for case in ("ddim-linspace", "pndm-linspace", "ddim-clip", "euler-zero-snr",
                                     "dpm-karras", "norm", "odd", "dropped")]
 )
