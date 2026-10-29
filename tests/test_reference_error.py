@@ -68,10 +68,8 @@ def pulled_by_itself(attention):
 
 
 def xla_attention(query, key, value):
-    """Dew's attention on jax.nn's XLA implementation."""
-    from dew.nn.attention import scaled_dot_product_attention
-
-    return scaled_dot_product_attention(query, key, value, implementation="xla")
+    """jax.nn's attention, its XLA implementation."""
+    return jax.nn.dot_product_attention(query, key, value, implementation="xla")
 
 
 def written_attention(query, key, value):
@@ -85,9 +83,9 @@ def written_attention(query, key, value):
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
 def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them():
-    """XLA:CPU refuses attention's XLA backward over a single key without YNNPACK's fusions
-    (`YNN_REFUSED`); check 1 turns both arms over to the fusions there (`_Paired`), the two still of one
-    kind, and judges them."""
+    """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
+    every matmul precision (`YNN_REFUSED`); check 1 turns both arms over to the fusions there (`_Paired`),
+    the two still of one kind, and judges them."""
     from reference_error import YNN_REFUSED, without_ynn
 
     with pytest.raises(jax.errors.JaxRuntimeError, match=YNN_REFUSED):
