@@ -32,6 +32,23 @@ def _flipped(data: bytes) -> bytes:
     return data[:-1] + bytes([data[-1] ^ 1])
 
 
+def _hub(commits: list, private: list[bool]):
+    """A stand-in for huggingface_hub's `HfApi` over the store's public dataset, private while
+    `private[0]`: each commit's operations appended to `commits` by their paths, every commit "b" * 40."""
+    class Hub:
+        def create_repo(self, repo, **options):
+            assert options == {"repo_type": "dataset", "private": False, "exist_ok": True}
+
+        def repo_info(self, repo, **options):
+            return type("Info", (), {"private": private[0]})()
+
+        def create_commit(self, repo, operations, **options):
+            commits.append({operation.path_in_repo: operation for operation in operations})
+            return type("Commit", (), {"oid": "b" * 40})()
+
+    return Hub
+
+
 def _checkout(root: Path) -> Path:
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     (root / "tests/fixtures").mkdir(parents=True)
@@ -148,17 +165,6 @@ def test_upload_pins_a_revision_only_once_each_file_reads_back_anonymously_as_it
     kept = {"0" * 64: {"fixture": "tests/fixtures/old.npz", "bytes": 5000, "reference": "an older one",
                        "license": "MIT"}}
 
-    class Hub:
-        def create_repo(self, repo, **options):
-            assert options == {"repo_type": "dataset", "private": False, "exist_ok": True}
-
-        def repo_info(self, repo, **options):
-            return type("Info", (), {"private": private[0]})()
-
-        def create_commit(self, repo, operations, **options):
-            commits.append({operation.path_in_repo: operation for operation in operations})
-            return type("Commit", (), {"oid": "b" * 40})()
-
     served = tmp_path / "served.npz"
     catalog = tmp_path / "catalog.json"
 
@@ -170,7 +176,7 @@ def test_upload_pins_a_revision_only_once_each_file_reads_back_anonymously_as_it
         assert where["token"] is False and where["revision"] == "b" * 40
         return str(served)
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _hub(commits, private))
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
     private[0] = True
     with pytest.raises(SystemExit):
@@ -232,17 +238,6 @@ def test_upload_takes_a_release_file_beside_a_recording_each_by_its_own_path(sto
                                  root=root)
     commits = []
 
-    class Hub:
-        def create_repo(self, repo, **options):
-            pass
-
-        def repo_info(self, repo, **options):
-            return type("Info", (), {"private": False})()
-
-        def create_commit(self, repo, operations, **options):
-            commits.append({operation.path_in_repo: operation for operation in operations})
-            return type("Commit", (), {"oid": "b" * 40})()
-
     def download(repo, path, **where):
         if path == store.CATALOG:
             raise EntryNotFoundError("no catalog")
@@ -251,7 +246,7 @@ def test_upload_takes_a_release_file_beside_a_recording_each_by_its_own_path(sto
         served.write_bytes(commits[-1][path].path_or_fileobj)
         return str(served)
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
+    monkeypatch.setattr(huggingface_hub, "HfApi", _hub(commits, [False]))
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
     store.upload(root)
     pins = store.pins(root)
