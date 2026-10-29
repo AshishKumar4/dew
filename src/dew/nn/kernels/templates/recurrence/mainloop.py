@@ -812,9 +812,10 @@ def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callab
         return
     streams = family.opened(streams["walked"], views)
 
-    def consumer(_):
+    def consumer(wg):
         walked = step if prologue is None else functools.partial(step, loaded=prologue())
-        family.walk(streams, ((walked, 0, steps),), (), (), call.interpret)
+        # The streams a producer loads, or on a layout without one the consumer's own feed of them.
+        family.walk(family.fed(streams, views, 0, steps, wg), ((walked, 0, steps),), (), (), call.interpret)
 
     family.roles(1, consumer, lambda: family.stream(streams, views, 0, steps))
 
@@ -1144,9 +1145,9 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
         # Each role's columns and tiles at static offsets: Mosaic GPU slices a swizzled tile at static
         # columns.
         for role in range(walkers):
-            pl.when(wg == role)(functools.partial(walk, role))
+            pl.when(wg == role)(functools.partial(walk, role, wg))
 
-    def walk(role):
+    def walk(role, wg):
         walked_step = role_step = step(role)
         if (fetch := prefetch) is not None:
             last = start + count - 1
@@ -1165,10 +1166,12 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
             return [_tile(slots, f"{name}{i}", memory, columns=pl.ds(role * bv, bv)).value() * scale
                     for i in range(slices)], accumulators
 
-        state = family.walk(entered, ((taken, 0, 1),), [family.zeros((call.block, bv))] * slices, (),
-                            call.interpret)[0]
+        # The streams a producer loads, or on a layout without one the role's own feed of them.
+        state = family.walk(family.fed(entered, entered_views, 0, 1, wg), ((taken, 0, 1),),
+                            [family.zeros((call.block, bv))] * slices, (), call.interpret)[0]
         carry = state if prefetch is None else (state, prefetch(start))
-        carry = family.walk(chunks, ((walked_step, start, start + count),), carry, (), call.interpret,
+        carry = family.walk(family.fed(chunks, views, start, start + count, wg),
+                            ((walked_step, start, start + count),), carry, (), call.interpret,
                             first=start)[0]
         state = carry if prefetch is None else carry[0]
         # The steps' stores left in flight (`_walk_stores`) done reading their tiles before the program ends.

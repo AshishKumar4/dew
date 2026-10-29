@@ -625,6 +625,14 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """The streams of `streams`' allocations, scoped, by name; their `views` where the family's walk
         loads them (`viewed`: each a ref and the block indices of a step's tile in it)."""
 
+    def fed(self, streams, views: dict, lo, hi, wg, *, refills: bool = True):
+        """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`), the walk's `first` its
+        `lo`: on a layout with a producer, the streams, which its producer loads from `views` (`stream`);
+        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`. Its rings fresh, one walk's a scope:
+        a second walk on them counts its steps from its own first against barriers already past them."""
+        del views, lo, hi, wg, refills
+        return streams
+
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi) -> None:
         """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one."""
@@ -894,15 +902,6 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:
         del views
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
-
-    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
-            refills: bool = True) -> "dict[str, Ring] | Feed":
-        """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`), the walk's `first` its
-        `lo`: on a layout with a producer, the rings, which its producer loads from `views` (`stream`);
-        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`. Its rings fresh, one walk's a scope:
-        a second walk on them counts its steps from its own first against barriers already past them."""
-        del views, lo, hi, wg, refills
-        return streams
 
     def stream(self, streams, views: dict, lo, hi) -> None:
         rings = tuple(streams.values())
