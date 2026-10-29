@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
+from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
 from rl_support import TinyHead
 
 from dew.objectives.rl import RolloutScheduler, Synchronous
@@ -44,15 +44,16 @@ ORACLE_DRAWS = 4
 """The draws each method's float64 term is held to its paper's form on."""
 
 
-def draw(seed):
+def draw(seed, dtype=np.float32):
     """A row grid of two sessions a row, their current, old and reference log-probabilities, each
-    session's advantage on its tokens and its session weight (one over its token count)."""
+    session's advantage on its tokens and its session weight (one over its token count), in `dtype`:
+    a float64 batch's weights are one over the count exactly, as a float64 pack would write them."""
     rng = np.random.default_rng([858, seed])
     rows = len(LENGTHS)
     segments = np.zeros((rows, WIDTH), np.int32)
-    mask = np.zeros((rows, WIDTH), np.float32)
+    mask = np.zeros((rows, WIDTH), dtype)
     advantage = np.zeros((rows, WIDTH), np.float32)
-    weights = np.zeros((rows, WIDTH), np.float32)
+    weights = np.zeros((rows, WIDTH), dtype)
     for row, lengths in enumerate(LENGTHS):
         start = 0
         for session, length in enumerate(lengths, start=1):
@@ -64,7 +65,8 @@ def draw(seed):
     old = -rng.uniform(0.5, 3.0, (rows, WIDTH)).astype(np.float32)
     policy = (old + rng.normal(0, 0.25, (rows, WIDTH))).astype(np.float32)
     reference = (old + rng.normal(0, 0.25, (rows, WIDTH))).astype(np.float32)
-    return policy, old, reference, advantage, mask, segments, weights
+    return (*(value.astype(dtype) for value in (policy, old, reference, advantage)), mask, segments,
+            weights)
 
 
 SPANS = [(row, slice(start, start + length)) for row, lengths in enumerate(LENGTHS)
@@ -181,7 +183,7 @@ def test_each_method_is_its_papers_objective(name, formula, settings):
     term, written = dew_term(name, **settings), paper(formula)
     for seed in range(ORACLE_DRAWS):
         with jax.enable_x64(new_val=True):
-            inputs = widened(draw(seed))
+            inputs = draw(seed, np.float64)
             found, expected = term(*inputs), written(*inputs)
             roundings = chain_roundings(jax.make_jaxpr(term)(*inputs))
         for kind, mine, theirs in zip(("loss", "gradient"), found, expected, strict=True):
