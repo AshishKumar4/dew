@@ -2,12 +2,11 @@
 Hub on the loopback (tests/local_hub.py), which keeps every request it answers."""
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-from local_hub import LocalHub
+from local_hub import LocalHub, hub_environment
 from tool_support import REPO_ROOT, load
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
@@ -38,10 +37,7 @@ def test_the_census_loads_each_model_without_its_weights_and_rows_each_refusal(t
              "local/bare": {"model.safetensors": source / "model.safetensors"}}
     out = tmp_path / "census"
     with LocalHub(repos) as hub:
-        env = {**{name: value for name, value in os.environ.items()
-                  if name not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")},
-               "HF_ENDPOINT": hub.endpoint, "HF_HUB_CACHE": str(tmp_path / "cache"),
-               "DEW_HUB_ANSWERS": str(tmp_path / "answers"), "PYTHONPATH": str(REPO_ROOT / "src")}
+        env = hub_environment(hub, tmp_path)
         for command in (["census", str(out), "10"], ["loads", str(out), "--jobs", "3"]):
             done = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "hf_coverage.py"), *command],
                                   env=env, capture_output=True, text=True, check=False)

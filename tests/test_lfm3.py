@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import respelled
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained
@@ -177,13 +178,9 @@ def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_pa
     its config, which keeps the auto_map, and no other file of its: the directory opens through the
     release's own transformers loader as the release does (ledger 2038). The modules here stand in for
     the release's (`RELEASED`), which the network test loads through transformers."""
-    import shutil
 
-    source = tmp_path / 'release'
-    shutil.copytree(TINY, source)
-    config = json.loads((source / 'config.json').read_text())
     code = LFM3.release_code
-    (source / 'config.json').write_text(json.dumps({**config, 'auto_map': dict(code.auto_map)}))
+    source = respelled(TINY, tmp_path / 'release', lambda config: {**config, 'auto_map': dict(code.auto_map)})
     for file, text in {**RELEASED, 'unrelated.py': 'raise ImportError\n'}.items():
         (source / file).write_text(text)
     loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
