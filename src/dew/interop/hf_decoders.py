@@ -48,11 +48,13 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Reading,
+    SourceCode,
     WrapperFields,
     _unread,
     held_parts,
     hf_activation,
     modeling_overrides,
+    part_plan,
     record_float,
     record_int,
     refuse,
@@ -904,14 +906,12 @@ def read_decoder(
             continue
         stored = held(part.tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
-        # torch Linear holds [out, in]; a stacked expert kernel arrives
-        # [E, in, out], which is the layout dew keeps.
-        insert(
-            variables,
-            path,
-            SourceLeaf((stored,), dtype, transposed=path[-1] == "kernel" and stored.ndim == 2),
-            name,
-        )
+        # The part's plan (`part_plan`): torch Linear holds [out, in]; a stacked expert kernel arrives
+        # [E, in, out], which is the layout dew keeps. Each expert's slice goes in at its own path
+        # until `_stack_experts` stacks them.
+        plan = part_plan(part, stored, family)
+        transposed = plan is not None and plan.order is not None
+        insert(variables, path, SourceLeaf((stored,), dtype, transposed=transposed), name)
     _stack_experts(params)
     return (variables if lazy else materialize(variables)), readings
 
@@ -1056,6 +1056,8 @@ def export_config(model) -> Mapping[str, object]:
     config: dict[str, object] = {
         'model_type': family.export_model_type,
         'architectures': [family.architecture],
+        # The release's own code, which `PretrainedDecoder.from_model` writes beside the export.
+        **({} if family.release_code is None else {'auto_map': dict(family.release_code.auto_map)}),
         'hidden_size': model.emb_features,
         'num_hidden_layers': model.num_layers,
         'num_attention_heads': model.num_heads,
@@ -1250,6 +1252,12 @@ def family_entry(family: str | DecoderFamily) -> DecoderFamily:
 
 def _family_of(fields: CausalTransformer) -> DecoderFamily:
     return next(family for family in ENTRIES if family.matches(fields))
+
+
+def release_code(model: CausalTransformer) -> SourceCode | None:
+    """The release whose own code is the exported family's reference (`DecoderFamily.release_code`),
+    or None for a family transformers implements."""
+    return _family_of(model).release_code
 
 
 def _family_for_config(config: Mapping[str, object]) -> DecoderFamily:

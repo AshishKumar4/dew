@@ -29,6 +29,7 @@ from dew.batch import (
     prefix_min,
     prefix_sum,
     real_slots,
+    token_coordinates,
     token_ids,
     token_positions,
     token_validity,
@@ -231,6 +232,13 @@ class ModelInputs:
                     value.firsts.shape[0] != self.tokens.shape[0]):
                 raise ValueError(f"token field {name!r}'s documents' firsts must have batch size "
                                  f"{self.tokens.shape[0]}, got {value.firsts.shape}")
+        # The tokens' layout is their coordinates or their flat fields, one of them (`token_coordinates`).
+        laid = self.token_fields.get(COORDINATES_FIELD)
+        if isinstance(laid, Coordinates):
+            batch, length = self.tokens.shape
+            token_coordinates((batch, length), laid, segments=self.token_fields.get("segment_ids"),
+                              valid=self.token_fields.get(VALIDITY_FIELD),
+                              positions=self.token_fields.get("positions"))
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")

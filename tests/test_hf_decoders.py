@@ -1067,16 +1067,12 @@ def _diffusion_fp32(name):
 
 
 @pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny"])
-def test_a_diffusion_decoders_logits_match_the_released_model_code(name):
-    """fp32 parity with the release's own modeling code, LLaDA's modeling_llada.py
-    (GSAI-ML/LLaDA-8B-Base at 0f2787f) and Dream's modeling_dream.py
-    (Dream-org/Dream-v0-Base-7B at 6572adb), each run by
-    tools/remote_code_reference.py under transformers 4.46.3 on a tiny
-    random-weight checkpoint, held to the float64 rule. A causal model on the
-    same weights misses by more than 1 (1.5 for LLaDA, 4.9 for Dream), so the
-    fixtures exercise full attention."""
-    model, variables, ids, reference, truth = _diffusion_fp32(name)
-    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, f"{name} logits")
+def test_the_diffusion_fixtures_exercise_full_attention(name):
+    """The release's own logits over the fixture's tokens (LLaDA's modeling_llada.py at 0f2787f, Dream's
+    modeling_dream.py at 6572adb, run by tools/remote_code_reference.py under transformers 4.46.3), which
+    tests/test_remote_code_releases.py holds Dew to over seeds, are a full-attention model's: a causal
+    model on the same weights misses them by more than 1 (1.5 for LLaDA, 4.9 for Dream)."""
+    model, variables, ids, reference, _ = _diffusion_fp32(name)
     causal = model.clone(causal=True)
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
 

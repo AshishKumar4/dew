@@ -43,6 +43,7 @@ from dew.batch import (
     merge,
     prefix_sum,
     shifted_span,
+    token_coordinates,
 )
 from dew.mesh import LayoutRefused
 from dew.nn.continuum import Continuum, ContinuumLevel
@@ -1396,10 +1397,8 @@ class CausalTransformer(nn.Module):
         del conditioning
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
-        if coordinates is None and (segment_ids is not None or attention_mask is not None
-                                    or positions is not None):
-            coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
-                                            positions=positions)
+        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
+                                        positions=positions)
         if coordinates is not None:
             segment_ids, positions, attention_mask = (coordinates.segments, coordinates.positions,
                                                      coordinates.valid)
@@ -1460,13 +1459,11 @@ class CausalTransformer(nn.Module):
         if depth < 0 or depth >= len(self.mtp):
             raise ValueError("prediction depth is outside the model's configured depths")
         embeds = self.token_embeddings(tokens) if input_embeddings is None else input_embeddings
-        given = attention_mask is not None or positions is not None
         state, prediction = self.mtp[depth].states(
             hidden, embeds, decode=decode,
             prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
             attention_metadata=AttentionMetadata(
-                coordinates=build_coordinates(hidden.shape[:2], valid=attention_mask, positions=positions)
-                if given else None,
+                coordinates=token_coordinates(hidden.shape[:2], valid=attention_mask, positions=positions),
                 rotary_positions=rotary_positions))
         return self._logits(state), prediction
 
@@ -1763,10 +1760,8 @@ class CausalTransformer(nn.Module):
                              "visibility; pass one")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
-        if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded
-                                    or positions is not None):
-            coordinates = build_coordinates(tokens.shape[:2], segments=segment_ids, valid=attention_mask,
-                                            positions=positions, right_padded=right_padded)
+        coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
+                                        valid=attention_mask, positions=positions, right_padded=right_padded)
         if decode and coordinates is not None and coordinates.max_segments > 1:
             raise ValueError(
                 "packed rows cannot append to a decode cache: it stores no document ids, so a cached "

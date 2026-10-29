@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dew import _records
+from dew.interop import release_pins
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DecoderFamily,
@@ -22,6 +23,7 @@ from dew.interop.decoder_parts import (
     Leaves,
     Renames,
     Ropes,
+    SourceCode,
     base_config,
     decoder_tensors,
     kind_mixers,
@@ -38,17 +40,22 @@ from dew.nn.mixers.short_conv import ShortConvMixer
 
 _KINDS = ('conv', 'full_attention', 'sliding_attention')
 
+
+_FEED_FORWARD: Renames = (
+    ('feed_forward.w1', 'mlp.gate_proj'), ('feed_forward.w3', 'mlp.up_proj'),
+    ('feed_forward.w2', 'mlp.down_proj'))
+"""LFM3's feed-forward names onto the shared ones, whole: its attention has a `gate_proj` of its own,
+which a bare `w1` for `gate_proj` would respell on export."""
+
 _SANDWICH: Renames = (
-    ('model.embedding_norm', 'model.norm'), ('feed_forward', 'mlp'), ('w1', 'gate_proj'),
-    ('w3', 'up_proj'), ('w2', 'down_proj'), ('operator_norm', 'input_layernorm'),
+    ('model.embedding_norm', 'model.norm'), *_FEED_FORWARD, ('operator_norm', 'input_layernorm'),
     ('post_operator_norm', 'post_attention_layernorm'), ('ffn_norm', 'pre_feedforward_layernorm'),
     ('post_ffn_norm', 'post_feedforward_layernorm'))
 """LFM3's names onto the shared ones under sandwich norms (`use_sandwich_norm`): the norm before
 each mixer and after it, before the feed-forward and after it, Gemma's four."""
 
 _PLAIN: Renames = (
-    ('model.embedding_norm', 'model.norm'), ('feed_forward', 'mlp'), ('w1', 'gate_proj'),
-    ('w3', 'up_proj'), ('w2', 'down_proj'), ('operator_norm', 'input_layernorm'),
+    ('model.embedding_norm', 'model.norm'), *_FEED_FORWARD, ('operator_norm', 'input_layernorm'),
     ('ffn_norm', 'post_attention_layernorm'))
 """LFM3's names onto the shared ones without sandwich norms: one norm before each mixer and one
 before each feed-forward."""
@@ -199,6 +206,7 @@ LFM3 = DecoderFamily(
     preserve_source_layout=True,
     padding_idx=True,
     aliases={'norm_eps': 'rms_norm_eps'},
+    release_code=SourceCode(*release_pins.LFM3),
     # Lfm3Config's defaults for the fields its decoder reads (configuration_lfm3.py).
     defaults={'conv_L_cache': 7, 'conv_bias': False, 'use_sandwich_norm': True, 'sliding_window': 256,
               'tie_word_embeddings': True, 'max_position_embeddings': 128000, 'rms_norm_eps': 1e-5,
