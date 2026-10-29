@@ -1041,7 +1041,9 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
     truth evaluated once for them all: the reference's draws, then each further reference's, a list. With
     `terms_fn`, the truth is that program's evaluated op by op with each output's terms (`float64_terms`),
-    every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`)."""
+    every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own
+    terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the same
+    widened inputs."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
@@ -1056,6 +1058,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         """The truth of `inputs` and, with `terms_fn`, its terms (else None)."""
         if terms_fn is None:
             return truth_of(inputs), None
+        if isinstance(terms_fn, _SiteTerms):
+            truth = truth_of(inputs)
+            with jax.enable_x64(new_val=True):
+                return truth, terms_fn.of(truth, *widened(inputs))
         with jax.enable_x64(new_val=True):
             return float64_terms(terms_fn, *widened(inputs))
 
@@ -1361,14 +1367,36 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
                                   "narrow_leaves": narrow_leaves}) + "\n")
 
 
+@dataclasses.dataclass(frozen=True)
+class _SiteTerms:
+    """A site's own program of its truth's terms (`assert_as_exact`'s `terms`): `fn` on a draw's inputs
+    widened to float64, the truth's tree of each entry's terms as `float64_terms` sizes them."""
+
+    fn: Callable
+
+    def of(self, truth, *inputs):
+        """The terms of `truth`, the draw's at `inputs`, held to its leaves, paths and shapes."""
+        terms = jax.device_get(self.fn(*inputs))
+        if _leaf_paths(terms) != _leaf_paths(truth):
+            raise ValueError(f"the site's terms are {_leaf_paths(terms)}, the truth's {_leaf_paths(truth)}")
+        for path, term, true in zip(_leaf_paths(truth), jax.tree.leaves(terms), jax.tree.leaves(truth),
+                                    strict=True):
+            if np.shape(term) != np.shape(true):
+                raise ValueError(f"{path}: the site's terms' shape is {np.shape(term)}, the truth's "
+                                 f"{np.shape(true)}")
+        return terms
+
+
 def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn, library_row, library_leaves,
-          also, terms: bool):
+          also, terms):
     """A check 1 site's arguments held to what it may ask (`assert_as_exact`): its term program, the
     traced truth (refused run as given or recorded), and its further references; refused below
     `FEWEST_SEEDS`, with a library arm not named by its row and leaves, or with further references of
     mixed kinds beside a plain Dew arm."""
     terms_fn = None
-    if terms:
+    if callable(terms):
+        terms_fn = _SiteTerms(terms)
+    elif terms:
         terms_fn = truth_fn if truth_fn is not None else reference_fn
         terms_fn = terms_fn.fn if isinstance(terms_fn, _Windowed) else terms_fn
         if _given(terms_fn) or getattr(terms_fn, "recorded", False):
@@ -1392,7 +1420,7 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
-                    terms: bool = False) -> None:
+                    terms: bool | Callable = False) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1455,7 +1483,13 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     distance there; a row whose terms are zero too (a query that keeps no key) has no size and stays held
     to the reference's distance, exactly zero where the reference is. Every other row, and every leaf's
     pooled ratio, as without. The truth program is traced, so it is JAX's: a truth run as given has no
-    terms and is refused.
+    terms and is refused. The traced terms are those of each leaf's final sums alone, so a row whose
+    cancellation sits behind its final sum has none there: an attention gradient's query that keeps one
+    key, whose logit gradient P (dP - delta) is zero in float64, sums zero terms into dQ. Such a site
+    passes its own terms program as `terms` instead: a function of the draw's inputs widened to float64
+    returning the truth's tree of each entry's terms (`float64_terms`' sizes), carried through that
+    cancellation (tests/attention_oracle.py's `attention_terms`), every arm sized by it alike; the truth
+    is as without, so it may run as given.
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound

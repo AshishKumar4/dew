@@ -280,6 +280,51 @@ def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
                         terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
 
 
+MIX = np.random.default_rng(2442).standard_normal((4, 4)).astype(np.float32)
+"""A fixed [4, 4] product past `cancelling`'s rows (`mixed`)."""
+
+
+def mixed(arm):
+    """`arm`'s rows through MIX: a row that cancels before that product sums zero terms into it, in
+    float64, however far each arm is off its zero."""
+    def run(x, w):
+        return {"rows": arm(x, w)["rows"] @ jnp.asarray(MIX)}
+    return run
+
+
+def mixed_terms(x, w):
+    """`mixed`'s terms carried through its cancellation (`float64_terms`' sizes): each dot's entry the
+    root sum of squares of its products, the cancelling rows' two sums both, then MIX's products of
+    those sizes."""
+    sizes = np.sqrt(np.square(np.asarray(x)) @ np.square(np.asarray(w)))
+    sizes[:8] *= np.sqrt(2.0)
+    return {"rows": np.sqrt(np.square(sizes) @ np.square(MIX.astype(np.float64)))}
+
+
+def test_check_1_sizes_a_row_that_cancels_behind_its_final_sum_by_the_sites_own_terms():
+    """A site's own terms program (`assert_as_exact`'s `terms`): the traced terms are a leaf's final
+    sums' alone, so rows that cancel before a further product (`mixed`, as an attention query that keeps
+    one key cancels its logit gradient before dQ sums it) have none and fail as rows of float64 zero; the
+    site's own terms, carried through the cancellation, size them, and nothing else is admitted: a
+    dropped term there is refused, a residue on rows whose terms are zero too is refused, and terms of
+    another tree are refused at the site."""
+    reference = mixed(cancelling(split=False))
+    with pytest.raises(GateFailure):
+        assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "traced terms", seeds=16,
+                        terms=True)
+    assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "the site's terms", seeds=16,
+                    terms=mixed_terms)
+    with pytest.raises(GateFailure):
+        assert_as_exact(mixed(cancelling(split=True, leak=True)), reference, cancelling_draw, "a leaked term",
+                        seeds=16, terms=mixed_terms)
+    with pytest.raises(GateFailure):
+        assert_as_exact(mixed(cancelling(split=True, residue=1e-20)), reference, cancelling_draw,
+                        "a residue on rows of no terms", seeds=16, terms=mixed_terms)
+    with pytest.raises(ValueError):
+        assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "another tree", seeds=16,
+                        terms=lambda x, w: mixed_terms(x, w)["rows"])
+
+
 def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw():
     """`also`: one Dew arm against several references on the same draws, each judged by its own check 1
     under its own label, Dew and the truth evaluated once a draw for them all. A Dew arm on par with one
