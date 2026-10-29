@@ -782,8 +782,9 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
     programs = decoding(model)
 
     def rows(programs, variables):
-        return {part: forced(programs, variables, prompt, tokens, prompt_rows=prompt_rows)
-                for part, (prompt, tokens, prompt_rows) in parts.items()}
+        return {'log_probabilities': jnp.concatenate([
+            forced(programs, variables, prompt, tokens, prompt_rows=prompt_rows)
+            for prompt, tokens, prompt_rows in parts.values()])}
 
     def dew(index, order):
         # Each order's weights placed alone, and gone from the device when the call returns.
@@ -829,8 +830,9 @@ def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distance
 
         def transcribed(tensors, dtype, parts=parts, mode=mode):
             ran = TOOL.DoryReference(config, tensors, dtype, mode=mode)
-            return {part: torch.as_tensor(ran.forced(prompt, tokens, prompt_rows)).log_softmax(-1).numpy()
-                    for part, (prompt, tokens, prompt_rows) in parts.items()}
+            logits = np.concatenate([ran.forced(prompt, tokens, prompt_rows)
+                                     for prompt, tokens, prompt_rows in parts.values()])
+            return torch.as_tensor(logits).log_softmax(-1).numpy()
 
         truth = transcribed(tensors, torch.float64)
         host = jax.device_get(loaded.variables)
@@ -842,13 +844,12 @@ def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distance
             tensors = loaded.export(symmetric(host, config, order(seed)))
             found = transcribed({key: np.array(value, copy=True) for key, value in tensors.items()},
                                 torch.float32)
-            return {part: np.sqrt(np.mean(np.square(found[part] - truth[part]), axis=1)) for part in found}
+            return np.sqrt(np.mean(np.square(found - truth), axis=1))
 
-        kept = [distances(seed) for seed in range(80)]
         with jax.enable_x64(new_val=True):
             stored = recording_of.record_distances(
-                mode, order, {part: np.stack([seed[part] for seed in kept]) for part in truth},
-                lambda seed, truth=truth: truth, dict.fromkeys(truth, 'float32'))
+                mode, order, {'log_probabilities': np.stack([distances(seed) for seed in range(80)])},
+                lambda seed, truth=truth: {'log_probabilities': truth}, {'log_probabilities': 'float32'})
         model = with_cache(loaded.model, mode).with_cache_capacity(32)
         assert_decodes_as_recorded(stored, mode, model, host, config, parts, f'tiny Dory, {mode}')
 
@@ -866,7 +867,7 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     provenance inside), in bf16 at one, two and four loops and in fp32 at two, through each cache: the
     log-probabilities of a sentence's prompt and of the 256 tokens vLLM drew greedily after it, each
     decoded a step at a time, and of 64 tokens drawn after 1100 random ids, past the 1024-token window,
-    every entry of every row, each part's rows a leaf, by check 1 (`assert_decodes_as_recorded`).
+    every entry of every row, by check 1 (`assert_decodes_as_recorded`).
 
     A seed is an order of the exact symmetries both engines hold the release under, on the same tokens
     (tools/dory_vllm_reference.py's `symmetry`: the residual stream's units, each feed-forward's hidden

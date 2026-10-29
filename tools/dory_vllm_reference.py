@@ -601,8 +601,8 @@ def summary(directory: Path) -> None:
     (`upstream`), kept as check 1 reads them (tools/recorded_references.py's `record_distances`: the count
     they resolve and its redraw, each seed's evidence and its truth's sketch), beside each run's prompts
     and the tokens drawn after them, and the provenance `record_run` wrote with the symmetries' largest
-    float64 distance from the identity (`invariance`), saved to `RECORDING`. Each part's rows are a leaf
-    of their own. The orders are exact symmetries, so every seed's truth is the identity's."""
+    float64 distance from the identity (`invariance`), saved to `RECORDING`. The orders are exact
+    symmetries, so every seed's truth is the identity's."""
     from recorded_references import provenance, record_distances, save
 
     config = json.loads((FIXTURE / 'config.json').read_text())
@@ -612,17 +612,12 @@ def summary(directory: Path) -> None:
     arrays: dict[str, np.ndarray] = {}
     for run in RUNS:
         key, label = name(*run), site(*run)
-        # Each part's rows a leaf of their own: a last-loop run's window takes the model code's rows,
-        # another reference than the engine's sentence rows (`SHARED`).
-        window = len(probe[f'{key}/window_generated'])
-        upstream = np.load(directory / f'upstream-{tag(key)}.npy')
-        truth = {'sentence': upstream[:-window], 'window': upstream[-window:]}
-        rows = np.load(directory / f'rows-{tag(key)}-vllm.npy').reshape(BATCHES * ORDERS, -1)
+        truth = {'log_probabilities': np.load(directory / f'upstream-{tag(key)}.npy')}
+        rows = np.load(directory / f'rows-{tag(key)}-vllm.npy')
         # The engine's sampler takes its log-probabilities in float32 at either dtype.
         arrays.update(record_distances(label, lambda seed: symmetry(config, *divmod(seed, ORDERS)),
-                                       {'sentence': rows[:, :-window], 'window': rows[:, -window:]},
-                                       lambda seed, truth=truth: truth,
-                                       {'sentence': 'float32', 'window': 'float32'}))
+                                       {'log_probabilities': rows.reshape(-1, rows.shape[-1])},
+                                       lambda seed, truth=truth: truth, {'log_probabilities': 'float32'}))
         for part, _, _ in PARTS:
             arrays[f'{label}.prompt.{part}'] = probe[part]
             arrays[f'{label}.continued.{part}'] = probe[f'{key}/{part}_generated']
