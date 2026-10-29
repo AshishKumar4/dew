@@ -85,9 +85,11 @@ def draw(seed: int, signed: bool, dtype=ml_dtypes.bfloat16):
     def values(shape):
         return held(rng.normal(size=shape) if signed else rng.uniform(0.5, 2.0, size=shape))
 
-    # The matrices scaled before they are rounded: the products certified are of the values the kernel reads.
+    # The matrices and the cotangent scaled before they are rounded: the products certified are of the values
+    # the kernel reads, and their grid is finer than the rows', so no sum of one sign is exact by the grids
+    # alone (rows and cotangent of [0.5, 2) sum a kernel gradient's products exactly in fp32).
     return (values((ROWS, DEPTH)), held(values((len(SIZES), DEPTH, WIDTH)) / np.sqrt(DEPTH)),
-            values((ROWS, WIDTH)))
+            held(values((ROWS, WIDTH)) / np.sqrt(WIDTH)))
 
 
 def groups(sizes) -> np.ndarray:
@@ -233,11 +235,11 @@ def gradient_steps(kernel: str, sizes=SIZES) -> list[list[slice]]:
 
 def scaled(x, steps, first: int, factor: float) -> np.ndarray:
     """`x` with each group's operand from its depth step `first` on (`steps`: each group's steps' indices into
-    it) scaled by `factor`, exactly: zero, or a power of two (`FALL`)."""
+    it) scaled by `factor`, exactly: to +0, or by a power of two (`FALL`)."""
     x = x.copy()
     for taken in steps:
         for step in taken[first:]:
-            x[step] *= factor
+            x[step] = x[step] * factor if factor else 0.0
     return x
 
 
@@ -382,14 +384,16 @@ def test_the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_
     """The exact-sums witness's faults, each the native kernel gradient run around a defect and witnessed a
     step at a time against the true operands: the default launch, whose tensor cores add each step's products
     into the accumulator by truncating adds, where exact sums are declared, refused at most of the elements
-    past each group's first step of a falling draw (`FALL`), where the witness decides the add's rounding; a
+    past each group's first step of a falling draw of one sign (`FALL`), where the witness decides the add's
+    rounding and every truncation errs one way (at 87% of them on Triton's launch, 99% on Mosaic GPU's); a
     lost block of sixteen of group 3's rows, refused at the step that loses them and nowhere else; and a row
     read under its neighbour group, refused at both groups' first steps and nowhere past those groups."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         steps = gradient_steps(kernel)
-        x, _, dy = draw(0, signed=True)
+        x, _, dy = draw(0, signed=False)
         held = kernel_gradient_witnessed(scaled(x, steps, 1, FALL), dy, steps, precision=None)
-        assert np.mean(np.concatenate([step.ravel() for taken in held for step in taken[1:]])) < 0.5
+        assert np.mean(np.concatenate([step.ravel() for taken in held for step in taken[1:]])) < 0.25
+        x, _, dy = draw(0, signed=True)
         [losing] = [j for j, step in enumerate(steps[3])
                     if step.start <= LOST.start and LOST.stop <= step.stop]
         held = kernel_gradient_witnessed(x, dy, steps, ran=scaled(x, [[LOST]], 0, 0.0))
@@ -402,12 +406,13 @@ def test_the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_
 def test_the_tf32_certificate_refuses_bf16_products_tf32_where_bf16_is_declared_and_a_truncated_read(
         kernel, generation_name):
     """The TF32 contract's faults, each the native forward of fp32 operands certified against products the
-    call does not take, on same-sign draws: the operands rounded to bf16 first (bf16 products where TF32 is
-    declared); the operands themselves (TF32 products) against their bf16 values' products, which a bf16
-    product declares (`gemm`'s `compute`, the MoE projection's); and the operands truncated to TF32 first,
-    where the tensor cores round them to nearest. Each is refused at nearly every element: rounding to bf16
-    moves a product by up to 2^-8 of it, a truncation by up to 2^-10 of it toward zero, where the allowance
-    is γ_128 at 2^-23 of the products' magnitudes."""
+    call does not take, on draws of one sign: the operands rounded to bf16 first (bf16 products where TF32 is
+    declared) and the operands themselves (TF32 products) against their bf16 values' products, which a bf16
+    product declares (`gemm`'s `compute`, the MoE projection's), each refused at more than nine elements in
+    ten (bf16 moves a product by up to 2^-8 of it, either way, where the allowance is γ_128 at 2^-23 of the
+    products' magnitudes); and the operands truncated to TF32 first, where the tensor cores round them to
+    nearest, refused at nearly every element (a truncation moves each product toward zero by up to 2^-10 of
+    it, every product the same way)."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         x, w, _ = draw(0, signed=False, dtype=np.float32)
 
@@ -415,10 +420,10 @@ def test_the_tf32_certificate_refuses_bf16_products_tf32_where_bf16_is_declared_
             return forward_of(*operands, SIZES, jnp.float32, dtype=jnp.float32)
 
         tf32 = forward_products(tf32_operand(x), tf32_operand(w), SIZES)
-        for native, products in ((forward(bf16(x), bf16(w)), tf32),
-                                 (forward(x, w), forward_products(bf16(x), bf16(w), SIZES)),
-                                 (forward(truncated(x, TFLOAT32), truncated(w, TFLOAT32)), tf32)):
-            assert np.mean(native_dot_holds(native, products, FLOAT32, flushes=False)) < 0.05
+        for native, products, most in ((forward(bf16(x), bf16(w)), tf32, 0.1),
+                                       (forward(x, w), forward_products(bf16(x), bf16(w), SIZES), 0.1),
+                                       (forward(truncated(x, TFLOAT32), truncated(w, TFLOAT32)), tf32, 0.05)):
+            assert np.mean(native_dot_holds(native, products, FLOAT32, flushes=False)) < most
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))

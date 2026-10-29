@@ -586,8 +586,9 @@ def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf
     of their TF32 values (`tf32_operand`) summed in fp32 by truncating adds in any order, holds at every
     element; the products of its operands' bf16 values where TF32 is declared, its TF32 products where bf16
     ones are, and the products of its operands truncated to TF32 where the tensor cores round them each break
-    it at nearly every element (the truncation, whose products all err toward zero, at most on Gaussian
-    draws)."""
+    it: the first two at more than nine elements in ten, the truncation at more than four in five of Gaussian
+    draws, whose products' errors partly cancel, and at nearly every one of draws of one sign, whose products
+    all err toward zero."""
     rng = np.random.default_rng(5)
 
     def bf16(value):
@@ -601,7 +602,7 @@ def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf
         native = _truncating_sums(tf32, rng)
         assert np.all(ct.native_dot_holds(native, tf32, oc.FLOAT32, flushes=False)), signed
         for faulty, products, most in ((_truncating_sums(wide, rng), tf32, 0.1), (native, wide, 0.1),
-                                       (_truncating_sums(truncated, rng), tf32, 0.5 if signed else 0.05)):
+                                       (_truncating_sums(truncated, rng), tf32, 0.2 if signed else 0.05)):
             held = ct.native_dot_holds(faulty, products, oc.FLOAT32, flushes=False)
             assert np.mean(held) < most, (signed, np.mean(held))
 
@@ -610,9 +611,10 @@ def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_a
     """The exact-sums witness (row 2084's link 2): an fp32 accumulator to which each depth step's partial,
     summed from zero by truncating adds in any order, is added by an IEEE add holds at every step, on draws at
     one scale and falling 2^-12 past the first step; the same steps' products added into the accumulator by
-    truncating adds, as the tensor cores add without exact sums, break it at most of the later steps' elements
-    of a falling draw, where it decides the add's rounding; and a step with its largest product lost breaks it
-    at nearly every element of that step and nowhere else."""
+    truncating adds, as the tensor cores add without exact sums, break it at nearly every later step's element
+    of a falling draw, where it decides the add's rounding (each of a step's sixteen adds truncating at the
+    accumulator's last place); and a step with its largest product lost breaks it at nearly every element of
+    that step and nowhere else."""
     rng = np.random.default_rng(7)
     width = 16
     for signed in (True, False):
@@ -624,7 +626,7 @@ def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_a
             held = _steps_held(_stepped_sums(products, width, rng, exact=True), products, width)
             assert all(np.all(step) for step in held), (signed, fall)
         truncating = _steps_held(_stepped_sums(products, width, rng, exact=False), products, width)
-        assert np.mean(truncating[1:]) < 0.5, (signed, np.mean(truncating[1:]))
+        assert np.mean(truncating[1:]) < 0.05, (signed, np.mean(truncating[1:]))
         lost = products.copy()
         step = lost[..., 2 * width:3 * width]
         np.put_along_axis(step, np.argmax(np.abs(step), -1)[..., None], 0.0, -1)
