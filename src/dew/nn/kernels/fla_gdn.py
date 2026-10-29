@@ -51,10 +51,8 @@ from dew.nn.kernels.chunked_launch import (
     spanned,
     write_rows,
 )
-from dew.nn.precision import compensated_difference
 
 RCP_LN2 = 1 / math.log(2)
-LN2 = math.log(2)
 """1 / ln 2, fla's RCP_LN2 (whose 1.4426950216 rounds to the same fp32): its kernels take the cumulated
 decay in base 2 and exponentiate with exp2; the prefix converts in float64 (`recurrence.cumulated`)."""
 
@@ -69,30 +67,28 @@ than the 128-wide pick). fp32 keys take at most WIDEST: at 256 an A100's fp32 fo
 shared bytes at its narrowest tile (CPU compile)."""
 
 
-def _pairs(rows, columns, rows_lo=None, columns_lo=None):
-    """The decay's exponent from each column position to each row position, `[R, C]`: `g_r - g_c`, of both
-    halves of a compensated prefix where its remainders are given (`algebra.apart`)."""
+def _paired(rows, columns, rows_lo=None, columns_lo=None):
+    """The decay from each column position to each row position, `[R, C]`: `exp2(g_r - g_c)`, of the prefix
+    separated into its whole part and fraction where the fractions are given (`algebra.between`)."""
     if rows_lo is None:
-        return rows[:, None] - columns[None, :]
-    return algebra.apart(rows, rows_lo, columns, columns_lo)
+        return jnp.exp2(rows[:, None] - columns[None, :])
+    return algebra.between((rows[:, None], rows_lo[:, None]), (columns[None, :], columns_lo[None, :]))
 
 
-def _range(last, gate, last_lo=None, gate_lo=None):
-    """The decay's exponent from each position to the chunk's last, `g_last - g`, of both halves where the
-    remainders are given (`precision.compensated_difference`): a steep token's rounding of the rounded prefix
-    took every mild one after it (ledger 2098, 1328)."""
+def _ranged(last, gate, last_lo=None, gate_lo=None):
+    """The decay from each position to the chunk's last, `exp2(g_last - g)`, of the separated prefix where
+    the fractions are given (`algebra.between`): from the rounded prefix a steep token's rounding took every
+    mild one after it (ledger 2098, 1328)."""
     if last_lo is None:
-        return last - gate
-    return compensated_difference((last, last_lo), (gate, gate_lo))
+        return jnp.exp2(last - gate)
+    return algebra.between((last, last_lo), (gate, gate_lo))
 
 
 def _raised(gate, gate_lo=None):
-    """`exp2(g)`, of both halves where the remainder is given: `exp2(hi) (1 + lo ln 2)`, the remainder's
-    factor to its first order, whose next term lies below fp32's resolution wherever `exp2(hi)` is a normal
-    fp32 (|lo| at most 2^-17 there); one product beside the hardware's exponential, where a second
-    exponential, or `algebra.raised`'s exact power of two, cost a KDA tile 4 and 15 times its launch on an
-    A100."""
-    return jnp.exp2(gate) if gate_lo is None else jnp.exp2(gate) * (1.0 + gate_lo * LN2)
+    """`exp2(g)` from the chunk's start, of the separated prefix where the fractions are given."""
+    if gate_lo is None:
+        return jnp.exp2(gate)
+    return algebra.between((gate, gate_lo), (0.0, 0.0))
 
 
 def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, bv: int, exact: bool,
@@ -183,7 +179,7 @@ def _kkt_solve_chunk(k_ref, g_ref, gl_ref, beta_ref, a_ref, start, taken, *, chu
         # The keys' products at the call's precision, the merges at its solve precision (`_dot`).
         return _dot(a, b, exact=exact, solve=k_ref.dtype if name == "merge" else None)
 
-    blocks = algebra.system(keys, lambda i, j: jnp.exp2(_pairs(gates[i], gates[j], lows[i], lows[j])), betas,
+    blocks = algebra.system(keys, lambda i, j: _paired(gates[i], gates[j], lows[i], lows[j]), betas,
                             count, width // bk, issue)
     inverse = algebra.inverted(blocks, issue)
     # fla zero-fills A before its kernel stores the lower blocks; here the blocks above are stored as zeros.
@@ -377,7 +373,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, *refs, chunk: int, a
             last, gate = _row(g_ref, final), _gates(g_ref, begin, taken, chunk)
             last_lo, gate_lo = ((None, None) if gl_ref is None
                                 else (_row(gl_ref, final), _gates(gl_ref, begin, taken, chunk)))
-            gated = corrected * jnp.exp2(_range(last, gate, last_lo, gate_lo))[:, None]
+            gated = corrected * _ranged(last, gate, last_lo, gate_lo)[:, None]
             return [state[i] * _raised(last, last_lo) + written(i, gated) for i in range(slices)]
 
         state = jax.lax.fori_loop(0, -(-count // chunk), step, state)
@@ -519,7 +515,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, *
                 gate, last = _gates(g_ref, begin, taken, chunk), _row(g_ref, final)
                 gate_lo, last_lo = ((None, None) if gl_ref is None
                                     else (_gates(gl_ref, begin, taken, chunk), _row(gl_ref, final)))
-                dv = (dv * jnp.exp2(_range(last, gate, last_lo, gate_lo))[:, None]
+                dv = (dv * _ranged(last, gate, last_lo, gate_lo)[:, None]
                       + read(dv_ref).astype(jnp.float32))
                 decay = _raised(gate, gate_lo)[:, None]
                 kept = [_raised(last, last_lo)] * slices
@@ -640,7 +636,7 @@ def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, *refs, chunk: int, 
             scores += _dot(read(k_ref, columns), read(q_ref, columns).T, exact=exact) * scale
         gate = _gates(g_ref, start, taken, chunk)
         low = None if gl_ref is None else _gates(gl_ref, start, taken, chunk)
-        scores = scores * jnp.exp2(-_pairs(gate, gate, low, low))
+        scores = scores * _paired(gate, gate, low, low).T
         index = jnp.arange(chunk)
         scores = jnp.where(index[:, None] <= index[None, :], scores, 0.0).astype(do_ref.dtype)
         for block in range(do_ref.shape[-1] // bv):
@@ -772,8 +768,8 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
                                 (_gates(gl_ref, start, taken, chunk, 0, head),
                                  _row(gl_ref, (start + taken - 1, head))))
             dq = dq * _raised(gate, gate_lo)[:, None] * scale
-            dk = dk * jnp.exp2(_range(last, gate, last_lo, gate_lo))[:, None]
-            ds = jnp.where(causal, ds * jnp.exp2(_pairs(gate, gate, gate_lo, gate_lo)), 0.0) * scale
+            dk = dk * _ranged(last, gate, last_lo, gate_lo)[:, None]
+            ds = jnp.where(causal, ds * _paired(gate, gate, gate_lo, gate_lo), 0.0) * scale
             # The keys' writes into the memory the chunk leaves run through (s, end]: the last row's pairs.
             leaving = jnp.sum(dk * keys.astype(jnp.float32), axis=1)
             pairs = (jnp.where(strict, ds * scores, 0.0)
@@ -944,7 +940,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
         d_x = jnp.where(strict, d_x, 0.0)
         d_x = _dot(d_x.astype(inverse_t.dtype), inverse_t, exact=exact)
         d_x = _dot(inverse_t, d_x.astype(inverse_t.dtype), exact=exact)
-        d_x = d_x * jnp.exp2(_pairs(gate, gate, low, low))
+        d_x = d_x * _paired(gate, gate, low, low)
         d_l = jnp.where(strict, -d_x, 0.0).astype(k_ref.dtype)
         def keys_grad(block, carry):
             products, d_beta = carry
@@ -1070,7 +1066,7 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, *refs, chunk: int, a
         gate = _gates(g_ref, start, taken, chunk)
         low = None if gl_ref is None else _gates(gl_ref, start, taken, chunk)
         out = out * _raised(gate, low)[:, None]
-        scores = scores * jnp.exp2(_pairs(gate, gate, low, low))
+        scores = scores * _paired(gate, gate, low, low)
         index = jnp.arange(chunk)
         scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
         value = read(v_ref)
@@ -1156,14 +1152,17 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
 def prefixed_fwd(cumulated, q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool,
                  keep: bool, wide: bool, *, compensated: bool = False):
     """A port's forward from the natural log decay: the sequences `cu_seqlens` describes, the decay
-    cumulated in base 2 within each chunk (`recurrence.cumulated`; its `(hi, lo)` halves where
-    `compensated`), named 'delta_decay' for a block's remat policy, then the port's `cumulated` forward
-    on it (this module's `cumulated_fwd`, or `fla_kda`'s)."""
+    cumulated in base 2 within each chunk (`recurrence.cumulated`; where `compensated` its `(hi, lo)`
+    halves, separated into the prefix's whole part and fraction, `algebra.separated`), named 'delta_decay'
+    for a block's remat policy, then the port's `cumulated` forward on it (this module's `cumulated_fwd`,
+    or `fla_kda`'s)."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans,
                                              compensated=compensated, interpret=interpret),
                         'delta_decay')
-    return cumulated(q, k, v, g, beta, h0, spans, scale, chunk, interpret, keep, wide)
+    # The halves as the prefix's whole part and fraction, whose differences every decay takes exactly.
+    return cumulated(q, k, v, algebra.separated(*g) if compensated else g, beta, h0, spans, scale, chunk,
+                     interpret, keep, wide)
 
 
 def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: int, interpret: bool,

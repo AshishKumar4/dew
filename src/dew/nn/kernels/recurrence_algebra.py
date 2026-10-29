@@ -211,6 +211,26 @@ def _scaled(x, k):
     return jnp.where(k < PAIR_FLOOR, 0.0, jax.lax.bitcast_convert_type(bits, jnp.float32))
 
 
+def separated(hi, lo):
+    """A compensated base-2 exponent `(hi, lo)` as its whole part and fraction `(n, f)`, `f` in [0, 1): the
+    form whose differences are exact at any size, the wholes' an integer and the fractions' within one
+    (`between`). Once a call, where its prefix is cumulated."""
+    whole = _floor(hi)
+    part = (hi - whole) + lo
+    carry = _floor(part)
+    return whole + carry, part - carry
+
+
+def between(later, earlier):
+    """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution at
+    any size: exp2 of the fractions' difference, in (1/2, 2), scaled by the wholes' power of two (`_scaled`),
+    zero below 2^-124. A difference of the rounded sums lost the fraction's last bits at the exponent's size,
+    1e-6 of the decay near -43, which put a port's decay gradient under decays near zero 9 to 14 times the
+    token-by-token recurrence's error from float64 (ledger 2098)."""
+    (whole, fraction), (other, its_fraction) = later, earlier
+    return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
+
+
 def grown_from(hi, lo, exp, unit: float = 1.0):
     """`exp(hi + lo)` of a compensated exponent `(hi, lo)`, rounded about once: `exp(hi)` corrected by its
     first-order term in `lo` (`|lo|` is under half an ulp of `hi`, so the second is far below fp32's

@@ -55,7 +55,6 @@ from dew.nn.kernels.chunked_launch import (
     write_rows,
 )
 from dew.nn.kernels.fla_gdn import _dot, _weighted_values
-from dew.nn.precision import compensated_difference
 
 SUB = 16
 """fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
@@ -95,8 +94,7 @@ def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, *refs, chunk: i
             if lo_ref is None:
                 decay = jnp.exp2(gate - _row(g_ref, earlier))
             else:
-                before = (_row(g_ref, earlier), _row(lo_ref, earlier))
-                decay = jnp.exp2(compensated_difference((gate, low), before))
+                decay = algebra.between((gate, low), (_row(g_ref, earlier), _row(lo_ref, earlier)))
             gated = k_ref[earlier].astype(jnp.float32) * decay
             here = (index == j)[None, :]
             return (jnp.where(here, (jnp.sum(query * gated, axis=1) * scale)[:, None], sums[0]),
@@ -282,19 +280,19 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, *refs, chunk: i
             scaled = (key * beta[:, None]) * raised
             if q_ref is not None and qg_ref is not None:
                 write(qg_ref, columns, read(q_ref, columns) * raised)
-            write(kg_ref, columns, key * jnp.exp2(_range(g_ref, lo_ref, start, taken, chunk, columns, gate)))
+            write(kg_ref, columns, key * _range(g_ref, lo_ref, start, taken, chunk, columns, gate))
             write(w_ref, columns, _dot(inverse, scaled.astype(key.dtype), exact=exact))
 
 
 def _range(g_ref, lo_ref, start, taken, chunk: int, columns, gate):
-    """Each of a chunk's rows' decay to its last real row in base 2, `g_last - g` `[chunk, columns]` (`gate`
-    the rows' prefix, read): where the prefix's remainder `lo_ref` is given, the difference of both halves
-    (`precision.compensated_difference`), else of the rounded prefix alone."""
+    """Each of a chunk's rows' decay to its last real row, `exp2(g_last - g)` `[chunk, columns]` (`gate` the
+    rows' prefix, read): where the prefix's fraction `lo_ref` is given, of the separated prefix
+    (`algebra.between`), else of the rounded prefix alone."""
     last = _row(g_ref, (start + taken - 1, columns))[None, :]
     if lo_ref is None:
-        return last - gate
-    return compensated_difference((last, _row(lo_ref, (start + taken - 1, columns))[None, :]),
-                                  (gate, _gates(lo_ref, start, taken, chunk, 0, columns)))
+        return jnp.exp2(last - gate)
+    return algebra.between((last, _row(lo_ref, (start + taken - 1, columns))[None, :]),
+                           (gate, _gates(lo_ref, start, taken, chunk, 0, columns)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -578,7 +576,7 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
             gate_exp, final_exp = fla_gdn._raised(gate, gate_lo), fla_gdn._raised(final, final_lo)
             decay_grad = decay_grad * final_exp
             dq = dq * gate_exp * scale
-            dk = dk * jnp.exp2(_range(g_ref, lo_ref, start, taken, chunk, keys, gate))
+            dk = dk * _range(g_ref, lo_ref, start, taken, chunk, keys, gate)
             gated_key = key * gate_exp
             dw = -dw.astype(transposed.dtype)
             scores = scores + _dot(dw, gated_key.T.astype(transposed.dtype), exact=exact)
@@ -710,16 +708,16 @@ class _SubChunk:
         return (_row(self.refs["g"], self.start + at)[None, :],
                 None if lo is None else _row(lo, self.start + at)[None, :])
 
-    def apart(self, later, earlier):
-        """`g_later - g_earlier`, of both halves where compensated."""
-        return later[0] - earlier[0] if later[1] is None else compensated_difference(later, earlier)
+    def decay(self, later, earlier):
+        """`exp2(g_later - g_earlier)`, of the separated prefix where compensated (`algebra.between`)."""
+        return jnp.exp2(later[0] - earlier[0]) if later[1] is None else algebra.between(later, earlier)
 
     def solved(self, left_operand, right_operand):
         return _dot(left_operand, right_operand, exact=self.exact, solve=self.refs["k"].dtype)
 
     def earlier(self, j):
         """Sub-chunk `j`'s keys decayed to this one's first row, `k_t exp2(g_first - g_t)`."""
-        return self.tile("k", j * SUB) * jnp.exp2(self.apart(self.decayed(self.first), self.gates(j * SUB)))
+        return self.tile("k", j * SUB) * self.decay(self.decayed(self.first), self.gates(j * SUB))
 
     def written(self, j):
         """Sub-chunk `j`'s keys by their write gate, `k beta` in the operands' dtype as fla's b_kb."""
@@ -738,7 +736,7 @@ def _from_before(sub: _SubChunk):
 
     empty = jnp.zeros((SUB, sub.refs["k"].shape[-1]), jnp.float32)
     dq2, dk2 = jax.lax.fori_loop(0, sub.i, before, (empty, empty))
-    ahead = jnp.exp2(sub.apart(sub.gates(sub.first), sub.decayed(sub.first)))
+    ahead = sub.decay(sub.gates(sub.first), sub.decayed(sub.first))
     return dq2 * ahead, dk2 * ahead
 
 
@@ -746,7 +744,7 @@ def _to_after(sub: _SubChunk, closing):
     """The terms from the sub-chunks after to the sub-chunk's columns, `[SUB, K]`: fla's blocks right of
     the diagonal, factored at the sub-chunk's last row `closing`."""
     def after(j, dkt):
-        behind = jnp.exp2(sub.apart(sub.gates(j * SUB), closing))
+        behind = sub.decay(sub.gates(j * SUB), closing)
         reads = sub.tile("q", j * SUB) * behind
         dkt = dkt + sub.solved(sub.scores("daqk", j * SUB, sub.first).T, reads)
         return dkt + sub.solved(sub.scores("dakk", j * SUB, sub.first).T,
@@ -754,7 +752,7 @@ def _to_after(sub: _SubChunk, closing):
 
     empty = jnp.zeros((SUB, sub.refs["k"].shape[-1]), jnp.float32)
     dkt = jax.lax.fori_loop(sub.i + 1, sub.count, after, empty)
-    return dkt * jnp.exp2(sub.apart(closing, sub.gates(sub.first)))
+    return dkt * sub.decay(closing, sub.gates(sub.first))
 
 
 def _spanning(sub: _SubChunk):
@@ -764,7 +762,7 @@ def _spanning(sub: _SubChunk):
     origin = sub.decayed(sub.first)
 
     def across(j, total):
-        through = jnp.exp2(sub.apart(sub.gates(j * SUB), origin))
+        through = sub.decay(sub.gates(j * SUB), origin)
         reads, writes = sub.tile("q", j * SUB) * through, sub.written(j * SUB).astype(jnp.float32) * through
 
         def from_before(b, total):
@@ -794,7 +792,7 @@ def _own_pairs(sub: _SubChunk, tokens, carry, held, leaving):
         dq2, dk2, running, ranged = carry
         token = sub.first + j
         causal = (index >= j)[:, None]
-        own = sub.row("k", token)[None, :] * jnp.exp2(sub.apart(gate, sub.decayed(token)))
+        own = sub.row("k", token)[None, :] * sub.decay(gate, sub.decayed(token))
         column = pl.ds(token, 1)
         qk = read_rows(_rows(sub.refs["daqk"], sub.start + sub.first, SUB, column), sub.left(sub.first))
         kk = read_rows(_rows(sub.refs["dakk"], sub.start + sub.first, SUB, column), sub.left(sub.first))
@@ -817,7 +815,7 @@ def _own_columns(sub: _SubChunk, tokens, dkt):
     def own(j, dkt):
         token = sub.first + j
         reads, gated = sub.row("q", token), sub.row("k", token) * sub.row("beta", token)
-        decay = jnp.exp2(sub.apart(sub.decayed(token), gate))
+        decay = sub.decay(sub.decayed(token), gate)
         causal = (index <= j)[:, None]
         qk = sub.refs["daqk"][sub.start + token, pl.ds(sub.first, SUB)]
         kk = sub.refs["dakk"][sub.start + token, pl.ds(sub.first, SUB)]
