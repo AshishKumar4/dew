@@ -157,18 +157,18 @@ def _dropping(shape) -> template.Hooks:
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
-                 natural: bool = False, seeds: int | None = None):
+                 natural: bool = False, seeds: int | None = None, width: int = 64):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `FORM_TILES`
     under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
-    (rows, queries, query and key heads, four and two under a hook) over the spans' keys in `dtype`, the
-    forward's logits `natural` or folded. The backward differentiates the queries, keys, values, the hook's
-    parameters and the initial state, over `seeds` draws where given (the site's own, else the template
-    site's)."""
+    (rows, queries, query and key heads, four and two under a hook) over the spans' keys in `dtype`, heads
+    `width` wide, the forward's logits `natural` or folded. The backward differentiates the queries, keys,
+    values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
+    else the template site's)."""
     rows, queries, heads, _ = shape
-    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, 64, rows=rows, heads=heads)
-    output = hooks_for(HOOKS["gate" if gate else "none"], queries, 64, gate_of(queries, 64))
-    draw_operands = _drawn(shape, dtype, width=64, keys=spans.keys)
+    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, width, rows=rows, heads=heads)
+    output = hooks_for(HOOKS["gate" if gate else "none"], queries, width, gate_of(queries, width))
+    draw_operands = _drawn(shape, dtype, width=width, keys=spans.keys)
 
     def draw(seed):
         return *draw_operands(seed), *draw_hooks(seed)
@@ -178,7 +178,7 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                                                for value, kind in zip(params, kinds, strict=True)), initial,
                               output.output_mod, output.output_params)
 
-    accurate, config = _backward_form(form, 64)
+    accurate, config = _backward_form(form, width)
 
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
@@ -238,11 +238,11 @@ grow as heads shrink. The H100 site (`_check_hooked_backward`, compiled) keeps t
 and seeds, at full resolution."""
 
 
-def _check_hooked_backward(hooks: str, *, form: str, interpret: bool):
+def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int = 64):
     """The backward in the form `form` names (`_backward_form`) under the score hook `SCORE_HOOKS[hooks]` over
-    the template core's causal packed documents under a window (`_check_hooks`' site): the gradients of the
-    queries, keys, values, of the hook's parameters and of the initial state. Interpreted, at the hook's own
-    site (`INTERPRETED_HOOK_SITES`)."""
+    the template core's causal packed documents under a window (`_check_hooks`' site), heads `width` wide:
+    the gradients of the queries, keys, values, of the hook's parameters and of the initial state.
+    Interpreted, at the hook's own site (`INTERPRETED_HOOK_SITES`)."""
     case = CASES["causal-documents-window"]
     queries, keys = core_geometry(case)
     (rows, heads, kv_heads), seeds = INTERPRETED_HOOK_SITES[hooks] if interpret else ((ROWS, 4, 2), None)
@@ -251,7 +251,7 @@ def _check_hooked_backward(hooks: str, *, form: str, interpret: bool):
               for name, value in arguments(case).items()}
     spans = template.spans(queries, keys, rows, **called)
     _check_spans("causal-documents-window", spans, (rows, queries, heads, kv_heads), interpret=interpret,
-                 backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds)
+                 backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds, width=width)
 
 
 def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form: str = "default"):
@@ -782,6 +782,15 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
     the interpreter: the gradients of the queries, keys and values, of each hook parameter and of the initial
     state."""
     _check_hooked_backward(hooks, form=form, interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
+def test_a_width_split_backward_writes_its_score_parameters_gradients_once_interpreted(hooks):
+    """The accurate backward 128 wide, its dK/dV sums in two column halves (`BackwardTiles.columns`), under a
+    hook whose gradient the dK/dV programs write (a key's parameter, a tile's): the first half's program
+    writes it, and every gradient is the reference's, under the interpreter."""
+    _check_hooked_backward(hooks, form="accurate", interpret=True, width=128)
 
 
 @lowers("sm90")

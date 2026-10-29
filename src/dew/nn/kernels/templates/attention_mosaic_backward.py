@@ -412,9 +412,18 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
         # `a @ b`), added into dQ: the query tile's other key blocks add theirs.
         dq = family.product(staged.at[0].transpose((1, 0)), k_smem, (count, k_smem.shape[-1]))
         add_dq(q_first, dq)
-    store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
-    key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
-    return tuple(total + piece for total, piece in zip(carry, key_pieces, strict=True)), (dk_acc, dv_acc)
+    if _grading(shares):
+        store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
+        key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
+        carry = tuple(total + piece for total, piece in zip(carry, key_pieces, strict=True))
+    return carry, (dk_acc, dv_acc)
+
+
+def _grading(shares: tuple) -> bool:
+    """Whether a dK/dV program at its head widths' `shares` (`BackwardTiles.columns`) writes the score
+    parameters' gradients: the first share's alone, each share's logits and their cotangents the tile's
+    whole."""
+    return shares[0][0] == 0
 
 
 KEY_ROWS = MappingProxyType({Kind.KEY: lambda entries: entries.sum(axis=-1)})
@@ -602,7 +611,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     pair, count = (block_k, block_q // consumers) if split else (consumers * block_k, block_q)
     q_steps = queries // block_q
     stages = min(program.tiles.stages, q_steps)
-    graded = [kind for kind in kinds if kind in DKV_GRADS] if shares[0][0] == 0 else []
+    graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
     leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop))
 
