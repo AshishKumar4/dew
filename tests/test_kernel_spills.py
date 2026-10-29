@@ -66,7 +66,22 @@ def experts(mesh, ahead=None) -> Trainer:
 BATCH = {"x": np.zeros((ROWS, FEATURES), np.float32)}
 
 
+@pytest.fixture
+def compiled_afresh():
+    """No persistent compilation cache for the test: a program the cache holds is fetched, runs no
+    ptxas and reports nothing, and a spill is seen at its compile alone (`report.compiled`). A run's
+    refusals are recorded beside the cache (`report.records`); a `refusals` scope keeps its own in
+    memory, beside programs an earlier test cached."""
+    cached = jax.config.jax_enable_compilation_cache
+    jax.config.update("jax_enable_compilation_cache", val=False)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_compilation_cache", val=cached)
+
+
 @lowers("sm90")
+@pytest.mark.usefixtures("compiled_afresh")
 def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config():
     """A step compiled ahead for a compile-only H100 on this CPU, its launch's derived tile spilling at
     ptxas, is refused that tile and lowered once more at the next, the miss recorded (`report.misses`);
@@ -90,6 +105,7 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config():
 
 @pytest.mark.gpu(reason="trains a step whose launch spills, and one compiled ahead, on this host's H100")
 @lowers("sm90")
+@pytest.mark.usefixtures("compiled_afresh")
 def test_a_run_steps_its_spilling_launch_down_and_one_handed_the_step_compiled_ahead_takes_it():
     """On an H100, a run whose launch's derived tile spills steps it down once, the miss recorded, and
     trains (row 2384's proof); a run in a fresh process's registry handed that step compiled ahead
