@@ -53,6 +53,9 @@ REMATS = {'kept': ((), None), 'recomputed': (('delta_memory',), None), 'saved': 
 checkpoint saves (`decoder_block.RematPolicy.save`, None for no checkpoint): the forward's memories kept,
 recomputed in the backward, or kept by their names under a checkpoint saving the delta rule's (row 2023)."""
 
+GRADIENT_GRID = [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in GRADIENT_CASES]
+"""The gradient's cases, the CPU's (`INTERPRETED_GRADIENT`) and the GPU flow's."""
+
 
 def drawn(dtype, seed: int, **shape) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
     """A draw's operands (`draw`), its documents' starts taken out (`restarted` puts them back: they are not
@@ -80,8 +83,7 @@ WHOLE_SUITE_INTERPRETED = {('packed documents', 'bf16', 'kept'): 225,
 @pytest.mark.parametrize(('case', 'dtype', 'remat'), [
     pytest.param(*case.values, id=case.id, marks=(*case.marks, pytest.mark.whole_suite))
     if case.id in {'-'.join(each) for each in WHOLE_SUITE_INTERPRETED} else case
-    for case in interpreted([(case, dtype, remat) for remat in REMATS for dtype in DTYPES
-                             for case in GRADIENT_CASES], INTERPRETED_GRADIENT)])
+    for case in interpreted(GRADIENT_GRID, INTERPRETED_GRADIENT)])
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
@@ -141,9 +143,10 @@ def test_the_fast_backward_is_bitwise_the_same_each_run():
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(again))
 
 
-WALKS = interpreted([('one sequence', 'forward'), ('one sequence', 'training')],
-                    {('one sequence', 'forward')})
-"""A two-role walk's products: the forward interpreted off a GPU, its fast backward the GPU tier's."""
+WALK_GRID = [('one sequence', 'forward'), ('one sequence', 'training')]
+INTERPRETED_WALKS = {('one sequence', 'forward')}
+"""A two-role walk's products: the forward interpreted off a GPU, its fast backward the GPU flow's."""
+WALKS = interpreted(WALK_GRID, INTERPRETED_WALKS)
 
 
 @runs('sm90')

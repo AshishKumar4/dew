@@ -31,7 +31,7 @@ from reference_error import (
     with_gradients,
 )
 from test_recurrence_chunk import chunk_on, token_by_token
-from test_recurrence_mosaic import NATIVE, REFUSED, taken, template_call
+from test_recurrence_mosaic import REFUSED, taken, template_call
 from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cotangents, restarting, stressed
 
 from dew.nn.kernels import generation
@@ -43,8 +43,9 @@ pytestmark = pytest.mark.kernel
 HOOKS = SITES['scalar delta']
 """The template's default call: the gated delta rule, a decay a head."""
 
-CASES = [pytest.param(name, regime, product, id=f'{name}-{regime}-{product}', marks=NATIVE)
+CASES = [(name, regime, product)
          for name in SITES for regime in REGIMES for product in ('forward', 'gradient')]
+"""Every form's regimes, forward and gradient: the GPU flow's alone (tests/test_gpu_recurrence.py)."""
 
 INTERPRETED = ('aligned keys', 'decays near zero')
 """The regimes the CPU interprets each form's forward under: where the template's tiles grow most, the
@@ -112,8 +113,7 @@ def runs(fn, hooks, operands: Chunk, drawn, product: str) -> bool:
     return True
 
 
-@pytest.mark.parametrize('name, regime, product', CASES)
-def test_the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product):
+def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product):
     """Each form's 16-bit forward through the template, or its forward and gradient, finite wherever the
     float64 recurrence's are on the regime's first draws, and on par with its reference arm's from float64
     over the site's declared seeds (check 1); a form or gradient it refuses is checked refused and skipped."""
