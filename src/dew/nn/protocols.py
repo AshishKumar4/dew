@@ -108,6 +108,7 @@ __all__ = [
     "ProjectionGroup",
     "ProjectsParameters",
     "QuantizesInputs",
+    "ReadsClips",
     "ReadsTrain",
     "Recomputing",
     "RematChoosing",
@@ -234,6 +235,15 @@ class ReadsTrain(Protocol):
 
     @property
     def reads_train(self) -> bool: ...
+
+
+@runtime_checkable
+class ReadsClips(Protocol):
+    """An encoder that says whether it reads a clip's frames, (B, T, H, W, C), or an image: a run over
+    clips takes one that does, and a run over images one that doesn't."""
+
+    @property
+    def reads_clips(self) -> bool: ...
 
 
 @runtime_checkable

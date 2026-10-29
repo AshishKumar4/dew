@@ -128,10 +128,13 @@ def placed(name: str, root: str) -> str | None:
     return relative
 
 
-PROBES = ((os.path, ("exists", "lexists", "isfile", "isdir", "getsize")),
+PROBES = ((os, ("stat", "lstat", "access")),
+          (os.path, ("exists", "lexists", "isfile", "isdir", "getsize")),
           (pathlib.Path, ("exists", "is_file", "is_dir", "stat")))
 """The existence and size probes a run's record keeps as reads (`opening`), which raise no audit event:
-`os.path`'s and `pathlib.Path`'s, which every test, collection, conftest, loader and followed child calls."""
+`os`'s stat calls, `os.path`'s (getmtime and islink among them, through os.stat) and `pathlib.Path`'s,
+which every test, collection, conftest, loader and followed child calls. A glob's wildcard parts list the
+directories they walk (`read`), so a file arriving where a glob looks changes a listing it keyed."""
 PROBED = "probe:"
 """What a probed path's name is recorded under: a probe's answer is whether the path is there and of
 what kind, and a file's size, so ci.py's `contents` keys a probed directory by its kind, not by the
@@ -239,8 +242,12 @@ def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: 
     def asked(path, *arguments, **keywords):
         if getattr(placing, "probing", False):
             return probe(path, *arguments, **keywords)
+        # A path relative to a directory descriptor (os.stat's dir_fd) is placed in the directory it names.
+        at = keywords.get("dir_fd")
+        base = os.readlink(f"/proc/self/fd/{at}") if at is not None else ""
         if not isinstance(path, int) and not listing_tool(sys._getframe(1).f_code.co_filename) and (
-                name := placed(os.path.abspath(os.fsdecode(os.fspath(path))), root)) is not None:
+                name := placed(os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path)))),
+                               root)) is not None:
             recorded(PROBED + name)
         placing.probing = True
         try:

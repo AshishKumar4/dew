@@ -1452,16 +1452,18 @@ def packed(root: Path, names: list[str]) -> None:
 
 def test_a_reader_files_share_in_one_process_is_every_such_files_input(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A data file a reader opens is the input of every test file its pytest process ran, not only the
-    one that opened it: a session fixture's lazy reader, or a process-lived cache (dew.data.text's
-    load_tokenizer), opened under one file serves the next without reopening it, so a change to the data
-    reruns both (train 239's review, row 1987)."""
+    """A data file a reader opens or probes is the input of every test file its pytest process ran, not
+    only the one that opened or probed it: a session fixture's lazy reader, or a process-lived cache
+    (dew.data.text's load_tokenizer, which asks after a tokenizer's optional files), read under one file
+    serves the next without reading again, so a change to the data, or an optional file's arrival, reruns
+    both (train 239's review, row 1987; the CI bundle's review)."""
     (tmp_path / "tests/fixtures").mkdir(parents=True)
     (tmp_path / "tests/fixtures/shared.json").write_text("[1]\n")
     (tmp_path / "tests/conftest.py").write_text(
         "import functools, pytest\nfrom pathlib import Path\n"
         "@pytest.fixture(scope='session')\ndef vocabulary():\n"
-        "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text())\n")
+        "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text()\n"
+        "                           + str(Path('tests/fixtures/template.jinja').exists()))\n")
     body = ("from pathlib import Path\ndef test_{0}(vocabulary):\n"
             "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n")
     written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
@@ -1472,6 +1474,8 @@ def test_a_reader_files_share_in_one_process_is_every_such_files_input(
     assert run() == [1, 1]
     (tmp_path / "tests/fixtures/shared.json").write_text("[2]\n")
     assert run() == [2, 2]
+    (tmp_path / "tests/fixtures/template.jinja").write_text("{{ x }}\n")
+    assert run() == [3, 3]
 
 
 def test_an_open_after_the_tests_ended_is_the_records_input(ci, tmp_path, monkeypatch, cache_worker):
@@ -2028,6 +2032,49 @@ def a_wheel(root: Path, name: str, version: str) -> Path:
         recorded = [*files, f"{info}/RECORD"]
         archive.writestr(f"{info}/RECORD", "".join(f"{path},,\n" for path in recorded))
     return wheel
+
+
+def test_a_release_check_marked_whole_suite_or_network_too_runs_in_its_release_task_alone(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A release_env test marked whole_suite or network too runs in its release task, never set aside there
+    as the whole suite's or the network lane's cells, and the network lane, which lacks its requirement,
+    never runs it (the bundle's review: such a check was planned, deselected by its own task, and reported
+    green)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    pinned = a_wheel(tmp_path, "pinned", "2.0")
+    written(tmp_path, {"test_release.py": "import pytest\nfrom pathlib import Path\n" + "".join(
+        f"@pytest.mark.release_env({str(pinned)!r})\n@pytest.mark.{also}\n"
+        f"def test_{also}_too():\n    import pinned\n    Path('ran-{also}').write_text(pinned.VERSION)\n"
+        for also in ("whole_suite", "network"))})
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", ["tests/test_release.py"], out, cache="off", processes=1, deadline=600.0,
+                       network=True) == 0
+    assert not (tmp_path / "ran-network").exists(), "the network lane ran a release check"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "release", "--python=3.12", "--tests=tests/test_release.py",
+                                      f"--requirement={pinned}", f"--out={tmp_path / 'release.json'}"])
+    assert ci.main() == 0
+    assert [(tmp_path / f"ran-{also}").read_text() for also in ("whole_suite", "network")] == ["2.0", "2.0"]
+
+
+@pytest.mark.parametrize("mark", ["release_env()", "release_env(requirement='pinned==2.0')",
+                                  "release_env('pinned==2.0', 'other==1.0')", "release_env(2)"])
+def test_a_release_mark_without_one_requirement_fails_its_files_collection(ci, tmp_path, monkeypatch, mark):
+    """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string)
+    fails its file's collection, naming its test: every suite task sets a marked test aside, and no release
+    task would plan it, so it would run nowhere (Main's read of b94d89999)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_release.py": f"import pytest\n@pytest.mark.{mark}\n"
+                       "def test_under_the_release():\n    pass\n"
+                       "def test_plain():\n    pass\n"})
+    (tmp_path / ".verdict").mkdir()
+    [row] = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
+    assert row["exitCode"] != 0, row["output"]
+    assert "tests/test_release.py::test_under_the_release" in row["output"] and "release_env" in row["output"]
 
 
 def test_a_release_check_runs_in_the_whole_suites_second_job_under_its_requirement(ci, tmp_path, monkeypatch,
