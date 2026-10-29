@@ -332,9 +332,9 @@ class SharedCrossAttention:
                                  precision=decoder.precision)
 
     def layer_key(self, decoder: CausalTransformer, index: int) -> Hashable:
-        """Layer `index`'s attention's key heads and widths, all its block takes of the layer beside
-        the attention the layer hands it."""
-        return self._attention(decoder, index).context_heads()
+        """Nothing: a layer's block takes its geometry from the layer's own attention, which the layer's
+        spec builds, and reads through the attention the layer hands it."""
+        return ()
 
     def flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
         """Layer `index`'s attention's read of the context (`AttendsContext.context_flops`)."""
