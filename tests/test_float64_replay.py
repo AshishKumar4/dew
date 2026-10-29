@@ -140,12 +140,43 @@ def test_a_float32_program_replays_to_itself_run_in_float64(name):
     np.testing.assert_array_equal(replayed.view(np.uint64), direct.view(np.uint64))
 
 
+def test_what_a_programs_results_do_not_read_is_not_replayed():
+    """A program whose result drops a value it computed, as a module's init drops its forward pass,
+    replays without it: a float operation the replay has no rule for (`tan`) runs nowhere when no
+    result reads it, inside a jit, or a scan's step as an output, a carry no read carry reads, or a
+    conditional's result on the step, and the result is its program's in float64."""
+    x = np.random.default_rng(3).uniform(0.5, 2.0, (6, 7)).astype(np.float32)
+
+    def dropping(x):
+        return (jnp.tan(x), _arithmetic(x))[1]
+
+    def scanned(x):
+        # A carry the result reads, an output and a carry it does not, and a conditional on the step
+        # whose result the carry reads one of.
+        def body(carry, row):
+            kept, dropped = carry
+            taken, _ = jax.lax.cond(row[0] > 1, lambda row: (row, jnp.tan(row)),
+                                    lambda row: (row, jnp.tan(row)), row)
+            return (kept + _arithmetic(taken), dropped * jnp.tan(row)), jnp.tan(row)
+        return jax.lax.scan(body, (x[0] * 0, x[0]), x)[0][0]
+
+    replayed = np.asarray(float64_replay(jax.jit(dropping))(x))
+    rows = np.asarray(float64_replay(scanned)(x))
+    with jax.enable_x64(new_val=True), jax.disable_jit():
+        direct = np.asarray(_arithmetic(jnp.asarray(x, jnp.float64)))
+    with jax.enable_x64(new_val=True):
+        summed = np.asarray(jax.lax.scan(lambda carry, row: (carry + _arithmetic(row), None),
+                                         jnp.zeros(7, jnp.float64), jnp.asarray(x, jnp.float64))[0])
+    np.testing.assert_array_equal(replayed.view(np.uint64), direct.view(np.uint64))
+    np.testing.assert_array_equal(rows.view(np.uint64), summed.view(np.uint64))
+
+
 REFUSED = {
-    "float": lambda x: jnp.cos(x),
+    "float": lambda x: jnp.tan(x),
     "complex": lambda x: jnp.cos(x.astype(jnp.complex64)).real,
     # A call whose integer boundary hides float arithmetic inside.
-    "hidden": lambda x: jax.lax.cond(x[0] > 0, lambda x: jnp.cos(x).astype(jnp.int32),
-                                     lambda x: x.astype(jnp.int32), x),
+    "hidden": lambda x: jax.lax.while_loop(lambda carry: carry[0] < 2, lambda carry: (
+        carry[0] + 1, carry[1] + jnp.tan(x).astype(jnp.int32)), (0, x.astype(jnp.int32)))[1],
 }
 
 

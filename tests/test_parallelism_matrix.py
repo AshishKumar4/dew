@@ -38,6 +38,11 @@ placed slots.
 The tool draws every parameter an initializer leaves all zeros, so a
 DiT's zeroed output and modulations do not hide the layers above them
 from the first step's gradient (2 of its 70 leaves were judged before).
+Every layout's step starts from one device's initial state; a layout's own
+draw of it, split over its mesh, is another program, which each model's
+first layout of every split of its parameters holds to one device's draw by
+check 1 (`layout_parity.held_draw`, docs/design/testing.md's Layout
+invariance).
 
 A layout's data axis takes the devices its other axes leave, so on eight
 devices every pipeline below splits the rows over data. The rows of
@@ -122,6 +127,27 @@ def cells(*, judged: bool) -> list[tuple[str, str, int | None]]:
             if judged != ((model, layout) in RUN_ONCE)]
 
 
+PARAMETER_AXES = ("fsdp", "tensor", "expert", "stage")
+"""The mesh axes that split a model's parameters; a data or sequence axis splits its rows alone."""
+DRAW_SEEDS = 8
+"""The keys each split's draw of a model's initial parameters is held over (`held_draw`)."""
+
+
+def split_draws() -> list[tuple[str, str, int | None]]:
+    """For each model, its first cell of every split of its parameters (`PARAMETER_AXES` at their sizes
+    in the tool's `LAYOUTS`), the refused cells left out: the cells whose own draw of the initial
+    parameters is a program no other cell of the model's draws."""
+    layouts = load("layout_parity").LAYOUTS
+    seen, chosen = set(), []
+    for model, layout, devices in sorted(cells(judged=True) + cells(judged=False)):
+        split = tuple(sorted((axis, size) for axis, size in layouts[layout].items()
+                             if axis in PARAMETER_AXES and size > 1))
+        if split and (model, layout) not in REFUSED and (model, split, devices) not in seen:
+            seen.add((model, split, devices))
+            chosen.append((model, layout, devices))
+    return chosen
+
+
 def named(cases) -> list[str]:
     """Each cell's test id: its model and layout, on four where it runs there."""
     return [f"{model}-{layout}" + ("-on-four" if devices else "") for model, layout, devices in cases]
@@ -164,3 +190,13 @@ def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model
         rows = tool.floored(model, (layout,), dtype="float32", devices=devices)
     found, shown = statuses(rows)
     assert found == ["refused" if (model, layout) in REFUSED else "works"], shown
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("model", "layout", "devices"), split_draws(), ids=named(split_draws()))
+def test_each_split_draws_a_models_initial_parameters_as_one_device_does(model, layout, devices, references):
+    """A layout's own draw of a model's initial parameters, split over its mesh, and one device's draw
+    are each held by check 1 to their float64 truth, the one-device program replayed in float64 from
+    its own random bits, which every layout draws alike (`layout_parity.held_draw`)."""
+    tool, _ = references
+    tool.held_draw(model, layout, seeds=DRAW_SEEDS, devices=devices)
