@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post33,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post34,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
@@ -123,7 +123,8 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Pallas's Mosaic GPU slices, applies pointwise ops to and broadcasts a unit row or column of a tiled array.
 - Mosaic GPU's CP_ASYNC copies a head's `[S, D]` block of `[B, S, H, D]`, a squeezed dimension between sliced ones, under a tile transform.
 - Mosaic GPU's `emit_pipeline` carries its ring slots rather than recomputing them each step.
-- Mosaic GPU's WGMMA forms its shared-operand descriptors at its instructions rather than hoisting them out of an enclosing loop: hoisted, the attention training forward at head dim 128 on an H100 stopped on an illegal instruction.
+- Mosaic GPU's WGMMA forms its shared-operand descriptors at its instructions rather than hoisting them out of an enclosing loop.
+- Mosaic GPU's TMA load coordinates reach ptxas as values it cannot fold: ptxas had miscompiled a literal coordinate into a misaligned copy, which stopped the attention training forward at head dim 128 on an H100 on an illegal instruction.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
