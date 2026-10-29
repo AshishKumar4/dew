@@ -723,10 +723,10 @@ a training product its fast backward (`Mosaic.trains`; the rule's gradient takes
 
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (*PORT_SUPPORTS[1:2], *TEMPLATE_SUPPORTS)
 """What the recurrence template needs of a delta rule's call: the port's placement (a Pallas call's results)
-and `TEMPLATE_SUPPORTS`, in every form its mainloop implements, the delta rule with
-a decay or without one and the forms without the delta rule alike (row 1963: the port's 'gated' form was the
-template's too). A declared port cell runs the port first where the port takes the call (`PORT_CELLS`,
-`GATED_DELTA`'s declared cells)."""
+and `TEMPLATE_SUPPORTS`, in every form its mainloop implements, the delta rule with a decay or without one
+and the forms without the delta rule alike (row 1963: the port's 'gated' form was the template's too). A
+declared port cell runs the port first where the port takes the call (`PORT_CELLS`, `GATED_DELTA`'s
+declared cells)."""
 
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
