@@ -2099,18 +2099,17 @@ def _applied(equation, inputs, given, wanted: bool):
                      for energy, value in zip(made, outputs, strict=True)]
 
 
-def scanned_steps(params, inputs: list[tuple], body) -> list[tuple]:
+def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
     """A scan (lax.scan's equation `params`) over `inputs` a step at a time, as the gate's evaluators
     walk one (`float64_terms`, check 2's `certified`): each input a tuple of lanes, a value and what an
     evaluator carries beside it, sliced at each step lane by lane (a lane of None stays None), and
     `body(step, step_inputs)` the body's outputs for one step, carries first, tuples alike. The carries
     thread from step to step and each further output stacks over the steps in scan order, a lane where
-    every step has one (else None); an empty scan's from its outvars' avals, its other lanes None."""
+    every step has one (else None); an empty scan's from its outvars' avals, its `lanes` - 1 others None."""
     jaxpr = params["jaxpr"].jaxpr
     constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
     consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
                          inputs[constants + carries:])
-    lanes = len(inputs[0]) if inputs else 1
     ys = []
     steps = range(params["length"])
     for step in reversed(steps) if params["reverse"] else steps:
@@ -2137,7 +2136,7 @@ def _scanned(params, inputs, given):
                                    [energy for _, energy in pairs])
         return list(zip(outputs, made, strict=True))
 
-    walked = scanned_steps(params, list(zip(inputs, given, strict=True)), step)
+    walked = scanned_steps(params, list(zip(inputs, given, strict=True)), step, lanes=2)
     return [value for value, _ in walked], [energy for _, energy in walked]
 
 

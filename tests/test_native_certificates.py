@@ -634,7 +634,7 @@ def mosaic_lane() -> rw.Lane:
         reaches.append(rw.exp2_reach(lambda x, run=run: run(x)[0]))
         flushes |= bool(np.any(run(np.full(128, 2.0 ** -30, np.float32))[1] == 0))
     assert max(reaches) <= PTX_EX2, reaches
-    return rw.Lane(max(reaches), flushes, wide=False)
+    return rw.Lane(max(reaches), flushes)
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))

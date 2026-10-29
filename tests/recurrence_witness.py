@@ -148,16 +148,11 @@ def within(native, iv: Iv) -> np.ndarray:
 @dataclasses.dataclass(frozen=True)
 class Lane:
     """The arithmetic a launch runs in: `exp2`'s reach (the most steps of the fp32 grid its result lies from
-    its correctly rounded value), whether fp32 results below the normal range flush to zero, and whether
-    the call's values are fp32 (three bf16 parts) or bf16."""
+    its correctly rounded value) and whether fp32 results below the normal range flush to zero. The witness
+    is of bf16 calls, whose launches store their values in bf16 (an fp32 call's, the template takes none at
+    these widths, is a later link's)."""
     reach: int
     flushes: bool
-    wide: bool
-
-    @property
-    def held(self) -> Format | None:
-        """The format the launches store their values in: bf16, or None where fp32 is stored exactly."""
-        return None if self.wide else BFLOAT16
 
 
 def fp32(iv: Iv, lane: Lane) -> Iv:
@@ -178,9 +173,8 @@ def fused(iv: Iv, lane: Lane) -> Iv:
 
 
 def staged(iv: Iv, lane: Lane) -> Iv:
-    """A register value staged for a product as the call's launches hold it: cast to bf16, or an fp32 value's
-    three parts, exactly."""
-    return iv if lane.held is None else cast(iv, lane.held)
+    """A register value staged for a product as the call's launches hold it: cast to bf16."""
+    return cast(iv, BFLOAT16)
 
 
 def aligned(iv: Iv, fmt: Format) -> np.ndarray:
@@ -193,21 +187,18 @@ def aligned(iv: Iv, fmt: Format) -> np.ndarray:
 
 def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
     """`a @ b` (`[M, K] @ [K, N]`) as one product the tensor cores accumulate in fp32: each term's exact range
-    (products of 16-bit values of `fmt`, or of three bf16 parts an fp32 operand's, the six whose orders sum
-    under three, within 2^-24 of the fp32 values' product), summed within the native-dot contract's bound
+    (products of 16-bit values of `fmt`), summed within the native-dot contract's bound
     (`native_certificates.native_dot_holds`: gamma_n at a truncating add's unit, n the terms that may be
     nonzero, an add of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's
     magnitudes are the terms' as the tensor cores align them (`aligned`): a subnormal operand's at `fmt`'s
     least normal, the exponent its field holds."""
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
-    parts = 6 if lane.wide else 1
-    live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1) * parts
+    live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1)
     magnitude = (aligned(a, fmt)[:, None, :] * aligned(b, fmt).T[None, :, :]).sum(-1) * (1 + 2.0 ** -50)
     unit = 2.0 ** -(FLOAT32.precision - 1)  # a truncating add's
     gammas = np.nextafter(live * unit / (1 - live * unit), np.inf)
     underflow = 2.0 ** FLOAT32.emin if lane.flushes else 2.0 ** (FLOAT32.emin - FLOAT32.precision + 1)
-    dropped = 2.0 ** -24 if lane.wide else 0.0
-    allowance = (gammas + dropped + (live + 2) * 2.0 ** -52) * magnitude + live * underflow
+    allowance = (gammas + (live + 2) * 2.0 ** -52) * magnitude + live * underflow
     return onto(_outward(terms.lo.sum(-1) - allowance, terms.hi.sum(-1) + allowance), FLOAT32)
 
 
@@ -227,8 +218,10 @@ def exp2(x: Iv, lane: Lane) -> Iv:
     """`exp2` of a value within `x`: within `lane.reach` steps of the fp32 grid of its correctly rounded
     value, the float64 `exp2` within 2^-50 of it; zero where it may fall below the normal range (ex2's flush,
     or a scaling's last product rounding there)."""
-    lo = below(np.exp2(x.lo) * (1 - 2.0 ** -50), FLOAT32)
-    hi = above(np.exp2(x.hi) * (1 + 2.0 ** -50), FLOAT32)
+    # The correctly rounded results' least and greatest (round to nearest is monotone), then the reach: a
+    # floor or ceiling onto the grid first would admit one step more than the measured reach.
+    lo = np.asarray(np.float32(np.exp2(x.lo) * (1 - 2.0 ** -50)), np.float64)
+    hi = np.asarray(np.float32(np.exp2(x.hi) * (1 + 2.0 ** -50)), np.float64)
     for _ in range(lane.reach):
         lo, hi = _toward(lo, FLOAT32, -np.inf), _toward(hi, FLOAT32, np.inf)
     return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
@@ -293,15 +286,14 @@ def inverse(k, beta, exponents: Exponents, lane: Lane) -> Iv:
     current = Iv(identity + np.where(first, lower_a.lo, 0.0), identity + np.where(first, lower_a.hi, 0.0))
 
     def merge(x: Iv) -> Iv:
-        return x if lane.wide else cast(x, FLOAT16)
+        return cast(x, FLOAT16)
 
     width = 2
     while width < CHUNK:
         lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
-        staged16 = BFLOAT16 if lane.wide else FLOAT16
-        power = dot(merge(current), merge(lower_a), lane, staged16)
+        power = dot(merge(current), merge(lower_a), lane, FLOAT16)
         masked = where(lower, power, point(np.zeros((CHUNK, CHUNK))))
-        joined = dot(merge(masked), merge(current), lane, staged16)
+        joined = dot(merge(masked), merge(current), lane, FLOAT16)
         current = fp32(add(current, joined), lane)
         width *= 2
     return Iv(current.lo - identity, current.hi - identity)
@@ -327,17 +319,11 @@ def corrected(values: Iv, weights, entering, lane: Lane) -> Iv:
 
 def carried(carry: Iv, values: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     """The memory leaving the chunk, fp32 (`algebra.scalar_write`, `carried`): the carry decayed to the
-    chunk's end plus the keys against the corrected values gated to it, each staged as the call holds it; an
-    fp32 call's last token's write outside the product (`mainloop._last_write`)."""
+    chunk's end plus the keys against the corrected values gated to it, each staged as the call holds it."""
     gate = exponents.gated(lane)
     gated = fp32(mul(values, Iv(gate.lo[:, None], gate.hi[:, None])), lane)
     keys = point(np.asarray(k).T)
-    if lane.wide:
-        earlier = where(np.arange(CHUNK)[:, None] < CHUNK - 1, gated, point(np.zeros(gated.lo.shape)))
-        last = mul(Iv(keys.lo[:, -1:], keys.hi[:, -1:]), Iv(gated.lo[-1:], gated.hi[-1:]))
-        write = fp32(add(dot(keys, earlier, lane), fused(last, lane)), lane)
-    else:
-        write = dot(keys, staged(gated, lane), lane)
+    write = dot(keys, staged(gated, lane), lane)
     decay = exponents.raised(lane)
     held = Iv(np.full(carry.lo.shape, decay.lo[-1]), np.full(carry.lo.shape, decay.hi[-1]))
     return fp32(add(fused(mul(carry, held), lane), write), lane)
@@ -381,7 +367,7 @@ def enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     _, u = weighted(step.a, step.v, step.beta, None, lane)
     c = corrected(u, step.w, step.h, lane)
     # The corrected values the write takes: fp32, within their enclosure and rounding to the stored `c`.
-    values = c if lane.held is None else meet(c, cell(step.c, lane.held))
+    values = meet(c, cell(step.c, BFLOAT16))
     stored = staged(inverse(step.k, step.beta, exponents, lane), lane)
     return {"a": stored, "w": w, "c": staged(c, lane),
             "h": carried(step.carry, values, step.k, exponents, lane),
@@ -430,7 +416,7 @@ def interpreted_lane() -> Lane:
     import jax.numpy as jnp
     from certified import lane
 
-    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes, wide=False)
+    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -581,7 +567,7 @@ def witness(run: Run, lane: Lane) -> dict:
     held = {name: within(recorded_[name], found[name]) for name in found}
 
     def grid(name):
-        return FLOAT32 if name == "leaving" else lane.held or FLOAT32
+        return FLOAT32 if name == "leaving" else BFLOAT16
 
     largest = {name: np.max(np.abs(record), -1, keepdims=True) for name, record in recorded_.items()}
     return {**held, "ulps": {name: ulps(found[name], recorded_[name], grid(name)) for name in found},

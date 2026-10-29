@@ -951,7 +951,7 @@ def _scanned(params, operands, findings, where: str) -> list:
     body = params["jaxpr"]
     walked = scanned_steps(params, [(value,) for value in operands], lambda step, inputs: [
         (value,) for value in _run(body.jaxpr, body.consts, [value for (value,) in inputs], findings,
-                                   f"{where}{step}/")])
+                                   f"{where}{step}/")], lanes=1)
     return [value for (value,) in walked]
 
 
@@ -967,7 +967,8 @@ def observing():
     try:
         yield seen
     finally:
-        _OBSERVING.remove(seen)
+        # By identity: two observers that have seen nothing yet are equal lists.
+        del _OBSERVING[next(index for index, observer in enumerate(_OBSERVING) if observer is seen)]
 
 
 def _held(eqn, operands, results, findings, at) -> None:
