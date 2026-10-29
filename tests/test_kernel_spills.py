@@ -35,19 +35,23 @@ class _Uncounted(grouped_matmul.MosaicGmm):
 class Experts(nn.Module):
     """An MoE layer's paired SwiGLU up projection, each expert taking an equal share of the rows,
     through a launch whose register model misses (`_Uncounted`), and a trained scale over its outputs:
-    the launch is the forward kernel alone, so the step differentiates the scale, not the launch."""
+    the launch is the forward kernel alone, so the step differentiates the scale, not the launch. Its
+    initialization, traced for the host, draws the weights without launching it."""
 
     @nn.compact
     def __call__(self, x):
         drawn = nn.initializers.normal(0.02)
         gate, up = (jax.lax.stop_gradient(self.param(name, drawn, (EXPERTS, FEATURES, WIDTH), jnp.bfloat16))
                     for name in ("gate", "up"))
+        scale = self.param("scale", nn.initializers.ones, (WIDTH,), jnp.float32)
+        if self.is_initializing():
+            return jnp.zeros((x.shape[0], WIDTH), jnp.bfloat16) * scale
         sizes = jnp.full((EXPERTS,), x.shape[0] // EXPERTS, jnp.int32)
         projected = _Uncounted()(
             jax.lax.stop_gradient(x.astype(jnp.bfloat16)), gate, sizes, paired=up,
             hooks=grouped_matmul.Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16",
             trans_rhs=False, interpret=False)
-        return projected * self.param("scale", nn.initializers.ones, (WIDTH,), jnp.float32)
+        return projected * scale
 
 
 def squared(outputs, batch):
