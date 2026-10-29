@@ -99,8 +99,9 @@ np.savez(sys.argv[1], revision=np.asarray(bundle.revision),
 def test_the_runtime_qualifications_native_phase_serves_its_pool_from_programs_compiled_up_front(tmp_path):
     """The runtime qualification's native phase (tools/slot_runtime_qualification.py) serves a slot
     release's pool through `ScoringServer.from_task`, its observer of the release's scoring task
-    compiling every program up front as the task does, and records each question's option logits from
-    batched passes (ledger 2056: the observer had no `compile`, so the phase raised before serving)."""
+    compiling every program its budget declares up front as the task does, and records each question's
+    option logits from batched passes (ledger 2056: the observer had no `compile`, so the phase raised
+    before serving)."""
     source, _ = slot_release(tmp_path, "slot_lm")
     with run_from("slot_runtime_qualification", "tools") as tool:
         requests = {str(seed): tool.request(seed, questions=4, short_words=2, long_words=6)
@@ -110,7 +111,7 @@ def test_the_runtime_qualifications_native_phase_serves_its_pool_from_programs_c
     asked = {name: question for body in requests.values() for name, question in body["questions"].items()}
     assert {name: len(value) for name, value in values.items()} == {
         name: len(question["criteria"]) for name, question in asked.items()}
-    assert max(metadata["batch_rows"]) >= 2
+    assert max(metadata["batch_rows"]) >= 2 and metadata["programs"] > 0
 
 
 def test_a_cached_slot_release_reopens_with_the_hub_offline(tmp_path):

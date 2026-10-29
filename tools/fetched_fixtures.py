@@ -122,8 +122,9 @@ def pin_release(path, data: bytes, *, reference: str, license: str, root: Path =
     if name is None or not (root / name).resolve().is_relative_to((root / FIXTURES).resolve()):
         raise ValueError(f"{path}: a release file is pinned under {FIXTURES}/, and resolves there")
     sha = digest(data)
-    pin = {"repo": STORE, "revision": None, "path": f"releases/{sha}/{_file_name(name)}", "sha256": sha,
-           "bytes": len(data), "reference": reference, "license": license, "kind": RELEASE}
+    pin = {"repo": STORE, "revision": None, "sha256": sha, "bytes": len(data), "reference": reference,
+           "license": license, "kind": RELEASE}
+    pin["path"] = _store_path(pin, name)
     stored = _stored(pin, root)
     stored.parent.mkdir(parents=True, exist_ok=True)
     stored.write_bytes(data)
@@ -175,8 +176,9 @@ def save(path, arrays: dict, *, reference: str, license: str, root: Path = REPO_
         _pin_file(name, root).unlink(missing_ok=True)
         return target
     sha = digest(data)
-    pin = {"repo": STORE, "revision": None, "path": f"recordings/{sha}.npz", "sha256": sha,
-           "bytes": len(data), "reference": reference, "license": license}
+    pin = {"repo": STORE, "revision": None, "sha256": sha, "bytes": len(data), "reference": reference,
+           "license": license}
+    pin["path"] = _store_path(pin, name)
     stored = _stored(pin, root)
     stored.parent.mkdir(parents=True, exist_ok=True)
     stored.write_bytes(data)
@@ -210,10 +212,10 @@ def fetch(root: Path = REPO_ROOT) -> None:
 def card(catalog: dict[str, dict]) -> str:
     """The store's card: what it holds, each file's fixture, size, reference and that reference's
     license, from its catalog."""
-    rows = "\n".join(f"| `{entry['fixture']}` | `{entry.get('path', f'recordings/{sha}.npz')}` | "
+    rows = "\n".join(f"| `{entry['fixture']}` | `{entry.get('path', f'recordings/{key}.npz')}` | "
                      f"{entry['bytes']:,} | "
                      f"{entry['reference']} | {entry['license']} |"
-                     for sha, entry in sorted(catalog.items(), key=lambda item: item[1]["fixture"]))
+                     for key, entry in sorted(catalog.items(), key=lambda item: item[1]["fixture"]))
     return ("---\nlicense: other\n---\n\n# Dew's recorded test fixtures\n\n"
             "Reference outputs recorded over the seeds Dew's accuracy tests draw "
             "(https://github.com/AshishKumar4/dew), where the reference cannot run in the test. Each file "
@@ -242,10 +244,14 @@ def upload(root: Path = REPO_ROOT) -> None:
                                                   force_download=True)).read_text())
     except (EntryNotFoundError, RepositoryNotFoundError):
         catalog = {}
-    catalog.update({pin["sha256"]: {"fixture": name, "bytes": pin["bytes"], "reference": pin["reference"],
-                                    "license": pin["license"],
-                                    **({"kind": RELEASE, "path": pin["path"]} if pin.get("kind") == RELEASE
-                                       else {})} for name, pin in due.items()})
+    # A recording is listed by its sha256, which names its file; a release file by its path, since the
+    # same bytes may be two files of two names (an entry listed before by its sha256 is moved to it).
+    catalog = {entry["path"] if entry.get("kind") == RELEASE else key: entry
+               for key, entry in catalog.items()}
+    catalog.update({pin["path"] if pin.get("kind") == RELEASE else pin["sha256"]: {
+        "fixture": name, "bytes": pin["bytes"], "reference": pin["reference"], "license": pin["license"],
+        **({"kind": RELEASE, "path": pin["path"]} if pin.get("kind") == RELEASE else {})}
+        for name, pin in due.items()})
     operations = [CommitOperationAdd(pin["path"], _checked(_stored(pin, root).read_bytes(), pin, name))
                   for name, pin in sorted(due.items())]
     listing = json.dumps(catalog, indent=1, sort_keys=True) + "\n"
