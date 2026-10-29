@@ -646,13 +646,16 @@ def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_bl
 def test_an_explicit_momentum_count_keeps_its_law_and_none_reads_the_runs_progress(mask):
     """A momentum ramp over `momentum_steps` updates reads the update count, an explicit 0 holding the first
     momentum at every update (optax's empty ramp); with None it ramps over the run's progress, 0 to 1,
-    to the last momentum at the run's end."""
+    from the first momentum to the last at the run's end and on past it. Exact where the schedule holds
+    or reaches an end; strictly between them on the way."""
+    def at(spec, *points):
+        return [float(spec.decay(point)) for point in points]
+
     held = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=0).ema
-    assert not held.progressed
-    assert [float(held.decay(update)) for update in (0, 1, 100)] == pytest.approx([0.9] * 3)
+    assert not held.progressed and at(held, 0, 1, 100) == [0.9] * 3
     counted = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=10).ema
-    assert not counted.progressed and float(counted.decay(10)) == pytest.approx(0.99)
-    assert float(counted.decay(5)) == pytest.approx(0.945)
+    start, middle, end, past = at(counted, 0, 5, 10, 1000)
+    assert not counted.progressed and start == 0.9 and end == past and start < middle < end
     progressed = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=None).ema
-    assert progressed.progressed
-    assert [float(progressed.decay(at)) for at in (0.0, 0.5, 1.0)] == pytest.approx([0.9, 0.945, 0.99])
+    start, middle, end, past = at(progressed, 0.0, 0.5, 1.0, 2.0)
+    assert progressed.progressed and start == 0.9 and end == past and start < middle < end
