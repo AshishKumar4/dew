@@ -21,6 +21,7 @@ to remove. A CPU interprets Pallas kernels, so there only the first two
 hold; the third needs the GPU.
 """
 
+import functools
 import math
 
 import jax
@@ -113,7 +114,7 @@ def placed(tree, mesh: jax.sharding.Mesh, *spec):
 
 
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
-                          donate=(), arm=None) -> None:
+                          donate=(), arm=None, also=None) -> None:
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
     by `specs` (PartitionSpecs) is on par with `fn` on one device over the site's declared `seeds`
     (check 1, `assert_as_exact`), both measured from `truth_fn`, the float64 tree of `fn`'s outputs on
@@ -128,7 +129,8 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     split is compared with in place of `fn` on one device: a call whose rounding depends on the shapes it
     runs at is compared with the shapes its shards run. A caller passing `arm` also asserts the split
     against the reference path (check 1 against float64), so the comparison with `arm` alone is not the
-    whole contract."""
+    whole contract: `also`, `(label, arm)`, is that second arm, compared with the same split runs (each
+    draw's split run once)."""
     run = without_ynn(fn, donate_argnums=donate)
 
     def put(args):
@@ -146,15 +148,25 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
         # A donated argument is consumed; the draw's own array goes on to the other arm and the truth.
         return [jnp.copy(arg) if index in donate else arg for index, arg in enumerate(args)]
 
+    drawn = functools.lru_cache(maxsize=None)(draw)
+    outputs: dict = {}
+
     def split(*args):
-        with jax.set_mesh(mesh):
-            return compiled(*put(kept(args)))
+        # Each draw's split run once, though `also` compares it a second time.
+        if id(args[0]) not in outputs:
+            with jax.set_mesh(mesh):
+                outputs[id(args[0])] = compiled(*put(kept(args)))
+        return outputs[id(args[0])]
 
     def one_device(*args):
         return run(*kept(args))
 
-    assert_as_exact(as_given(split), as_given(one_device) if arm is None else arm, draw, label, seeds=seeds,
+    assert_as_exact(as_given(split), as_given(one_device) if arm is None else arm, drawn, label, seeds=seeds,
                     truth_fn=truth_fn)
+    if also is not None:
+        also_label, also_arm = also
+        assert_as_exact(as_given(split), also_arm, drawn, f"{label}, {also_label}", seeds=seeds,
+                        truth_fn=truth_fn)
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})
