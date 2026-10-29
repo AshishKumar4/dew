@@ -327,7 +327,9 @@ def inputs(name: str, depends: list[str]) -> list[str]:
                 if path.startswith(("src/", "tools/")) and path.endswith(".py") and not path.startswith(HARNESS)
                 for parent in Path(path).parents
                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
-    return sorted({name, *depends, *packages})
+    # A build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
+    # (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files).
+    return sorted({name, *(path for path in depends if not built(Path(path.removeprefix("probe:")))), *packages})
 
 
 @functools.cache
