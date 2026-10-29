@@ -107,6 +107,10 @@ class BackwardTiles:
     columns: int = 1
     dkv_family: str | None = None
     dkv_consumers: int | None = None
+    staged_logits: bool = False
+    """Whether the keys-first dK/dV launch stages its logits' queries (the call's taken by its power) a
+    step from the call's own in its consumers' shared memory, where a stream of them beside the call's
+    passes the block (width 256's)."""
 
     @property
     def dkv(self) -> "BackwardTiles":

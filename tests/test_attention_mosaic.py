@@ -431,9 +431,9 @@ def test_the_keys_first_backward_keeps_the_logits_the_forward_keeps_finite_inter
     """Queries of 2^120 over keys of 4, one of 8, 64 wide at the scale 1/8: the forward's logits, the
     queries taken by the scale's power before their products (`attention.prescale`), are 2^125 and 2^126,
     where the unscaled products pass fp32's largest. The two-launch backward takes its logits from the
-    queries taken by the power, so its weights are the forward's, one-hot on the key of 8, and every
-    gradient is the float64 reference's to the bit: dV that key's the queries' summed cotangents, dQ and
-    dK zero."""
+    queries taken by the power (`attention_mosaic_backward._dkv_step`), so its weights are the forward's,
+    one-hot on the key of 8, and every gradient is the float64 reference's to the bit: dV that key's the
+    queries' summed cotangents, dQ and dK zero."""
     tokens, width = 64, 64
     query = jnp.full((1, tokens, 1, width), 2.0 ** 120, jnp.bfloat16)
     key = jnp.full((1, tokens, 1, width), 4.0, jnp.bfloat16).at[:, 1].set(8.0)
@@ -463,6 +463,25 @@ def test_the_keys_first_backward_keeps_the_logits_of_keys_the_power_would_flush_
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), query, key, value)
     for name, mine, theirs, true in zip(("query", "key", "value"), found, pull(dout), truth, strict=True):
         assert_as_exact_as_the_reference(mine, np.asarray(theirs, np.float64), true, f"{form} {name}")
+
+
+@INTERPRETS
+@pytest.mark.parametrize("form", HOOKED_FORMS)
+def test_the_keys_first_backward_keeps_the_key_gradients_of_queries_the_power_would_flush_interpreted(form):
+    """A query of 2^-126 over two zero keys, 64 wide at the scale 2^-10, whose values' first entries are
+    2^126 and -2^126 under a cotangent on that entry alone: each logit is 0, each score cotangent ±2^125
+    and each key's gradient ±2^-11 an entry, where the query taken by the scale's power (2^-136) flushes to
+    zero. dK takes the call's own queries, so every gradient is the float64 reference's to the bit."""
+    width = 64
+    query = jnp.full((1, 1, 1, width), 2.0 ** -126, jnp.bfloat16)
+    key = jnp.zeros((1, 2, 1, width), jnp.bfloat16)
+    first = jnp.asarray([2.0 ** 126, -2.0 ** 126])
+    value = jnp.zeros((1, 2, 1, width), jnp.bfloat16).at[0, :, 0, 0].set(first)
+    dout = jnp.zeros((1, 1, 1, width), jnp.bfloat16).at[..., 0].set(1.0)
+    found, truth = _keys_first_gradients(query, key, value, dout, template.spans(1, 2, 1), form=form,
+                                         scale=2.0 ** -10)
+    for mine, true in zip(found, truth, strict=True):
+        np.testing.assert_array_equal(mine, true)
 
 
 @INTERPRETS

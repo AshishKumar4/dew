@@ -450,6 +450,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         hooked = (self.score_mod is not None or ba.arguments["initial"] is not None
                   or ba.arguments["drop"] is not None)
         if config.fused and (config.dkv != dataclasses.replace(config, dkv_family=None, dkv_consumers=None)
+                             or config.staged_logits
                              or ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1]):
             return False
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
@@ -498,15 +499,20 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
         # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
+        # Its logits' queries a stream of their own, else where that passes the block staged a step
+        # (`BackwardTiles.staged_logits`).
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
         dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
         for columns in (1, 2, 4):
-            def tiles(rows: int, walked: int, consumers: int, columns=columns) -> BackwardTiles:
-                return BackwardTiles(walked, rows, 2, consumers, family=family.name, columns=columns, **dkv)
+            for staged in (False, True):
+                def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
+                          ) -> BackwardTiles:
+                    return BackwardTiles(walked, rows, 2, consumers, family=family.name, columns=columns,
+                                         staged_logits=staged, **dkv)
 
-            if config := _derived(family, query.dtype, key.shape[1], query.shape[1], tiles, fits,
-                                  overlapped=False):
-                return config
+                if config := _derived(family, query.dtype, key.shape[1], query.shape[1], tiles, fits,
+                                      overlapped=False):
+                    return config
         return None
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
