@@ -8,9 +8,8 @@ import shutil
 from pathlib import Path
 
 import jax.numpy as jnp
-import numpy as np
 import pytest
-from interop_support import fixture_ids, transformers_arms, transformers_model
+from interop_support import fixture_ids, token_draw, transformers_arms, transformers_model
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, seeds_for, widened
 
 from dew.interop import Pretrained
@@ -21,13 +20,6 @@ FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 def shrunk(name: str, **dims) -> dict:
     """The released config of fixture `name` with `dims` over its own: every other field as released."""
     return {**json.loads((FIXTURES / name / "config.json").read_text()), **dims}
-
-
-def ids_over(vocabulary: int, shape=(2, 9)):
-    """Check 1's draw of token ids over a whole vocabulary, the same on every run."""
-    def draw(seed):
-        return (np.random.default_rng([0x1D5, seed]).integers(0, vocabulary, shape).astype(np.int32),)
-    return draw
 
 
 def test_minicpm5_computes_transformers_logits_through_the_llama_reader(tmp_path):
@@ -45,7 +37,7 @@ def test_minicpm5_computes_transformers_logits_through_the_llama_reader(tmp_path
     loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     reference, truth = transformers_arms(transformers_model(tmp_path),
                                          lambda model, ids: model(ids, use_cache=False).logits)
-    draw = ids_over(config["vocab_size"])
+    draw = token_draw(0x1D5, config["vocab_size"], (2, 9))
     seeds = seeds_for(reference, draw, "MiniCPM5 logits", truth_fn=truth)
     assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, draw, "MiniCPM5 logits",
                     seeds=seeds, truth_fn=truth)
