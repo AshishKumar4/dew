@@ -136,7 +136,8 @@ def test_a_run_records_its_hub_backbone_at_its_commit_online_and_from_the_cache_
     from token_support import write_token_corpus
 
     ids = np.random.RandomState(0).randint(1, 60, 640).astype(np.uint8)
-    tokens = write_token_corpus(tmp_path / "tokens", ids)
+    # Written with the backbone's own tokenizer, by its name: the checkpoint carries no tokenizer files.
+    tokens = write_token_corpus(tmp_path / "tokens", ids, tokenizer="local/llama")
     files = {name: FIXTURE / name for name in ("config.json", "model.safetensors")}
 
     def ran(name, environment):
