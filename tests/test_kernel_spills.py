@@ -145,6 +145,35 @@ with report.refusals():
 none where it is empty."""
 
 
+SCOPED = """
+import json, sys
+from dew.nn.kernels.templates import report
+from dew.training.ahead import AheadOfTime, handed
+
+step = AheadOfTime.load(sys.argv[1])
+identity, config, names = step.refusals[0]
+foreign = (identity, config, frozenset({"another kernel"}))
+report.refuse([foreign])
+with handed(step):
+    within = report.refused_launches()
+print(json.dumps({"within": sorted(map(repr, within)), "step": sorted(map(repr, step.refusals)),
+                  "after": repr(foreign) in map(repr, report.refused_launches())}))
+"""
+"""A process that refused a launch of another program, handed the step compiled ahead at argv[1]."""
+
+
+@lowers("sm90")
+def test_a_run_handed_a_step_compiled_ahead_derives_within_the_steps_refusals_alone(tmp_path, nonce):
+    """A process handed a step compiled ahead, whatever launches it or its cache refused before, lowers
+    it within the launch configs the step's compiles refused alone (`dew.training.ahead.handed`): one it
+    refused of another program is no refusal there, and is the process's own again after (ledger 2453,
+    where a refusal shared through a cache led a handed run to derive another program)."""
+    step = str(tmp_path / "step.dew-aot")
+    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
+    scoped = spilled(tmp_path, SCOPED, step)
+    assert scoped["within"] == scoped["step"] and scoped["after"]
+
+
 @pytest.mark.gpu(reason="trains a step whose launch spills on this host's H100")
 @lowers("sm90")
 def test_a_run_steps_its_spilling_launch_down_and_trains(tmp_path, nonce):
