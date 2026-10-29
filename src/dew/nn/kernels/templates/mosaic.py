@@ -1112,8 +1112,15 @@ class Feed:
     """A walk's steps `lo` to `hi` (its indices, `walk`'s segment bounds) as a consumer-fed walk reads them
     (`ConsumerFed`), step `index` in the rings' slot of counter `index - first` (`walk`'s `first`, as
     `Slots` takes it): the loading consumer (`loads`, one warpgroup's traced flag) loads each step into
+<<<<<<< HEAD
     each of `rings` from its view of `views` at the step's place in the walk (`index - lo`), the first
     steps before the walk (`primed`) and each later one once the slot it reuses is given back
+=======
+    each of `rings` from its view of `views` at `index - origin` (a plain walk's views take its own
+    indices, as a producer's `stream` gives them: `origin` 0; `persist`'s a tile's steps counted from its
+    first), the first steps before the walk (`primed`) and each later one once the slot it reuses is given
+    back
+>>>>>>> 72dbfe8c5d5115f4d100eab088e3d78ee4ea2ec0
     (`refilled`, at the given step's counter): by the walk after each step's release, or where `refills`
     is False by the template, at a point of its own (a walk whose turns order its consumers refills past
     the turn that lets the other finish); the loading consumer waits at the walk's end for every slot's
@@ -1124,6 +1131,10 @@ class Feed:
     hi: jax.Array
     loads: jax.Array
     first: jax.Array | int = 0
+<<<<<<< HEAD
+=======
+    origin: jax.Array | int = 0
+>>>>>>> 72dbfe8c5d5115f4d100eab088e3d78ee4ea2ec0
     refills: bool = True
     drains: bool = False
 
@@ -1133,7 +1144,11 @@ class Feed:
 
     def load(self, index) -> None:
         for name, ring in self.rings.items():
+<<<<<<< HEAD
             ring.load(index - self.first, viewed(self.views[name], ring.smem.shape[1:], index - self.lo))
+=======
+            ring.load(index - self.first, viewed(self.views[name], ring.smem.shape[1:], index - self.origin))
+>>>>>>> 72dbfe8c5d5115f4d100eab088e3d78ee4ea2ec0
 
     def primed(self) -> None:
         """The walk's first steps, a slot each, loaded."""
@@ -1218,7 +1233,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     def _tile_streams(self, rings: dict[str, Ring], counter, steps, views: dict,
                       wg) -> "dict[str, Ring] | Feed":
         # The tile's steps as its loading consumer feeds them, the first ones primed.
-        feed = Feed(rings, views, counter, counter + steps, wg == self.loader)
+        feed = Feed(rings, views, counter, counter + steps, wg == self.loader, origin=counter)
         feed.primed()
         return feed
 
