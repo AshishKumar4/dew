@@ -186,6 +186,15 @@ def test_a_small_budget_splits_passes_without_moving_a_logit(decide):
                                          "budgeted logits")
 
 
+def drawn_about(variables):
+    """A draw of weights about `variables`, each leaf moved by a few percent, as a seed keys it."""
+    def draw(seed):
+        key = jax.random.key(seed)
+        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
+                             variables),)
+    return draw
+
+
 PACKED_SEEDS = 16
 """Check 1's declared seeds for a packed pass against its rows alone."""
 
@@ -211,10 +220,7 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
     wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
                    layout=task.layout)
 
-    def draw(seed):
-        key = jax.random.key(seed)
-        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
-                             decide.variables),)
+    draw = drawn_about(decide.variables)
 
     def real(scored: list[np.ndarray]) -> np.ndarray:
         """Each row's questions' logits over their own options, the padding slots left out."""
@@ -727,10 +733,7 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     def spread(variables) -> Decide:
         return replace(task, variables=jax.device_put(variables, NamedSharding(mesh, PartitionSpec())))
 
-    def draw(seed):
-        key = jax.random.key(seed)
-        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
-                             decide.variables),)
+    draw = drawn_about(decide.variables)
 
     @as_given
     def alone(variables) -> np.ndarray:
