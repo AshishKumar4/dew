@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1988,3 +1989,45 @@ def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_pat
     assert slow() == (0, {"test_new": False, "test_old": False, "test_sized[1]": False, "test_cell": True,
                           "test_named": True, "TestHeld::test_inside": True, "test_sized[big]": True})
     assert slow("--new", str(base)) == (1, {"test_new": False, "test_sized[big]": True})
+
+
+def a_wheel(root: Path, name: str, version: str) -> Path:
+    """A pure-Python wheel of `name` at `version` whose module says its version, as an index serves one."""
+    wheel = root / f"{name}-{version}-py3-none-any.whl"
+    info = f"{name}-{version}.dist-info"
+    files = {f"{name}/__init__.py": f"VERSION = {version!r}\n",
+             f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+             f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
+                              "Tag: py3-none-any\n"}
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, text in files.items():
+            archive.writestr(path, text)
+        recorded = [*files, f"{info}/RECORD"]
+        archive.writestr(f"{info}/RECORD", "".join(f"{path},,\n" for path in recorded))
+    return wheel
+
+
+def test_a_release_check_runs_on_the_whole_suite_alone_under_its_own_requirement(ci, tmp_path, monkeypatch):
+    """A test marked release_env(<requirement>) checks a release's own code under a package pinned apart from
+    the suite's (2173: LFM3's needs transformers>=5.18.0, MiMo-V2's <=5.1.0): it runs on the whole suite's run
+    alone, in a task of its own whose pytest runs with the requirement over the suite's environment (uv's
+    overlay, torch and jax the suite's), under a row of its own beside its file's other tests; every other
+    run sets it aside, as the suite's environment lacks its requirement."""
+    interpreter(tmp_path, "3.12")
+    pinned = a_wheel(tmp_path, "pinned", "2.0")
+    written(tmp_path, {"test_release.py": "import pytest\n"
+                       f"@pytest.mark.release_env({str(pinned)!r})\n"
+                       "def test_under_the_release():\n    import pinned\n"
+                       "    assert pinned.VERSION == '2.0'\n"
+                       "def test_plain():\n    pass\n"})
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
+    monkeypatch.delenv("DEW_WHOLE_SUITE", raising=False)
+    rows = {found["name"]: found["exitCode"] for found in armada_task(ci, monkeypatch, out, "off")}
+    assert rows == {"3.12:tests/test_release.py": 0}, rows
+    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
+    rows = {found["name"]: found["exitCode"] for found in armada_task(ci, monkeypatch, out, "off")}
+    released = f"3.12:tests/test_release.py#release:{pinned}"
+    assert rows == {"3.12:tests/test_release.py": 0, released: 0}, rows
