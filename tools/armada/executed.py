@@ -66,6 +66,10 @@ collected: dict[str, int] = {}
 is 0."""
 deselected: dict[str, int] = {}
 """Each test file's tests the selection set aside, as pytest reports it (`pytest_deselected`)."""
+released: dict[str, dict[str, list[str]]] = {}
+"""Each test file's release checks, by the requirement each runs under, as pytest resolves a node's
+release_env mark, recorded before any selection: its row names them, and a whole suite's run plans their
+tasks from it (`ci.py release-plan`)."""
 whole_suite: dict[str, list[str]] = {}
 """Each test file's tests marked whole_suite, by their node ids, as pytest resolves a node's marks (its own,
 its class's, its module's, a parameter set's, a conftest's), which `ci.py slow` reads in the file's row."""
@@ -111,13 +115,16 @@ def conftest(name: str) -> bool:
     return Path(name).name == "conftest.py"
 
 
+def kept(read: str | None) -> None:
+    # The durations record is split.py's, which cuts a split file from it, read or probed: the file's own
+    # entries are its groups' input (ci.py's `cache_key`), and no other file's.
+    if read is not None and read.removeprefix(followed.PROBED) != str(DURATIONS):
+        current[-1].add(read)
+
+
 def audited(event, args):
     if event in followed.READS:
-        read = followed.read(event, args, root)
-        # The durations record is split.py's, which cuts a split file from it: the file's own entries are its
-        # groups' input (ci.py's `cache_key`), and no other file's.
-        if read is not None and read != str(DURATIONS):
-            current[-1].add(read)
+        kept(followed.read(event, args, root))
         return
     kind = followed.start(event, args, str(children)) if running else None
     if kind == "followed":
@@ -135,7 +142,7 @@ followed.installed()
 os.environ |= {CHILDREN: str(children), "DEW_EXECUTED_ROOT": root,
                "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
                "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, "")}
-followed.opening(lambda read: current[-1].add(read), root)
+followed.opening(kept, root)
 
 
 sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
@@ -189,6 +196,11 @@ def tally(counts: dict[str, int], items) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
     tally(collected, items)
+    # Before any selection sets them aside, as every run but a release check's does (`ci.py selected`).
+    for item in items:
+        if (mark := item.get_closest_marker("release_env")) is not None and mark.args:
+            checks = released.setdefault(item.nodeid.split("::")[0], {})
+            checks.setdefault(str(mark.args[0]), []).append(item.nodeid)
 
 
 def pytest_deselected(items):
@@ -240,7 +252,8 @@ def pytest_sessionfinish(session):
     if counted := os.environ.get("DEW_COLLECTED"):
         Path(counted).write_text(json.dumps({
             name: {"collected": count, "deselected": deselected.get(name, 0),
-                   **({"whole_suite": whole_suite[name]} if name in whole_suite else {})}
+                   **({"whole_suite": whole_suite[name]} if name in whole_suite else {}),
+                   **({"release_env": released[name]} if name in released else {})}
             for name, count in collected.items()}))
 
 

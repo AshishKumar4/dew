@@ -12,6 +12,10 @@ tools/armada/install.sh, whose key holds every pin, or by hand), and the tests r
 awaiting its revision, with the store's catalog of every file it has held and the card made from it,
 reads each file back anonymously at that commit and checks it before the pin takes the revision.
 `check` is check.sh's rule: no recording over IN_GIT in git, and every pin whole and uploaded.
+A release's own file a test reads offline (a remote-code release's modeling code, its config) is the
+store's second kind (`RELEASE`, `pin_release`): kept whole whatever its size, under
+releases/<sha256>/<its name>, its pin naming the release and its license, read and checked by sha256
+as a recording is and held to none of the recordings' rules.
 
 Usage, from the checkout:
   python tools/fetched_fixtures.py fetch
@@ -41,6 +45,9 @@ LOCAL = "tests/fixtures/fetched"
 PINNED = ".fetched.json"
 CATALOG = "catalog.json"
 FIELDS = ("repo", "revision", "path", "sha256", "bytes", "reference", "license")
+RELEASE = "release"
+"""The `kind` of a pin that holds a release's own file (`pin_release`); a pin without one is a
+recording's."""
 REDRAWN = ".redraw.npy"
 """The member every recording holds (record_case's `<site>.redraw`, which `indexed_recording` reads),
 which marks an NPZ as one."""
@@ -75,7 +82,54 @@ def digest(data: bytes) -> str:
 
 
 def _stored(pin: dict, root: Path) -> Path:
+    if pin.get("kind") == RELEASE:
+        # Built from its parts, never the pin's path itself, so no pin reaches outside the store.
+        return root / LOCAL / "releases" / _sha(pin) / _file_name(pin["path"])
     return root / LOCAL / f"{pin['sha256']}.npz"
+
+
+def _sha(pin: dict) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", str(pin["sha256"])):
+        raise ValueError(f"{pin['sha256']!r} is no sha256")
+    return pin["sha256"]
+
+
+def _file_name(path: str) -> str:
+    """The last part of `path`, a file's own name: none that is empty, '.' or '..'."""
+    name = Path(path).name
+    if name in ("", ".", ".."):
+        raise ValueError(f"{path!r} names no file")
+    return name
+
+
+def _store_path(pin: dict, name: str) -> str:
+    """Where the store keeps the file pinned at the fixture `name`: a recording's under its sha256, a
+    release file's under its sha256 and the fixture's own name (`pin_release`)."""
+    if pin.get("kind") == RELEASE:
+        return f"releases/{pin['sha256']}/{_file_name(name)}"
+    return f"recordings/{pin['sha256']}.npz"
+
+
+def pin_release(path, data: bytes, *, reference: str, license: str, root: Path = REPO_ROOT) -> Path:
+    """Keep `data`, a release's own file, in the local store whole, pinned at `path` under
+    tests/fixtures/ with no revision until `upload`: by its sha256 and its own name, the release it
+    is from (`reference`, its repo, commit and file) and that release's `license`. Returns the stored
+    file, which `local(path)` reads."""
+    name = fixture(path, root)
+    # Written where it resolves to: a symlink at the place, or above it, may not carry a write out.
+    if name is None or not (root / name).resolve().is_relative_to((root / FIXTURES).resolve()):
+        raise ValueError(f"{path}: a release file is pinned under {FIXTURES}/, and resolves there")
+    sha = digest(data)
+    pin = {"repo": STORE, "revision": None, "path": f"releases/{sha}/{_file_name(name)}", "sha256": sha,
+           "bytes": len(data), "reference": reference, "license": license, "kind": RELEASE}
+    stored = _stored(pin, root)
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_bytes(data)
+    target = root / name
+    target.unlink(missing_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _pinned(name, pin, root)
+    return stored
 
 
 def _checked(data: bytes, pin: dict, name: str) -> bytes:
@@ -154,7 +208,8 @@ def fetch(root: Path = REPO_ROOT) -> None:
 def card(catalog: dict[str, dict]) -> str:
     """The store's card: what it holds, each file's fixture, size, reference and that reference's
     license, from its catalog."""
-    rows = "\n".join(f"| `{entry['fixture']}` | `recordings/{sha}.npz` | {entry['bytes']:,} | "
+    rows = "\n".join(f"| `{entry['fixture']}` | `{entry.get('path', f'recordings/{sha}.npz')}` | "
+                     f"{entry['bytes']:,} | "
                      f"{entry['reference']} | {entry['license']} |"
                      for sha, entry in sorted(catalog.items(), key=lambda item: item[1]["fixture"]))
     return ("---\nlicense: other\n---\n\n# Dew's recorded test fixtures\n\n"
@@ -186,7 +241,9 @@ def upload(root: Path = REPO_ROOT) -> None:
     except (EntryNotFoundError, RepositoryNotFoundError):
         catalog = {}
     catalog.update({pin["sha256"]: {"fixture": name, "bytes": pin["bytes"], "reference": pin["reference"],
-                                    "license": pin["license"]} for name, pin in due.items()})
+                                    "license": pin["license"],
+                                    **({"kind": RELEASE, "path": pin["path"]} if pin.get("kind") == RELEASE
+                                       else {})} for name, pin in due.items()})
     operations = [CommitOperationAdd(pin["path"], _checked(_stored(pin, root).read_bytes(), pin, name))
                   for name, pin in sorted(due.items())]
     listing = json.dumps(catalog, indent=1, sort_keys=True) + "\n"
@@ -213,12 +270,11 @@ def check(root: Path = REPO_ROOT) -> list[str]:
     """What check.sh refuses: a recording over IN_GIT that git tracks, and a pin with a field missing, a
     sha256, revision or store path not of its form, IN_GIT bytes or fewer, or a fixture git tracks
     too."""
-    listed = subprocess.run(["git", "ls-files", "-z", "--", "*.npz"], cwd=root, capture_output=True,
-                            check=True)
+    listed = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True)
     tracked = set(filter(None, listed.stdout.decode().split("\0")))
     problems = [f"{name}: a recording of {(root / name).stat().st_size:,} bytes in git, over "
                 f"{IN_GIT:,}; save it to the fetched store (`save`)"
-                for name in sorted(tracked) if (root / name).is_file()
+                for name in sorted(tracked) if name.endswith(".npz") and (root / name).is_file()
                 and (root / name).stat().st_size > IN_GIT and _recording(root / name)]
     for name, pin in pins(root).items():
         missing = [field for field in FIELDS if pin.get(field) in (None, "")]
@@ -226,13 +282,13 @@ def check(root: Path = REPO_ROOT) -> list[str]:
             problems.append(f"{name}: its pin holds no {', '.join(missing)}"
                             + (" (its upload is due)" if "revision" in missing else ""))
             continue
-        if not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"]) or (
-                pin["path"] != f"recordings/{pin['sha256']}.npz"):
+        if not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"]) or pin.get("kind") not in (None, RELEASE) or (
+                pin["path"] != _store_path(pin, name)):
             problems.append(f"{name}: its pin's sha256 {pin['sha256']!r} or path {pin['path']!r} is not "
                             f"of the store's form")
         if not re.fullmatch(r"[0-9a-f]{40}", pin["revision"]):
             problems.append(f"{name}: its pin's revision {pin['revision']!r} is not a commit")
-        if pin["bytes"] <= IN_GIT:
+        if pin["bytes"] <= IN_GIT and pin.get("kind") != RELEASE:
             problems.append(f"{name}: {pin['bytes']:,} bytes, at most {IN_GIT:,}, belongs in git")
         if name in tracked:
             problems.append(f"{name}: pinned and tracked by git alike")

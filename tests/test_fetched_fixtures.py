@@ -189,3 +189,89 @@ def test_upload_pins_a_revision_only_once_each_file_reads_back_anonymously_as_it
     # The catalog keeps every file the store has held, so the card names each one's source.
     assert set(json.loads(commits[-1][store.CATALOG].path_or_fileobj)) == {"0" * 64, pin["sha256"]}
     assert store.check(root) == []
+
+
+def test_a_release_file_is_pinned_whole_read_by_its_sha_and_leaves_recordings_as_they_were(store, tmp_path):
+    """A release's own file (`pin_release`) is kept whole in the store under its sha256 and its own name,
+    whatever its size, pinned with its release and license; read back as its pin's bytes, refused once
+    a bit flips, and checked to none of the recordings' rules (a small one is not sent back to git).
+    Beside it a recording pins, reads and checks exactly as before (ledger 2173)."""
+    root = _checkout(tmp_path)
+    recording = _saved(store, root)
+    before = dict(store.pins(root)[LARGE])
+    name, code = "tests/fixtures/hf/site/release/modeling_site.py", b"class Site:\n    pass\n"
+    stored = store.pin_release(name, code, reference="org/site@abc/modeling_site.py", license="apache-2.0",
+                               root=root)
+    pin = store.pins(root)[name]
+    held = f"releases/{pin['sha256']}/modeling_site.py"
+    assert (pin["kind"], pin["path"], pin["bytes"]) == ("release", held, len(code))
+    assert stored == root / store.LOCAL / pin["path"] and store.local(name, root) == stored
+    assert stored.read_bytes() == code
+    assert store.pins(root)[LARGE] == before and store.local(LARGE, root) == recording
+    _uploaded(store, root)
+    assert store.check(root) == []
+    stored.write_bytes(_flipped(code))
+    with pytest.raises(AssertionError):
+        store.local(name, root)
+
+
+def test_upload_takes_a_release_file_beside_a_recording_each_by_its_own_path(store, tmp_path, monkeypatch):
+    """An upload due with a recording and a release file commits each under its own store path, catalogs
+    the release file with its kind, path and license and the recording with its four keys alone, and
+    the card's recording row stays as it was; each reads back by its own path before its pin takes
+    the revision. A release pin naming a file other than its fixture's is refused by check, and a
+    release file tracked by git beside its pin too."""
+    import huggingface_hub
+    from huggingface_hub.errors import EntryNotFoundError
+
+    root = _checkout(tmp_path)
+    recording = _saved(store, root)
+    name, code = "tests/fixtures/hf/site/release/modeling_site.py", b"class Site:\n    pass\n"
+    released = store.pin_release(name, code, reference="org/site@abc/modeling_site.py", license="apache-2.0",
+                                 root=root)
+    commits = []
+
+    class Hub:
+        def create_repo(self, repo, **options):
+            pass
+
+        def repo_info(self, repo, **options):
+            return type("Info", (), {"private": False})()
+
+        def create_commit(self, repo, operations, **options):
+            commits.append({operation.path_in_repo: operation for operation in operations})
+            return type("Commit", (), {"oid": "b" * 40})()
+
+    def download(repo, path, **where):
+        if path == store.CATALOG:
+            raise EntryNotFoundError("no catalog")
+        served = tmp_path / "served" / path
+        served.parent.mkdir(parents=True, exist_ok=True)
+        served.write_bytes(commits[-1][path].path_or_fileobj)
+        return str(served)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Hub)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    store.upload(root)
+    pins = store.pins(root)
+    release, held = pins[name], pins[LARGE]
+    assert release["path"] == f"releases/{release['sha256']}/modeling_site.py"
+    assert commits[-1][release["path"]].path_or_fileobj == released.read_bytes() == code
+    assert commits[-1][held["path"]].path_or_fileobj == recording.read_bytes()
+    catalog = json.loads(commits[-1][store.CATALOG].path_or_fileobj)
+    assert catalog[release["sha256"]] == {
+        "fixture": name, "bytes": len(code), "reference": release["reference"], "license": "apache-2.0",
+        "kind": "release", "path": release["path"]}
+    assert set(catalog[held["sha256"]]) == {"fixture", "bytes", "reference", "license"}
+    card = commits[-1]["README.md"].path_or_fileobj.decode()
+    assert f"| `{LARGE}` | `recordings/{held['sha256']}.npz` |" in card
+    assert f"| `{name}` | `{release['path']}` |" in card
+    assert (release["revision"], held["revision"]) == ("b" * 40, "b" * 40) and store.check(root) == []
+    # A pin naming another file than its fixture's is refused, as is the fixture tracked beside its pin.
+    store._pinned(name, {**release, "path": f"releases/{release['sha256']}/other.py"}, root)
+    assert store.check(root)
+    store._pinned(name, release, root)
+    (root / name).write_bytes(code)
+    subprocess.run(["git", "add", name], cwd=root, check=True)
+    assert store.check(root)
+
