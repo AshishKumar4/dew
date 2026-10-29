@@ -3,19 +3,19 @@
 The corpus (tests/fixtures/saved_runs, written by tools/saved_runs_reference.py) holds, for each main that
 recorded it, a saved run of each run kind: its run.json and its checkpoints. This main reads each as a user's
 process would: the record rebuilds its run (`RunConfig.load`), the checkpoint's inference declaration pins
-(`SavedRun.pinned`), the kind's saved task loads it (`from_run`) and answers one call, and the run resumes a
-step past its last. Its data is the kind's own, written here, since a record names its data where the run
-that wrote it read them."""
+(`SavedRun.pinned`) where its objective declares one, the kind's saved task loads it (`from_run`) and
+answers one call, and the run resumes a step past its last. Its data is the kind's own, written here, since
+a record names its data where the run that wrote it read them."""
 
 import dataclasses
 import json
 import tarfile
 from pathlib import Path
 
-import numpy as np
 import pytest
 from test_run_options import KINDS
 
+from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
 from dew.inference.tasks import SavedRun, TextGeneration
 
@@ -26,12 +26,10 @@ SAVED = [(recorded.name, kind) for recorded in sorted(CORPUS.iterdir()) if recor
 
 
 def called(task) -> None:
-    """One call of a loaded task, the one its kind's runs make: a language model continues a prompt of
-    token ids by a token, which it draws in its vocabulary; every other kind's task is answered by
-    loading."""
+    """One call of a loaded task, the one its kind's runs make: a language model continues one prompt by
+    one token, through the tokenizer its run recorded; every other kind's task is answered by loading."""
     if isinstance(task, TextGeneration):
-        drawn = task([[1, 2, 3]], max_new_tokens=1, key=0)
-        assert np.asarray(drawn.lengths).tolist() == [1]
+        assert len(task.decode(task("ab", max_new_tokens=1, key=0))) == 1
 
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=[f"{recorded}-{kind}" for recorded, kind in SAVED])
@@ -42,14 +40,19 @@ def test_a_run_an_earlier_main_saved_loads_answers_and_resumes(tmp_path, recorde
     with tarfile.open(CORPUS / recorded / f"{kind}.tar.xz") as packed:
         packed.extractall(runs, filter="data")
     run = runs / kind
-    saved = SavedRun.pinned(str(run))
-    if saved.objective.saved_task is not None:
+    with Checkpoints(str(run)) as checkpoints:
+        last = checkpoints.latest
+        declared = checkpoints.artifact(last) is not None
+    # A run whose objective declares no inference record (a JEPA encoder's) loads by its resume alone.
+    if declared:
+        saved = SavedRun.pinned(str(run))
+        assert saved.step == last
         called(saved.objective.saved_task.from_run(str(run)))
     recorded_run = RunConfig.load(str(run))
     here = KINDS[kind](tmp_path, drawn=False)
     sources = {name: getattr(here, name) for name in ("data", "validation", "pretrained")
                if hasattr(here, name)}
-    trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(runs), steps=saved.step + 1,
+    trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(runs), steps=last + 1,
                                   compilation_cache_dir=None, multi_host=False)
     state = dataclasses.replace(recorded_run, trainer=trainer, **sources).prepare().train(kind)
-    assert int(state.step) == saved.step + 1
+    assert int(state.step) == last + 1
