@@ -385,13 +385,17 @@ RECORDS = ("a", "w", "c", "o", "h", "leaving")
 
 @functools.cache
 def interpreted_lane() -> Lane:
-    """The arithmetic Mosaic GPU's interpreter runs a launch in, a CPU process's XLA: its `exp2`'s reach and
-    whether it flushes, as check 2 measures the lane (`certified.lane`: a level `n` lies at most `n` steps of
-    the grid from the correctly rounded value), a 16-bit call."""
+    """The arithmetic Mosaic GPU's interpreter runs a launch in, a CPU process's XLA, measured once: its
+    `exp2`'s reach over the witness's own operands (`exp2_reach`: XLA's CPU exp2, computed as exp(x ln 2), is
+    a step off some powers of two, 2^71 among them, which check 2's exact cases admit no lane breaking, so
+    its reach is the witness's own measure, not `certified.lane`'s) and whether it flushes (`certified.lane`),
+    a 16-bit call."""
+    import jax
+    import jax.numpy as jnp
     from certified import lane
 
-    measured = lane()
-    return Lane(measured.reach["exp2", "float32"], measured.flushes, mainloop.block_of(mainloop.INTERPRETED))
+    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes,
+                mainloop.block_of(mainloop.INTERPRETED))
 
 
 @dataclasses.dataclass(frozen=True)
