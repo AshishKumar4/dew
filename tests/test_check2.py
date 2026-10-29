@@ -502,6 +502,19 @@ def _truncating_sum(values: np.ndarray) -> np.float32:
     return total
 
 
+def _outer(left, right) -> np.ndarray:
+    """`[rows, columns, depth]`: each element's products, its row of `left` times its row of `right`."""
+    return left[:, None, :] * right[None, :, :]
+
+
+def _without(products: ct.Terms, at) -> ct.Terms:
+    """`products` with each element's term at `at` (`[...]`, an index along the last axis) lost."""
+    exact, magnitudes = products.exact.copy(), products.magnitudes.copy()
+    for found in (exact, magnitudes):
+        np.put_along_axis(found, np.asarray(at)[..., None], 0.0, -1)
+    return ct.Terms(exact, magnitudes)
+
+
 def _truncating_sums(products: np.ndarray, rng) -> np.ndarray:
     """Each element's `products` (summed along the last axis) summed by `_truncating_sum` in an order of its
     own, as float64."""
@@ -525,14 +538,14 @@ def _stepped_sums(products: np.ndarray, width: int, rng, exact: bool) -> list[np
     return [np.asarray(state, np.float64).reshape(products.shape[:-1]) for state in states]
 
 
-def _steps_held(states: list, products: np.ndarray, width: int) -> list[np.ndarray]:
+def _steps_held(states: list, products: ct.Terms, width: int) -> list[np.ndarray]:
     """Each depth step's witness (`promoted_step_holds`) of `states`, the accumulators `_stepped_sums` gives,
     against the true `products`."""
     return [ct.promoted_step_holds(before, after, products[..., j * width:(j + 1) * width], flushes=False)
             for j, (before, after) in enumerate(itertools.pairwise(states))]
 
 
-def _steps_apart(states: list, products: np.ndarray, width: int, fault_ends) -> list[np.ndarray]:
+def _steps_apart(states: list, products: ct.Terms, width: int, fault_ends) -> list[np.ndarray]:
     """Each depth step's separation (`separated`) of the witness's interval on the true `products`
     (`promoted_step_ends`) from a fault's, `fault_ends(before, step)` of the accumulator before the step and
     the step's slice of the depth."""
@@ -553,10 +566,27 @@ def test_the_truncating_model_keeps_the_low_part_of_an_add():
 def test_a_native_dot_holds_products_that_truncate_away_below_the_normal_range():
     """128 products of 1.5 * 2^-75 and 2^-75, each a subnormal fp32 sum truncates to zero: the output zero
     holds, as a truncating add below the normal range loses up to a whole subnormal unit."""
-    products = np.full((1, 128), 1.5 * 2.0 ** -150)
-    native = np.asarray([_truncating_sum(products[0])], np.float64)
+    products = ct.terms(np.multiply, np.full((1, 128), 1.5 * 2.0 ** -75), np.full((1, 128), 2.0 ** -75),
+                        fmt=oc.BFLOAT16)
+    native = np.asarray([_truncating_sum(products.exact[0])], np.float64)
     assert native[0] == 0
     assert np.all(ct.native_dot_holds(native, products, oc.FLOAT32, flushes=False))
+
+
+def test_a_native_dot_aligns_a_subnormal_operand_at_its_least_normal_and_no_bare_product_of_one():
+    """The native-dot contract's magnitudes (row 2084, link 3): the tensor cores' sum of `SUBNORMAL_CASE`'s
+    five fp16 products, one of the subnormal 2^-24, holds where that operand counts at fp16's least normal
+    (`certified.aligned`) and is refused at the products' own magnitudes; bare products a subnormal operand
+    may have made, any under `SUBNORMAL_REACH`, raise rather than take the tight bound, where products of 4
+    and more pass bare."""
+    left, right, native = ct.SUBNORMAL_CASE
+    products = ct.terms(np.multiply, np.asarray([left]), np.asarray([right]), fmt=rw.FLOAT16)
+    assert ct.native_dot_holds([native], products, oc.FLOAT32, flushes=False).tolist() == [True]
+    tight = ct.Terms(products.exact, np.abs(products.exact))
+    assert ct.native_dot_holds([native], tight, oc.FLOAT32, flushes=False).tolist() == [False]
+    with pytest.raises(ValueError, match="subnormal"):
+        ct.native_dot_ends(products.exact, oc.FLOAT32, flushes=False)
+    assert ct.native_dot_holds([16.0], np.full((1, 4), 4.0), oc.FLOAT32, flushes=False).tolist() == [True]
 
 
 def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_product_or_a_narrow_partial():
@@ -573,14 +603,13 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
         left, right = (np.asarray(ml_dtypes.bfloat16(rng.normal(size=shape) if signed else
                                                      rng.uniform(0.5, 2.0, size=shape)), np.float64)
                        for shape in ((16, 128), (4, 128)))
-        products = left[:, None, :] * right[None, :, :]
-        summed = _truncating_sums(products, rng)
+        products = ct.terms(_outer, left, right, fmt=oc.BFLOAT16)
+        summed = _truncating_sums(products.exact, rng)
         for out, native in ((oc.FLOAT32, summed), (oc.BFLOAT16, summed.astype(ml_dtypes.bfloat16))):
             held = ct.native_dot_holds(np.asarray(native, np.float64), products, out, flushes=False)
             assert np.all(held), (signed, out.name)
-        lost = products.copy()
-        np.put_along_axis(lost, np.argmax(np.abs(lost), -1)[..., None], 0.0, -1)
-        first, rest = (_truncating_sums(half, rng) for half in (products[..., :64], products[..., 64:]))
+        lost = _without(products, np.argmax(np.abs(products.exact), -1))
+        first, rest = (_truncating_sums(half.exact, rng) for half in (products[..., :64], products[..., 64:]))
         narrow = np.float32(first.astype(ml_dtypes.bfloat16)) + np.float32(rest)
         # The first half's bf16 value lies between its ends' bf16 values; the IEEE add is monotone in both.
         halved = ct.native_dot_ends(products[..., :64], oc.FLOAT32, flushes=False)
@@ -588,7 +617,7 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
                                            for end in halved), products[..., 64:], flushes=False)
         truth = ct.native_dot_ends(products, oc.FLOAT32, flushes=False)
         fault_lost = ct.native_dot_ends(lost, oc.FLOAT32, flushes=False)
-        for faulty, fault, share in ((_truncating_sums(lost, rng), fault_lost, 0.95),
+        for faulty, fault, share in ((_truncating_sums(lost.exact, rng), fault_lost, 0.95),
                                      (narrow, narrowed, 0.65 if signed else 0.9)):
             held = ct.native_dot_holds(np.asarray(faulty, np.float64), products, oc.FLOAT32, flushes=False)
             ct.assert_refused(held, ct.separated(truth, fault), share)
@@ -629,14 +658,16 @@ def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf
     for signed in (True, False):
         left, right = (np.asarray((rng.normal(size=shape) if signed else rng.uniform(0.5, 2.0, size=shape))
                                   .astype(np.float32), np.float64) for shape in ((32, 128), (8, 128)))
-        tf32, wide, truncated = (read(left)[:, None, :] * read(right)[None, :, :] for read in (
-            ct.tf32_operand, bf16, lambda value: oc.truncated(value, oc.TFLOAT32)))
-        native = _truncating_sums(tf32, rng)
+        tf32, wide, truncated = (ct.terms(_outer, read(left), read(right), fmt=fmt) for read, fmt in (
+            (ct.tf32_operand, oc.TFLOAT32), (bf16, oc.BFLOAT16),
+            (lambda value: oc.truncated(value, oc.TFLOAT32), oc.TFLOAT32)))
+        native = _truncating_sums(tf32.exact, rng)
         assert np.all(ct.native_dot_holds(native, tf32, oc.FLOAT32, flushes=False)), signed
         cut = 0.75 if signed else 0.95
-        for faulty, declared, given, share in ((_truncating_sums(wide, rng), tf32, wide, 0.85),
+        for faulty, declared, given, share in ((_truncating_sums(wide.exact, rng), tf32, wide, 0.85),
                                                (native, wide, tf32, 0.85),
-                                               (_truncating_sums(truncated, rng), tf32, truncated, cut)):
+                                               (_truncating_sums(truncated.exact, rng), tf32, truncated,
+                                                cut)):
             held = ct.native_dot_holds(faulty, declared, oc.FLOAT32, flushes=False)
             ct.assert_refused(held, ct.separated(*(ct.native_dot_ends(products, oc.FLOAT32, flushes=False)
                                                    for products in (declared, given))), share)
@@ -658,13 +689,12 @@ def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_a
                                                      rng.uniform(0.5, 2.0, size=shape)), np.float64)
                        for shape in ((16, 64), (4, 64)))
         for fall in (1.0, 2.0 ** -12):
-            products = (left * np.where(np.arange(64) < width, 1.0, fall))[:, None, :] * right[None, :, :]
-            held = _steps_held(_stepped_sums(products, width, rng, exact=True), products, width)
+            products = ct.terms(_outer, left * np.where(np.arange(64) < width, 1.0, fall), right,
+                                fmt=oc.BFLOAT16)
+            held = _steps_held(_stepped_sums(products.exact, width, rng, exact=True), products, width)
             assert all(np.all(step) for step in held), (signed, fall)
-        lost = products.copy()
-        step = lost[..., 2 * width:3 * width]
-        np.put_along_axis(step, np.argmax(np.abs(step), -1)[..., None], 0.0, -1)
-        states = _stepped_sums(lost, width, rng, exact=True)
+        lost = _without(products, 2 * width + np.argmax(np.abs(products.exact[..., 2 * width:3 * width]), -1))
+        states = _stepped_sums(lost.exact, width, rng, exact=True)
         held = _steps_held(states, products, width)
         apart = _steps_apart(states, products, width, lambda before, step, lost=lost: ct.promoted_step_ends(
             before, before, lost[..., step], flushes=False))
@@ -672,7 +702,7 @@ def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_a
         assert all(np.all(held[j]) for j in (0, 1, 3)), signed
         if not signed:
             # A truncation's bound toward zero holds where the accumulator and every product share a sign.
-            states = _stepped_sums(products, width, rng, exact=False)
+            states = _stepped_sums(products.exact, width, rng, exact=False)
             held = _steps_held(states, products, width)
             apart = _steps_apart(states, products, width, lambda before, step, terms=products: (
                 ct.truncating_step_ends(before, terms[..., step], flushes=False)))

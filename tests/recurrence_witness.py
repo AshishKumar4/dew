@@ -184,12 +184,11 @@ def staged(iv: Iv, lane: Lane) -> Iv:
 
 
 def aligned(iv: Iv, fmt: Format) -> np.ndarray:
-    """Each operand's magnitude as a tensor core aligns its products by: its own, but a subnormal of `fmt`'s
-    at `fmt`'s least normal, its exponent field's (`dot`)."""
-    magnitude = np.maximum(np.abs(iv.lo), np.abs(iv.hi))
-    least = 2.0 ** fmt.emin
-    return np.where((magnitude > 0) & (np.minimum(np.abs(iv.lo), np.abs(iv.hi)) < least),
-                    np.maximum(magnitude, least), magnitude)
+    """The largest magnitude a tensor core aligns a product by of an operand within `iv`
+    (`certified.aligned`: a subnormal of `fmt` at `fmt`'s least normal)."""
+    from certified import aligned as at
+
+    return np.maximum(at(iv.lo, fmt), at(iv.hi, fmt))
 
 
 def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
@@ -199,9 +198,7 @@ def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
     (`certified.native_dot_holds`: gamma_n at a truncating add's unit, n the terms that may be nonzero, an add
     of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's magnitudes are the
     terms' as the tensor cores align them (`aligned`): a subnormal operand's at `fmt`'s least normal, the
-    exponent its field holds. Five fp16 products, one of the subnormal 2^-24 and 1, summed to 752 fp32 units
-    from their exact sum on an A100 (mma.sync) and an H100 (wgmma), as if each term were kept to 2^-37, 2^-23
-    under 2^-14 (row 2084, link 3), where their own magnitudes' bound admits 12."""
+    exponent its field holds."""
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
     parts = 6 if lane.wide else 1
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1) * parts

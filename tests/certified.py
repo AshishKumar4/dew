@@ -333,30 +333,92 @@ up to a whole unit in the last place, twice round to nearest's (src/dew/nn/kerne
 the unit roundoff of a format one bit narrower."""
 
 
+SUBNORMAL_REACH = 4.0
+"""Below it a product may come from a subnormal operand of a 16-bit format or of TF32: a subnormal times the
+format's largest finite value is under 2^-126 2^128 = 4 (bf16, TF32), and under 2^-14 65504 < 4 (fp16)."""
+
+
+def aligned(values, fmt: Format) -> np.ndarray:
+    """Each operand's magnitude as a tensor core aligns its products by: its own, but a subnormal of `fmt` at
+    `fmt`'s least normal, the exponent its field holds (`SUBNORMAL_CASE`, where the products' own magnitudes'
+    bound admits 12 fp32 units and the tensor cores' sum lies 752 from the exact)."""
+    magnitude = np.abs(np.asarray(values, np.float64))
+    least = 2.0 ** fmt.emin
+    return np.where((magnitude > 0) & (magnitude < least), least, magnitude)
+
+
+SUBNORMAL_CASE = ((-(2.0 ** -24), 23 * 2.0 ** -24, 97 * 2.0 ** -24, 8.821487426757812e-05,
+                   -0.00101470947265625),
+                  (1.0, 0.0023059844970703125, -201 * 2.0 ** -24, -401 * 2.0 ** -24, -55 * 2.0 ** -24),
+                  -5.52972779e-08)
+"""Five fp16 products, the first of the subnormal 2^-24 and 1, and the sum the tensor cores give them in fp32
+on an A100 (the GEMM template's Triton launch) and an H100 (its Mosaic GPU and Triton launches), a recurrence
+inverse's merge (row 2084, link 3): 752 fp32 units from their exact sum, -5.52946098e-08, as if each term
+were kept to 2^-37, 2^-23 under the subnormal's exponent field's 2^-14 (`aligned`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Terms:
+    """A native GEMM's exact products (float64, summed along the last axis) and each one's magnitude as the
+    tensor cores align it (`aligned`), sliced alike: what its contract reads (`native_dot_ends`)."""
+    exact: np.ndarray
+    magnitudes: np.ndarray
+
+    @property
+    def shape(self) -> tuple:
+        return self.exact.shape
+
+    def __getitem__(self, index) -> "Terms":
+        return Terms(self.exact[index], self.magnitudes[index])
+
+
+def terms(build, *operands, fmt: Format) -> Terms:
+    """The products `build(*operands)` multiplies out of 16-bit or TF32 operands of `fmt` (a product of them,
+    each term one product), and their magnitudes as the tensor cores align them: `build` of each operand's
+    aligned magnitude (`aligned`)."""
+    return Terms(np.asarray(build(*operands), np.float64),
+                 np.asarray(build(*(aligned(operand, fmt) for operand in operands)), np.float64))
+
+
+def _terms_of(products) -> Terms:
+    """`products` as `Terms`: given so, or exact products none of which a subnormal operand may have made
+    (none nonzero below `SUBNORMAL_REACH`), whose magnitudes are their own; a subnormal operand must never
+    take the tight bound unseen, so any other raises."""
+    if isinstance(products, Terms):
+        return products
+    products = np.asarray(products, np.float64)
+    if np.any((products != 0) & (np.abs(products) < SUBNORMAL_REACH)):
+        raise ValueError("a product under 4 may come from a subnormal 16-bit operand, which the tensor cores "
+                         "align at its format's least normal: pass its operands' `Terms` (`terms`)")
+    return Terms(products, np.abs(products))
+
+
 def native_dot_ends(products, out: Format, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
     """The least and the greatest value of `out` a native GEMM's output takes on its exact `products`
-    (`native_dot_holds`): the nearest `out` values of the allowance's two ends; +0 for an empty sum."""
+    (`native_dot_holds`; `Terms`, or exact products `_terms_of` admits bare): the nearest `out` values of the
+    allowance's two ends; +0 for an empty sum."""
+    products = _terms_of(products)
     count = products.shape[-1]
     if count == 0:
         return np.zeros(products.shape[:-1]), np.zeros(products.shape[:-1])
-    exact = exact_sum(products, -1)
+    exact = exact_sum(products.exact, -1)
     accumulator = FORMATS["float32"]
     # A truncating add below the normal range loses up to a whole subnormal unit, not half of one.
     underflow = 2.0 ** accumulator.emin if flushes else 2.0 ** (accumulator.emin - accumulator.precision + 1)
-    allowance = (gamma(count, TRUNCATING["float32"]) + 2.0 ** -52) * magnitude_sum(products, -1) + \
-        count * underflow
+    magnitude = magnitude_sum(products.magnitudes, -1)
+    allowance = (gamma(count, TRUNCATING["float32"]) + 2.0 ** -52) * magnitude + count * underflow
     zero = np.zeros_like(exact)
     return (rounded(np.nextafter(exact - allowance, -np.inf), zero, out),
             rounded(np.nextafter(exact + allowance, np.inf), zero, out))
 
 
 def native_dot_holds(native, products, out: Format, flushes: bool) -> np.ndarray:
-    """Whether each element of a native GEMM's output is a value its exact `products` (float64, summed along
-    the last axis) admit, as check 2 holds a fused template GEMM natively (row 2084, link 1): accumulated in
-    fp32 in any order by adds that truncate (`TRUNCATING`), within γ_n of their magnitudes of the exact sum
-    plus what underflow loses past that (as `_terms_hold`), then rounded once to nearest in `out`, the
-    output's format. Rounding is monotone, so the output lies between the nearest `out` values of the
-    allowance's two ends."""
+    """Whether each element of a native GEMM's output is a value its exact `products` (`Terms`: float64,
+    summed along the last axis, with their magnitudes as the tensor cores align them) admit, as check 2
+    holds a fused template GEMM natively (row 2084, link 1): accumulated in fp32 in any order by adds that
+    truncate (`TRUNCATING`), within γ_n of their aligned magnitudes of the exact sum plus what underflow loses
+    past that (as `_terms_hold`), then rounded once to nearest in `out`, the output's format. Rounding is
+    monotone, so the output lies between the nearest `out` values of the allowance's two ends."""
     low, high = native_dot_ends(products, out, flushes)
     native = np.asarray(native, np.float64)
     return np.isfinite(native) & (native >= low) & (native <= high)
@@ -412,14 +474,15 @@ def truncating_step_ends(before, products, flushes: bool) -> tuple[np.ndarray, n
     zero (Fasi, Higham, Mikaitis and Pranesh, Numerical behavior of NVIDIA tensor cores, PeerJ Computer
     Science 7:e330, 2021: the products aligned and the sum normalized by truncation)."""
     accumulator = FORMATS["float32"]
-    before = np.asarray(before, np.float64)
-    terms = np.concatenate([before[..., None], products], -1)
-    low, high = native_dot_ends(terms, accumulator, flushes)
+    before, products = np.asarray(before, np.float64), _terms_of(products)
+    summed = Terms(np.concatenate([before[..., None], products.exact], -1),
+                   np.concatenate([np.abs(before)[..., None], products.magnitudes], -1))
+    low, high = native_dot_ends(summed, accumulator, flushes)
     # The float64 sum is within half its unit of the exact one, so a unit further from zero bounds it.
-    total = exact_sum(terms, -1)
+    total = exact_sum(summed.exact, -1)
     bound = truncated(np.nextafter(total, np.copysign(np.inf, total)), accumulator)
-    positive = (before >= 0) & np.all(products >= 0, -1)
-    negative = (before <= 0) & np.all(products <= 0, -1)
+    positive = (before >= 0) & np.all(products.exact >= 0, -1)
+    negative = (before <= 0) & np.all(products.exact <= 0, -1)
     return np.where(negative, np.maximum(low, bound), low), np.where(positive, np.minimum(high, bound), high)
 
 

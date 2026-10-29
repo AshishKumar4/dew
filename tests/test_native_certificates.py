@@ -27,19 +27,22 @@ import numpy as np
 import pytest
 import recurrence_witness as rw
 from certified import (
+    SUBNORMAL_CASE,
+    Terms,
     assert_refused,
     native_dot_ends,
     native_dot_holds,
     promoted_step_ends,
     promoted_step_holds,
     separated,
+    terms,
     tf32_operand,
     truncating_step_ends,
 )
 from generation_support import generations, runs
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
-from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, rounded, truncated
+from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, Format, rounded, truncated
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import template
@@ -142,26 +145,27 @@ def spans(sizes) -> list[tuple[int, int]]:
     return list(itertools.pairwise(np.cumsum((0, *sizes)).tolist()))
 
 
-def forward_products(x, w, sizes) -> np.ndarray:
-    """`[rows, width, depth]`: each output element's exact products, its row times its group's column."""
-    return x[:, None, :] * np.swapaxes(w[groups(sizes)], 1, 2)
+def forward_products(x, w, sizes, fmt: Format = BFLOAT16) -> Terms:
+    """`[rows, width, depth]`: each output element's exact products of operands of `fmt` (`certified.terms`),
+    its row times its group's column."""
+    return terms(lambda x, w: x[:, None, :] * np.swapaxes(w[groups(sizes)], 1, 2), x, w, fmt=fmt)
 
 
-def input_gradient_products(dy, w, sizes) -> np.ndarray:
+def input_gradient_products(dy, w, sizes, fmt: Format = BFLOAT16) -> Terms:
     """`[rows, depth, width]`: each input gradient element's exact products, the row's cotangent times its
     group's matrix row."""
-    return dy[:, None, :] * w[groups(sizes)]
+    return terms(lambda dy, w: dy[:, None, :] * w[groups(sizes)], dy, w, fmt=fmt)
 
 
-def rows_products(x, dy) -> np.ndarray:
+def rows_products(x, dy, fmt: Format = BFLOAT16) -> Terms:
     """`[depth, width, rows]`: the exact products of rows of `x` and of the cotangent `dy` a kernel gradient
     sums, each element's its rows' column of `x` times theirs of `dy`."""
-    return x.T[:, None, :] * dy.T[None, :, :]
+    return terms(lambda x, dy: x.T[:, None, :] * dy.T[None, :, :], x, dy, fmt=fmt)
 
 
-def kernel_gradient_products(x, dy, sizes) -> list[np.ndarray]:
+def kernel_gradient_products(x, dy, sizes, fmt: Format = BFLOAT16) -> list[Terms]:
     """Each group's kernel gradient's exact products (`rows_products` of its rows)."""
-    return [rows_products(x[start:end], dy[start:end]) for start, end in spans(sizes)]
+    return [rows_products(x[start:end], dy[start:end], fmt) for start, end in spans(sizes)]
 
 
 def kernel_gradient_ends(products: list) -> tuple[np.ndarray, np.ndarray]:
@@ -236,21 +240,21 @@ def kernel_gradient_of(x, dy, sizes, out_dtype=jnp.bfloat16, *, dtype=jnp.bfloat
     return np.asarray(native, np.float64)
 
 
-def assert_products_certify(x, w, dy, read, outputs: tuple, label) -> None:
+def assert_products_certify(x, w, dy, read, fmt: Format, outputs: tuple, label) -> None:
     """Every element of the native forward and kernel gradient of `x`, `w` and `dy`, in each of `outputs`
     (a dtype and its format, the first the operands' own), and of the input gradient, in the operands' own,
-    is a value the exact products of the operands' values as the tensor cores read them (`read`) admit
-    (`native_dot_holds`)."""
+    is a value the exact products of the operands' values as the tensor cores read them (`read`, values of
+    `fmt`) admit (`native_dot_holds`)."""
     dtype = outputs[0][0]
     rx, rw, rdy = (read(value) for value in (x, w, dy))
-    forward, gradient = forward_products(rx, rw, SIZES), kernel_gradient_products(rx, rdy, SIZES)
+    forward, gradient = forward_products(rx, rw, SIZES, fmt), kernel_gradient_products(rx, rdy, SIZES, fmt)
     for out_dtype, out in outputs:
         assert np.all(native_dot_holds(forward_of(x, w, SIZES, out_dtype, dtype=dtype), forward, out,
                                        flushes=False)), (label, out.name)
         assert np.all(kernel_gradient_holds(kernel_gradient_of(x, dy, SIZES, out_dtype, dtype=dtype),
                                             gradient, out)), (label, out.name)
     assert np.all(native_dot_holds(input_gradient_of(x, w, dy, SIZES, dtype=dtype),
-                                   input_gradient_products(rdy, rw, SIZES), outputs[0][1],
+                                   input_gradient_products(rdy, rw, SIZES, fmt), outputs[0][1],
                                    flushes=False)), label
 
 
@@ -372,7 +376,7 @@ def test_the_grouped_gemm_templates_products_certify_natively(kernel, generation
     fp32: the null of row 2084's links 1 and 2."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         for seed in range(SEEDS):
-            assert_products_certify(*draw(seed, signed), lambda value: value,
+            assert_products_certify(*draw(seed, signed), lambda value: value, BFLOAT16,
                                     ((jnp.bfloat16, BFLOAT16), (jnp.float32, FLOAT32)), seed)
 
 
@@ -384,8 +388,8 @@ def test_fp32_operands_certify_natively_as_products_of_their_tf32_values(kernel,
     products of their TF32 values admit (`tf32_operand`, `native_dot_holds`)."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         for seed in range(SEEDS):
-            assert_products_certify(*draw(seed, signed, np.float32), tf32_operand, ((jnp.float32, FLOAT32),),
-                                    seed)
+            assert_products_certify(*draw(seed, signed, np.float32), tf32_operand, TFLOAT32,
+                                    ((jnp.float32, FLOAT32),), seed)
 
 
 @pytest.mark.parametrize("kernel, generation_name", EXACT)
@@ -525,7 +529,7 @@ def test_the_tf32_certificate_refuses_bf16_products_tf32_where_bf16_is_declared_
 
         def read(left, right):
             """The products the kernel takes of operands it is given: of their TF32 values."""
-            return forward_products(tf32_operand(left), tf32_operand(right), SIZES)
+            return forward_products(tf32_operand(left), tf32_operand(right), SIZES, TFLOAT32)
 
         tf32, wide = read(x, w), forward_products(bf16(x), bf16(w), SIZES)
         cases = (((bf16(x), bf16(w)), tf32), ((x, w), wide),
@@ -570,6 +574,43 @@ def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narro
                                       forward_products(halves[1], w, SIZES), flushes=False)
         truth = native_dot_ends(products, FLOAT32, flushes=False)
         assert_refused(held, separated(truth, narrowed), NARROW_SHARE)
+
+
+SUBNORMAL_CELLS = [
+    pytest.param(dtype, kernel, name, marks=runs(name), id=f"{jnp.dtype(dtype).name}-{kernel}-{name}")
+    for dtype, kernel, name in (
+        (jnp.float16, "triton", "sm80"), (jnp.float16, "triton", "sm90"), (jnp.float16, "mosaic_gpu", "sm90"),
+        (jnp.bfloat16, "mosaic_gpu", "sm80"), (jnp.bfloat16, "mosaic_gpu", "sm90"),
+        (jnp.bfloat16, "triton", "sm80"), (jnp.bfloat16, "triton", "sm90"))]
+"""The template's launches of 16-bit products by dtype on the lanes' GPUs (Mosaic GPU's mma.sync bundle takes
+no fp16)."""
+
+
+@pytest.mark.parametrize("dtype, kernel, generation_name", SUBNORMAL_CELLS)
+def test_subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, kernel, generation_name):
+    """A subnormal 16-bit operand's products, which the tensor cores align by its exponent field
+    (`certified.aligned`): the native forward's element summing `SUBNORMAL_CASE`'s five fp16 products, and
+    every element of a forward of rows a quarter of whose values are subnormals of `dtype` (Gaussian draws
+    beside them), holds with each such operand counted at its format's least normal."""
+    fmt = rw.FLOAT16 if dtype == jnp.float16 else BFLOAT16
+    values = np.float16 if dtype == jnp.float16 else ml_dtypes.bfloat16
+    rng = np.random.default_rng([2084, 3, 7])
+    x, w, _ = draw(0, signed=True, dtype=values)
+    least = 2.0 ** fmt.emin
+    subnormal = rng.random(x.shape) < 0.25
+    x = np.where(subnormal, np.asarray((rng.uniform(-1, 1, x.shape) * least).astype(values), np.float64), x)
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
+        assert np.all(native_dot_holds(forward_of(x, w, SIZES, jnp.float32, dtype=dtype),
+                                       forward_products(x, w, SIZES, fmt), FLOAT32, flushes=False))
+        if dtype == jnp.float16:
+            left, right, _ = SUBNORMAL_CASE
+            case = np.zeros((ROWS, DEPTH))
+            case[0, :5] = left
+            matrices = np.zeros((len(SIZES), DEPTH, WIDTH))
+            matrices[:, :5, 0] = right
+            native = forward_of(case, matrices, SIZES, jnp.float32, dtype=dtype)
+            products = forward_products(case, matrices, SIZES, fmt)
+            assert np.all(native_dot_holds(native, products, FLOAT32, flushes=False))
 
 
 PTX_EX2 = 2
