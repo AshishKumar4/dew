@@ -443,10 +443,11 @@ class Layout:
             return "unfit"
         return "options_alike" if row.options_alike else None
 
-    def shortest_row(self, encoder: Tokenizer, specials: Specials) -> int:
-        """The tokens of the shortest row this layout lays out, one one-option question about an empty
-        state, laid out with room to spare: `bounds`' unit, which no window shorter holds."""
-        return self._laid_size(encoder, specials, 1, empty=self.state(encoder, specials, ""))[0]
+    def shortest_row(self, encoder: Tokenizer, specials: Specials) -> tuple[int, int]:
+        """The tokens of the row `bounds` counts by, one one-option question about an empty state laid
+        out with room to spare, and its context's (its schema where the row reads it there): no window
+        shorter, nor a context, holds its bounds."""
+        return self._laid_size(encoder, specials, 1, empty=self.state(encoder, specials, ""))
 
     def _laid_size(self, encoder: Tokenizer, specials: Specials, *options: int,
                    empty: Sequence[int]) -> tuple[int, int]:

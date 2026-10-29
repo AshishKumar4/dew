@@ -546,14 +546,15 @@ class Decide(SavedRunTask):
     def _bounds(self) -> dict[int, Bounds]:
         """Each pass length's window bounds, as a run's windows of that length hold them
         (`DecisionObjective.bounds`): the layout's window and its halvings, none shorter than the
-        shortest row it lays out (`_probe`). A length shorter than the rows its bounds count by
-        (`Layout.shortest_row`, a question of a one-character option) holds one row a window, of one
-        question unless the row asks more (`packing`)."""
-        shortest = self.layout.shortest_row(self.tokenizer, self.specials)
+        shortest row it lays out (`_probe`). A length shorter than the row its bounds count by, or a
+        context shorter than that row's schema (`Layout.shortest_row`, a question of a one-character
+        option), holds one row a window, of one question unless the row asks more (`packing`)."""
+        shortest, schema = self.layout.shortest_row(self.tokenizer, self.specials)
         held, segments = self.context_length, self._scoring.segments
+        counted = held is None or schema <= held
         return {length: replace(self.layout, max_len=length).bounds(
             self.tokenizer, self.specials, held, segments, None if held is None else max(length, held))
-            if length >= shortest else Bounds(1, 1, None)
+            if length >= shortest and counted else Bounds(1, 1, None)
             for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens))}
 
     @functools.cached_property
@@ -1078,24 +1079,19 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
 
 
 def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -> Variables:
-    """A task's weights with its backbone's projections packed as a served decoder's are, in each
-    collection that holds the backbone (its trained parameters, or a frozen trunk's): the one layout a
-    task holds whatever its source stored, a run's packed or an export's apart, so its loads compute one
-    program (ledger 2299). Weights it owns (`owned`, a load's) pack in place, their members freed
+    """A task's weights with its backbone's projections packed as a served decoder's are, each
+    group's input quantization moved with it (`dew.inference.projections`): the one layout a task holds
+    whatever its source stored, a run's packed or an export's apart, so its loads compute one program
+    (ledger 2299). Weights it owns (`owned`, a load's) pack in place, their members freed
     (`packed_owned`); a bundle's borrowed ones (`Decide.of`) into a new tree that leaves the bundle's
-    whole (`inference_projections`). An adapter binds and an export writes the model's own tree
-    (`dew.inference.projections.unpacked`)."""
-    from dew.batch import FROZEN
+    whole (`inference_projections`). A frozen trunk's parameters keep the layout they were stored in
+    (ledger 2439). An adapter binds and an export writes the model's own tree (`unpacked`)."""
+    from dew.batch import part
     from dew.inference.projections import inference_projections, packed_owned
 
     pack = packed_owned if owned else inference_projections
-    held = dict(variables)
-    for collection in ("params", FROZEN):
-        if "backbone" in held.get(collection, {}):
-            trees = dict(held[collection])
-            trees["backbone"] = pack(model.backbone, {"params": trees["backbone"]})["params"]
-            held[collection] = trees
-    return held
+    return joined({"backbone": pack(model.backbone, part(variables, "backbone")),
+                   "head": part(variables, "head")})
 
 
 def decoded_images(images: object) -> list[Image.Image]:
