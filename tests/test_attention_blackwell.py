@@ -137,3 +137,31 @@ def test_the_blackwell_forward_reads_the_calls_keys_at_every_key_tile_interprete
         query = jnp.zeros((1, tokens, 1, 64), jnp.bfloat16)
         value = jnp.ones((1, tokens, 1, 64), jnp.bfloat16)
         np.testing.assert_array_equal(_forward_of(query, query, value, tiles=tiles), 1.0)
+
+
+@INTERPRETS
+@pytest.mark.parametrize(("width", "value_width"), [(32, 32), (64, 128)], ids=["32-wide", "values-wider"])
+def test_the_blackwell_forward_keeps_its_widths_through_its_guards_interpreted(width, value_width):
+    """Heads 32 wide (the swizzle pads them to 64) and values wider than their queries and keys: the
+    default's guards trace the plain-JAX rewalk beside the launch, over the same padded call, so the
+    output is the call's `[B, Q, H, Dv]` and on par with the template's reference (check 1)."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(jnp.asarray(rng.normal(size=(1, 136, 2, size)), jnp.bfloat16)
+                     for size in (width, width, value_width))
+
+    ours = _attended(False, 136, 1, interpret=True)
+    assert jax.eval_shape(ours, *draw(0)).shape == (1, 136, 2, value_width)
+    assert_as_exact(ours, _attended(False, 136, 1, reference=True), draw,
+                    f"blackwell {width} over {value_width}", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_the_blackwell_forward_of_no_keys_is_zero_interpreted():
+    """A call of queries over no keys walks one tile of padding, whose zero values weigh to a zero output,
+    every query's row written."""
+    query = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
+    empty = jnp.zeros((1, 0, 1, 64), jnp.bfloat16)
+    spans = template.spans(128, 0, 1)
+    out = attention_blackwell.forward(query, empty, empty, spans, interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.zeros((1, 128, 1, 64), np.float32))

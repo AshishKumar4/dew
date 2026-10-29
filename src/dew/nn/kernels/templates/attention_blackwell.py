@@ -88,17 +88,19 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=scale, natural=natural,
                            headroom=algebra.headroom(value.dtype), prescale=power)
     # Swizzled tiles hold whole 64-element rows of 16-bit operands.
-    query, key, value = (jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % 64),))
-                         for array in (call.query, call.key, call.value))
+    call = dataclasses.replace(call, **{name: jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % 64),))
+                                        for name, array in (("query", call.query), ("key", call.key),
+                                                            ("value", call.value))})
 
     def launch(form: algebra.Forward, live: jax.Array | None):
         if live is None:
-            return _forward(query, key, value, spec=form, tiles=tiles, interpret=interpret)
-        # The rows whose weighted values overflowed, rewalked shifting on the plain-JAX mainloop (the
-        # rare launch, `algebra.walked_launches`); its maxima and overflows are not read.
+            return _forward(call.query, call.key, call.value, spec=form, tiles=tiles, interpret=interpret)
+        # The rows whose weighted values overflowed, rewalked shifting on the plain-JAX mainloop over the
+        # same padded call (the rare launch, `algebra.walked_launches`); its maxima and overflows are not
+        # read.
         out, _ = attention_portable.padded_walk(form, call, Hooks(), block_q=TCGEN05.rows,
                                                 block_k=tiles.block_k, residuals=False)
-        return out[..., :query.shape[3]], jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
+        return out, jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
 
     def kept(live: jax.Array, guarded: jax.Array, plain: jax.Array) -> jax.Array:
         return jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded, plain)
@@ -288,8 +290,9 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     kv_heads, value_width = key.shape[2], value.shape[-1]
     group = heads // kv_heads
     rows, block_k, dtype = TCGEN05.rows, tiles.block_k, query.dtype
-    # The key tiles holding the call's keys, none of padding alone.
-    blocks = -(-spec.keys // block_k)
+    # The key tiles holding the call's keys, none of padding alone but a call of no keys' one (its zero
+    # values weigh to a zero output, as `padded_call` pads it for).
+    blocks = max(1, -(-spec.keys // block_k))
     target = generation.gpu_target("sm100")
     transforms = mosaic_sm100.swizzled(dtype, width)
     key_stages = mosaic_sm100.Stages(tiles.stages, (((block_k, width), dtype, transforms),))
