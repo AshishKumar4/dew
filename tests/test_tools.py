@@ -361,6 +361,32 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dt
 # tools/layout_parity.py
 # ---------------------------------------------------------------------------
 
+def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
+    """The layout tool's default judge (the floor judge, `floored`), from its command line on eight host
+    devices, runs a model under the mixture and the objective the command gives and writes its rows to
+    --out; --window, which is check 1's, without --seeds is refused."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    environment = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=8",
+                   "JAX_PLATFORMS": "cpu"}
+
+    def tool(*flags):
+        return subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), *flags],
+                              env=environment, capture_output=True, text=True, check=False)
+
+    out = tmp_path / "rows.json"
+    done = tool("--models", "moe", "--layouts", "expert4", "--out", str(out), "--mixture", '{"top_k": 1}',
+                "--objective", '{"balance": {"aux_loss_alpha": 0.01}}')
+    assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
+    (row,) = json.loads(out.read_text())
+    assert (row["status"], row["mixture"]["top_k"], row["objective"]["balance"]["aux_loss_alpha"]) == (
+        "works", 1, 0.01)
+    assert tool("--models", "dense", "--layouts", "data4", "--window", "2").returncode != 0
+
+
 def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
     from residual_orders import permuted
 
