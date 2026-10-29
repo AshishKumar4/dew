@@ -21,6 +21,7 @@ from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resou
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
+    OUTPUT,
     TRACED_TILE,
     AttentionLaunch,
     Gradients,
@@ -205,15 +206,19 @@ class MosaicForward(_Mainloop[Tiles]):
     output_width: int = TRACED_TILE
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
-             drop=None, *, residuals: bool, interpret: bool, config: Tiles, return_residuals: bool = False):
+             drop=None, *, residuals: bool | str, interpret: bool, config: Tiles,
+             return_residuals: bool = False):
         hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
                       self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop)
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False,
                              family=bundle_of(config, query.dtype)):
             raise NotImplementedError(reason)
-        run = _trained_forward if residuals else _plain_forward
-        return run(query, key, value, self.spans(start, end, query_ids, key_ids), hooks, scale=self.scale,
-                   natural=self.natural, tiles=config, interpret=interpret), None
+        spans = self.spans(start, end, query_ids, key_ids)
+        form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret}
+        if residuals is True:
+            return _trained_forward(query, key, value, spans, hooks, **form), None
+        # The inference walk, its rows beside the output where it keeps them (`OUTPUT`).
+        return _plain_forward(query, key, value, spans, hooks, rows=residuals == OUTPUT, **form), None
 
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
         """`_Mainloop.legal`'s, and on a plain launch whose sums can pass fp32's largest (`algebra.headroom`),
@@ -222,7 +227,7 @@ class MosaicForward(_Mainloop[Tiles]):
         if not super().legal(ba, config, target):
             return False
         query, value = ba.arguments["query"], ba.arguments["value"]
-        if ba.arguments["residuals"] or not algebra.headroom(value.dtype):
+        if ba.arguments["residuals"] is True or not algebra.headroom(value.dtype):
             return True
         family = bundle_of(config, query.dtype)
         columns = guarded_columns(family, value.shape[3], value.dtype)
@@ -253,7 +258,7 @@ class MosaicForward(_Mainloop[Tiles]):
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
-                                           bool(ba.arguments.get("residuals")), min(config.stages, steps))
+                                           ba.arguments.get("residuals") is True, min(config.stages, steps))
         return resources.shared_bytes(family, _scope(family, allocations, reducing(
             family, config.consumers, self.score_mod, self.output_mod)))
 
@@ -261,7 +266,7 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         return _forward_registers(family, config, _width(value.shape[-1], family, query.dtype), query.dtype,
-                                  bool(ba.arguments.get("residuals")))
+                                  ba.arguments.get("residuals") is True)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
@@ -297,20 +302,22 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
 @overload
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, natural: bool = NATURAL, residuals: Literal[True],
+            *, scale: float | None = None, natural: bool = NATURAL, residuals: Literal[True, "output"],
             interpret: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, natural: bool = NATURAL, residuals: bool = False,
+            *, scale: float | None = None, natural: bool = NATURAL, residuals: bool | str = False,
             interpret: bool = False):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` the training forward's,
     its output with the backward's residuals as every mainloop's training forward gives them
     (`attention_portable.attend(residuals=True)`): the maxima and denominators `[B, H, Q]`, each query's
-    anchor key `[B, H, Q]` int32 and the split sums (`Split`). `natural` keeps the logits natural
+    anchor key `[B, H, Q]` int32 and the split sums (`Split`); `residuals=OUTPUT` the same residuals of the
+    inference walk, which keeps its output for the backward's D in place of an anchor (`output_split`,
+    `takes_output_residuals`). `natural` keeps the logits natural
     (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic GPU's interpret mode), as a GPU of the
     family `generation.assumed` names."""
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
@@ -319,7 +326,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
 def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                      hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                     residuals: bool = False) -> str | None:
+                     residuals: bool | str = False) -> str | None:
     """Why `forward` runs no call of these arrays compiled on this device, or None
     (`MosaicForward.declined`)."""
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
@@ -328,7 +335,7 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 def forward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                   hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                  residuals: bool = False) -> bool:
+                  residuals: bool | str = False) -> bool:
     """Whether `forward` runs the call compiled on this device (`forward_declined`): its family has a
     bundle here, the call is one this mainloop takes (`refused`) and a config fits the device."""
     return forward_declined(query, key, value, spans, hooks, scale=scale, natural=natural,

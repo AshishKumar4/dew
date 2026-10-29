@@ -1118,6 +1118,34 @@ class Split(NamedTuple):
     shift: jax.Array
 
 
+OUTPUT = "output"
+"""The residuals a Mosaic training forward names where it keeps its output for the backward's D
+(`takes_output_residuals`, `output_split`), beside `True`, the anchor's split sums."""
+
+
+def output_split(out: jax.Array) -> Split:
+    """The split sums of a forward that keeps its output in place of its anchor's
+    (`takes_output_residuals`): its output `[B, Q, H, Dv]` as the normalized sums of every key (shift -1,
+    `attention_algebra.split_residuals`), no anchor's own weight and the others' weights 1, so
+    `attention_algebra.split_delta` takes D as `rowsum(dO ⊙ O)` about 0 with no anchor key (each query's
+    -1)."""
+    others = jnp.swapaxes(out, 1, 2).astype(jnp.float32)
+    rows = jnp.zeros(others.shape[:-1], jnp.float32)
+    return Split(others, rows, rows + 1.0, rows - 1.0)
+
+
+def takes_output_residuals(hooks: Hooks, dtype, *, accurate: bool) -> bool:
+    """Whether a training forward keeps its output for the backward's D (`output_split`, FlashAttention's
+    `rowsum(dO ⊙ O)`) in place of its anchor's split sums: a 16-bit call in the fast form with no initial
+    state, no dropout and no output hook (D is the attention's own output's). Its forward is the inference
+    walk alone, which writes its rows beside the output (ET-KFPROF2-h100: the anchor's peaks pass, its
+    split-sum walk and D's reductions took 1.07 of the template's 3.81 ms Qwen3-8B causal step); the
+    backward's D is then the rounded output's, as FlashAttention's is, which check 1 judges a term at a time.
+    The accurate form, an initial state (whose anchor keeps a sink's share) and fp32 keep the anchor's."""
+    return (jnp.dtype(dtype).itemsize == 2 and not accurate and hooks.initial is None and hooks.drop is None
+            and hooks.output_mod is None)
+
+
 DQ_GRADS = (Kind.HEAD, Kind.QUERY)
 """The parameter kinds whose gradients the dQ program writes: a head's partial sum over its queries and
 its queries' own."""
@@ -1182,9 +1210,11 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     others = jnp.pad(call.rows(split.others.astype(jnp.float32)), widened)
     own, others_total = call.rows(split.own), call.rows(split.others_total)
     shift = call.rows(split.shift.astype(jnp.float32))
-    # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads.
-    anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2),
-                                       jnp.swapaxes(key_index, 1, 2)[..., None], axis=1)
+    # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads; zero
+    # for a query with no anchor key (-1, `output_split`'s).
+    places = jnp.swapaxes(key_index, 1, 2)[..., None]
+    anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2), jnp.maximum(places, 0), axis=1)
+    anchor_value = jnp.where(places >= 0, anchor_value, 0)
     maximum = call.rows(maxima.astype(jnp.float32))
     arrays = (*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value, shift,
               others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows)
