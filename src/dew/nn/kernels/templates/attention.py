@@ -735,17 +735,23 @@ def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
             return value[row, :, head]
 
 
-def prescale(dtype, width: int, scale: float) -> tuple[float, float]:
-    """The power of two a call's queries take before their products with the keys, and the scale left after
-    it: where the products of `dtype` operands `width` wide can pass fp32's largest (bf16's and fp32's),
-    `scale`'s power of two at or below its magnitude, so no product the reference keeps finite overflows
-    here (it scales the query before its products, `dew.nn.attention`): Q 2^127 and K 4 over a width of 16,
-    a product of 2^129 where the reference's is 2^127; else 1 and `scale` (fp16's products never pass it). A
-    power of two scales exactly, so the logits, the weights and the gradients (`gradients`: the cotangents
-    at the whole scale against the call's own queries and keys, no product taken back by the power) are the
-    unscaled call's bit for bit where every value stays in fp32's normal range and the form is the same: a
-    whole scale below `algebra.RAW_SCALES` leaves one that takes the raw form (`algebra.Forward.raw`), whose
-    differences round otherwise."""
+def logit_scale(width: int, scale: float | None) -> float:
+    """A call's logit scale: `scale`, else attention's default, the inverse root of its head `width`."""
+    return width ** -0.5 if scale is None else scale
+
+
+def prescale(dtype, width: int, scale: float | None) -> tuple[float, float]:
+    """The power of two a call's queries take before their products with the keys, and the scale left after it
+    (`scale` the call's, `logit_scale`): where the products of `dtype` operands `width` wide can pass fp32's
+    largest (bf16's and fp32's), `scale`'s power of two at or below its magnitude, so no product the reference
+    keeps finite overflows here (it scales the query before its products, `dew.nn.attention`): Q 2^127 and K 4
+    over a width of 16, a product of 2^129 where the reference's is 2^127; else 1 and `scale` (fp16's products
+    never pass it). A power of two scales exactly, so the logits, the weights and the gradients (`gradients`:
+    the cotangents at the whole scale against the call's own queries and keys, no product taken back by the
+    power) are the unscaled call's bit for bit where every value stays in fp32's normal range and the form is
+    the same: a whole scale below `algebra.RAW_SCALES` leaves one that takes the raw form
+    (`algebra.Forward.raw`), whose differences round otherwise."""
+    scale = logit_scale(width, scale)
     largest = float(jnp.finfo(dtype).max)
     if scale == 0 or largest * largest * width < float(jnp.finfo(jnp.float32).max):
         return 1.0, scale
@@ -759,7 +765,7 @@ def by_power(query: jax.Array, power: float) -> jax.Array:
     return query if power == 1.0 else query * jnp.asarray(power, query.dtype)
 
 
-def prescaled(query: jax.Array, scale: float) -> tuple[jax.Array, float, float]:
+def prescaled(query: jax.Array, scale: float | None) -> tuple[jax.Array, float, float]:
     """`query` taken by its call's power of two before its products (`prescale`, `by_power`), the scale
     left after it, and the power."""
     power, left = prescale(query.dtype, query.shape[-1], scale)
@@ -775,7 +781,7 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
     batch, queries, heads, width = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
-    scale = width ** -0.5 if scale is None else scale
+    scale = logit_scale(width, scale)
     seen = dense(spans)
     grouped = query.reshape(batch, queries, kv_heads, heads // kv_heads, width)
     products = float32_einsum("bqhgd,bkhd->bhgqk", grouped, key,
@@ -1182,7 +1188,7 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     # The logits taken as the forward took them (`prescale`): every launch recomputes them from the query
     # taken by the power, at the scale left, and takes the gradients' cotangents at the call's whole scale
     # against the call's own keys and queries, so no factor of the power is taken back from a product.
-    power, scale = prescale(query.dtype, width, width ** -0.5 if scale is None else scale)
+    power, scale = prescale(query.dtype, width, scale)
     # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
     dout = dout.astype(query.dtype)
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)

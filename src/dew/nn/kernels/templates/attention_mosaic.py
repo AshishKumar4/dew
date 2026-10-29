@@ -32,6 +32,7 @@ from dew.nn.kernels.templates.attention import (
     Split,
     gradients,
     kept_dtype,
+    logit_scale,
     power_of_two,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import (
@@ -356,7 +357,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
                        output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
-                       scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural)
+                       scale=logit_scale(query.shape[3], scale), natural=natural)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop)
@@ -641,7 +642,7 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                         score_kinds=tuple(param.kind for param in hooks.score_params),
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                         form=spans.form, keys=spans.keys,
-                        scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural,
+                        scale=logit_scale(query.shape[3], scale), natural=natural,
                         accurate=accurate, rounded=rounded)
     return op, (query, key, value, dout, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params), hooks.initial, residuals, hooks.drop)

@@ -224,7 +224,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     `natural` keeps the logits natural (`algebra.Forward.base2`)."""
     hooks = Hooks() if hooks is None else hooks
     # The query taken by its scale's power of two before its products (`prescale`).
-    query, scale, power = prescaled(query, query.shape[3] ** -0.5 if scale is None else scale)
+    query, scale, power = prescaled(query, scale)
     call = padded_call(query, key, value, spans, hooks, pad)
     queries, value_width = call.queries, value.shape[-1]
     # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
