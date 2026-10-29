@@ -29,7 +29,7 @@ import operator
 import os
 import re
 import tempfile
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from types import MappingProxyType
@@ -598,9 +598,9 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
         component, name = wrapper_route(f"{module}.weight", record)
         return name.removesuffix(".weight") if component == "language_model" else None
 
-    def projected(entries: list[object], field: str) -> list[str]:
+    def projected(entries: Sequence[str]) -> list[str]:
         out: list[str] = []
-        for entry in _records.listed(entries, field, read=_records.text, what="module names"):
+        for entry in entries:
             if entry.startswith("re:"):
                 pattern = re.compile(entry[3:])
                 out.extend(name for module in wrapper_modules() if pattern.match(module)
@@ -617,7 +617,8 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
 
     for field in QUANTIZED_MODULE_LISTS:
         if isinstance(quantization.get(field), list):
-            quantization[field] = projected(quantization[field], field)
+            quantization[field] = projected(_records.listed(quantization[field], field, read=_records.text,
+                                                            what="module names"))
     if isinstance(quantization.get("quantized_layers"), Mapping):
         layers = {str(module): entry for module, entry in
                   _records.record(quantization["quantized_layers"], "quantized_layers").items()}
@@ -638,7 +639,8 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
         for group, entry in _records.record(quantization["config_groups"], "config_groups").items():
             held = dict(_records.record(entry, f"config_groups.{group}"))
             if isinstance(held.get("targets"), list):
-                held["targets"] = projected(held["targets"], f"config_groups.{group}.targets")
+                held["targets"] = projected(_records.listed(held["targets"], f"config_groups.{group}.targets",
+                                                            read=_records.text, what="module names"))
             groups[group] = held
         quantization["config_groups"] = groups
     return quantization

@@ -1803,9 +1803,9 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         group = quantization.get("group_size")
         if not isinstance(group, int) or isinstance(group, bool) or group <= 0:
             raise ValueError(f"awq group_size {group!r}: a positive group of inputs per scale")
-        return awq(_integer_bits(quantization, method), group, grid)
+        return awq(_integer_bits(quantization, "awq"), group, grid)
     if method == "gptq":
-        return gptq(_integer_bits(quantization, method),
+        return gptq(_integer_bits(quantization, "gptq"),
                     v1=quantization.get("checkpoint_format", "gptq") == "gptq", grid=grid)
     if method == "modelopt":
         return modelopt_nvfp4(config, quantization, grid)
