@@ -244,7 +244,10 @@ class MultiStepDPM:
         orders = [min(index, 2) + 1 for index in range(times.shape[0] - 1)]
         _check_gaps(_grid_levels(process, times)[1], _history_gaps(orders),
                     reason="its finite differences divide by")
-        coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), jnp.float32)
+        # The history in the dtype the rates take at the run's times, as each step carries them, so a
+        # float64 walk stays float64 (ledger 2063).
+        rates = process.rates(times[0], like=x)[1]
+        coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), rates.dtype)
         return (jnp.zeros_like(x), coefficient, jnp.zeros_like(x), coefficient,
                 jnp.zeros((), jnp.int32))
 
@@ -313,7 +316,9 @@ class LMS:
         orders = [min(index, self.order - 1) + 1 for index in range(times.shape[0] - 1)]
         _check_gaps(_grid_levels(process, times)[1], _history_gaps(orders),
                     reason="LMS's Lagrange basis divides by")
-        sigmas = jnp.ones((self.order, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
+        # The sigmas in the dtype the rates take at the run's times, as each step carries them (2063).
+        rates = process.rates(times[0], like=x)[1]
+        sigmas = jnp.ones((self.order, x.shape[0]) + (1,) * (x.ndim - 1), rates.dtype)
         return jnp.zeros((self.order, *x.shape), x.dtype), sigmas, jnp.zeros((), jnp.int32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):

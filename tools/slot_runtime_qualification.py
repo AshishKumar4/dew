@@ -273,6 +273,9 @@ class ObservedScoring:
     def fits(self, rows):
         return self.task.fits(rows)
 
+    def compile(self, variables):
+        return self.task.compile(variables)
+
     def forward(self, variables, rows):
         self.batch_rows.append(len(rows))
         return self.task.forward(variables, rows)
