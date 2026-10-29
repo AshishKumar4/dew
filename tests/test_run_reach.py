@@ -245,6 +245,7 @@ def test_a_saved_decision_and_image_run_trace_their_helpers_in_their_form(tmp_pa
     from dew.inference.images import TextToImage
 
     for kind, build in (("decision", decision), ("diffusion", diffusion)):
+        (tmp_path / kind).mkdir()
         trained(build(tmp_path / kind, drawn=False), tmp_path, kind,
                 trainer={"attention_form": "accurate", "checkpoint_final": True})
     decide = Decide.from_run(str(tmp_path / "runs" / "decision"))
