@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, lowers
+from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import Mesh
 from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
@@ -1239,6 +1239,7 @@ def test_an_a100_derives_no_mosaic_backward(accurate):
     assert _gated_backward("sm80", 128, accurate)[2] is None
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "accurate"), BACKWARD_GATE)
 def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, width, accurate):
     """The backward at its derived tiles of a causal call `width` wide in the form `accurate` names, lowered
