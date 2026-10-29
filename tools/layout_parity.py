@@ -1310,7 +1310,7 @@ PERMUTATIONS = 16
 """The row orders the floor judge's permutation floor draws (`permutation_floor`)."""
 
 
-_floor_held: dict[tuple[str, str, int | None], tuple[Any, ...]] = {}
+_floor_held: dict[tuple[str, str, int | None, str], tuple[Any, ...]] = {}
 """Each floor-judged model's batch, one-device first step and floors by its dtype and device count, as
 the first layout's `floored` computed them in this process: a model's layouts judge against the same
 reference, so its permutation floor's runs and float64 anchor run once for them all."""
