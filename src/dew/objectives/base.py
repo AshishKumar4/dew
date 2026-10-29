@@ -1381,6 +1381,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return self.model_tree(variables)
 
+    def bind_widths(self, widths: Mapping[str, object]) -> None:
+        """Take the run's static widths, the facts its data's run-scoped steps bound (`Loader.widths`,
+        such as a decision's `slots`), before the run records its task (`task_settings`). An objective
+        whose task pads to none keeps none."""
+        del widths
+
     def task_settings(self) -> DataclassInstance | None:
         """Return the task settings a saved step records beside its model, an
         instance of `settings`, or None when the objective declares no

@@ -161,6 +161,6 @@ def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model
     its sums, and its FLOPs an even split, or it is refused for the reason REFUSED gives."""
     tool, _ = references
     with jax.enable_x64(new_val=True):
-        rows = [tool.floored(model, layout, dtype="float32", devices=devices)]
+        rows = tool.floored(model, (layout,), dtype="float32", devices=devices)
     found, shown = statuses(rows)
     assert found == ["refused" if (model, layout) in REFUSED else "works"], shown
