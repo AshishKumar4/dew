@@ -11,8 +11,13 @@ on its operands zeroed from the next step on. The rule's validation: its nulls (
 draws certify) and its faults, each refused where it lands: a lost block of products, a row read under the
 wrong group, a partial sum rounded to bf16 mid-depth; bf16 products where TF32 is declared and the
 reverse, and operands truncated to TF32 where the tensor cores round them; and a step's partial added by
-the tensor cores' truncating adds where IEEE sums are declared."""
+the tensor cores' truncating adds where IEEE sums are declared. Link 3: the recurrence template's gated
+delta rule with a decay a head, each record its launches store between them held inside its launch step's
+enclosure on the native records the step reads (`recurrence_witness`), its faults a dropped carry, a state
+rounded to bf16 where fp32 is held, the decay from rounded cumulative sums and an off-by-one chunk
+boundary."""
 
+import functools
 import itertools
 
 import jax
@@ -20,6 +25,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+import recurrence_witness as rw
 from certified import (
     assert_refused,
     native_dot_ends,
@@ -31,6 +37,8 @@ from certified import (
     truncating_step_ends,
 )
 from generation_support import generations, runs
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
 from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, rounded, truncated
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
@@ -562,3 +570,95 @@ def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narro
                                       forward_products(halves[1], w, SIZES), flushes=False)
         truth = native_dot_ends(products, FLOAT32, flushes=False)
         assert_refused(held, separated(truth, narrowed), NARROW_SHARE)
+
+
+PTX_EX2 = 2
+"""PTX ISA 9.4 §9.7.3.21: "The maximum ulp error is 2 ulp from correctly rounded result across the full
+range of inputs" of ex2.approx.f32, Mosaic GPU's `exp2` under `approx_math`, which the recurrence mainloop's
+launches compile with."""
+
+
+def mosaic_exp2(semantics: str):
+    """Mosaic GPU's `exp2` under `approx_math` on fp32 operands, a multiple of 128 of them, in a kernel
+    lowered with `semantics` (`plgpu.LoweringSemantics`' name: Lane, mma.sync's bundle's; Warpgroup,
+    wgmma's), beside each operand's product with 2^-100 (whether a product below the normal range
+    flushes)."""
+    def body(x_ref, out_ref, tiny_ref):
+        span = pl.ds(jax.lax.axis_index("x") * 128, 128)
+        value = x_ref[span]
+        out_ref[span] = jnp.exp2(value)
+        tiny_ref[span] = value * np.float32(2.0 ** -100)
+
+    def run(x):
+        f32 = jax.ShapeDtypeStruct(np.shape(x), jnp.float32)
+        params = plgpu.CompilerParams(approx_math=True,
+                                      lowering_semantics=getattr(plgpu.LoweringSemantics, semantics))
+        kernel = plgpu.kernel(body, out_type=(f32, f32), grid=(np.size(x) // 128,), grid_names=("x",),
+                              compiler_params=params)
+        return tuple(np.asarray(out, np.float64) for out in jax.jit(kernel)(jnp.asarray(x, jnp.float32)))
+
+    return run
+
+
+@functools.cache
+def mosaic_lane() -> rw.Lane:
+    """The arithmetic the recurrence mainloop's launches run in on this GPU, probed natively in each lowering
+    its bundles take: `exp2`'s reach (`recurrence_witness.exp2_reach`), at most PTX's (`PTX_EX2`, past it a
+    finding), and whether an fp32 product below the normal range flushes (2^-30 times 2^-100); a 16-bit
+    call's. Its fp32 adds, multiplies, contractions and casts to bf16 and fp16 round to nearest, subnormals
+    kept (row 2084's link 3 probe, both GPUs and lowerings)."""
+    reaches, flushes = [], False
+    for semantics in ("Lane", "Warpgroup"):
+        run = mosaic_exp2(semantics)
+        reaches.append(rw.exp2_reach(lambda x, run=run: run(x)[0]))
+        flushes |= bool(np.any(run(np.full(128, 2.0 ** -30, np.float32))[1] == 0))
+    assert max(reaches) <= PTX_EX2, reaches
+    return rw.Lane(max(reaches), flushes, wide=False)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+@pytest.mark.parametrize("regime", rw.REGIMES)
+def test_the_recurrence_templates_records_certify_natively_a_step_at_a_time(generation_name, regime):
+    """Every record of the recurrence template's native bf16 call of three chunks and two value heads on one
+    key head, forced (`generation.chosen`, `recurrence_witness.recorded`), lies inside its launch step's
+    enclosure on the native records the step reads, each chunk's from the fp32 memory it enters, under each
+    regime of decay (`REGIMES`): its inverses, weighted keys, corrected values, outputs, and stored and fp32
+    memories; the certify build is the production program bit for bit, and each chunk's stored entering
+    memory is the fp32 memory the chunks before it leave, rounded as stored (end_j == start_{j+1})."""
+    with generation.assumed(generation_name):
+        run = rw.recorded(*rw.draw(0, regime, heads=2))
+    held = rw.witness(run, mosaic_lane())
+    assert np.all(run.seams)
+    for name in rw.RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively(
+        generation_name):
+    """The native step witness's faults, each refused where it lands (`certified.assert_refused`), a memory
+    kept across chunks (`REGIMES`' 'slow'): a document starting at the second chunk, whose zero memory is
+    refused at more than 95% of the memory the first chunk leaves (99.99% on an A100 and an H100); and the
+    second chunk run from that memory rounded to bf16 where fp32 is held, refused at more than 60% of the fp32
+    memory it leaves (74%)."""
+    with generation.assumed(generation_name):
+        operands = rw.draw(1, "slow", chunks=2, heads=2)
+        truth = rw.recorded(*operands)
+        assert_refused(*rw.dropped_refusals(operands, truth, 1, mosaic_lane()), 0.95)
+        assert_refused(*rw.handed_refusals(operands, truth, 1, mosaic_lane()), 0.6)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_the_recurrence_step_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary_natively(
+        generation_name):
+    """The native step witness's faults, each refused where it lands (`recurrence_witness.assert_refusals`):
+    the decay from a difference of fp32 cumulative sums (row 2066's defect) in a decay alone, refused at more
+    than 50% of the fp32 memory each chunk leaves (75% on an A100 and an H100; the 16-bit records' grid hides
+    it, and a write beside the decay its rounding's share); and each chunk's boundary a token early, at more
+    than 95% of the weighted keys, corrected values and outputs (99.9%); no record held where its intervals
+    separate."""
+    with generation.assumed(generation_name):
+        rw.assert_refusals(rw.cumsum_refusals(rw.draw(1, "decay", chunks=2, heads=2), mosaic_lane()),
+                           {"leaving": 0.5})
+        rw.assert_refusals(rw.shifted_refusals(rw.draw(1, "mild", chunks=2, heads=2), mosaic_lane()),
+                           {"w": 0.95, "c": 0.95, "o": 0.95})

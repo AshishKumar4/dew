@@ -398,13 +398,27 @@ def ulps(iv: Iv, record, fmt: Format) -> np.ndarray:
 def exp2_reach(native) -> int:
     """The most steps of the fp32 grid `native(x)`, an fp32 `exp2` of fp32 operands, lies from `2^x` correctly
     rounded (`op_certificates.exp2_rounded`), over the fractions `algebra.raised` and `algebra.decayed` take,
-    (-2, 2), densely, and the integers there, exact cases."""
+    (-2, 2): 2^17 of them, densely and drawn, the integers there (exact cases) among them."""
     from op_certificates import exp2_rounded
 
     rng = np.random.default_rng(2084)
     x = np.concatenate([np.linspace(-2, 2, 1 << 16, dtype=np.float32), np.arange(-2, 3, dtype=np.float32),
-                        rng.uniform(-2, 2, 1 << 16).astype(np.float32)])
+                        rng.uniform(-2, 2, (1 << 16) - 5).astype(np.float32)])
     return int(np.max(np.abs(_index(np.asarray(native(x), np.float64)) - _index(exp2_rounded(x, FLOAT32)))))
+
+
+RECORDS = ("a", "w", "c", "o", "h", "leaving")
+"""The records the witness holds (`enclosed`)."""
+
+
+def interpreted_lane() -> Lane:
+    """The arithmetic Mosaic GPU's interpreter runs a launch in, a CPU process's XLA: its `exp2`'s reach
+    (`exp2_reach`) and whether it flushes (`certified.lane`), a 16-bit call."""
+    import jax
+    import jax.numpy as jnp
+    from certified import lane
+
+    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes, wide=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -672,3 +686,14 @@ def dropped_refusals(operands: tuple, truth: Run, at: int, lane: Lane) -> tuple[
     leaving = enclosed(truth, lane)["leaving"]
     stored = stored_memory(Iv(leaving.lo[at - 1], leaving.hi[at - 1]), lane)
     return within(faulty.h[at], stored), separated(stored, point(np.zeros_like(stored.lo)))
+
+
+def assert_refusals(found: dict, shares: dict) -> None:
+    """A fault's refusals by record (`refusals`): no record held where its intervals separate, and those more
+    than `shares[record]` of each record where the fault is claimed to land (`certified.assert_refused`)."""
+    from certified import assert_refused
+
+    for name, (held, apart) in found.items():
+        assert not np.any(held & apart), name
+    for name, share in shares.items():
+        assert_refused(*found[name], share)
