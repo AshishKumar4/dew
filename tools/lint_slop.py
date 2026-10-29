@@ -52,7 +52,7 @@ Scope is per rule, because the rules are not all about the same thing:
   construction, which keeps what its constructor computed in float32; its
   twin is built inside tools/torch_precision.py's `float64`
   (`lint_promotions`).
-- SLOP023 is about `src/<package>`: a JAX array is never divided by a literal
+- SLOP024 is about `src/<package>`: a JAX array is never divided by a literal
   that is no power of two, which XLA computes as a product with the literal's
   rounded reciprocal, not correctly rounded (rows 1402, 1403); `precision.
   divided` divides as IEEE does. It reports only an operand it proves is an
@@ -672,7 +672,7 @@ def jax_private(module: Module) -> Iterator[Finding]:
 
 
 ARRAY_MODULES = ("jax.numpy", "jax.lax", "jax.nn", "jax.random", "jax.scipy")
-"""The modules whose functions return JAX arrays (but `ARRAY_FACTS`), which SLOP023 proves an operand by."""
+"""The modules whose functions return JAX arrays (but `ARRAY_FACTS`), which SLOP024 proves an operand by."""
 ARRAY_FACTS = {"dtype", "finfo", "iinfo", "issubdtype", "result_type", "promote_types", "can_cast", "shape",
                "ndim", "size", "isdtype"}
 """The functions of `ARRAY_MODULES` that return no array: a dtype, its facts, a shape or a count."""
@@ -703,7 +703,7 @@ def _resolved(node: ast.expr, bound: dict[str, str]) -> str:
 
 
 def _array(node: ast.expr, bound: dict[str, str], arrays: set[str]) -> bool:
-    """Whether SLOP023 proves `node` a JAX array: a call of a function of `ARRAY_MODULES` but its facts, a
+    """Whether SLOP024 proves `node` a JAX array: a call of a function of `ARRAY_MODULES` but its facts, a
     method or subscript of an array, arithmetic with one, or a name in `arrays` (a parameter annotated as
     one)."""
     if isinstance(node, ast.Call):
@@ -735,7 +735,7 @@ def _rounded_divisor(node: ast.expr) -> float | None:
 
 
 def divisions(module: Module) -> Iterator[Finding]:
-    """SLOP023: a JAX array (`_array`) divided by a literal no power of two (`_rounded_divisor`), a
+    """SLOP024: a JAX array (`_array`) divided by a literal no power of two (`_rounded_divisor`), a
     parameter annotated as an array read as one within its function."""
     bound = _modules_bound(module.tree)
     scope: dict[ast.AST, ast.AST] = {}
@@ -758,7 +758,7 @@ def divisions(module: Module) -> Iterator[Finding]:
             continue
         value = _rounded_divisor(divisor)
         if value is not None and _array(numerator, bound, arrays[scope.get(node, module.tree)]):
-            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP023",
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP024",
                           f"divides a JAX array by {value!r}, which XLA computes as a product with its "
                           "rounded reciprocal, not correctly rounded; divide with precision.divided")
 

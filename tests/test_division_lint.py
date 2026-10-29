@@ -1,4 +1,4 @@
-"""SLOP023: in the library, a JAX array is never divided by a literal that is no power of two, which XLA
+"""SLOP024: in the library, a JAX array is never divided by a literal that is no power of two, which XLA
 computes as a product with the literal's rounded reciprocal, not correctly rounded (rows 1402, 1403);
 `dew.nn.precision.divided` divides as IEEE does. The rule reports only an operand it proves is a JAX
 array: a call of jax.numpy, jax.lax, jax.nn, jax.random or jax.scipy, a method or a subscript of one,
@@ -52,10 +52,10 @@ def _codes(lint, tmp_path, parts, body):
 @pytest.mark.parametrize("case", list(DIVISIONS))
 def test_a_jax_array_divided_by_a_literal_no_power_of_two_is_reported_in_the_library(lint, case, tmp_path):
     body, count = DIVISIONS[case]
-    assert _codes(lint, tmp_path, ("src", "dew", "case.py"), body).count("SLOP023") == count
+    assert _codes(lint, tmp_path, ("src", "dew", "case.py"), body).count("SLOP024") == count
 
 
 def test_the_rule_reads_the_library_alone(lint, tmp_path):
     body = "import jax.numpy as jnp\ndef f(x):\n    return jnp.mean(x) / 3.0"
-    assert "SLOP023" not in _codes(lint, tmp_path, ("tests", "test_case.py"), body)
-    assert "SLOP023" not in _codes(lint, tmp_path, ("tools", "case.py"), body)
+    assert "SLOP024" not in _codes(lint, tmp_path, ("tests", "test_case.py"), body)
+    assert "SLOP024" not in _codes(lint, tmp_path, ("tools", "case.py"), body)
