@@ -5,11 +5,12 @@ from .api import LatentNormalization, ModuleAutoEncoder
 from .kl import AutoencoderKL
 
 
-def published_normalization(config: dict) -> tuple[float, float]:
-    """An AutoencoderKL config's latent shift and scale: its `shift_factor`
-    (0 where absent or null) and `scaling_factor` (SD1's 0.18215 where absent),
-    read alike by a standalone load and a pipeline's (`load_kl_vae`)."""
-    return config.get("shift_factor") or 0.0, config.get("scaling_factor", 0.18215)
+def published(config: dict, dtype) -> tuple[AutoencoderKL, float, float]:
+    """An AutoencoderKL config's model, computing in `dtype`, and its latent shift and scale: its
+    `shift_factor` (0 where absent or null) and `scaling_factor` (SD1's 0.18215 where absent), built
+    alike by a standalone load and a pipeline's (`load_kl_vae`)."""
+    return (AutoencoderKL.from_diffusers(config, dtype), config.get("shift_factor") or 0.0,
+            config.get("scaling_factor", 0.18215))
 
 
 class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
@@ -36,8 +37,7 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
 
             _, params, _, config = load_kl_vae(modelname, dtype, revision=revision, subfolder=None,
                                                params=params)
-            model = AutoencoderKL.from_diffusers(config, dtype)
-            shift, scale = published_normalization(config)
+            model, shift, scale = published(config, dtype)
             latent_shift = shift if latent_shift is None else latent_shift
             latent_scale = scale if latent_scale is None else latent_scale
         if params is None:

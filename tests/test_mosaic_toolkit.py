@@ -157,7 +157,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0):
             first = jnp.int32(lo)
             # A plain walk's views take its own step indices, as a producer's stream gives them.
             views = {'p': (p_gmem, lambda j: (0, j - first)), 'x': (x_gmem, lambda j: (j - first, 0))}
-            feed = family.fed(family.opened(streams), views, first, first + FED_STEPS, wg, first=first)
+            feed = family.fed(family.opened(streams), views, first, first + FED_STEPS, wg)
 
             def step(at, slots, carry, accumulators):
                 del at

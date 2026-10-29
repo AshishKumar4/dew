@@ -159,6 +159,11 @@ class Mma(mosaic.Family):
         per_thread = -(-columns * 2 // (4 // self.m_warps * 8))
         return -(-per_thread * jnp.dtype(dtype).itemsize // 4)
 
+    def row_registers(self, rows: int, dtype) -> int:
+        # Each of the `m_warps` row warps' 16-row tiles a thread's two rows (`MMALayouts`' accumulator
+        # tiling), so a thread holds two of each `m_warps * 16` rows.
+        return -(-rows * 2 * jnp.dtype(dtype).itemsize // (self.m_warps * 16 * 4))
+
     def column_unit(self, dtype) -> int:
         # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
         # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64
@@ -353,8 +358,7 @@ class Mma(mosaic.Family):
         return plgpu.load(lhs, layout=self.lhs)
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
-        out = plgpu.mma(self.zeros(shape), self._left(lhs), plgpu.load(rhs, layout=self.rhs),
-                        m_warps=self.m_warps)
+        out = self.products(self.zeros(shape), lhs, rhs, interpret=False)
         if then is not None:
             then()
         return out
@@ -363,8 +367,6 @@ class Mma(mosaic.Family):
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        if isinstance(lhs, jax.Array):
-            return plgpu.mma(acc, self._left(lhs), plgpu.load(rhs, layout=self.rhs), m_warps=self.m_warps)
         # The left operand a step deep, sliced in registers along the depth at its layout's tiles; the
         # right one a sub-step at a time from the stage (`fragment_depth`), along its rows' 8-row tiles,
         # or, a transposed view (whose rows are a swizzled tile's columns, no narrower slice of which
@@ -386,10 +388,8 @@ class Mma(mosaic.Family):
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
     def register_products(self, acc, parts, rhs, interpret: bool):
-        del interpret
-        operand = plgpu.load(rhs, layout=self.rhs)
         for formed in parts:
-            acc = plgpu.mma(acc, self._left(mosaic.unscaled_part(formed)), operand, m_warps=self.m_warps)
+            acc = self.products(acc, mosaic.unscaled_part(formed), rhs, interpret)
         return acc
 
     def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
