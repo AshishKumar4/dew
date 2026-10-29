@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dew.cache import HubAnswer, hub_answer, recorded_hub_answer
+from dew.cache import HubAnswer, hub_answer, hub_commit, recorded_hub_answer
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
@@ -79,23 +79,14 @@ class Hub(Dataset):
 
     @cached_property
     def commit(self) -> str:
-        """The commit `revision` names, the default branch's where None, as the Hub last answered
-        (`dew.cache.hub_answer`): online its answer, recorded; offline (`HF_HUB_OFFLINE`) the
+        """The commit `revision` names, the default branch's where None (`dew.cache.hub_commit`):
+        online the Hub's answer, recorded; offline (`HF_HUB_OFFLINE`) the cache's ref, else the
         answer recorded online."""
         return self._pinned.value
 
     @cached_property
     def _pinned(self) -> HubAnswer[str]:
-        from huggingface_hub import HfApi
-
-        def ask() -> str:
-            commit = HfApi().dataset_info(self.repo, revision=self.revision).sha
-            if commit is None:
-                raise ValueError(f"HF {self.repo!r} did not resolve to a commit")
-            return commit
-
-        # A git revision is never named HEAD but the default branch is.
-        return hub_answer(("dataset commit", self.repo, self.revision or "HEAD"), ask)
+        return hub_commit(self.repo, self.revision, repo_type="dataset")
 
     @property
     def builder(self):
