@@ -112,6 +112,9 @@ even split (the DiT's fsdp2_sequence2 1.016), and a repeated matmul path 8%
 and more (the DiT's text projection under fsdp2_tensor2 9%, the dense
 decoder's head under fsdp2_tensor2 18%)."""
 
+ORDERS_OUT = Path("out/layout-parity-orders")
+"""Where a model with residual orders keeps its orders' files by default (`run_orders`)."""
+
 LAYOUTS: dict[str, dict[str, int]] = {
     "data4": {},
     "fsdp4": {"fsdp": 4},
@@ -1397,8 +1400,7 @@ def _floor_reference(model: str, case, reference, dtype: str, devices: int | Non
 
 def floored(model: str, layouts: Sequence[str], *, dtype: str, devices: int | None = None,
             mixture: dict[str, Any] | None = None, objective: dict[str, Any] | None = None,
-            out: Path = Path("out/layout-parity-orders"),
-            speak: Callable[[str], None] = lambda line: None) -> list[dict[str, Any]]:
+            out: Path = ORDERS_OUT, speak: Callable[[str], None] = lambda line: None) -> list[dict[str, Any]]:
     """Each of `layouts`' first step on `model` held to the one-device reference by the floor judge
     (`_floored`), a row each; a model with residual orders judged over them once for all its layouts
     instead (`run_orders`, its files under `out`), as `run` judges it. `mixture` and `objective` are
@@ -1874,12 +1876,11 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, seeds: int
     for model in models:
         case, reference = model_case(model, dtype, mixture, objective)
         count = seeds if isinstance(seeds, int) else seeds[model]
-        # A run of no draws runs each layout once (`ran`), a model with residual orders as any other.
+        # A run of no draws runs each layout once (`ran`), a model with residual orders as any other;
+        # with draws its orders judge it, as `floored` does.
         if case.orders and count:
-            with jax.enable_x64(new_val=True):
-                rows.extend(run_orders(
-                    [model], layouts, dtype=dtype, devices=devices, mixture=mixture, objective=objective,
-                    out=Path('out/layout-parity-orders') if orders_out is None else orders_out, speak=speak))
+            rows.extend(floored(model, layouts, dtype=dtype, devices=devices, mixture=mixture,
+                                objective=objective, out=orders_out or ORDERS_OUT, speak=speak))
             keep(rows)
             continue
         window = windows if isinstance(windows, int) else windows.get(model, 1)
@@ -2000,7 +2001,7 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
             out.write_text(json.dumps(rows, indent=1))
 
     mixed, aimed = json.loads(mixture), json.loads(objective)
-    orders_out = Path('out/layout-parity-orders') if out is None else out.parent / f'{out.stem}-orders'
+    orders_out = ORDERS_OUT if out is None else out.parent / f'{out.stem}-orders'
     if seeds is None:
         # The floor judge, which CI's matrix and its multi-host gangs run until check 1's draws shard
         # across tasks (`floored`): a layout at a time, through agreed phases on a pool, a model with
