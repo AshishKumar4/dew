@@ -108,6 +108,32 @@ def test_llada2s_task_walks_as_its_release_and_generates_the_recorded_prompts():
     assert (rebuilt.solver, rebuilt.block, rebuilt.steps) == (walked.solver, walked.block, walked.steps)
 
 
+def test_llada2s_task_continues_stops_and_takes_a_zero_budget():
+    """LLaDA2's blockwise task over padded rows: its greedy reveal draws every continuation of a prompt
+    alike (`n`); an end token it draws stops a row there, the rest padding; and a zero budget returns
+    the prompts with no response and no refinement."""
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
+    task = replace(source.text_generation(), block=4, steps=4)
+    tokens = jnp.asarray([[0, 3, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
+    inputs = ModelInputs(tokens, {"attention_mask": jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]],
+                                                                bool)})
+    single = task(inputs, 8, key=7).host()
+    many = task(inputs, 8, key=7, n=3).host()
+    np.testing.assert_array_equal(many.tokens.reshape(3, 3, 12), np.repeat(single.tokens[:, None], 3, 1))
+    eos = int(single.tokens[0, 5])
+    stopped = replace(task, eos_token_ids=(eos,))(inputs, 8, key=7).host()
+    for row, response in enumerate(single.tokens[:, 4:]):
+        hits = np.flatnonzero(response == eos)
+        length = int(hits[0]) + 1 if hits.size else 8
+        assert (int(stopped.lengths[row]), bool(stopped.terminated[row])) == (length, bool(hits.size))
+        np.testing.assert_array_equal(stopped.tokens[row, 4:4 + length], response[:length])
+        np.testing.assert_array_equal(stopped.tokens[row, 4 + length:], task.pad_token_id)
+    empty = task(inputs, 0, key=7, n=2).host()
+    np.testing.assert_array_equal(empty.tokens, np.repeat(np.asarray(tokens), 2, axis=0))
+    np.testing.assert_array_equal(empty.lengths, 0)
+    np.testing.assert_array_equal(empty.decoder_steps, 0)
+
+
 def test_confident_spreads_a_fixed_quota_where_no_block_is_walked():
     """Without a block, `Confident`'s quota spreads the slots masked at the walk's first step over its
     steps, fixed: eight masked slots over three steps reveal 3, 3 and 2 at a threshold no draw passes,
