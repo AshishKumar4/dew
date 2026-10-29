@@ -60,7 +60,7 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
 
 
 def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
-                     stages: int, columns: int = 1, scaled: bool = False) -> tuple[list, dict]:
+                     stages: int, columns: int = 1) -> tuple[list, dict]:
     """The dK/dV program's allocations as `Family.scoped` takes them, in `_dkv_launch`'s order: its
     consumers' resident keys and values; dK's output stage and dV's (the one stage where the widths agree),
     fp32, each its program's share of the `columns`; each consumer's
@@ -81,9 +81,6 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
               plgpu.SMEM((holders, block_k), jnp.float32),
               plgpu.Barrier(num_barriers=holders), plgpu.Barrier(num_barriers=holders)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, value_width), dtype)}
-    if scaled:
-        # The queries taken by the call's power, the logits' operand (`_Backward.scaled`).
-        blocks["logits"] = ((block_q, width), dtype)
     swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
     return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles)
 
@@ -154,8 +151,8 @@ class _Backward:
 
     @property
     def scaled(self) -> bool:
-        """Whether the call's queries take a power for their logits (`by_power`): the dQ launch's queries,
-        and the keys-first dK/dV launch's logits' stream beside the call's own, which dK takes."""
+        """Whether the dK/dV program's logits take the query's power (`by_power`), after their product of the
+        call's own streamed queries, which dK takes."""
         return self.spec.prescale != 1.0
 
     @property
@@ -389,16 +386,16 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     shape = (tiles.block_k, count)
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
-    # The logits from the queries taken by the call's power (the forward's `(Q 2^p) Kᵀ`, a stream of their
-    # own, `_Backward.scaled`), dK from the call's own: the power taken after the product passes fp32's
-    # largest where the forward's logits do not (Q 2^120 over keys of 8 at width 64 and scale 1/8), and a
-    # query staged by it a step cost a third of the launch (ET-SWAPABL-h100: 3.32 against 2.21 ms causal at
-    # Qwen3-8B 2 x 4096).
-    l_slot = slots["logits"] if walk.scaled else q_slot
     if count != tiles.block_q:
-        q_slot, do_slot, l_slot = (slot.at[pl.ds(first_row, count)] for slot in (q_slot, do_slot, l_slot))
+        q_slot, do_slot = q_slot.at[pl.ds(first_row, count)], do_slot.at[pl.ds(first_row, count)]
     q_first = index * tiles.block_q + first_row
-    s = family.product(k_smem, l_slot.transpose((1, 0)), shape)
+    # The logits from the call's queries, the power taken after the product, exact in fp32: the forward's
+    # `(Q 2^p) Kᵀ` but where a query's entry times the power leaves bf16's normal range (below 2^-126). A
+    # query staged by the power a step cost a third of the launch (ET-SWAPABL-h100: 3.32 against 2.21 ms
+    # causal at Qwen3-8B 2 x 4096); the keys by it would differ where a key leaves that range instead.
+    s = family.product(k_smem, q_slot.transpose((1, 0)), shape)
+    if walk.scaled:
+        s = s * walk.spec.prescale
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
@@ -700,15 +697,13 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
 
 
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
-                score_params: tuple, drop: Dropout | None, *, walk: _Backward,
-                scaled: jax.Array | None = None) -> tuple[jax.Array, ...]:
+                score_params: tuple, drop: Dropout | None, *, walk: _Backward) -> tuple[jax.Array, ...]:
     """`_dkv_columns`' launch of each of the config's `columns`, its share of dK's and dV's columns (the
-    score hook's key and tile gradients the first's), dK and dV joined along their widths; `scaled`, the
-    queries taken by the call's power where they take one (`_Backward.scaled`), their logits' operand."""
+    score hook's key and tile gradients the first's), dK and dV joined along their widths."""
     columns = walk.program.tiles.columns
     width, value_width = query.shape[-1] // columns, value.shape[-1] // columns
     launched = [_dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index, spans,
-                             score_params, drop, scaled, walk=walk,
+                             score_params, drop, walk=walk,
                              shares=((column * width, width), (column * value_width, value_width)))
                 for column in range(columns)]
     if columns == 1:
@@ -718,8 +713,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 
 def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
-                 score_params: tuple, drop: Dropout | None, scaled: jax.Array | None, *, walk: _Backward,
-                 shares: tuple) -> tuple[jax.Array, ...]:
+                 score_params: tuple, drop: Dropout | None, *, walk: _Backward, shares: tuple
+                 ) -> tuple[jax.Array, ...]:
     """The dK/dV program under the dQ program's softmax: each consumer's `block_k` keys of a query head,
     resident, walked by the query tiles that see them, streamed with their output cotangents through a ring
     each; a tile's weights and score cotangents (the algebra's, rows the keys, `_dkv_step`) the transposed
@@ -741,17 +736,16 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     stages = min(program.tiles.stages, q_steps)
     graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
-    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop, scaled))
+    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop))
 
     def body(*refs, streams):
-        inputs, (spans_of, score_refs, drop_of, l_ref), (dk_ref, dv_ref), held, (key_refs, tile_refs) = (
+        inputs, (spans_of, score_refs, drop_of), (dk_ref, dv_ref), held, (key_refs, tile_refs) = (
             _dkv_refs(refs, treedef, len(leaves), graded, widths=value_width == width))
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded = held
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
 
-        streamed_refs = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
-        views = _views_of(streamed_refs, row, head)
+        views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
         holders = 1 if split else consumers
@@ -816,7 +810,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         return family.roles(consumers, consumer, producer)
 
     scoped, rings = _dkv_allocations(family, program.tiles, width, value_width, query.dtype, stages=stages,
-                                     columns=program.tiles.columns, scaled=scaled is not None)
+                                     columns=program.tiles.columns)
 
     def entry(*refs):
         summed = family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
@@ -965,12 +959,10 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      approx_math)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
-    # The queries taken by the call's power, the logits' operand of every launch (`_Backward.scaled`).
-    scaled = by_power(query, prescale)
     if drop is not None:
         # A dropping call's D its dropped products' own, centred about each query's least one
         # (`algebra.dropout_centre`): no anchor, and no key chosen.
-        centre = _centre_launch(scaled, key, value, dout, maximum, spans, score_params,
+        centre = _centre_launch(by_power(query, prescale), key, value, dout, maximum, spans, score_params,
                                 drop, walk=walk)
         anchor = jnp.zeros_like(anchor)
         delta = algebra.centre_finish(centre, state_total, initial_term, algebra.centre_scale(spec.keys))
@@ -987,7 +979,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])
     # The dQ program reads its queries for their logits alone.
-    dq_sum, keyed, rows = _dq_launch(scaled, key, value, dout, maximum, forward_total,
+    dq_sum, keyed, rows = _dq_launch(by_power(query, prescale), key, value, dout, maximum, forward_total,
                                      anchor, delta, chosen, spans, score_params, drop, walk=walk)
     count = sum(walk.summed)
     dq_swapped = jnp.swapaxes(dq_sum, 1, 2)
@@ -999,8 +991,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                                                                   (total0, initial_term), maximum, anchor,
                                                                   delta, accurate=accurate)
     dk, dv, *key_tile = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen,
-                                    spans, score_params, drop, walk=dkv_walk,
-                                    scaled=scaled if walk.scaled else None)
+                                    spans, score_params, drop, walk=dkv_walk)
     summed_kinds = [kind for kind in score_kinds if kind in DQ_GRADS]
     head_query = tuple(grad.sum(axis=-1)[None, :, :, None] if kind == Kind.HEAD else grad
                        for grad, kind in zip(dq_grads, summed_kinds, strict=True))
