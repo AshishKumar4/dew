@@ -218,22 +218,19 @@ def train_and_reload(source, reference, key, given, noise):
 
 
 def check_pipeline(directory, streamed: bool = False):
-    """The saved pipeline's trajectory, update, reload and export against the source, loaded whole or,
-    with `streamed`, streamed onto a mesh a leaf at a time: the whole load's tree, bit for bit, each
-    leaf placed on the mesh (`streamed_parity`), every component and its walk held to the source as
-    the whole load's are (`qualified`), another program than the whole load's, which XLA need not round
-    alike, and the pipeline the update, reload and export run on. The two loads are two runs, each
-    its own process's (tests/test_native_diffusion.py), so neither waits on the other's programs."""
+    """The saved pipeline's trajectory, update, reload and export against the source. With
+    `streamed`, the pipeline streamed onto a mesh a leaf at a time loads the same tree, placed on the
+    mesh, its trajectory's images are held to the source as the whole load's are, and it is the
+    pipeline the update, reload and export run on (`streamed_parity`)."""
     directory = Path(directory)
     source = bundle(directory)
-    if streamed:
-        source = streamed_parity(directory, source)
     reference = np.load(directory / "reference.npz")
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     errors, key = {}, jax.random.PRNGKey(17)
     given, null, process, times = selection(source, meta)
-    _, given = qualified(errors, directory.name, source, reference, meta, key, given, null, process, times,
-                         label="streamed_" if streamed else "")
+    _, given = qualified(errors, directory.name, source, reference, meta, key, given, null, process, times)
+    if streamed:
+        source, given = streamed_parity(errors, directory, source, reference, meta, key)
     training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
     errors["reload"] = 0.0
     print(json.dumps({"directory": str(directory), "errors": errors, "training": training}))
@@ -281,9 +278,12 @@ def qualified(errors, name, source, reference, meta, key, given, null, process, 
     return images, given
 
 
-def streamed_parity(directory, whole):
-    """The pipeline streamed onto a mesh a leaf at a time, holding every leaf the `whole` load holds,
-    bit for bit, each placed on the mesh."""
+def streamed_parity(errors, directory, whole, reference, meta, key):
+    """The pipeline streamed onto a mesh a leaf at a time: every leaf the whole load holds, bit for
+    bit, each placed on the mesh, and every component and its walk held to the source as the whole
+    load's are (`qualified`): another program than the whole load's, which XLA need not round alike.
+    Returns the streamed pipeline and its walk's conditions, for the update, reload and export to
+    run on."""
     streamed = bundle(directory, streamed=True)
     assert jax.tree.structure(streamed.variables) == jax.tree.structure(whole.variables)
     for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables):
@@ -291,7 +291,10 @@ def streamed_parity(directory, whole):
     for left, right in zip(jax.tree.leaves(streamed.variables), jax.tree.leaves(whole.variables),
                            strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
-    return streamed
+    given, null, process, times = selection(streamed, meta)
+    _, given = qualified(errors, directory.name, streamed, reference, meta, key, given, null, process, times,
+                         label="streamed_")
+    return streamed, given
 
 
 def check_grids(directory, grids, case=None):
