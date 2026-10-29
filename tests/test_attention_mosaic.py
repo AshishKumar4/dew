@@ -410,6 +410,33 @@ second wholly padding (the accurate form's one consumer pads 64 queries to no mo
 
 
 @INTERPRETS
+@pytest.mark.parametrize("form", HOOKED_FORMS)
+def test_the_keys_first_backward_keeps_the_logits_the_forward_keeps_finite_interpreted(form):
+    """Queries of 2^120 over keys of 4, one of 8, 64 wide at the scale 1/8: the forward's logits, the
+    queries taken by the scale's power before their products (`attention.prescale`), are 2^125 and 2^126,
+    where the unscaled products pass fp32's largest. The keys-first dK/dV launch takes the power on its
+    keys before its products, so its weights are the forward's, one-hot on the key of 8, and every gradient
+    is the float64 reference's to the bit: dV that key's the queries' summed cotangents, dQ and dK zero."""
+    tokens, width = 64, 64
+    spans = template.spans(tokens, tokens, 1)
+    query = jnp.full((1, tokens, 1, width), 2.0 ** 120, jnp.bfloat16)
+    key = jnp.full((1, tokens, 1, width), 4.0, jnp.bfloat16).at[:, 1].set(8.0)
+    value = jnp.broadcast_to(jnp.arange(tokens, dtype=jnp.bfloat16)[None, :, None, None], key.shape)
+    dout = jnp.ones((1, tokens, 1, width), jnp.bfloat16)
+    accurate, config = _backward_form(form)
+    with _device(interpret=True), _pinned(FORM_TILES, config):
+        residuals = attention_mosaic.forward(query, key, value, spans, residuals=True, interpret=True)[1:]
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                          accurate=accurate, interpret=True)
+    with jax.enable_x64(new_val=True):
+        wide = [jnp.asarray(np.asarray(array, np.float64)) for array in (query, key, value, dout)]
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), *wide[:3])
+        expected = pull(wide[3])
+    for found, truth in zip((grads.query, grads.key, grads.value), expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(found, np.float64), np.asarray(truth))
+
+
+@INTERPRETS
 @pytest.mark.parametrize(("queries", "form"), PADDED_CALLS.values(), ids=PADDED_CALLS)
 def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
     """A call of `queries` queries over as many keys, padded to whole programs, under a hook dividing by a
