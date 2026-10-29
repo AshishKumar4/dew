@@ -252,7 +252,7 @@ def test_the_frozen_product_in_forward_mode_is_the_decoded_kernels_tangent():
     tangent as the input's direction times the decoded kernel (`frozen_fp8_kernel`), the linear map the
     FP8 products stand for, each on par with the dequantized float32 products by check 1 from float64,
     whatever JAX's default matmul precision; the packed leaves take no tangent."""
-    assert_as_exact(default_precision_tangents, without_ynn(decoded_tangents), tangent_case,
+    assert_as_exact(default_precision_tangents, decoded_tangents, tangent_case,
                     "the frozen FP8 product in forward mode", seeds=TANGENT_SEEDS, truth_fn=exact_tangents)
     x, *leaves, _ = tangent_case()
     _, along_leaves = jax.jvp(frozen_fp8_product, (x, *leaves),
