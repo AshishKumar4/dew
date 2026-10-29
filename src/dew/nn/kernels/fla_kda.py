@@ -567,8 +567,12 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
             key = read(k_ref, keys)
             gate = _gates(g_ref, start, taken, chunk, 0, keys)
             final = _row(g_ref, (start + taken - 1, keys))
-            gate_exp = jnp.exp2(gate)
-            decay_grad = decay_grad * jnp.exp2(final)
+            if lo_ref is None:
+                gate_exp, final_exp = jnp.exp2(gate), jnp.exp2(final)
+            else:
+                gate_exp = algebra.raised(gate, _gates(lo_ref, start, taken, chunk, 0, keys))
+                final_exp = algebra.raised(final, _row(lo_ref, (start + taken - 1, keys)))
+            decay_grad = decay_grad * final_exp
             dq = dq * gate_exp * scale
             dk = dk * jnp.exp2(_range(g_ref, lo_ref, start, taken, chunk, keys, gate))
             gated_key = key * gate_exp
