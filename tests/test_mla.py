@@ -1045,7 +1045,8 @@ def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_pr
                           objective=ObjectiveConfig("lm", {"prefix": prefix}), max_new_tokens=0)
     LMRunConfig.cli(["--trainer.steps", "2", "--trainer.name", "prefix", "--trainer.checkpoint-dir",
                      str(tmp_path / "runs"), "--trainer.compilation-cache-dir", "None",
-                     "--trainer.multi-host", "False", "--trainer.log-every", "1"], default=default).run()
+                     "--trainer.multi-host", "False", "--trainer.log-every", "1", "--trainer.eval-every",
+                     "None"], default=default).run()
     restored = TextGeneration.from_run(str(tmp_path / "runs" / "prefix"))
     objective = LMObjective(restored.model, seq, prefix=prefix)
     blocks = np.broadcast_to(np.where(np.arange(seq + 1) < prefix, 1, -1), (2, seq + 1)).astype(np.int32)
