@@ -91,14 +91,22 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     consumers' resident keys and values; a tile's weights and score cotangents staged for the transposed
     products' left operands and dQ's; dK's and dV's output stage, which a tile's dQ adds take too (fp32, the
     head widths equal, `MosaicBackward.legal`); the two loads' barriers; and its query and output-cotangent
-    streams in `stages` slots (`Family.streams`)."""
+    streams and its queries' statistics' (`FUSED_ROWS`) in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     scoped = [plgpu.SMEM((consumers, block_k, width), dtype), plgpu.SMEM((consumers, block_k, width), dtype),
               plgpu.SMEM((consumers, 2, block_q, block_k), dtype),
               plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
               plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
-    blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
+    blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
+              **{name: ((block_q,), jnp.float32 if name != "chosen" else jnp.int32) for name in FUSED_ROWS}}
     return scoped, family.streams(blocks, stages, consumers)
+
+
+FUSED_ROWS = ("peak", "total", "anchor", "delta", "chosen")
+"""The per-query statistics a fused step reads, each streamed beside its queries (FlashAttention-3's
+producer loads its rows' LSE and dPsum so): a tile's rows in shared memory before its products, none held
+in registers across them (read from global memory past them, 2.32 against 2.05 ms the launch at Qwen3-8B
+causal; before them in registers, 60 bytes spilled at 128 x 64 and width 64, ET-A05AB5/6-h100)."""
 
 
 def _holders(family: mosaic.Family, consumers: int) -> int:
@@ -453,12 +461,12 @@ def _unread_tiles(family: mosaic.Family, store_tiles, count: int, shape: tuple[i
         store_tiles(tile * block_q + first, [zeros] * count)
 
 
-def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,
-                carry, accumulators):
+def _fused_step(walk: _Backward, resident: tuple, staged, coords_of, whole, add_dq, index, slots, carry,
+                accumulators):
     """A fused dK/dV consumer's query tile `index`, queries first (`[bq, bk]`, the hookless fast form's
     one launch): its scores and score cotangents from the query and output cotangent slots (`slots`) and its
-    resident keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query)`) and
-    coordinates (`coords_of(first query)`), a tile every query sees whole (`whole(index)`) unmasked. Its
+    resident keys and values (`resident`), under the tile's queries' statistics (their slots, `FUSED_ROWS`)
+    and coordinates (`coords_of(first query)`), a tile every query sees whole (`whole(index)`) unmasked. Its
     weights and score cotangents staged in `staged`, whose transposes are dV's and dK's left operands
     (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`) issued into `accumulators` in place, and the
     cotangents times the resident keys the tile's dQ, added into dQ (`add_dq(first query, dQ)`)."""
@@ -468,17 +476,19 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    # The tile's queries' statistics read before its products, which their loads run under (ET-A05AB5/6-h100:
-    # read past them, 2.32 ms the launch at Qwen3-8B causal; before them, 2.05 against base's 2.09).
-    rows = rows_of(q_first)
     # The logits from the query taken by its power in registers (`_Backward.scaled`), dK from the call's own.
     keys = k_smem.transpose((1, 0))
     s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), keys, walk.interpret)
          if walk.scaled else family.product(q_slot, keys, shape))
     dp = family.product(do_slot, v_smem.transpose((1, 0)), shape)
 
+    # The statistics' slots awaited outside the choice, each branch reading them (a slot acquired in one
+    # branch alone would go unawaited in the other).
+    row_slots = [slots[name] for name in FUSED_ROWS]
+
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
+        rows = tuple(map(family.rows_of, row_slots))
         exponentials, weights, cotangents, _, _ = _scores(walk, coords_of(q_first), (), s, dp, *rows,
                                                           masked=masked)
         return exponentials, weights, cotangents
@@ -518,14 +528,13 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, dk_ref, dv_ref, k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
-        views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
+        views = {**_views_of({"queries": q_ref, "douts": do_ref}, row, head),
+                 **{name: (ref.at[row, head], lambda j: (j,)) for name, ref in zip(FUSED_ROWS, stat_refs,
+                                                                                    strict=True)}}
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(consumers)])
-
-        def rows_of(q_first):
-            return tuple(_rows(family, ref, row, head, q_first, block_q) for ref in stat_refs)
 
         def consumer(index):
             k_first = pair_first + index * block_k
@@ -538,7 +547,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first,
                                           shape=(block_q, block_k))
             adds = functools.partial(_dq_added, walk, dq_ref, out_smem, (row, head), index)
-            step = functools.partial(_fused_step, walk, (k_smem.at[index], v_smem.at[index]), rows_of,
+            step = functools.partial(_fused_step, walk, (k_smem.at[index], v_smem.at[index]),
                                      staged.at[index], coords_of, whole, adds)
             _, (dk, dv) = family.walk(streams, ((step, lo, hi),), (), ((block_k, width), (block_k, width)),
                                       walk.interpret, first=streamed[0])
