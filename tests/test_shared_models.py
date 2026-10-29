@@ -119,9 +119,9 @@ def as_service(held):
 
 
 def live_kernel(service, tmp_path):
-    """The live page's two sides over a tiny run: the guest's client (its contract read from Dew), the tiny run's
-    pipeline, and the shared process's native models serving it, behind the progress reporter, as "model" at
-    "pinned", with the guidance record and solvers it takes from Dew."""
+    """The live page's two sides over a tiny run: the guest's client (its contract read from Dew), the tiny
+    run's pipeline, and the shared process's native models serving it, behind the progress reporter, as
+    "model" at "pinned", with the guidance record and solvers it takes from Dew."""
     import numpy as np
     from test_inference import make_run
 
