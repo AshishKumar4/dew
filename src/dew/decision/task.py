@@ -44,6 +44,7 @@ from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
     OPTION_TILE,
     QUESTION_FIELDS,
+    Bounds,
     DecisionInputs,
     Encoded,
     JointLayout,
@@ -490,15 +491,14 @@ class Decide(SavedRunTask):
         """The shapes a text pass packs its rows into, declared once: windows of the layout's length
         and its halvings (`dew.inference.tasks.length_ladder`), each at a few window counts, one (a lone
         request's pass), the powers of 8 below the most the budget's tokens and rows allow, and that
-        most; each window's question slots a run's window's (`DecisionObjective.bounds`), its options
-        the budget's (`Budget`). Where the budget declares its options, each shape is one
+        most; each window's question slots a run's window's of that length (`DecisionObjective.bounds`),
+        its options the budget's (`Budget`). Where the budget declares its options, each shape is one
         program, which `compile_scoring` compiles."""
         shapes = []
-        for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens)):
+        for length, bounds in self._bounds.items():
             most = max(1, min(self.budget.rows, self.budget.tokens // length))
             counts = sorted({*(8 ** power for power in range(math.floor(math.log(most, 8)) + 1)), most})
-            shapes.extend(PassShape(length, count, self._scoring.bounds.questions, self.budget.options)
-                          for count in counts)
+            shapes.extend(PassShape(length, count, bounds.questions, self.budget.options) for count in counts)
         return tuple(shapes)
 
     def _shape(self, rows: Sequence[Encoded]) -> PassShape:
@@ -518,13 +518,26 @@ class Decide(SavedRunTask):
         return self._packs[shape.length, shape.rows]
 
     @functools.cached_property
+    def _bounds(self) -> dict[int, Bounds]:
+        """Each pass length's window bounds, as a run's windows of that length hold them
+        (`DecisionObjective.bounds`): the layout's window and its halvings, none shorter than the
+        shortest row it lays out or the layout's own shortest (`Layout.shortest_row`)."""
+        smallest = max(len(self._probe[0].tokens), self.layout.shortest_row(self.tokenizer, self.specials))
+        held, segments = self.context_length, self._scoring.segments
+        return {length: replace(self.layout, max_len=length).bounds(
+            self.tokenizer, self.specials, held, segments, None if held is None else max(length, held))
+            for length in length_ladder(self.layout.max_len, smallest)}
+
+    @functools.cached_property
     def _packs(self) -> dict[tuple[int, int], Pack]:
         """Each pass shape's packing (`packing`), by its length and windows."""
         from dew.decision.rows import packing
 
-        held = packing(self.layout, self._scoring.bounds, self._scoring.context_window, trained=False)
-        return {(shape.length, shape.rows): replace(held, seq_len=shape.length, bins=shape.rows)
-                for shape in self.pass_shapes}
+        held = self.context_length
+        return {(shape.length, shape.rows): replace(
+            packing(replace(self.layout, max_len=shape.length), self._bounds[shape.length],
+                    None if held is None else max(shape.length, held), trained=False), bins=shape.rows)
+            for shape in self.pass_shapes}
 
     def _placed(self, rows: Sequence[Encoded], shape: PassShape) -> list[int] | None:
         """The window of `shape` each of `rows` goes to, in order (`dew.data.tokens.FirstFit`), or None
@@ -681,7 +694,7 @@ class Decide(SavedRunTask):
             raise ValueError(f"{len(rows)} rows pack into {len(windows)} windows of {shape.length} "
                              f"tokens, more than the {shape.rows} the pass holds; `fits` says which rows "
                              "a pass holds")
-        bounds = self._scoring.bounds
+        bounds = self._bounds[shape.length]
         in_context = isinstance(self.layout, JointLayout) and self.layout.schema_in_context
         # A joint layout's windows hold their real options in as many slots as its bounds allow, as a
         # run's (`DecisionObjective.data`).

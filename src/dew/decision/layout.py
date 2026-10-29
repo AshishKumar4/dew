@@ -443,6 +443,20 @@ class Layout:
             return "unfit"
         return "options_alike" if row.options_alike else None
 
+    def shortest_row(self, encoder: Tokenizer, specials: Specials) -> int:
+        """The tokens of the shortest row this layout lays out, one one-option question about an empty
+        state, laid out with room to spare: `bounds`' unit, which no window shorter holds."""
+        return self._laid_size(encoder, specials, 1)[0]
+
+    def _laid_size(self, encoder: Tokenizer, specials: Specials, *options: int) -> tuple[int, int]:
+        """A row's tokens and its context's, of a question of each of `options` one-option questions about
+        an empty state, laid out with room to spare (`bounds`)."""
+        roomy = dataclasses.replace(self, max_len=1 << 30)
+        asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
+                 for index, count in enumerate(options)}
+        laid = roomy.rows(encoder, specials, "", asked, tokens=self.state(encoder, specials, ""))
+        return sum(len(row.tokens) for row in laid), sum(len(row.context or ()) for row in laid)
+
     def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None,
                segments: int | None = None, context_window: int | None = None) -> Bounds:
         """The most rows, at most `segments`, questions and options a window of `max_len` tokens
@@ -468,11 +482,7 @@ class Layout:
                              "context's length; give its context_length")
 
         def size(*options: int) -> tuple[int, int]:
-            # A row's tokens and its context's, of a one-option question about an empty state for each.
-            asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
-                     for index, count in enumerate(options)}
-            laid = roomy.rows(encoder, specials, "", asked, tokens=empty)
-            return sum(len(row.tokens) for row in laid), sum(len(row.context or ()) for row in laid)
+            return self._laid_size(encoder, specials, *options)
 
         row, held = size(1)
         if row > self.max_len:
