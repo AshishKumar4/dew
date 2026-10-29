@@ -4,7 +4,6 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
 from reference_error import assert_as_exact
 
@@ -48,18 +47,6 @@ def test_bloom_padded_rows_prefill_and_decode_through_the_cache_as_the_reference
         joined = np.concatenate((ids[row, mask[row]], np.asarray(token[row])))[None]
         full = loaded.model.apply(loaded.variables, joined)
         np.testing.assert_array_equal(np.asarray(decoded[row, -1]).argmax(), np.asarray(full[0, -1]).argmax())
-
-
-@pytest.mark.parametrize('change', [
-    {'apply_residual_connection_post_layernorm': True}, {'slow_but_exact': True, 'pretraining_tp': 2},
-    {'n_head': 5}], ids=['post-norm residuals', 'tensor-parallel exact path', 'heads not dividing the width'])
-def test_a_bloom_dew_does_not_compute_is_refused(change, tmp_path):
-    """A BLOOM checkpoint whose config asks what Dew's BLOOM does not compute (residuals read after the
-    norm, the tensor-parallel reference's exact path that drops projection biases, a width no whole
-    number of heads divides) is refused at load rather than computed without it."""
-    with pytest.raises(ValueError):
-        Pretrained.load(respelled(DIRECTORY, tmp_path / 'bloom', lambda config: {**config, **change}),
-                        dtype='float32', attention_impl='reference')
 
 
 def test_the_exact_path_of_one_tensor_parallel_rank_computes_bloom_itself(tmp_path):

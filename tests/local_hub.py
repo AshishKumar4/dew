@@ -108,127 +108,134 @@ def _hashed(files: Mapping[str, Path], parent: str = "") -> str:
     return digest.hexdigest()
 
 
-def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
-    """The request handler of `hub`'s server: each route as the Hub answers it, unknown repos and files
-    answered as the Hub answers them (404, with its error code)."""
+class _Handler(BaseHTTPRequestHandler):
+    """A request handler of a loopback Hub (`hub`): each route as the Hub answers it, unknown repos and
+    files answered as the Hub answers them (404, with its error code)."""
 
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: str) -> None:
-            """Quiet: the hub's record is `served`."""
+    hub: LocalHub
+    def log_message(self, format: str, *args: str) -> None:
+        """Quiet: the hub's record is `served`."""
 
-        def do_HEAD(self) -> None:
-            self._answer(head=True)
+    def do_HEAD(self) -> None:
+        self._answer(head=True)
 
-        def do_GET(self) -> None:
-            self._answer(head=False)
+    def do_GET(self) -> None:
+        self._answer(head=False)
 
-        def _answer(self, *, head: bool) -> None:
-            address = urlsplit(self.path)
-            path = unquote(address.path)
-            # A revision names a pull request's ref with its slashes quoted: the routes match the path as
-            # sent, and each part is read unquoted.
-            if self._pulls(address.path, head=head):
-                return
-            if path == _LISTING:
-                # Every repo, whatever the listing filters, each with the fields `expand` asks, as the Hub
-                # states a commit and downloads only where asked.
-                hub.served.append(Served(self.command, None, None, None, 0))
-                expand = parse_qs(address.query).get("expand", [])
-                self._json([{"id": repo, "modelId": repo,
-                             **({"sha": hub.commit(repo)} if "sha" in expand else {}),
-                             **({"downloads": 0} if "downloads" in expand else {})} for repo in hub.repos],
-                           head=head)
-                return
-            api, file = _API.fullmatch(address.path), _FILE.fullmatch(address.path)
-            match = api or file
-            if match is None or match["repo"] not in hub.repos:
-                hub.served.append(Served(self.command, None if match is None else match["repo"],
-                                         None if file is None else unquote(file["file"]), None, 0))
-                self._missing("RepoNotFound", head=head)
-                return
-            repo = match["repo"]
-            revision = (api["tree"] if api is not None and api["tree"] is not None else match["revision"])
-            files, commit = hub.at(repo, None if revision is None else unquote(revision))
-            if api is not None:
-                hub.served.append(Served(self.command, repo, None, None, 0))
-                folder = unquote(api["folder"] or "").rstrip("/")
-                if api["tree"] is None:
-                    self._json({"id": repo, "modelId": repo, "sha": commit, "private": False,
-                                "siblings": [{"rfilename": name} for name in sorted(files)]}, head=head)
-                elif folder and not any(name.startswith(f"{folder}/") for name in files):
-                    self._missing("EntryNotFound", head=head, commit=commit)
-                else:
-                    self._json([{"type": "file", "path": name, "size": files[name].stat().st_size,
-                                 "oid": hashlib.sha1(files[name].read_bytes()).hexdigest()}
-                                for name in sorted(files) if name.startswith(f"{folder}/" if folder else "")],
-                               head=head)
-                return
-            name = unquote(file["file"])
-            if name not in files:
-                hub.served.append(Served(self.command, repo, name, None, 0))
+    def _answer(self, *, head: bool) -> None:
+        address = urlsplit(self.path)
+        path = unquote(address.path)
+        # A revision names a pull request's ref with its slashes quoted: the routes match the path as
+        # sent, and each part is read unquoted.
+        if self._pulls(address.path, head=head):
+            return
+        if path == _LISTING:
+            # Every repo, whatever the listing filters, each with the fields `expand` asks, as the Hub
+            # states a commit and downloads only where asked.
+            self.hub.served.append(Served(self.command, None, None, None, 0))
+            expand = parse_qs(address.query).get("expand", [])
+            self._json([{"id": repo, "modelId": repo,
+                         **({"sha": self.hub.commit(repo)} if "sha" in expand else {}),
+                         **({"downloads": 0} if "downloads" in expand else {})} for repo in self.hub.repos],
+                       head=head)
+            return
+        api, file = _API.fullmatch(address.path), _FILE.fullmatch(address.path)
+        match = api or file
+        if match is None or match["repo"] not in self.hub.repos:
+            self.hub.served.append(Served(self.command, None if match is None else match["repo"],
+                                     None if file is None else unquote(file["file"]), None, 0))
+            self._missing("RepoNotFound", head=head)
+            return
+        repo = match["repo"]
+        revision = (api["tree"] if api is not None and api["tree"] is not None else match["revision"])
+        files, commit = self.hub.at(repo, None if revision is None else unquote(revision))
+        if api is not None:
+            self.hub.served.append(Served(self.command, repo, None, None, 0))
+            folder = unquote(api["folder"] or "").rstrip("/")
+            if api["tree"] is None:
+                self._json({"id": repo, "modelId": repo, "sha": commit, "private": False,
+                            "siblings": [{"rfilename": name} for name in sorted(files)]}, head=head)
+            elif folder and not any(name.startswith(f"{folder}/") for name in files):
                 self._missing("EntryNotFound", head=head, commit=commit)
-                return
-            body = files[name].read_bytes()
-            asked = _RANGE.fullmatch(self.headers.get("range", "")) if not head else None
-            start, stop = (0, len(body)) if asked is None else (
-                int(asked[1]), min(len(body), int(asked[2]) + 1 if asked[2] else len(body)))
-            sent = body[start:stop]
-            hub.served.append(Served(self.command, repo, name, None if asked is None else (start, stop),
-                                     0 if head else len(sent)))
-            self.send_response(200 if asked is None else 206)
-            self.send_header("X-Repo-Commit", commit)
-            self.send_header("ETag", f'"{hashlib.sha1(body).hexdigest()}"')
-            self.send_header("Content-Length", str(len(body) if head else len(sent)))
-            if asked is not None:
-                self.send_header("Content-Range", f"bytes {start}-{stop - 1}/{len(body)}")
-            self.end_headers()
-            if not head:
-                self.wfile.write(sent)
-
-        def _pulls(self, sent: str, *, head: bool) -> bool:
-            """Answer a repo's discussions (its open pull requests) or a revision's commits, the revision's
-            and the one a pull request sits on; False for any other route."""
-            discussions, commits = _DISCUSSIONS.fullmatch(sent), _COMMITS.fullmatch(sent)
-            match = discussions or commits
-            if match is None or match["repo"] not in hub.repos:
-                return False
-            repo = match["repo"]
-            hub.served.append(Served(self.command, repo, None, None, 0))
-            pulls = hub.pulls.get(repo, {})
-            if discussions is not None:
-                # Filtered by author where the request names one, as the Hub filters them.
-                author = parse_qs(urlsplit(self.path).query).get("author")
-                listed = [{"num": num, "title": pull.title, "status": "open", "author": {"name": pull.author},
-                           "createdAt": _DATE, "repo": {"name": repo, "type": "model"}, "isPullRequest": True}
-                          for num, pull in sorted(pulls.items()) if author is None or pull.author in author]
-                self._json({"discussions": listed, "count": len(listed), "start": 0, "numItems": len(listed)},
+            else:
+                self._json([{"type": "file", "path": name, "size": files[name].stat().st_size,
+                             "oid": hashlib.sha1(files[name].read_bytes()).hexdigest()}
+                            for name in sorted(files) if name.startswith(f"{folder}/" if folder else "")],
                            head=head)
-                return True
-            _, commit = hub.at(repo, unquote(commits["revision"]))
-            history = [commit] + ([hub.commit(repo)] if commit != hub.commit(repo) else [])
-            self._json([{"id": sha, "title": "", "message": "", "authors": [], "date": _DATE}
-                        for sha in history], head=head)
+            return
+        self._file(repo, unquote(file["file"]), files, commit, head=head)
+
+    def _file(self, repo: str, name: str, files: Mapping[str, Path], commit: str, *, head: bool) -> None:
+        """Answer a file's metadata (HEAD) or its bytes, a range of them where the request asks one."""
+        if name not in files:
+            self.hub.served.append(Served(self.command, repo, name, None, 0))
+            self._missing("EntryNotFound", head=head, commit=commit)
+            return
+        body = files[name].read_bytes()
+        asked = _RANGE.fullmatch(self.headers.get("range", "")) if not head else None
+        start, stop = (0, len(body)) if asked is None else (
+            int(asked[1]), min(len(body), int(asked[2]) + 1 if asked[2] else len(body)))
+        sent = body[start:stop]
+        self.hub.served.append(Served(self.command, repo, name, None if asked is None else (start, stop),
+                                 0 if head else len(sent)))
+        self.send_response(200 if asked is None else 206)
+        self.send_header("X-Repo-Commit", commit)
+        self.send_header("ETag", f'"{hashlib.sha1(body).hexdigest()}"')
+        self.send_header("Content-Length", str(len(body) if head else len(sent)))
+        if asked is not None:
+            self.send_header("Content-Range", f"bytes {start}-{stop - 1}/{len(body)}")
+        self.end_headers()
+        if not head:
+            self.wfile.write(sent)
+
+    def _pulls(self, sent: str, *, head: bool) -> bool:
+        """Answer a repo's discussions (its open pull requests) or a revision's commits, the revision's
+        and the one a pull request sits on; False for any other route."""
+        discussions, commits = _DISCUSSIONS.fullmatch(sent), _COMMITS.fullmatch(sent)
+        match = discussions or commits
+        if match is None or match["repo"] not in self.hub.repos:
+            return False
+        repo = match["repo"]
+        self.hub.served.append(Served(self.command, repo, None, None, 0))
+        pulls = self.hub.pulls.get(repo, {})
+        if discussions is not None:
+            # Filtered by author where the request names one, as the Hub filters them.
+            author = parse_qs(urlsplit(self.path).query).get("author")
+            listed = [{"num": num, "title": pull.title, "status": "open", "author": {"name": pull.author},
+                       "createdAt": _DATE, "repo": {"name": repo, "type": "model"}, "isPullRequest": True}
+                      for num, pull in sorted(pulls.items()) if author is None or pull.author in author]
+            self._json({"discussions": listed, "count": len(listed), "start": 0, "numItems": len(listed)},
+                       head=head)
             return True
+        _, commit = self.hub.at(repo, unquote(commits["revision"]))
+        history = [commit] + ([self.hub.commit(repo)] if commit != self.hub.commit(repo) else [])
+        self._json([{"id": sha, "title": "", "message": "", "authors": [], "date": _DATE}
+                    for sha in history], head=head)
+        return True
 
-        def _json(self, value, *, head: bool) -> None:
-            body = json.dumps(value).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            if not head:
-                self.wfile.write(body)
+    def _json(self, value, *, head: bool) -> None:
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
 
-        def _missing(self, code: str, *, head: bool, commit: str | None = None) -> None:
-            body = json.dumps({"error": code}).encode()
-            self.send_response(404)
-            self.send_header("X-Error-Code", code)
-            if commit is not None:
-                self.send_header("X-Repo-Commit", commit)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            if not head:
-                self.wfile.write(body)
+    def _missing(self, code: str, *, head: bool, commit: str | None = None) -> None:
+        body = json.dumps({"error": code}).encode()
+        self.send_response(404)
+        self.send_header("X-Error-Code", code)
+        if commit is not None:
+            self.send_header("X-Repo-Commit", commit)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
 
-    return Handler
+
+def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
+    """The request handler of `hub`'s server (`_Handler`)."""
+    return type("Handler", (_Handler,), {"hub": hub})
+

@@ -415,9 +415,8 @@ class Pretrained:
         another kind and names that kind.
 
         `text_only=True` loads a multimodal wrapper's language model alone, as its text family's own
-        checkpoint states it (Qwen3.5's `Qwen3_5ForCausalLM`), or a media bundle's its family reads whole
-        as that family's text checkpoint (DeepSeek-V4.1's, its routers' image-span bias left with the
-        media): no tower, projector or audio encoder is built, nor their tensors read, and the source
+        checkpoint states it (Qwen3.5's `Qwen3_5ForCausalLM`; DeepSeek-V4.1's bundle as its own text
+        checkpoint): no tower, projector or audio encoder is built, nor their tensors read, and the source
         saves as that text checkpoint. A source that is a decoder already loads as it is; a pipeline or
         a fallback has no language model to take.
 

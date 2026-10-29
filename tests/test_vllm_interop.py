@@ -286,8 +286,8 @@ def test_the_server_refuses_impossible_controls_but_ignores_unknown_ones(client)
     context = json.loads((Path(client.model) / "config.json").read_text())["max_position_embeddings"]
     try:
         past = client(PROMPTS[0], context + 1, sampling=GREEDY, extra_body={"return_token_ids": True})
-    except openai.BadRequestError:
-        pass
+    except openai.BadRequestError as refused:
+        assert refused.status_code == 400
     else:
         choice = past.responses[0].choices[0]
         assert len(choice.prompt_token_ids) + len(choice.token_ids) <= context, past.finish_reasons

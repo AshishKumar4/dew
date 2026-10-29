@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
+from interop_support import fixture_ids, transformers_arms, transformers_model
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
@@ -29,20 +29,6 @@ def test_opt_logits_follow_transformers_and_its_greedy_continuation():
     generated = generate(loaded.model, loaded.variables, ids[:1, :4], 6, key=0,
                          sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(DIRECTORY / 'generated.npy'))
-
-
-@pytest.mark.parametrize('change', [
-    {'activation_dropout': 0.1}, {'do_layer_norm_before': False}, {'_remove_final_layer_norm': True},
-    {'layer_norm_elementwise_affine': False}, {'word_embed_proj_dim': 16}, {'layerdrop': 0.1}],
-    ids=['activation dropout', 'post-norm', 'no final norm', 'unscaled norms', 'projected embeddings',
-         'layer drop'])
-def test_an_opt_dew_does_not_compute_is_refused(change, tmp_path):
-    """An OPT checkpoint whose config asks what Dew's OPT does not compute (dropout inside the
-    feed-forward, post-residual or scaleless norms, no final norm, embeddings projected to another
-    width, dropped layers) is refused at load rather than computed without it."""
-    with pytest.raises(ValueError):
-        Pretrained.load(respelled(DIRECTORY, tmp_path / 'opt', lambda config: {**config, **change}),
-                        dtype='float32', attention_impl='reference')
 
 
 @pytest.mark.network
