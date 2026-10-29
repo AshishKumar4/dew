@@ -872,11 +872,11 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     if ropes.scaling is not None:
         if apart and 'sliding_attention' in layer_types:
             full = kinds.setdefault('full_attention', native_fields(LayerKind)())
-            full[ramp_field(ropes.scaling)] = ropes.scaling
+            full['rope_scaling'] = ropes.scaling
         else:
-            config[ramp_field(ropes.scaling)] = ropes.scaling
+            config['rope_scaling'] = ropes.scaling
     if ropes.local_scaling is not None:
-        kinds['sliding_attention'][ramp_field(ropes.local_scaling)] = ropes.local_scaling
+        kinds['sliding_attention']['rope_scaling'] = ropes.local_scaling
     return config
 
 
@@ -890,10 +890,6 @@ def nested_ramp(ramp: Ramp | None) -> Ramp | None:
     return native_fields(YarnScaling)(**{**ramp, 'truncate': True})
 
 
-def ramp_field(ramp: Ramp) -> str:
-    """The field a ramp lands under, on the model or a kind: `rope_scaling` reads the llama3 ramp
-    over the plain frequencies, `yarn` replaces them."""
-    return 'rope_scaling' if ramp['rope_type'] == 'llama3' else 'yarn'
 
 
 
@@ -1965,6 +1961,9 @@ class DecoderFamily:
     """Reads a media bundle released under the family's own model_type, which
     keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
+    wrapper_media_suffixes: tuple[str, ...] = ()
+    """Suffixes of a bundle's decoder tensors that serve its media alone, which its language model read
+    as its text checkpoint drops (`hf_decoders.language_model_names`): V4.1's routers' image-span bias."""
     defaults: Mapping[str, object] = field(default_factory=dict)
     """The computational fields the family's config class fills where a file
     omits them, which the shared readers would otherwise default for every

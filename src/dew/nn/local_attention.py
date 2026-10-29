@@ -13,18 +13,16 @@ from dew.batch import prefix_sum, valid_order
 from dew.mesh import SEQUENCE_AXIS, logical_spec
 
 from .attention import (
-    SPLASH_LANES,
+    AttentionImpl,
     attention_kernel,
-    chunk_mask,
-    combined_attention_mask,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
-    query_split,
     resolve_implementation,
     scaled_dot_product_attention,
-    split_with_queries,
-    tensor_shards,
 )
+from .attention_kernels import SPLASH_LANES
+from .attention_masks import chunk_mask, combined_attention_mask
+from .attention_parallel import query_split, split_with_queries, tensor_shards
 from .documents import with_documents
 from .inputs import sequence_blocks
 from .kernels.selection import forced
@@ -48,7 +46,7 @@ def _banded(x, before=None):
 def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
                     places=None, segment_ids=None, max_segments=None, valid=None,
                     right_padded: bool = False, dtype=None, precision=None, force_fp32_for_softmax=True,
-                    implementation='auto', sinks=None, softcap=None):
+                    implementation: AttentionImpl = 'auto', sinks=None, softcap=None):
     """Causal self-attention in which each query reads only nearby keys, in
     memory linear in the sequence.
 

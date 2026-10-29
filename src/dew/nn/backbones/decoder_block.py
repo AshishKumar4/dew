@@ -21,9 +21,8 @@ from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
 from ..activations import GatedActivation, gated_product
-from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
-from ..cross_attention import NAME as CROSS_ATTENTION
+from ..cross_attention import NAME as CROSS_ATTENTION, AttendsContext, LayerReads
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
@@ -42,6 +41,7 @@ from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
+from ..norms import LayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
@@ -75,7 +75,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
     """The decoder's norm factory, building each norm by its `name` as
     `specs` changes it there. 'layer' keeps torch's exact variance, the
     reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
-    (`dew.nn.attention.LayerNorm`), whose mean and square reduce in one pass,
+    (`dew.nn.norms.LayerNorm`), whose mean and square reduce in one pass,
     which the vision towers run."""
 
     def build(*, name: str) -> nn.Module:
@@ -98,7 +98,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
 
 @runtime_checkable
 class SeamNorm(Protocol):
-    """A pre-norm that owns a block's residual seam (`dew.nn.attention.RMSNorm`):
+    """A pre-norm that owns a block's residual seam (`dew.nn.norms.RMSNorm`):
     it adds a sublayer's branch to the stream it reads and hands that stream
     back beside the norm, `(x + branch, normed)`, so one fused pass takes the
     add, the norm and, in reverse, the stream's own cotangent."""
@@ -879,7 +879,15 @@ class DecoderBlock(nn.Module):
         """The state after the cross-attention block joins it: the plain stream (AltUp's active
         copy among them, nGPT's unit one), mHC's streams through their mean, or the depth
         state's partial block through the mixture the attention reads."""
-        cross = functools.partial(self.cross_attention, decode=decode, train=train)
+        # A block that reads through the layer's own attention is handed it, with the layer's attention
+        # input from the states a sublayer reads (`LayerReads`).
+        layer = {}
+        if self.cross_attention.reads_layer:
+            if not isinstance(self.self_attn, AttendsContext):
+                raise ValueError(f"this layer's mixer ({type(self.self_attn).__name__}) has no attention of "
+                                 "its own for its cross-attention block to read a context through")
+            layer = {"layer": LayerReads(self._attention_input, self.self_attn)}
+        cross = functools.partial(self.cross_attention, decode=decode, train=train, **layer)
         if isinstance(state, _Plain):
             return state._replace(x=constrain(cross(state.x, context), RESIDUAL))
         if isinstance(state, _Streams):
@@ -891,6 +899,11 @@ class DecoderBlock(nn.Module):
                 return partial
             return self.attention_res(sources(state.blocks, state.finished, partial))
         return state._replace(partial=cross(state.partial, context, read=mixture))
+
+    def _attention_input(self, read: jax.Array) -> jax.Array:
+        """The states a sublayer reads, `read`, as the layer's attention reads them: through its
+        input norm where it pre-norms its attention, else as they are."""
+        return self.input_layernorm(read) if self.wiring.pre_norms and self.attention_norm else read
 
     def _joined(self, state: _BlockState) -> tuple[SeamNorm, _Plain] | None:
         """The MLP's pre-norm and the plain stream, where that norm adds the

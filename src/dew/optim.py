@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
+import functools
 import inspect
 import json
 import math
@@ -37,7 +38,7 @@ from dew._records import share
 from dew.mesh import LogicalAxes
 from dew.nn.precision import at_least_fp32, stochastic_bf16
 from dew.nn.sharding import declarations, declared_axes
-from dew.registry import JsonDict, from_record, record_argument, schedules, to_record
+from dew.registry import JsonDict, from_record, imported, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -1760,7 +1761,11 @@ def _rate_argument() -> tyro.constructors.PrimitiveConstructorSpec:
 class OptimConfig:
     """Holds the optimizer, learning-rate schedule and gradient clipping."""
 
-    optimizer: Optimizer = "adamw"
+    optimizer: Optimizer | str = "adamw"
+    """One of Dew's optimizers (`OPTIMIZER_MAP`), or any Optax optimizer factory by its import path,
+    `optax:sgd` or `optax:adafactor` (`dew.registry.imported`), built as `factory(learning_rate,
+    **optimizer_opts)` with `b1`, `b2` and `weight_decay` where the config sets them, so an experiment
+    on an Optax transformation records the same optimizer it ran."""
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
     learning_rate: Annotated[float | ScheduleSpec, _rate_argument()] = 2.7e-4
     """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`).
@@ -1775,8 +1780,8 @@ class OptimConfig:
     """The weight decay passed to the optimizer, None keeping its own (adamw's 1e-4, the others'
     0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
     read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
-    and vectors such as a norm's scale, timm's split for every optimizer
-    (`dew.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
+    and vectors such as a norm's scale, timm's split for every optimizer and for an Optax factory
+    given one (`dew.optim.weight_decay_mask`, its `mask`); Muon decays them as Moonlight does, and
     `param_groups` replace the split. Records written before this change decayed every
     parameter; ParamGroup('all', ('*',)) restores that."""
     b1: float | None = None
@@ -1858,7 +1863,7 @@ class OptimConfig:
             raise ValueError("b1 and b2 are fields of OptimConfig, not optimizer_opts")
         given = {'b1': self.b1, 'b2': self.b2, 'weight_decay': self.weight_decay}
         opts.update({name: value for name, value in given.items() if value is not None})
-        make: Callable[..., optax.GradientTransformation] = OPTIMIZER_MAP[self.optimizer]
+        make = self.factory()
         if self.state_dtype != 'float32':
             if self.optimizer not in STATE_OPTIMIZERS[self.state_dtype]:
                 raise ValueError(
@@ -1879,7 +1884,9 @@ class OptimConfig:
                 solvers[group.name] = group.solver(make, self.learning_rate, steps, {**opts, **decay})
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
-            if self.optimizer not in ('muon', 'muonclip'):
+            # An Optax factory takes the split with a decay it is given; Dew's own take it always.
+            if self.optimizer not in ('muon', 'muonclip') and (self.optimizer in OPTIMIZER_MAP
+                                                                 or 'weight_decay' in opts):
                 opts['mask'] = weight_decay_mask
             solver = scheduled_solver(make, self.learning_rate, steps, opts)
 
@@ -1892,6 +1899,27 @@ class OptimConfig:
         if self.ema_profiles:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        """The factory `optimizer` names: Dew's own (`OPTIMIZER_MAP`) by name, else the one its import
+        path names, whose every build is witnessed an Optax transformation."""
+        if self.optimizer in OPTIMIZER_MAP:
+            return OPTIMIZER_MAP[self.optimizer]
+        if ':' not in self.optimizer:
+            raise ValueError(f"optimizer {self.optimizer!r} is none of Dew's {sorted(OPTIMIZER_MAP)} and no "
+                             f"import path; name an Optax factory as optax:sgd")
+        named, factory = self.optimizer, imported(self.optimizer)
+
+        # The factory's own signature, which a group's `b1` schedule is checked against (`ParamGroup.solver`).
+        @functools.wraps(factory)
+        def built(learning_rate, **opts) -> optax.GradientTransformation:
+            transformation = factory(learning_rate, **opts)
+            if not isinstance(transformation, optax.GradientTransformation):
+                raise ValueError(f"optimizer {named!r} builds {type(transformation).__name__}, not an Optax "
+                                 f"gradient transformation")
+            return transformation
+
+        return built
 
     def rates(self) -> dict[str | None, dict[str, float]]:
         """The rate fields each of `build`'s solvers holds in its state

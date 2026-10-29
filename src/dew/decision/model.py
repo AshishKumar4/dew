@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 
-from dew.batch import Variables, part, prefix_sum, thaw
+from dew.batch import TOKEN_LAYOUT_FIELDS, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
@@ -108,7 +108,7 @@ class DecisionModel(HeadedModel):
                 # the rows' layout is the decision's coordinates alone, the processor's flat fields
                 # left out (`token_coordinates`).
                 kwargs = {name: value for name, value in given.kwargs().items()
-                          if name not in ("positions", "attention_mask", "segment_ids")}
+                          if name not in TOKEN_LAYOUT_FIELDS}
                 if conditioning is not None:
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)

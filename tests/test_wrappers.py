@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import respelled
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
@@ -38,15 +39,11 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 @pytest.mark.parametrize("family", ["gemma3-tiny-mm", "gemma4-tiny-mm"])
 def test_a_gemma_wrapper_keeps_image_and_source_block_visibility_together(tmp_path, family):
-    import shutil
 
     from dew.interop import Pretrained
 
-    directory = tmp_path / "source"
-    shutil.copytree(FIXTURES / family, directory)
-    config = json.loads((directory / "config.json").read_text())
-    config["modeling_overrides"] = {"attention": {"sliding_attention": "block_bidirectional"}}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURES / family, tmp_path / "source", lambda config: {
+        **config, "modeling_overrides": {"attention": {"sliding_attention": "block_bidirectional"}}})
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     tokens = jnp.asarray([[10, 11, 12, 13]], jnp.int32)
     altered = tokens.at[0, 1].set(14)
@@ -61,16 +58,12 @@ def test_a_gemma_wrapper_keeps_image_and_source_block_visibility_together(tmp_pa
 
 
 def test_an_explicit_causal_source_override_exports_through_the_native_decoder(tmp_path):
-    import shutil
 
     from dew.interop import Pretrained
     from dew.interop.pretrained import PretrainedDecoder
 
-    directory = tmp_path / "source"
-    shutil.copytree(FIXTURES / "llama-tiny", directory)
-    config = json.loads((directory / "config.json").read_text())
-    config["modeling_overrides"] = {"attention": {"full_attention": "causal"}}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURES / "llama-tiny", tmp_path / "source", lambda config: {
+        **config, "modeling_overrides": {"attention": {"full_attention": "causal"}}})
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     exported = tmp_path / "derived"
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(exported)
@@ -124,16 +117,12 @@ def test_released_block_attention_matches_transformers_against_float64():
 def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mate(tmp_path):
     """A source declaring block attention changes visibility only where runtime block IDs admit
     it. A future block mate can affect the earlier token, and source export preserves that rule."""
-    import shutil
 
     from dew.interop import Pretrained
 
-    directory = tmp_path / "source"
-    shutil.copytree(FIXTURES / "qwen35-tiny-mm", directory)
-    config = json.loads((directory / "config.json").read_text())
-    config["modeling_overrides"] = {"attention": {
-        "full_attention": "block_bidirectional", "linear_attention": "causal"}}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURES / "qwen35-tiny-mm", tmp_path / "source", lambda config: {
+        **config, "modeling_overrides": {"attention": {"full_attention": "block_bidirectional",
+                                                       "linear_attention": "causal"}}})
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     altered = ids.at[0, 1].set(7)
@@ -257,6 +246,25 @@ def test_a_text_only_load_is_the_wrappers_language_model_as_its_text_checkpoint(
         tmp_path / "export" / "model.safetensors"))
     reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), logits)
+
+
+def test_the_pipeline_selects_what_a_source_loads(tmp_path):
+    """`dew.pipeline` takes a source's selection as `Pretrained.load` does (ledger 2248): `text_only`
+    builds Qwen3.5's text task over its language model alone, and `prediction_depths=0` DeepSeek V3's
+    without its prediction depth; a run directory's record selects its own, so either is refused there."""
+    from dew.inference import pipeline
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    blind = _without(FIXTURES / "qwen35-native-tiny", tmp_path / "blind",
+                     lambda name: name.startswith("model.visual."))
+    text = pipeline(str(blind), text_only=True)
+    assert isinstance(text.model, CausalTransformer)
+    trimmed = pipeline(str(FIXTURES / "deepseek-v3-tiny"), prediction_depths=0)
+    assert trimmed.model.num_nextn_predict_layers == 0
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run" / "run.json").write_text("{}")
+    with pytest.raises(ValueError):
+        pipeline(str(tmp_path / "run"), text_only=True)
 
 
 def test_a_text_only_load_takes_a_checkpoint_without_its_prediction_depth():
@@ -431,21 +439,16 @@ def test_a_text_only_load_keeps_what_the_wrapper_declares_for_its_language_model
     modeling overrides turn on still admits a future block mate, and its end-of-text id still ends
     generation; and a vision tensor stored under two disagreeing names, which the full load refuses,
     is never compared."""
-    import shutil
 
     from safetensors.numpy import save_file
 
     from dew.interop import Pretrained
     from dew.interop.generation_config import eos_ids
 
-    directory = tmp_path / "source"
-    shutil.copytree(FIXTURES / "qwen35-tiny-mm", directory)
-    config = json.loads((directory / "config.json").read_text())
-    config["modeling_overrides"] = {"attention": {
-        "full_attention": "block_bidirectional", "linear_attention": "causal"}}
-    config["eos_token_id"] = 3
-    config["text_config"] = {**config["text_config"], "eos_token_id": None}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURES / "qwen35-tiny-mm", tmp_path / "source", lambda config: {
+        **config, "modeling_overrides": {"attention": {"full_attention": "block_bidirectional",
+                                                       "linear_attention": "causal"}},
+        "eos_token_id": 3, "text_config": {**config["text_config"], "eos_token_id": None}})
     tensors = load_file(directory / "model.safetensors")
     spelled = next(name for name in tensors if name.startswith("model.visual."))
     tensors[spelled.removeprefix("model.")] = tensors[spelled] + 1

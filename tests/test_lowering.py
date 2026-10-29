@@ -130,6 +130,22 @@ def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_
     assert (flops.hardware, flops.unsized) == (sum(entry["flops"] for entry in templated), unstated)
 
 
+def test_a_kernel_is_named_from_its_location_wherever_the_location_nests_the_name():
+    """A Mosaic GPU call's kernel name (`_lowering._kernel_name`) from its location's name stack wherever the
+    location nests it: its own, a call site's callee's, a fused location's part (a rewrite that merged
+    operations); a location that carries no name gives none, and the report names the call by its hash."""
+    from jax.extend.mlir import ir
+
+    from dew.training import _lowering
+
+    with ir.Context():
+        named = ir.Location.name("jit(step)/attention_forward/mpmd_map")
+        source = ir.Location.file("model.py", 1, 1)
+        for location in (named, ir.Location.callsite(named, [source]), ir.Location.fused([source, named])):
+            assert _lowering._kernel_name(location) == "attention_forward"
+        assert _lowering._kernel_name(ir.Location.fused([source])) is None
+
+
 def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_unsized():
     """dew_cutlass's grouped GEMMs, lowered for the GPU, count each token row's product once in the FLOP
     count and in the kernel report; a custom call nothing sizes counts as an unsized launch in both."""
@@ -202,7 +218,7 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     The reverse pass's compensated sums and their rounded assembly must lower
     too; interpreting on CPU cannot expose broken multi-result GPU assembly.
     """
-    from dew.nn.attention import rms_normalized
+    from dew.nn.norms import rms_normalized
 
     def forward_backward(x, scale, seed):
         def norm(x, scale):

@@ -24,6 +24,7 @@ import torch
 from model_support import TINY_DECODER, Digits, decoder, flat_tree
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
+from whole_suite import timed
 
 from dew.batch import FROZEN, coordinates, thaw
 from dew.checkpoints import Checkpoints
@@ -148,12 +149,17 @@ def idefics_block(wide: bool):
     return run
 
 
-@pytest.mark.parametrize("dtype", [pytest.param(np.float32, id="float32"),
-                                   pytest.param(jnp.bfloat16, id="bfloat16", marks=pytest.mark.whole_suite)])
-def test_the_block_computes_and_differentiates_as_idefics(dtype):
+PAST_TARGET = {"idefics": {"bfloat16": 132}}
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2158):
+the bfloat16 block; every train computes and differentiates it in float32."""
+
+
+@pytest.mark.parametrize("precision", timed(PAST_TARGET, "idefics", ["float32", "bfloat16"]))
+def test_the_block_computes_and_differentiates_as_idefics(precision):
     """Through both gated branches, the output and the gradients into the residual, the context and
     every parameter on par with IDEFICS's in float32 and in bfloat16 (check 1), over contexts of
     every length; the gates' products are at least float32."""
+    dtype = {"float32": np.float32, "bfloat16": jnp.bfloat16}[precision]
     label = f"block {np.dtype(dtype).name}"
     assert_as_exact(dew_block, idefics_block(wide=False), functools.partial(block_draw, dtype=dtype), label,
                     seeds=SEEDS[label], truth_fn=idefics_block(wide=True))
@@ -183,11 +189,14 @@ def model_draw(model: CausalTransformer, *, gated: bool = True):
     `gated`, and its tokens, a context and each row's context tokens, a row of none among them."""
     init = jax.jit(model.init)
 
+    cross = model.cross_attention
+    assert cross is not None
+
     def draw(seed):
         rng = np.random.default_rng(seed)
         ids = rng.integers(0, VOCAB, (B, SEQ)).astype(np.int32)
-        context = rng.standard_normal((B, CROSS.context_length, CROSS.context_features)).astype(np.float32)
-        lengths = rng.integers(0, CROSS.context_length + 1, B).astype(np.int32)
+        context = rng.standard_normal((B, cross.context_length, model.context_width)).astype(np.float32)
+        lengths = rng.integers(0, cross.context_length + 1, B).astype(np.int32)
         lengths[0] = 0
         variables = init(jax.random.key(seed), ids)
         if gated:
@@ -211,9 +220,10 @@ def float64(model):
     return model.clone(dtype=jnp.float64, attention_impl="reference")
 
 
-def fresh_against_base(model: CausalTransformer, label: str):
+def fresh_against_base(model: CausalTransformer, label: str, seeds: int | None = None):
     """Check 1: `model` drawn at zero gates, reading a context, on par with the decoder without its
-    blocks from that decoder's float64: the same function in two programs."""
+    blocks from that decoder's float64: the same function in two programs, over `seeds` (this file's
+    `SEEDS[label]` unless given)."""
     base = dataclasses.replace(model, cross_attention=None)
 
     def base_logits(model):
@@ -221,7 +231,7 @@ def fresh_against_base(model: CausalTransformer, label: str):
         return lambda variables, ids, context, lengths: run(_without_blocks(variables), ids)
 
     assert_as_exact(logits(model), base_logits(base), model_draw(model, gated=False), label,
-                    seeds=SEEDS[label], truth_fn=base_logits(float64(base)))
+                    seeds=SEEDS[label] if seeds is None else seeds, truth_fn=base_logits(float64(base)))
 
 
 def test_a_fresh_block_computes_the_decoder_it_was_attached_to():
@@ -259,39 +269,49 @@ def _without_blocks(variables):
     return kept(dict(variables))
 
 
-@jax.jit
-def _decoded(variables, ids, context, lengths):
-    """The prompt prefilled with its context into a fresh cache, then each later token a step with
-    none: the logits from the prompt's last position on."""
-    _, made = MODEL.apply(variables, ids.shape[0], method=CausalTransformer.init_cache, mutable=["cache"])
-    out, held = MODEL.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
-                            conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
-    steps = [out[:, -1]]
-    for position in range(PROMPT, SEQ):
-        out, held = MODEL.apply({**variables, **held}, ids[:, position:position + 1], decode=True,
-                                mutable=["cache"])
-        steps.append(out[:, -1])
-    return jnp.stack(steps, axis=1)
+def decoded(model: CausalTransformer):
+    """`model`'s prompt prefilled with its context into a fresh cache, then each later token a step
+    with none: the logits from the prompt's last position on, compiled."""
+    @jax.jit
+    def run(variables, ids, context, lengths):
+        _, made = model.apply(variables, ids.shape[0], method=CausalTransformer.init_cache, mutable=["cache"])
+        out, held = model.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
+                                conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
+        steps = [out[:, -1]]
+        for position in range(PROMPT, SEQ):
+            out, held = model.apply({**variables, **held}, ids[:, position:position + 1], decode=True,
+                                    mutable=["cache"])
+            steps.append(out[:, -1])
+        return jnp.stack(steps, axis=1)
+    return run
+
+
+def assert_a_cached_context_decodes_as_the_full_forward(model: CausalTransformer, label: str,
+                                                        seeds: int | None = None):
+    """The context a prefill carries stays in `model`'s cache, its count a row with it, and each later
+    step attends over it without it: the steps' logits on par with the full forward's from the float64
+    forward (check 1), over `seeds` (this file's `SEEDS["decode"]` unless given)."""
+    def full(model):
+        run = logits(model)
+        return lambda variables, ids, context, lengths: run(variables, ids, context, lengths)[:, PROMPT - 1:]
+
+    draw = model_draw(model)
+    assert_as_exact(decoded(model), full(model), draw, label,
+                    seeds=SEEDS["decode"] if seeds is None else seeds, truth_fn=full(float64(model)))
+    variables, ids, context, lengths = draw(0)
+    _, made = model.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
+    _, held = model.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
+                          conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
+    kept = [leaf for path, leaf in flat_tree(held["cache"]).items() if path.endswith(CROSS_LENGTHS)]
+    assert model.cross_attention is not None and len(kept) == len(model.cross_attention.layer_ids)
+    for leaf in kept:
+        np.testing.assert_array_equal(np.asarray(leaf), lengths)
 
 
 def test_a_cached_context_decodes_as_the_full_forward():
     """The context a prefill carries stays in the cache, and each later step attends over it without
     it: the steps' logits on par with the full forward's from the float64 forward (check 1)."""
-    def full(model):
-        run = logits(model)
-        return lambda variables, ids, context, lengths: run(variables, ids, context, lengths)[:, PROMPT - 1:]
-
-    draw = model_draw(MODEL)
-    assert_as_exact(_decoded, full(MODEL), draw, "cached context", seeds=SEEDS["decode"],
-                    truth_fn=full(float64(MODEL)))
-    variables, ids, context, lengths = draw(0)
-    _, made = MODEL.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
-    _, held = MODEL.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
-                          conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
-    kept = [leaf for path, leaf in flat_tree(held["cache"]).items() if path.endswith(CROSS_LENGTHS)]
-    assert len(kept) == len(CROSS.layer_ids)
-    for leaf in kept:
-        np.testing.assert_array_equal(np.asarray(leaf), lengths)
+    assert_a_cached_context_decodes_as_the_full_forward(MODEL, "cached context")
 
 
 def test_a_scanned_stack_runs_its_blocks_as_the_plain_one():
@@ -493,23 +513,23 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
     server = Server.from_task(served_task(), slots=2, capacity=128)
     wide = request(0)
     with pytest.raises(ValueError):
-        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2)
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2, key=0)
     with pytest.raises(ValueError):
-        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2)
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2, key=0)
     for length in (-1, 3):
         with pytest.raises(ValueError):
             server.submit(dataclasses.replace(wide, conditioning={
-                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2)
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2, key=0)
     model = decoder().clone(max_seq_len=128)
     plain = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
                            RunProcessor(Digits()), sampling=Sampling(temperature=0))
     with pytest.raises(ValueError):
-        Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2)
+        Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2, key=0)
     with jax.enable_x64(new_val=True):
         wrapped = np.asarray([2 ** 32 + 1], np.int64)
         with pytest.raises(ValueError):
             server.submit(dataclasses.replace(wide, conditioning={
-                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2)
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2, key=0)
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():

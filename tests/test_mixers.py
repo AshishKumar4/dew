@@ -24,10 +24,11 @@ from flax import linen as nn
 from model_support import TINY_DECODER
 from reference_error import assert_as_exact, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
+from whole_suite import timed
 
 from dew.batch import coordinates
 from dew.nn import linear
-from dew.nn.attention import alibi_bias
+from dew.nn.attention_masks import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
@@ -262,8 +263,13 @@ one chunk); the scan's packed resets within a chunk stay held by tests/test_mamb
 tests/test_mamba_ssd.py at their own geometries."""
 
 
-@pytest.mark.parametrize("kind", [pytest.param(kind, marks=pytest.mark.whole_suite) if kind == "memory"
-                                  else kind for kind in sorted(mixers.paths)])
+PAST_TARGET = {"packed": {"memory": 122}}
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2160):
+the memory mixer's packed row; every train packs every other mixer's, and test_memory_composition.py
+packs the memory decoder's."""
+
+
+@pytest.mark.parametrize("kind", timed(PAST_TARGET, "packed", sorted(mixers.paths)))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """Every mixer in the registry: a row packing documents (segment ids, positions restarting),
     one across a chunk of the chunked rules, gives each document's logits and the parameters' gradients

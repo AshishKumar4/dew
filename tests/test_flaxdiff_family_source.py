@@ -37,7 +37,7 @@ from reference_error import (
 )
 
 from dew.interop.flaxdiff import SCAN_PROJECTION, scan_projection
-from dew.nn.attention import Stage
+from dew.nn.attention_blocks import Stage
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import HierarchicalMMDiT, SimpleMMDiT
 from dew.nn.backbones.unet import Unet

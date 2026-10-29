@@ -1413,10 +1413,11 @@ def _output_held(call: _Call, bv: int) -> _Held:
     `Family.products_overlap`), its values and one product's fragments (`_product`); and the first step's
     scores' phase, their sum, their pairs' decays and their masks (an fp32 call's split into parts) and their
     product's fragments. The two phases hold at once where the walk steps over value blocks (the scores'
-    branch inside its loop), or where its products overlap; apart where it takes one value block on a family
-    whose products complete in turn. So an A100's need was 232, 240, None and 216 registers at value blocks
-    16, 32, 64 and 128 wide of 128 values, and None at 128 of 256; an H100's 224, 224, 232/240 and None
-    (the 1971 gate's dump: where both phases were stated at once, 456 refused 216). Under a decay a key
+    branch inside its loop); apart where it takes one value block, the scores staged before its products
+    issue. So an A100's need was 232, 240, None and 216 registers at value blocks 16, 32, 64 and 128 wide of
+    128 values, and None at 128 of 256; an H100's 222 at 64 and within 255 at 128 (Mosaic GPU forming
+    each warpgroup product's descriptors at its use, JAX 0.12.0.1.post33; post32's hoisted descriptors
+    held the 128-wide block past 255, where both phases were stated at once). Under a decay a key
     dimension the value block's phase, and apart from it the first step's: a key block's prefix halves, its
     decay raised from them and its queries widened, staged for every step (`algebra.key_gated`)."""
     held, memories, given, family = call.held, call.memories, call.given, call.family
@@ -1434,7 +1435,7 @@ def _output_held(call: _Call, bv: int) -> _Held:
     scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
               + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
               + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
-    if call.value_width // bv == 1 and not family.products_overlap:
+    if call.value_width // bv == 1:
         return _Held(phases=(values, scores))
     return _Held(phases=(values + scores,))
 
@@ -2047,10 +2048,12 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
     steps = chunks / sequences.shape[0]
     work = Work(2 * 3 * CHUNK * width * walked_width * steps, steps)
     # The memory's gradient carried, its key slices in fp32, and the one it gives the chunk before as it is
-    # summed; a step's corrected values' two gradients and its local one beside the output's gradient, a
-    # memory slice as an operand, and the stored tiles' casts.
+    # summed; a step's two fp32 tiles at once, the corrected values' gradient beside the local one it adds
+    # or the decayed output's gradient read after it (`algebra.reverse_carried`: the local one folds into it
+    # before the read forms), beside the output's gradient, a memory slice as an operand, and the stored
+    # tiles' casts.
     held_tiles = _Held(carried=[_f32(width, bv)] * 2, phases=(
-        [_f32(CHUNK, bv)] * 3 + _held(given, CHUNK, bv)
+        [_f32(CHUNK, bv)] * 2 + _held(given, CHUNK, bv)
         + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(held, CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
     final_landing, after = _final_landing(call, bv)

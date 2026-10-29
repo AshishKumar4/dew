@@ -88,6 +88,13 @@ def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:
 VALIDITY_FIELD = "attention_mask"
 """The token field that marks real slots. Absent means every slot is real."""
 
+SEGMENTS_FIELD = "segment_ids"
+"""The token field that numbers each slot's document. Absent means one document a row."""
+
+POSITIONS_FIELD = "positions"
+"""The token field that holds each slot's place. Absent means each slot's own, counted from its row's
+start."""
+
 
 COORDINATES_FIELD = "coordinates"
 """The token field that holds the tokens' `Coordinates`, which a decoder reads in place of the
@@ -306,13 +313,18 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
                        right_padded=right_padded)
 
 
+TOKEN_LAYOUT_FIELDS = (SEGMENTS_FIELD, VALIDITY_FIELD, POSITIONS_FIELD)
+"""The flat token fields a call's layout is given in where it gives no `Coordinates`
+(`token_coordinates`): its documents, its validity and its places."""
+
+
 def token_coordinates(shape: tuple[int, int], given: Coordinates | None = None, *, segments=None,
                       valid=None, positions=None, right_padded: bool = False) -> Coordinates | None:
     """A call's token layout as one `Coordinates`, the one conversion of its fields: `given` as it is,
     else built (`coordinates`) from the flat fields `segment_ids` (`segments`), `attention_mask`
     (`valid`) and `positions`, None where the call gives none. A call giving both is refused: its
     `Coordinates` would silently drop its flat fields (ledger 1122)."""
-    fields = (("segment_ids", segments), (VALIDITY_FIELD, valid), ("positions", positions))
+    fields = zip(TOKEN_LAYOUT_FIELDS, (segments, valid, positions), strict=True)
     flat = [name for name, value in fields if value is not None] + (["right_padded"] if right_padded else [])
     if given is not None:
         if flat:
@@ -385,7 +397,7 @@ def token_layout(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, 
     the array module."""
     laid = fields.get(COORDINATES_FIELD)
     valid = token_validity(fields)
-    segments = laid.segments if isinstance(laid, Coordinates) else fields.get("segment_ids")
+    segments = laid.segments if isinstance(laid, Coordinates) else fields.get(SEGMENTS_FIELD)
     return (None if valid is None else xp.asarray(valid, bool),
             None if segments is None else xp.asarray(segments))
 
@@ -407,7 +419,7 @@ def token_positions(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], 
     `Coordinates`' where the fields carry them, else the `positions` field; None where neither gives
     any. `xp` is the array module."""
     laid = fields.get(COORDINATES_FIELD)
-    positions = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
+    positions = laid.positions if isinstance(laid, Coordinates) else fields.get(POSITIONS_FIELD)
     return None if positions is None else xp.asarray(positions)
 
 

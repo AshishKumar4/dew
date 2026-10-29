@@ -53,6 +53,11 @@ MESH_SEEDS = 512
 """The per-shard test's draws, sized by `seeds_for` with one device compared with
 itself: the fewest, doubling from `FEWEST_SEEDS`, that resolve the factor for each
 case, which is 512 for lengths and starts over two key heads."""
+WIDE_SEEDS = {6: 64, 8: 8}
+"""The partly split and gathered key heads' sites' draws by their key heads, sized by `seeds_for` paired,
+the split run against each arm it is compared with (the shares on one device and the reference path): 16
+and 64 over six key heads, 8 and 8 over eight either way (ET-WIDESEEDS, row 2195: at 512 each site took
+117 to 120 s of a CPU task)."""
 
 CASES = {
     "full-grouped": {},
@@ -222,13 +227,14 @@ def shares_on_one_device(routed, heads: int, kv_heads: int, shards: int):
 
 
 def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_heads: int, rules, label: str,
-                       moves=(), shards: int | None = None) -> None:
+                       moves=(), shards: int | None = None, seeds: int = MESH_SEEDS) -> None:
     """`case`'s named template call on `mesh`, its arguments placed by `specs` and the logical axis `rules` in
     context, runs per shard (`sharded.assert_runs_per_shard`), and its compiled step moves no operand between
     devices beyond `moves`. Its output and gradients are on par with one device's whole call over the site's
-    draws (check 1), measured from float64 on the reference path. With `shards`, they are on par with the
-    shares of the same route run on one device (`shares_on_one_device`) instead, and the split is also
-    asserted against the fp32 reference path: its own error within 1.5 times that path's on every leaf."""
+    `seeds` draws (check 1), measured from float64 on the reference path. With `shards`, they are on par
+    with the shares of the same route run on one device (`shares_on_one_device`) instead, and the split is
+    also asserted against the fp32 reference path: its own error within 1.5 times that path's on every
+    leaf."""
     queries, keys = geometry(case)
     draw = drawing(queries, keys, jnp.float32, sinks=True, heads=heads, kv_heads=kv_heads)
 
@@ -237,7 +243,7 @@ def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_he
 
     with nn.logical_axis_rules(rules):
         # With `shards`, the one split run of each draw compared with both arms (row 2156).
-        assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, label, seeds=MESH_SEEDS,
+        assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, label, seeds=seeds,
                               truth_fn=truth, moves=moves, arm=arm,
                               also=None if shards is None else ("the reference path", jax.jit(truth)))
 
@@ -275,7 +281,7 @@ def test_partly_split_key_heads_keep_the_kernel_contract_on_a_tensor_and_expert_
     per_shard_contract(case, mesh, specs, heads=WIDE_HEADS, kv_heads=kv_heads,
                        rules=PARTLY_SPLIT_KEY_HEADS[kv_heads],
                        label=f"template split eight ways, {kv_heads} key heads on the tensor axis",
-                       shards=WIDE_SHARDS)
+                       shards=WIDE_SHARDS, seeds=WIDE_SEEDS[kv_heads])
 
 
 @pytest.mark.mesh(devices=8)
@@ -291,7 +297,8 @@ def test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expe
     case = MESH_CASES["own-documents"]
     per_shard_contract(case, mesh, specs, heads=WIDE_HEADS, kv_heads=8,
                        rules=KEY_HEADS_LEADING_THE_OTHER_WAY, moves=("all-gather",),
-                       label="template split eight ways, key heads the other way", shards=WIDE_SHARDS)
+                       label="template split eight ways, key heads the other way", shards=WIDE_SHARDS,
+                       seeds=WIDE_SEEDS[8])
 
 
 @pytest.mark.mesh(devices=8)
@@ -528,10 +535,11 @@ def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, whol
     """A causal bf16 call over six rows of fourteen heads that names the template and its Mosaic mainloop
     (`generation.chosen`), its forward and backward lowered for an H100 on a mesh splitting its rows or its
     heads in two (`generation.gpu_mesh`): no array of any Mosaic launch holds the call's whole count of rows
-    or heads, and each launch's operands hold a shard's own, half the call's (`attention._per_shard`; the
-    counts no other axis takes), so no device runs the global batch; and the lowered program's own
-    operations move no operand between devices (`sharded.MOVES`, as a `shard_map` body would issue them;
-    what the partitioner inserts after lowering is the compiled program's, which this CPU does not build)
+    or heads, and each launch's operands hold a shard's own, half the call's
+    (`attention_parallel.on_attention_shards`; the counts no other axis takes), so no device runs the
+    global batch; and the lowered program's own operations move no operand between devices
+    (`sharded.MOVES`, as a `shard_map` body would issue them; what the partitioner inserts after lowering
+    is the compiled program's, which this CPU does not build)
     (bible §7: a new accelerator route qualifies through its real target lowering on a multi-device
     mesh)."""
     import math

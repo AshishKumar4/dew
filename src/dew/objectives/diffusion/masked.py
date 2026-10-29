@@ -37,6 +37,7 @@ from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, Di
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.moe import ROUTER_COLLECTION
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Lacks, TokenModel
 from dew.objectives.base import OMITTED, Aux, EMASpec, Omitted, Ratio, Shown, Source, Step, ended, model_rngs
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
@@ -102,9 +103,10 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         `CausalTransformer(causal=False)`'s do. `solver`, `steps` and `block`
         set how generation unmasks in the task `pipeline` returns, and `solver`
         and `steps` how the preview does, which walks whole rows; None for
-        `solver` or `steps` and an omitted `block` take a loaded source's own
-        walk where its family declares one (`masked_recipe`, LLaDA2.0's
-        blocks), else `Unmask` over MDLM's steps and the whole response.
+        `solver` or `steps` takes a loaded source's own walk where its family
+        declares one (`masked_recipe`, LLaDA2.0's blocks), else `Unmask` over
+        MDLM's steps, and an omitted `block` the source's walk's where the
+        solver is omitted too, else the whole response.
         `samples` is how many rows the preview draws. `decode` turns a row of ids into the text the artifact
         shows;
         with None, the artifact shows the ids alone.
@@ -117,9 +119,10 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         # The source's own walk, where its family declares one, for what the caller omits.
         recipe = model.masked_recipe if isinstance(model, Walking) else None
         own_solver, own_steps, own_block = (_DEFAULT_SOLVER, MDLM_STEPS, None) if recipe is None else recipe
+        # A walk the caller names (its solver) keeps the block it names, none where it names none.
+        block = (own_block if solver is None else None) if block is OMITTED else block
         solver = own_solver if solver is None else solver
         steps = own_steps if steps is None else steps
-        block = own_block if block is OMITTED else block
         model = self.bind_model(model, variables=variables, processor=processor)
         if not isinstance(model, TokenModel) or model.causal:
             raise Lacks("bidirectional",
@@ -199,7 +202,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         tokens, losses, weights, counted, predicted, real, sown = self._token_losses(params, batch, step,
                                                                                    train=train)
         prediction = Ratio(self.row_mean(losses, batch, weights=weights).total,
-                           self.row_mean(real.astype(jnp.float32), batch).total)
+                           self.row_mean(real.astype(at_least_fp32(losses.dtype)), batch).total)
         correct = predicted == tokens
         accuracy, _ = self.accuracy(correct.astype(losses.dtype), batch, counted).mean()
         reported = {

@@ -152,7 +152,7 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
 
 def _task_inputs(processor: Processor | None, request: Request, *, images: Media | None,
                  collective: bool, max_new_tokens: int | None, default_tokens: int | None,
-                 max_length: int | None, key: int | jax.Array | None) -> tuple[ModelInputs, int, jax.Array]:
+                 max_length: int | None, key: int | jax.Array) -> tuple[ModelInputs, int, jax.Array]:
     def prepared() -> tuple[ModelInputs, int, jax.Array]:
         """Tokenize the request, size its budget and draw its key."""
         random_key = request_key(key)
@@ -387,9 +387,10 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
     and refused where it holds more than its name and fields (ledger 1239),
     a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
-    fields (`_earlier_projectors`, ledger 1622), and a row of segments' question budgets, which it
-    ignored and an earlier record wrote at their defaults (row 2006). A record in today's shapes passes
-    as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    fields, a decoder's or kind's YaRN field beside its rope scaling and a decoder's cross-attention
+    by its fields alone (`_earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
+    question budgets, which it ignored and an earlier record wrote at their defaults (row 2006). A
+    record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     for key in ("head", "layout"):
         held = record.get(key)
@@ -431,30 +432,90 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
     if "model" in current:
-        current = _earlier_projectors(current)
+        current = _earlier_model(current)
     return current
 
 
-def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A record's earlier Qwen or MiMo projector fields read as today's (`earlier_shapes`), wherever the
-    model nests the projector through another recorded wrapper. Carried until 1.0 (ledger 1622);
-    current constructors and source codecs accept only their current schema."""
+_EARLIER_PROJECTORS = ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector")
+_DECODER = ("dew.nn.backbones.causal_transformer:CausalTransformer", "causal_transformer")
+"""The decoder's import path and its registry alias, either of which a record names it by."""
+
+
+def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A record's model with each component in today's fields (`earlier_shapes`), wherever the model
+    nests it through another recorded wrapper: a Qwen or MiMo projector's earlier fields (ledger 1622),
+    and a decoder's and its layer kinds' YaRN field beside their rope scaling (`_one_scaling`, ledger
+    1898), whether the decoder names its class or a wrapper declares the field it fills
+    (`MultimodalTransformer.language_model`, `DiffusionGemma.text`), which records its fields alone
+    (ledger 2274). Carried until 1.0 (ledger 1552); current constructors and source codecs accept only
+    their current schema."""
     def current(value):
-        if isinstance(value, Mapping):
-            component = {key: current(field) for key, field in value.items()}
-            name, fields = component.get("class"), component.get("fields")
-            if name in ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector") \
-                    and isinstance(fields, dict) and "vision_width" in fields:
-                width, merge = fields.pop("vision_width"), fields.pop("merge_size")
-                component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
-                                     "width": width * merge ** 2,
-                                     "bias": name == "dew.nn.vision.qwen35:Qwen35Projector"}
-            return component
         if isinstance(value, list | tuple):
             return [current(field) for field in value]
-        return value
+        if not isinstance(value, Mapping):
+            return value
+        component = {key: current(field) for key, field in value.items()}
+        # A component record names its class; the run's model record (`ModelConfig`) names it too, and
+        # holds the fields it defaulted beside the ones it was given.
+        name, fields = component.get("class", component.get("name")), component.get("fields")
+        if not isinstance(fields, dict):
+            return component
+        if name in _EARLIER_PROJECTORS and "vision_width" in fields:
+            width, merge = fields.pop("vision_width"), fields.pop("merge_size")
+            component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
+                                   "width": width * merge ** 2, "bias": name == _EARLIER_PROJECTORS[0]}
+        elif name in _DECODER:
+            component["fields"] = _decoder_fields(fields)
+            defaults = component.get("defaults")
+            if isinstance(defaults, Mapping):
+                component["defaults"] = _one_scaling(defaults)
+        elif isinstance(name, str):
+            component["fields"] = _declared_decoders(name, fields)
+        return component
 
     return {**record, "model": current(record["model"])}
+
+
+def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, object]:
+    """The fields of the component class `name` with each decoder its fields declare
+    (`dew.registry.declared_type`) and record as their fields alone translated (`_decoder_fields`)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import declared_type, imported, models
+
+    owner = models[name] if name in models.paths else imported(name)
+    if not isinstance(owner, type):
+        return fields
+    return {field: (_decoder_fields(value) if isinstance(value, Mapping) and "class" not in value
+                    and declared_type(owner, field) is CausalTransformer else value)
+            for field, value in fields.items()}
+
+
+def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
+    """A decoder's fields and its layer kinds' with an earlier YaRN field read as their rope scaling
+    (`_one_scaling`), and an earlier cross-attention, IDEFICS's block recorded by its fields alone
+    when the field declared that class, as its class record (`dew.nn.cross_attention.CrossBlocks`,
+    ledger 2320)."""
+    kinds, cross = fields.get("kinds"), fields.get("cross_attention")
+    return {**_one_scaling(fields), **({"kinds": {
+        kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
+               else _one_scaling(held)) if isinstance(held, Mapping) else held
+        for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {}),
+        **({"cross_attention": {"class": "dew.nn.cross_attention:CrossAttention", "fields": dict(cross)}}
+           if isinstance(cross, Mapping) and "class" not in cross else {})}
+
+
+def _one_scaling(fields: Mapping[str, object]) -> Mapping[str, object]:
+    """A decoder's or layer kind's fields with an earlier `yarn` field read as its `rope_scaling`: the
+    fields it wrote, as YaRN's record. Fields setting both are refused: they were two scalings."""
+    current = dict(fields)
+    yarn = current.pop("yarn", None)
+    if yarn is None:
+        return current
+    if current.get("rope_scaling") is not None:
+        raise ValueError("an earlier record sets yarn and rope_scaling, two rope scalings")
+    held = yarn.get("fields", yarn) if isinstance(yarn, Mapping) else yarn
+    current["rope_scaling"] = {"rope_type": "yarn", **held} if isinstance(held, Mapping) else held
+    return current
 
 
 def settings_fields(settings: type) -> frozenset[str]:
@@ -801,7 +862,7 @@ class TextGeneration(_NativeTextTask):
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  sampling: Sampling | None = None, images: Media | None = None,
                  logits: Transforms | None = None, stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation:
@@ -885,7 +946,7 @@ class BlockGeneration(_NativeTextTask):
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.block"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
@@ -975,7 +1036,7 @@ class MaskedGeneration(_NativeTextTask):
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  steps: int | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.masked"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,

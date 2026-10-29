@@ -169,6 +169,8 @@ COLLECT_TASKS = 4
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
+HARNESS = "tools/armada/"
+"""The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
           "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
           "tools/armada/watched.py")
@@ -317,12 +319,18 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     import it tried now finds), or an __init__.py added to a namespace package on the way to one, which
     executes as the import passes, changes its key; one added to a package it never imported does not.
     tools/ itself is among them, as a test puts it, or a directory under it, on sys.path and imports a tool
-    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`)."""
+    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`). The
+    harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
+    import of a test's, so their directories are none of its inputs (Main, 2026-10-29: tools/'s entries
+    keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
     packages = {str(parent) for path in depends
-                if path.startswith(("src/", "tools/")) and path.endswith(".py")
+                if path.startswith(("src/", "tools/")) and path.endswith(".py") and not path.startswith(HARNESS)
                 for parent in Path(path).parents
                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
-    return sorted({name, *depends, *packages})
+    # A build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
+    # (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files).
+    kept = (path for path in depends if not built(Path(path.removeprefix("probe:"))))
+    return sorted({name, *kept, *packages})
 
 
 @functools.cache
@@ -407,47 +415,64 @@ READ_TOKEN = "DEW_XLA_CACHE_READ_TOKEN"
 """The test cache's read-only token, which the plan reads records with (`reusable`): it never writes them."""
 
 
-def pinned_class() -> str | None:
-    """The one CPU class .armada.json pins its tasks to (task.cpu), as `cpu_class` names it, which their rows
-    are recorded under; None where it pins none or several, or the tasks run on a CUDA lane, whose class
-    (`device_class`) the plan cannot know."""
+def pinned_classes() -> list[str]:
+    """The CPU classes .armada.json pins its tasks to (task.cpu, one or a list), as `cpu_class` names them,
+    which their rows are recorded under, a task's on the class it lands on; none where it pins none, or the
+    tasks run on a CUDA lane, whose class (`device_class`) the plan cannot know."""
     config = Path(".armada.json")
     if not config.is_file() or "cuda" in os.environ.get("JAX_PLATFORMS", "").split(","):
-        return None
+        return []
     cpu = json.loads(config.read_text()).get("task", {}).get("cpu")
-    return f"{cpu['vendor']}-{cpu['family']}-{cpu['model']}" if isinstance(cpu, dict) else None
+    return [f"{each['vendor']}-{each['family']}-{each['model']}" for each in
+            ([cpu] if isinstance(cpu, dict) else cpu or [])]
 
 
 def reusable(python: str, names: list[str], common: str) -> set[str]:
     """The files of `names` whose whole row ran green on exactly these inputs (`common`, and each file's
-    own, `fresh`) on the class the tasks run on (`pinned_class`), read at plan time with the cache's read
-    token (`READ_TOKEN`): a task of their own would only look each up and exit. None where the plan has no
-    token or no single class (Main, 2026-10-28: a lane run with most files unchanged booted a container a
-    task)."""
-    token, held = os.environ.get(READ_TOKEN), pinned_class()
-    if not token or held is None or "DEW_XLA_CACHE_URL" not in os.environ:
+    own, `fresh`) on any class the tasks run on (`pinned_classes`), which a task of theirs could land on,
+    read at plan time with the cache's read token (`READ_TOKEN`): a task of their own would only look each
+    up and exit. None where the plan has no token or no class (Main, 2026-10-28: a lane run with most files
+    unchanged booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
+    token, held = os.environ.get(READ_TOKEN), pinned_classes()
+    if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return set()
 
     def hit(name: str) -> bool:
-        found = recorded(record_key(python, row(python, name, ""), held, common), token)
-        return found is not None and fresh(found, name, common)
+        return green_record(python, name, "", common, token, held) is not None
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         return {name for name, found in zip(names, pool.map(hit, names), strict=True) if found}
 
 
+def green_record(python: str, name: str, split: str, common: str, token: str,
+                 classes: list[str]) -> dict | None:
+    """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
+    of `classes`, the first found; else None. The plan (`reusable`) and a task (`reused`) read it alike."""
+    for each in classes:
+        found = recorded(record_key(python, row(python, name, split), each, common), token)
+        if found is not None and fresh(found, name, common):
+            return found
+    return None
+
+
+def reused_classes(network: bool = False) -> list[str]:
+    """The classes whose green rows a task on this host reuses: every class the tasks are pinned to, where
+    this host's is one of them, as the plan counted a row green on any of them reusable (`reusable`), so the
+    task holding the files it kept reuses them wherever it lands; else this host's class alone."""
+    own, held = device_class(network), pinned_classes()
+    return held if own in held else [own]
+
+
 def reused(python: str, name: str, split: str, common: str, network: bool = False) -> dict | None:
-    """The green row of test file `name` (in `split`'s group) recorded on this host's class
-    (`device_class`), if it ran green there on exactly these inputs; else None. The record of the last
+    """The green row of test file `name` (in `split`'s group) recorded on a class this host reuses
+    (`reused_classes`), if it ran green there on exactly these inputs; else None. The record of the last
     run on these shared inputs decides: a key hashes them (`cache_key`), so no run on others, whose
     record the last run's may be, can be fresh here."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    found = recorded(record_key(python, row(python, name, split), device_class(network), common), token)
-    if found is None or not fresh(found, name, common):
-        return None
-    return found["row"]
+    found = green_record(python, name, split, common, token, reused_classes(network))
+    return None if found is None else found["row"]
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
@@ -822,7 +847,7 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), said."""
     rows = [found for name in tests if (found := reused(python, name, group, common, network))]
     if rows:
-        print(f"{len(rows)} files ran green on these inputs on {device_class(network)}; "
+        print(f"{len(rows)} files ran green on these inputs on {', '.join(reused_classes(network))}; "
               "their rows are reused")
     return rows
 
