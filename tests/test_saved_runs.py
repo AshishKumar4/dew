@@ -1,18 +1,21 @@
 """Runs saved by earlier mains, read at this one (row 2282).
 
 The corpus (tests/fixtures/saved_runs, written by tools/saved_runs_reference.py) holds, for each main that
-recorded it, a saved run of each run kind: its run.json and its checkpoints. This main reads each as a user's
+recorded it, a saved run of each run kind: its run.json and its last checkpoint, a recording that is
+committed or pinned in the fetched store (`reference_error.recording`). This main reads each as a user's
 process would: the record rebuilds its run (`RunConfig.load`), the checkpoint's inference declaration pins
 (`SavedRun.pinned`) where its objective declares one, the kind's saved task loads it (`from_run`) and
 answers one call, and the run resumes a step past its last. Its data is the kind's own, written here, since
 a record names its data where the run that wrote it read them."""
 
 import dataclasses
+import io
 import json
 import tarfile
 from pathlib import Path
 
 import pytest
+from reference_error import recording
 from test_run_options import KINDS
 
 from dew.checkpoints import Checkpoints
@@ -37,7 +40,8 @@ def test_a_run_an_earlier_main_saved_loads_answers_and_resumes(tmp_path, recorde
     """A kind's run saved at an earlier main rebuilds from its record, pins its last checkpoint, loads as
     its saved task and answers a call, and resumes from that checkpoint to a step past it."""
     runs = tmp_path / "runs"
-    with tarfile.open(CORPUS / recorded / f"{kind}.tar.xz") as packed:
+    stored = recording(f"tests/fixtures/saved_runs/{recorded}/{kind}.npz")["run"]
+    with tarfile.open(fileobj=io.BytesIO(stored.tobytes()), mode="r:xz") as packed:
         packed.extractall(runs, filter="data")
     run = runs / kind
     with Checkpoints(str(run)) as checkpoints:
