@@ -57,7 +57,8 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 
-from dew.nn.attention import pallas_flash_attention, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention_tpu import pallas_flash_attention
 from dew.telemetry.benchmark import samples
 
 KERNELS = ('splash', 'flash', 'xla')

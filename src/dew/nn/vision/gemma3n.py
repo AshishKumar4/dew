@@ -17,9 +17,9 @@ from dew import _records
 from dew.interop.config_records import NativeFields
 from dew.interop.unread import Stored
 from dew.interop.weights import in_params, placed
-from dew.nn.attention import RMSNorm
 from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import float32_dot_general
 from dew.registry import Record, from_record
 
