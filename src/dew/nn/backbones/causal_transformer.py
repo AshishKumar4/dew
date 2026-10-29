@@ -1433,15 +1433,18 @@ class CausalTransformer(nn.Module):
                    conditioning: Mapping[str, jax.Array] | None = None):
         """Return the shared language head's logits for each prediction depth's hidden states; a
         call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
+        # The call's token layout, converted once (`token_coordinates`); the depths read it alone.
+        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
+                                        positions=positions)
         return [self._logits(state) for state in self.mtp_hidden_states(
-            hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
+            hidden, tokens, train=train, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates,
             conditioning=conditioning)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
-                 decode: bool = False, prediction_phase: PredictionPhase = "ordinary"):
+                 decode: bool = False, prediction_phase: PredictionPhase = "ordinary",
+                 coordinates: Coordinates | None = None):
         """Run one unshifted prediction step, optionally appending to the depth's own KV cache.
 
         Call `init_mtp_cache` before cached steps. `hidden` is the target
@@ -1451,7 +1454,8 @@ class CausalTransformer(nn.Module):
         that state in place of the target's. With
         `index_share_for_mtp_iteration`, a cached "extend" step publishes its
         index selections and a "draft" step reuses them, while "ordinary"
-        always recomputes them.
+        always recomputes them. The step's tokens are laid out by their `coordinates` or by their flat
+        `attention_mask` and `positions`, one of them (`token_coordinates`).
         """
         if prediction_phase not in ("ordinary", "extend", "draft"):
             raise ValueError("prediction_phase must be ordinary, extend or draft")
@@ -1462,7 +1466,8 @@ class CausalTransformer(nn.Module):
             hidden, embeds, decode=decode,
             prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
             attention_metadata=AttentionMetadata(
-                coordinates=token_coordinates(hidden.shape[:2], valid=attention_mask, positions=positions),
+                coordinates=token_coordinates(hidden.shape[:2], coordinates, valid=attention_mask,
+                                              positions=positions),
                 rotary_positions=rotary_positions))
         return self._logits(state), prediction
 
