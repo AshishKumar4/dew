@@ -214,9 +214,10 @@ class Coords(NamedTuple):
         return expand(x, like) if self.keys_first else across(x, like)
 
     def query_places(self) -> jax.Array:
-        """The tile's queries' places, one a query (`[bq]`): each row's of `q_pos`, by a reduction along it
-        (exact: a row holds one place), which every mainloop's layouts take, a slice of a column not."""
-        return jnp.max(jnp.broadcast_to(self.q_pos, (self.q_pos.shape[0], self.k_pos.shape[-1])), axis=-1)
+        """The tile's queries' places, one a query (`[bq]`): `q_pos` reduced along the tile's key axis (exact:
+        a query's entries hold one place), which every mainloop's layouts take, a slice of a column not."""
+        tile = jnp.broadcast_to(self.q_pos, jnp.broadcast_shapes(self.q_pos.shape, self.k_pos.shape))
+        return jnp.max(tile, axis=0 if self.keys_first else -1)
 
     def key_count(self, like: jax.Array) -> int:
         """The keys the tile `like` holds."""
@@ -938,8 +939,15 @@ Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
 
 
 def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | None:
-    """A tile's dropout multipliers at `queries` and `keys` (`Coords.drop`), None where no call drops."""
-    return None if coords.drop is None else coords.drop(queries, keys)
+    """A tile's dropout multipliers at `queries` and `keys` (`Coords.drop`), None where no call drops. A
+    tile whose coordinates are its entries (a Mosaic program's, `queries` its `q_pos`) mixes each query's
+    word once, on its vector (`Draw.words`), its keys entry for entry: the same bits, half the hashing."""
+    if coords.drop is None:
+        return None
+    if queries is coords.q_pos and jnp.shape(queries) == jnp.shape(keys) and jnp.ndim(keys) == 2:
+        words = coords.queries(coords.drop.words(coords.query_places()), keys)
+        return coords.drop.multiplied(coords.drop.kept(words, keys))
+    return coords.drop(queries, keys)
 
 
 
