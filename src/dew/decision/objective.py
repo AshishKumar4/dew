@@ -231,8 +231,6 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  consistency: float = 0.0, context_window: int | None = None):
         held: Variables | None = None
         self.image_processor = None
-        # What the backbone's source drew fresh over its weights, under the model's `backbone`.
-        self._fresh_backbone = tuple(f"backbone/{module}" for module in getattr(backbone, "fresh", ()))
         match backbone:
             case Decide():
                 model, held = backbone.model, backbone.variables
@@ -249,6 +247,12 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                     tokenizer = tokenizer or tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
+        from dew.interop.pretrained import Pretrained
+
+        # What the backbone's source drew fresh over the weights it holds, under the model's `backbone`:
+        # none where other variables replace them.
+        self._fresh_backbone = tuple(f"backbone/{module}" for module in backbone.fresh) if (
+            variables is OMITTED and isinstance(backbone, Pretrained)) else ()
         if variables is not OMITTED:
             held = variables
         if tokenizer is None:

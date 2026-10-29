@@ -255,6 +255,18 @@ def _flag_json(text: str) -> JSON:
     return None if text == "None" else json.loads(text)
 
 
+def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str]) -> tuple[str, ...]:
+    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree
+    is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
+    if not modules:
+        return ()
+    from dew.optim import parameter_name
+
+    trained = jax.eval_shape(lambda: objective.init(jax.random.key(0)))["params"]
+    names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
+    return tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names))
+
+
 def _best_argument():
     """A metric name or JSON policies through one CLI argument."""
     def read(given):
@@ -1614,14 +1626,18 @@ class RunConfig:
         with generation.chosen(attention_form=self.trainer.attention_form):
             return target.compiled(self.built(objective, mesh, rollout), dataset, steps)
 
-    def grouped(self, objective: Objective) -> OptimConfig:
+    def grouped(self, objective: Objective[Loss, Effects]) -> OptimConfig:
         """The run's optimizer, each group that claims the modules its objective draws fresh beside a
-        loaded base matching them (`ParamGroup.fresh`, `Objective.fresh_modules`), which every process
-        agrees on before any records it; as configured where no group claims them."""
+        loaded base matching those that hold a parameter (`ParamGroup.fresh`, `trained_modules`): the
+        groups every process agrees on before any records them, the same where none claims them."""
+        def resolved() -> JSON:
+            optim = self.optim
+            if any(group.fresh for group in optim.param_groups):
+                optim = optim.with_fresh(trained_modules(objective, objective.fresh_modules()))
+            return to_record(optim.param_groups, tuple[ParamGroup, ...])
+        groups = agreed_same("run param groups", resolved)
         if not any(group.fresh for group in self.optim.param_groups):
             return self.optim
-        groups = agreed_same("run param groups", lambda: to_record(
-            self.optim.with_fresh(objective.fresh_modules()).param_groups, tuple[ParamGroup, ...]))
         return dataclasses.replace(self.optim, param_groups=from_record(tuple[ParamGroup, ...], groups))
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],

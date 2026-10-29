@@ -962,7 +962,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         """The modules this objective trains that are drawn fresh beside a loaded base, by their paths
         under `params` (`backbone/layers_1/cross_attention`, `head`), which a run's fresh group claims
         (`dew.optim.ParamGroup.fresh`): none by default, an objective declaring what it draws beside
-        the base it holds and what its source drew (`Pretrained.fresh`)."""
+        the base it holds and what its source drew (`Pretrained.fresh`). One drawn with no parameter, a
+        tied readout, the group leaves out (`dew.config.trained_modules`)."""
         return ()
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:

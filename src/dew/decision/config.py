@@ -45,7 +45,7 @@ from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
-from dew.nn.cross_attention import ContextEncoder, CrossAttention
+from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
 from dew.nn.protocols import RematChoosing
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig, import_path, record_argument
@@ -176,6 +176,11 @@ class DecisionRunConfig(DecoderRunConfig):
     """How a context becomes the states its cross-attention reads
     (`DecisionModel.context_encoder`): the backbone's token table, or the
     backbone's own pass over it. With `context_layers` alone."""
+    context_form: Literal["idefics", "shared"] = "idefics"
+    """The block each context layer runs: IDEFICS's gated block, an attention and a
+    feed-forward of its own drawn beside the layer (`CrossAttention`), or the
+    layer's own attention reading the context behind a gate it adds, the only
+    weights the form draws (`SharedCrossAttention`). With `context_layers` alone."""
     def pinned(self) -> DecisionRunConfig:
         """This run with its Hub sources at their commits (`RunConfig.pinned`), its backbone's `revision`
         among them (`SourceReference.pinned`), so its record names the commit it read."""
@@ -215,6 +220,8 @@ class DecisionRunConfig(DecoderRunConfig):
         if not self.context_frozen and self.context_layers is None:
             raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
                              "--context-layers")
+        if self.context_form != "idefics" and self.context_layers is None:
+            raise ValueError("--context-form says which block context layers run; set --context-layers")
         derived = {}
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder
@@ -241,7 +248,8 @@ class DecisionRunConfig(DecoderRunConfig):
         start = self.looped(start)
         if self.context_layers is not None:
             # Drawn from a key of their own, apart from the adapter's and the head's.
-            blocks = CrossAttention(self.context_layers, self.context_length)
+            form = SharedCrossAttention if self.context_form == "shared" else CrossAttention
+            blocks = form(self.context_layers, self.context_length)
             start = start.with_cross_attention(blocks, key=jax.random.fold_in(
                 jax.random.key(self.trainer.key), 1), frozen=self.context_frozen)
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)

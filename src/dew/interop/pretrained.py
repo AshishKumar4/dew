@@ -536,6 +536,7 @@ class Pretrained:
         from dew.nn.cross_attention import NAME, crossing
         from dew.nn.inputs import request_key
         from dew.nn.protocols import CrossAttending, Predicting
+        from dew.optim import parameter_name
 
         if not isinstance(self.model, CrossAttending):
             raise TypeError(f"a {type(self.model).__name__} takes no cross-attention layers")
@@ -554,8 +555,7 @@ class Pretrained:
         variables = merge(self.variables, blocks)
         # Each block's module, its path under `params` to and with the block's own name.
         added = {"/".join(keys[1:keys.index(NAME) + 1]) for keys in (
-            tuple(getattr(entry, "key", entry) for entry in path)
-            for path, _ in jax.tree_util.tree_leaves_with_path(blocks))}
+            parameter_name(path).split("/") for path, _ in jax.tree_util.tree_leaves_with_path(blocks))}
         return replace(self, model=model, variables=freeze(variables, crossing) if frozen else variables,
                        fresh=tuple(sorted({*self.fresh, *added})))
 
