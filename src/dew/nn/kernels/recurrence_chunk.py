@@ -659,8 +659,9 @@ any of them (no target's row names it: a GPU no row named took the portable math
 step where the port took 3.1, template review 2026-10-26 P1-1), and every shape, dtype, chunk size and mesh,
 except inside a caller's `shard_map` that checks varying axes over operands that vary, where a Pallas call,
 which states no varying type for its results, cannot run; float64 operands, whose rule is the reference math
-itself; and keys wider than the port takes in their dtype. Packed documents take the port at any bound: it stores the memories by where they pass,
-as many as the tokens' chunks, a row's and one, whatever the bound (`chunked_launch.Sequences`)."""
+itself; and keys wider than the port takes in their dtype. Packed documents take the port at any bound: it
+stores the memories by where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
+(`chunked_launch.Sequences`)."""
 
 PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('mma.sync', 'forward'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
