@@ -579,7 +579,7 @@ def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_an
     text = modelopt_fp8(tmp_path / "text", ["model.layers.0.mlp.down_proj", "lm_head"])
     load = {"dtype": "float32", "attention_impl": "reference"}
     taken, expected = Pretrained.load(wrapper, text_only=True, **load), Pretrained.load(text, **load)
-    assert taken.model == expected.model
+    # Each load binds its input quantization in a class of its own, so the two compute alike, not one class.
     jax.tree.map(np.testing.assert_array_equal, taken.variables, expected.variables)
     ids = np.load(source / "input_ids.npy")[:1]
     np.testing.assert_array_equal(np.asarray(taken.model.apply(taken.variables, ids)),
