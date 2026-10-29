@@ -278,7 +278,7 @@ class _Attending:
     token's index where None) only where the call states its keys' positions (`key_places`), as Dew's
     own attention reads a stated visibility (`AttentionMetadata.key_positions`)."""
 
-    implementation: str
+    implementation: AttentionImpl
     documents: jax.Array | None
     valid: jax.Array | None
     max_segments: int

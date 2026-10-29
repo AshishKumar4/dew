@@ -44,7 +44,6 @@ from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
-from dew.nn.attention import attention_implementation
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention
 from dew.nn.protocols import RematChoosing
@@ -198,7 +197,7 @@ class DecisionRunConfig(DecoderRunConfig):
             raise ValueError(f"--model sets {decided}, which {self.pretrained} decides; only dtype and "
                              "attention_impl are choices")
         dtype = str(self.model.fields.get("dtype") or "float32")
-        attention_impl = attention_implementation(str(self.model.fields.get("attention_impl", "auto")))
+        attention_impl = self.source_attention()
         budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
                    "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
                    "framing": self.framing, "segments": self.segments, "order": self.order,

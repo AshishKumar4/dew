@@ -335,5 +335,5 @@ def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.
     return product[..., 0]
 
 
-__all__ = ["CROSS_CACHE", "CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "ContextEncoder",
-           "CrossAttention", "GatedCrossAttention", "crossing", "encode_context", "gated_join"]
+__all__ = ["CROSS_CACHE", "CROSS_LENGTHS", "NAME", "ContextEncoder", "CrossAttention", "GatedCrossAttention",
+           "crossing", "encode_context", "gated_join"]

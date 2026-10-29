@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.interop import Pretrained
+    from dew.nn.attention import AttentionImpl
     from dew.training.trainer import Trainer
 
 
@@ -1108,6 +1109,14 @@ class RunConfig:
         (`source`) and where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
         keeps the source as it is). Every run kind that starts from a source loads it with these."""
         return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen)}
+
+    def source_attention(self) -> AttentionImpl:
+        """The attention implementation a run that starts from a source loads it with: its model's
+        `attention_impl` field, auto unless set, refused unless it names one (`AttentionImpl`). Every run
+        kind that loads a source reads it here."""
+        from dew.nn.attention import attention_implementation
+
+        return attention_implementation(str(self.model.fields.get("attention_impl", "auto")))
 
     def built_fresh(self) -> None:
         """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
