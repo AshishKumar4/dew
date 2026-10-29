@@ -370,7 +370,7 @@ def enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     stored = staged(inverse(step.k, step.beta, exponents, lane), lane)
     return {"a": stored, "w": w, "c": staged(c, lane),
             "h": carried(step.carry, values, step.k, exponents, lane),
-            "o": output(step.q, step.k, step.h, step.c, exponents, scale, lane)}
+            "o": staged(output(step.q, step.k, step.h, step.c, exponents, scale, lane), lane)}
 
 
 def stored_memory(iv: Iv, lane: Lane) -> Iv:
@@ -384,15 +384,12 @@ def _index(x) -> np.ndarray:
     return np.where(np.signbit(np.asarray(x, np.float64)), -bits, bits)
 
 
-def grid_steps(iv: Iv, fmt: Format) -> np.ndarray:
-    """How many steps of `fmt`'s grid each enclosure spans: zero where it admits one value."""
-    lo, hi = above(iv.lo, fmt), below(iv.hi, fmt)
-    if fmt.name == "float32":
-        return np.maximum(_index(hi) - _index(lo), 0)
-    dtype = DTYPES[fmt.name]
-    index = [np.where(np.signbit(x), -1, 1) * np.abs(x).astype(dtype).view(np.uint16).astype(np.int64)
-             for x in (lo, hi)]
-    return np.maximum(index[1] - index[0], 0)
+def ulps(iv: Iv, record, fmt: Format) -> np.ndarray:
+    """Each enclosure's width in units of `fmt`'s last place at its record (at the least normal's for a zero):
+    how far apart two values it admits may lie, on the record's own grid."""
+    record = np.abs(np.asarray(record, np.float64))
+    _, exponent = np.frexp(np.maximum(record, 2.0 ** fmt.emin))
+    return (iv.hi - iv.lo) / np.ldexp(1.0, exponent - fmt.precision)
 
 
 def exp2_reach(native) -> int:
@@ -506,12 +503,10 @@ def witness(run: Run, lane: Lane) -> dict[str, np.ndarray]:
     """Whether each record of `run` lies inside its step's enclosure (`enclosures`), by record `[N, H, ...]`:
     `a`, `w`, `c`, `o`, the entering memory `h` (the first chunk's its initial memory stored), and `leaving`,
     each chunk's leaving memory (the next chunk's stored, or the final memory, fp32), with each enclosure's
-    width in steps of its grid (`grid_steps`) under `steps`."""
+    width in its record's units of the last place (`ulps`) under `ulps`."""
     scale = run.k.shape[-1] ** -0.5
     held: dict[str, list] = {name: [] for name in ("a", "w", "c", "o", "leaving")}
-    steps: dict[str, list] = {name: [] for name in held}
-    grids = {"a": lane.held or FLOAT32, "w": lane.held or FLOAT32, "c": lane.held or FLOAT32,
-             "o": lane.held or FLOAT32}
+    widths: dict[str, list] = {name: [] for name in held}
     for n in range(run.chunks):
         for head in range(run.heads):
             step = run.step(n, head, lane)
@@ -522,9 +517,9 @@ def witness(run: Run, lane: Lane) -> dict[str, np.ndarray]:
                        "leaving": run.leaving(n, head)}
             for name, record in records.items():
                 held[name].append(within(record, found[name]))
-                grid = grids.get(name, FLOAT32 if last else lane.held or FLOAT32)
-                steps[name].append(grid_steps(found[name], grid))
+                grid = FLOAT32 if name == "leaving" and last else lane.held or FLOAT32
+                widths[name].append(ulps(found[name], record, grid))
     first = within(run.h[0], stored_memory(point(run.h0), lane))
     shaped = {name: np.stack(values).reshape(run.chunks, run.heads, *values[0].shape)
               for name, values in held.items()}
-    return {**shaped, "h": first, "steps": {name: np.stack(values) for name, values in steps.items()}}
+    return {**shaped, "h": first, "ulps": {name: np.stack(values) for name, values in widths.items()}}
