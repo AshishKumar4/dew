@@ -18,8 +18,8 @@ from dew.nn.dex import DifferentialExtension, LayerDex, annealed, diff_lambda_in
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 HEADS = (1, 3)
 SEEDS = {"dex differential": 256, "dex through the decoder": 8, "dex at the anneal's start": 8,
-         "dex gradients through the decoder": 8}
-"""Check 1's declared seeds for each site, sized paired by `seeds_for` on armada (IGDEXS, IGDEXS2)."""
+         "dex gradients through the decoder": 256}
+"""Check 1's declared seeds for each site, sized paired by `seeds_for` on armada (IGDEXS, IGDEXS4)."""
 
 
 def reference(attention, projection, strength, cotangent):
