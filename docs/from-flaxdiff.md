@@ -69,7 +69,7 @@ images = pipe(["a lighthouse on a rocky coast"], key=0, steps=25, solver=Heun())
 
 `images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way the older trainer previewed its runs, with Euler ancestral over 200 steps of that trainer's own time grid and classifier-free guidance 3. Passing another `steps` samples the same grid at that count. `tests/test_flaxdiff.py` compares a call with the older package's own preview sampling of the same run, run from its source at the pinned commit. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture with `adaln_silu=False` and `text_pooling="all"`, the two places where the blocks of the `flaxdiff` 0.2 package differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against that package's own code.
 
-Anything else, including the older UNets and the 2024 checkpoints, has no loader. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
+Anything else, including the older UNets and the 2024 checkpoints, has no loader: a run of another architecture, schedule, autoencoder or condition count is refused from its config, and a 2024 aggregate checkpoint (`default/checkpoint`) by its layout. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
 
 ## FlaxDiff's named datasets
 
