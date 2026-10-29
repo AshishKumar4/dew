@@ -212,23 +212,25 @@ def _scaled(x, k):
 
 
 def separated(hi, lo):
-    """A compensated base-2 exponent `(hi, lo)` as its whole part and fraction `(n, f)`, `f` in [0, 1): the
-    form whose differences are exact at any size, the wholes' an integer and the fractions' within one
-    (`between`). Once a call, where its prefix is cumulated."""
+    """A compensated base-2 exponent `(hi, lo)` as its whole part and fraction `(n, f)`: `n` the integer
+    `floor(hi)` (`hi` itself past 2^23, where every fp32 is one), `f` what `hi` holds past it and `lo`, the
+    form whose differences are exact at any size (`between`). Once a call, where its prefix is cumulated."""
     whole = _floor(hi)
-    part = (hi - whole) + lo
-    carry = _floor(part)
-    return whole + carry, part - carry
+    return whole, (hi - whole) + lo
 
 
 def between(later, earlier):
     """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution at
-    any size: exp2 of the fractions' difference, in (1/2, 2), scaled by the wholes' power of two (`_scaled`),
-    zero below 2^-124. A difference of the rounded sums lost the fraction's last bits at the exponent's size,
-    1e-6 of the decay near -43, which put a port's decay gradient under decays near zero 9 to 14 times the
-    token-by-token recurrence's error from float64 (ledger 2098)."""
+    any size: exp2 of the fractions' difference less its whole part, in (1/2, 2), scaled by the wholes'
+    difference and that whole part (`_scaled`), zero below 2^-124. A difference of the rounded sums lost the
+    fraction's last bits at the exponent's size, 1e-6 of the decay near -43, which put a port's decay
+    gradient under decays near zero 9 to 14 times the token-by-token recurrence's error from float64 (ledger
+    2098). Past 2^23 a whole part takes no carry from its fraction (`lo` up to half its ulp), so the
+    fractions' difference may pass one: its truncation joins the scale."""
     (whole, fraction), (other, its_fraction) = later, earlier
-    return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
+    difference = fraction - its_fraction
+    step = difference.astype(jnp.int32).astype(difference.dtype)
+    return _scaled(jnp.exp2(difference - step), (whole - other) + step)
 
 
 def grown_from(hi, lo, exp, unit: float = 1.0):
