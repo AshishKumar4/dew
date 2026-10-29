@@ -50,9 +50,11 @@ DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek
             "mamba2-tiny")
 
 
-DECODER_SEEDS = {"float32": 0, "bfloat16": 0}
+DECODER_SEEDS = {"float32": {"mixtral-tiny": 16},
+                 "bfloat16": {"mixtral-tiny": 512, "deepseek-v3-tiny": 0}}
 """Each decoder's declared draws of ids against transformers' forward in the same precision (check 1),
-sized by `seeds_for` paired with Dew's logits on the CPU."""
+sized by `seeds_for` paired with Dew's logits on the CPU: 8 where a decoder is not named. DeepSeek V3's
+bfloat16 logits do not resolve within the 512-seed cap, a finding its site reports Inconclusive."""
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
@@ -68,11 +70,11 @@ def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     reference, truth = transformers_arms(narrow, lambda model, ids: model(ids, use_cache=False).logits,
                                          source=source)
     assert_as_exact(lambda ids: pretrained.model.apply(pretrained.variables, ids).astype(jnp.float32),
-                    reference, fixture_ids(directory), f"{name} {dtype}", seeds=DECODER_SEEDS[dtype],
-                    truth_fn=truth)
+                    reference, fixture_ids(directory), f"{name} {dtype}",
+                    seeds=DECODER_SEEDS[dtype].get(name, 8), truth_fn=truth)
 
 
-BIAS_SEEDS = 0
+BIAS_SEEDS = {"qwen2-tiny": 64, "llama-tiny": 32}
 """The projection biases' declared draws of batches against transformers' bfloat16 gradients (check 1),
 sized by `seeds_for` paired with Dew's gradients on the CPU."""
 
@@ -133,7 +135,7 @@ def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torc
                 for layout in biases}
 
     assert_as_exact(ours, torch_gradients(narrow, contextlib.nullcontext), draw, f"{name} bias gradients",
-                    seeds=BIAS_SEEDS, truth_fn=torch_gradients(wide, float64))
+                    seeds=BIAS_SEEDS[name], truth_fn=torch_gradients(wide, float64))
 
 
 def denoise(model, variables, prompt, canvas, **conditioning):
