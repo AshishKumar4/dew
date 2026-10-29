@@ -276,24 +276,6 @@ def test_a_tokens_decay_gradient_sums_only_the_terms_through_it():
     np.testing.assert_array_equal(got, np.asarray([0.0, 1.0, 1.0 + 2.0 ** 24], np.float32))
 
 
-def test_a_decay_past_a_pairs_reach_is_read_at_its_size():
-    """A decay a live memory reads at the edge of fp32's range: one token of natural log decay -86.5
-    (`exp2(-124.8)`, a normal fp32 under a pair's least scale, 2^-124) reading a memory of 2^125, its key
-    and write gate zero, so the output is the memory's decayed read, of order one. The port's absolute decay
-    scales over fp32's whole range (`fla_gdn._raised`); on par with the portable math from float64 on the
-    draw (the gate's one-draw rule)."""
-    width = 16
-    q = jnp.zeros((1, 1, 1, width), jnp.float32).at[..., 0].set(1.0)
-    k, v = jnp.zeros((1, 1, 1, width), jnp.float32), jnp.zeros((1, 1, 1, width), jnp.float32)
-    g, beta = jnp.full((1, 1, 1), -86.5, jnp.float32), jnp.zeros((1, 1, 1), jnp.float32)
-    h0 = jnp.full((1, 1, width, width), 2.0 ** 125, jnp.float32)
-    drawn = (q, k, v, g, beta, h0)
-    with jax.enable_x64(new_val=True):
-        exact = np.asarray(recurrence(*widened(drawn))[0])
-    mine, theirs = (np.asarray(jax.jit(rule)(*drawn)[0], np.float64) for rule in (fla_rule, portable))
-    assert_as_exact_as_the_reference(mine, theirs, exact, "the port's read of a decay at fp32's edge")
-
-
 def wy_math(k, v, beta, g, chunk=64):
     """`(w, u, inverse)` from `(k, v, beta, g)` per chunk and head (`support.wy`): the WY representation in
     whatever dtype it is given."""

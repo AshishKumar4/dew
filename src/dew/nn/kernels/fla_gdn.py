@@ -51,7 +51,6 @@ from dew.nn.kernels.chunked_launch import (
     spanned,
     write_rows,
 )
-from dew.nn.kernels.templates.attention_algebra import power2
 
 RCP_LN2 = 1 / math.log(2)
 """1 / ln 2, fla's RCP_LN2 (whose 1.4426950216 rounds to the same fp32): its kernels take the cumulated
@@ -86,13 +85,10 @@ def _ranged(last, gate, last_lo=None, gate_lo=None):
 
 
 def _raised(gate, gate_lo=None):
-    """`exp2(g)` from the chunk's start, of the separated prefix where the fractions are given: exp2 of the
-    fraction scaled by its whole part's power of two over fp32's whole range (`attention_algebra.power2`),
-    where a pair's scaling (`algebra.between`) holds only the exponents its tiles' pairs reach: a live decay
-    under 2^-124 is a normal fp32, which a memory as large as its inverse reads at order one."""
+    """`exp2(g)` from the chunk's start, of the separated prefix where the fractions are given."""
     if gate_lo is None:
         return jnp.exp2(gate)
-    return power2(jnp.exp2(gate_lo), gate)
+    return algebra.between((gate, gate_lo), (0.0, 0.0))
 
 
 def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, bv: int, exact: bool,
