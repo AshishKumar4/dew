@@ -30,7 +30,7 @@ from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _rows, packing
 from dew.decision.scoring import LogLoss, ScoringRule
-from dew.decision.task import Decide, DecideSettings, Weights, laid_out
+from dew.decision.task import Decide, DecideSettings, Weights, laid_out, whole_blocks_of
 from dew.inference.loading import RunProcessor
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
@@ -346,7 +346,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                                   self.context_window)
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
+                          whole_blocks=whole_blocks_of(self.layout))
         logits = self.model.logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training)
         )
@@ -378,12 +379,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                 Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
-        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
+                          whole_blocks=whole_blocks_of(self.layout))
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
                            ) -> tuple[Ratio | Weighted, Decisions]:
-        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
+                          whole_blocks=whole_blocks_of(self.layout))
         logits = self.model.logits(params, inputs)
         return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
 

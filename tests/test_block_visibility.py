@@ -335,3 +335,39 @@ def test_a_blocks_bounds_are_its_runs_first_token_and_one_past_its_last():
                                   [[0, 1, 1, 3, 3, 5, 5, 5], [0, 0, 0, 0, 4, 4, 4, 4]])
     np.testing.assert_array_equal(np.asarray(block_ends(groups)),
                                   [[1, 3, 3, 5, 5, 8, 8, 8], [4, 4, 4, 4, 8, 8, 8, 8]])
+
+
+WHOLE = np.asarray([[0, 0, 0, 1, 1, 1, 1, -1], [2, 2, 2, 2, 3, 3, 3, 3]], np.int32)
+"""`SEGMENTS`' documents each one whole block, its padding in none."""
+
+
+def test_whole_blocks_read_as_the_non_causal_call_by_documents():
+    """Where its producer states each block is its document's whole (`AttentionMetadata.whole_blocks`, a
+    decision row read whole), a block layer takes the non-causal call by documents its blocks describe:
+    its states are bitwise those of the layer's block-causal reading of the same blocks, and of a
+    non-causal decoder over the documents, and its call routes as that decoder's does on an H100 (the
+    kernels that run a non-causal call by documents, which block groups' spans refuse)."""
+    kinds = {"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}}
+    decoder = model(**kinds).clone(attention_impl="xla")
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), ids)
+    segments, blocks = jnp.asarray(SEGMENTS), jnp.asarray(WHOLE)
+
+    def states(decoder, **fields):
+        return np.asarray(decoder.apply(params, ids, segment_ids=segments,
+                                        method=CausalTransformer.hidden_states, **fields))
+
+    whole = states(decoder, block_groups=blocks, whole_blocks=True)
+    np.testing.assert_array_equal(whole, states(decoder, block_groups=blocks))
+    np.testing.assert_array_equal(whole, states(decoder.clone(causal=False)))
+
+    def routes(decoder, **fields):
+        bf16 = decoder.clone(attention_impl="auto", dtype="bfloat16", head_dim=64)
+        shapes = jax.eval_shape(lambda: bf16.init(jax.random.key(1), ids))
+        with generation.assumed("sm90"), generation.routes() as found:
+            jax.jit(lambda params: bf16.apply(params, ids, segment_ids=segments,
+                                              method=CausalTransformer.hidden_states, **fields)).trace(shapes)
+        return [(route.choice, route.kernel) for route in found]
+
+    assert routes(decoder, block_groups=blocks, whole_blocks=True) == routes(decoder.clone(causal=False))
+    assert routes(decoder, block_groups=blocks) != routes(decoder.clone(causal=False))

@@ -1609,7 +1609,8 @@ class CausalTransformer(nn.Module):
                               attention_key_positions=None, attention_key_runs=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
                               right_padded: bool = False, coordinates: Coordinates | None = None,
-                              conditioning: Mapping[str, jax.Array] | None = None):
+                              conditioning: Mapping[str, jax.Array] | None = None,
+                              whole_blocks: bool = False):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
@@ -1653,12 +1654,15 @@ class CausalTransformer(nn.Module):
           (`dew.nn.inputs.CONTEXT`) and its rows' lengths (`CONTEXT_LENGTHS`).
           A cached call that carries it keeps its keys and values for the
           calls after it. A model without cross-attention takes none.
+        - `whole_blocks` states that each of `block_groups`' blocks is its
+          document's whole run of real tokens (`AttentionMetadata.whole_blocks`).
         """
         coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
                                         valid=attention_mask, positions=positions, right_padded=right_padded)
         attention_metadata = self._attention_metadata(
             tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
-            attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning)
+            attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
+            whole_blocks=whole_blocks)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1719,7 +1723,8 @@ class CausalTransformer(nn.Module):
     def _attention_metadata(self, tokens, decode: bool, image_groups, block_groups, rotary_positions,
                             pairwise_mask, key_positions, key_runs, media_mask, admitted=None,
                             coordinates: Coordinates | None = None,
-                            conditioning: Mapping[str, jax.Array] | None = None) -> AttentionMetadata | None:
+                            conditioning: Mapping[str, jax.Array] | None = None, *,
+                            whole_blocks: bool = False) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
         carries none of it: the tokens' layout `hidden_and_mtp_inputs`
         converted (`coordinates`), the token ids a hash router selects by,
@@ -1775,7 +1780,8 @@ class CausalTransformer(nn.Module):
             rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
             key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
             media=media_mask,
-            admitted=admitted, blocks=blocks, context=context, routing_block=block)
+            admitted=admitted, blocks=blocks, context=context, routing_block=block,
+            whole_blocks=whole_blocks and block_groups is not None)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before
