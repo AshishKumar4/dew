@@ -4,6 +4,7 @@ SVG as a reader sees it: what each mark's place, size, fill and animation say of
 import base64
 import io
 import re
+from fractions import Fraction
 from xml.etree import ElementTree
 
 import numpy as np
@@ -34,6 +35,42 @@ def held(root: ElementTree.Element, element: ElementTree.Element, prop: str) -> 
     first key and its trailing hold and reset (`Figure.animate`)."""
     steps = keyframes(root, element)[1:-2]
     return [re.search(rf"{prop}:([^;]*)", declarations)[1] for _, declarations in steps]
+
+
+def ticks(root: ElementTree.Element, anchor: str = "middle") -> dict[str, float]:
+    """An axis's numeric tick labels and where each stands along it: the x axis's centred under it
+    (`anchor="middle"`, by x), the y axis's ending at it (`anchor="end"`, by y)."""
+    along = "x" if anchor == "middle" else "y"
+    return {text.text: float(text.get(along)) for text in root.iter(f"{SVG}text")
+            if text.get("text-anchor") == anchor and text.text and text.text.lstrip("-").isdigit()}
+
+
+def hundredths(written: str) -> int:
+    """A number the figure writes, to the hundredth (`figures._number`), in whole hundredths."""
+    return round(float(written) * 100)
+
+
+CELL = Fraction(1, 200)
+"""Half a hundredth: a place the figure writes stands for one within this of it on each axis."""
+
+
+def crosses(low: tuple[Fraction, Fraction], high: tuple[Fraction, Fraction], line: tuple) -> bool:
+    """Whether the line of points p with line[0] * p[0] + line[1] * p[1] + line[2] == 0 passes through the
+    square from `low` to `high`: its corners lie on both sides of it, or one on it."""
+    sides = [line[0] * x + line[1] * y + line[2] for x in (low[0], high[0]) for y in (low[1], high[1])]
+    return min(sides) <= 0 <= max(sides)
+
+
+def cell(point: tuple[Fraction, Fraction]) -> tuple[tuple[Fraction, Fraction], tuple[Fraction, Fraction]]:
+    """The square of places a written `point` stands for."""
+    return (point[0] - CELL, point[1] - CELL), (point[0] + CELL, point[1] + CELL)
+
+
+def reaches(low: tuple[Fraction, Fraction], high: tuple[Fraction, Fraction], center, radius) -> bool:
+    """Whether the square from `low` to `high` holds a point `radius` from `center`."""
+    near = sum((min(max(c, lo), hi) - c) ** 2 for c, lo, hi in zip(center, low, high, strict=True))
+    far = sum(max((lo - c) ** 2, (hi - c) ** 2) for c, lo, hi in zip(center, low, high, strict=True))
+    return near <= radius ** 2 <= far
 
 
 def pixels(element: ElementTree.Element) -> np.ndarray:
@@ -122,40 +159,35 @@ def test_a_scatters_dots_slide_by_their_moves_and_land_where_their_targets_are_d
     move by the same amount slide alike, one that does not move stays, one that moves right alone slides right
     alone. Where it ends is where the same dot is drawn when `moved` is where it starts, both pictures on one
     pair of axes (their ticks drawn alike): each dot's place plus its slide is its twin's place, at the 0.1 px
-    the slide is written to; there, a dot at an axis's tick sits on the tick's label."""
+    the hundredth both are written to; there, a dot at an axis's tick sits on the tick's label."""
     start = {"base": [(0.0, 0.0), (5.0, 5.0)], "tuned": [(20.0, 20.0), (0.0, 20.0)]}
     end = {"base": [(10.0, 20.0), (15.0, 25.0)], "tuned": [(20.0, 20.0), (10.0, 20.0)]}
     moved = read(figures.points(start, x_label="x", y_label="y", joined=False, moved=end))
     slides = [re.search(r"translate\(([-\d.]+)px,([-\d.]+)px\)", dot.get("style")).groups()
               for dot in moved.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
-    assert slides[0] == slides[1] and slides[2] == ("0.0", "0.0")
-    assert float(slides[3][0]) > 0 and slides[3][1] == "0.0" and float(slides[0][1]) < 0
+    assert slides[0] == slides[1] and slides[2] == ("0", "0")
+    assert float(slides[3][0]) > 0 and slides[3][1] == "0" and float(slides[0][1]) < 0
     landed = read(figures.points(end, x_label="x", y_label="y", joined=False, moved=start))
-
-    def ticks(root) -> dict[str, tuple[str, str]]:
-        return {text.text: (text.get("x"), text.get("y")) for text in root.iter(f"{SVG}text")
-                if text.text and text.text.lstrip("-").isdigit()}
 
     def dots(root) -> list:
         return [dot for dot in root.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
 
-    assert ticks(moved) == ticks(landed)
+    assert ticks(moved) == ticks(landed) and ticks(moved, "end") == ticks(landed, "end")
     for dot, twin, (dx, dy) in zip(dots(moved), dots(landed), slides, strict=True):
-        assert (f"{float(twin.get('cx')) - float(dot.get('cx')):.1f}",
-                f"{float(twin.get('cy')) - float(dot.get('cy')):.1f}") == (dx, dy)
+        assert hundredths(dot.get("cx")) + hundredths(dx) == hundredths(twin.get("cx"))
+        assert hundredths(dot.get("cy")) + hundredths(dy) == hundredths(twin.get("cy"))
     drawn = [float(dot.get("cx")) for dot in dots(landed)]
-    assert drawn[0] == float(ticks(landed)["10"][0]) and drawn[2] == float(ticks(landed)["20"][0])
+    assert drawn[0] == ticks(landed)["10"] and drawn[2] == ticks(landed)["20"]
 
 
-@pytest.mark.parametrize(("x", "ticks"), [([1, 1000], {"1", "10", "100", "1000"}),
+@pytest.mark.parametrize(("x", "marks"), [([1, 1000], {"1", "10", "100", "1000"}),
                                           ([2, 30], {"2", "5", "10", "20"})], ids=["decades", "within-two"])
-def test_a_log_axis_marks_powers_of_ten_or_their_halves_and_fifths(x, ticks):
+def test_a_log_axis_marks_powers_of_ten_or_their_halves_and_fifths(x, marks):
     """A logarithmic axis marks each power of ten its span holds, and 2 and 5 times them where it spans less
     than two decades."""
     figure = figures.points({"loss": [(x[0], 1.0), (x[1], 2.0)]}, x_label="tokens", y_label="loss",
                             log_x=True)
-    labels = {text.text for text in read(figure).iter(f"{SVG}text") if text.get("text-anchor") == "middle"}
-    assert ticks <= labels and not labels - ticks - {"tokens"}
+    assert set(ticks(read(figure))) == marks
 
 
 def test_a_log_axis_places_each_dot_at_its_logarithm():
@@ -163,10 +195,9 @@ def test_a_log_axis_places_each_dot_at_its_logarithm():
     "100"."""
     figure = read(figures.points({"loss": [(1.0, 1.0), (10.0, 1.5), (100.0, 2.0)]}, x_label="tokens",
                                  y_label="loss", log_x=True))
-    ticks = {text.text: float(text.get("x")) for text in figure.iter(f"{SVG}text")
-             if text.get("text-anchor") == "middle"}
+    marks = ticks(figure)
     placed = [float(dot.get("cx")) for dot in figure.iter(f"{SVG}circle")]
-    assert placed == [ticks["1"], ticks["10"], ticks["100"]]
+    assert placed == [marks["1"], marks["10"], marks["100"]]
 
 
 def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
@@ -205,11 +236,11 @@ def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
 
 def test_an_arrows_head_points_along_its_line_at_its_end():
     """`Figure.arrow`'s head is a triangle whose tip is the line's end and whose base stands behind it,
-    square to the line and halved by it, one size whatever the line's length and direction: at the hundredths
-    the figure writes, its corners lie as far from the tip, their midpoint on the line behind the tip, and the
-    base and sides match every other arrow's; in a moved group the drawing is the same."""
-    heads = []
-    for x1, y1, x2, y2 in ((0, 10, 100, 10), (40, 90, 40, 10), (10, 90, 70, 10), (10, 90, 40, 50)):
+    square to the line and halved by it, 7 px behind the tip and 7 px wide whatever the line's length and
+    direction, each claim holding at a place within the hundredth that what the figure writes stands for
+    (`cell`). In a moved group the drawing is the same."""
+    for x1, y1, x2, y2 in ((0, 10, 100, 10), (40, 90, 40, 10), (10, 90, 70, 10), (10, 90, 40, 50),
+                           (10, 10, 100, 40), (10, 90, 60, 20), (10, 90, 90, 10)):
         figure = figures.Figure(120, 120)
         with figure.group(5, 7) as moved:
             figure.arrow(x1, y1, x2, y2)
@@ -217,16 +248,16 @@ def test_an_arrows_head_points_along_its_line_at_its_end():
         root = read(figure)
         line = next(root.iter(f"{SVG}line"))
         head = next(root.iter(f"{SVG}path"))
-        tip, a, b = [(float(x), float(y)) for x, y in re.findall(r"([-\d.]+),([-\d.]+)", head.get("d"))]
-        assert tip == (float(line.get("x2")), float(line.get("y2")))
+        written = re.findall(r"([-\d.]+),([-\d.]+)", head.get("d"))
+        tip, a, b = [(Fraction(x), Fraction(y)) for x, y in written]
+        assert tip == (Fraction(line.get("x2")), Fraction(line.get("y2"))) == (x2, y2)
         middle = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
-        behind = ((tip[0] - middle[0]) * (x2 - x1) + (tip[1] - middle[1]) * (y2 - y1))
-        across = (middle[0] - x1) * (y2 - y1) - (middle[1] - y1) * (x2 - x1)
-        assert behind > 0 and round(across, 2) == 0
-
-        def apart(p, q):
-            return round((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2, 2)
-
-        assert apart(a, tip) == apart(b, tip)
-        heads.append((apart(a, tip), apart(a, b)))
-    assert len(set(heads)) == 1
+        half = ((a[0] - b[0]) / 2, (a[1] - b[1]) / 2)
+        along = (x2 - x1, y2 - y1)
+        # The base's midpoint: on the line, behind the tip, 7 px from it.
+        assert crosses(*cell(middle), (along[1], -along[0], along[0] * y1 - along[1] * x1))
+        assert (tip[0] - middle[0]) * along[0] + (tip[1] - middle[1]) * along[1] > 0
+        assert reaches(*cell(middle), tip, 7)
+        # The half-base from it: square to the line, 3.5 px long.
+        assert crosses(*cell(half), (along[0], along[1], 0))
+        assert reaches(*cell(half), (0, 0), Fraction(7, 2))
