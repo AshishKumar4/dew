@@ -528,13 +528,18 @@ class Decide(SavedRunTask):
     def packing(self, shape: PassShape) -> Pack:
         """How a pass of `shape` packs its rows: first-fit into its windows, each holding whole rows within
         its bounds, as a run packs its rows (`dew.decision.rows.packing`)."""
+        return self._packs[shape.length, shape.rows]
+
+    @functools.cached_property
+    def _packs(self) -> dict[tuple[int, int], Pack]:
+        """Each pass shape's packing (`packing`), by its length and windows."""
         from dew.decision.rows import packing
 
-        bounds = self._window_bounds(shape.length)
         held = self.context_length
-        windowed = replace(self.layout, max_len=shape.length)
-        return replace(packing(windowed, bounds, None if held is None else max(shape.length, held)),
-                       bins=shape.rows)
+        return {(shape.length, shape.rows): replace(
+            packing(replace(self.layout, max_len=shape.length), self._window_bounds(shape.length),
+                    None if held is None else max(shape.length, held)), bins=shape.rows)
+            for shape in self.pass_shapes}
 
     def _placed(self, rows: Sequence[Encoded], shape: PassShape) -> list[int] | None:
         """The window of `shape` each of `rows` goes to, in order (`dew.data.tokens.FirstFit`), or None
@@ -542,8 +547,9 @@ class Decide(SavedRunTask):
         from dew.data.packing import window_fields
         from dew.data.tokens import FirstFit
 
-        lengths, paired = window_fields(self.packing(shape))
-        placement = FirstFit([lengths[name] for name in paired], shape.rows, self.packing(shape).segments)
+        pack = self.packing(shape)
+        lengths, paired = window_fields(pack)
+        placement = FirstFit([lengths[name] for name in paired], shape.rows, pack.segments)
         placed = []
         for row in rows:
             # A row's tokens, its questions along each field of theirs, and its context's tokens.
