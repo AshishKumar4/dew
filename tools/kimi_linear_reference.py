@@ -48,6 +48,10 @@ The tiny config keeps the release's fields and layer pattern at small widths:
 names them, the last layer MLA), a dense first layer, then 8 routed experts
 of which 2 route, beside the release's one shared expert and its routed
 scaling of 2.446. `A_log` is stored in the release's `[1, 1, heads, 1]`.
+
+`truth` writes numerics.npz as kimi_k3_reference.py's does, the released
+model as `patched` changes it, in float64 on the CPU, fla 0.4.0's kernels
+answered by its own torch references, its separate gate by `kda_gate_ref`.
 """
 
 import copy
@@ -57,9 +61,19 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from kimi_k3_reference import LEARNING_RATE, fixture_batch, greedy, record_orders, scatter, sgd_step
+from kimi_k3_reference import (
+    LEARNING_RATE,
+    fixture_on_gpu,
+    float64_truth,
+    greedy,
+    record_orders,
+    scatter,
+    sgd_step,
+    symmetric,
+    write_fixture,
+    write_truth,
+)
 from reference_source import config_lookups, hub_modules, record_padding
-from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 REVISION = "e1df551a447157d4658b573f9a695d57658590e9"
@@ -162,10 +176,18 @@ def record_released_padding() -> None:
                    json.loads((DESTINATION / "config.json").read_text()), DESTINATION)
 
 
+def patched():
+    """The pinned modules (`remote_modules`) with the gate weighing by unshifted scores and the routed experts
+    in the backward pass."""
+    configuration, modeling = remote_modules()
+    modeling.KimiMoEGate.forward = unbiased_gate(modeling.KimiMoEGate.forward)
+    moe = modeling.KimiSparseMoeBlock
+    moe.moe_infer = moe.moe_infer.__wrapped__
+    return configuration, modeling
+
+
 def released_modules():
-    """The pinned configuration and modeling modules, with fla's kernels held
-    to IEEE fp32, the gate weighing by unshifted scores and the routed
-    experts in the backward pass."""
+    """The pinned modules as `patched` changes them, with fla's kernels held to IEEE fp32."""
     if os.environ.get("TRITON_F32_DEFAULT") != "ieee":
         raise SystemExit("run with TRITON_F32_DEFAULT=ieee so fla's kernels keep fp32")
     if os.environ.get("FLA_TRIL_PRECISION", "ieee") != "ieee":
@@ -173,13 +195,10 @@ def released_modules():
     os.environ["TRITON_CACHE_DIR"] = str(CACHE / "triton-ieee")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    configuration, modeling = remote_modules()
+    configuration, modeling = patched()
     from fla.ops.kda import wy_fast
 
     assert ieee_only(wy_fast), "fla's recompute_w_u no longer autotunes its dot precision"
-    modeling.KimiMoEGate.forward = unbiased_gate(modeling.KimiMoEGate.forward)
-    moe = modeling.KimiSparseMoeBlock
-    moe.moe_infer = moe.moe_infer.__wrapped__
     return configuration, modeling
 
 
@@ -192,15 +211,8 @@ def main() -> None:
     model.config._attn_implementation = "eager"
     scatter(model)
     tensors = {name: parameter.detach().cpu().contiguous().clone() for name, parameter in model.named_parameters()}
-    save_file(tensors, str(DESTINATION / "model.safetensors"))
-    (DESTINATION / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    generation = {"bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0}
-    (DESTINATION / "generation_config.json").write_text(json.dumps(generation, indent=2) + "\n")
-
-    model = model.cuda().eval()
-    ids, mask = fixture_batch()
-    input_ids = torch.tensor(ids, device="cuda")
-    attention_mask = torch.tensor(mask, device="cuda")
+    write_fixture(DESTINATION, tensors, config)
+    model, ids, mask, input_ids, attention_mask = fixture_on_gpu(model)
     logits, loss, updated = sgd_step(model, input_ids, attention_mask, lambda name: True)
     with torch.no_grad():
         for name, parameter in model.named_parameters():
@@ -213,6 +225,28 @@ def main() -> None:
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
              generated=generated, step_logits=step_logits, precision=matmul_precision())
     print("wrote", DESTINATION, "tensors", len(tensors))
+
+
+def truth(directory: Path) -> dict[str, np.ndarray]:
+    """The float64 truth of the Kimi Linear fixture at `directory` (`kimi_k3_reference.float64_truth`): the
+    released model as `patched` changes it, built and run in float64 on the CPU (`torch_precision.float64`),
+    fla's kernels answered by its own references at their call boundaries (`fla_float64`), holding the
+    fixture's weights, every parameter trained."""
+    from fla_float64 import installed
+    from safetensors.torch import load_file
+    from torch_precision import float64
+
+    configuration, modeling = patched()
+    config = json.loads((directory / "config.json").read_text())
+    tensors = load_file(str(directory / "model.safetensors"))
+    with installed(modeling), float64():
+        model = modeling.KimiLinearForCausalLM(
+            configuration.KimiLinearConfig(**copy.deepcopy(config))).double()
+        model.config._attn_implementation = "eager"
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                parameter.copy_(tensors[name])
+        return float64_truth(model.eval(), directory, lambda name: True)
 
 
 def orders(drawn: Path) -> None:
@@ -239,5 +273,9 @@ if __name__ == "__main__":
         record_released_padding()
     elif sys.argv[1:2] == ["orders"]:
         orders(Path(sys.argv[2]))
+    elif sys.argv[1:] == ["truth"]:
+        write_truth(DESTINATION, truth)
+    elif sys.argv[1:2] == ["symmetric"]:
+        symmetric(DESTINATION, Path(sys.argv[2]), truth)
     else:
         main()
