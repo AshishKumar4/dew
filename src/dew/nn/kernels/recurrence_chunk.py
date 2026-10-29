@@ -961,7 +961,6 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     (`mainloop.Tiles`, the template's config, `templates.recurrence.template`); a `family` given is the bundle
     it issues by, interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's
     declared `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`)."""
-    from .templates import bundles
     from .templates.recurrence import mainloop, template
 
     dtype = jnp.result_type(query, key, value)
@@ -988,12 +987,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     # tracer).
     @jax.custom_vjp
     def rule(query, key, value, g, beta, state, starts, firsts):
-        # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`), by
-        # the bundle they name on the device (`Tiles.layout`; interpreted off a GPU, the interpreter's).
-        own = tiles.forward or tiles
-        layout = None if own.layout is None or device is None else bundles.named(own.layout,
-                                                                                 mainloop.bundle_dtype(dtype))
-        alone = {**run, "tiles": own, **({"family": layout} if layout is not None else {})}
+        # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
+        alone = {**run, "tiles": tiles.forward or tiles}
         return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
                                 max_segments=max_segments, scale=scale, delta=delta, wide=wide, **alone)
 
