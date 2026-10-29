@@ -893,7 +893,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             refills: bool = True) -> "dict[str, Ring] | Feed":
         """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`), the walk taking the same
         `first`: on a layout with a producer, the rings, which its producer loads from `views` (`stream`);
-        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`."""
+        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`. Its rings fresh, one walk's a scope:
+        a second walk on them counts its steps from its own first against barriers already past them."""
         del views, lo, hi, wg, first, refills
         return streams
 
