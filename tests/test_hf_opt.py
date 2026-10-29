@@ -63,9 +63,9 @@ def test_an_opt_350m_shaped_decoder_computes_transformers_logits(variant, tmp_pa
     assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, draw,
                     "OPT-350m logits", seeds=seeds, truth_fn=truth)
     loaded.save(tmp_path / "export")
-    exported = OPTForCausalLM.from_pretrained(tmp_path / "export").eval()
+    # Both read by the same class on the same attention, so the export's weights and config alone differ.
+    exported, source = (transformers_model(tmp_path / name) for name in ("export", "source"))
     ids = torch.as_tensor(np.asarray(draw(0)[0]), dtype=torch.long)
     with torch.no_grad():
-        source = transformers_model(tmp_path / "source")
         np.testing.assert_array_equal(exported(ids, use_cache=False).logits.numpy(),
                                       source(ids, use_cache=False).logits.numpy())
