@@ -3,7 +3,6 @@ import ast
 import contextlib
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from tool_support import load, run_from
@@ -108,8 +107,12 @@ def test_the_live_sampler_cell_runs_whole_through_the_stand_ins_as_dew_runs_it(s
     cell = compile(tree, "sampler.py", "exec")
     # Dew's own run of the cell first: the stand-ins, once installed, refuse every other Dew module to the
     # rest of the test's process.
-    native_namespace = {"dew": SimpleNamespace(pipeline=lambda *args, **kwargs: pipe)}
-    exec(cell, native_namespace)
+    import dew
+
+    native_namespace = {}
+    with monkeypatch.context() as patched:
+        patched.setattr(dew, "pipeline", lambda *args, **kwargs: pipe)
+        exec(cell, native_namespace)
     namespace = {}
     with stood_in(client) as real:
         exec(cell, namespace)
