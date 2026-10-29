@@ -7,8 +7,8 @@ backward recomputes that uniform weight into its query's and its keys'
 gradients. Two ways a row sees no key: an explicit mask with an all-false
 row, and a packed row's padding (segment id 0), which `document_mask` keeps
 from every key. Each implementation is held to the float64 attention of
-tests/attention_oracle.py, which defines such a row as zero: in fp32 by
-tests/reference_error.py's rule, as the fp32 reference attention is, and in
+tests/attention_oracle.py, which defines such a row as zero: in fp32 on par
+(check 1) with the fp32 reference attention over drawn operands, and in
 bf16 to the tolerance the Splash tests hold bf16 to. A row whose own key is
 cut but whose block runs on reads its block's later keys (`block_groups`).
 """
@@ -19,16 +19,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import (
-    attention_terms,
-    exact_value_and_grads,
-    kept,
-    packed_ids,
-    qkv,
-    reference,
-    value_and_grads,
-)
-from reference_error import assert_as_exact_as_the_reference
+from attention_oracle import exact_attention, exact_value_and_grads, packed_ids, qkv, value_and_grads
+from reference_error import assert_as_exact, with_gradients
 from test_attention_splash import TOLERANCE
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -78,19 +70,38 @@ def run(implementation, case, dtype):
     return query, key, value, structure, found, truth
 
 
+SEEDS = dict.fromkeys(CPU, 8)
+"""Each CPU implementation's declared draws against the fp32 reference attention (check 1), by its case:
+sized by `seeds_for` paired on armada."""
+
+
 @pytest.mark.parametrize("implementation, case", CPU, ids=[f"{i}-{c}" for i, c in CPU])
 def test_a_row_that_sees_no_key_reads_nothing(implementation, case):
-    query, key, value, structure, found, truth = run(implementation, case, jnp.float32)
-    # The 'tpu' row interprets the TPU kernel on this CPU: its reference sums as the target does (fp32),
-    # not as the CPU's policy does.
-    with jax.default_matmul_precision(FP32_SUMS) if implementation == "tpu" else contextlib.nullcontext():
-        expected = reference(query, key, value, **structure)
-    # The loss is the outputs' squares, so the cotangent is twice the output.
-    keep = kept(query.shape[1], key.shape[1], **structure)
-    terms = attention_terms(query, key, value, 2 * truth[0], keep)
-    for name, mine, theirs, want, summed in zip(("output", "query", "key", "value"), found, expected, truth,
-                                                terms, strict=True):
-        assert_as_exact_as_the_reference(mine, theirs, want, f"{implementation} {case} {name}", terms=summed)
+    """Each CPU implementation: a row that sees no key has a zero output and query gradient, and its output
+    and gradients are on par (check 1) with the fp32 reference attention's from float64 over drawn
+    operands and cotangents."""
+    structure = run(implementation, case, jnp.float32)[3]
+    shape = (2, 256, 4, 64)
+
+    def draw(seed):
+        cotangent = jax.random.normal(jax.random.fold_in(jax.random.key(93), seed), shape, jnp.float32)
+        return (*qkv(shape, jnp.float32, seed=seed), cotangent)
+
+    def attended(implementation, **options):
+        def attend(q, k, v):
+            return scaled_dot_product_attention(q, k, v, implementation=implementation, **structure,
+                                                **options)
+        return with_gradients(attend)
+
+    def reference(*drawn):
+        # The 'tpu' row interprets the TPU kernel on this CPU: its reference sums as the target does (fp32),
+        # not as the CPU's policy does.
+        with jax.default_matmul_precision(FP32_SUMS) if implementation == "tpu" else contextlib.nullcontext():
+            return attended("reference", precision=jax.lax.Precision.HIGHEST)(*drawn)
+
+    exact = with_gradients(lambda q, k, v: exact_attention(q, k, v, anchored=True, **structure))
+    assert_as_exact(attended(implementation), reference, draw, f"{implementation} {case}",
+                    seeds=SEEDS[implementation, case], truth_fn=exact)
 
 
 @pytest.mark.gpu(reason="cuDNN's and flash's fused attention")
