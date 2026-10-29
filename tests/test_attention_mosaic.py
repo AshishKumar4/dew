@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
@@ -409,31 +409,60 @@ in both forms; and a tile's worth of queries under two consumers, which pads to 
 second wholly padding (the accurate form's one consumer pads 64 queries to no more)."""
 
 
+def _keys_first_gradients(query, key, value, dout, spans, *, form: str, scale: float):
+    """The two-launch backward's gradients in the form `form` names, interpreted, from this mainloop's own
+    training forward at `scale`; and the float64 reference's (`template.reference` widened)."""
+    accurate, config = _backward_form(form)
+    with _device(interpret=True), _pinned(FORM_TILES, config):
+        residuals = attention_mosaic.forward(query, key, value, spans, scale=scale, residuals=True,
+                                             interpret=True)[1:]
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                          scale=scale, accurate=accurate, interpret=True)
+    with jax.enable_x64(new_val=True):
+        wide = [jnp.asarray(np.asarray(array, np.float64)) for array in (query, key, value, dout)]
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), *wide[:3])
+        truth = tuple(np.asarray(grad) for grad in pull(wide[3]))
+    return tuple(np.asarray(grad, np.float64) for grad in (grads.query, grads.key, grads.value)), truth
+
+
 @INTERPRETS
 @pytest.mark.parametrize("form", HOOKED_FORMS)
 def test_the_keys_first_backward_keeps_the_logits_the_forward_keeps_finite_interpreted(form):
     """Queries of 2^120 over keys of 4, one of 8, 64 wide at the scale 1/8: the forward's logits, the
     queries taken by the scale's power before their products (`attention.prescale`), are 2^125 and 2^126,
-    where the unscaled products pass fp32's largest. The keys-first dK/dV launch takes the power on its
-    keys before its products, so its weights are the forward's, one-hot on the key of 8, and every gradient
-    is the float64 reference's to the bit: dV that key's the queries' summed cotangents, dQ and dK zero."""
+    where the unscaled products pass fp32's largest. The two-launch backward takes its logits from the
+    queries taken by the power, so its weights are the forward's, one-hot on the key of 8, and every
+    gradient is the float64 reference's to the bit: dV that key's the queries' summed cotangents, dQ and
+    dK zero."""
     tokens, width = 64, 64
-    spans = template.spans(tokens, tokens, 1)
     query = jnp.full((1, tokens, 1, width), 2.0 ** 120, jnp.bfloat16)
     key = jnp.full((1, tokens, 1, width), 4.0, jnp.bfloat16).at[:, 1].set(8.0)
     value = jnp.broadcast_to(jnp.arange(tokens, dtype=jnp.bfloat16)[None, :, None, None], key.shape)
     dout = jnp.ones((1, tokens, 1, width), jnp.bfloat16)
-    accurate, config = _backward_form(form)
-    with _device(interpret=True), _pinned(FORM_TILES, config):
-        residuals = attention_mosaic.forward(query, key, value, spans, residuals=True, interpret=True)[1:]
-        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
-                                          accurate=accurate, interpret=True)
-    with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(np.asarray(array, np.float64)) for array in (query, key, value, dout)]
-        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), *wide[:3])
-        expected = pull(wide[3])
-    for found, truth in zip((grads.query, grads.key, grads.value), expected, strict=True):
-        np.testing.assert_array_equal(np.asarray(found, np.float64), np.asarray(truth))
+    spans = template.spans(tokens, tokens, 1)
+    found, truth = _keys_first_gradients(query, key, value, dout, spans, form=form, scale=width ** -0.5)
+    for mine, true in zip(found, truth, strict=True):
+        np.testing.assert_array_equal(mine, true)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("form", HOOKED_FORMS)
+def test_the_keys_first_backward_keeps_the_logits_of_keys_the_power_would_flush_interpreted(form):
+    """Queries of 2^126 over keys of 2^-126 and 2^-125 in turn, 64 wide at the scale 2^-10: the forward's
+    logits are 1/16 and 1/8, where keys taken by the scale's power would fall below bf16's least subnormal
+    and flush to zero. The two-launch backward takes the power on its queries, as the forward does, so its
+    gradients are within check 1's rule of the fp32 reference's against float64."""
+    tokens, width, scale = 64, 64, 2.0 ** -10
+    rng = np.random.default_rng(0)
+    query = jnp.full((1, tokens, 1, width), 2.0 ** 126, jnp.bfloat16)
+    key = jnp.where((jnp.arange(tokens) % 2 == 0)[None, :, None, None], 2.0 ** -126, 2.0 ** -125)
+    key = jnp.broadcast_to(key, (1, tokens, 1, width)).astype(jnp.bfloat16)
+    value, dout = (jnp.asarray(rng.standard_normal((1, tokens, 1, width)), jnp.bfloat16) for _ in range(2))
+    spans = template.spans(tokens, tokens, 1)
+    found, truth = _keys_first_gradients(query, key, value, dout, spans, form=form, scale=scale)
+    _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), query, key, value)
+    for name, mine, theirs, true in zip(("query", "key", "value"), found, pull(dout), truth, strict=True):
+        assert_as_exact_as_the_reference(mine, np.asarray(theirs, np.float64), true, f"{form} {name}")
 
 
 @INTERPRETS

@@ -151,9 +151,8 @@ class _Backward:
 
     @property
     def scaled(self) -> bool:
-        """Whether the call's logits take a power of two (`by_power`): the dQ launch's and the fused
-        launch's queries take it, and the keys-first dK/dV launch's resident keys, its queries the call's
-        own, which dK takes."""
+        """Whether the call's queries take a power of two for their logits (`by_power`): the fused launch's
+        in registers, dK its own; the two launches' queries are taken by it (`_launch_backward`)."""
         return self.spec.prescale != 1.0
 
     @property
@@ -390,12 +389,12 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     if count != tiles.block_q:
         q_slot, do_slot = q_slot.at[pl.ds(first_row, count)], do_slot.at[pl.ds(first_row, count)]
     q_first = index * tiles.block_q + first_row
-    # The logits from the resident keys taken by the call's power (`_launch_backward`), which pass fp32's
-    # largest nowhere the forward's `(Q 2^p) Kᵀ` does not (the power taken after the product does: Q 2^120
-    # over keys of 8 at width 64 and scale 1/8), the forward's bit for bit but where a key's entry times the
-    # power leaves bf16's normal range; dK from the call's own queries. A query staged by the power a step
-    # cost a third of the launch (ET-SWAPABL-h100: 3.32 against 2.21 ms causal at Qwen3-8B 2 x 4096), and a
-    # stream of them of its own passes the block at width 256.
+    # The launch's queries are the call's taken by its power (`_launch_backward`), so its logits are the
+    # forward's `(Q 2^p) Kᵀ` bit for bit: the power taken after the product passes fp32's largest where the
+    # forward's does not (Q 2^120 over keys of 8 at width 64 and scale 1/8), and on the keys a key's entry
+    # can leave bf16's range (2^-126 at the scale 2^-10). A query staged by the power a step cost a third of
+    # the launch (ET-SWAPABL-h100: 3.32 against 2.21 ms causal at Qwen3-8B 2 x 4096), and a stream of the
+    # call's own beside them passes the block at width 256.
     s = family.product(k_smem, q_slot.transpose((1, 0)), shape)
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
@@ -415,8 +414,9 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
     dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_columns, walk.interpret)
-    # Each part formed as its product is issued (`algebra.formed_parts`).
-    parts = algebra.formed_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
+    # Each part formed as its product is issued (`algebra.formed_parts`), at the scale left past the power
+    # its queries took: dK at the call's whole scale against its own queries.
+    parts = algebra.formed_parts(logits * walk.spec.scale, q_slot.dtype, accurate=walk.accurate)
     dk_acc = family.register_products(dk_acc, parts, q_columns, walk.interpret)
     if _grading(shares):
         store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
@@ -960,10 +960,12 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      approx_math)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
+    # The queries taken by the call's power: the two-launch backward's every query operand (`_dkv_step`).
+    scaled = by_power(query, prescale)
     if drop is not None:
         # A dropping call's D its dropped products' own, centred about each query's least one
         # (`algebra.dropout_centre`): no anchor, and no key chosen.
-        centre = _centre_launch(by_power(query, prescale), key, value, dout, maximum, spans, score_params,
+        centre = _centre_launch(scaled, key, value, dout, maximum, spans, score_params,
                                 drop, walk=walk)
         anchor = jnp.zeros_like(anchor)
         delta = algebra.centre_finish(centre, state_total, initial_term, algebra.centre_scale(spec.keys))
@@ -980,7 +982,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])
     # The dQ program reads its queries for their logits alone.
-    dq_sum, keyed, rows = _dq_launch(by_power(query, prescale), key, value, dout, maximum, forward_total,
+    dq_sum, keyed, rows = _dq_launch(scaled, key, value, dout, maximum, forward_total,
                                      anchor, delta, chosen, spans, score_params, drop, walk=walk)
     count = sum(walk.summed)
     dq_swapped = jnp.swapaxes(dq_sum, 1, 2)
@@ -991,9 +993,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     dq, refined, denominator, mass, dq_grads = algebra.dq_finish(sums, forward_total, state_total, peak0,
                                                                   (total0, initial_term), maximum, anchor,
                                                                   delta, accurate=accurate)
-    # The keys-first launch's keys read for its logits alone: taken by the power (`_dkv_step`).
-    dk, dv, *key_tile = _dkv_launch(query, by_power(key, prescale), value, dout, maximum, denominator, anchor,
-                                    refined, chosen, spans, score_params, drop, walk=dkv_walk)
+    # The keys-first launch's queries taken by the power, its logits' and dK's (`_dkv_step`).
+    dk, dv, *key_tile = _dkv_launch(scaled, key, value, dout, maximum, denominator, anchor, refined, chosen,
+                                    spans, score_params, drop, walk=dkv_walk)
     summed_kinds = [kind for kind in score_kinds if kind in DQ_GRADS]
     head_query = tuple(grad.sum(axis=-1)[None, :, :, None] if kind == Kind.HEAD else grad
                        for grad, kind in zip(dq_grads, summed_kinds, strict=True))
