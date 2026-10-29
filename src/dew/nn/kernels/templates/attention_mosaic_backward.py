@@ -54,7 +54,7 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
               plgpu.SMEM((consumers, block_q, value_width), dtype),
               plgpu.SMEM((consumers, block_q, width // config.columns), jnp.float32),
               plgpu.SMEM((consumers, block_q), jnp.float32),
-              plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
+              family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
     return scoped, family.streams(blocks, stages, consumers)
 
@@ -84,7 +84,7 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         plgpu.SMEM((holders, block_k), jnp.float32)]
     scoped = [mosaic.staged((holders, block_k, width), dtype, swizzle),
               mosaic.staged((holders, block_k, value_width), dtype, swizzle), *outputs,
-              plgpu.Barrier(num_barriers=holders), plgpu.Barrier(num_barriers=holders)]
+              family.load_barriers(holders), family.load_barriers(holders)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, value_width), dtype)}
     if config.fused:
         # A fused launch's (`_dkv_step`'s `add_dq`): each consumer's score cotangents staged for dQ's
@@ -94,8 +94,8 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     if config.staged_logits:
         # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
         # and the two turns that order its writes against their products' reads (`_staged_logits`).
-        scoped += [mosaic.staged((block_q, width), dtype, swizzle), plgpu.Barrier(num_arrivals=consumers),
-                   plgpu.Barrier(num_arrivals=consumers)]
+        scoped += [mosaic.staged((block_q, width), dtype, swizzle), family.schedule(consumers),
+                   family.schedule(consumers)]
     else:
         blocks["logits"] = ((block_q, width), dtype)
     swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
@@ -113,7 +113,7 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     scoped = [plgpu.SMEM((consumers, block_k, width), dtype), plgpu.SMEM((consumers, block_k, width), dtype),
               plgpu.SMEM((consumers, 2, block_q, block_k), dtype),
               plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
-              plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
+              family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
     return scoped, family.streams(blocks, stages, consumers)
 
@@ -421,7 +421,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     s = family.product(k_smem, logits_slot.transpose((1, 0)), shape)
     if logits_stage is not None:
         # Its share of the staged queries read (the product waited): the next step's stage may be written.
-        plgpu.barrier_arrive(logits_stage[2])
+        walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
@@ -468,26 +468,33 @@ def _staged_logits(walk: _Backward, stage: tuple, q_slot, part: tuple):
     step's (`read`, which each arrives at past its product and once before its walk, and waits for once
     past it), and every consumer waits for it (`written`); the consumer's share of it, `part`'s rows."""
     ref, written, read, index = stage
-    family = walk.program.family
-    plgpu.barrier_wait(read)
+    family, consumers = walk.program.family, walk.consumers
+    family.turn(read, consumers, arrive=False)
 
     @pl.when(index == 0)
     def _():
         family.staged(by_power(family.tile_of(q_slot), walk.spec.prescale), ref)
 
-    plgpu.barrier_arrive(written)
-    plgpu.barrier_wait(written)
+    family.turn(written, consumers)
     first, count = part
     return ref if count == ref.shape[0] else ref.at[pl.ds(first, count)]
 
 
-def _logits_stage(allocated: list, index) -> tuple | None:
+def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index) -> tuple | None:
+    """A fused launch's consumer `index`'s dQ adds (`_dkv_step`'s `add_dq`): its score cotangents' stage and
+    its tiles' add into dQ at `place` (`_dq_added`); None where the launch adds none."""
+    if not walk.fused:
+        return None
+    return stages[0].at[index], functools.partial(_dq_added, walk, dq_ref, stages[1], place, index)
+
+
+def _logits_stage(family: mosaic.Family, consumers: int, allocated: list, index) -> tuple | None:
     """Consumer `index`'s staged logits' queries (`_staged_logits`' `stage`) from their `allocated` ref and
-    turns, its read turn's first arrival made (no step's stage is written before it); None where its
-    launch streams them."""
+    turns (`Family.schedule`), its read turn's first arrival made (no step's stage is written before it);
+    None where its launch streams them."""
     if not allocated:
         return None
-    plgpu.barrier_arrive(allocated[2])
+    family.turn(allocated[2], consumers, wait=False)
     return (*allocated, index)
 
 
@@ -650,22 +657,6 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
     rows = dq.shape[0]
     view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
     walk.program.family.added(dq, view, walk.interpret, smem=out_smem.at[index, pl.ds(0, rows)])
-
-
-def _resident_loaded(family: mosaic.Family, copies, index, *, shared: bool) -> None:
-    """A dK/dV consumer's resident keys and values (`(view, ref, barrier)` each) loaded: `shared` between the
-    consumers (`split_queries`), the first loading them and each waiting; else its own."""
-    if not shared:
-        family.loaded(copies)
-        return
-
-    @pl.when(index == 0)
-    def _():
-        for view, ref, barrier in copies:
-            plgpu.copy_gmem_to_smem(view, ref, barrier)
-
-    for _, _, barrier in copies:
-        plgpu.barrier_wait(barrier)
 
 
 def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, index) -> None:
@@ -842,7 +833,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             keys_view = (row, pl.ds(k_first, block_k), lax.div(head, heads // kv_heads))
             copies = ((k_ref.at[keys_view], k_smem.at[holder], k_loaded.at[holder]),
                       (v_ref.at[keys_view], v_smem.at[holder], v_loaded.at[holder]))
-            _resident_loaded(family, copies, index, shared=split)
+            # Shared between the consumers (`split_queries`): the first loads them, each waits.
+            family.loaded(copies, issued=index == 0 if split else True)
             lo, hi, _ = program.readers(k_first, q_steps, spans_of, row)
             part = (index * count, count) if split else (0, block_q)
 
@@ -860,9 +852,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[holder], v_smem.at[holder]
-            adds = None if not walk.fused else (fused_stages[0].at[index], functools.partial(
-                _dq_added, walk, dq_ref, fused_stages[1], (row, head), index))
-            stage = _logits_stage(logits_stages, index)
+            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index)
+            stage = _logits_stage(family, consumers, logits_stages, index)
             step = functools.partial(_dkv_step, walk, resident, rows_of, coords_of, params_of, store_tiles,
                                      shares, part, stage, adds)
             # Its consumers' own loads of its query stream where they feed it (`Family.fed`).
@@ -874,7 +865,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                              first=lo if split else streamed[0])
             if stage is not None:
                 # The read turn's last phase, past the walk's last product, observed.
-                plgpu.barrier_wait(stage[2])
+                family.turn(stage[2], consumers, arrive=False)
             if not split:
                 # The tiles past this block's last reader its partner reads.
                 family.passed(streams, hi, streamed[1], first=streamed[0])
@@ -1003,7 +994,7 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
     scoped = [plgpu.SMEM((consumers, block_q, width), query.dtype),
               plgpu.SMEM((consumers, block_q, dout.shape[-1]), dout.dtype),
               plgpu.SMEM((consumers, block_q), jnp.float32),
-              plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
+              family.load_barriers(consumers), family.load_barriers(consumers)]
     rings = family.streams({"keys": ((block_k, width), key.dtype), "values": ((block_k, value.shape[-1]),
                                                                               value.dtype)},
                            program.stages, consumers)
