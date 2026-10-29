@@ -165,12 +165,17 @@ def _kernel_name(location: ir.Location) -> str | None:
 
 def _named(location: ir.Location) -> str | None:
     """The name a location carries, as JAX lowers an equation's (`mlir._source_info_to_location`): a name
-    location's own (its name stack), or a call site's callee's (a traceback without a name stack); None
-    where it carries none."""
+    location's own (its name stack), a call site's callee's (a traceback without a name stack), or a fused
+    location's first part that carries one (a rewrite that merged operations); None where it carries
+    none."""
     if location.typeid == ir.NameLoc.static_typeid:
         return ir.NameLoc(location).name_str
     if location.typeid == ir.CallSiteLoc.static_typeid:
         return _named(ir.CallSiteLoc(location).callee)
+    if location.typeid == ir.FusedLoc.static_typeid:
+        # Its parts are locations, which the bindings' stubs type as objects.
+        parts = (part for part in ir.FusedLoc(location).locations if isinstance(part, ir.Location))
+        return next(filter(None, map(_named, parts)), None)
     return None
 
 
