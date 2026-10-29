@@ -211,9 +211,10 @@ def drawn_cases(seed: int) -> dict[str, np.ndarray]:
     """Check 1's draw of the requests: `CASES` with every free text (a state's string, a message's
     content, an instruction's question, an option's description) drawn again from `WORDS` at its own
     word count, a bracketed marker kept where it stands; their structure (the question types, the
-    option labels, the conversation's turns, a None) kept, so each case lays out as it does, cut where
-    it is. As JSON's UTF-8 bytes, under `cases` (an array a program can take beside the draw's other
-    inputs, `requests`), the same on every run."""
+    option labels a dict names, the conversation's turns, a None) kept, so each case lays out as it
+    does, cut where it is; a list's labels are drawn distinct, case aside. As JSON's UTF-8 bytes, under
+    `cases` (an array a program can take beside the draw's other inputs, `requests`), the same on every
+    run."""
     generator = np.random.default_rng([0x1A7A, seed])
 
     def text(value: str) -> str:
@@ -226,7 +227,11 @@ def drawn_cases(seed: int) -> dict[str, np.ndarray]:
         if isinstance(value, dict):
             return {name: drawn(item, name) for name, item in value.items()}
         if isinstance(value, list):
-            return [drawn(item) for item in value]
+            # A list of options is their labels, the answer keys, which must differ: drawn until they do.
+            items = [drawn(item) for item in value]
+            while len({json.dumps(item).lower() for item in items}) < len(items):
+                items = [drawn(item) for item in value]
+            return items
         return value
 
     return {"cases": np.frombuffer(json.dumps(drawn(CASES)).encode(), np.uint8)}

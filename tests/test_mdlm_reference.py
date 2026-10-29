@@ -65,6 +65,31 @@ def test_the_corruption_is_mdlms_on_the_same_draws():
 RECORDING = Path(__file__).parent / "fixtures" / "mdlm" / "recorded_nelbo.npz"
 
 
+def taped(tokens, seed) -> Step:
+    """The objective's step reading the corruption its key draws from `seed`, MDLM's on the same
+    uniforms (tools/mdlm_reference.py `uniforms`): its times and masks (`Step.tape`)."""
+    process = MDLM(mask_id=MASK)()
+    time_key, mask_key, _ = jax.random.split(jax.random.key(seed), 3)
+    t = process.sample_t(time_key, tokens.shape[0])
+    _, is_masked = process.corrupt(mask_key, tokens, t)
+    return Step(jnp.asarray(0), jax.random.key(0), None, tape={"times": t, "mask": is_masked})
+
+
+def nelbo(inputs) -> dict:
+    """Dew's per-token NELBO, its mean and the mean's gradient in both weights over a draw
+    (tools/mdlm_reference.py `drawn_inputs`), which the recording's paired sizing reads too."""
+    model = objective()
+    variables = {"params": {"hidden": inputs["hidden"], "head": inputs["head"]}}
+    batch = {"text": jnp.asarray(inputs["tokens"], jnp.int32)}
+    step = taped(batch["text"], inputs["seed"])
+    def loss(variables):
+        return model.scalar_loss(variables, batch, step)[0]
+
+    value, gradient = jax.value_and_grad(loss)(variables)
+    return {"nlls": model.evaluate(variables, batch, step).losses, "loss": value,
+            "grad_hidden": gradient["params"]["hidden"], "grad_head": gradient["params"]["head"]}
+
+
 def test_the_nelbo_and_its_gradient_are_mdlms():
     """The per-token NELBO terms (zero where a token stayed visible), their mean and its gradient in
     the backbone's weights are on par with MDLM's float32 run from its float64 run (check 1), over
@@ -74,31 +99,15 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
     own float32 divisions."""
     from tools.mdlm_reference import drawn_inputs
 
-    model, process = objective(), MDLM(mask_id=MASK)()
     seeds = declared_seeds(RECORDING)["nelbo"]
     draw, reference, truth = indexed_recording(recording(RECORDING), "nelbo", seeds, inputs_of=drawn_inputs)
-
-    def taped(tokens, seed):
-        """The objective's step reading the corruption its key draws, MDLM's on the same uniforms."""
-        time_key, mask_key, _ = jax.random.split(jax.random.key(seed), 3)
-        t = process.sample_t(time_key, tokens.shape[0])
-        _, is_masked = process.corrupt(mask_key, tokens, t)
-        return Step(jnp.asarray(0), jax.random.key(0), None, tape={"times": t, "mask": is_masked})
-
-    def ours(index, inputs):
-        variables = {"params": {"hidden": inputs["hidden"], "head": inputs["head"]}}
-        batch = {"text": inputs["tokens"].astype(jnp.int32)}
-        step = taped(batch["text"], inputs["seed"])
-        value, gradient = jax.value_and_grad(lambda variables: model.scalar_loss(variables, batch, step)[0])(
-            variables)
-        return {"nlls": model.evaluate(variables, batch, step).losses, "loss": value,
-                "grad_hidden": gradient["params"]["hidden"], "grad_head": gradient["params"]["head"]}
-
-    assert_as_exact(ours, reference, draw, "MDLM's NELBO", seeds=seeds, truth_fn=truth)
+    assert_as_exact(lambda index, inputs: nelbo(inputs), reference, draw, "MDLM's NELBO", seeds=seeds,
+                    truth_fn=truth)
 
     variables = {"params": {"hidden": jnp.asarray(REFERENCE["hidden"]),
                             "head": jnp.asarray(REFERENCE["head"])}}
     batch = {"text": jnp.asarray(REFERENCE["tokens"], jnp.int32)}
+    model = objective()
     _, aux = model.scalar_loss(variables, batch, taped(batch["text"], 0))
     tokens, corrupted = REFERENCE["tokens"], REFERENCE["corrupted"]
     logits = REFERENCE["hidden"].astype(np.float64) @ REFERENCE["head"].astype(np.float64)

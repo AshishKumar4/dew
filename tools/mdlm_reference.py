@@ -141,15 +141,18 @@ def nelbo(reference, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarr
 
 
 def record() -> None:
-    """The loss over check 1's seeds (`record_case`), its count sized on the reference alone, the
-    inputs drawn again by the test (`drawn_inputs`)."""
+    """The loss over check 1's seeds (`record_case`), the inputs drawn again by the test
+    (`drawn_inputs`), its count sized paired with Dew's loss (tests/test_mdlm_reference.py `nelbo`), as
+    check 1 judges it: rows of 16 tokens put few masked terms in a draw, so each arm's error is
+    heavy-tailed across draws alike, and the reference against itself on other draws never resolves."""
     from recorded_references import provenance, record_case, save
+    from test_mdlm_reference import nelbo as ours
 
     reference = published()
     def evaluate(inputs):
         return nelbo(reference, inputs, torch.float32), nelbo(reference, inputs, torch.float64)
 
-    recorded = record_case("nelbo", drawn_inputs, evaluate, store_inputs=False)
+    recorded = record_case("nelbo", drawn_inputs, evaluate, store_inputs=False, dew=jax.jit(ours))
     made = provenance("kuleshov-group/mdlm", COMMIT, "cpu",
                       "PYTHONPATH=src:tools python tools/mdlm_reference.py --record", torch=torch.__version__)
     print(save(RECORDING, {**recorded, "nelbo.provenance": made}, reference="kuleshov-group/mdlm",
