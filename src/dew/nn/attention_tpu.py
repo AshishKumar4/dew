@@ -9,7 +9,7 @@ import jax.numpy as jnp
 
 from .attention_kernels import SPLASH_LANES
 from .attention_masks import repeat_kv_heads, structural_mask
-from .attention_parallel import four_dimensional, per_shard, shard_heads
+from .attention_parallel import four_dimensional, on_attention_shards, shard_heads
 from .documents import document_ids
 from .precision import at_default_precision
 from .sharding import SCORES
@@ -44,7 +44,7 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     uses it. The flash kernel has no interpreter and runs only on a TPU.
 
     A Mosaic kernel cannot be partitioned automatically, so on a mesh both run
-    per shard (`per_shard`), on its rows and heads. Splash's descriptor then
+    per shard (`on_attention_shards`), on its rows and heads. Splash's descriptor then
     covers one shard's heads, so a mask that differs by head where the mesh
     splits the heads is flash's.
     """
@@ -70,7 +70,7 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     def attend(query, key, value, bias, sinks):
         # Splash holds the mask in its descriptor; flash takes it as an array.
         held = None if descriptor is not None or mask is None else four_dimensional(mask)
-        return per_shard(local, query, key, value,
+        return on_attention_shards(local, query, key, value,
                           bias=(None if bias is None else four_dimensional(bias), SCORES),
                           mask=(held, SCORES), sinks=(sinks, ("activation_heads",)),
                           segment_ids=(segment_ids, ("activation_batch", None)))

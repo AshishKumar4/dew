@@ -68,10 +68,10 @@ def test_a_runs_frozen_tree_is_its_objectives_held_arrays_through_every_step(pla
     assert analysis is not None and analysis.output_size_in_bytes < frozen_bytes
 
 
-def test_timing_a_frontier_of_plans_leaves_the_frozen_tree_whole():
-    """A plan timed over two candidates deletes the state it timed the first on and restores a copy
-    (`planning.Trials`): the moving state alone, so the frozen tree the run and its objective share
-    is the same arrays after the timing, none deleted."""
+def test_trial_runs_of_a_plan_leave_the_frozen_tree_whole():
+    """Two trial runs of a plan's step, as AutoPGLE's profile takes them (`planning.Trials.run`), each
+    step a copy of the moving state and delete it, then restore it: the frozen tree the run and its
+    objective share is the same arrays after the trials, none deleted."""
     objective = adapted(placed=True)
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec())
     state = trainer.place()[0]
@@ -80,10 +80,10 @@ def test_timing_a_frontier_of_plans_leaves_the_frozen_tree_whole():
     from dew.training.planning import Trials
 
     rows = batch()
-    trainer.compile(state, rows)
     trials = Trials(state, rows)
     step = trainer.compile(state, rows)
-    trials.seconds([step, step])
+    for _ in range(2):
+        trials.run(lambda trial: jax.block_until_ready(step(trial, rows)))
     assert frozen_ids(trials.state.variables[FROZEN]) == frozen_ids(held[FROZEN])
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(held[FROZEN]))
 

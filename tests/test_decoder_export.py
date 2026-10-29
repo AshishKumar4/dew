@@ -136,19 +136,9 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # too: dew's gradient of the next-token cross entropy, written back into
 # the source's tensor layout, against the reference's `.grad`.
 GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
-
-WHOLE_SUITE = {"gradients": ("deepseek_v4", "glm5_next"), "trips": ("glm5_next",), "indexed": ("glm5_next",),
-               "balanced": ("glm5_next",), "glm5": ("released",)}
-"""The cases past a group's 120 s on armada, run by the whole suite alone (`whole_suite`, ledger 2182):
-DeepSeek V4's and GLM-5 Next's gradients against their references (162 s and 147 s), every case reading
-GLM-5 Next's round trip (its training and export, 123 s of setup the first one pays) and GLM-5's released
-standalone export (173 s)."""
-
-
-def whole_suite(cases, kind: str) -> list:
-    """`cases`, those `WHOLE_SUITE[kind]` names marked to run in the whole suite alone."""
-    return [pytest.param(case, marks=pytest.mark.whole_suite, id=case) if case in WHOLE_SUITE[kind]
-            else pytest.param(case, id=case) for case in cases]
+# Every case runs each train since the export checks compile Dew's forward (ledgers 2182, 2278): GLM-5's
+# released standalone export, 173 s in train 279's CI before, is 99 s on armada at c937fc46a after; the
+# gradients and the cases reading GLM-5 Next's round trip 41-55 s.
 
 
 @pytest.fixture(scope="module")
@@ -167,12 +157,12 @@ def trips(workspace):
     return cached_round_trips(tool.round_trip, CASES, workspace)
 
 
-@pytest.fixture(params=whole_suite(CASES, "trips"))
+@pytest.fixture(params=list(CASES), ids=list(CASES))
 def trip(request, trips):
     return trips(request.param)
 
 
-@pytest.fixture(params=whole_suite(INDEXED, "indexed"))
+@pytest.fixture(params=INDEXED, ids=INDEXED)
 def indexed(request, trips):
     """A family whose checkpoint holds one tensor per expert, with them."""
     found = trips(request.param)
@@ -338,7 +328,6 @@ def test_the_mtp_copies_carry_the_trained_embedding_and_head(name, trips):
         assert moved > MOVEMENT, f"{copy} still holds the checkpoint's values"
 
 
-@pytest.mark.whole_suite
 def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
     trip = trips('glm5_next')
     model = trip.source.model
@@ -354,7 +343,7 @@ def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
     assert np.any(trip.exported_tensors[projection] != trip.source_tensors[projection])
 
 
-@pytest.mark.parametrize("name", whole_suite(GRADIENTS, "gradients"))
+@pytest.mark.parametrize("name", GRADIENTS, ids=GRADIENTS)
 def test_the_gradients_match_the_reference_implementation(name, trips):
     """Compare all trunk next-token CE gradients by source tensor name.
 
@@ -386,7 +375,7 @@ def test_the_gradients_match_the_reference_implementation(name, trips):
         f"dew's largest deviation is on {worst}")
 
 
-@pytest.mark.parametrize("name", whole_suite(BALANCED, "balanced"))
+@pytest.mark.parametrize("name", BALANCED, ids=BALANCED)
 def test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export(name, trips):
     """The routers' balancing bias is state the step moves, not a
     parameter. It is a sign step of the balance rate, so every entry of
@@ -1214,7 +1203,7 @@ def test_a_model_its_family_config_cannot_carry_is_refused_at_export(fixture, ch
         PretrainedDecoder.from_model(model, loaded.variables)
 
 
-@pytest.mark.parametrize("variant", whole_suite(["released", "native_geometry", "dense"], "glm5"))
+@pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
 def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
     import jax.numpy as jnp
 
