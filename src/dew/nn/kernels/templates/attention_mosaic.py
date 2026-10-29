@@ -147,8 +147,9 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # consumers feed their own rings (`split_queries`) runs the dK/dV launches alone: the keys-first one,
         # and the fused one, each consumer its own keys over the stream they walk whole.
         fed_alone = isinstance(config, BackwardTiles) and config.fused and not config.dkv_apart
-        return (family is not None and (fed_alone or not split_queries(family)) and whole_tiles(family, config)
-                and self.refusal(ba, family) is None and super().legal(ba, config, target))
+        return (family is not None and (fed_alone or not split_queries(family))
+                and whole_tiles(family, config) and self.refusal(ba, family) is None
+                and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
