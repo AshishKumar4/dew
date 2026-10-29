@@ -703,7 +703,8 @@ def test_a_refusal_holds_in_every_process_sharing_its_records(tmp_path):
     environment = {**os.environ, "DEW_REFUSAL_RECORDS": str(tmp_path / "refusals.jsonl")}
     seeded = preamble + f"report.refuse([('a launch', {tile}, {{'dew_gmm'}})])"
     subprocess.run([sys.executable, "-c", seeded], check=True, env=environment)
-    read = subprocess.run([sys.executable, "-c", preamble + f"print(report.refused_launches() == (('a launch', "
-                                                             f"{tile}, frozenset({{'dew_gmm'}})),))"],
-                          check=True, env=environment, capture_output=True, text=True)
+    expected = f"(('a launch', {tile}, frozenset({{'dew_gmm'}})),)"
+    reading = preamble + f"print(report.refused_launches() == {expected})"
+    read = subprocess.run([sys.executable, "-c", reading], check=True, env=environment, capture_output=True,
+                          text=True)
     assert read.stdout.strip() == "True"
