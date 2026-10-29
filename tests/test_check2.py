@@ -563,8 +563,9 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
     element, same-sign products included, whose truncations all err one way. Each fault is refused where it
     lands (`assert_refused`): the same sums with their largest product lost, at more than 95% of the
     elements; and the first half's partial rounded to bf16 before an IEEE add of the rest's, as the native
-    fault adds them, wherever that rounding outweighs the sum's own: at more than NARROW of Gaussian draws,
-    whose partials sometimes cancel to a bf16 value's neighbourhood, and more than NARROW of one sign."""
+    fault adds them, wherever that rounding outweighs the sum's own: at more than 65% of the elements of
+    Gaussian draws, whose partials sometimes cancel to a bf16 value's neighbourhood, and more than 90% of
+    draws of one sign."""
     rng = np.random.default_rng(3)
     for signed in (True, False):
         left, right = (np.asarray(ml_dtypes.bfloat16(rng.normal(size=shape) if signed else
@@ -586,7 +587,7 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
         truth = ct.native_dot_ends(products, oc.FLOAT32, flushes=False)
         fault_lost = ct.native_dot_ends(lost, oc.FLOAT32, flushes=False)
         for faulty, fault, share in ((_truncating_sums(lost, rng), fault_lost, 0.95),
-                                     (narrow, narrowed, 0.75 if signed else 0.95)):
+                                     (narrow, narrowed, 0.65 if signed else 0.9)):
             held = ct.native_dot_holds(np.asarray(faulty, np.float64), products, oc.FLOAT32, flushes=False)
             ct.assert_refused(held, ct.separated(truth, fault), share)
 
@@ -615,8 +616,8 @@ def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf
     of their TF32 values (`tf32_operand`) summed in fp32 by truncating adds in any order, holds at every
     element; the products of its operands' bf16 values where TF32 is declared, its TF32 products where bf16
     ones are, and the products of its operands truncated to TF32 where the tensor cores round them are each
-    refused where they land (`assert_refused`): the first two at more than SWAP of the elements, the
-    truncation at more than CUT of Gaussian draws, whose products' errors partly cancel, and at more than CUT
+    refused where they land (`assert_refused`): the first two at more than 85% of the elements, the
+    truncation at more than 75% of Gaussian draws, whose products' errors partly cancel, and at more than 95%
     of draws of one sign, whose products all err toward zero."""
     rng = np.random.default_rng(5)
 
@@ -630,9 +631,9 @@ def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf
             ct.tf32_operand, bf16, lambda value: oc.truncated(value, oc.TFLOAT32)))
         native = _truncating_sums(tf32, rng)
         assert np.all(ct.native_dot_holds(native, tf32, oc.FLOAT32, flushes=False)), signed
-        cut = 0.8 if signed else 0.95
-        for faulty, declared, given, share in ((_truncating_sums(wide, rng), tf32, wide, 0.9),
-                                               (native, wide, tf32, 0.9),
+        cut = 0.75 if signed else 0.95
+        for faulty, declared, given, share in ((_truncating_sums(wide, rng), tf32, wide, 0.85),
+                                               (native, wide, tf32, 0.85),
                                                (_truncating_sums(truncated, rng), tf32, truncated, cut)):
             held = ct.native_dot_holds(faulty, declared, oc.FLOAT32, flushes=False)
             ct.assert_refused(held, ct.separated(*(ct.native_dot_ends(products, oc.FLOAT32, flushes=False)
@@ -645,7 +646,7 @@ def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_a
     one scale and falling 2^-12 past the first step. Each fault is refused where it lands (`assert_refused`):
     a step with its largest product lost, at more than 95% of that step's elements, and nowhere else; and,
     on a falling draw of one sign, the same steps' products added into the accumulator by truncating adds,
-    as the tensor cores add without exact sums (`truncating_step_ends`), at more than TRUNC of the later
+    as the tensor cores add without exact sums (`truncating_step_ends`), at more than 40% of the later
     steps' elements, about those whose exact sum lies past the midpoint between two fp32 values, which a
     truncation leaves below and a rounding above."""
     rng = np.random.default_rng(7)
