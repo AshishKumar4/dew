@@ -727,6 +727,7 @@ def release(python: str, tests: list[str], requirement: str, out: Path) -> int:
         print(f"RED {name}")
     return 1 if red else 0
 
+
 def node_of(case: ET.Element) -> str:
     """A JUnit case's pytest node id, as tests/test_durations.json keys it."""
     parts = (case.get("classname") or "").split(".")
