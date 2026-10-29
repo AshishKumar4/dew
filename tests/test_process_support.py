@@ -1,6 +1,7 @@
 """Worker reports and cleanup survive failed starts, failed exits and timeouts."""
 
 import os
+import select
 import subprocess
 import sys
 from pathlib import Path
@@ -138,16 +139,30 @@ def test_a_worker_ends_with_its_owner_however_the_owner_dies(tmp_path):
             assert gone_within(worker, 30), (signal_number, worker)
 
 
-def gone_within(pid: int, seconds: float) -> bool:
-    """Whether process `pid` has ended (gone, or a zombie no one reaps yet) within `seconds`."""
-    import time
+def test_a_worker_that_ends_by_itself_leaves_its_owner_nothing_running(tmp_path):
+    """A worker that ends on its own, its owner reading its output and never stopping it (a rank that
+    finishes), leaves no process of its ownership running beside the owner: its lifeline ends with it and
+    kills nothing, as the group's id is then free for another process."""
+    before = children()
+    process = start_process([sys.executable, "-c", "print('done')"], devices=1)
+    assert process.communicate(timeout=60)[0].strip() == "done"
+    assert all(gone_within(pid, 30) for pid in children() - before), children() - before
 
-    bound = time.monotonic() + seconds
-    while time.monotonic() < bound:
-        try:
-            if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
-                return True
-        except (FileNotFoundError, ProcessLookupError):
-            return True
-        time.sleep(0.05)
-    return False
+
+def children() -> set[int]:
+    """This process's live children, every thread's (/proc's children lists)."""
+    return {int(pid) for task in Path("/proc/self/task").iterdir()
+            for pid in (task / "children").read_text().split()}
+
+
+def gone_within(pid: int, seconds: float) -> bool:
+    """Whether process `pid` has ended (gone, or a zombie no one reaps yet) within `seconds`: its pidfd is
+    readable once it ends."""
+    try:
+        ended = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    try:
+        return bool(select.select([ended], [], [], seconds)[0])
+    finally:
+        os.close(ended)
