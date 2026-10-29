@@ -366,13 +366,21 @@ FUSED_FASTER = ("this module's table (469e47b1f): Qwen3.5-0.8B's 4 x 3072 rows o
                 "and an H100 SXM")
 """The receipt behind the fused norm's and SiLU product's declared cells (`NORM`, `SWIGLU`)."""
 
+FP16_NORM_FASTER = ("FSNORM16 (base/kernels 3b6c752c8, CUPTI, arms rotated): Qwen3.5-0.8B's 4 x 3072 rows "
+                    "of 1024 in fp16, the fused norm's forward and reverse against XLA's on an H100 SXM "
+                    "(17.7 and 58.3 us against 33.0 and 105.3) and an A100-SXM4-40GB (40.0 and 133.7 against "
+                    "74.5 and 227.8)")
+"""The receipt behind the fused norm's fp16 cells."""
+
 NORM: Op[NormCase] = Op('rms_norm', (Kernel('pallas', NORM_SUPPORTS), Kernel('xla', (), generic=True)),
                         lambda case: 'xla',
-                        declared={(device, 'bfloat16'): ('pallas', FUSED_FASTER)
-                                  for device in ('sm80', 'sm90')})
+                        declared={**{(device, 'bfloat16'): ('pallas', FUSED_FASTER)
+                                     for device in ('sm80', 'sm90')},
+                                  **{(device, 'float16'): ('pallas', FP16_NORM_FASTER)
+                                     for device in ('sm80', 'sm90')}})
 """The norm selector: XLA's arithmetic, but the fused kernel where it measured faster (bf16 rows on an
 A100 and an H100: the seam 76/187 against 103/200 us and 36/81 against 44/89, the gated norm's 118;224
-against 123;343 and 52;101 against 59;149) and its requirements hold."""
+against 123;343 and 52;101 against 59;149; fp16 rows, `FP16_NORM_FASTER`) and its requirements hold."""
 
 
 def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,

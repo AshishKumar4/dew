@@ -174,7 +174,7 @@ def dividing[C](configs: Sequence[C], extents: tuple[int, ...],
                  if all(extent % block == 0 for extent, block in zip(extents, blocks(config), strict=True)))
 
 
-class Unfitted(ValueError):
+class Unfitted(report.Exhausted):
     """A call no config of a launch holds: its programs stage at least `least` bytes of shared memory,
     past the `budget` a block of `generation` holds, or (`least` None) no config's threads hold their
     registers (`Template.register_budget`), or the launch declares none."""
