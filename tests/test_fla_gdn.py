@@ -103,8 +103,9 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     q, k, v, h, g = output_operands(*shape, dtype)
     scale = shape[4] ** -0.5
     launch = fla_gdn.ChunkFwdO(config=tiles)
-    got = launch(q, k, v, support.entered_states(h), *separated_prefix(g), *chunked_launch.sequences(*shape[:2]),
-                 scale=scale, chunk=64, interpret=INTERPRETED)
+    spans = chunked_launch.sequences(*shape[:2])
+    got = launch(q, k, v, support.entered_states(h), *separated_prefix(g), *spans, scale=scale, chunk=64,
+                 interpret=INTERPRETED)
     want = support.reference_o(q, k, v, h, g, scale=scale)
     assert got.shape == want.shape and got.dtype == want.dtype
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
