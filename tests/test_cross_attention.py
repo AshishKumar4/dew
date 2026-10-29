@@ -148,7 +148,8 @@ def idefics_block(wide: bool):
     return run
 
 
-@pytest.mark.parametrize("dtype", [np.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
+@pytest.mark.parametrize("dtype", [pytest.param(np.float32, id="float32"),
+                                   pytest.param(jnp.bfloat16, id="bfloat16", marks=pytest.mark.whole_suite)])
 def test_the_block_computes_and_differentiates_as_idefics(dtype):
     """Through both gated branches, the output and the gradients into the residual, the context and
     every parameter on par with IDEFICS's in float32 and in bfloat16 (check 1), over contexts of
