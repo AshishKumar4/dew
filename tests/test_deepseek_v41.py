@@ -537,7 +537,8 @@ def cached_draft(module, variables, context, block):
     """A DSpark stage's draft of `block` after `context`, cached: the context written by an empty block,
     then the block drafted after it with none."""
     writing = MixerCall(decode=True, kv_store={DRAFT_CONTEXT: context})
-    state = {**module.init(jax.random.key(0), block[:, :0], writing), "params": variables["params"]}
+    # The call that allocates the cache writes nothing (`cache_positions`), as a decoder's first does.
+    state = {**module.init(jax.random.key(0), block, writing), "params": variables["params"]}
     _, written = module.apply(state, block[:, :0], writing, mutable=["cache"])
     return module.apply({**state, "cache": written["cache"]}, block, MixerCall(decode=True))
 
@@ -585,7 +586,7 @@ def test_a_quantized_drafting_cache_drafts_what_dequantizing_in_the_own_basis_co
     module = DRAFTING.clone(kv_cache=KVCache(quantized=quantized))
     context = jax.random.normal(jax.random.key(7), (2, 6, 32))
     block = jax.random.normal(jax.random.key(8), (2, 3, 32))
-    variables = {"params": module.init(jax.random.key(3), block[:, :0],
+    variables = {"params": module.init(jax.random.key(3), block,
                                        MixerCall(decode=True, kv_store={DRAFT_CONTEXT: context}))["params"]}
     decoded = jax.jit(lambda variables, context, block: cached_draft(module, variables, context, block))
     own = jax.jit(lambda variables, context, block: uncached_own_basis_draft(
