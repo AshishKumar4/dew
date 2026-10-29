@@ -9,6 +9,7 @@ form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2).
 Each solver's order of accuracy is measured against that closed form.
 """
 
+import dataclasses
 import functools
 import json
 from dataclasses import dataclass
@@ -233,7 +234,6 @@ INTEGRATES = {
                     ("karras",)),
     "flow_sde": ("flow",),
     "unmask": ("masked",),
-    "confident": ("masked",),
 }
 """The cases a solver that integrates one process family samples; it refuses
 every other family's (FAMILIES)."""
@@ -264,6 +264,14 @@ REFUSES = {
 """The families a solver that reaches its data by `CONVERGES_ON` refuses."""
 
 
+CONFIDENCE = {"confident": "masked"}
+"""The solvers that reveal by confidence, a release's own heuristic, by the case they walk: each draws a
+position's token from its distribution but reveals the likeliest draws first, which favors likely tokens
+by design, so at its defaults it walks its case to a full reveal within the oracle's support, not to the
+oracle's frequencies (its parity is with its release's walk, tests/test_blockwise_walk.py); with no
+threshold every masked position reveals from its first draw, which samples the oracle exactly."""
+
+
 def assert_reaches_its_data(case, solver, steps=100):
     build, shape, reaches = PROCESS_CASES[case]
     reaches(generate(*build(), solver, steps, shape=shape))
@@ -272,11 +280,18 @@ def assert_reaches_its_data(case, solver, steps=100):
 @pytest.mark.parametrize("name", sorted(solvers))
 def test_every_registered_solver_samples_its_processes_and_refuses_the_rest(name):
     """Each solver `dew.registry.solvers` names, at its defaults, walks every
-    process case it integrates from the prior to the oracle's data, and a
+    process case it integrates from the prior to the oracle's data, a
+    confidence reveal its case to a full reveal (`CONFIDENCE`), and a
     solver of one process family refuses every other continuous case."""
     solver = solvers.build(name)
-    integrated = INTEGRATES.get(name)
-    for case in integrated or CONVERGES_ON.get(name, GAUSSIAN):
+    if name in CONFIDENCE:
+        build, shape, _ = PROCESS_CASES[CONFIDENCE[name]]
+        counts = np.bincount(np.asarray(generate(*build(), solver, 100, shape=shape)).ravel(),
+                             minlength=len(TOKEN_PROBS) + 1)
+        assert counts[-1] == 0 and counts.sum() > 0, counts
+        assert_reaches_its_data(CONFIDENCE[name], dataclasses.replace(solver, threshold=0.0))
+    integrated = INTEGRATES.get(name, (CONFIDENCE[name],) if name in CONFIDENCE else None)
+    for case in () if name in CONFIDENCE else integrated or CONVERGES_ON.get(name, GAUSSIAN):
         assert_reaches_its_data(case, solver)
     refused = REFUSES.get(name, ()) if integrated is None else sorted(set(FAMILIES) - set(integrated))
     for case in refused:
