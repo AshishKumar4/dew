@@ -1833,6 +1833,8 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     dv, dbeta_u = _values_back(run.a, run.v, dv2, run.beta, run.taken, call)
     dk_w, dbeta_k, after_w, decay_w = _keys_back(run.a, run.k, dw, d_l, run.hi, run.lo, run.beta, run.taken,
                                                  call)
+    # The keys launch's terms a key block's, summed (each linear in them).
+    dbeta_k, after_w, decay_w = (x.sum(0) for x in (dbeta_k, after_w, decay_w))
     dbeta = dbeta_u + dbeta_k
     chunks = call.chunks
     # Each token's decay's gradient, the launches' (`algebra.summed_back` is linear in its terms) and the
@@ -2109,16 +2111,30 @@ def _gradient_stored(call: _Call, kind: str, block: int, grad, *, weights: Seque
         family.added(grad, sums[kind], call.interpret, smem=landing["sums"])
 
 
+def _memory_sum(call: _Call, issue: _Issuer, entered: _Parts, leaving: _Parts) -> jax.Array:
+    """`sum(S dS)` over the value columns of a block of the memories entered and left, `[rows]`: the
+    diagonal of their product `S^T dS` where the family's products read registers, else their elementwise
+    product's rows (`_query_key`)."""
+    if call.family.operands_in_registers:
+        traced = issue("memory_trace", entered.T, leaving)
+        return jnp.sum(jnp.where(_diagonal(traced.shape[0], call.family), traced, 0.0), axis=1)
+    return jnp.sum(entered.value().astype(jnp.float32) * leaving.value().astype(jnp.float32), axis=1)
+
+
 def _query_key_held(call: _Call) -> _Held:
     """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum,
-    its memory product and its scores' product, a block's queries or keys in fp32 for the range terms, and a
-    block of the memories entered and left for `sum(S dS)`; where products read registers, a block of each
-    operand."""
+    its memory product and its scores' product, and a block's queries or keys in fp32 for the range terms;
+    then `sum(S dS)` (`_memory_sum`): the memories' product and its diagonal's mask where products read
+    registers, with a block of each operand, else the memories in fp32."""
     held, memories, given = call.held, call.memories, call.given
+    block = (memories, call.block, call.block)
+    summed = ([_f32(call.block, call.block), *_masks(call.block, call.block), *_fragments(call, block, block)]
+              if call.family.operands_in_registers else [_f32(call.block, call.block)] * 2)
     return _Held(phases=(
-        [_f32(CHUNK, call.block)] * 4 + [_f32(call.block, call.block)] * 2
+        [_f32(CHUNK, call.block)] * 4
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block), (memories, call.block,
-                                                                                      call.block)),))
+                                                                                      call.block)),
+        summed))
 
 
 @_lowered_once
@@ -2169,19 +2185,23 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
                       "dk": dk_ref.at[span, pl.ds(key_columns, call.block)]},
                 first=first_head, landing=landing)
 
+            issue = _Issuer(call)
             after, leaving = algebra.memory_gradients(
                 functools.partial(whole, "queries", given), functools.partial(whole, "keys", given), 1,
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
                 functools.partial(column, "value_grads", held),
                 lambda i, j: column("entered", memories, j), lambda i, j: column("leaving", memories, j),
-                blocks, _tile(slots, "ds", held), gate, low, ending, ending_low, None, scale, _Issuer(call),
+                blocks, _tile(slots, "ds", held), gate, low, ending, ending_low, None, scale, issue,
                 emit=stored)
             after_ref.at[c, h, span][...] = after
             leaving_ref.at[c, h, span][...] = leaving
-            # `sum(S dS)` over the block's rows, each row's, read here rather than both memories again.
+            # `sum(S dS)` over the block's rows, read here rather than both memories again: where products
+            # read registers (mma.sync's), each value block's `S^T dS` diagonal, a product of the memories
+            # as they lie in shared memory (their elementwise product held two fp32 tiles beside the step's
+            # fragments, past an A100's 255 registers); where they read shared memory, that elementwise
+            # product (the product's accumulator spilled 44 bytes a thread on an H100's).
             memory_ref.at[c, h, pl.ds(n * call.block, call.block)][...] = functools.reduce(jnp.add, (
-                jnp.sum(column("entered", memories, j).value().astype(jnp.float32)
-                        * column("leaving", memories, j).value().astype(jnp.float32), axis=1)
+                _memory_sum(call, issue, column("entered", memories, j), column("leaving", memories, j))
                 for j in range(blocks)))
             # The step's reduce-adds ('dq', 'dk', `Family.added`) waited on by design, not by 'dw''s store
             # being emitted after them: Mosaic GPU waits on no copy at a kernel's exit (template numerics
@@ -2384,60 +2404,67 @@ def _values_back(a, v, du, beta, taken, call: _Call):
 
 @_lowered_once
 def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: _Call):
-    """`dk [R, HV * Dk]` as `call.held` and `(dbeta, after, decay [HV, R])` fp32: the WY representation's
-    backward's keys' part a chunk and value head at a time (`algebra.keys_gradient`), given the system's
-    gradient `dl` (`_system_back`'s): the keys' gradient through `w` and through the system, beta's
-    through both, the decay's range terms through `w`, and its gradient from the pair terms
-    (`algebra.summed_pairs`, in the launch)."""
+    """`dk [R, HV * Dk]` as `call.held` and `(dbeta, after, decay [blocks, HV, R])` fp32: the WY
+    representation's backward's keys' part a key block of a chunk and value head at a time
+    (`algebra.keys_gradient`), given the system's gradient `dl` (`_system_back`'s): the keys' gradient through
+    `w` and through the system, beta's through both, the decay's range terms through `w`, and its gradient
+    from the pair terms (`algebra.summed_pairs`, in the launch), each a key block's, which `gradients` sums
+    (each linear in its block's terms). A program takes one key block: a program walking a chunk's key blocks
+    held each block's operand fragments across the walk, 64 to 200 bytes a thread past an A100's 255
+    registers."""
     width, family = call.width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
 
     def program(a_ref, k_ref, dw_ref, dl_ref, hi_ref, lo_ref, beta_ref, taken_ref, dk_ref, dbeta_ref,
                 after_ref, decay_ref, *, streams, staging, landing):
-        n, h = _axis("chunks"), _axis("heads")
+        c, n, h = _axis("blocks"), _axis("chunks"), _axis("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         staged, *summing = staging
+        column = c * call.block
         views = _views(lower=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
-                       keys=given.views(k_ref, row, CHUNK, h // call.group * width, width),
-                       w_grads=held.views(dw_ref, row, CHUNK, h * width, width),
+                       keys=given.views(k_ref, row, CHUNK, h // call.group * width + column, call.block),
+                       w_grads=held.views(dw_ref, row, CHUNK, h * width + column, call.block),
                        system=held.views(dl_ref, row, CHUNK, h * CHUNK, CHUNK))
 
         def step(index, slots, carry, accumulators):
             del index
 
-            column = functools.partial(_column, call, slots)
+            def whole(name, operand, block):
+                del block
+                return _tile(slots, name, operand)
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             beta = family.rows_of(beta_ref.at[h, span])
-            stored = _block_stored(call, dk_ref, row, h * width, landing["block"])
+            stored = _block_stored(call, dk_ref, row, h * width + column, landing["block"])
 
             d_beta, after, pairs = algebra.keys_gradient(
-                _tile(slots, "lower", held), functools.partial(column, "keys", given), width // call.block,
-                functools.partial(column, "w_grads", held), _tile(slots, "system", held), beta, gate, low,
+                _tile(slots, "lower", held), functools.partial(whole, "keys", given), 1,
+                functools.partial(whole, "w_grads", held), _tile(slots, "system", held), beta, gate, low,
                 held.dtype, _Issuer(call, dict.fromkeys(("inverse_t", "keys_dl", "keys_dlt"), staged)),
                 emit=stored)
             summed, columns = _summed(tuple(summing), call)
-            decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, columns)
-            dbeta_ref.at[h, span][...] = d_beta
-            after_ref.at[h, span][...] = after
+            decay_ref.at[c, h, span][...] = algebra.summed_pairs(pairs, summed, columns)
+            dbeta_ref.at[c, h, span][...] = d_beta
+            after_ref.at[c, h, span][...] = after
             return carry, accumulators
 
         _walk(streams, views, step, call)
 
-    tiles = _streamed(lower=((CHUNK, CHUNK), held), keys=((CHUNK, width), given),
-                      w_grads=((CHUNK, width), held), system=((CHUNK, CHUNK), held))
-    tokens = jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32)
-    out_type = (held.shape(call.heads * width), tokens, tokens, tokens)
-    # Each key block's products through `w` and the system, and the keys' own pairs.
-    work = Work(2 * CHUNK * CHUNK * (4 * width))
-    # The system's gradient narrow and scaled by beta beside a key block's gradient terms and their sum;
-    # then the keys' own pairs, the pair terms, and the pairs' sums' masks and product
-    # (`algebra.keys_gradient`).
+    tiles = _streamed(lower=((CHUNK, CHUNK), held), keys=((CHUNK, call.block), given),
+                      w_grads=((CHUNK, call.block), held), system=((CHUNK, CHUNK), held))
+    blocks = width // call.block
+    terms = jax.ShapeDtypeStruct((blocks, call.heads, call.rows), jnp.float32)
+    out_type = (held.shape(call.heads * width), terms, terms, terms)
+    # The key block's products through `w` and the system, and its keys' own pairs.
+    work = Work(2 * CHUNK * CHUNK * (4 * call.block))
+    # The system's gradient narrow and scaled by beta beside the key block's terms: through `w`, the keys in
+    # fp32, the product being issued and the sum it joins (`algebra.keys_gradient`: each term dies as the next
+    # forms); then its keys' own pairs, the pair terms, and the pairs' sums' masks and product.
     held_tiles = _Held(phases=(
-        _held(held, CHUNK, CHUNK) * 2 + [_f32(CHUNK, call.block)] * 5
+        _held(held, CHUNK, CHUNK) * 2 + [_f32(CHUNK, call.block)] * 4
         + _fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, call.block), (held, CHUNK, call.block)),
         _held(held, CHUNK, CHUNK) + [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK)))
-    return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                   grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(7), work=work,
-                   held=held_tiles, staging=_staging(held, (CHUNK, CHUNK)) + _summing(call),
+    return _kernel(program, call, out_type=out_type, grid=(blocks, call.chunks, call.heads),
+                   grid_names=("blocks", "chunks", "heads"), blocks=tiles, stages=1, live=_taken(7),
+                   work=work, held=held_tiles, staging=_staging(held, (CHUNK, CHUNK)) + _summing(call),
                    landing={"block": held.landing(CHUNK, call.block)})(a, k, dw, dl, hi, lo, beta, taken)

@@ -8,7 +8,6 @@ import functools
 import os
 import tempfile
 from pathlib import Path
-from unittest import mock
 
 import fla_gdn_support as support
 import jax
@@ -220,50 +219,11 @@ PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "inp
                "kernel gradient", "kernel gradient fp32", "kernel gradient fp16")
 """The forms every family's GEMM launches emit: each product and output dtype they take."""
 
-HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "fp16 normed biased forward",
-                "normed biased input gradient", "normed kernel gradient", "exact normed kernel gradient",
-                "cast forward", "residual forward", "two bf16 outputs forward", "scaled forward",
-                "row scaled forward", "gated forward", "gated kernel gradient", "paired swiglu forward",
-                "paired forward")
-"""The hooked and exactly summed forms, which a family's launches emit where its register model counts what
-they hold (`Family.counts_hooks`): the fuser's prologues over side vectors (a norm's scaling, a cast) and
-tiles (a SwiGLU gate's side), and epilogues (a bias, a residual add
-after an activation, two outputs, column and row scales), each as the `Hooks` the fuser builds
-(`templates.gemm.fused`); and a paired product's (`templates.gemm.template.gemm`'s `paired`: a gate's and
-an up projection's two accumulators, their SwiGLU or both products)."""
-
-
-FUSED_FORMS = ("fused normed residual forward",)
-"""The forms the fuser itself emits, captured from its own launches (`_fused_case`): a model's RMS norm into
-the prologue and an activation and residual add into the epilogue."""
-
-
-def _fused_case(rows: int, depth: int, width: int, groups: int):
-    """The fuser's own launch of `FUSED_FORMS` at a projection's extents, on the assumed GPU: a residual
-    stream's RMS norm producing the left operand and SiLU plus a residual add consuming the product, under
-    `fuser.fuse`; its model from the arguments and tile the launch took (`tuning.seen`), the program the
-    fuser lowers compiled whole."""
-    from jax.experimental.pallas import fuser
-    from test_gemm_template import rms_norm, silu_residual
-
-    from dew.nn.kernels.templates.gemm import fused
-
-    def fusing(x, weight, w, sizes, r):
-        return silu_residual(fused.fusible_gemm(rms_norm(x, weight), w, sizes), None, r)
-
-    def run(*arrays):
-        return fuser.fuse(fusing)(*arrays)
-
-    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16), jax.ShapeDtypeStruct((depth,), jnp.float32),
-            jax.ShapeDtypeStruct((groups, depth, width), jnp.bfloat16),
-            jax.ShapeDtypeStruct((groups,), jnp.int32), jax.ShapeDtypeStruct((rows, width), jnp.bfloat16))
-    with tuning.seen() as seen:
-        jax.jit(run).trace(*args)
-    # The hooked launch: the fuser's analysis also traces the plain product, which its program does not hold.
-    (launch, config, ba), = [(op, config, ba) for (op, _), (config, ba) in zip(seen, seen.taken, strict=True)
-                             if isinstance(op, grouped_matmul.MosaicGmm) and ba.arguments["hooks"].epilogue]
-    return support.KernelCase(f"{FUSED_FORMS[0]} {config}", lambda: (run, args),
-                              {"dew_gmm": _model(launch, ba, config)})
+HOOKED_FORMS = ("kernel gradient exact fp32", "scaled forward", "row scaled forward", "paired swiglu forward")
+"""The hooked and exactly summed forms whose register need the family's model prices (`Family.counts_hooks`,
+`grouped_matmul._priced`): epilogues over side vectors (a column or row scale), a paired product's SwiGLU
+over its two accumulators, and the running sum. A prologue, an epilogue's side tile and a second output are
+not yet priced; their calls take another launch."""
 
 
 def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
@@ -333,9 +293,9 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
         ("row scaled forward", gmm, (x, w, sizes, (), (vector((rows,)),)),
          {**forward, "hooks": hooks(epilogue=scaled_rows, epilogue_axes=(("rows",),))}),
         ("paired swiglu forward", gmm, (x, w, sizes, (), (), w),
-         {**forward, "hooks": hooks(epilogue=swiglu, paired=True)}),
+         {**forward, "hooks": hooks(epilogue=swiglu)}),
         ("paired forward", gmm, (x, w, sizes, (), (), w),
-         {**forward, "hooks": hooks(out_dtypes=("bfloat16", "bfloat16"), paired=True)}),
+         {**forward, "hooks": hooks(out_dtypes=("bfloat16", "bfloat16"))}),
     ]
 
 
@@ -377,67 +337,51 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                 cases.append(support.KernelCase(label,
                                                 lambda configured=configured, args=args: (configured, args),
                                                 {kernel: _model(launch, ba, config)}))
-        family = bundles.of(generation_name, jnp.bfloat16)
-        if family is not None and family.counts_hooks and not every_consumer_count:
-            cases.append(_fused_case(*GEMM_SHAPES[shape]))
     return cases
 
 
-def _model(launch, ba, config) -> dict:
+def _model(launch, ba, config) -> resources.RegisterModel:
     """What a launch's model decides at `config` for the call `ba`, as the gate holds it to the compiled
-    kernel: its registers a consumer thread, its budget, its consumers, the most programs its family runs a
-    multiprocessor and its producer's registers where it has one, against ptxas's need
-    (`kernel_compile.decisions`); and the scratch the planner sized it by (`resources.scratch_bytes` of
-    `launch_of`'s allocations, its barriers apart), against the kernel's own."""
-    bundle = mosaic_gpu.family_of(config, jnp.bfloat16)
-    producer = bundle.warpgroups(config.warpgroups) > config.warpgroups
-    shared = resources.scratch_bytes(mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype),
-                                    launch.launch_of(ba, config).scope(config.stages))
-    return {"registers": launch.registers(ba, config), "budget": launch.register_budget(config),
-            "shared": shared,
-            "consumers": config.warpgroups, "most": bundle.programs(config.warpgroups),
-            "register_step": bundle.register_step,
-            "producer": resources.PRODUCER_REGISTERS if producer else 0}
+    kernel (`resources.register_model`, `kernel_compile.decisions`), and the scratch the planner sized it by
+    (`resources.scratch_bytes` of `launch_of`'s allocations, its barriers apart), against the kernel's
+    own."""
+    family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+    shared = resources.scratch_bytes(family, launch.launch_of(ba, config).scope(config.stages))
+    return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared)
 
 
 def _derived_and_refused(launch, ba, target) -> tuple:
     """A launch's derived tile, and the tiles its derivation asked the planner about (`launch_of`) that
     it refused for their registers alone (`resources.plan`: a ring its program's share holds, the registers
     not), whose need the gate checks refuses them too: a model over the need throws tiles away
-    (`kernel_compile.decisions`). Each is the largest such of its rows and columns, at the deepest ring
-    the planner holds without the registers, the one a derivation would take had they held."""
-    launch_of, asked = type(launch).launch_of, []
-
-    def recorded(self, ba, tile):
-        planned = launch_of(self, ba, tile)
-        asked.append((tile, planned))
-        return planned
-
-    with mock.patch.object(type(launch), "launch_of", recorded):
+    (`kernel_compile.decisions`). Each is the largest such of its rows, columns and layout, at the deepest
+    ring the planner holds without the registers, the one a derivation would take had they held (the
+    plans it asked, `resources.recording`)."""
+    with resources.recording() as asked:
         config = launch.derived(ba, target)
     refused: dict = {}
-    for tile, planned in asked:
-        family = mosaic_gpu.family_of(tile, ba.arguments['tokens'].dtype)
-        if resources.plan([planned], family, target, programs=tile.programs) is not None:
+    for each in asked:
+        (tile,) = each.tiles
+        if each.plans is not None:
             continue
-        held = resources.plan([dataclasses.replace(planned, registers=0)], family, target,
-                              programs=tile.programs)
+        held = resources.plan([dataclasses.replace(launch.launch_of(ba, tile), registers=0)], each.family,
+                              target, programs=each.programs)
         if held is not None:
             tile = dataclasses.replace(tile, stages=held[0].stages)
-            shape = (tile.block_m, tile.block_n, tile.block_k, tile.warpgroups)
+            shape = (tile.block_m, tile.block_n, tile.block_k, tile.warpgroups, tile.family)
             refused[shape] = max(refused.get(shape, tile), tile, key=lambda each: each.stages)
     return config, list(refused.values())
 
 
-def _emitted_forms(family, shape: str | None = None, *, fused: bool = True) -> set[str]:
-    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`, and with `fused` the fuser's
-    own, `FUSED_FORMS`): none without a bundle, the hooked, exactly summed and fused ones where its register
-    model counts what they hold (`Family.counts_hooks`); at a projection `shape`, each whose output's width
-    steps by the family's column unit and whose contraction by its narrowest depth (`Family.column_unit`,
-    `Family.depths`: mma.sync stores a row over a role's 128 threads, so no output 64 wide)."""
+def _emitted_forms(family, shape: str | None = None) -> set[str]:
+    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`): none without a bundle, the
+    hooked and exactly summed ones where its register model counts what they hold (`Family.counts_hooks`);
+    at a projection `shape`, each whose output's width steps by the family's column unit, whose stores take
+    it (`Family.stores_columns`: a grouped product's rows ragged to one, a kernel gradient's whole role's)
+    and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
-    forms = {*PLAIN_FORMS, *((*HOOKED_FORMS, *(FUSED_FORMS if fused else ())) if family.counts_hooks else ())}
+    forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ())}
     if shape is None:
         return forms
     _, depth, width, _ = GEMM_SHAPES[shape]
@@ -447,7 +391,9 @@ def _emitted_forms(family, shape: str | None = None, *, fused: bool = True) -> s
         # An input gradient's output is the depth wide, contracting the width; every other form's output
         # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
         columns, contracted = (depth, width) if "input gradient" in form else (width, depth)
-        return columns % unit == 0 and ("kernel gradient" in form or contracted % step == 0)
+        stored = family.role_rows if "kernel gradient" in form else 1
+        return (columns % unit == 0 and family.stores_columns(columns, stored)
+                and ("kernel gradient" in form or contracted % step == 0))
 
     return {form for form in forms if takes(form)}
 
@@ -473,60 +419,6 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
-@lowers("sm90")
-@pytest.mark.parametrize("form,block_m,block_n,consumers", [
-    ("gated", 128, 128, 1),
-    ("gated", 128, 192, 1),
-    ("gated", 128, 256, 2),
-    ("normed", 256, 64, 1),
-    ("cast", 256, 64, 1),
-    ("cast", 384, 64, 2),
-    ("dw-gated", 128, 64, 1),
-    ("dw-gated", 128, 128, 1),
-    ("dw32", 128, 192, 1),
-    ("residual", 256, 64, 1),
-    ("residual", 128, 128, 1),
-])
-def test_the_gemm_hook_phase_boundary_tiles_decide_as_ptxas(form, block_m, block_n, consumers):
-    """The hook probes' live-phase boundaries, including tiles the model refuses: compare their actual
-    budget and residency assemblies to the model, not to a hand-written admission answer."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-    from test_gemm_template import casted, gated, normed, silu_residual
-
-    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    vector = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
-    rows, depth, width, groups = 4096, 2048, 26880, 8
-    dw = form.startswith("dw")
-    launch = grouped_matmul.MosaicTgmm() if dw else grouped_matmul.MosaicGmm()
-    side, axes, prologue = (), (), None
-    if "gated" in form:
-        side, axes, prologue = (shaped((rows, depth)),), (("rows", "depth"),), gated
-    elif form == "normed":
-        side, axes, prologue = (vector((rows,)), vector((depth,))), (("rows",), ("depth",)), normed
-    elif form == "cast":
-        side, axes, prologue = (vector((depth,)),), (("depth",),), casted
-    args = (shaped((rows, depth)), shaped((rows, width) if dw else (groups, depth, width)),
-            jax.ShapeDtypeStruct((groups,), jnp.int32), side)
-    hooks = grouped_matmul.Hooks(prologue, axes)
-    if form == "residual":
-        args += ((vector((width,)), shaped((rows, width))),)
-        hooks = grouped_matmul.Hooks(epilogue=silu_residual,
-                                    epilogue_axes=(("columns",), ("rows", "columns")))
-    options = {"out_dtype": "float32" if dw else "bfloat16", "interpret": False, "hooks": hooks}
-    if not dw:
-        options["trans_rhs"] = False
-    with generation.assumed("sm90"):
-        tile = mosaic_gpu.Tiles(block_m, block_n, 64, 3, 1, warpgroups=consumers)
-        ba = launch.bind(*args, **options)
-        kernel = "dew_tgmm" if dw else "dew_gmm"
-        case = support.KernelCase(
-            f"{form} {tile}", lambda: (lambda *a: launch._fwd(*a, **options, config=tile)[0], args),
-            {kernel: _model(launch, ba, tile)})
-    found = compile_mosaic_kernels([case], "sm90")
-    failed = mosaic_failures(found)
-    assert len(found) == 1 and not failed, "\n".join(failed)
-
-
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     """The whole contract a Mosaic GPU Family bundle offers its templates, compiled through ptxas for a
@@ -542,7 +434,7 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     assert family is not None
     cases = _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)), every_consumer_count=True)
     counts = sorted({1, family.consumers})
-    expected = {f"{form} x{count}" for form in _emitted_forms(family, fused=False) for count in counts}
+    expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
     found = compile_mosaic_kernels(cases, generation_name)
