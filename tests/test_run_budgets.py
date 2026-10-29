@@ -489,27 +489,30 @@ def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_
     consumes its whole bound again from none, ending at it; a run of steps from that state keeps no clock,
     in its state or its checkpoints."""
     (x,) = clocked_records(0)
+    # A fit donates the state it is given, so each one's counts are read before the next fit takes it.
     first = thin_fit(x, examples=CLOCKED_RECORDS)
+    steps = int(first.step)
+    assert int(first.consumed) == CLOCKED_RECORDS
     again = thin_fit(x, examples=CLOCKED_RECORDS, state=first)
-    assert int(first.consumed) == int(again.consumed) == CLOCKED_RECORDS
-    assert int(again.step) == 2 * int(first.step)
+    assert int(again.consumed) == CLOCKED_RECORDS and int(again.step) == 2 * steps
     checkpoints = Checkpoints(str(tmp_path))
-    stepped = thin_fit(x, steps=int(first.step) + 2, state=first, checkpoints=checkpoints, checkpoint_every=1)
+    stepped = thin_fit(x, steps=2 * steps + 2, state=again, checkpoints=checkpoints, checkpoint_every=1)
     checkpoints.wait()
     assert stepped.consumed is None
     assert not {CONSUMED_EXAMPLES, CONSUMED_COMMITTED} & checkpoints.control(int(stepped.step)).keys()
 
 
-class Seen(Pulled):
-    """`Pulled`, keeping the fields of every batch its loss is traced over."""
+class Placed(Pulled):
+    """`Pulled`, keeping the fields of every batch the trainer places for its step, as it reads each placed
+    batch's row geometry (`Objective.row_tokens`)."""
 
     def __init__(self):
         super().__init__()
         self.fields: list[frozenset[str]] = []
 
-    def loss(self, variables, batch, step):
+    def row_tokens(self, batch):
         self.fields.append(frozenset(batch))
-        return super().loss(variables, batch, step)
+        return super().row_tokens(batch)
 
 
 def test_only_a_run_on_the_examples_clock_carries_its_count_to_the_step(tmp_path):
@@ -520,22 +523,23 @@ def test_only_a_run_on_the_examples_clock_carries_its_count_to_the_step(tmp_path
     ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
     optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
     planned = Pipeline(Memory({"x": x, "id": ids})).read("memory").batch(BATCH)
-    loader, _ = fitted(planned, None, objective=Seen().data(), examples=CLOCKED_RECORDS)
+    loader, _ = fitted(planned, None, objective=Placed().data(), examples=CLOCKED_RECORDS)
     stream = loader.train(DataPartition())
     try:
         assert EXAMPLES_CONSUMED in next(stream)
     finally:
         if isinstance(stream, Closeable):
             stream.close()
-    seen, checkpoints = Seen(), Checkpoints(str(tmp_path))
+    seen, checkpoints = Placed(), Checkpoints(str(tmp_path))
     state = Trainer(seen, optim, key=0, checkpoints=checkpoints).fit(
         planned, examples=CLOCKED_RECORDS, log_every=1, checkpoint_every=1)
     checkpoints.wait()
     assert state.consumed is None and seen.fields
     assert not any(EXAMPLES_CONSUMED in held for held in seen.fields)
     assert not {CONSUMED_EXAMPLES, CONSUMED_COMMITTED} & checkpoints.control(int(state.step)).keys()
-    clocked = Seen()
-    Trainer(clocked, optim, key=0).fit(clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
+    clocked = Placed()
+    chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed").batch(BATCH)
+    Trainer(clocked, optim, key=0).fit(chain, examples=CLOCKED_RECORDS, log_every=1)
     assert clocked.fields and all(EXAMPLES_CONSUMED in held for held in clocked.fields)
 
 
