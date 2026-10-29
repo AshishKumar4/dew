@@ -13,6 +13,7 @@ import numpy as np
 import optax
 import pytest
 from test_block_sft import assert_tree_equal
+from test_eval_harness import instance
 from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_files
 from test_run_option_matrix import recorded
 from test_run_options import decision, lm, scalars, trained
@@ -176,6 +177,49 @@ def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
     recorded_run = tmp_path / "runs" / "cpu" / "run.json"
     assert main(["train", str(recorded_run), "--set", "trainer.name=again"]) == 0
     assert kernels("again") == kernels("cpu")
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_saved_run_is_served_scored_and_loaded_in_the_attention_form_it_trained_in(tmp_path, monkeypatch):
+    """A run recorded "accurate" records its form with its checkpoints (`Objective.inference_record`), and
+    every way a saved run is loaded traces its attention in it, with no form chosen around the call
+    (row 2255): its task from the run (`TextGeneration.from_run`) and from `dew.pipeline` generate, a
+    harness over it scores, and a server of it steps, each attention call under the accurate form; a
+    run recorded with none loads in the fast form."""
+    import dew
+    from dew.eval.harness import DewLM
+    from dew.inference.serving import Server
+    from dew.inference.tasks import TextGeneration
+    from dew.nn import attention
+    from dew.nn.kernels import generation
+
+    seen: list[str] = []
+    case = attention.attention_case
+
+    def observed(*arguments, **keywords):
+        found = case(*arguments, **keywords)
+        seen.append(found.form)
+        return found
+
+    monkeypatch.setattr(attention, "attention_case", observed)
+    run = lm(tmp_path, drawn=False)
+    trained(run, tmp_path, "accurate", trainer={"attention_form": "accurate", "checkpoint_final": True})
+    trained(run, tmp_path, "fast", trainer={"checkpoint_final": True})
+
+    def forms(call) -> set[str]:
+        seen.clear()
+        call()
+        return set(seen)
+
+    accurate, fast = (str(tmp_path / "runs" / name) for name in ("accurate", "fast"))
+    assert generation.chosen_kernel("attention_form", "fast") == "fast"
+    loaded = TextGeneration.from_run(accurate)
+    assert forms(lambda: loaded("ab", max_new_tokens=1, key=0)) == {"accurate"}
+    assert forms(lambda: dew.pipeline(accurate)("ab", max_new_tokens=1, key=0)) == {"accurate"}
+    assert forms(lambda: DewLM(loaded).loglikelihood([instance("a", "b")])) == {"accurate"}
+    server = Server.from_task(loaded, slots=1, capacity=64)
+    assert forms(lambda: (server.submit("ab", max_new_tokens=1, key=0), server.run())) == {"accurate"}
+    assert forms(lambda: TextGeneration.from_run(fast)("ab", max_new_tokens=1, key=0)) == {"fast"}
 
 
 def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_called(tmp_path):
