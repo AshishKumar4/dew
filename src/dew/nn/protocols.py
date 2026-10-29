@@ -638,7 +638,15 @@ class Differential(Protocol):
     """A decoder whose softmax layers can take DEX's differential on chosen heads (`dew.nn.dex`):
     CausalTransformer, and a wrapper over one."""
 
+    @property
+    def dex(self) -> DifferentialExtension | None: ...
+
     def with_dex(self, extension: DifferentialExtension | None) -> Self: ...
+
+    def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
+        """Where the decoder's parameters sit under `params` (`()` for its own, a wrapper's deeper), and
+        its softmax attention layers, by index: what DEX extends and its recipe trains."""
+        ...
 
 
 @runtime_checkable

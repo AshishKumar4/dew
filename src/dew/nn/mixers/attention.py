@@ -455,9 +455,10 @@ class CausalSelfAttention(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Query/output maps and unshared K/V maps, plus QK and AV."""
+        """Query/output maps, unshared K/V maps and DEX's maps of its chosen heads, plus QK and AV."""
         window = self.ctx.sliding_window if self.ctx.causal or self.ctx.bidirectional_window else None
         return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
+                + self._dex_flops(lengths)
                 + attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
                                   causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk))
 
@@ -468,6 +469,14 @@ class CausalSelfAttention(nn.Module):
         products = attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
                                    causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk)
         return self.model_flops(lengths) - products
+
+    @nn.nowrap
+    def _dex_flops(self, lengths) -> float:
+        """DEX's work on each token's chosen heads (`dew.nn.dex`): a `[Dv, Dv]` map of each, none
+        without it."""
+        if self.ctx.dex is None:
+            return 0.0
+        return projection_flops(lengths, len(self.ctx.dex.heads) * self.value_dim, self.value_dim)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -876,8 +885,8 @@ class CausalSelfAttention(nn.Module):
         projections over the rows of `lengths` tokens, the key and value projections over the context's
         `context_lengths`."""
         maps = self.projections()
-        rows = sum(projection_flops(lengths, *maps[name]) for name in ('q_proj', 'gate_proj', 'o_proj')
-                   if name in maps)
+        rows = self._dex_flops(lengths) + sum(projection_flops(lengths, *maps[name])
+                                              for name in ('q_proj', 'gate_proj', 'o_proj') if name in maps)
         return rows + sum(projection_flops(context_lengths, *maps[name]) for name in ('k_proj', 'v_proj')
                           if name in maps)
 

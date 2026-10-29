@@ -280,9 +280,18 @@ class MultimodalTransformer(DecoderWrapper):
     def with_cross_attention(self, cross: CrossBlocks | None) -> Self:
         return self._over(self.language_model.with_cross_attention(cross))
 
+    @property
+    def dex(self) -> DifferentialExtension | None:
+        return self.language_model.dex
+
     @nn.nowrap
     def with_dex(self, extension: DifferentialExtension | None) -> Self:
         return self._over(self.language_model.with_dex(extension))
+
+    @nn.nowrap
+    def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
+        held, attention = self.language_model.dex_sites()
+        return ("language_model", *held), attention
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:

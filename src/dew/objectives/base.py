@@ -1342,7 +1342,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         weights = self.evaluation_variables(variables, step)
         if loss and evaluate and self._validation_scores is not None:
-            report = self.program('report', self._validation_scores)
+            scores = self._validation_scores
+
+            def progressed(weights: Variables, batch: Batch, step: Step):
+                # The loss reads the run's progress as `_loss`'s does, so a metric scored beside it
+                # leaves it as it is.
+                with stepping(Progress(step.committed)):
+                    return scores(weights, batch, step)
+
+            report = self.program('report', progressed)
             return report(weights, batch, replace(step, training=False))
         statistics = self._validation_loss(weights, batch, step) if loss else None
         return statistics, self.evaluate(variables, batch, step) if evaluate else None

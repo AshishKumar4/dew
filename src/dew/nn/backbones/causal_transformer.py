@@ -114,7 +114,7 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
-from .decoder_fields import refuse_unbuildable
+from .decoder_fields import refuse_unbuildable, softmax_attention_layers
 from .decoder_stack import (
     WRITTEN,
     DecoderBank,
@@ -1108,9 +1108,7 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def mixer_of(self, index: int) -> nn.Module:
-        """Layer `index`'s mixer, unbound: what its kind builds over the layer's context
-        (`mixer_context`), which a cross-attention block that reads through it is sized by
-        (`dew.nn.cross_attention.SharedCrossAttention`)."""
+        """Layer `index`'s mixer, unbound, as its kind builds it over the layer's context."""
         types = self.per_layer_types
         spec = self._layer_specs(types, self.layer_kinds(types), self.layer_mixer)[index]
         return (spec.kind.mixer or self.layer_mixer).build(
@@ -1422,7 +1420,6 @@ class CausalTransformer(nn.Module):
                    conditioning: Mapping[str, jax.Array] | None = None):
         """Return the shared language head's logits for each prediction depth's hidden states; a
         call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
-        # The call's token layout, converted once (`token_coordinates`); the depths read it alone.
         coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
                                         positions=positions)
         return [self._logits(state) for state in self.mtp_hidden_states(
@@ -1443,8 +1440,7 @@ class CausalTransformer(nn.Module):
         that state in place of the target's. With
         `index_share_for_mtp_iteration`, a cached "extend" step publishes its
         index selections and a "draft" step reuses them, while "ordinary"
-        always recomputes them. The step's tokens are laid out by their `coordinates` or by their flat
-        `attention_mask` and `positions`, one of them (`token_coordinates`).
+        always recomputes them. Its tokens are laid out by `coordinates` or flat fields (`token_coordinates`).
         """
         if prediction_phase not in ("ordinary", "extend", "draft"):
             raise ValueError("prediction_phase must be ordinary, extend or draft")
@@ -2302,6 +2298,11 @@ class CausalTransformer(nn.Module):
     def with_dex(self, extension: DifferentialExtension | None) -> Self:
         """This decoder with `extension`'s differential on its chosen heads (`dew.nn.dex`), None for none."""
         return self.clone(dex=extension)
+
+    @nn.nowrap
+    def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
+        """Its parameters at the root of `params`, and its softmax attention layers (`Differential`)."""
+        return (), softmax_attention_layers(self)
 
     def with_remat(self, policy: RematPolicy | None) -> Self:
         """Start at `policy`, including policies outside `DECODER_REMAT`.

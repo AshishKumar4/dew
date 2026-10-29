@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from ..mixers import AttentionMixer
+from ..mixers.attention import CausalSelfAttention
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 
@@ -232,6 +233,7 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
             "copies through the layers, so a model has one or the other")
     _streams(model)
     _cross_attention(model)
+    _dex(model)
     _embedding_width(model)
     if model.swiglu_limit is not None and model.swiglu_limit <= 0:
         raise ValueError(
@@ -252,6 +254,28 @@ def _embedding_width(model: CausalTransformer):
     if model.embedding_features is not None and beside:
         raise ValueError(f"embedding_features projects the embedding in and out of the stream, which "
                          f"{', '.join(beside)} would read at the stream's width")
+
+
+def softmax_attention_layers(model: CausalTransformer) -> frozenset[int]:
+    """`model`'s layers whose mixer is softmax attention (`CausalSelfAttention`), by index: those DEX
+    extends and its recipe trains the projections of (`dew.nn.dex`)."""
+    return frozenset(index for index in range(model.num_layers)
+                     if isinstance(model.mixer_of(index), CausalSelfAttention))
+
+
+def _dex(model: CausalTransformer):
+    """Raise `ValueError` where DEX names a layer this model lacks or one whose mixer is no softmax
+    attention, which takes no differential (`softmax_attention_layers`)."""
+    if model.dex is None:
+        return
+    named = {layer for layer, _ in model.dex.layers}
+    outside = sorted(named - set(range(model.num_layers)))
+    if outside:
+        raise ValueError(f"DEX layers {outside} are outside the {model.num_layers} layers")
+    other = sorted(named - softmax_attention_layers(model))
+    if other:
+        raise ValueError(f"DEX names layers {other}, whose mixers are no softmax attention; it extends a "
+                         "softmax attention layer's heads")
 
 
 def _cross_attention(model: CausalTransformer):

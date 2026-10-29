@@ -23,6 +23,7 @@ extension and freezes the rest (`dew.optim.ParamGroup`).
 
 import dataclasses
 import math
+from collections.abc import Callable
 from typing import Literal
 
 import jax
@@ -82,13 +83,18 @@ class DifferentialExtension:
         if self.anneal_steps < 1:
             raise ValueError(f"lambda anneals over a positive number of updates, not {self.anneal_steps}")
 
-    def trainable(self, path: tuple[str, ...]) -> bool:
+    def trainable(self, path: tuple[str, ...], decoder: tuple[str, ...],
+                  attention: Callable[[str], bool]) -> bool:
         """Whether the parameter at `path` (`("params", ...)`) trains under the extension's recipe
-        (`trains`): the extension's own, and with the paper's recipe the attention's key, value and output
-        projections; every parameter with "all"."""
+        (`trains`): every parameter with "all"; else the extension's own, and the key, value and output
+        projections of the decoder's softmax attention layers, whose modules' names `attention` takes
+        (`layers_3`, or a scanned run's `layers_3_7`), under the decoder's parameters (`decoder`,
+        `("params",)` for a bundle's own decoder, deeper in a wrapper's)."""
         if self.trains == "all" or path[-1] in DEX_PARAMETERS:
             return True
-        return any(name in path for name in TRAINED_PROJECTIONS)
+        depth = len(decoder)
+        return (path[:depth] == decoder and len(path) > depth + 2 and attention(path[depth])
+                and path[depth + 1] == "self_attn" and path[depth + 2] in TRAINED_PROJECTIONS)
 
     def layer(self, index: int) -> LayerDex | None:
         """Layer `index`'s extension, or None where it carries none."""

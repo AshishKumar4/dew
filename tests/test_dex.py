@@ -2,7 +2,6 @@
 against a plain float64 reference, forward and gradients, its annealed lambda, and the public path, a
 loaded source with the extension attached."""
 
-from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -10,15 +9,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import FROZEN, thaw
-from dew.interop import Pretrained
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.dex import DifferentialExtension, LayerDex, annealed, diff_lambda_init, differential
 
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 HEADS = (1, 3)
-SEEDS = {"dex differential": 256, "dex through the decoder": 16}
+SEEDS = {"dex differential": 256, "dex through the decoder": 8, "dex at the anneal's start": 8,
+         "dex gradients through the decoder": 8}
 """Check 1's declared seeds for each site, sized paired by `seeds_for` on armada (IGDEXS, IGDEXS2)."""
 
 
@@ -73,29 +73,6 @@ def test_the_differential_is_the_papers_equation_forward_and_back():
                     truth_fn=truth)
 
 
-def test_a_training_step_anneals_lambda_through_the_runs_progress():
-    """Within a run's step (`dew.nn.progress.stepping`) the layer reads lambda annealed over the run's
-    updates: at update 0 the extended decoder computes the source's logits bit for bit whatever lambda
-    has learned, and past the anneal its learned lambda, as outside a run."""
-    from dew.nn.progress import Progress, stepping
-
-    extension = DifferentialExtension(((0, HEADS),), anneal_steps=10, trains="all")
-    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", dex=extension)
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
-    flat = flatten_dict(loaded.variables["params"])
-    for key in flat:
-        if key[-1] == "dex_lambda":
-            flat[key] = jnp.asarray(0.5, jnp.float32)
-    variables = {**loaded.variables, "params": unflatten_dict(flat)}
-    ids = jnp.asarray(np.random.default_rng(1).integers(0, 256, (2, 7)), jnp.int32)
-    with stepping(Progress(jnp.asarray(0, jnp.int32))):
-        start = loaded.model.apply(variables, ids)
-    np.testing.assert_array_equal(np.asarray(start), np.asarray(source.model.apply(source.variables, ids)))
-    with stepping(Progress(jnp.asarray(10, jnp.int32))):
-        ended = loaded.model.apply(variables, ids)
-    np.testing.assert_array_equal(np.asarray(ended), np.asarray(loaded.model.apply(variables, ids)))
-
-
 def test_lambda_anneals_from_zero_to_its_learned_value():
     """Eq. 4: lambda(0) = 0, half way (1 - a) (t/T) lambda_init + a lambda_learn at a = 1/2, the learned
     value from T on, and the learned value outside training (no step); lambda_init by default the
@@ -117,71 +94,142 @@ def test_lambda_anneals_from_zero_to_its_learned_value():
             DifferentialExtension(layers)
 
 
-def absorbed(variables, layer: int, heads, value_dim: int):
-    """A decoder's variables with layer `layer`'s DEX folded into its output projection: `o_proj(O')`
-    is `o_proj` with each chosen head's block `K_h` made `(I - lambda W_h) K_h`, computed in float64,
-    the extension's own parameters left out. An independent route to the extended layer's function."""
+def folded(variables):
+    """A decoder's variables with each layer's DEX folded into its output projection: `o_proj(O')` is
+    `o_proj` with each chosen head's block `K_h` made `K_h - lambda W_h K_h`, `(I - lambda W_h) K_h`, the
+    extension's own parameters left out, in jnp so it differentiates: an independent route to the
+    extended layer's function, through the source decoder's own forward (Eq. 3 and 5)."""
     flat = flatten_dict(variables["params"])
-    prefix = next(key[:-1] for key in flat if key[-1] == "dex_lambda" and f"layers_{layer}" in key)
-    strength = np.float64(flat.pop((*prefix, "dex_lambda")))
-    projection = np.asarray(flat.pop((*prefix, "dex_projection")), np.float64)
-    kernel = np.array(flat[(*prefix, "o_proj", "kernel")], np.float64)
-    for slot, head in enumerate(heads):
-        rows = slice(head * value_dim, (head + 1) * value_dim)
-        kernel[rows] = (np.eye(value_dim) - strength * projection[slot]) @ kernel[rows]
-    flat[(*prefix, "o_proj", "kernel")] = kernel.astype(np.float32)
+    for prefix in [key[:-1] for key in flat if key[-1] == "dex_lambda"]:
+        strength = flat.pop((*prefix, "dex_lambda"))
+        projection = flat.pop((*prefix, "dex_projection"))
+        kernel = flat[(*prefix, "o_proj", "kernel")]
+        width = projection.shape[-1]
+        for slot, head in enumerate(HEADS):
+            rows = slice(head * width, (head + 1) * width)
+            block = kernel[rows]
+            moved = strength.astype(block.dtype) * projection[slot].astype(block.dtype) @ block
+            kernel = kernel.at[rows].set(block - moved)
+        flat[(*prefix, "o_proj", "kernel")] = kernel
     return {**variables, "params": unflatten_dict(flat)}
 
 
-def test_a_loaded_source_takes_dex_and_computes_its_folded_output_projection():
-    """Through the public path: a source loaded with DEX on layer 0's heads 1 and 3 adds their
-    projections and a zero lambda alone, and computes the source's logits bit for bit until they train;
-    with lambda and the projections moved, its logits are the source's with layer 0's output projection
-    folded through the extension (`absorbed`), on par from the extended decoder's float64 (check 1)."""
-    extension = DifferentialExtension(((0, HEADS),), anneal_steps=10)
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
-    recipe = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", dex=extension)
-    # The paper's recipe: the extension and the attention's key, value and output projections train, the
-    # rest frozen.
-    trained = {key[-2] if key[-1] in ("kernel", "bias") else key[-1]
-               for key in flatten_dict(recipe.variables["params"])}
-    assert trained == {"k_proj", "v_proj", "o_proj", "dex_projection", "dex_lambda"}
-    assert FROZEN in recipe.variables
-    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference",
-                             dex=replace(extension, trains="all"))
-    assert thaw(recipe.variables).keys() == loaded.variables.keys()
-    added = {key[-1] for key in flatten_dict(loaded.variables["params"])} - {
-        key[-1] for key in flatten_dict(source.variables["params"])}
-    assert added == {"dex_projection", "dex_lambda"}
-    ids = jnp.asarray(np.random.default_rng(0).integers(0, 256, (2, 7)), jnp.int32)
-    np.testing.assert_array_equal(np.asarray(loaded.model.apply(loaded.variables, ids)),
-                                  np.asarray(source.model.apply(source.variables, ids)))
-    value_dim = loaded.model.features_per_head
+def loads(trains: str = "all"):
+    """The source and the source with DEX on layer 0's heads 1 and 3 (`HEADS`), each loaded in float32."""
+    extension = DifferentialExtension(((0, HEADS),), anneal_steps=10, trains=trains)
+    return (Pretrained.load(LLAMA, dtype="float32", attention_impl="reference"),
+            Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", dex=extension))
 
-    def moved(seed):
+
+def moved_draw(variables, value_dim: int):
+    """A draw of the extended decoder's variables with lambda and the projections moved off their start,
+    beside a row of tokens and a cotangent on its logits."""
+    def draw(seed):
         rng = np.random.default_rng([0xDEC, seed])
-        flat = flatten_dict(loaded.variables["params"])
+        flat = flatten_dict(variables["params"])
         for key in flat:
             if key[-1] == "dex_lambda":
                 flat[key] = jnp.asarray(rng.uniform(0.2, 0.8), jnp.float32)
             elif key[-1] == "dex_projection":
                 drawn = rng.standard_normal(flat[key].shape) / np.sqrt(value_dim)
                 flat[key] = jnp.asarray(drawn, jnp.float32)
-        return {**loaded.variables, "params": unflatten_dict(flat)}, jnp.asarray(rng.integers(0, 256, (2, 7)))
+        ids = jnp.asarray(rng.integers(0, 256, (2, 7)), jnp.int32)
+        cotangent = jnp.asarray(rng.standard_normal((2, 7, 256)), jnp.float32)
+        return {**variables, "params": unflatten_dict(flat)}, ids, cotangent
+    return draw
 
-    run = jax.jit(loaded.model.apply)
-    plain = jax.jit(source.model.apply)
-    wide = jax.jit(loaded.model.clone(dtype=jnp.float64).apply)
-    def folded(variables, ids):
-        return plain(absorbed(variables, 0, HEADS, value_dim), ids)
 
-    assert_as_exact(run, as_given(folded), moved, "dex through the decoder",
-                    seeds=SEEDS["dex through the decoder"], truth_fn=wide)
+def test_a_loaded_source_takes_dex_by_the_papers_recipe():
+    """A source loaded with DEX adds its chosen heads' projections and a lambda alone, and by the
+    paper's recipe trains them and every softmax attention layer's key, value and output projections,
+    the rest frozen; with every parameter training, the same tree unsplit."""
+    source, recipe = loads("attention")
+    trained = {key[-2] if key[-1] in ("kernel", "bias") else key[-1]
+               for key in flatten_dict(recipe.variables["params"])}
+    assert trained == {"k_proj", "v_proj", "o_proj", "dex_projection", "dex_lambda"}
+    assert FROZEN in recipe.variables
+    _, loaded = loads()
+    assert thaw(recipe.variables).keys() == loaded.variables.keys()
+    added = {key[-1] for key in flatten_dict(loaded.variables["params"])} - {
+        key[-1] for key in flatten_dict(source.variables["params"])}
+    assert added == {"dex_projection", "dex_lambda"}
+    # The source's format holds no extension: its export refuses it, where a run's checkpoint, which keeps
+    # it, reads back as a bundle of the decoder it extends.
+    with pytest.raises(ValueError):
+        loaded.export()
+    rebuilt = PretrainedDecoder.from_model(loaded.model, loaded.variables)
+    assert rebuilt.model.dex == loaded.model.dex
+
+
+def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
+    """Within a run's step (`dew.nn.progress.stepping`) the layer reads lambda annealed over the run's
+    updates: at update 0 the extended decoder computes its source's logits whatever its extension holds,
+    and from the anneal's end on, as outside a run, the source's forward over the folded output
+    projection (`folded`), each on par from the float64 of what it is held to (check 1)."""
+    from dew.nn.progress import Progress, stepping
+
+    source, loaded = loads()
+    draw = moved_draw(loaded.variables, loaded.model.features_per_head)
+
+    def stepped(updates: int | None):
+        def run(variables, ids, _):
+            if updates is None:
+                return loaded.model.apply(variables, ids)
+            with stepping(Progress(jnp.asarray(updates, jnp.int32))):
+                return loaded.model.apply(variables, ids)
+        return jax.jit(run)
+
+    plain = jax.jit(lambda variables, ids, _: source.model.apply(source.variables, ids))
+    wide = source.model.clone(dtype=jnp.float64)
+    assert_as_exact(stepped(0), plain, draw, "dex at the anneal's start",
+                    seeds=SEEDS["dex at the anneal's start"],
+                    truth_fn=jax.jit(lambda variables, ids, _: wide.apply(widened(source.variables), ids)))
+    through = jax.jit(lambda variables, ids, _: source.model.apply(folded(variables), ids))
+    wide_through = jax.jit(lambda variables, ids, _: wide.apply(folded(widened(variables)), ids))
+    for updates in (10, None):
+        assert_as_exact(stepped(updates), through, draw, "dex through the decoder",
+                        seeds=SEEDS["dex through the decoder"], truth_fn=wide_through)
+
+
+def test_dex_trains_through_the_decoder_as_its_folded_output_projection():
+    """Gradients through the loaded decoder: of the logits under a cotangent, with respect to DEX's
+    projections and lambda and layer 0's key, value and output projections, on par with the same
+    gradients through the source's forward over the folded output projection (`folded`), from the
+    folded route in float64 (check 1); every DEX gradient nonzero, so an update moves the extension."""
+    source, loaded = loads()
+    draw = moved_draw(loaded.variables, loaded.model.features_per_head)
+
+    def kept(gradients) -> dict:
+        flat = flatten_dict(gradients)
+        return {"/".join(key): leaf for key, leaf in flat.items()
+                if "layers_0" in key and (key[-1] in ("dex_lambda", "dex_projection")
+                                          or key[-2] in ("k_proj", "v_proj", "o_proj"))}
+
+    def gradients(forward, wide: bool = False):
+        @jax.jit
+        def run(variables, ids, cotangent):
+            # The float64 route differentiates its widened weights, its gradients float64 too.
+            if wide:
+                variables, cotangent = widened(variables), widened(cotangent)
+
+            def loss(params):
+                return jnp.sum(forward({**variables, "params": params}, ids) * cotangent)
+            return kept(jax.grad(loss)(variables["params"]))
+        return run
+
+    extended = gradients(loaded.model.apply)
+    through = gradients(lambda variables, ids: source.model.apply(folded(variables), ids))
+    wide = source.model.clone(dtype=jnp.float64)
+    wide_through = gradients(lambda variables, ids: wide.apply(folded(variables), ids), wide=True)
+    assert_as_exact(extended, through, draw, "dex gradients through the decoder",
+                    seeds=SEEDS["dex gradients through the decoder"], truth_fn=wide_through)
+    found = extended(*draw(0))
+    assert all(np.any(np.asarray(leaf) != 0) for name, leaf in found.items() if "dex_" in name)
 
 
 def test_a_run_names_dex_on_the_command_line_and_its_record_rebuilds_it():
-    """`--source.dex` takes the extension's record as JSON, every run kind's (`SourceOptions.dex`), which its
-    source's load reads (`RunConfig.source_keywords`) and its run record writes and reads back; the
+    """`--source.dex` takes the extension's record as JSON, every run kind's (`SourceOptions.dex`), which
+    its source's load reads (`RunConfig.source_keywords`) and its run record writes and reads back; the
     decoder that carries it records it beside its fields and rebuilds from that record."""
     from dew.config.lm import LMRunConfig
     from dew.nn.backbones.causal_transformer import CausalTransformer
