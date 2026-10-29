@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
-from reference_source import config_lookups, hub_modules, record_padding
+from reference_source import config_lookups, hub_modules, padded_probe, record_padding
 from torch_precision import float64_twin
 
 from dew.interop.verify import probe_ids, scatter_weights
@@ -72,10 +72,7 @@ def write_tiny(modeling) -> None:
     scatter_weights(model, 1234)
     model.save_pretrained(directory, safe_serialization=True)
     ids = probe_ids(config.vocab_size)
-    mask = np.ones_like(ids, bool)
-    mask[1, :3] = False
-    padded = np.where(mask, ids, 0)
-    positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
+    mask, padded, positions = padded_probe(ids)
     arrays = {'input_ids': ids, 'attention_mask': mask,
               'logits': logits(model, ids), 'padded_logits': logits(model, padded, mask, positions)}
     with torch.no_grad():

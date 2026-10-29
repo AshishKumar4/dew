@@ -20,7 +20,8 @@ provenance as the suite reads them, `git_head` names the commit of the
 checkout a record came from, and `recipe_images` draws the images a recipe
 names. `record_padding` records the rows a release's own token lookup leaves
 untrained under a fixture's config with its pad id stated, left out and null
-(`padding_variant`), which the suite reads offline.
+(`padding_variant`), which the suite reads offline. `padded_probe` is the left
+padding a fixture's probe rows are recorded under.
 """
 
 from __future__ import annotations
@@ -170,6 +171,17 @@ def dew_revision() -> str:
         raise SystemExit("the Dew this process imports is installed, not checked out, so a record cannot "
                          "name its commit; run from a checkout")
     return found
+
+
+def padded_probe(ids):
+    """The left padding a fixture's probe rows (`dew.interop.verify.probe_ids`) are recorded under, the tests'
+    attention_mask.npy: row 1's first three tokens padded. The mask, the ids with each padded token 0, and
+    each token's position counted from its row's first real one."""
+    import numpy as np
+
+    mask = np.ones_like(ids, bool)
+    mask[1, :3] = False
+    return mask, np.where(mask, ids, 0), np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
 
 
 def recipe_images(recipe: dict):
