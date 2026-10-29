@@ -64,9 +64,9 @@ AGGREGATIONS = ("token-mean", "session-mean", "constant")
 """How the per-token terms reduce: over every kept token, over each session's then the sessions', or
 each session's sum over a constant number of tokens (`aggregation_tokens`, Dr. GRPO's generation
 budget, one for RLOO's sequence sums) averaged over the sessions."""
-KL_TERMS = ("k3", "squared")
-"""The reference penalty's estimator: k3 (GRPO's), or the squared log-ratio (REINFORCE++'s `k2` loss,
-arXiv:2501.03262 equation 8)."""
+KL_TERMS = ("k3", "k2")
+"""The reference penalty's estimator: k3 (GRPO's), or k2, half the squared log-ratio (REINFORCE++'s loss,
+arXiv:2501.03262 equation 8 and appendix B.1)."""
 
 
 class _Terms(NamedTuple):
@@ -118,6 +118,11 @@ class GRPOObjective(TokenScorer):
     with `k3`).
 
     `beta` is the KL strength, and at 0.0 no frozen reference is allocated.
+    `kl_term` is its estimator (`KL_TERMS`). `reward_kl` is a reference
+    penalty in the reward instead (RLOO's, arXiv:2402.14740 equation 3): the
+    rollout subtracts `reward_kl` times each call's summed log-ratio of the
+    proximal policy to the reference from that call's reward before its
+    estimator compares returns (`RolloutScheduler`), and the loss adds no term.
     `epsilon_low`, `epsilon_high` and `dual_clip` are the clip points.
     `model`, `seq_len` and the scoring `options` are `TokenScorer`'s, with
     `seq_len` one less than the row width; the response mask says which
@@ -190,9 +195,11 @@ class GRPOObjective(TokenScorer):
                  sequence_mask: tuple[float, float] | None = None,
                  geometric_mask: tuple[float, float] | None = None,
                  sampling_temperature: float = 1.0, balance: ExpertBalance | None = None,
-                 aggregation_tokens: int | None = None, kl_term: str = "k3", **options):
-        if beta < 0:
-            raise ValueError(f"beta scales the KL penalty, so it is non-negative, got {beta}")
+                 aggregation_tokens: int | None = None, kl_term: str = "k3", reward_kl: float = 0.0,
+                 **options):
+        if beta < 0 or reward_kl < 0:
+            raise ValueError(f"beta and reward_kl scale a KL penalty, so they are non-negative, got {beta} "
+                             f"and {reward_kl}")
         if policy_loss not in POLICY_LOSSES:
             raise ValueError(f"policy_loss must be one of {POLICY_LOSSES}, got {policy_loss!r}")
         if aggregation not in AGGREGATIONS:
@@ -206,9 +213,10 @@ class GRPOObjective(TokenScorer):
             raise ValueError(f"kl_term must be one of {KL_TERMS}, got {kl_term!r}")
         self.aggregation_tokens = aggregation_tokens
         self.kl_term = kl_term
+        self.reward_kl = reward_kl
         super().__init__(model, seq_len, balance=balance, **options)
         # The reference is the starting policy, frozen at unit decay, where a KL term reads it.
-        self.ema = EMASpec.constant(1.0 if beta > 0 else None)
+        self.ema = EMASpec.constant(1.0 if beta > 0 or reward_kl > 0 else None)
         # The batch is packed `input_ids` rows, not the LM's text windows.
         self.inputs = InputSpec(sample=Field(IDS_KEY, (seq_len + 1,)))
         self.beta = beta
@@ -232,6 +240,15 @@ class GRPOObjective(TokenScorer):
         if not sampling_temperature > 0:
             raise ValueError(f"sampling_temperature is a positive temperature, got {sampling_temperature}")
         self.sampling_temperature = sampling_temperature
+
+    def reference_penalty(self, policy: jax.Array, reference: jax.Array, weights: jax.Array,
+                          mass: jax.Array) -> Ratio:
+        """The loss's reference penalty over the current likelihoods `policy` and the reference's, by
+        `kl_term` (k3, or k2: half the squared log-ratio), reduced as the policy term is: `weights` and
+        `mass` are `policy_ratio`'s, so it is a token, session or constant mean as the method's is."""
+        terms = (k3_kl(policy, reference) if self.kl_term == "k3"
+                 else 0.5 * jnp.square(policy - jax.lax.stop_gradient(reference)))
+        return Ratio(jnp.sum(jnp.where(weights != 0, terms, 0) * weights), mass)
 
     def packed_log_probs(self, params: Variables, batch) -> jax.Array:
         """Return each packed id's log-probability given its own chain's prefix, placed by `onto_ids`.
@@ -350,10 +367,7 @@ class GRPOObjective(TokenScorer):
                 raise ValueError(
                     "the KL term reads step.ema, but the objective keeps no EMA; "
                     "a GRPO run with beta above zero always freezes one")
-            reference = self.packed_log_probs(step.ema, batch)
-            kl_terms = (k3_kl(terms.policy, reference) if self.kl_term == "k3"
-                        else jnp.square(terms.policy - jax.lax.stop_gradient(reference)))
-            kl = Ratio(jnp.sum(jnp.where(weights != 0, kl_terms, 0) * weights), mass)
+            kl = self.reference_penalty(terms.policy, self.packed_log_probs(step.ema, batch), weights, mass)
             metrics["kl"], _ = kl.mean()
             objective = Ratio(pg.total + self.beta * kl.total, mass)
         else:

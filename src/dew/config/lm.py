@@ -46,8 +46,14 @@ class Tokens(NamedTuple):
 class PromptRollout:
     """GRPO's synchronous rollout over a run's prompts (`RolloutScheduler.sampled`): `groups`
     completions of each prompt the policy draws under `sampling`, each at most `max_new_tokens`, each
-    scored by `reward` against its prompt's record, their advantages by `estimator`, and a completion
-    that runs out of its budget trained as `truncation` says.
+    scored by `reward` against its prompt's record, their advantages by `estimator` (`group` by
+    default), a completion that runs out of its budget trained as `truncation` says, and `admit` of a
+    batch's prompts' groups trained on (every one by default).
+
+    `method` names a composition (`dew.objectives.rl.methods`: grpo, dapo, dr_grpo, gspo, cispo, gmpo,
+    reinforce_pp, rloo), which fixes the objective's settings it names, stated `--objective.*`
+    arguments refused, and the rollout's estimator, dynamic sampling and overlong punishment over
+    `max_new_tokens`; `estimator` is then the method's.
 
     `reward` names it by its import path: a function of a completion's text and its prompt's record
     (`dew.objectives.rl.Reward`), or a class whose instance at its defaults is one
@@ -57,11 +63,14 @@ class PromptRollout:
     reward: str
     groups: int = 4
     max_new_tokens: int = 32
-    estimator: str = "group"
+    estimator: str | None = None
     truncation: str = "score"
     sampling: Sampling = dataclasses.field(default_factory=lambda: Sampling(temperature=1.0))
+    method: str | None = None
+    admit: int | None = None
 
     def __post_init__(self) -> None:
+        from dew.objectives.rl.methods import method
         from dew.objectives.rl.sessions import check_estimator, check_truncation
 
         if ":" not in self.reward:
@@ -70,19 +79,36 @@ class PromptRollout:
             raise ValueError("groups is the completions drawn of each prompt, at least two for an advantage")
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 1:
             raise ValueError("max_new_tokens is a positive budget of completion tokens")
-        check_estimator(self.estimator)
+        if self.method is not None:
+            method(self.method)
+            if self.estimator is not None:
+                raise ValueError(f"the method {self.method} fixes the estimator; leave "
+                                 "--rollout.estimator out")
+        if self.estimator is not None:
+            check_estimator(self.estimator)
         check_truncation(self.truncation)
+        if self.admit is not None and (type(self.admit) is not int or self.admit < 1):
+            raise ValueError("admit is a positive number of each batch's prompts' groups, or None for all")
+
+    def objective_settings(self) -> dict:
+        """The objective settings `method` fixes, which the run derives (`ObjectiveConfig.build`)."""
+        from dew.objectives.rl.methods import method
+
+        return {} if self.method is None else method(self.method).settings(self.max_new_tokens)
 
     def build(self, objective, decode):
         """The scheduler drawing over `objective`'s policy, decoding completions with `decode`."""
         from dew.objectives.rl import RolloutScheduler
+        from dew.objectives.rl.methods import method
         from dew.registry import imported
 
         reward = imported(self.reward)
+        settings = ({"estimator": self.estimator or "group"} if self.method is None
+                    else method(self.method).rollout(self.max_new_tokens))
         return RolloutScheduler.sampled(objective, reward() if isinstance(reward, type) else reward,
                                         decode=decode, groups=self.groups, max_new_tokens=self.max_new_tokens,
-                                        estimator=self.estimator, truncation=self.truncation,
-                                        sampling=self.sampling)
+                                        truncation=self.truncation, sampling=self.sampling, admit=self.admit,
+                                        **settings)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -203,9 +229,11 @@ class LMRunConfig(DecoderRunConfig):
         elif kind == "block_diffusion":
             objective = self.block_objective(model, variables, source)
         else:
+            # A rollout's method fixes the objective settings it names (`PromptRollout.method`).
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
-                samples=samples, processor=self.processor())
+                samples=samples, processor=self.processor(),
+                **({} if self.rollout is None else self.rollout.objective_settings()))
         # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
         loaded, held = self.compiled(objective.data(), self.chain(), self.validation)
         scored = self.trainer.eval_interval(loaded) is not None and bool(held)

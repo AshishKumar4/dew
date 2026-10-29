@@ -108,6 +108,31 @@ whitens across every compared member of the batch (REINFORCE++ with a
 baseline, arXiv:2501.03262 equations 6-7)."""
 GLOBAL_EPSILON = 1e-8
 """The `global` estimator's deviation floor (REINFORCE++'s epsilon)."""
+
+
+@dataclass(frozen=True)
+class Moments:
+    """The count, mean and summed squared deviation (`m2`) of the `global` estimator's group-centred
+    advantages over one data share's compared members (`centred_moments`); `pooled` joins every share's
+    into the batch's mean and deviation."""
+
+    count: int
+    mean: float
+    m2: float
+
+
+def pooled(shares: Sequence[Moments]) -> tuple[float, float]:
+    """The mean and (population) deviation of the members of every share together, joined pairwise in
+    float64 (Chan, Golub and LeVeque's update), so no share's sum of squares cancels against its mean."""
+    count, mean, m2 = 0, 0.0, 0.0
+    for share in shares:
+        if share.count:
+            joined = count + share.count
+            delta = share.mean - mean
+            mean += delta * share.count / joined
+            m2 += share.m2 + delta * delta * count * share.count / joined
+            count = joined
+    return mean, float(np.sqrt(m2 / count)) if count else 0.0
 CREDITS = ("session", "turn")
 """What an advantage is computed over: `session`, one per session from its
 return, every call alike; `turn`, one per call from the return still ahead of
@@ -445,33 +470,20 @@ def overlong_penalty(length: int, overlong: tuple[int, int]) -> float:
     return (budget - cache - length) / cache if length <= budget else -1.0
 
 
-def advantages(sessions: Sequence[Session], estimator: str = "group", *,
-               truncation: str = "mask", credit: str = "session",
-               overlong: tuple[int, int] | None = None) -> list[np.ndarray]:
-    """Each session's advantage at each of its calls, from the returns of its `(task, group)`.
-
-    A session's return is the reward it trains on plus every reward its
-    calls earned (`Call.reward`); from a call on, it is that reward plus the
-    rewards of that call and the ones after it. With `credit="session"` the
-    estimator compares sessions' returns and every call of a session takes
-    its session's advantage; with `credit="turn"` it compares the members'
-    returns from their call `t` on, for each turn `t`, and each call takes
-    its own. The baseline reads the trained members only, each at its
-    trained return. A masked member has no score to compare against, and a
-    comparison of fewer than two members has no baseline, so every member
-    there gets zero.
-    """
-    check_estimator(estimator)
+def _comparisons(sessions: Sequence[Session], truncation: str, credit: str,
+                 overlong: tuple[int, int] | None, shaping: Mapping[int, Sequence[float]] | None
+                 ) -> tuple[dict[int, list[float]], dict[tuple[str, str, int], list[tuple[int, int]]]]:
+    """The trained sessions' returns from each call on, by session, and who is compared with whom:
+    each comparison's `(session, turn)` members, compared on `returns[session][turn]`."""
     check_truncation(truncation)
     check_credit(credit)
-    # The trained sessions' returns from each call on, by session.
     # DAPO's soft overlong punishment joins the reward of a response's sampled tokens (`overlong`).
     shaped = {index: reward + (0.0 if overlong is None else
                                overlong_penalty(sum(len(call.tokens) for call in session.calls), overlong))
               for index, session in enumerate(sessions)
               if (reward := trained_reward(session, truncation)) is not None}
-    ahead = {index: _returns_ahead(sessions[index], reward) for index, reward in shaped.items()}
-    # Who is compared with whom, and the return each one is compared on.
+    ahead = {index: _returns_ahead(sessions[index], reward, None if shaping is None else shaping.get(index))
+             for index, reward in shaped.items()}
     compared: dict[tuple[str, str, int], list[tuple[int, int]]] = {}
     for index in ahead:
         session = sessions[index]
@@ -479,6 +491,26 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
         turns = range(len(session.calls)) if credit == "turn" else (0,)
         for turn in turns:
             compared.setdefault((session.task, session.group, turn), []).append((index, turn))
+    return ahead, compared
+
+
+def varies(sessions: Sequence[Session], *, truncation: str = "mask", credit: str = "session",
+           overlong: tuple[int, int] | None = None) -> bool:
+    """Whether some comparison among `sessions` holds two trained members whose returns differ, the
+    returns `advantages` compares: a group of which none does gives every member a zero advantage
+    (DAPO's dynamic sampling, `RolloutScheduler.varied`)."""
+    ahead, compared = _comparisons(sessions, truncation, credit, overlong, None)
+    return any(len({ahead[index][turn] for index, turn in members}) > 1 for members in compared.values())
+
+
+def _compared(sessions: Sequence[Session], estimator: str, truncation: str, credit: str,
+              overlong: tuple[int, int] | None, shaping: Mapping[int, Sequence[float]] | None
+              ) -> tuple[set[int], dict[tuple[int, int], float], list[tuple[int, int]]]:
+    """The trained sessions, each `(session, turn)` member's value by `estimator` within its
+    comparison (`global`'s group-centred, before the batch whitens it), and the members compared with
+    at least one other, whose values the estimator wrote."""
+    check_estimator(estimator)
+    ahead, compared = _comparisons(sessions, truncation, credit, overlong, shaping)
     values = {key: 0.0 for members in compared.values() for key in members}
     by_size: dict[int, list[list[tuple[int, int]]]] = {}
     for members in compared.values():
@@ -490,21 +522,79 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
         if estimator == "rloo":
             computed = rloo_advantage(rewards, size)
         else:
-            # `global` centres here and whitens across the batch below.
             computed = group_advantage(rewards, size, normalise_by_std=estimator == "group")
         values.update(zip(order, np.asarray(jax.device_get(computed), np.float32).tolist(), strict=True))
-    if estimator == "global":
-        # The group-centred advantages whitened across the batch's compared members (equation 7):
-        # their mean taken out and their deviation divided by, with the paper's epsilon.
-        compared_members = [key for size in by_size.values() for members in size for key in members]
-        if compared_members:
-            centred = np.asarray([values[key] for key in compared_members], np.float64)
-            whitened = (centred - centred.mean()) / (centred.std() + GLOBAL_EPSILON)
-            values.update(zip(compared_members, whitened.astype(np.float32).tolist(), strict=True))
+    members = [member for groups in by_size.values() for group in groups for member in group]
+    return set(ahead), values, members
+
+
+def reference_penalties(sessions: Sequence[Session], packed: Mapping[str, np.ndarray], reference: np.ndarray,
+                        weight: float) -> dict[int, list[float]]:
+    """Each session's calls' reward-side reference penalty, by session (`advantages`' `shaping`): minus
+    `weight` times the call's summed log-ratio of the proximal policy (`old_log_probs`) to the
+    reference (`reference`, aligned with the packed ids) over its sampled ids, in float64. RLOO's
+    `r - beta log(pi / pi_ref)` (arXiv:2402.14740 equation 3), a session's sequence ratio the sum of
+    its calls'."""
+    sampled = np.asarray(packed[RESPONSE_MASK_KEY]) > 0
+    ratio = (np.asarray(packed[OLD_LOG_PROBS_KEY], np.float64) - np.asarray(reference, np.float64))[sampled]
+    owners = np.asarray(packed[SESSION_INDEX_KEY])[sampled], np.asarray(packed[CALL_INDEX_KEY])[sampled]
+    calls = max((len(session.calls) for session in sessions), default=0)
+    summed = np.zeros((len(sessions), max(calls, 1)), np.float64)
+    np.add.at(summed, owners, ratio)
+    return {index: (-weight * summed[index, :len(session.calls)]).tolist()
+            for index, session in enumerate(sessions)}
+
+
+def centred_moments(sessions: Sequence[Session], *, truncation: str = "mask", credit: str = "session",
+                    overlong: tuple[int, int] | None = None,
+                    shaping: Mapping[int, Sequence[float]] | None = None) -> Moments:
+    """The `global` estimator's group-centred advantages' `Moments` over `sessions`' compared members,
+    one data share's part of the batch that whitens them (`pooled`)."""
+    _, values, members = _compared(sessions, "global", truncation, credit, overlong, shaping)
+    centred = np.asarray([values[key] for key in members], np.float64)
+    if not len(centred):
+        return Moments(0, 0.0, 0.0)
+    return Moments(len(centred), float(centred.mean()), float(np.sum(np.square(centred - centred.mean()))))
+
+
+def advantages(sessions: Sequence[Session], estimator: str = "group", *,
+               truncation: str = "mask", credit: str = "session",
+               overlong: tuple[int, int] | None = None, shaping: Mapping[int, Sequence[float]] | None = None,
+               whitening: tuple[float, float] | None = None) -> list[np.ndarray]:
+    """Each session's advantage at each of its calls, from the returns of its `(task, group)`.
+
+    A session's return is the reward it trains on plus every reward its
+    calls earned (`Call.reward`) and `shaping` adds to them (each call's, by
+    session: a reference penalty in the reward, `GRPOObjective.reward_kl`);
+    from a call on, it is that reward plus the rewards of that call and the
+    ones after it. With `credit="session"` the
+    estimator compares sessions' returns and every call of a session takes
+    its session's advantage; with `credit="turn"` it compares the members'
+    returns from their call `t` on, for each turn `t`, and each call takes
+    its own. The baseline reads the trained members only, each at its
+    trained return. A masked member has no score to compare against, and a
+    comparison of fewer than two members has no baseline, so every member
+    there gets zero.
+
+    `global` whitens the group-centred values with the batch's mean and
+    deviation (`whitening`): where a batch is packed over several data
+    shares, every share's pooled (`centred_moments`, `pooled`), and by
+    default these sessions' own.
+    """
+    trained, values, members = _compared(sessions, estimator, truncation, credit, overlong, shaping)
+    if estimator == "global" and members:
+        # REINFORCE++'s equation 7: the group-centred values less the batch's mean, over its deviation
+        # with the paper's epsilon.
+        mean, deviation = whitening or pooled([centred_moments(sessions, truncation=truncation,
+                                                               credit=credit, overlong=overlong,
+                                                               shaping=shaping)])
+        centred = np.asarray([values[key] for key in members], np.float64)
+        whitened = (centred - mean) / (deviation + GLOBAL_EPSILON)
+        values.update(zip(members, whitened.astype(np.float32).tolist(), strict=True))
     per_call = []
     for index, session in enumerate(sessions):
         calls = len(session.calls)
-        if index not in ahead:
+        if index not in trained:
             per_call.append(np.zeros(calls, np.float32))
         elif credit == "turn":
             per_call.append(np.asarray([values[(index, turn)] for turn in range(calls)], np.float32))
@@ -513,12 +603,14 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
     return per_call
 
 
-def _returns_ahead(session: Session, reward: float) -> list[float]:
+def _returns_ahead(session: Session, reward: float, shaping: Sequence[float] | None = None) -> list[float]:
     """From each call on, the session's trained `reward` plus the rewards of that call and every
-    call after it; a session without calls returns `reward` alone, at turn 0."""
+    call after it, each call's `shaping` with its own; a session without calls returns `reward`
+    alone, at turn 0."""
     remaining, returns = reward, []
-    for call in reversed(session.calls):
-        remaining += 0.0 if call.reward is None else call.reward
+    added = [0.0] * len(session.calls) if shaping is None else list(shaping)
+    for call, extra in zip(reversed(session.calls), reversed(added), strict=True):
+        remaining += (0.0 if call.reward is None else call.reward) + extra
         returns.append(remaining)
     return returns[::-1] or [reward]
 
@@ -567,8 +659,9 @@ def rows_needed(lengths: Sequence[int], width: int) -> int:
 
 def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
          estimator: str = "group", truncation: str = "mask", credit: str = "session",
-         support_capacity: int | None = None,
-         overlong: tuple[int, int] | None = None) -> dict[str, np.ndarray]:
+         support_capacity: int | None = None, overlong: tuple[int, int] | None = None,
+         shaping: Mapping[int, Sequence[float]] | None = None,
+         whitening: tuple[float, float] | None = None) -> dict[str, np.ndarray]:
     """Strictly merge each trained session's calls, then pack the chains into `[rows, width]`.
 
     A call joins the chain of the call before it only when its prompt ids
@@ -583,7 +676,8 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     ids alone, and `behavior_log_probs`, `versions` and `call_index` are set
     on those ids. `advantages` holds, on each sampled id, its call's
     advantage, which `estimator` computes within its `(task, group)` over
-    `credit` (`advantages`), and `token_rewards` the rewards that land on
+    `credit` (`advantages`, which reads `overlong`, `shaping` and
+    `whitening`), and `token_rewards` the rewards that land on
     each sampled id (`TOKEN_REWARDS_KEY`).
     `session_weights` is one over the session's number of sampled ids on
     each of them and 0 elsewhere. It sums to the number of sessions, so
@@ -611,7 +705,8 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
         raise ValueError("a packed row holds at least two ids")
     if rows is not None and (type(rows) is not int or rows < 1):
         raise ValueError("rows is a positive integer, or None for as many as the chains need")
-    values = advantages(sessions, estimator, truncation=truncation, credit=credit, overlong=overlong)
+    values = advantages(sessions, estimator, truncation=truncation, credit=credit, overlong=overlong,
+                        shaping=shaping, whitening=whitening)
     built = _built(sessions, width, truncation)
     placed = _place([len(chain.tokens) for chain in built], width)
     count = len(placed) if rows is None else rows
