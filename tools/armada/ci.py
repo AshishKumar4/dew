@@ -460,8 +460,8 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
         found = recorded(record_key(python, row(python, name, split), each, common), token)
         if found is not None and fresh(found, name, common):
             return found
-        # The last run's record is another commit's: its file's inputs, as that run found them, hashed here, name
-        # the green run of exactly these, kept by its key (`green_key`) whatever ran since.
+        # The last run's record is another commit's: its file's inputs, as that run found them, hashed
+        # here, name the green run of exactly these, kept by its key (`green_key`) whatever ran since.
         if found is not None and found["depends"] is not None:
             key = cache_key(common, name, parsed_row(found["row"]["name"])[2], found["depends"])
             kept = recorded(green_key(each, key), token)
