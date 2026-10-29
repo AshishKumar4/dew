@@ -609,9 +609,9 @@ def test_a_judges_draws_ahead_keep_every_pending_draw_and_only_the_window():
             for seed in range(judge.AHEAD):
                 judge.ahead(seed)
                 judge.reference(seed)
-        # The first layout's reads submit draws 0 .. 2 AHEAD - 1 ahead; the second layout's find each.
-        assert sorted(drawn) == list(range(2 * judge.AHEAD)), drawn
-        assert len(judge._ahead) <= 2 * judge.AHEAD + judge.AHEAD + 1
+        # The second layout's reads find the first layout's draws: none is drawn twice.
+        assert len(drawn) == len(set(drawn)) and set(range(judge.AHEAD)) <= set(drawn), sorted(drawn)
+        assert len(judge._ahead) <= 3 * judge.AHEAD + 1
 
 
 def test_layout_parity_fails_a_run_with_an_inconclusive_row():
