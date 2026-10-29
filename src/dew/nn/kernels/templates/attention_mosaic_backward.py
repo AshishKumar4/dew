@@ -179,13 +179,18 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     logits, slopes = algebra.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
                                          coords.k_pos, params,
                                          scale=walk.spec.scale if how.factor is None else 1.0, slopes=True)
-    # Each query's statistics along the tile's own query axis (`algebra.Coords.queries`).
-    inverse_total = coords.queries(algebra.inverse(total), s)
-    exponentials, weights = algebra.normalized(logits, coords.queries(peak, s), inverse_total, how)
+    # Each query's statistics along a keys-first tile's query axis (`algebra.Coords.queries`); a queries-first
+    # tile's the algebra broadcasts at each use, so no broadcast tile stays live across the step (a fused
+    # launch at 128 x 64 and width 64 spilled 60 bytes holding them).
+    def per_query(x):
+        return coords.queries(x, s) if coords.keys_first else x
+
+    inverse_total = per_query(algebra.inverse(total))
+    exponentials, weights = algebra.normalized(logits, per_query(peak), inverse_total, how)
     at_anchor = coords.k_pos == coords.queries(chosen, coords.k_pos)
-    cotangents = algebra.grad_scores(exponentials, dp, coords.queries(anchor, s), coords.queries(delta, s),
-                                     seen, at_anchor, inverse_total,
-                                     multiplier=algebra.drawn(coords, coords.q_pos, coords.k_pos))
+    multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
+    cotangents = algebra.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
+                                     inverse_total, multiplier=multiplier)
     return exponentials, weights, cotangents, slopes, seen
 
 
@@ -463,8 +468,8 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    # The tile's queries' statistics read before its products, which their loads run under (read past them,
-    # 2.32 against 2.07 ms at Qwen3-8B causal, ET-A05AB5-h100).
+    # The tile's queries' statistics read before its products, which their loads run under (ET-A05AB5/6-h100:
+    # read past them, 2.32 ms the launch at Qwen3-8B causal; before them, 2.05 against base's 2.09).
     rows = rows_of(q_first)
     # The logits from the query taken by its power in registers (`_Backward.scaled`), dK from the call's own.
     keys = k_smem.transpose((1, 0))
