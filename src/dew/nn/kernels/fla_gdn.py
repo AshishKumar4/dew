@@ -51,10 +51,8 @@ from dew.nn.kernels.chunked_launch import (
     spanned,
     write_rows,
 )
-from dew.nn.precision import compensated_difference
 
 RCP_LN2 = 1 / math.log(2)
-LN2 = math.log(2)
 """1 / ln 2, fla's RCP_LN2 (whose 1.4426950216 rounds to the same fp32): its kernels take the cumulated
 decay in base 2 and exponentiate with exp2; the prefix converts in float64 (`recurrence.cumulated`)."""
 
@@ -69,30 +67,28 @@ than the 128-wide pick). fp32 keys take at most WIDEST: at 256 an A100's fp32 fo
 shared bytes at its narrowest tile (CPU compile)."""
 
 
-def _pairs(rows, columns, rows_lo=None, columns_lo=None):
-    """The decay's exponent from each column position to each row position, `[R, C]`: `g_r - g_c`, of both
-    halves of a compensated prefix where its remainders are given (`algebra.apart`)."""
-    if rows_lo is None:
-        return rows[:, None] - columns[None, :]
-    return algebra.apart(rows, rows_lo, columns, columns_lo)
+def _paired(rows, columns, rows_lo=None, columns_lo=None):
+    """The decay from each column position to each row position, `[R, C]`: `exp2(g_r - g_c)`, of the prefix
+    separated into its whole part and fraction where the fractions are given (`algebra.between`)."""
+    if rows_lo is None or columns_lo is None:
+        return jnp.exp2(rows[:, None] - columns[None, :])
+    return algebra.between((rows[:, None], rows_lo[:, None]), (columns[None, :], columns_lo[None, :]))
 
 
-def _range(last, gate, last_lo=None, gate_lo=None):
-    """The decay's exponent from each position to the chunk's last, `g_last - g`, of both halves where the
-    remainders are given (`precision.compensated_difference`): a steep token's rounding of the rounded prefix
-    took every mild one after it (ledger 2098, 1328)."""
+def _ranged(last, gate, last_lo=None, gate_lo=None):
+    """The decay from each position to the chunk's last, `exp2(g_last - g)`, of the separated prefix where
+    the fractions are given (`algebra.between`): from the rounded prefix a steep token's rounding took every
+    mild one after it (ledger 2098, 1328)."""
     if last_lo is None:
-        return last - gate
-    return compensated_difference((last, last_lo), (gate, gate_lo))
+        return jnp.exp2(last - gate)
+    return algebra.between((last, last_lo), (gate, gate_lo))
 
 
 def _raised(gate, gate_lo=None):
-    """`exp2(g)`, of both halves where the remainder is given: `exp2(hi) (1 + lo ln 2)`, the remainder's
-    factor to its first order, whose next term lies below fp32's resolution wherever `exp2(hi)` is a normal
-    fp32 (|lo| at most 2^-17 there); one product beside the hardware's exponential, where a second
-    exponential, or `algebra.raised`'s exact power of two, cost a KDA tile 4 and 15 times its launch on an
-    A100."""
-    return jnp.exp2(gate) if gate_lo is None else jnp.exp2(gate) * (1.0 + gate_lo * LN2)
+    """`exp2(g)` from the chunk's start, of the separated prefix where the fractions are given."""
+    if gate_lo is None:
+        return jnp.exp2(gate)
+    return algebra.between((gate, gate_lo), (0.0, 0.0))
 
 
 def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, bv: int, exact: bool,
@@ -183,8 +179,19 @@ def _kkt_solve_chunk(k_ref, g_ref, gl_ref, beta_ref, a_ref, start, taken, *, chu
         # The keys' products at the call's precision, the merges at its solve precision (`_dot`).
         return _dot(a, b, exact=exact, solve=k_ref.dtype if name == "merge" else None)
 
-    blocks = algebra.system(keys, lambda i, j: jnp.exp2(_pairs(gates[i], gates[j], lows[i], lows[j])), betas,
-                            count, width // bk, issue)
+    def decay(i, j):
+        """The pairs' decays of sub-chunks `i` and `j`, `exp2` of the separated prefix's difference rounded
+        once: within a chunk the solve's pairs weigh nothing past fp32's resolution beside its unit
+        diagonal, and `algebra.between`'s exponential and power-of-two scaling here left a row's inverse
+        1 ulp apart alone and among its neighbours on a CPU (identical operands, the first diagonal block
+        from its fifth row; how XLA's code for it differs between the two programs is not established),
+        which a row's output keeps bitwise (tests/test_linear_attention.py)."""
+        rows, columns = gates[i], gates[j]
+        if lows[i] is None:
+            return jnp.exp2(rows[:, None] - columns[None, :])
+        return jnp.exp2((rows[:, None] - columns[None, :]) + (lows[i][:, None] - lows[j][None, :]))
+
+    blocks = algebra.system(keys, decay, betas, count, width // bk, issue)
     inverse = algebra.inverted(blocks, issue)
     # fla zero-fills A before its kernel stores the lower blocks; here the blocks above are stored as zeros.
     for i in range(count):
@@ -377,7 +384,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, *refs, chunk: int, a
             last, gate = _row(g_ref, final), _gates(g_ref, begin, taken, chunk)
             last_lo, gate_lo = ((None, None) if gl_ref is None
                                 else (_row(gl_ref, final), _gates(gl_ref, begin, taken, chunk)))
-            gated = corrected * jnp.exp2(_range(last, gate, last_lo, gate_lo))[:, None]
+            gated = corrected * _ranged(last, gate, last_lo, gate_lo)[:, None]
             return [state[i] * _raised(last, last_lo) + written(i, gated) for i in range(slices)]
 
         state = jax.lax.fori_loop(0, -(-count // chunk), step, state)
@@ -495,11 +502,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, *
             exchange = (index[:, None] + index[None, :] == chunk - 1).astype(jnp.float32)
 
             def reversed_rows(x):
-                x = x.astype(jnp.float32)
-                if exact:
-                    return _dot(exchange, x, exact=True)
-                return jnp.dot(exchange, x, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
-                               preferred_element_type=jnp.float32)
+                return _exactly(x.T, exchange, exact).T
 
             out_grad = read(do_ref)
             dv = sum(_dot(read(k_ref, pl.ds(i * 64, 64)), grad[i].astype(k_ref.dtype), exact=exact)
@@ -519,7 +522,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, *
                 gate, last = _gates(g_ref, begin, taken, chunk), _row(g_ref, final)
                 gate_lo, last_lo = ((None, None) if gl_ref is None
                                     else (_gates(gl_ref, begin, taken, chunk), _row(gl_ref, final)))
-                dv = (dv * jnp.exp2(_range(last, gate, last_lo, gate_lo))[:, None]
+                dv = (dv * _ranged(last, gate, last_lo, gate_lo)[:, None]
                       + read(dv_ref).astype(jnp.float32))
                 decay = _raised(gate, gate_lo)[:, None]
                 kept = [_raised(last, last_lo)] * slices
@@ -640,7 +643,7 @@ def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, *refs, chunk: int, 
             scores += _dot(read(k_ref, columns), read(q_ref, columns).T, exact=exact) * scale
         gate = _gates(g_ref, start, taken, chunk)
         low = None if gl_ref is None else _gates(gl_ref, start, taken, chunk)
-        scores = scores * jnp.exp2(-_pairs(gate, gate, low, low))
+        scores = scores * _paired(gate, gate, low, low).T
         index = jnp.arange(chunk)
         scores = jnp.where(index[:, None] <= index[None, :], scores, 0.0).astype(do_ref.dtype)
         for block in range(do_ref.shape[-1] // bv):
@@ -772,8 +775,8 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
                                 (_gates(gl_ref, start, taken, chunk, 0, head),
                                  _row(gl_ref, (start + taken - 1, head))))
             dq = dq * _raised(gate, gate_lo)[:, None] * scale
-            dk = dk * jnp.exp2(_range(last, gate, last_lo, gate_lo))[:, None]
-            ds = jnp.where(causal, ds * jnp.exp2(_pairs(gate, gate, gate_lo, gate_lo)), 0.0) * scale
+            dk = dk * _ranged(last, gate, last_lo, gate_lo)[:, None]
+            ds = jnp.where(causal, ds * _paired(gate, gate, gate_lo, gate_lo), 0.0) * scale
             # The keys' writes into the memory the chunk leaves run through (s, end]: the last row's pairs.
             leaving = jnp.sum(dk * keys.astype(jnp.float32), axis=1)
             pairs = (jnp.where(strict, ds * scores, 0.0)
@@ -860,7 +863,7 @@ def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, g_lo=None, ch
                    scale=scale, interpret=interpret)
 
 
-def _summed_back(index, pairs, after):
+def _summed_back(index, pairs, after, *, exact: bool):
     """The gradient of each of a chunk's per-token decays, `d/dg_t`, from the gradients of terms through
     ranges of its cumulated decay: `pairs` `[C, C]`, each `(i, j)` a term through the range `(j, i]`
     (strictly lower), and `after` `[C]`, each `s` a term through the range from the chunk's start to
@@ -869,10 +872,23 @@ def _summed_back(index, pairs, after):
     those back, adding and taking back every term whose range misses the token: fp32's residue where
     the gradient is exactly zero (keys of zero before a token, 1.7e-10 in
     test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla), and the cancellation of terms
-    many times the gradient where it is not. Each row's pairs before `t` are its running sum less
-    its `t`th, exactly zero where no pair before `t` is nonzero."""
-    through = jnp.cumsum(pairs, axis=1) - pairs
+    many times the gradient where it is not. Each row's pairs before `t` are their sum, a product with
+    the strictly upper mask (`_exactly`): a running sum less its `t`th lost a small pair beside a large
+    one (1 beside 2^24 summed to 2^24, then less 2^24, nothing)."""
+    before = (index[:, None] < index[None, :]).astype(jnp.float32)
+    through = _exactly(pairs, before, exact)
     return jnp.sum(jnp.where(index[:, None] >= index[None, :], through + after[:, None], 0.0), axis=0)
+
+
+def _exactly(x, mask, exact: bool):
+    """`x @ mask` fp32 for a mask of zeros and ones, each product exact: bf16x6's three parts of an fp32
+    value its 24 bits, which one product of IEEE fp32 would compile to FMA loops on sm80; interpreted,
+    IEEE fp32 (`_dot`)."""
+    x = x.astype(jnp.float32)
+    if exact:
+        return _dot(x, mask, exact=True)
+    return jnp.dot(x, mask, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
+                   preferred_element_type=jnp.float32)
 
 
 def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, dp_ref, da_ref, *refs,
@@ -944,7 +960,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
         d_x = jnp.where(strict, d_x, 0.0)
         d_x = _dot(d_x.astype(inverse_t.dtype), inverse_t, exact=exact)
         d_x = _dot(inverse_t, d_x.astype(inverse_t.dtype), exact=exact)
-        d_x = d_x * jnp.exp2(_pairs(gate, gate, low, low))
+        d_x = d_x * _paired(gate, gate, low, low)
         d_l = jnp.where(strict, -d_x, 0.0).astype(k_ref.dtype)
         def keys_grad(block, carry):
             products, d_beta = carry
@@ -968,7 +984,8 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
                                              (jnp.zeros((chunk, chunk), jnp.float32), d_beta))
         write_rows(_rows(db_ref, start, chunk), taken, d_beta)
         weighted = d_l.astype(jnp.float32) * (products * beta[:, None]) + read(dp_ref)
-        write_rows(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate + read(da_ref)))
+        write_rows(_rows(dg_ref, start, chunk), taken,
+                   _summed_back(index, weighted, d_gate + read(da_ref), exact=exact))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1070,7 +1087,7 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, *refs, chunk: int, a
         gate = _gates(g_ref, start, taken, chunk)
         low = None if gl_ref is None else _gates(gl_ref, start, taken, chunk)
         out = out * _raised(gate, low)[:, None]
-        scores = scores * jnp.exp2(_pairs(gate, gate, low, low))
+        scores = scores * _paired(gate, gate, low, low)
         index = jnp.arange(chunk)
         scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
         value = read(v_ref)
@@ -1149,21 +1166,21 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     recomputes in its backward from the initial memory, as the rule does without `keep` (a remat rung
     recomputing 'delta_memory', `dew.nn.backbones.decoder_block.RematPolicy.recompute`). Each is
     named for a block's remat policy, which keeps or recomputes it."""
-    return prefixed_fwd(cumulated_fwd, q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret, keep, wide,
-                        compensated=True)
+    return prefixed_fwd(cumulated_fwd, q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret, keep, wide)
 
 
 def prefixed_fwd(cumulated, q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool,
-                 keep: bool, wide: bool, *, compensated: bool = False):
+                 keep: bool, wide: bool):
     """A port's forward from the natural log decay: the sequences `cu_seqlens` describes, the decay
-    cumulated in base 2 within each chunk (`recurrence.cumulated`; its `(hi, lo)` halves where
-    `compensated`), named 'delta_decay' for a block's remat policy, then the port's `cumulated` forward
-    on it (this module's `cumulated_fwd`, or `fla_kda`'s)."""
+    cumulated in base 2 within each chunk (`recurrence.cumulated`, compensated: its `(hi, lo)` halves,
+    separated into the prefix's whole part and fraction, `algebra.separated`, whose differences every
+    decay takes exactly), named 'delta_decay' for a block's remat policy, then the port's `cumulated`
+    forward on it (this module's `cumulated_fwd`, or `fla_kda`'s)."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
-    g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans,
-                                             compensated=compensated, interpret=interpret),
+    g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans, compensated=True,
+                                             interpret=interpret),
                         'delta_decay')
-    return cumulated(q, k, v, g, beta, h0, spans, scale, chunk, interpret, keep, wide)
+    return cumulated(q, k, v, algebra.separated(*g), beta, h0, spans, scale, chunk, interpret, keep, wide)
 
 
 def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: int, interpret: bool,

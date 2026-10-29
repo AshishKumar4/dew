@@ -265,11 +265,15 @@ def test_a_tokens_decay_gradient_sums_only_the_terms_through_it():
     index = jnp.arange(3)
     pairs = jnp.zeros((3, 3), jnp.float32).at[1, 0].set(2.0 ** 24)
     after = jnp.asarray([0.0, 0.0, 1.0], jnp.float32)
-    got = np.asarray(fla_gdn._summed_back(index, pairs, after))
+    got = np.asarray(fla_gdn._summed_back(index, pairs, after, exact=True))
     np.testing.assert_array_equal(got, np.asarray([1.0, 2.0 ** 24 + 1.0, 1.0], np.float32))
     cumulated = after + jnp.sum(pairs, axis=1) - jnp.sum(pairs, axis=0)
     summed_back = np.cumsum(np.asarray(cumulated)[::-1])[::-1]
     assert summed_back[0] != 1.0
+    # A small pair beside a large one in the same row: a running sum less the token's own lost it.
+    pairs = jnp.zeros((3, 3), jnp.float32).at[2, 0].set(1.0).at[2, 1].set(2.0 ** 24)
+    got = np.asarray(fla_gdn._summed_back(index, pairs, jnp.zeros(3, jnp.float32), exact=True))
+    np.testing.assert_array_equal(got, np.asarray([0.0, 1.0, 1.0 + 2.0 ** 24], np.float32))
 
 
 def wy_math(k, v, beta, g, chunk=64):

@@ -29,7 +29,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import product, resources
+from dew.nn.kernels.templates import cost, product, resources
 from dew.nn.sharding import per_shard
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
@@ -630,6 +630,14 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """The streams of `streams`' allocations, scoped, by name; their `views` where the family's walk
         loads them (`viewed`: each a ref and the block indices of a step's tile in it)."""
 
+    def fed(self, streams, views: dict, lo, hi, wg, *, refills: bool = True):
+        """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`), the walk's `first` its
+        `lo`: on a layout with a producer, the streams, which its producer loads from `views` (`stream`);
+        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`. Its rings fresh, one walk's a scope:
+        a second walk on them counts its steps from its own first against barriers already past them."""
+        del views, lo, hi, wg, refills
+        return streams
+
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi) -> None:
         """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one."""
@@ -890,15 +898,6 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:
         del views
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
-
-    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
-            refills: bool = True) -> "dict[str, Ring] | Feed":
-        """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`), the walk's `first` its
-        `lo`: on a layout with a producer, the rings, which its producer loads from `views` (`stream`);
-        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`. Its rings fresh, one walk's a scope:
-        a second walk on them counts its steps from its own first against barriers already past them."""
-        del views, lo, hi, wg, refills
-        return streams
 
     def stream(self, streams, views: dict, lo, hi) -> None:
         rings = tuple(streams.values())
@@ -1182,6 +1181,16 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     def registers(self, consumers: int) -> int:
         return resources.entry_registers(consumers)
+
+    def programs(self, consumers: int) -> int:
+        """`Family.programs`: as many as the register file holds at the program's entry registers in the
+        allocator's unit (`registers` rounded up to `register_step`), each of its `consumers` warpgroups'
+        threads at them, no producer beside them, within the multiprocessor's 64 warps: a one-warpgroup
+        program's 255 (256 allocated) hold two a multiprocessor, 168 three, where a producer's layout holds
+        one (the recurrence's solve launch on an H100, two at a time: 0.356 -> 0.235 ms, JS-fed5)."""
+        allocated = -(-self.registers(consumers) // self.register_step) * self.register_step
+        held = cost.REGISTERS // (consumers * resources.THREADS * allocated)
+        return max(1, min(held, 64 * 32 // (consumers * resources.THREADS)))
 
     def warpgroups(self, consumers: int) -> int:
         return consumers

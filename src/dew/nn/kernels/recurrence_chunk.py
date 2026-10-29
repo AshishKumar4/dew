@@ -667,10 +667,6 @@ takes in their dtype. Packed documents take the port at any bound: it stores the
 as many as the tokens' chunks, a row's and one, whatever the bound (`chunked_launch.Sequences`)."""
 
 PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('wgmma', 'forward'): ('fla', "on an H100 80GB HBM3, 16-bit, the port's forward 0.440 ms against the "
-                                  "template's 0.559 on Qwen3.5-27B's gated delta net and 0.276 against 0.489 "
-                                  "on Qwen3-Next's (SE-family-h100-b0980aaff; on an H100 PCIe 0.602 against "
-                                  "0.776, SE-family-h100-e0de17766)"),
     ('mma.sync', 'forward'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
                                      "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against "
                                      "0.942 on Qwen3-Next's (SE-family-a100-1a31d279a)"),
@@ -682,7 +678,12 @@ shrinks as the template wins its cells, and no cell is picked or ranked at run t
 template's, its keys launch a key block a program and its query/key launch's memory sum a product: its
 forward and gradient on an H100 2.46 ms against the port's 3.12 on Qwen3.5-27B's gated delta net and 1.92
 against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an A100 SXM4 40GB 4.56 against 4.83 and
-3.44 against 4.69 (JS-train80-a100-db2c4aca0)."""
+3.44 against 4.69 (JS-train80-a100-db2c4aca0).
+An H100's forward is the template's, its solve launch two programs a multiprocessor on warpgroup MMA's layout
+without a producer (`mainloop._solving`): on an H100 80GB HBM3 0.364 ms against the port's 0.514 on
+Qwen3.5-27B's gated delta net and 0.279 against 0.327 on Qwen3-Next's (JS-solvefed-h100-92eacee68; on an
+H100 PCIe, before its states and output launches kept a producer, 0.520 against 0.691,
+JS-fed3-h100-9d3a38de3)."""
 
 def _trains(call: base.Call | None) -> bool:
     """Whether the recurrence template's gradient runs the call (`Mosaic.trains`)."""
@@ -761,7 +762,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
-    case = PortCase(reverse=_reverse_mode(query, key, value, g, beta),
+    case = PortCase(reverse=_reverse_mode(query, key, value, g, beta, state),
                     varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
                     family=family, product=product, delta=delta, decayed=decayed)
@@ -1291,16 +1292,18 @@ tangent) and its tiling over the geometry (`ssd_kernel_runs`)."""
 
 
 def scan_case(x, B, chunk_size: int, *, tpu: bool = True, padded: bool = False, call: base.Call | None = None,
-              product: str = 'forward') -> ScanCase:
+              product: str = 'forward', operands: tuple = ()) -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
     `chunk_size` chunks, their widths as the port and the TPU's scan take them where `padded`
     (`_scan_widths`, `_rated_scan`); on a TPU where `tpu` asks, the platform its Pallas scan builds for
-    (`ssd_kernel_platform`); the template's `call` and the `product`."""
+    (`ssd_kernel_platform`); the template's `call` and the `product`. Its reverse mode is every operand's,
+    `x`, `B` and the scan's others (`operands`: its queries, steps, rates and memory), any of which a
+    tangent may trace alone."""
     widths = (x.shape[-1], B.shape[-1], chunk_size)
     if padded:
         widths = (_scan_widths(widths[0]), _scan_widths(widths[1]), chunk_size)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
-    return ScanCase(reverse=_reverse_mode(x, B), varying=bool(jax.typeof(x).mat.varying),
+    return ScanCase(reverse=_reverse_mode(x, B, *operands), varying=bool(jax.typeof(x).mat.varying),
                     dtype=jnp.dtype(x.dtype), widths=widths,
                     tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
                          if tpu and generation.backend() == 'tpu' else None),
@@ -1317,7 +1320,8 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=1.0, delta=False, wide=True)
-    case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
+    case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
+                     operands=(query, g, beta, state))
     return select(SCAN, case).kernel if report else selected(SCAN, case).name
 
 

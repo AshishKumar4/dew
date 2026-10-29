@@ -439,8 +439,9 @@ key heads, value heads, key and value widths, and whether the decay is a key dim
 def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.RegisterModel:
     """A launch's register model as the compile gate decides on it (`resources.register_model`,
     `kernel_compile.decisions`): its stated registers (`Launch.registers`) at its consumer roles
-    (`Launch.consumers`, a walk's `Tiles.walkers`)."""
-    return resources.register_model(family, launch.consumers, launch.registers)
+    (`Launch.consumers`, a walk's `Tiles.walkers`), by the bundle it issues by (`Launch.family`; the solve
+    launch's warpgroup MMA layout without a producer), `family` where it names none."""
+    return resources.register_model(launch.family or family, launch.consumers, launch.registers)
 
 
 class Unbudgeted(template.Mosaic):

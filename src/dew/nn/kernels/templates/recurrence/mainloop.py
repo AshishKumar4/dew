@@ -535,8 +535,9 @@ class Launch:
     streams' slots and barriers and its staging tiles, as its bundle declares them), the registers a consumer
     thread holds at its program's peak (`resources.live_registers` of the tiles it states), its steps, the
     chunks in flight, the bytes a step streams in, a program's tensor FLOPs and exponentials, the bytes it
-    reads and writes in global memory, and the programs a multiprocessor holds of it at once
-    (`resources.plan`)."""
+    reads and writes in global memory, the programs a multiprocessor holds of it at once
+    (`resources.plan`), its consumer roles, and the bundle it issues by (`family`: the call's, or the
+    layout a launch takes for itself, `_solving`), which every check of it reads."""
 
     name: str
     programs: int
@@ -551,6 +552,7 @@ class Launch:
     device_bytes: int
     resident: int = 1
     consumers: int = 1
+    family: mosaic.Family | None = None
 
 
 _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned", default=None)
@@ -728,7 +730,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             flops = work.flops * _products(call.held.parts) * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
                                     held.registers(family), work.steps * each, stages, stepped, flops,
-                                    work.exponentials * each, moved, found.programs, consumers))
+                                    work.exponentials * each, moved, found.programs, consumers, family))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
         return recorded
@@ -812,11 +814,27 @@ def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callab
         return
     streams = family.opened(streams["walked"], views)
 
-    def consumer(_):
+    def consumer(wg):
         walked = step if prologue is None else functools.partial(step, loaded=prologue())
-        family.walk(streams, ((walked, 0, steps),), (), (), call.interpret)
+        # The streams a producer loads, or on a layout without one the consumer's own feed of them.
+        family.walk(family.fed(streams, views, 0, steps, wg), ((walked, 0, steps),), (), (), call.interpret)
 
     family.roles(1, consumer, lambda: family.stream(streams, views, 0, steps))
+
+
+def _solving(call: _Call) -> mosaic.Family:
+    """The bundle the solve launch issues by: on a GPU of warpgroup MMA its layout without a producer
+    (`bundles.layouts`' last, `mosaic_sm90.FED`), whose consumers hold a program's entry registers and two
+    programs a multiprocessor (`ConsumerFed.programs`), else the call's. The solve's persistent programs walk
+    a chunk at a time on their products' latency, one a multiprocessor beside a producer leaving its tensor
+    cores idle: on an H100 PCIe the 27B gated delta net's took 0.235 ms on it against 0.356 beside a
+    producer, Qwen3-Next's 0.156 against 0.240, where the states launch's walk took 0.187 beside a producer
+    against 0.202 to 0.243 without one (JS-fed5-h100-d82eeb171). Interpreted, the interpreter's
+    (`INTERPRETED`)."""
+    if call.interpret:
+        return call.family
+    layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype))
+    return layouts[-1] if layouts and call.family is layouts[0] else call.family
 
 
 @_lowered_once
@@ -830,6 +848,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     stored and loaded the inverse between them. Where it `keeps` no inverse (a forward no backward reads,
     `a` None), its store's landing tile goes: an A100's launch then holds two programs a multiprocessor
     (an inverse's 8 KB past half its shared memory kept it at one, SE-family-a100-0c8018352)."""
+    call = dataclasses.replace(call, family=_solving(call))
     width, value_width, family = call.width, call.value_width, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
 
@@ -1144,9 +1163,9 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
         # Each role's columns and tiles at static offsets: Mosaic GPU slices a swizzled tile at static
         # columns.
         for role in range(walkers):
-            pl.when(wg == role)(functools.partial(walk, role))
+            pl.when(wg == role)(functools.partial(walk, role, wg))
 
-    def walk(role):
+    def walk(role, wg):
         walked_step = role_step = step(role)
         if (fetch := prefetch) is not None:
             last = start + count - 1
@@ -1165,10 +1184,12 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
             return [_tile(slots, f"{name}{i}", memory, columns=pl.ds(role * bv, bv)).value() * scale
                     for i in range(slices)], accumulators
 
-        state = family.walk(entered, ((taken, 0, 1),), [family.zeros((call.block, bv))] * slices, (),
-                            call.interpret)[0]
+        # The streams a producer loads, or on a layout without one the role's own feed of them.
+        state = family.walk(family.fed(entered, entered_views, 0, 1, wg), ((taken, 0, 1),),
+                            [family.zeros((call.block, bv))] * slices, (), call.interpret)[0]
         carry = state if prefetch is None else (state, prefetch(start))
-        carry = family.walk(chunks, ((walked_step, start, start + count),), carry, (), call.interpret,
+        carry = family.walk(family.fed(chunks, views, start, start + count, wg),
+                            ((walked_step, start, start + count),), carry, (), call.interpret,
                             first=start)[0]
         state = carry if prefetch is None else carry[0]
         # The steps' stores left in flight (`_walk_stores`) done reading their tiles before the program ends.
@@ -1780,9 +1801,10 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
 
 def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> bool:
     """Whether each of `launches` fits a block of `shared` bytes and its consumer threads hold their registers
-    (`Launch.registers` within `Family.registers` at its consumer roles): a generated launch spills
-    nothing."""
-    return all(launch.shared <= shared and launch.registers <= family.registers(launch.consumers)
+    (`Launch.registers` within `Family.registers` at its consumer roles, of the bundle it issues by,
+    `Launch.family`, `family` where it names none): a generated launch spills nothing."""
+    return all(launch.shared <= shared
+               and launch.registers <= (launch.family or family).registers(launch.consumers)
                for launch in launches)
 
 
@@ -2048,10 +2070,12 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
     steps = chunks / sequences.shape[0]
     work = Work(2 * 3 * CHUNK * width * walked_width * steps, steps)
     # The memory's gradient carried, its key slices in fp32, and the one it gives the chunk before as it is
-    # summed; a step's corrected values' two gradients and its local one beside the output's gradient, a
-    # memory slice as an operand, and the stored tiles' casts.
+    # summed; a step's two fp32 tiles at once, the corrected values' gradient beside the local one it adds
+    # or the decayed output's gradient read after it (`algebra.reverse_carried`: the local one folds into it
+    # before the read forms), beside the output's gradient, a memory slice as an operand, and the stored
+    # tiles' casts.
     held_tiles = _Held(carried=[_f32(width, bv)] * 2, phases=(
-        [_f32(CHUNK, bv)] * 3 + _held(given, CHUNK, bv)
+        [_f32(CHUNK, bv)] * 2 + _held(given, CHUNK, bv)
         + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(held, CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
     final_landing, after = _final_landing(call, bv)

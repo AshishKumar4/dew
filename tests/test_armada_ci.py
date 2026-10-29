@@ -1727,15 +1727,16 @@ def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
 
 
 def planned_checkout(ci, root: Path, monkeypatch, cache_worker,
-                     pinned: str) -> tuple[Path, Callable[[], list[str]]]:
+                     *pinned: str) -> tuple[Path, Callable[[], list[str]]]:
     """Three 3.12 test files, each weighing about a task of its own, run green on CPU class
     GenuineIntel-6-143 against the shared test cache (`cached_checkout`), in a checkout whose .armada.json
-    pins its tasks to `pinned` (vendor-family-model), with the cache's read token: where their verdict is
-    written, and the plan's 3.12 entries' files, each entry's sorted."""
+    pins its tasks to `pinned` (vendor-family-model, one or several), with the cache's read token: where
+    their verdict is written, and the plan's 3.12 entries' files, each entry's sorted."""
     verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
-    vendor, family, model = pinned.split("-")
+    classes = [{"vendor": vendor, "family": int(family), "model": int(model)}
+               for vendor, family, model in (each.split("-") for each in pinned)]
     config = json.loads((ROOT / ".armada.json").read_text())
-    config["task"]["cpu"] = {"vendor": vendor, "family": int(family), "model": int(model)}
+    config["task"]["cpu"] = classes[0] if len(classes) == 1 else classes
     (root / ".armada.json").write_text(json.dumps(config))
     names = ("a", "b", "c")
     written(root, {f"test_{name}.py": "from pathlib import Path\n"
@@ -1795,6 +1796,25 @@ def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recor
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
+def test_a_row_that_read_its_installs_metadata_is_reused_by_a_planner_without_it(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A run that read its editable install's metadata (setuptools' <name>.egg-info, which importlib.metadata
+    reads for a version, and which a task's environment writes into its checkout) keys no row on it: the
+    environment's build output is the locks' (`shared`), and a planner, whose checkout has none, reuses the
+    row (train 300: every record held src/dewml.egg-info's files, and its plan reused none of 501)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    metadata = tmp_path / "src/dewml.egg-info/PKG-INFO"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("Version: 1\n")
+    (tmp_path / "tests/test_a.py").write_text(
+        "from pathlib import Path\ndef test_a():\n"
+        "    assert Path('src/dewml.egg-info/PKG-INFO').read_text()\n"
+        "    with Path('runs-a').open('a') as runs: runs.write('x')\n")
+    armada_task(ci, monkeypatch, verdict)
+    shutil.rmtree(metadata.parent)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
 def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, monkeypatch, cache_worker):
     """The plan looks records up under the class .armada.json pins the tasks to, never its own host's: rows
     recorded on another class plan every file a task of its own, as before."""
@@ -1802,6 +1822,19 @@ def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, m
     armada_task(ci, monkeypatch, verdict)
     (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+
+
+def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Tasks pinned to several CPU classes (.armada.json's task.cpu a list) land on any of them, so the plan
+    reuses a file whose row ran green on these inputs on any pinned class, and plans the rest: rows split by
+    class, the plan reading each pinned class's (Main, 2026-10-29: the suite widened to 25/17 and 26/17, the
+    fleet's own classes, as one class starved lanes' verdicts)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17",
+                                        "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
 def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):

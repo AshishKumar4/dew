@@ -227,12 +227,18 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
     """The forward under the hooks `FORWARD_HOOKS[hooks]` over the template core's causal packed documents
-    under a window (`test_attention_triton`'s hook site)."""
+    under a window (`test_attention_triton`'s hook site): a single hook over both rows, so each kind of
+    parameter is read at a second row; several at once interpreted over the first row alone (its three
+    documents and its padding: their 32 draws over a second row took the interpreter past the CPU suite's
+    120 s target, row 2196), compiled over both."""
     case = CASES["causal-documents-window"]
     queries, keys = core_geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
     score, gate = FORWARD_HOOKS[hooks]
-    _check_spans("causal-documents-window", spans, (ROWS, queries, 4, 2), interpret=interpret, score=score,
+    rows = 1 if interpret and len(score) + gate > 1 else ROWS
+    called = {name: value[:rows] if hasattr(value, "shape") else value
+              for name, value in arguments(case).items()}
+    spans = template.spans(queries, keys, rows, **called)
+    _check_spans("causal-documents-window", spans, (rows, queries, 4, 2), interpret=interpret, score=score,
                  gate=gate, dtype=dtype, natural=natural)
 
 
@@ -270,11 +276,14 @@ def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int
 
 def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form: str = "default"):
     """`_check_spans` over the template core's call form `case` (`test_attention_template.CASES`, or its
-    calls over runs, `RUN_CASES`), two query heads a key head, the backward in the form `form` names."""
+    calls over runs, `RUN_CASES`), two query heads a key head, the backward in the form `form` names: over
+    one key head interpreted (a second took the interpreter's accurate backward 7 s a draw more, past the
+    CPU suite's 120 s target at 8 draws, row 2196; the hooked sinks site keeps two), two compiled."""
     call = CASES[case] if case in CASES else RUN_CASES[case]
     queries, keys = core_geometry(call)
     spans = template.spans(queries, keys, ROWS, **arguments(call))
-    _check_spans(case, spans, (ROWS, queries, 4, 2), interpret=interpret, backward=backward, form=form)
+    heads = (2, 1) if interpret else (4, 2)
+    _check_spans(case, spans, (ROWS, queries, *heads), interpret=interpret, backward=backward, form=form)
 
 
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,

@@ -18,6 +18,8 @@ from jax.core import Tracer
 from dew._coordination import agreed
 from dew.batch import (
     COORDINATES_FIELD,
+    POSITIONS_FIELD,
+    SEGMENTS_FIELD,
     VALIDITY_FIELD,
     Coordinates,
     coordinates,
@@ -236,9 +238,9 @@ class ModelInputs:
         laid = self.token_fields.get(COORDINATES_FIELD)
         if isinstance(laid, Coordinates):
             batch, length = self.tokens.shape
-            token_coordinates((batch, length), laid, segments=self.token_fields.get("segment_ids"),
+            token_coordinates((batch, length), laid, segments=self.token_fields.get(SEGMENTS_FIELD),
                               valid=self.token_fields.get(VALIDITY_FIELD),
-                              positions=self.token_fields.get("positions"))
+                              positions=self.token_fields.get(POSITIONS_FIELD))
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")
@@ -756,9 +758,9 @@ def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coord
 
 RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     VALIDITY_FIELD: _response_validity,
-    "positions": _response_positions,
+    POSITIONS_FIELD: _response_positions,
     "rotary_positions": _response_coordinates,
-    "segment_ids": _response_document,
+    SEGMENTS_FIELD: _response_document,
     "image_indices": _response_text,
     "audio_indices": _response_text,
     "image_groups": _response_text,

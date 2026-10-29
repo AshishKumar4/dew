@@ -4,6 +4,7 @@ training stream (`waited_read`)."""
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import math
@@ -338,6 +339,11 @@ class FitRun:
             self.ahead = (waited_read(self, interval, agree=True),)
         return self.ahead[0] is None
 
+    def held(self) -> contextlib.AbstractContextManager[None]:
+        """The training stream's placements held for a block of device work beside the steps
+        (`DevicePrefetchIterator.held`), none to hold once the stream is closed."""
+        return contextlib.nullcontext() if self.train is None else self.train.held()
+
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
         a caller's alias would keep the closed stream reachable from a failed
@@ -413,13 +419,17 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
     if len(labels) != len(set(labels)):
         raise ValueError("select each metric once; one Best.top already keeps all its winners")
     if plateau is not None:
-        metric = owned(plateau.metric)
-        if not isinstance(metric, (Metric, TrainingScalar, Summary)):
+        # A name binds as a Best of it does, to the metric fit scores under it, its split and direction.
+        metric = plateau.metric if isinstance(plateau.metric, str) else owned(plateau.metric)
+        if not isinstance(metric, (str, Metric, TrainingScalar, Summary)):
             raise TypeError(
                 "Plateau selects a declared metric object or summary, not a Best policy or score function"
             )
-        stopping = Best(metric, mode=plateau.mode, split=plateau.split).resolved(scored)
-        plateau = dataclasses.replace(plateau, metric=metric, mode=stopping.mode, split=stopping.split)
+        chosen = owned(Best(metric, mode=plateau.mode, split=plateau.split))
+        stopping = (chosen if isinstance(chosen, Best) else Best(chosen, mode=plateau.mode,
+                                                                 split=plateau.split)).resolved(scored)
+        plateau = dataclasses.replace(plateau, metric=stopping._source, mode=stopping.mode,
+                                      split=stopping.split)
     return selection, plateau, pause
 
 
