@@ -464,8 +464,8 @@ def _staged_logits(walk: _Backward, stage: tuple, q_slot, part: tuple):
     """A step's logits' queries, the slot `q_slot`'s taken by the call's power, staged in `stage` (its ref,
     its written and read turns, the consumer's index): the first consumer stages the whole slot (a share of
     32 of its 64 rows takes no warpgroup-MMA tile to load and store), once every consumer has read the last
-    step's (`read`, which each arrives at past its product and arrives at once before its walk), and every
-    consumer waits for it (`written`); the consumer's share of it, `part`'s rows."""
+    step's (`read`, which each arrives at past its product and once before its walk, and waits for once
+    past it), and every consumer waits for it (`written`); the consumer's share of it, `part`'s rows."""
     ref, written, read, index = stage
     family = walk.program.family
     plgpu.barrier_wait(read)
@@ -860,8 +860,9 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             resident = k_smem.at[holder], v_smem.at[holder]
             adds = None if not walk.fused else (fused_stages[0].at[index], functools.partial(
                 _dq_added, walk, dq_ref, fused_stages[1], (row, head), index))
+            stage = _logits_stage(logits_stages, index)
             step = functools.partial(_dkv_step, walk, resident, rows_of, coords_of, params_of, store_tiles,
-                                     shares, part, _logits_stage(logits_stages, index), adds)
+                                     shares, part, stage, adds)
             # Its consumers' own loads of its query stream where they feed it (`Family.fed`).
             fed = (family.fed(streams, views, lo, hi, index)
                    if isinstance(family, mosaic.ConsumerFed) else streams)
@@ -869,6 +870,9 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                              tuple(family.zeros((block_k,)) for _ in key_refs),
                                              tuple((block_k, share) for _, share in shares), walk.interpret,
                                              first=lo if split else streamed[0])
+            if stage is not None:
+                # The read turn's last phase, past the walk's last product, observed.
+                plgpu.barrier_wait(stage[2])
             if not split:
                 # The tiles past this block's last reader its partner reads.
                 family.passed(streams, hi, streamed[1], first=streamed[0])

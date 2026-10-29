@@ -68,6 +68,11 @@ HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
 
+FORM_WIDTHS = {"fused-keys-first": 64}
+"""The head width a backward form takes where its derivation's is narrower than the checks' 128: the
+keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at 128)."""
+
+
 def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
     """The backward form `form` names, `(accurate, config)`: two launches, the dQ launch one consumer's
     beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
@@ -829,8 +834,8 @@ def test_a_call_of_whole_key_tiles_reads_no_padding_interpreted(call, backward):
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("call", CALLS)
 def test_the_backward_is_on_par_interpreted(call, form):
-    """The backward in both forms under the interpreter."""
-    _check_backward(call, SHAPES["interpreted"], form=form, interpret=True)
+    """The backward in every form under the interpreter, each at its width (`FORM_WIDTHS`)."""
+    _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, width=FORM_WIDTHS.get(form, 128))
 
 
 @INTERPRETS
@@ -1114,7 +1119,7 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
 @pytest.mark.parametrize("call", CALLS)
 def test_the_backward_is_on_par_on_an_h100(call, form):
     """The backward in both forms compiled on an H100."""
-    _check_backward(call, SHAPES["compiled"], form=form, interpret=False)
+    _check_backward(call, SHAPES["compiled"], form=form, interpret=False, width=FORM_WIDTHS.get(form, 128))
 
 
 @ON_HOPPER
