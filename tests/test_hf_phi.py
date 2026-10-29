@@ -76,11 +76,12 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
     from transformers import AutoModelForCausalLM
 
     from dew.interop import PretrainedDecoder
+    from dew.nn.rope import YarnScaling
     from tools.torch_precision import float64
 
     source = yarn_source(tmp_path)
     loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
-    assert loaded.model.yarn is not None and loaded.model.partial_rotary_factor == 0.5
+    assert isinstance(loaded.model.rope_scaling, YarnScaling) and loaded.model.partial_rotary_factor == 0.5
 
     def dew(ids):
         def loss(params):

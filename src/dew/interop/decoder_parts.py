@@ -872,11 +872,11 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     if ropes.scaling is not None:
         if apart and 'sliding_attention' in layer_types:
             full = kinds.setdefault('full_attention', native_fields(LayerKind)())
-            full[ramp_field(ropes.scaling)] = ropes.scaling
+            full['rope_scaling'] = ropes.scaling
         else:
-            config[ramp_field(ropes.scaling)] = ropes.scaling
+            config['rope_scaling'] = ropes.scaling
     if ropes.local_scaling is not None:
-        kinds['sliding_attention'][ramp_field(ropes.local_scaling)] = ropes.local_scaling
+        kinds['sliding_attention']['rope_scaling'] = ropes.local_scaling
     return config
 
 
@@ -890,10 +890,6 @@ def nested_ramp(ramp: Ramp | None) -> Ramp | None:
     return native_fields(YarnScaling)(**{**ramp, 'truncate': True})
 
 
-def ramp_field(ramp: Ramp) -> str:
-    """The field a ramp lands under, on the model or a kind: `rope_scaling` reads the llama3 ramp
-    over the plain frequencies, `yarn` replaces them."""
-    return 'rope_scaling' if ramp['rope_type'] == 'llama3' else 'yarn'
 
 
 

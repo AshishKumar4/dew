@@ -87,7 +87,7 @@ def _classic(model: CausalTransformer):
             or model.position_embedding_size < model.max_seq_len + model.position_embedding_offset)):
         raise ValueError('position_embedding_offset requires learned table rows past max_seq_len')
     if model.position_embedding != "rotary" and (
-        model.partial_rotary_factor is not None or model.rope_scaling is not None or model.yarn is not None
+        model.partial_rotary_factor is not None or model.rope_scaling is not None
     ):
         raise ValueError('rotary scaling requires rotary positions')
     if model.mixture is not None and (model.mlp_bias or model.mlp in ('gelu', 'gelu_exact', 'relu')):

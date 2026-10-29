@@ -909,7 +909,7 @@ def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
                            'compress_rate': rates[kind]}
             if compressor == 'csa':
                 layer_mixer.update(index)
-            record.update(rope_theta=compress_theta, yarn=compress_ramp,
+            record.update(rope_theta=compress_theta, rope_scaling=compress_ramp,
                           mixer={'class': 'deepseek_v4', 'fields': layer_mixer})
         kinds[kind] = record
     return kinds

@@ -175,11 +175,14 @@ def test_a_yarn_record_extends_every_family_whose_source_builds_it(name, tmp_pat
     """The family's reader takes a YaRN record onto its rotated layers, and its logits over drawn ids
     past the original context hold check 1 against the source's."""
 
+    from dew.nn.rope import YarnScaling
+
     config = _fixture_config(name)
     directory = _source(name, tmp_path / name, **_yarned(config))
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     model = loaded.model
-    assert model.yarn is not None or any(kind.yarn is not None for kind in (model.kinds or {}).values())
+    assert any(isinstance(scaling, YarnScaling) for scaling in
+               (model.rope_scaling, *(kind.rope_scaling for kind in (model.kinds or {}).values())))
     reference, wide = _reference(directory)
     forward = jax.jit(model.apply)
 
