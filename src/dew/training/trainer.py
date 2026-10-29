@@ -1409,7 +1409,7 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                with run.held():
+                with run.held() if self.rollout is not None else contextlib.nullcontext():
                     batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
                 device, _ = split_fields(batch)
                 inputs = self.objective.inputs
@@ -1849,7 +1849,7 @@ class Trainer(Generic[Loss, Effects]):
                     batch = agreed_next("cooldown read", branched.train)
                     if batch is None:
                         break
-                    with branched.held():
+                    with branched.held() if self.rollout is not None else contextlib.nullcontext():
                         batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked,
                                            counted)
                     device, _ = split_fields(batch)
