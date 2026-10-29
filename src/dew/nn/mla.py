@@ -609,31 +609,10 @@ class MultiHeadLatentAttention(nn.Module):
             reach = (document_reach(segment_ids, valid, positions)
                      if isinstance(self.rope_scaling, LongRopeScaling) and segment_ids is not None else None)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions, reach)
-            metadata = attention_metadata
-            pairwise, runs, key_positions, bias = (
-                (None,) * 4 if metadata is None else
-                (metadata.pairwise_mask, metadata.key_runs, metadata.key_positions, metadata.position_bias))
-            groups = {name: jnp.asarray(getattr(metadata, name), jnp.int32) for name in self._group_fields()
-                      if metadata is not None and getattr(metadata, name) is not None}
-            if (self.sliding_window is not None or self.attention_chunk is not None or groups
-                    or pairwise is not None or runs is not None):
-                # A dense layer's call as the shared attention core reads its coordinates
-                # (`visibility_mask`): its own pairwise mask or key runs replacing its causality and
-                # documents, else its documents, causality and groups read whole, each within its
-                # window and chunk over its tokens' places (or the key positions its own keys are read
-                # at), its real keys alone.
-                own = pairwise is not None or runs is not None
-                places = jnp.broadcast_to(positions, (batch, length))
-                key_places = places if key_positions is None else jnp.asarray(key_positions)
-                mask = visibility_mask(
-                    length, length, causal and not own,
-                    self.sliding_window if not own or key_positions is not None else None,
-                    None if pairwise is None else jnp.asarray(pairwise, bool)[:, None],
-                    None if own else segment_ids, key_valid=valid,
-                    block_groups=groups.get("block_groups"), image_groups=groups.get("image_groups"),
-                    key_runs=None if runs is None else jnp.asarray(runs), places=(places, key_places),
-                    chunk=self.attention_chunk)
-                causal = False
+            visible = self._dense_visibility(attention_metadata, positions, segment_ids, valid, causal,
+                                             batch, length)
+            if visible is not None:
+                mask, causal = visible, False
             elif segment_ids is not None:
                 inside = document_mask(segment_ids)[:, None]
                 mask = inside
@@ -698,6 +677,37 @@ class MultiHeadLatentAttention(nn.Module):
                 force_fp32_for_softmax=self.force_fp32_for_softmax)
         return self._attend(query, key, value, x, mask, implementation, causal=causal, bias=bias,
                             unselected=unselected, force_fp32_for_softmax=self.force_fp32_for_softmax)
+
+    def _dense_visibility(self, metadata, positions, segment_ids, valid, causal: bool, batch: int,
+                          length: int) -> jax.Array | None:
+        """An uncached dense call's visibility `[B, 1, Q, K]` as the shared attention core reads it
+        (`AttentionMixer._masking`), None where its causality and documents alone give it: its own
+        pairwise mask, else its key runs, replace its causality, documents, groups and validity, a
+        windowed layer windowing them over the key positions the call gives (the runs' queries read at
+        them too, the call's own tokens); else its documents, causality, groups and real keys, within
+        its window over its tokens' places `positions`. Its chunk keeps each query, at its own place, to
+        the keys of its chunk."""
+        pairwise, runs, key_positions = ((None,) * 3 if metadata is None else
+                                         (metadata.pairwise_mask, metadata.key_runs, metadata.key_positions))
+        groups = {name: jnp.asarray(getattr(metadata, name), jnp.int32) for name in self._group_fields()
+                  if metadata is not None and getattr(metadata, name) is not None}
+        own = pairwise is not None or runs is not None
+        if not (own or groups or self.sliding_window is not None or self.attention_chunk is not None):
+            return None
+        places = jnp.broadcast_to(positions, (batch, length))
+        key_places = places if not own or key_positions is None else jnp.asarray(key_positions)
+        runs = None if pairwise is not None or runs is None else jnp.asarray(runs)
+        mask = visibility_mask(
+            length, length, causal and not own,
+            self.sliding_window if not own or key_positions is not None else None,
+            None if pairwise is None else jnp.asarray(pairwise, bool)[:, None],
+            None if own else segment_ids, key_valid=None if own else valid,
+            block_groups=None if own else groups.get("block_groups"),
+            image_groups=None if own else groups.get("image_groups"), key_runs=runs,
+            places=(key_places if runs is not None else places, key_places))
+        if self.attention_chunk is not None:
+            mask = mask & chunk_mask(places, key_places, self.attention_chunk)
+        return mask
 
     def _check_call(self, call: MixerCall, batch: int, length: int) -> None:
         metadata = call.metadata
