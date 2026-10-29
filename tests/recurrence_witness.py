@@ -196,9 +196,9 @@ def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
     (products of 16-bit values of `fmt`, or of three bf16 parts an fp32 operand's, the six whose orders sum
     under three, within 2^-24 of the fp32 values' product), summed within the native-dot contract's bound
     (`native_certificates.native_dot_holds`: gamma_n at a truncating add's unit, n the terms that may be
-    nonzero, an add of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's magnitudes are the
-    terms' as the tensor cores align them (`aligned`): a subnormal operand's at `fmt`'s least normal, the
-    exponent its field holds."""
+    nonzero, an add of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's
+    magnitudes are the terms' as the tensor cores align them (`aligned`): a subnormal operand's at `fmt`'s
+    least normal, the exponent its field holds."""
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
     parts = 6 if lane.wide else 1
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1) * parts
