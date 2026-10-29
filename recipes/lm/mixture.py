@@ -3,9 +3,9 @@ at a fixed commit, mixed by tokens and packed into rows a trainer reads.
 
     python recipes/lm/mixture.py --show 2000
 
-The sources are FineWeb-Edu's 10B-token sample (web text, `text`), CodeParrot's clean Python validation split
-(`content`) and UltraChat 200k's SFT conversations (`messages`), each read as the Hub stores it, streamed from
-its own shards. Text and code are tokenized and ended by EOS; a conversation is rendered through the
+The sources are FineWeb-Edu (web text, `text`, its crawls in order), The Stack v1's filtered Python functions
+(`content`) and UltraChat 200k's SFT conversations (`messages`), each read as the Hub stores it, streamed from its
+own Parquet shards. Text and code are tokenized and ended by EOS; a conversation is rendered through the
 tokenizer's chat template, and keeps only its tokens, as a pretraining row does not weigh speakers apart. The
 three are mixed at 70/20/10 by valid target tokens (`mix(by="tokens")`) and packed first-fit into rows of
 `SEQ_LEN + 1` tokens. `--show N` reads the first N mixed documents and prints what a run would log of them
@@ -33,17 +33,17 @@ def tokenizer():
 
 
 def sources(tok) -> dict[str, Pipeline]:
-    """Each source at its pinned commit, read from its own shards as it streams (FineWeb-Edu's sample is 10B
-    tokens, more than a run's host need hold), as token documents under "text"."""
-    web = Hub("HuggingFaceFW/fineweb-edu", name="sample-10BT", columns=("text",),
-              revision="87f09149ef4734204d70ed1d046ddc9ca3f2b8f9")
-    code = Hub("codeparrot/codeparrot-clean-valid", columns=("content",),
-               revision="4db92d2ec0c1b4c41eeb439cfae16854511d9dcd")
+    """Each source at its pinned commit, read from its own shards as it streams (FineWeb-Edu holds 1.3T tokens,
+    more than a run's host need hold), as token documents under "text"."""
+    web = Hub("HuggingFaceFW/fineweb-edu", columns=("text",), revision="87f09149ef4734204d70ed1d046ddc9ca3f2b8f9")
+    code = Hub("bigcode/python-stack-v1-functions-filtered", columns=("content",),
+               revision="8e72b18ab4a29b52fbd6a39c1441f67d09633ade")
     conversations = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft", columns=("messages",),
                         revision="8049631c405ae6576f93f445c6b8166f76f5505a")
     return {"web": web.read("streamed").map(text.tokenize(tok, eos=True)).named("web"),
             "code": code.read("streamed").map(text.tokenize(tok, field="content", eos=True)).named("code"),
-            "chat": conversations.read("streamed").map(chat.template(tok)).select_columns("text").named("chat")}
+            "chat": conversations.read("streamed").map(chat.template(tok)).select_columns("text")
+            .named("chat")}
 
 
 def mixed(tok) -> Pipeline:
