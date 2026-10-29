@@ -76,7 +76,6 @@ from typing import Any, Dict
 import numpy as np
 import torch
 from huggingface_hub import get_safetensors_metadata, hf_hub_download
-from reference_source import padded_probe
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -345,6 +344,7 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     generate drops the prefix at that crossing (transformers issue #49334),
     so that output is recorded separately from the intended continuation.
     """
+    from reference_source import padded_probe
     from torch_precision import float64, float64_twin
 
     write_tiny(name, model)
