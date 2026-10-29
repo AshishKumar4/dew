@@ -4,7 +4,8 @@ sphere, each sublayer's output joining the residual by a learned step along the 
 NVIDIA's Dory (vllm-project/vllm#60149, vllm/model_executor/models/dory.py at 55076950) is the
 reference these follow, rounding for rounding: a unit norm reduces in fp32 and returns its input's
 dtype (`justnorm`), and the residual's step norms both ends in that dtype before it takes the step
-in fp32 (`slerp_norm`).
+in fp32 (`slerp_norm`). Each fp32 is at least fp32 (`at_least_fp32`): a float64 model computes in
+float64 throughout.
 """
 
 import dataclasses

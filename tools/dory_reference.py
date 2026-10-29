@@ -252,12 +252,28 @@ class DoryReference:
     def decode(self, prompt, steps: int):
         """Greedy decoding of one prompt, cached as `recurrent_kv_cache_mode` says: the tokens and
         each step's logits, the prompt's last first."""
+        tokens, rows = self.decoded(prompt, steps, lambda step, logits: int(logits.argmax()))
+        return np.asarray(tokens), np.stack([row[-1] for row in rows])
+
+    def forced(self, prompt, tokens, prompt_rows: bool = True):
+        """The logits of each position of `prompt` followed by `tokens`, the prompt prefilled and
+        each of `tokens` but the last decoded a step at a time, cached as
+        `recurrent_kv_cache_mode` says, as a run that drew `tokens` computed them: the prompt's
+        rows (those before its last alone where `prompt_rows` is False), then a row a token."""
+        _, rows = self.decoded(prompt, len(tokens), lambda step, logits: int(tokens[step]))
+        first = rows[0] if prompt_rows else rows[0][-1:]
+        return np.concatenate([first, *rows[1:]])
+
+    def decoded(self, prompt, steps: int, choose):
+        """`steps` tokens after `prompt`, each `choose(step, its logits)`, cached as
+        `recurrent_kv_cache_mode` says: the tokens and each call's logits, the prompt's call's a
+        row a prompt position, a decoding call's one row."""
         caches: dict = {}
         tokens, seen = list(prompt), []
         ids, positions = torch.as_tensor(np.asarray(prompt)), torch.arange(len(prompt))
         with torch.no_grad():
-            for _ in range(steps):
-                logits = self.logits(self.hidden(ids, positions, caches))[-1]
+            for step in range(steps):
+                logits = self.logits(self.hidden(ids, positions, caches))
                 for key, own in caches.pop('pending').items():
                     # A later write of the same key (the last loop's) replaces the earlier
                     # pass's entries for the step's tokens; the held earlier tokens stay.
@@ -265,9 +281,9 @@ class DoryReference:
                     caches[key] = own if held is None else tuple(
                         torch.cat([old, new]) for old, new in zip(held, own, strict=True))
                 seen.append(logits.cpu().numpy())
-                tokens.append(int(logits.argmax()))
+                tokens.append(choose(step, logits[-1]))
                 ids, positions = torch.as_tensor(tokens[-1:]), torch.as_tensor([len(tokens) - 1])
-        return np.asarray(tokens), np.stack(seen)
+        return tokens, seen
 
 
 def random_tensors(config: dict, seed: int) -> dict[str, np.ndarray]:

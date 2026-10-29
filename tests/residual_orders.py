@@ -27,6 +27,7 @@ each language cell's.
 import re
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.sharding import declarations, declared_axes, parameter_path
@@ -104,14 +105,18 @@ def residual_width(variables) -> int:
 
 
 def permuted(variables, order: np.ndarray):
-    """`variables` with the residual stream's units in `order`."""
+    """`variables` with the residual stream's units in `order`, each leaf where it is: a device
+    array reordered on its device, a host array on the host."""
     width = len(order)
     declared = declarations(variables["params"])
 
     def reorder(path, leaf):
         for axis in _residual_axes(path, leaf, width, declared):
             grouped = (np.arange(leaf.shape[axis] // width)[:, None] * width + order).reshape(-1)
-            leaf = np.take(np.asarray(leaf), grouped, axis=axis)
+            if isinstance(leaf, jax.Array):
+                leaf = jnp.take(leaf, jnp.asarray(grouped), axis=axis)
+            else:
+                leaf = np.take(np.asarray(leaf), grouped, axis=axis)
         return leaf
 
     return {**variables, "params": jax.tree_util.tree_map_with_path(reorder, variables["params"])}
