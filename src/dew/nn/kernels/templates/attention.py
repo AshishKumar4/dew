@@ -1299,8 +1299,12 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
         # Its weight before any product, as the launch takes it (`attention_algebra.refinement`).
         moved = (starts[2] - delta) * ((starts[1] * factor) * inverse)
+        # Its denominator's: D over T in one division, as the reference's derivative of its own division
+        # rounds it, not D times T's rounded inverse (row 2466: 1.5 to 1.66 times the reference's error from
+        # float64 at fp32 sums).
+        share = jnp.where(total > 0, delta / jnp.where(total > 0, total, 1.0), 0.0)
         initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
-                          total=(-(delta * inverse) * factor).astype(state.total.dtype),
+                          total=(-share * factor).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
