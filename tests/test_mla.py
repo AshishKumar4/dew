@@ -721,13 +721,12 @@ def test_dense_mla_reads_its_window_as_masking_by_hand():
 
 def test_dense_mla_reads_its_chunk_as_masking_by_hand():
     """A chunked layer (the kind's `attention_chunk`) computes what the plain block computes under
-    a pairwise mask of the chunk rule, bit for bit: both materialize that mask on the reference
-    kernel over the same keys."""
+    a pairwise mask of the chunk rule, on par with it from it in float64 (check 1)."""
     rule = np.broadcast_to(VIS_CAUSAL & ((VIS_SLOTS[:, None] // 4) == (VIS_SLOTS[None, :] // 4)),
                            (2, VIS_LENGTH, VIS_LENGTH))
-    variables, hidden = visibility_variables(), visibility_draw(visibility_variables())(3)[1]
-    chunked = kind_module(attention_chunk=4).apply(variables, hidden)
-    np.testing.assert_array_equal(np.asarray(chunked), np.asarray(by_hand(rule)(variables, hidden)))
+    chunked = kind_module(attention_chunk=4)
+    assert_as_exact(jax.jit(lambda v, h: chunked.apply(v, h)), by_hand(rule),
+                    visibility_draw(visibility_variables()), "mla chunk", seeds=SEEDS["visibility"])
 
 
 VIS_BLOCKS = np.asarray([[-1, 0, 0, 0, -1, 1, 1, 1, -1, 2, 2, -1],
@@ -750,58 +749,56 @@ def whole_group_rule(groups: np.ndarray) -> np.ndarray:
 ], ids=["blocks", "images", "prefix"])
 def test_dense_mla_reads_its_groups_whole_as_masking_by_hand(field, groups):
     """A causal block that reads its block, image or prefix groups whole computes what the plain
-    block computes under a pairwise mask of the whole-group rule, bit for bit: both run the
-    reference kernel over that mask. The rule keeps keys a causal mask does not, so the groups
-    are read."""
+    block computes under a pairwise mask of the whole-group rule, on par with it (check 1). The rule
+    keeps keys a causal mask does not, so the groups are read."""
     rule = whole_group_rule(np.asarray(groups))
     assert (rule & ~VIS_CAUSAL[None]).any()
     named = field.removeprefix("bidirectional_")[:-1] + "_groups"
     metadata = AttentionMetadata(**{named: jnp.asarray(groups)})
     module = visibility_module(**{field: True})
-    variables, hidden = visibility_variables(), visibility_draw(visibility_variables())(3)[1]
-    grouped = module.apply(variables, hidden, MixerCall(metadata=metadata))
-    np.testing.assert_array_equal(np.asarray(grouped), np.asarray(by_hand(rule)(variables, hidden)))
+    assert_as_exact(jax.jit(lambda v, h: module.apply(v, h, MixerCall(metadata=metadata))), by_hand(rule),
+                    visibility_draw(visibility_variables()), f"mla {field}", seeds=SEEDS["visibility"])
 
 
 def test_dense_mla_reads_key_runs_as_masking_by_hand():
     """A call's key runs, two keys either side of each query, compute what the plain block
-    computes under a pairwise mask of their union, bit for bit on the reference kernel."""
+    computes under a pairwise mask of their union, on par with it (check 1)."""
     lo, hi = np.clip(VIS_SLOTS - 2, 0, None), np.clip(VIS_SLOTS + 2, None, VIS_LENGTH)
     runs = np.broadcast_to(np.stack([lo, hi], -1)[:, None], (2, VIS_LENGTH, 1, 2)).astype(np.int32)
     rule = np.broadcast_to((VIS_SLOTS[None, :] >= lo[:, None]) & (VIS_SLOTS[None, :] < hi[:, None]),
                            (2, VIS_LENGTH, VIS_LENGTH))
     call = MixerCall(metadata=AttentionMetadata(key_runs=jnp.asarray(runs)))
-    variables, hidden = visibility_variables(), visibility_draw(visibility_variables())(3)[1]
-    ran = visibility_module().apply(variables, hidden, call)
-    np.testing.assert_array_equal(np.asarray(ran), np.asarray(by_hand(rule)(variables, hidden)))
+    module = visibility_module()
+    assert_as_exact(jax.jit(lambda v, h: module.apply(v, h, call)), by_hand(rule),
+                    visibility_draw(visibility_variables()), "mla key runs", seeds=SEEDS["visibility"])
 
 
 def test_dense_mla_windows_its_key_runs_over_their_positions():
     """Key runs over the whole row, windowed by a windowed layer over the keys' given positions
     (runs of three places, then a gap), compute what masking by hand over those positions
-    computes, bit for bit on the reference kernel."""
+    computes, on par with it (check 1)."""
     places = np.asarray([0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14], np.int32)
     runs = np.broadcast_to(np.asarray([[[0, VIS_LENGTH]]]), (2, VIS_LENGTH, 1, 2)).astype(np.int32)
     rule = np.broadcast_to(np.abs(places[:, None] - places[None, :]) <= 1,
                            (2, VIS_LENGTH, VIS_LENGTH))
     metadata = AttentionMetadata(key_runs=jnp.asarray(runs),
                                  key_positions=jnp.broadcast_to(places, (2, VIS_LENGTH)))
-    variables, hidden = visibility_variables(), visibility_draw(visibility_variables())(3)[1]
-    ran = visibility_module(sliding_window=2).apply(variables, hidden, MixerCall(metadata=metadata))
-    np.testing.assert_array_equal(np.asarray(ran), np.asarray(by_hand(rule)(variables, hidden)))
+    module = visibility_module(sliding_window=2)
+    assert_as_exact(jax.jit(lambda v, h: module.apply(v, h, MixerCall(metadata=metadata))), by_hand(rule),
+                    visibility_draw(visibility_variables()), "mla windowed key runs",
+                    seeds=SEEDS["visibility"])
 
 
 def test_dense_mla_reads_a_position_bias_as_masking_by_hand():
     """A position bias that forbids the odd keys but a query's own computes what a pairwise mask
-    of the same keys computes, bit for bit on the reference kernel: the bias's -inf is the
-    mask's."""
+    of the same keys computes, on par with it (check 1): the bias's -inf is the mask's."""
     rule = VIS_CAUSAL & ((VIS_SLOTS[None, :] % 2 == 0) | (VIS_SLOTS[:, None] == VIS_SLOTS[None, :]))
     bias = np.where(rule, 0.0, -np.inf).astype(np.float32)[None, None]
     call = MixerCall(metadata=AttentionMetadata(position_bias=jnp.asarray(bias)))
-    variables, hidden = visibility_variables(), visibility_draw(visibility_variables())(3)[1]
-    biased = visibility_module().apply(variables, hidden, call)
+    module = visibility_module()
     rule = np.broadcast_to(rule, (2, VIS_LENGTH, VIS_LENGTH))
-    np.testing.assert_array_equal(np.asarray(biased), np.asarray(by_hand(rule)(variables, hidden)))
+    assert_as_exact(jax.jit(lambda v, h: module.apply(v, h, call)), by_hand(rule),
+                    visibility_draw(visibility_variables()), "mla position bias", seeds=SEEDS["visibility"])
 
 
 def test_dense_mla_reads_packed_documents_under_a_window_as_the_split_calls_do():
