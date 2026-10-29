@@ -1796,6 +1796,25 @@ def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recor
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
+def test_a_row_that_read_its_installs_metadata_is_reused_by_a_planner_without_it(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A run that read its editable install's metadata (setuptools' <name>.egg-info, which importlib.metadata
+    reads for a version, and which a task's environment writes into its checkout) keys no row on it: the
+    environment's build output is the locks' (`shared`), and a planner, whose checkout has none, reuses the
+    row (train 300: every record held src/dewml.egg-info's files, and its plan reused none of 501)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    metadata = tmp_path / "src/dewml.egg-info/PKG-INFO"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("Version: 1\n")
+    (tmp_path / "tests/test_a.py").write_text(
+        "from pathlib import Path\ndef test_a():\n"
+        "    assert Path('src/dewml.egg-info/PKG-INFO').read_text()\n"
+        "    with Path('runs-a').open('a') as runs: runs.write('x')\n")
+    armada_task(ci, monkeypatch, verdict)
+    shutil.rmtree(metadata.parent)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
 def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, monkeypatch, cache_worker):
     """The plan looks records up under the class .armada.json pins the tasks to, never its own host's: rows
     recorded on another class plan every file a task of its own, as before."""
