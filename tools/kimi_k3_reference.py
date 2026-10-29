@@ -75,7 +75,7 @@ DESTINATION = ROOT / "kimi-k3-tiny"
 LEARNING_RATE = 1e-2
 PICKS = "autotune.json"
 """Where a fixture keeps the configuration each of fla's autotuned kernels took at each shape its run
-called it with (`record_picks`)."""
+called it with, and its GPU's multiprocessor count (`record_picks`)."""
 
 
 def tiny_config() -> dict:
@@ -223,8 +223,8 @@ def matmul_precision() -> str:
     from fla.ops.kda import chunk_intra
     from torch_precision import recorded_matmuls
 
-    return recorded_matmuls(**{"the intra-chunk solve": str(getattr(chunk_intra.SOLVE_TRIL_DOT_PRECISION, "value",
-                                                                    chunk_intra.SOLVE_TRIL_DOT_PRECISION))})
+    solve = chunk_intra.SOLVE_TRIL_DOT_PRECISION
+    return recorded_matmuls(**{"the intra-chunk solve": str(getattr(solve, "value", solve))})
 
 
 def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
@@ -404,12 +404,17 @@ def autotuned() -> dict:
 
 
 def picks() -> dict:
-    """The configuration each of fla's autotuned kernels took at each shape it ran, as `PICKS` keeps
-    them: its tiles, warps and stages, which a timing chose and which decide how its sums round."""
-    return {name: sorted([list(key), {"kwargs": config.kwargs, "num_warps": config.num_warps,
-                                      "num_stages": config.num_stages, "num_ctas": config.num_ctas}]
-                         for key, config in kernel.cache.items())
-            for name, kernel in sorted(autotuned().items()) if kernel.cache}
+    """What decides how this run's sums round beyond its inputs, as `PICKS` keeps it: the configuration
+    each of fla's autotuned kernels took at each shape it ran (its tiles, warps and stages, which a timing
+    chose), and the GPU's multiprocessor count, over which fla's gated norm backward splits its weight
+    gradient's partial sums (fused_norm_gate's `NS`)."""
+    from fla.utils import get_multiprocessor_count
+
+    kernels = {name: sorted([list(key), {"kwargs": config.kwargs, "num_warps": config.num_warps,
+                                         "num_stages": config.num_stages, "num_ctas": config.num_ctas}]
+                            for key, config in kernel.cache.items())
+               for name, kernel in sorted(autotuned().items()) if kernel.cache}
+    return {"multiprocessors": get_multiprocessor_count(0), "kernels": kernels}
 
 
 def record_picks(destination: Path) -> None:
@@ -420,14 +425,20 @@ def record_picks(destination: Path) -> None:
 def restore_picks(destination: Path) -> None:
     """Set each of fla's autotuned kernels to the configurations the fixture's run in `destination`
     took (`record_picks`), so each shape it runs takes its recorded configuration without timing: a
-    later run reproduces the fixture's bits from a cold cache, where timing could pick another tile
-    (ledger 568: four A100 runs of the orders could not reproduce order 0)."""
+    later run on a GPU of as many multiprocessors reproduces the fixture's bits from a cold cache, where
+    timing could pick another tile (ledger 568: four A100 runs of the orders could not reproduce order
+    0). One of another count splits the norm's sums otherwise, and is refused."""
+    from fla.utils import get_multiprocessor_count
     from triton import Config
 
     recorded, kernels = json.loads((destination / PICKS).read_text()), autotuned()
-    if missing := sorted(set(recorded) - set(kernels)):
+    here = get_multiprocessor_count(0)
+    if recorded["multiprocessors"] != here:
+        raise SystemExit(f"the fixture's run split its sums over {recorded['multiprocessors']} "
+                         f"multiprocessors, this GPU's {here}: record it again here")
+    if missing := sorted(set(recorded["kernels"]) - set(kernels)):
         raise SystemExit(f"fla no longer autotunes {missing}, which the fixture's run did")
-    for name, taken in recorded.items():
+    for name, taken in recorded["kernels"].items():
         kernels[name].cache.update({tuple(key): Config(config["kwargs"], num_warps=config["num_warps"],
                                                        num_stages=config["num_stages"],
                                                        num_ctas=config["num_ctas"])

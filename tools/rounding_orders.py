@@ -35,7 +35,9 @@ def main(fixture: Path, out: Path, count: int, seed: int, group: int) -> None:
     np.save(out / "orders.npy", drawn)
     for k, order in enumerate(drawn):
         loaded.save(out / str(k), variables=permuted(loaded.variables, order))
-        for name in ("reference.npz", "numerics.npz", "generation_config.json"):
+        # Not numerics.npz: each order's float64 truth is its own, which its reference's recorder writes
+        # there (`symmetric`).
+        for name in ("reference.npz", "generation_config.json"):
             if (fixture / name).exists():
                 shutil.copy(fixture / name, out / str(k) / name)
     # A quantized format may pack an equal value in other bits (FP4's two
