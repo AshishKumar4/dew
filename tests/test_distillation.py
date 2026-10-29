@@ -518,7 +518,7 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
         weights = own.weights.astype(jnp.float32)
         return jnp.sum(ratio * -own.losses * weights) / jnp.sum(weights)
 
-    found = jax.grad(lambda p: objective.scalar_loss({**params, "params": p}, batch, step_at()))(
+    found = jax.grad(lambda p: objective.scalar_loss({**params, "params": p}, batch, step_at())[0])(
         params["params"])
     expected = jax.grad(by_hand)(params["params"])
     jax.tree.map(np.testing.assert_array_equal, objective.student_variables({"params": found})["params"],
@@ -544,7 +544,7 @@ def test_a_teacher_position_scored_non_finitely_is_counted_and_never_trained_on(
 
     objective.teacher.predict = broken
     loss, aux = objective.loss(params, batch, step_at())
-    gradient = jax.grad(lambda p: objective.scalar_loss({**params, "params": p}, batch, step_at()))(
+    gradient = jax.grad(lambda p: objective.scalar_loss({**params, "params": p}, batch, step_at())[0])(
         params["params"])
     assert np.isfinite(float(loss.total))
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(gradient))
