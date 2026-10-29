@@ -721,9 +721,9 @@ call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Tem
 widths, a decay a key dimension's floor, a bundle for the device's family, a config that fits), a GPU, and for
 a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no other, row 1926)."""
 
-MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (*PORT_SUPPORTS[1:3], *TEMPLATE_SUPPORTS)
-"""What the recurrence template needs of a delta rule's call: the port's trace and placement (its custom VJP,
-a Pallas call's results) and `TEMPLATE_SUPPORTS`, in every form its mainloop implements, the delta rule with
+MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (*PORT_SUPPORTS[1:2], *TEMPLATE_SUPPORTS)
+"""What the recurrence template needs of a delta rule's call: the port's placement (a Pallas call's results)
+and `TEMPLATE_SUPPORTS`, in every form its mainloop implements, the delta rule with
 a decay or without one and the forms without the delta rule alike (row 1963: the port's 'gated' form was the
 template's too). A declared port cell runs the port first where the port takes the call (`PORT_CELLS`,
 `GATED_DELTA`'s declared cells)."""
