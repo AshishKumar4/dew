@@ -358,6 +358,8 @@ def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) 
     return resources.Scope(program=(scoped, *held), walks=walks, reducing_warpgroups=reducing_warpgroups)
 
 
+DQ_ROWS = 7
+"""The per-query rows a dQ step holds across its walk (`_backward_registers`)."""
 KEYS_FIRST_STATISTICS = 5
 """The per-query statistics a keys-first dK/dV step holds as column vectors (`_backward_registers`)."""
 
@@ -365,17 +367,21 @@ KEYS_FIRST_STATISTICS = 5
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                         accurate: bool, dq: bool) -> int:
     """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
-    consumer's dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums), beside a step's logits and
-    output cotangents' products fp32, then its score cotangents fp32 and their parts in the operands' dtype; a
-    dK/dV consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products, a
-    fused launch's dQ tile `[bq, D]` fp32 and its per-query statistics; every sum its share of the
-    `columns`."""
+    consumer's dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums) and its per-query rows,
+    beside a step's logits and output cotangents' products fp32, then its score cotangents fp32 and their
+    parts in the operands' dtype; a dK/dV consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside
+    a step's two products, a fused launch's dQ tile `[bq, D]` fp32 and its per-query statistics; every sum its
+    share of the `columns`."""
     block_q, block_k = config.block_q, config.block_k
     products = [(block_q, block_k, jnp.float32)] * 2
     if dq:
         carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
-        return resources.live_registers(family, carried, products, cotangents)
+        # Its per-query rows in the accumulator's row layout (`Family.row_registers`), live across the walk:
+        # the maximum, the prior total, the anchor, D, the anchor key and the residual and mass sums
+        # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
+        rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
+        return resources.live_registers(family, carried, products, cotangents) + rows
     # A consumer's share of a slot's queries where the consumers share its keys (`split_queries`).
     queries = block_q // config.consumers if split_queries(family) else block_q
     step = [(queries, block_k, jnp.float32)] * 2
