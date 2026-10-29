@@ -151,8 +151,9 @@ class _Backward:
 
     @property
     def scaled(self) -> bool:
-        """Whether the dK/dV program's logits take the query's power (`by_power`), after their product of the
-        call's own streamed queries, which dK takes."""
+        """Whether the call's logits take a power of two (`by_power`): the dQ launch's and the fused
+        launch's queries take it, and the keys-first dK/dV launch's resident keys, its queries the call's
+        own, which dK takes."""
         return self.spec.prescale != 1.0
 
     @property
@@ -389,13 +390,13 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     if count != tiles.block_q:
         q_slot, do_slot = q_slot.at[pl.ds(first_row, count)], do_slot.at[pl.ds(first_row, count)]
     q_first = index * tiles.block_q + first_row
-    # The logits from the call's queries, the power taken after the product, exact in fp32: the forward's
-    # `(Q 2^p) Kᵀ` but where a query's entry times the power leaves bf16's normal range (below 2^-126). A
-    # query staged by the power a step cost a third of the launch (ET-SWAPABL-h100: 3.32 against 2.21 ms
-    # causal at Qwen3-8B 2 x 4096); the keys by it would differ where a key leaves that range instead.
+    # The logits from the resident keys taken by the call's power (`_launch_backward`), which pass fp32's
+    # largest nowhere the forward's `(Q 2^p) Kᵀ` does not (the power taken after the product does: Q 2^120
+    # over keys of 8 at width 64 and scale 1/8), the forward's bit for bit but where a key's entry times the
+    # power leaves bf16's normal range; dK from the call's own queries. A query staged by the power a step
+    # cost a third of the launch (ET-SWAPABL-h100: 3.32 against 2.21 ms causal at Qwen3-8B 2 x 4096), and a
+    # stream of them of its own passes the block at width 256.
     s = family.product(k_smem, q_slot.transpose((1, 0)), shape)
-    if walk.scaled:
-        s = s * walk.spec.prescale
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
@@ -990,8 +991,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     dq, refined, denominator, mass, dq_grads = algebra.dq_finish(sums, forward_total, state_total, peak0,
                                                                   (total0, initial_term), maximum, anchor,
                                                                   delta, accurate=accurate)
-    dk, dv, *key_tile = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen,
-                                    spans, score_params, drop, walk=dkv_walk)
+    # The keys-first launch's keys read for its logits alone: taken by the power (`_dkv_step`).
+    dk, dv, *key_tile = _dkv_launch(query, by_power(key, prescale), value, dout, maximum, denominator, anchor,
+                                    refined, chosen, spans, score_params, drop, walk=dkv_walk)
     summed_kinds = [kind for kind in score_kinds if kind in DQ_GRADS]
     head_query = tuple(grad.sum(axis=-1)[None, :, :, None] if kind == Kind.HEAD else grad
                        for grad, kind in zip(dq_grads, summed_kinds, strict=True))

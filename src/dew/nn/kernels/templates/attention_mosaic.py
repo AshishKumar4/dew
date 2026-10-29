@@ -376,9 +376,13 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     of them in the operands' dtype at a time (`algebra.formed_parts`; ptxas held the accurate form's three at
     width 128 in 255 registers, unspilled, where all three would be 262); a dK/dV consumer's dK and dV sums
     `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products (a fused launch's queries first, its dQ
-    tile `[bq, D]` fp32 too) and its per-query statistics; every sum its share of the `columns`."""
+    tile `[bq, D]` fp32 too) and its per-query statistics; every sum its share of the `columns`. A
+    queries-first step's masked tile holds its predicates beside its products (`algebra.seen` of its places'
+    int tiles, `_coords`, a byte an entry), from its logits' mask to its cotangents' (ptxas: the fused
+    launch at 128 x 64 and width 64 spills 60 bytes, its model 252 without them; 64 x 64 at width 128 holds
+    255 unspilled, 242); a keys-first step's places are vectors broadcast at each use."""
     block_q, block_k = config.block_q, config.block_k
-    products = [(block_q, block_k, jnp.float32)] * 2
+    products = [(block_q, block_k, jnp.float32)] * 2 + [(block_q, block_k, jnp.int8)]
     if dq:
         carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]
@@ -520,9 +524,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         if config.fused:
             launches = [(family, config, _fused_allocations(family, config, width, dtype, q_stages))]
         else:
-            launches = [(dkv_family, config.dkv, _dkv_allocations(dkv_family, config.dkv, width, value_width,
-                                                                  dtype, stages=q_stages,
-                                                                  columns=config.columns))]
+            launches = [(dkv_family, config.dkv, _dkv_allocations(
+                dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns))]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k))))
