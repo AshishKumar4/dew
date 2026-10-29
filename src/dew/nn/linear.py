@@ -928,7 +928,7 @@ class GatedDeltaNet(nn.Module):
                                     f"training sequences; a decode step holds one state per row. Decode on "
                                     f"a mesh with sequence=1.")
             rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
-                                     max_segments=tokens.max_segments)
+                                     max_segments=tokens.max_segments, write_bound=1.0)
             out = over_sequence(functools.partial(split_delta_rule, widths=widths, parts=heads,
                                                   dtype=operand if ported else wide, rule=rule),
                                 shards, (mixed, g, beta, tokens.segments, tokens.starts, valid),
