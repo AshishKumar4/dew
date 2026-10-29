@@ -1447,8 +1447,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
 
     `also` names further references Dew is held to on the same draws, each judged by its own check 1
     as the reference is (its label `label`, against its name), Dew and the truth evaluated once a draw
-    for them all (`_drawn`): one Dew arm against several references, the truth `truth_fn` (which a site
-    with several references names). Each compiles paired with Dew's arm (`_arms`), and a plain Dew arm,
+    for them all (`_drawn`): one Dew arm against several references, the truth as above. Each compiles
+    paired with Dew's arm (`_arms`), and a plain Dew arm,
     whose compilation its pairing decides, takes references of one kind, plain or `as_given`.
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
@@ -1464,10 +1464,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                          f"the leaves it covers")
     also = dict(also or {})
     mixed = not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in also.values())
-    if also and (truth_fn is None or mixed):
-        raise ValueError(f"{label}: further references name the truth, and beside a plain Dew arm each is "
-                         f"of the reference's kind, plain or as given, so one compilation of Dew's pairs "
-                         f"with all")
+    if also and mixed:
+        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's kind, "
+                         f"plain or as given, so one compilation of Dew's pairs with all")
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
     further = [_arms(dew_fn, fn)[1] for fn in also.values()]
