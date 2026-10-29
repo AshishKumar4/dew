@@ -223,10 +223,11 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
 
 
-WHOLE_SUITE_PATHS = ("deepseek-v4-tiny",)
-"""The checkpoints whose rungs take past a group's target to step (DeepSeek V4's hyper-connected
-layers, 130 s on armada at 727e70cb1, 256 s before the rungs left tests/test_model_protocols.py), each
-run by the whole suite alone (`whole_suite`)."""
+WHOLE_SUITE_PATHS = ("deepseek-v4-tiny", "deepseek-v41-tiny", "qwen35-tiny", "glm5-next-tiny")
+"""The checkpoints whose rungs take past a group's 120 s to step, each run by the whole suite alone
+(`whole_suite`): DeepSeek V4's and V4.1's hyper-connected layers (130 s and 126 s on armada at 727e70cb1
+and d00c68f8f; 256 s and 187 s in the durations record), Qwen 3.5's and GLM-5 Next's (182 s and 162 s
+there)."""
 
 
 @pytest.mark.parametrize("name", [pytest.param(name, marks=pytest.mark.whole_suite)
