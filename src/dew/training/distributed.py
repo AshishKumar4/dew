@@ -118,14 +118,10 @@ def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[st
     return {link_topology(mesh, axis): figure for (mesh, axis), figure in bandwidths.items()}
 
 
-def link_figure(mesh: Mesh, axis: str, ahead: Mapping[str, float | None],
-                resumed: Mapping[str, float | None]) -> float | None:
-    """The bandwidth a step over `mesh` decides `axis`'s projections by: a step compiled ahead's own
-    (`AheadOfTime.links`), else the one a resumed checkpoint traced with on this very placement
-    (`resumed_link_figures`), either None where it was unmeasured, else the one measured there
-    (`link_bandwidth`)."""
-    if axis in ahead:
-        return ahead[axis]
+def link_figure(mesh: Mesh, axis: str, resumed: Mapping[str, float | None]) -> float | None:
+    """The bandwidth a step over `mesh` decides `axis`'s projections by: the one a resumed checkpoint
+    traced with on this very placement (`resumed_link_figures`), None where it was unmeasured, else the
+    one measured there (`link_bandwidth`)."""
     topology = link_topology(mesh, axis)
     return resumed[topology] if topology in resumed else link_bandwidth(mesh, axis)
 

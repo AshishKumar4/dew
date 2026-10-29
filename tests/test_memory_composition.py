@@ -33,14 +33,17 @@ from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.memory import CARRY, Gate, InContextMemory, MLPMemory, Objective
 from dew.nn.mlp import GatedMLP
 
-SEEDS = {"memory decoder gradient": 512, "memory decoder decode": 16, "adapted memory": 8, "rows split": 256,
-         "rows split cms": 512, "served memory moving": 8, "served memory projections": 8,
-         "served memory convolved": 8}
-"""The sites' declared seeds where `seeds_for` on armada, each reference compared with itself, sizes them
-apart from `MEMORY_SEEDS`: the memory decoder's gradients, every parameter's leaf, and the
-continuum-memory level's rows split over a data axis at 512; the other memories' rows split at 256; the
-decoder's last logits after a cached decode at 16; an adapted memory decoder at 8; each served memory
-(`SERVED`) at 8, paired with quantized training (`seeds_for(..., dew_fn=)`)."""
+SEEDS = {"scanned memory decoder gradient": 32, "rematted memory decoder gradient": 64,
+         "memory decoder decode": 16, "adapted memory": 8, "rows split": 256, "rows split cms": 512,
+         "served memory moving": 8, "served memory projections": 8, "served memory convolved": 8,
+         "served quantized memory": 128, "served quantized memory alone": 128}
+"""The sites' declared seeds where `seeds_for` on armada sizes them apart from `MEMORY_SEEDS`, each
+reference compared with itself: the continuum-memory level's rows split over a data axis at 512, the other
+memories' at 256, the decoder's last logits after a cached decode at 16, an adapted memory decoder at 8;
+and paired with the arm judged (`seeds_for(..., dew_fn=)`): each served memory (`SERVED`) at 8 with
+quantized training, the scanned memory decoder's gradients, every parameter's leaf, at 32 and the rematted
+one's at 64, and the quantized memory decoder served and alone against its full forward at 128 each
+(armada IGMEM2 at main 34c949ee8, where the gradients' unpaired 512 cost the rematted site 124 s)."""
 
 
 def decoder(memory: InContextMemory | None = None, **fields):
@@ -89,7 +92,7 @@ def test_a_scanned_memory_decoder_trains_as_the_plain_loop():
     plain = decoder()
     _, draw = memory_draw(plain)
     assert_as_exact(trained(decoder(scan_layers=True)), trained(plain), draw,
-                    "scanned memory decoder gradient", seeds=SEEDS["memory decoder gradient"],
+                    "scanned memory decoder gradient", seeds=SEEDS["scanned memory decoder gradient"],
                     truth_fn=trained(decoder(dtype=jnp.float64)))
 
 
@@ -102,7 +105,8 @@ def test_a_rematted_memory_decoder_trains_as_the_plain_loop_reaching_every_memor
     plain, rematted = decoder(), decoder(scan_layers=True, remat=RematPolicy(save=(CARRY,)))
     _, draw = memory_draw(plain)
     assert_as_exact(trained(rematted), trained(plain), draw, "rematted memory decoder gradient",
-                    seeds=SEEDS["memory decoder gradient"], truth_fn=trained(decoder(dtype=jnp.float64)))
+                    seeds=SEEDS["rematted memory decoder gradient"],
+                    truth_fn=trained(decoder(dtype=jnp.float64)))
     gradient = trained(rematted)(*draw(0))[1]
     for index in (0, 1):
         layer = gradient[f"layers_{index}"]["self_attn"]
@@ -588,6 +592,7 @@ def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward
         start = decoded_stored(widened(bound.variables))
     assert_served_as_exact(bound, (Served(3), Served(5)), "served quantized memory",
                            serving={"slots": 2, "capacity": 64}, alone=False,
+                           seeds=(SEEDS["served quantized memory"], SEEDS["served quantized memory alone"]),
                            truth=(spec.apply(model), start))
 
 

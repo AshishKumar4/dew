@@ -13,7 +13,13 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew._model_types import GEMMA4_TYPES
-from dew.batch import Coordinates, coordinates as build_coordinates, prefix_sum, token_coordinates
+from dew.batch import (
+    POSITIONS_FIELD,
+    Coordinates,
+    coordinates as build_coordinates,
+    prefix_sum,
+    token_coordinates,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
@@ -439,7 +445,7 @@ class MultimodalTransformer(DecoderWrapper):
             # The response's rule (`next_position`): past the last real token's position, or past
             # the largest coordinate of a multi-axis one.
             fields = {name: value for name, value in (("rotary_positions", rotary_positions),
-                                                      ("positions", positions)) if value is not None}
+                                                      (POSITIONS_FIELD, positions)) if value is not None}
             following = next_position(fields, valid)
             assert following is not None
             if allocated:

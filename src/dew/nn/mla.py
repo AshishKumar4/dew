@@ -814,17 +814,13 @@ class MultiHeadLatentAttention(nn.Module):
         """`[B, 1, T, total]`: which of the cache's `total` slots each query at `slots` sees, those up
         to its own slot that hold a token, within its window and chunk counted over the cache's
         slots, which hold each row's real tokens in order."""
-        seen = causal_attention_mask(slots, total, key_valid=cached_validity(self, total))
-        if self.sliding_window is None and self.attention_chunk is None:
+        seen = causal_attention_mask(slots, total, self.sliding_window,
+                                     key_valid=cached_validity(self, total))
+        if self.attention_chunk is None:
             return seen
         slots = jnp.asarray(slots)
-        keys = jnp.arange(total)
-        if self.sliding_window is not None:
-            seen = seen & (slots[..., None] - keys < self.sliding_window)[:, None]
-        if self.attention_chunk is not None:
-            seen = seen & chunk_mask(slots, jnp.broadcast_to(keys, (slots.shape[0], total)),
-                                     self.attention_chunk)
-        return seen
+        return seen & chunk_mask(slots, jnp.broadcast_to(jnp.arange(total), (slots.shape[0], total)),
+                                 self.attention_chunk)
 
     def _attend(self, query, key, value, x, mask, implementation, *, causal: bool = False, bias=None,
                 unselected=None, force_fp32_for_softmax: bool = True):

@@ -81,3 +81,8 @@ def prompt_inputs(records):
 
 
 
+
+
+def completion_length(text: str, record) -> float:
+    """A reward of a completion's length, which varies within a group, so every group has an advantage."""
+    return float(len(text))

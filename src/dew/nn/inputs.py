@@ -117,22 +117,22 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     for index, (row, slot) in enumerate(zip(arrays, slots, strict=True)):
         tokens[index, slot] = row
         valid[index, slot] = True
-    padded = {"attention_mask": valid}
+    padded = {VALIDITY_FIELD: valid}
     for name, values in (fields or {}).items():
         aligned = [np.asarray(row) for row in values]
         if len(aligned) != len(arrays) or any(
             value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)
         ):
             raise ValueError(f"token field {name!r} must align with the token rows")
-        if name == "attention_mask" and any(np.any((row != 0) & (row != 1)) for row in aligned):
-            raise ValueError("attention_mask must contain only zero or one")
-        dtype = bool if name == "attention_mask" else np.result_type(*(row.dtype for row in aligned))
+        if name == VALIDITY_FIELD and any(np.any((row != 0) & (row != 1)) for row in aligned):
+            raise ValueError(f"{VALIDITY_FIELD} must contain only zero or one")
+        dtype = bool if name == VALIDITY_FIELD else np.result_type(*(row.dtype for row in aligned))
         value = np.zeros(tokens.shape, dtype=dtype)
         for index, (row, slot) in enumerate(zip(aligned, slots, strict=True)):
             value[index, slot] = row
         padded[name] = value
-    if padded["attention_mask"].all():
-        del padded["attention_mask"]
+    if padded[VALIDITY_FIELD].all():
+        del padded[VALIDITY_FIELD]
     return tokens, padded
 
 
