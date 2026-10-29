@@ -1581,8 +1581,10 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     its test process runs, tools/armada's recorder and plugins, is every row's input through its own files
     (`SHARED`), not through tools/'s entries, which only a test that imports a tool by its name reads (Main,
     2026-10-29: train 296 added tools/fla_float64.py and reused 1 of 1795 rows)."""
+    # The harness as a checkout holds it, under the checkout's root, beside the project it reads.
     shutil.copytree(ROOT / "tools/armada", tmp_path / "tools/armada",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
     module = load("ci", str(tmp_path / "tools/armada"))
     monkeypatch.chdir(tmp_path)
     for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
