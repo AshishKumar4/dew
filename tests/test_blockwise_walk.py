@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.diffusion.discrete import MDLM, Confident
+from dew.diffusion.discrete import MDLM, Confident, Unmask
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 
@@ -166,6 +166,10 @@ def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
     objective = MaskedDiffusionObjective(source, MDLM(mask_id=source.model.mask_token_id)(), 8,
                                          ema_decay=None, processor=RunProcessor(ByteTokenizer()))
     assert (objective.solver, objective.steps, objective.block) == (solver, steps, block)
+    # A solver the caller names walks whole rows unless it names a block too (ledger 2231).
+    named = MaskedDiffusionObjective(source, MDLM(mask_id=source.model.mask_token_id)(), 8, ema_decay=None,
+                                     processor=RunProcessor(ByteTokenizer()), solver=Unmask())
+    assert named.block is None
     rows = jax.device_count()
     stream = grain.MapDataset.source([{"text": np.full((rows, 8), 7, np.int32)}]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
