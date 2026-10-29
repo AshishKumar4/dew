@@ -20,16 +20,18 @@ from jax.typing import DTypeLike
 
 from dew.batch import Coordinates, prefix_sum
 from dew.nn.attention import (
-    RMSNorm,
+    AttentionImpl,
+    cudnn_takes_mask,
+    kernel_for_materialized_mask,
+    reference_only,
+    scaled_dot_product_attention,
+)
+from dew.nn.attention_masks import (
     alibi_bias,
     causal_attention_mask,
     chunk_mask,
-    cudnn_takes_mask,
-    kernel_for_materialized_mask,
     key_spans,
     max_attention_logits,
-    reference_only,
-    scaled_dot_product_attention,
     visibility_mask,
 )
 from dew.nn.blocks import normal_kernel
@@ -62,6 +64,7 @@ from dew.nn.kv_cache import (
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
@@ -226,7 +229,7 @@ class _Masking(NamedTuple):
     """A call's packed documents, or a cache call's (`CausalSelfAttention._cached_documents`)."""
     max_segments: int | None
     """The most documents a row of `documents` holds (`Coordinates.max_segments`)."""
-    implementation: str
+    implementation: AttentionImpl
     cursor: jax.Array | None
     """The decode mask over the cache's filled slots a decode step's kernels stand in for, where this
     call builds it."""
@@ -815,7 +818,7 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.asarray(positions)
         return positions, append, prefix
 
-    def _mask_kernel(self, query, key, decode: bool) -> str:
+    def _mask_kernel(self, query, key, decode: bool) -> AttentionImpl:
         """The kernel a call that builds its mask runs: xla
         (`kernel_for_materialized_mask`), except a cache call over several
         queries (a prefill, a verified draft) where cuDNN takes the mask
@@ -956,7 +959,7 @@ class CausalSelfAttention(nn.Module):
                         cursor, starts, key_places, groups, valid, runs)
 
     def _overridden(self, metadata: AttentionMetadata | None, rotary_positions, B: int, S: int, keys: int,
-                    key_places, implementation: str, masked: str, decode: bool):
+                    key_places, implementation: AttentionImpl, masked: AttentionImpl, decode: bool):
         """A call's own visibility (`call_visibility`), None where it states none, and the kernel it takes:
         a mask's the masked one (`masked`), as a cached call's or a named kernel's runs do; an uncached
         call's runs the one the layer chooses ('auto')."""

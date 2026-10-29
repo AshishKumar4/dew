@@ -26,7 +26,6 @@ from reference_error import (
     ieee_fixture,
 )
 
-from dew.nn.attention import RMSNorm
 from dew.nn.mimo_audio import (
     AudioTokenizerEncoder,
     MiMoAudioCodeEncoder,
@@ -35,6 +34,7 @@ from dew.nn.mimo_audio import (
     translate_mimo_audio_config,
     translate_mimo_audio_weights,
 )
+from dew.nn.norms import RMSNorm
 from dew.nn.quantizers import residual_quantize
 from dew.registry import towers
 

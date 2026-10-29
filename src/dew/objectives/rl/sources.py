@@ -268,13 +268,14 @@ class PromptSource:
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
     def _rollout(self, task: Task, prompt: PromptTask, version: int, drawn: Future[Draw]) -> Session:
+        source = prompt.record.data_source
         failed = _draw_failure(drawn)
         if failed is not None:
-            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed)
+            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed, source)
         draw = drawn.result().checked(self.server.sampling)
         if draw.version != version:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {},
-                           f"draw: served by version {draw.version}, submitted under {version}")
+                           f"draw: served by version {draw.version}, submitted under {version}", source)
         return scored_draw(task.id, 0, Call.of(draw), self.decode(draw.response(self.server.sampling)),
                            prompt.record, self.reward)
 

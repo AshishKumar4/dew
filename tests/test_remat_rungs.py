@@ -23,6 +23,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import float64_twin
 from reference_error import assert_as_exact, widened
 from tool_support import load
+from whole_suite import timed
 
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -223,16 +224,15 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
 
 
-WHOLE_SUITE_PATHS = ("deepseek-v4-tiny", "deepseek-v41-tiny", "qwen35-tiny", "glm5-next-tiny", "kimi-k3-tiny",
-                     "kimi-linear-tiny")
-"""The checkpoints whose rungs take past a group's 120 s to step, each run by the whole suite alone
-(`whole_suite`): DeepSeek V4's and V4.1's hyper-connected layers (130 s and 126 s on armada at 727e70cb1
-and d00c68f8f; 256 s and 187 s in the durations record), Qwen 3.5's and GLM-5 Next's (182 s and 162 s
-there), and Kimi K3's and Kimi Linear's (128 s and 127 s at 4b732a903)."""
+PAST_TARGET = {"rungs": {"deepseek-v4-tiny": 130, "deepseek-v41-tiny": 126, "qwen35-tiny": 182,
+                         "glm5-next-tiny": 162, "kimi-k3-tiny": 128, "kimi-linear-tiny": 127}}
+"""The checkpoints whose rungs take past a group's 120 s to step (`timed`), each its seconds on armada:
+DeepSeek V4's and V4.1's at 727e70cb1 and d00c68f8f, Kimi K3's and Kimi Linear's at 4b732a903, Qwen 3.5's
+and GLM-5 Next's in the durations record. Every train steps every other checkpoint's rungs, and the
+architectures' rungs cover each mixer these hold."""
 
 
-@pytest.mark.parametrize("name", [pytest.param(name, marks=pytest.mark.whole_suite)
-                                  if name in WHOLE_SUITE_PATHS else name for name in PATHS])
+@pytest.mark.parametrize("name", timed(PAST_TARGET, "rungs", PATHS))
 def test_a_checkpoints_remat_rungs_step_as_it_does(name):
     source, read = loaded(name), reads(name, "float32")
     _climbs_and_restores(name, source.model, source.variables, (read.tokens,), method="logits")

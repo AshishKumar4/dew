@@ -57,6 +57,8 @@ from dew.data.pipeline import Dataset, ObjectiveData
 from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
 from dew.lora import LoRA
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import attention_route
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig
 from dew.quantization import Quantization
@@ -79,7 +81,7 @@ from dew.registry import (
 from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead, compile_only_gpus
-from dew.training.budget import Pause, budget_tokens, run_length, run_steps
+from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
@@ -93,6 +95,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.interop import Pretrained
+    from dew.nn.attention import AttentionImpl
     from dew.training.trainer import Trainer
 
 
@@ -407,9 +410,17 @@ class TrainerConfig:
     row it makes: the records the chain makes in its own order, counted before they are packed and
     before an objective makes several rows of one (a decision layout's row a question)
     (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
-    stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
+    stop: (Annotated[Pause, tyro.conf.subcommand("pause")]
+           | Annotated[Plateau, tyro.conf.subcommand("plateau")] | None) = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
-    (`Pause`): `--trainer.stop.fraction 0.5`."""
+    (`Pause`): `--trainer.stop.fraction 0.5`; or once a metric, by its recorded name
+    as `best` names one, stops improving (`Plateau`): `trainer.stop:plateau --trainer.stop.metric
+    val/loss --trainer.stop.evals 3`."""
+    restore_best: bool = False
+    """End on the model the run ranked best (`Trainer.fit`'s `restore_best`): the state the run hands
+    on (`RunConfig.train`'s `after`) holds the best step's weights, EMA and counters, with the final
+    step's optimizer state. The checkpoints stay as written; `dew export --step best` exports the
+    best one."""
     cooldowns: Annotated[Cooldowns, tyro.conf.subcommand("cooldowns")] | None = None
     """Branch the run into cooldowns, each scored by its validation and discarded (`Cooldowns`):
     `--trainer.cooldowns.at 20% 40% --trainer.cooldowns.length 20%`."""
@@ -435,6 +446,12 @@ class TrainerConfig:
 
     False disables this save; cadenced, ranked and preemption saves keep their own policy.
     """
+    local_directory: str | None = None
+    """A path on every host's own disk where the run also writes checkpoints every `local_every`
+    steps, under its name as in `checkpoint_dir`, cheaper than the persistent ones and lost with the
+    host (`Checkpoints`); a resume reads the newer of the two. Set with `local_every`, or neither."""
+    local_every: int | str | None = None
+    """The steps between local checkpoints, or a share of the run such as "5%" (`local_directory`)."""
     scored_to: str | None = None
     """A directory that takes every validation batch's scoring artifacts at each evaluation, a decision
     run's decisions among them, as `<scored_to>/step-<step>/<split>-<batch>.npz`, for pooling a pass's
@@ -458,6 +475,10 @@ class TrainerConfig:
     once per stage.
     """
     dynamic_scale: bool = False
+    attention_form: Literal["fast", "accurate"] = "fast"
+    """The form the attention template computes in (`dew.nn.kernels.templates.attention_route`):
+    "accurate" takes its accurate products, at their cost, for every attention the run traces, the
+    step and its evaluations, and a resumed run traces in the form it records."""
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
     microbatches: int | None = None
     """Microbatches a pipelined step feeds through the mesh's stages, a
@@ -521,6 +542,13 @@ class TrainerConfig:
     the CUDA plugin and no GPU, and writes it with what it costs: each device's peak bytes and the
     step's FLOPs, read before booking the GPUs. The program exits with status 0, and writes no
     checkpoint or tracking.
+
+    `--trainer.compile-ahead.capacity-gib 80` states each GPU's memory, and the run's own fit search
+    then plans the step there as a run would, its log and the saved step naming every program it
+    compiled, each with the bytes derived for it beside XLA's, and the plan it took, with the seconds
+    planning took. A run with its remat set compiles at that remat alone, and is told of no other;
+    this is how to ask what fits beside it: compile it ahead once at each remat policy its model
+    takes (the model's `remat` field) and compare the plans.
     """
     ahead: str | None = None
     """Run the step `compile_ahead` saved at this path as the run's first step, in place of compiling it.
@@ -562,6 +590,9 @@ class TrainerConfig:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
+        if self.attention_form not in attention_route.FORMS:
+            raise ValueError(f"--trainer.attention-form is one of the template's forms "
+                             f"{attention_route.FORMS}, not {self.attention_form!r}")
         run_length(self.steps, self.epochs, self.tokens, self.examples, required=False)
         if isinstance(self.log_every, str) and not is_share(self.log_every):
             raise ValueError(f"--trainer.log-every is steps or a share such as 1%, not {self.log_every!r}")
@@ -573,6 +604,9 @@ class TrainerConfig:
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
             object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
+        if isinstance(self.stop, Mapping) and "class" not in self.stop:
+            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
+            object.__setattr__(self, 'stop', from_record(Pause, self.stop, dtypes=False))
         if isinstance(self.keep, Keep) and self.keep.where is not None:
             raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
         if self.best is not None:
@@ -602,8 +636,15 @@ class TrainerConfig:
         it started from need not be read (`Pretrained.load`'s `weights`)."""
         if self.name is None:
             return False
-        with Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep) as checkpoints:
+        with self.checkpoints(self.name) as checkpoints:
             return checkpoints.latest is not None
+
+    def checkpoints(self, name: str) -> Checkpoints:
+        """The checkpoints of the run `name` in `checkpoint_dir`, keeping `keep`, with its local tier
+        under `name` in `local_directory`, so runs sharing a local disk resume each only its own."""
+        return Checkpoints(os.path.join(self.checkpoint_dir, name), keep=self.keep,
+                           local_directory=None if self.local_directory is None else os.path.join(
+                               self.local_directory, name), local_every=self.local_every)
 
     def source_placement(self, *, frozen: bool) -> SourcePlacement:
         """Where a run that starts from a source (`Pretrained.load`) reads it: the load's keywords,
@@ -933,7 +974,8 @@ _RANDOM_SEARCH = RandomSearch()
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     """A whole run's configuration. A kind of run subclasses it with its own
-    settings and builds what it trains from them (`prepare`); `run` trains it.
+    settings and builds what it trains from them (`build_run`, which `prepare` calls
+    on the run with its Hub sources pinned); `run` trains it.
     """
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
@@ -942,7 +984,7 @@ class RunConfig:
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
     RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
-                                            "val_metrics", "val_summaries")
+                                            "val_metrics", "val_every", "val_summaries")
     """The fields a run resumed under its name may change: how it trains and optimizes, what it reads
     and scores, and, in a kind of run that adds them, how it previews. Every other field says what
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
@@ -988,6 +1030,11 @@ class RunConfig:
     given is asked for whatever the data holds: a split the run does not validate, or data with no
     validation split, refuses it.
     """
+    val_every: Annotated[Mapping[str, int | str], record_argument(Mapping[str, int | str])] = (
+        dataclasses.field(default_factory=dict))
+    """A split's own validation cadence, as `trainer.eval_every` spells one (`EvalSuite.every`), one
+    JSON object on the command line: `--val-every '{"test": "25%"}'` scores `test` every quarter of the
+    run and every other split at `trainer.eval_every`. A split it names must be one the run validates."""
     val_summaries: Annotated[tuple[Summary, ...], record_argument(tuple[Summary, ...])] = ()
     """Scalars weighed from each evaluation's split scores, a board's weighted index, each formed at a
     step that scored every split it weighs and logged as `evaluation/summary/<name>`, which
@@ -1108,6 +1155,14 @@ class RunConfig:
         (`source`) and where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
         keeps the source as it is). Every run kind that starts from a source loads it with these."""
         return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen)}
+
+    def source_attention(self) -> "AttentionImpl":
+        """The attention implementation a run that starts from a source loads it with: its model's
+        `attention_impl` field, auto unless set, refused unless it names one (`AttentionImpl`). Every run
+        kind that loads a source reads it here."""
+        from dew.nn.attention import attention_implementation
+
+        return attention_implementation(str(self.model.fields.get("attention_impl", "auto")))
 
     def built_fresh(self) -> None:
         """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
@@ -1253,9 +1308,14 @@ class RunConfig:
         return run_class.from_dict(named[1])
 
     def prepare(self) -> Prepared:
-        """Build what this run trains: the objective its record names around
-        its model, on its data. A kind of run with settings of its own builds
-        from them in its own `prepare`."""
+        """Build what this run trains, as `build_run` builds it from the run with its Hub sources pinned
+        (`pinned`), so the record names what it started from and is what it loads."""
+        return self.pinned().build_run()
+
+    def build_run(self) -> Prepared:
+        """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
+        pins them first): the objective its record names around its model, on its data. A kind of
+        run with settings of its own builds from them in its own `build_run`."""
         if self.objective is None or self.lora is not None:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
@@ -1280,21 +1340,26 @@ class RunConfig:
         `validates`: what each split scores where `val_metrics` names none (`suites`)."""
         return tuple(self.metric(config) for config in self.default_metrics(validates=validates))
 
-    def suites(self, dataset: Loader, validation: Mapping[str, Reader] | None,
+    def suites(self, dataset: Loader, validation: Mapping[str, Reader] | None, metrics: Sequence[Metric] = (),
                ) -> Mapping[str, EvalSuite] | None:
         """Each split the run validates, `validation`'s or `dataset.val` as `val`, with the metrics
-        `val_metrics` names for it built (`metric`); None where `val_metrics` names none, so each scores
-        the kind's own. A metric for a split the run does not validate is refused."""
-        if self.val_metrics is None:
+        `val_metrics` names for it built (`metric`), else the kind's own `metrics`, at its cadence in
+        `val_every`, else the run's; None where neither names any, so each scores the kind's own at
+        the run's. A metric or a cadence for a split the run does not validate is refused."""
+        if self.val_metrics is None and not self.val_every:
             return None
         splits = dict(validation) if validation is not None else (
             {"val": dataset.val} if dataset.val is not None else {})
-        named = {config.split for config in self.val_metrics if config.split is not None}
+        named = {config.split for config in self.val_metrics or () if config.split is not None}
         if (self.val_metrics and not splits) or not named <= set(splits):
             raise ValueError(f"val_metrics score {sorted(named) or 'every split'}, and the run validates "
                              f"{sorted(splits) or 'none'}")
-        return {split: EvalSuite(reader, tuple(self.metric(config) for config in self.val_metrics
-                                                if config.split in (None, split)))
+        if not set(self.val_every) <= set(splits):
+            raise ValueError(f"val_every times {sorted(self.val_every)}, and the run validates "
+                             f"{sorted(splits) or 'none'}")
+        return {split: EvalSuite(reader, tuple(metrics) if self.val_metrics is None else tuple(
+                    self.metric(config) for config in self.val_metrics if config.split in (None, split)),
+                                 self.val_every.get(split))
                 for split, reader in splits.items()}
 
     def chain(self) -> Dataset:
@@ -1328,6 +1393,13 @@ class RunConfig:
                                 f"{_chain_label(prepared.run.data)}/date-{run_timestamp()}")
         return prepared.train(name)
 
+    def pinned(self) -> Self:
+        """This run with its Hub sources named at the commits they resolve to now, as its record names
+        them and `prepare` loads them: here an imported adapter's (`LoRA.resolved`); a kind of run pins
+        its own sources beside it. Itself where nothing is left to pin."""
+        lora = None if self.lora is None else self.lora.resolved()
+        return self if lora == self.lora else dataclasses.replace(self, lora=lora)
+
     def profile(self, directory: str | None = None, *, warmup: int = 20, steps: int = 10,
                 capture: ProfileWindow | None = None) -> ProfileReport | None:
         """Train this run afresh under `directory` for `warmup` steps, then a window of `steps` more traced
@@ -1335,22 +1407,24 @@ class RunConfig:
         as `report.json` beside XProf's own reports. The warmup is whole windows, at least one, so the step
         compiles before the window and the window is one log interval. The run keeps its own settings but
         those that would read or write outside the window, which a profile drops together: its length,
-        stop, checkpoints, the checkpoint ranking (`best`), its cooldowns, the validation splits it names
-        and their metrics and summaries (a split its chain holds out scores after the window), and its W&B
-        sink. `directory` unset is profiles/<the run's name>/<the time
-        it starts>, read once the process is prepared, as `run` reads a run's name. The run's own
-        directory is left as it is. `capture` gives the capture's options (its `host_tracer_level`,
-        `python_tracer_level` and `activity_cap`; its directory and steps are the profile's). Raises
-        ValueError for a directory that holds this run's profile already. The report is process zero's,
-        which logs the run; None on the others."""
+        stop, checkpoints local or persistent, the checkpoint ranking (`best`) and the best model it
+        would end on, its cooldowns, the validation splits it names and their metrics, cadences and
+        summaries (a split its chain holds out scores after the window), its W&B sink, and a lowering, a
+        compile ahead or a step compiled ahead for its own length, which the profile trains past.
+        `directory` unset is profiles/<the run's name>/<the time it starts>, read once the process is
+        prepared, as `run` reads a run's name. The run's own directory is left as it is. `capture` gives the
+        capture's options (its `host_tracer_level`, `python_tracer_level` and `activity_cap`; its
+        directory and steps are the profile's). Raises ValueError for a directory that holds this run's
+        profile already. The report is process zero's, which logs the run; None on the others."""
         from dew.training import prepare_process, run_timestamp
 
         name = self.trainer.name or "profile"
         warmup = max(1, -(-warmup // steps)) * steps
         trainer = dataclasses.replace(
             self.trainer, name=name, resume="never", steps=warmup + steps, epochs=None, tokens=None,
-            examples=None, stop=None, best=None, cooldowns=None, log_every=steps, eval_every=None,
-            checkpoint_every=None, checkpoint_final=False, wandb=None, publish=False)
+            examples=None, stop=None, best=None, restore_best=False, cooldowns=None, log_every=steps,
+            eval_every=None, checkpoint_every=None, checkpoint_final=False, local_directory=None,
+            local_every=None, wandb=None, publish=False, lower_for=None, compile_ahead=None, ahead=None)
         prepare_process(None, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
         # The report names its paths whole, wherever it is read from.
         directory = os.path.abspath(directory or os.path.join("profiles", name, run_timestamp()))
@@ -1361,8 +1435,8 @@ class RunConfig:
         captured = dataclasses.replace(capture or ProfileWindow(window, steps), directory=window, steps=steps,
                                        warmup=warmup)
         trainer = dataclasses.replace(trainer, checkpoint_dir=directory, profile=captured)
-        profiled = dataclasses.replace(self, validation=None, val_metrics=None, val_summaries=(),
-                                       trainer=trainer)
+        profiled = dataclasses.replace(self, validation=None, val_metrics=None, val_every={},
+                                       val_summaries=(), trainer=trainer)
         profiled.prepare().train(name)
         if jax.process_index() != 0:
             return None
@@ -1449,7 +1523,7 @@ class RunConfig:
         self.check_process()
         dataset, validation = self.compiled(objective.data(), dataset, validation)
         # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
-        suites = self.suites(dataset, validation)
+        suites = self.suites(dataset, validation, metrics)
         sized, dataset, steps = self.trainer.resolved(dataset)
         self = dataclasses.replace(self, trainer=sized)
         if self.trainer.quantization is not None:
@@ -1470,7 +1544,7 @@ class RunConfig:
                 wandb_tracker = WandbTracker(
                     trainer.wandb.project, name if trainer.wandb.name is None else trainer.wandb.name,
                     entity=trainer.wandb.entity, offline=trainer.wandb.offline)
-            checkpoints = Checkpoints(os.path.join(trainer.checkpoint_dir, name), keep=trainer.keep)
+            checkpoints = trainer.checkpoints(name)
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
             def check_resumed() -> None:
@@ -1499,18 +1573,20 @@ class RunConfig:
             # profile, tune_kernels and any step compiled ahead; prepare_process read the process fields,
             # and the rest are fit's arguments or built the checkpoints and the tracker.
             ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
-            state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
-                               profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
-                dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
-                eval_every=trainer.eval_interval(dataset),
-                checkpoint_every=trainer.checkpoint_interval(dataset),
-                checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
-                metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
-                best=trainer.best_policies(), stop=trainer.stop, cooldowns=trainer.cooldowns,
-                resume=trainer.resume,
-                # A run that names no metrics and validates no split has no suite to score.
-                validation=validation if suites is None else suites or None, summaries=self.val_summaries,
-            )
+            # Every attention the run traces takes its recorded form.
+            with generation.chosen(attention_form=trainer.attention_form):
+                state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
+                                   profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
+                    dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
+                    eval_every=trainer.eval_interval(dataset),
+                    checkpoint_every=trainer.checkpoint_interval(dataset),
+                    checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
+                    metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
+                    best=trainer.best_policies(), stop=trainer.stop, restore_best=trainer.restore_best,
+                    cooldowns=trainer.cooldowns, resume=trainer.resume,
+                    # A run that names no metrics and validates no split has no suite to score.
+                    validation=validation if suites is None else suites or None,
+                    summaries=self.val_summaries)
             if after is not None:
                 after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
@@ -1533,8 +1609,9 @@ class RunConfig:
         compile-only GPUs, with no checkpoints or tracker: what ends a run that compiles ahead."""
         target = self.trainer.compile_ahead
         assert target is not None
-        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices))
-        return target.compiled(self.built(objective, mesh, rollout), dataset, steps)
+        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
+        with generation.chosen(attention_form=self.trainer.attention_form):
+            return target.compiled(self.built(objective, mesh, rollout), dataset, steps)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
