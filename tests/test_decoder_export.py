@@ -1266,11 +1266,13 @@ def assert_same_tensors(written: dict, expected: dict) -> None:
         assert written[tensor].dtype == value.dtype and np.array_equal(written[tensor], value), tensor
 
 
-@pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny"])
+@pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny", "glm5-next-tiny"])
 def test_a_moe_decoder_saves_every_tensor_its_source_holds(name, tmp_path):
     """A causal MoE decoder saved in its source's layout writes every tensor the source checkpoint
     holds, each expert's projections split from their stacked kernel and DeepSeek V3's balancing
-    bias from the `moe` collection, bit for bit, and its config keeps `use_cache`."""
+    bias from the `moe` collection, bit for bit, and its config keeps `use_cache`. GLM-5 Next's is the
+    source-layout route its trained round trip exports by, every train while that runs in the whole
+    suite alone (`WHOLE_SUITE`)."""
     loaded = Pretrained.load(FIXTURES / name, dtype="float32", param_dtype="auto", attention_impl="xla")
     loaded.save(tmp_path)
     assert_same_tensors(written_tensors(tmp_path), written_tensors(FIXTURES / name))
