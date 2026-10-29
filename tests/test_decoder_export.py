@@ -105,7 +105,6 @@ from reference_error import (
     within,
 )
 from residual_orders import orders, permuted, residual_width
-from whole_suite import timed
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.safetensors_io import save_hf_layout
@@ -137,12 +136,9 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # too: dew's gradient of the next-token cross entropy, written back into
 # the source's tensor layout, against the reference's `.grad`.
 GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
-
-PAST_TARGET = {"glm5": {"released": 173}}
-"""The cases past a group's 120 s (`timed`): GLM-5's released standalone export, 173 s in train 279's CI
-before the export checks compiled Dew's forward, 99 s on armada at c937fc46a after (ledgers 2182, 2278);
-every train runs its native-geometry and dense exports. The gradients and every case reading GLM-5 Next's
-round trip, once past it, run each train since the compile: 52-55 s and 41-51 s at c937fc46a."""
+# Every case runs each train since the export checks compile Dew's forward (ledgers 2182, 2278): GLM-5's
+# released standalone export, 173 s in train 279's CI before, is 99 s on armada at c937fc46a after; the
+# gradients and the cases reading GLM-5 Next's round trip 41-55 s.
 
 
 @pytest.fixture(scope="module")
@@ -1207,7 +1203,7 @@ def test_a_model_its_family_config_cannot_carry_is_refused_at_export(fixture, ch
         PretrainedDecoder.from_model(model, loaded.variables)
 
 
-@pytest.mark.parametrize("variant", timed(PAST_TARGET, "glm5", ["released", "native_geometry", "dense"]))
+@pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
 def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
     import jax.numpy as jnp
 
