@@ -26,7 +26,7 @@ from dew.batch import Variables, real_slots, thaw
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, compensated_sum, weighted_total
 from dew.objectives.base import Aux, EMASpec, Ratio, Shown
 from dew.objectives.lm.chunked import final_read
 from dew.objectives.routing import ExpertBalance
@@ -249,7 +249,7 @@ class GRPOObjective(TokenScorer):
         `mass` are `policy_ratio`'s, so it is a token, session or constant mean as the method's is."""
         terms = (k3_kl(policy, reference) if self.kl_term == "k3"
                  else 0.5 * jnp.square(policy - jax.lax.stop_gradient(reference)))
-        return Ratio(jnp.sum(jnp.where(weights != 0, terms, 0) * weights), mass)
+        return Ratio(weighted_total(terms, weights)[0], mass)
 
     def packed_log_probs(self, params: Variables, batch) -> jax.Array:
         """Return each packed id's log-probability given its own chain's prefix, placed by `onto_ids`.
@@ -395,7 +395,8 @@ class GRPOObjective(TokenScorer):
         if importance is not None:
             per_token = per_token * importance
         weights = self._weights(terms, effective, keep)
-        mass = jax.lax.stop_gradient(jnp.sum(weights))
+        # Summed once rounded (`compensated_sum`): the session weights' sum is their count.
+        mass = jax.lax.stop_gradient(compensated_sum(weights, tuple(range(weights.ndim))))
         if self.aggregation == "constant":
             # Each session's sum over the constant, averaged over the sessions (their session weights sum
             # to their count): a kept token weighs one over the constant.
@@ -404,7 +405,7 @@ class GRPOObjective(TokenScorer):
             # A sequence's tokens share its term: summed once a sequence, as its paper's form sums it.
             total = sequence_sum(per_token, weights, terms.segments)
         else:
-            total = jnp.sum(jnp.where(weights != 0, per_token, 0) * weights)
+            total, _ = weighted_total(per_token, weights)
         return Ratio(total, mass), weights, mass, aux
 
     def _policy_terms(self, terms: _Terms, mask: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
