@@ -524,6 +524,24 @@ class KernelOp(tokamax.Op):
         naming `HOOKS` defines it."""
         raise NotImplementedError(f"{type(self).__name__} names hooks {self.HOOKS} but no way to trace them")
 
+    def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
+        """The launch of `ba` at `config` as a resource derivation lowers it (never run): a function of the
+        call's arrays, making this launch's kernels alone, and their abstract values; compiled, not
+        interpreted, where the launch takes `interpret`."""
+        leaves, treedef = jax.tree.flatten((ba.args, ba.kwargs))
+        held = [hasattr(leaf, "shape") and hasattr(leaf, "dtype") for leaf in leaves]
+
+        def fn(*arrays):
+            given = iter(arrays)
+            args, kwargs = jax.tree.unflatten(treedef, [next(given) if array else leaf
+                                                        for leaf, array in zip(leaves, held, strict=True)])
+            if "interpret" in kwargs:
+                kwargs = {**kwargs, "interpret": False}
+            return self._fwd(*args, config=config, **kwargs)[0]
+
+        return fn, tuple(jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+                         for leaf, array in zip(leaves, held, strict=True) if array)
+
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Arrays at `specs` to time the launch on: normal floats, zero integers."""
         keys = jax.random.split(jax.random.key(seed), len(specs))
