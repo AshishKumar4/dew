@@ -216,8 +216,7 @@ def main() -> None:
     model, ids, mask, input_ids, attention_mask = fixture_on_gpu(model)
     logits, loss, updated = sgd_step(model, input_ids, attention_mask, lambda name: True)
     with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            parameter.copy_(tensors[name].to(parameter))
+        load_weights(model, tensors)
         again = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         assert torch.equal(again, logits), "restoring the written weights must restore the logits"
         generated, step_logits = greedy(model, input_ids, attention_mask)
@@ -227,6 +226,13 @@ def main() -> None:
              generated=generated, step_logits=step_logits, precision=matmul_precision())
     record_picks(DESTINATION)
     print("wrote", DESTINATION, "tensors", len(tensors))
+
+
+def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
+    """Copy stored tensors into `model`'s parameters, each in its parameter's dtype and device."""
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            parameter.copy_(tensors[name].to(parameter))
 
 
 def truth(directory: Path) -> dict[str, np.ndarray]:
@@ -245,9 +251,7 @@ def truth(directory: Path) -> dict[str, np.ndarray]:
         model = modeling.KimiLinearForCausalLM(
             configuration.KimiLinearConfig(**copy.deepcopy(config))).double()
         model.config._attn_implementation = "eager"
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                parameter.copy_(tensors[name])
+        load_weights(model, tensors)
         return float64_truth(model.eval(), directory, lambda name: True)
 
 
@@ -259,14 +263,7 @@ def orders(drawn: Path) -> None:
     config = json.loads((DESTINATION / "config.json").read_text())
     model = modeling.KimiLinearForCausalLM(configuration.KimiLinearConfig(**copy.deepcopy(config))).float()
     model.config._attn_implementation = "eager"
-    model = model.cuda().eval()
-
-    def load(model, weights):
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                parameter.copy_(weights[name].to(parameter))
-
-    record_orders(model, drawn, DESTINATION, load, lambda name: True, matmul_precision())
+    record_orders(model, drawn, DESTINATION, load_weights, lambda name: True, matmul_precision())
 
 if __name__ == "__main__":
     import sys

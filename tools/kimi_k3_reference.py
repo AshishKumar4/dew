@@ -407,7 +407,6 @@ def orders(drawn: Path) -> None:
     model = modeling.KimiK3ForConditionalGeneration(
         configuration.KimiK3Config(**copy.deepcopy(config))).float()
     model.language_model.config._attn_implementation = "eager"
-    model = model.cuda().eval()
     record_orders(model, drawn, DESTINATION, load_weights, lambda name: name.startswith("language_model."),
                   matmul_precision())
 
@@ -471,8 +470,7 @@ def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
     from safetensors.torch import load_file
 
     restore_picks(destination)
-    ids, mask = fixture_batch()
-    input_ids, attention_mask = torch.tensor(ids, device="cuda"), torch.tensor(mask, device="cuda")
+    model, _, mask, input_ids, attention_mask = fixture_on_gpu(model)
     valid = mask.astype(bool)
     with np.load(destination / "numerics.npz") as exact, np.load(destination / "reference.npz") as stored:
         truth, recorded = exact["updated_logits_f64"][valid], stored["updated_logits"]
