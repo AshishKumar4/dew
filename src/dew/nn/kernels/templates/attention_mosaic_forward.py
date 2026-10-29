@@ -150,7 +150,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         if live is None:
             status, out, *finished = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks,
                                              tiles=tiles, family=family, training=False, interpret=interpret,
-                                             counted=form.natural == spec.natural, rows=rows)
+                                             counted=form.natural == spec.natural, finishes=rows)
             return (out, *finished), status[0], status[1] > 0
         unit = guarded_columns(family, v.shape[-1], v.dtype)
         guarded = guarded_tiles(family, tiles, unit, v.dtype)
@@ -530,7 +530,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
             interpret: bool, columns: int | None = None, peaks: bool = False,
             anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False,
-            rows: bool = False):
+            finishes: bool = False):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -540,7 +540,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     their shift), the anchor keys `[B, H, Qp]` int32 and the split sums `[B, H, Qp, Dv]` fp32, in `Split`'s
     layout, each block's rows one contiguous slab. A peak walk
     (`peaks`) reads the keys alone and gives each row's keys' largest logit `[B, H, Qp]` fp32 in the walk's
-    units and its anchor key `[B, H, Qp]` int32 (`_peak_consumer`). With `rows`, the output's launch also
+    units and its anchor key `[B, H, Qp]` int32 (`_peak_consumer`). With `finishes`, the output's launch also
     gives its rows' finished maxima and denominators `[2, B, H, Qp]` fp32 (`Output`, `algebra.finish`).
     """
     batch, queries, heads, width = query.shape
@@ -596,8 +596,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                                        stages[0].at[index])
             else:
                 out_view = outputs[0].at[rows]
-            finished = None if len(outputs) < 2 else tuple(outputs[1].at[place, *state_rows]
-                                                           for place in range(2))
+            finished = None if training or not finishes else tuple(outputs[1].at[place, *state_rows]
+                                                                        for place in range(2))
             _consumer(program, spec, index, q_ref.at[rows], out_view, status, q_smem.at[index],
                       q_loaded.at[index], out_smem.at[index], row_smem.at[index], streams, turn, streamed,
                       first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)), hooks=hooks,
@@ -624,7 +624,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                     jax.ShapeDtypeStruct((batch, heads, queries, value.shape[-1]), jnp.float32))
     else:
         out_type = (status_type, jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), out_dtype))
-        if rows:
+        if finishes:
             out_type += (jax.ShapeDtypeStruct((2, batch, heads, queries), jnp.float32),)
     approx_math = approximate(hooks, (block_q, block_k), value.shape[-1], differentiated=False)
     # Each launch named apart, so its compile reports and profile rows say which it is.
