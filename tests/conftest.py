@@ -3,6 +3,7 @@ import http.server
 import json
 import logging
 import os
+import sys
 import threading
 import urllib.parse
 from pathlib import Path
@@ -75,10 +76,11 @@ def pytest_runtest_makereport(item, call):
     `gate_findings`, a JSON list of each finding's leaf, rule, measure (an infinite one `Infinity`) and
     the phase it failed: what a promotion matches a candidate's failures to its parent's by."""
     outcome = yield
-    if call.excinfo is not None:
-        from reference_error import GateFailure
-
-        if isinstance(call.excinfo.value, GateFailure):
+    # Only a test that loaded the gate can raise its GateFailure: a skip or another failure loads none, so
+    # the files whose tests skip are not keyed on the gate's every change in the test cache.
+    gate = sys.modules.get("reference_error")
+    if call.excinfo is not None and gate is not None:
+        if isinstance(call.excinfo.value, gate.GateFailure):
             found = ("gate_findings", json.dumps([{"leaf": finding.leaf, "rule": finding.rule,
                                                    "measure": finding.measure, "phase": call.when}
                                                   for finding in call.excinfo.value.findings]))
