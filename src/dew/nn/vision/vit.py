@@ -30,7 +30,6 @@ from dew.batch import coordinates
 from dew.interop.unread import Stored, held
 from dew.interop.weights import Tree, checkpoint_array, insert, placed
 from dew.nn.activations import activation as named_activation
-from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import DecoderBlock
 from dew.nn.blocks import table_rows, torch_bicubic_resize
 from dew.nn.conv import Conv
@@ -38,6 +37,7 @@ from dew.nn.dense import Dense
 from dew.nn.flops import matching_lengths, patch_lengths, projection_flops
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mlp import GatedMLP
+from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import float32_dot_general
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import logical_axes

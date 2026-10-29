@@ -49,7 +49,7 @@ def test_session_digest_changes_with_source_content_or_population(tmp_path):
 
 def defined(test: str) -> bool:
     """Whether `test`, a file or a `file::name` (a parametrized id's base), names a file of the
-    repository and, with a name, a function or class its module defines."""
+    repository and, with a name, a test its module defines as pytest collects one."""
     path, _, name = test.partition("::")
     source = ROOT / path
     if not source.is_file():
@@ -57,8 +57,13 @@ def defined(test: str) -> bool:
     if not name:
         return True
     tree = ast.parse(source.read_text())
-    return name.split("[")[0] in {node.name for node in tree.body
-                                  if isinstance(node, ast.FunctionDef | ast.ClassDef)}
+    def tested(node) -> bool:
+        # As pytest collects: a test_ function, or a Test class with a test_ method.
+        if isinstance(node, ast.FunctionDef):
+            return node.name.startswith("test")
+        return isinstance(node, ast.ClassDef) and node.name.startswith("Test") and any(map(tested, node.body))
+
+    return name.split("[")[0] in {node.name for node in tree.body if tested(node)}
 
 
 def test_every_selection_names_its_tests_and_a_deleted_test_is_refused_before_the_baseline(tmp_path):
@@ -71,7 +76,8 @@ def test_every_selection_names_its_tests_and_a_deleted_test_is_refused_before_th
                                          *FILE_TESTS.values()) for test in selection}
     assert selections and [test for test in sorted(selections) if not defined(test)] == []
     here = Path(__file__).relative_to(ROOT)
-    assert defined(f"{here}::defined") and not defined(f"{here}::deleted")
+    test = "test_every_selection_names_its_tests_and_a_deleted_test_is_refused_before_the_baseline"
+    assert defined(f"{here}::{test}") and not defined(f"{here}::defined") and not defined(f"{here}::deleted")
     assert not defined("tests/test_deleted.py")
     gone = Target("src/dew/diffusion/schedules", ("tests/test_schedulers.py", "tests/test_deleted.py"))
     with pytest.raises(ValueError):

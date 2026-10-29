@@ -114,6 +114,17 @@ Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and 
 | `host_parameters` | `()` | Globs of variables an inference placement keeps in pinned host memory |
 | `frozen_whole` | `False` | Keep the frozen collection (a LoRA run's base) whole over `fsdp`, split only over the other axes its rules give it |
 
+To change one name's placement and keep every other, drop the default table's rules for that name and put yours ahead of the rest. This keeps the vocabulary off the `tensor` axis, whether `fsdp` can split it or not:
+
+```python
+from dew.mesh import DEFAULT_RULES
+from dew.training import Layout
+
+layout = Layout(rules=(("vocab", "fsdp"), *(rule for rule in DEFAULT_RULES if rule[0] != "vocab")))
+```
+
+A rule put ahead of the defaults without dropping theirs is only a preference: where it cannot place the dimension (its axis has size 1, or does not divide it), the default rules for the name behind it still apply. A rules mapping, or a sequence without the defaults, replaces the table whole. The defaults name some logical axes more than once as fallbacks, and a mapping keeps one rule per name, so build a variant from them as above and not as `dict(DEFAULT_RULES)`.
+
 A parameter that no module declares logical axes for is split on its largest dimension that the `fsdp` size divides. `Layout.check` raises `LayoutRefused` when more than `tolerance` of the shardable elements stay replicated, and it lists the largest replicated parameters. Raising `tolerance` only hides the problem, so fix the placement. A rule that puts a parameter on `data` or `stage` is refused.
 
 The `sequence` axis's devices compute their own positions with the same weights, as `fsdp`'s compute their own rows, so the two hold the training state between them. Whatever the rules put on `fsdp` is split over `fsdp` and `sequence` together wherever their product divides that dimension and the pair leaves the other axes' splits as they are, and over `fsdp` alone otherwise. On `MeshSpec(fsdp=2, sequence=2)` a parameter the pair splits lies on each device as on `MeshSpec(fsdp=4)`, a quarter of it, and so do its optimizer moments, its EMA copy and its gradient; on `MeshSpec(sequence=N)` an N-th. Parameters below `min_shard` stay replicated, and `frozen_whole` keeps the frozen collection whole over both. A step reads such a weight as it reads an `fsdp` split. torchtitan's FSDP shards over its `dp_shard` and `cp` axes together in the same way. `Layout.check` counts the axes the rules name, so a `sequence` size that divides none of a parameter's dimensions leaves that parameter whole over `sequence` without a refusal.

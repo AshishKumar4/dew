@@ -56,7 +56,7 @@ class JepaRunConfig(RunConfig):
         varies."""
         return media_field(self.chain(), "JEPA")
 
-    def prepare(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The encoder, the predictor over its patch grid, the target-block mask
         and the probes, around the objective the run names. The predictor
         computes as the encoder does, its compute dtype and attention kernel."""

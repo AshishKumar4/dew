@@ -11,7 +11,8 @@ from attention_oracle import exact_attention
 from reference_error import assert_as_exact
 
 from dew.batch import coordinates
-from dew.nn.attention import alibi_bias, chunk_mask, key_spans, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention_masks import alibi_bias, chunk_mask, key_spans
 from dew.nn.documents import CrossDocuments, cross_document_mask, document_mask
 from dew.nn.inputs import counted_places
 from dew.nn.kernels.templates import attention as template

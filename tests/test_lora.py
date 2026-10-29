@@ -1469,3 +1469,155 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
     rebuilt = Adapter.from_run(tmp_path / "run")
     rebuilt.save(rebuilt.variables, tmp_path / "from-run")
     _same_files(tmp_path / "from-run", tmp_path / "in-process")
+
+
+def test_an_imported_adapter_binds_to_its_bundle_as_a_fresh_one_does(decoder, tmp_path):
+    """`source.adapt(LoRA(..., source=<PEFT directory>))` binds an imported adapter to the bundle as a
+    fresh spec's does: its factors are the file's (the adapted model computes what `LoRA.load` binds,
+    bit for bit), the adapter saves its factors back under the source's names, and the bundle saves the
+    merged weights a plain load computes. A spec stating another rank, alpha, target, rslora or dropout
+    than the file holds is refused, as is the PEFT fixture whose modules take ranks and alphas of their
+    own, which one spec cannot state."""
+    spec = LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0, dropout=0.0)
+    drawn = decoder.adapt(spec, key=0)
+    # Factors that move the logits, so the import is no identity.
+    trained = {**drawn.variables, "params": jax.tree.map(lambda leaf: leaf + 0.05, drawn.variables["params"])}
+    drawn.adapter.save(trained, tmp_path / "imported")
+    expected = LoRA.load(decoder.model, decoder.variables, tmp_path / "imported", layouts=decoder.layouts)
+    stated = dataclasses.replace(spec, source=str(tmp_path / "imported"))
+    bundled = decoder.adapt(stated, key=1)
+    ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6) % decoder.model.vocab_size
+    found = np.asarray(bundled.model.apply(bundled.variables, ids))
+    np.testing.assert_array_equal(found, np.asarray(expected.model.apply(expected.variables, ids)))
+    assert not np.array_equal(found, np.asarray(decoder.model.apply(decoder.variables, ids)))
+    bundled.adapter.save(bundled.variables, tmp_path / "again")
+    again = LoRA.load(decoder.model, decoder.variables, tmp_path / "again", layouts=decoder.layouts)
+    jax.tree.map(np.testing.assert_array_equal, thaw(again.variables), thaw(expected.variables))
+    bundled.save(tmp_path / "merged")
+    merged = Pretrained.load(tmp_path / "merged", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(merged.model.apply(merged.variables, ids)),
+                                  np.asarray(decoder.model.apply(expected.merge(expected.variables), ids)))
+    for other in ({"rank": 4}, {"alpha": 8.0}, {"modules": ("q_proj",)}, {"rslora": True},
+                  {"dropout": 0.1}):
+        with pytest.raises(ValueError):
+            decoder.adapt(dataclasses.replace(stated, **other), key=0)
+    with pytest.raises(ValueError):
+        decoder.adapt(LoRA(rank=4, modules=("q_proj", "v_proj", "down_proj"), alpha=8, dropout=0.1,
+                           source=str(ADAPTER)), key=0)
+
+
+TRAIN_IMPORTED = """
+import sys
+from dew.config.lm import LMRunConfig
+from dew.data import Loading, presets
+from dew.data.sources.tokens import TokenFiles
+from dew.registry import ModelConfig
+
+tokens, root, name = sys.argv[1:4]
+chain = TokenFiles(tokens).pipe(presets.lm, None, seq_len=8, batch=8, pack=None).loading(Loading(workers=0))
+model = ModelConfig("causal_transformer",
+                    {"emb_features": 16, "num_layers": 1, "num_heads": 2, "dtype": "float32"})
+LMRunConfig.cli([*sys.argv[4:], "--trainer.name", name, "--trainer.checkpoint-dir", root,
+                 "--trainer.steps", "1",
+                 "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+                 "--trainer.eval-every", "None", "--trainer.checkpoint-every", "1", "--max-new-tokens", "0",
+                 "--optim.learning-rate", "0"], default=LMRunConfig(data=chain, model=model)).run()
+"""
+"""A recorded LM run in a process of its own, which reads `HF_ENDPOINT` as it imports the Hub client:
+`tokens`, the runs' root and the run's name, then its own flags."""
+
+
+def test_a_recorded_run_imports_its_adapter_from_the_hub_and_replays_it_offline(tmp_path):
+    """A run whose `--lora.source` names a Hub repo (here on the loopback) starts from that adapter's
+    factors and records the repo at the commit it read (`RunConfig.pinned`); with the Hub gone, the same
+    command reads the cached commit and records it alike. At a zero learning rate each run's factors
+    are the served adapter's, bit for bit."""
+    import json
+    import subprocess
+    import sys
+
+    from local_hub import LocalHub, hub_environment
+    from token_support import write_token_corpus
+
+    ids = np.random.RandomState(0).randint(1, 250, 640).astype(np.uint8)
+    tokens = write_token_corpus(tmp_path / "tokens", ids)
+    spec = ["--lora.rank", "2", "--lora.modules", "q_proj", "v_proj", "--lora.alpha", "4.0"]
+
+    def trained(name, *flags, hub=None, offline=False):
+        done = subprocess.run([sys.executable, "-c", TRAIN_IMPORTED, tokens.train, str(tmp_path / "runs"),
+                               name, *spec, *flags], env=hub_environment(hub, tmp_path, offline=offline),
+                              capture_output=True, text=True, check=False)
+        assert done.returncode == 0, done.stderr[-3000:]
+        return tmp_path / "runs" / name
+
+    # A fresh adapter's run writes the factors the Hub then serves, moved off zero so they compute.
+    fresh = Adapter.from_run(trained("fresh"))
+    moved = {**fresh.variables, "params": jax.tree.map(lambda leaf: leaf + 0.05, fresh.variables["params"])}
+    fresh.save(moved, tmp_path / "served")
+    served = {name: tmp_path / "served" / name for name in (lora.PEFT_CONFIG, lora.PEFT_WEIGHTS)}
+    with LocalHub({"local/adapter": served}) as hub:
+        online = trained("online", "--lora.source", "local/adapter", hub=hub)
+        commit = hub.commit("local/adapter")
+    offline = trained("offline", "--lora.source", "local/adapter", offline=True)
+    for run in (online, offline):
+        recorded = json.loads((run / "run.json").read_text())["fields"]["lora"]
+        assert recorded["source"] == f"local/adapter@{commit}"
+        restored = Adapter.from_run(run, step=1)
+        jax.tree.map(np.testing.assert_array_equal, thaw(restored.variables)["params"],
+                     thaw(moved)["params"])
+
+
+ADAPT_IMPORTED = """
+import sys
+import jax.numpy as jnp
+import numpy as np
+from dew.interop.pretrained import Pretrained
+from dew.lora import LoRA
+
+decoder = Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference")
+spec = LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0, source=sys.argv[2], weight_name=sys.argv[3])
+bundled = decoder.adapt(spec, key=0)
+ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6) % decoder.model.vocab_size
+np.save(sys.argv[4], np.asarray(bundled.model.apply(bundled.variables, ids)))
+"""
+"""An imported adapter bound to a decoder in a process of its own, which reads `HF_ENDPOINT` as it
+imports the Hub client: the decoder, the adapter's source and its weight name, and where its logits go."""
+
+
+def test_an_adapter_named_by_its_folder_fetches_the_files_it_reads_alone(decoder, tmp_path):
+    """An adapter inside a checkpoint folder (`--lora.weight-name checkpoint-10`) beside the trainer's
+    own state loads from a local directory, through a link to that folder, and from a Hub repo alike,
+    computing the same logits, bit for bit, as `LoRA.load` of that folder; from the Hub only its PEFT
+    pair is fetched, the optimizer state and the root's other files left there."""
+    import subprocess
+    import sys
+
+    from local_hub import LocalHub, hub_environment
+
+    drawn = decoder.adapt(LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0), key=0)
+    moved = {**drawn.variables, "params": jax.tree.map(lambda leaf: leaf + 0.05, drawn.variables["params"])}
+    checkpoint = tmp_path / "local" / "checkpoint-10"
+    drawn.adapter.save(moved, checkpoint)
+    (checkpoint / "optimizer.pt").write_bytes(b"\x80" * 64)
+    (tmp_path / "local" / "other.safetensors").write_bytes(b"\x00" * 16)
+    ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6) % decoder.model.vocab_size
+    expected = LoRA.load(decoder.model, decoder.variables, checkpoint, layouts=decoder.layouts)
+    logits = np.asarray(expected.model.apply(expected.variables, ids))
+    spec = LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0, source=str(tmp_path / "local"),
+                weight_name="checkpoint-10")
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "checkpoint-10").symlink_to(checkpoint, target_is_directory=True)
+    for source in (tmp_path / "local", linked):
+        local = decoder.adapt(dataclasses.replace(spec, source=str(source)), key=1)
+        np.testing.assert_array_equal(np.asarray(local.model.apply(local.variables, ids)), logits)
+    served = {path.relative_to(tmp_path / "local").as_posix(): path
+              for path in (tmp_path / "local").rglob("*") if path.is_file()}
+    with LocalHub({"local/checkpoints": served}) as hub:
+        done = subprocess.run([sys.executable, "-c", ADAPT_IMPORTED, str(LLAMA), "local/checkpoints",
+                               "checkpoint-10", str(tmp_path / "hub.npy")],
+                              env=hub_environment(hub, tmp_path), capture_output=True, text=True, check=False)
+        assert done.returncode == 0, done.stderr[-3000:]
+        fetched = {read.file for read in hub.served if read.repo == "local/checkpoints" and read.file}
+    np.testing.assert_array_equal(np.load(tmp_path / "hub.npy"), logits)
+    assert fetched <= {"checkpoint-10/adapter_config.json", "checkpoint-10/adapter_model.safetensors"}

@@ -174,14 +174,9 @@ def recorded_logit_difference(model, variables, directory) -> float:
 
 
 def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path):
-    from shutil import copytree
-
     original = FIXTURES / "llama-tiny"
-    directory = tmp_path / "checkpoint"
-    copytree(original, directory)
-    config = fixture_config("llama-tiny")
-    config.update(is_llama_config=True, rope_interleaved=False)
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(original, tmp_path / "checkpoint",
+                          lambda config: {**config, "is_llama_config": True, "rope_interleaved": False})
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     ids = np.load(original / "input_ids.npy")
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
@@ -195,7 +190,6 @@ def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_
     state its embedding and residual dropout, which LlamaModel never applies: the release loads as
     the model its own fields state, the same model and variables bit for bit, and a repeat that
     states another value than its field is refused by name (ledger 1883)."""
-    from shutil import copytree
 
     original = FIXTURES / "llama-tiny"
     plain = Pretrained.load(original, dtype="float32")
@@ -205,10 +199,8 @@ def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_
     repeats = {"ffn_hidden_size": config["intermediate_size"],
                "num_query_groups": config["num_key_value_heads"], "rotary_base": theta,
                "kv_channels": head_dim, "seq_length": config["max_position_embeddings"]}
-    directory = tmp_path / "checkpoint"
-    copytree(original, directory)
     stated = {**config, "head_dim": head_dim, **repeats, "embd_pdrop": 0.0, "resid_pdrop": 0.0}
-    (directory / "config.json").write_text(json.dumps(stated))
+    directory = respelled(original, tmp_path / "checkpoint", lambda _: stated)
     loaded = Pretrained.load(directory, dtype="float32")
     assert loaded.model == plain.model
     for got, want in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(plain.variables), strict=True):
@@ -318,15 +310,12 @@ def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds
     disagree with the ones the reference reads: its logits under them are the bits it computes
     without them, the same program on the same values, which the fixture's parity test holds to the
     reference's."""
-    from shutil import copytree
 
     import torch
     import transformers
 
-    directory = tmp_path / "checkpoint"
-    copytree(FIXTURES / name, directory)
     config = {**fixture_config(name), **stale}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURES / name, tmp_path / "checkpoint", lambda _: config)
     ids = np.load(FIXTURES / name / "input_ids.npy")
 
     def theirs(source):
@@ -383,18 +372,15 @@ def test_an_olmo3_model_with_a_llama3_ramp_on_one_kind_writes_back_what_transfor
     """OLMo3 rotates each layer kind through its own rope_parameters entry, so a Llama-3 ramp on
     the full layers beside plain sliding ones loads, writes back in that spelling, and
     transformers' Olmo3 reads the export to the logits Dew computes."""
-    from shutil import copytree
 
     import torch
     from transformers import Olmo3ForCausalLM
 
-    source = tmp_path / "source"
-    copytree(FIXTURES / "olmo3-tiny", source)
     config = fixture_config("olmo3-tiny")
     config["rope_parameters"]["full_attention"] = {
         "rope_type": "llama3", "rope_theta": 500000.0, "factor": 8.0, "low_freq_factor": 1.0,
         "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
-    (source / "config.json").write_text(json.dumps(config))
+    source = respelled(FIXTURES / "olmo3-tiny", tmp_path / "source", lambda _: config)
     ids = np.load(FIXTURES / "olmo3-tiny" / "input_ids.npy")
     from dew.interop import PretrainedDecoder
 
@@ -1625,12 +1611,7 @@ def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, t
     """transformers saves the trunk alone whatever depth the config names:
     such a checkpoint, the dense one too, whose default step names a routed
     kind its trunk lacks, loads the trunk it holds and computes its logits."""
-    from shutil import copytree
-
-    directory = tmp_path / name
-    copytree(FIXTURES / name, directory)
-    stated = {**fixture_config(name), "num_nextn_predict_layers": 1}
-    (directory / "config.json").write_text(json.dumps(stated))
+    directory = _respelled(name, tmp_path, lambda config: {**config, "num_nextn_predict_layers": 1})
     model, variables = fp32_decoder(directory)
     assert model.num_nextn_predict_layers == 0 and "mtp_0" not in variables["params"]
     ids = jnp.asarray(np.load(FIXTURES / name / "input_ids.npy"), jnp.int32)

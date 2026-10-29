@@ -26,7 +26,7 @@ from memory_support import (
     layer,
     written,
 )
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -61,43 +61,60 @@ def decoder(memory: InContextMemory | None = None, **fields):
                                 "kinds": {"memory": LayerKind(mixer=InContextMemoryMixer(memory))}, **fields})
 
 
-@pytest.mark.whole_suite
-def test_a_memory_decoder_trains_scans_remats_and_decodes():
-    """A decoder whose first two layers are memories, which its scanned stack scans as one group, from
-    the plain loop's tree: the scanned stack's logits and gradient, and both under a remat policy that
-    keeps each memory's chunk carry (`CARRY`), are the plain loop's, on par against float64 (check 1),
-    the gradient reaching every memory's initial network; and the scanned stack's cached decode, token
-    by token after a prefill, gives the full pass's last logits (check 1)."""
+def trained(model):
+    """`model`'s logits and its parameters' gradient under a cotangent, compiled."""
+    @jax.jit
+    def run(variables, ids, cotangent):
+        logits, pull = jax.vjp(lambda held: model.apply(held, ids), variables)
+        return logits, pull(cotangent)[0]["params"]
+    return run
+
+
+def memory_draw(plain):
+    """The decoder's drawn inputs (`model_draw`) and a drawn cotangent over its logits."""
     from model_support import model_draw
 
-    from dew.nn.backbones.decoder_block import RematPolicy
-
-    plain, scanned = decoder(), decoder(scan_layers=True)
-    rematted = decoder(scan_layers=True, remat=RematPolicy(save=(CARRY,)))
-    wide = decoder(dtype=jnp.float64)
     draw_model = model_draw(plain, (ROWS, LENGTH), 37)
 
-    def trained(model):
-        """The model's logits and its parameters' gradient under a cotangent."""
-        @jax.jit
-        def run(variables, ids, cotangent):
-            logits, pull = jax.vjp(lambda held: model.apply(held, ids), variables)
-            return logits, pull(cotangent)[0]["params"]
-        return run
-
-    def draw_with_cotangent(seed: int):
+    def draw(seed: int):
         cotangent = np.random.default_rng([1648, seed]).standard_normal((ROWS, LENGTH, 37)).astype(np.float32)
         return *draw_model(seed), cotangent
+    return draw_model, draw
 
-    for name, model in (("scanned", scanned), ("rematted", rematted)):
-        assert_as_exact(trained(model), trained(plain), draw_with_cotangent,
-                        f"{name} memory decoder gradient", seeds=SEEDS["memory decoder gradient"],
-                        truth_fn=trained(wide))
-    gradient = trained(rematted)(*draw_with_cotangent(0))[1]
+
+def test_a_scanned_memory_decoder_trains_as_the_plain_loop():
+    """A decoder whose first two layers are memories, which its scanned stack scans as one group, from
+    the plain loop's tree: the scanned stack's logits and gradient are the plain loop's, on par against
+    float64 (check 1)."""
+    plain = decoder()
+    _, draw = memory_draw(plain)
+    assert_as_exact(trained(decoder(scan_layers=True)), trained(plain), draw,
+                    "scanned memory decoder gradient", seeds=SEEDS["memory decoder gradient"],
+                    truth_fn=trained(decoder(dtype=jnp.float64)))
+
+
+def test_a_rematted_memory_decoder_trains_as_the_plain_loop_reaching_every_memory():
+    """The scanned memory decoder under a remat policy that keeps each memory's chunk carry (`CARRY`):
+    its logits and gradient are the plain loop's, on par against float64 (check 1), the gradient reaching
+    every memory's initial network."""
+    from dew.nn.backbones.decoder_block import RematPolicy
+
+    plain, rematted = decoder(), decoder(scan_layers=True, remat=RematPolicy(save=(CARRY,)))
+    _, draw = memory_draw(plain)
+    assert_as_exact(trained(rematted), trained(plain), draw, "rematted memory decoder gradient",
+                    seeds=SEEDS["memory decoder gradient"], truth_fn=trained(decoder(dtype=jnp.float64)))
+    gradient = trained(rematted)(*draw(0))[1]
     for index in (0, 1):
         layer = gradient[f"layers_{index}"]["self_attn"]
         assert all(np.abs(np.asarray(leaf)).max() > 0 for name in layer if head_of((name,)) is not None
                    for leaf in jax.tree.leaves(layer[name]))
+
+
+def test_a_scanned_memory_decoder_decodes_as_its_full_pass():
+    """The scanned memory decoder's cached decode, token by token after a prefill, gives the full pass's
+    last logits, on par against float64 (check 1)."""
+    plain, scanned = decoder(), decoder(scan_layers=True)
+    draw_model, _ = memory_draw(plain)
 
     @jax.jit
     def decoded(variables, ids):
@@ -112,7 +129,7 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
         return jax.jit(lambda variables, ids: model.apply(variables, ids)[:, -1])
 
     assert_as_exact(decoded, last(plain), draw_model, "memory decoder decode",
-                    seeds=SEEDS["memory decoder decode"], truth_fn=last(wide))
+                    seeds=SEEDS["memory decoder decode"], truth_fn=last(decoder(dtype=jnp.float64)))
 
 
 ADAPTED = {"titans": ("titans", ("layers_0", "layers_1"), 2 * HEADS * 2),
@@ -514,9 +531,8 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
     from its request's own key (`dew.sampling.text.rounding_keys`), Titans' MLP and a linear memory
     whose cache holds the recurrence's state alike: a task call and one live server each repeat a
     request alike, and another key moves its likelihoods though greedy decoding draws nothing. A row's
-    stream is its own (`test_a_cached_memorys_rounding_is_each_rows_own`); a batch-mate's values still
-    enter through the quantization's scales (ledger 2032). Without the stream the decode raised in
-    Qwix's make_rng (ledger 2020)."""
+    stream is its own (`test_a_cached_memorys_rounding_is_each_rows_own`). Without the stream the decode
+    raised in Qwix's make_rng (ledger 2020)."""
     pytest.importorskip("qwix")
     from model_support import Digits
 
@@ -541,6 +557,38 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
         (first,), (again,), (moved,) = generate(["12"], 3), generate(["12"], 3), generate(["12"], 4)
         np.testing.assert_array_equal(likelihoods(again), likelihoods(first))
         assert not np.array_equal(likelihoods(moved), likelihoods(first))
+
+
+def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward():
+    """A memory decoder served quantized (`TextGeneration.quantized`: every inner Dense of its heads'
+    networks, weights and activations) through a server's two slots draws tokens whose likelihoods are on
+    par with the served decoder's full forward over the same tokens, against quantized training from its
+    stored W_0 in float64 (check 1; `assert_served_as_exact`), as is the lone task's over its own draws.
+    The tokens scored are each one's own: a moving weight's quantization rounds at boundaries that a 1e-7
+    relative change of the weights crosses, moving the likelihoods by 1.2e-2 where the unquantized
+    decoder moves by 1.4e-6, so a lone task batched with itself already moves its likelihoods by 8.8e-4
+    and no two programs of it draw alike by rule (ledger 2032; armada probes IG2032 and IG2032c at main
+    783ea620a)."""
+    pytest.importorskip("qwix")
+    from model_support import Digits
+    from serving_support import Served, assert_served_as_exact
+
+    from dew.inference import RunProcessor, TextGeneration
+    from dew.quantization import Quantization, decoded_stored
+    from dew.sampling import Sampling
+
+    model = decoder().clone(max_seq_len=64)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    spec = Quantization(patterns=(INNER,))
+    task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    bound = task.quantized(spec)
+    # The served decoder computes quantized training from the float its stored W_0 decodes to (`served_site`),
+    # each code times its scale in float64 for the truth, as the decoder's own decode computes it exactly.
+    with jax.enable_x64(new_val=True):
+        start = decoded_stored(widened(bound.variables))
+    assert_served_as_exact(bound, (Served(3), Served(5)), "served quantized memory",
+                           serving={"slots": 2, "capacity": 64}, alone=False,
+                           truth=(spec.apply(model), start))
 
 
 def test_a_cached_memorys_rounding_is_each_rows_own():
