@@ -34,10 +34,6 @@ from dew.nn.kernels.templates import bundles, mosaic, product, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import mainloop, template
 
-ON_ITS_FAMILY = pytest.mark.skipif(
-    mainloop.family_of() is None,
-    reason="the mainloop's bundles run compiled on a GPU of the family each claims (an A100's, an H100's)")
-
 pytestmark = pytest.mark.kernel
 
 SEEDS = 8
@@ -87,11 +83,21 @@ dimension's launches packed and not, and an fp32 call's refusal under one. Inter
 3.5 times these (2838 against 805 seconds)."""
 
 def interpreted(grid: list[tuple], chosen: set[tuple]) -> list:
-    """`grid`'s parameters, each id its values joined by '-', those not in `chosen` the GPU tier's alone
-    (`NATIVE`); a test's dtype taken by its id."""
-    return [pytest.param(*(DTYPES.get(value, value) for value in values), id='-'.join(values),
-                         marks=() if values in chosen else NATIVE)
-            for values in grid]
+    """`grid`'s parameters the CPU interprets, those in `chosen`, each id its values joined by '-'; the rest
+    are the GPU flow's alone (`native`, tests/test_gpu_recurrence.py); a test's dtype taken by its id."""
+    return [pytest.param(*(DTYPES.get(value, value) for value in values), id='-'.join(values))
+            for values in grid if values in chosen]
+
+
+def native(grid: list[tuple], chosen: set[tuple]) -> list[tuple[str, tuple]]:
+    """`grid`'s parameters the GPU flow checks alone, those not in `chosen` (`interpreted`): each its id, its
+    values joined by '-', and its values, a dtype taken by its id."""
+    return [('-'.join(values), tuple(DTYPES.get(value, value) for value in values))
+            for values in grid if values not in chosen]
+
+
+FORWARD_GRID = [(case, dtype) for dtype in DTYPES for case in SHAPES]
+"""The forward's cases, the CPU's (`INTERPRETED_FORWARD`) and the GPU flow's."""
 
 
 INTERPRETED_HEADS = {'one sequence': {'key_heads': 1, 'value_heads': 2, 'value_width': 64},
@@ -218,8 +224,7 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
     return rule
 
 
-@pytest.mark.parametrize(('case', 'dtype'), interpreted(
-    [(case, dtype) for dtype in DTYPES for case in SHAPES], INTERPRETED_FORWARD))
+@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, INTERPRETED_FORWARD))
 def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
     """The mainloop's output and final memory on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time in float64): the gated delta rule with a decay a head or
@@ -423,10 +428,7 @@ a decay, the gated linear attentions, the rated scan in bf16 and the formed hook
 evidence on the template; their reference arm in a 16-bit call is open)."""
 
 
-@ON_ITS_FAMILY
-@pytest.mark.parametrize('packed', (False, True), ids=['one sequence', 'packed'])
-@pytest.mark.parametrize('hooks', TAKEN, ids=str)
-def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
+def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
     """The chunked op on the mainloop, each hook combination it takes, its output and final memory on par with
     the recurrence a token at a time's from float64 over the site's declared draws (check 1), as
     test_recurrence_chunk holds the portable math; a call the template refuses (a launch's registers past a

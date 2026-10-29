@@ -349,15 +349,17 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
                              finite_seeds=SEEDS[name, regime])
 
 
-ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-{backend}',
-                           marks=getattr(pytest.mark, backend)(reason=f"the portable backward as {backend} "
-                                                                      f"compiles it"))
-               for backend in ('gpu', 'tpu') for name in ('scalar delta', 'vector delta')
+ACCELERATED = [(name, regime) for name in ('scalar delta', 'vector delta')
                for regime in ('decays near zero', 'aligned keys', 'resets on chunk edges')]
 """The gradient sites an accelerator holds too: the portable backward is a TPU's default and any GPU's past
 its kernels, whose compilers fuse and round its arithmetic as the CPU's do not (template numerics review
 2026-10-26 follow-up: its float64 evidence was the CPU's alone); the delta rule a decay a head and a key
-dimension under the regimes its chunked forms break hardest."""
+dimension under the regimes its chunked forms break hardest. A TPU runs them here; a GPU in its flow
+(tests/test_gpu_recurrence.py)."""
+
+TPU_ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-tpu',
+                                marks=pytest.mark.tpu(reason="the portable backward as tpu compiles it"))
+                   for name, regime in ACCELERATED]
 
 
 PAST_TARGET = {"gradient": {('rated', 'a fading memory'): 246}}
@@ -365,7 +367,7 @@ PAST_TARGET = {"gradient": {('rated', 'a fading memory'): 246}}
 f58abb8a3, ledger 2125), which the whole suite runs (`timed`)."""
 
 
-@pytest.mark.parametrize('name, regime', timed(PAST_TARGET, "gradient", CASES + ACCELERATED))
+@pytest.mark.parametrize('name, regime', timed(PAST_TARGET, "gradient", CASES + TPU_ACCELERATED))
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
     token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
@@ -401,12 +403,7 @@ PORT_GRADIENT_SEEDS = {
 }
 """Each regime's declared seeds for the SSD port's gradient (check 1), sized as `PORT_SEEDS` are."""
 
-PORT = pytest.mark.gpu(reason="the SSD port compiled, as a GPU runs it")
-
-
-@PORT
-@pytest.mark.parametrize('regime', REGIMES)
-def test_the_ssd_port_stays_finite_and_exact_where_chunked_forms_break(regime):
+def the_ssd_port_stays_finite_and_exact_where_chunked_forms_break(regime):
     """The rated scan on the SSD port (row 1341: the suite held the portable math alone): its output and
     final memory finite wherever the float64 reference's are on every declared seed, and on par with the
     token-by-token recurrence's from float64 (check 1), as the portable math's are."""
@@ -418,9 +415,7 @@ def test_the_ssd_port_stays_finite_and_exact_where_chunked_forms_break(regime):
                              finite_seeds=PORT_SEEDS[regime])
 
 
-@PORT
-@pytest.mark.parametrize('regime', REGIMES)
-def test_the_ssd_ports_gradient_is_as_exact_as_the_recurrences(regime):
+def the_ssd_ports_gradient_is_as_exact_as_the_recurrences(regime):
     """The SSD port's gradient (its custom VJP's) finite wherever the reference's in float64 is, and on par
     with the token-by-token recurrence's from float64 (check 1) over the regime's declared seeds."""
     hooks = SITES['rated']

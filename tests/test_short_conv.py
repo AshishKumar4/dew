@@ -212,11 +212,7 @@ def test_a_conv_the_kernels_do_not_take_runs(dtype, out, parts, taps):
                         seeds=REFUSED_SEEDS, truth_fn=loss(xla_conv1d, out=jnp.float64))
 
 
-@pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-@pytest.mark.parametrize("model", sorted(CONV_SHAPES))
-def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
+def the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
     """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
     fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as
     XLA's own conv (`assert_as_exact_as_the_reference`), at each launch's config at that model's shapes.
