@@ -150,9 +150,9 @@ def test_the_blackwell_forward_keeps_its_widths_through_its_guards_interpreted(w
         return tuple(jnp.asarray(rng.normal(size=(1, 136, 2, size)), jnp.bfloat16)
                      for size in (width, width, value_width))
 
-    ours = _attended(False, 136, 1, interpret=True)
+    ours = _attended(CASES["full"], 136, 1, interpret=True)
     assert jax.eval_shape(ours, *draw(0)).shape == (1, 136, 2, value_width)
-    assert_as_exact(ours, _attended(False, 136, 1, reference=True), draw,
+    assert_as_exact(ours, _attended(CASES["full"], 136, 1, reference=True), draw,
                     f"blackwell {width} over {value_width}", seeds=SEEDS)
 
 
