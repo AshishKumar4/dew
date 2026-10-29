@@ -17,7 +17,7 @@ import tokamax
 
 from dew.devices import deterministic_ops_requested
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resources
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, mosaic_sm90, resources
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
@@ -267,7 +267,20 @@ class MosaicForward(_Mainloop[Tiles]):
                       ba.arguments["initial"], self.output_mod,
                       tuple(map(Param, ba.arguments["output_params"], self.output_kinds)),
                       ba.arguments["drop"])
+        # An interpreted launch runs no race, and an assumed GPU's compile (the CPU gate's, compile-ahead's)
+        # runs nothing.
+        run_here = not ba.arguments["interpret"] and generation.ASSUMED.get() is None
+        if ba.arguments["residuals"] and run_here and family.name == mosaic_sm90.WGMMA.name:
+            return TRAINING_FAULT
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
+
+
+TRAINING_FAULT = ("the training forward on warpgroup MMA dies at times with CUDA_ERROR_ILLEGAL_INSTRUCTION "
+                  "on an H100, its rate the run's timing (B2 S4096 H32 KV8 D128: 7 of 8 processes on fork "
+                  "post32, 1 of 1 on post33's PCIe node, none under compute-sanitizer), until its mechanism "
+                  "is fixed (ledger 2254)")
+"""Why the Mosaic forward runs no compiled training call on warpgroup MMA: its route runs Triton's or
+XLA's."""
 
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool) -> int:
