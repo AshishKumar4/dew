@@ -185,10 +185,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         tokens = batch.get("tokens")
         if isinstance(tokens, ModelInputs) and tokens.conditioning:
             raise MissingFlopsCount("DecisionObjective needs its image tower's multi-sequence geometry")
+        # Spans in the context pool over its tokens, not the row's, where the head pools them.
+        pools = self.schema_in_context and model.head.pools_spans
         if not isinstance(model.head, CountedDecisions):
             raise MissingFlopsCount(f"{type(model.head).__name__} has no declared decision_flops")
-        # Spans in the context pool over its tokens, not the row's, where the head pools them.
-        pooled = self._context_lengths(batch) if self.schema_in_context and model.head.pools_spans else None
+        pooled = self._context_lengths(batch) if pools else None
         return model.head.decision_flops(*_rows(batch, self.schema_in_context),
                                          **({} if pooled is None else {"pooled": pooled}))
 

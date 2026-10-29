@@ -846,7 +846,10 @@ class QuestionLayout(Layout):
         row_tokens = laid.tokens
         # The question's spans are those of the stream it is written to; the readout is the row's last
         # token, its cue.
-        asked = (rendered_chunks(context, _Pieces(encoder) if unit == "pieces" else encoder, unit)
+        # A question's context holds its own segments' chunks, never a state's placeholder.
+        written = [chunk for chunk in context if isinstance(chunk, Chunk)]
+        assert len(written) == len(context), "a question's context holds no state"
+        asked = (rendered_chunks(written, _Pieces(encoder) if unit == "pieces" else encoder, unit)
                  if in_context else laid)
         spans = [asked.marks[("option", index)] for index in range(len(slots))]
         row = Laid(name, kind_of(question), asked.marks["question"], tuple(spans), tuple(slots),
