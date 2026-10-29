@@ -2,6 +2,8 @@
 primitive at a time, natively, each equation held to its own operation's contract, as the lane
 computes (`lane`, measured on it), and a primitive without a contract refused."""
 
+import itertools
+
 import certified as ct
 import jax
 import jax.numpy as jnp
@@ -498,6 +500,36 @@ def _truncating_sum(values: np.ndarray) -> np.float32:
     return total
 
 
+def _truncating_sums(products: np.ndarray, rng) -> np.ndarray:
+    """Each element's `products` (summed along the last axis) summed by `_truncating_sum` in an order of its
+    own, as float64."""
+    flat = products.reshape(-1, products.shape[-1])
+    return np.asarray([_truncating_sum(row[rng.permutation(row.size)]) for row in flat],
+                      np.float64).reshape(products.shape[:-1])
+
+
+def _stepped_sums(products: np.ndarray, width: int, rng, exact: bool) -> list[np.ndarray]:
+    """The fp32 accumulator of each element's `products` (summed along the last axis) after each depth step
+    of `width` of them, from zero: each step's partial summed from zero by truncating adds in an order of its
+    own and added by an IEEE add (`exact`, as exact sums promote it), or each step's products added into the
+    accumulator itself by truncating adds, as the tensor cores add without exact sums."""
+    flat = products.reshape(-1, products.shape[-1])
+    states = [np.zeros(flat.shape[0], np.float32)]
+    for start in range(0, flat.shape[-1], width):
+        rows = (row[rng.permutation(row.size)] for row in flat[:, start:start + width])
+        states.append(np.asarray([np.float32(running + _truncating_sum(row)) if exact else
+                                  _truncating_sum(np.concatenate([[running], row]))
+                                  for running, row in zip(states[-1], rows, strict=True)], np.float32))
+    return [np.asarray(state, np.float64).reshape(products.shape[:-1]) for state in states]
+
+
+def _steps_held(states: list, products: np.ndarray, width: int) -> list[np.ndarray]:
+    """Each depth step's witness (`promoted_step_holds`) of `states`, the accumulators `_stepped_sums` gives,
+    against the true `products`."""
+    return [ct.promoted_step_holds(before, after, products[..., j * width:(j + 1) * width], flushes=False)
+            for j, (before, after) in enumerate(itertools.pairwise(states))]
+
+
 def test_the_truncating_model_keeps_the_low_part_of_an_add():
     """1 less 2^-80, both exact bf16 products, truncates to fp32's value below one, which a float64 add
     of them, rounding to one, would hide."""
@@ -526,12 +558,10 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
                                                      rng.uniform(0.5, 2.0, size=shape)), np.float64)
                        for shape in ((16, 128), (4, 128)))
         products = left[:, None, :] * right[None, :, :]
-        orders = [rng.permutation(128) for _ in range(products.shape[0] * products.shape[1])]
+        summed = _truncating_sums(products, rng)
         flat = products.reshape(-1, 128)
-        summed = np.asarray([_truncating_sum(row[order]) for row, order in zip(flat, orders, strict=True)])
         for out, native in ((oc.FLOAT32, summed), (oc.BFLOAT16, summed.astype(ml_dtypes.bfloat16))):
-            held = ct.native_dot_holds(np.asarray(native, np.float64).reshape(products.shape[:2]), products,
-                                       out, flushes=False)
+            held = ct.native_dot_holds(np.asarray(native, np.float64), products, out, flushes=False)
             assert np.all(held), (signed, out.name)
         lost = np.asarray([_truncating_sum(np.delete(row, np.argmax(np.abs(row)))) for row in flat])
         narrow = np.asarray([_truncating_sum(np.concatenate([
@@ -540,3 +570,63 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
             held = ct.native_dot_holds(faulty.reshape(products.shape[:2]).astype(np.float64), products,
                                        oc.FLOAT32, flushes=False)
             assert np.mean(held) < most, (signed, np.mean(held))
+
+
+def test_a_tf32_operand_rounds_to_nearest_a_tie_away_from_zero():
+    """TF32 keeps 11 of fp32's 24 bits: 1 + 2^-11, a tie, reads as 1 + 2^-10 (away from zero, where to even
+    it is 1) and its negative as its negative; a value just below the tie reads as 1, 1 + 3 2^-11, a tie at an
+    odd last bit, as 1 + 2^-9 (to even too), and a value TF32 holds as itself."""
+    values = [1 + 2 ** -11, -1 - 2 ** -11, 1 + 2 ** -11 - 2 ** -23, 1 + 3 * 2 ** -11, 1 + 2 ** -10]
+    expected = [1 + 2 ** -10, -1 - 2 ** -10, 1.0, 1 + 2 ** -9, 1 + 2 ** -10]
+    assert ct.tf32_operand(np.float32(values)).tolist() == expected
+
+
+def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf16_and_a_truncation():
+    """The TF32 contract (row 2084's link 2): a GEMM of fp32 operands at the default precision, its products
+    of their TF32 values (`tf32_operand`) summed in fp32 by truncating adds in any order, holds at every
+    element; the products of its operands' bf16 values where TF32 is declared, its TF32 products where bf16
+    ones are, and the products of its operands truncated to TF32 where the tensor cores round them each break
+    it at nearly every element (the truncation, whose products all err toward zero, at most on Gaussian
+    draws)."""
+    rng = np.random.default_rng(5)
+
+    def bf16(value):
+        return np.asarray(value.astype(ml_dtypes.bfloat16), np.float64)
+
+    for signed in (True, False):
+        left, right = (np.asarray((rng.normal(size=shape) if signed else rng.uniform(0.5, 2.0, size=shape))
+                                  .astype(np.float32), np.float64) for shape in ((32, 128), (8, 128)))
+        tf32, wide, truncated = (read(left)[:, None, :] * read(right)[None, :, :] for read in (
+            ct.tf32_operand, bf16, lambda value: oc.truncated(value, oc.TFLOAT32)))
+        native = _truncating_sums(tf32, rng)
+        assert np.all(ct.native_dot_holds(native, tf32, oc.FLOAT32, flushes=False)), signed
+        for faulty, products, most in ((_truncating_sums(wide, rng), tf32, 0.1), (native, wide, 0.1),
+                                       (_truncating_sums(truncated, rng), tf32, 0.5 if signed else 0.05)):
+            held = ct.native_dot_holds(faulty, products, oc.FLOAT32, flushes=False)
+            assert np.mean(held) < most, (signed, np.mean(held))
+
+
+def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_add_or_a_lost_product():
+    """The exact-sums witness (row 2084's link 2): an fp32 accumulator to which each depth step's partial,
+    summed from zero by truncating adds in any order, is added by an IEEE add holds at every step, on draws at
+    one scale and falling 2^-12 past the first step; the same steps' products added into the accumulator by
+    truncating adds, as the tensor cores add without exact sums, break it at most of the later steps' elements
+    of a falling draw, where it decides the add's rounding; and a step with its largest product lost breaks it
+    at nearly every element of that step and nowhere else."""
+    rng = np.random.default_rng(7)
+    width = 16
+    for signed in (True, False):
+        left, right = (np.asarray(ml_dtypes.bfloat16(rng.normal(size=shape) if signed else
+                                                     rng.uniform(0.5, 2.0, size=shape)), np.float64)
+                       for shape in ((16, 64), (4, 64)))
+        for fall in (1.0, 2.0 ** -12):
+            products = (left * np.where(np.arange(64) < width, 1.0, fall))[:, None, :] * right[None, :, :]
+            held = _steps_held(_stepped_sums(products, width, rng, exact=True), products, width)
+            assert all(np.all(step) for step in held), (signed, fall)
+        truncating = _steps_held(_stepped_sums(products, width, rng, exact=False), products, width)
+        assert np.mean(truncating[1:]) < 0.5, (signed, np.mean(truncating[1:]))
+        lost = products.copy()
+        step = lost[..., 2 * width:3 * width]
+        np.put_along_axis(step, np.argmax(np.abs(step), -1)[..., None], 0.0, -1)
+        held = _steps_held(_stepped_sums(lost, width, rng, exact=True), products, width)
+        assert np.mean(held[2]) < 0.05 and all(np.all(held[j]) for j in (0, 1, 3)), signed

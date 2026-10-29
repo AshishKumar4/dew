@@ -13,6 +13,7 @@ import numpy as np
 from op_certificates import (
     EXP_RANGE,
     FORMATS,
+    TFLOAT32,
     Format,
     exact_sum,
     gamma,
@@ -20,6 +21,7 @@ from op_certificates import (
     interval_precision,
     magnitude_sum,
     rounded,
+    rounded_away,
     two_sum,
 )
 
@@ -330,14 +332,12 @@ up to a whole unit in the last place, twice round to nearest's (src/dew/nn/kerne
 the unit roundoff of a format one bit narrower."""
 
 
-def native_dot_holds(native, products, out: Format, flushes: bool) -> np.ndarray:
-    """Whether each element of a native GEMM's output is a value its exact `products` (float64, summed along
-    the last axis) admit, as check 2 holds a fused template GEMM natively (row 2084, link 1): accumulated in
-    fp32 in any order by adds that truncate (`TRUNCATING`), within γ_n of their magnitudes of the exact sum
-    plus what underflow loses past that (as `_terms_hold`), then rounded once to nearest in `out`, the
-    output's format. Rounding is monotone, so the output lies between the nearest `out` values of the
-    allowance's two ends."""
+def _native_dot_ends(products, out: Format, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
+    """The least and the greatest value of `out` a native GEMM's output takes on its exact `products`
+    (`native_dot_holds`): the nearest `out` values of the allowance's two ends; +0 for an empty sum."""
     count = products.shape[-1]
+    if count == 0:
+        return np.zeros(products.shape[:-1]), np.zeros(products.shape[:-1])
     exact = exact_sum(products, -1)
     accumulator = FORMATS["float32"]
     # A truncating add below the normal range loses up to a whole subnormal unit, not half of one.
@@ -345,10 +345,46 @@ def native_dot_holds(native, products, out: Format, flushes: bool) -> np.ndarray
     allowance = (gamma(count, TRUNCATING["float32"]) + 2.0 ** -52) * magnitude_sum(products, -1) + \
         count * underflow
     zero = np.zeros_like(exact)
-    low = rounded(np.nextafter(exact - allowance, -np.inf), zero, out)
-    high = rounded(np.nextafter(exact + allowance, np.inf), zero, out)
+    return (rounded(np.nextafter(exact - allowance, -np.inf), zero, out),
+            rounded(np.nextafter(exact + allowance, np.inf), zero, out))
+
+
+def native_dot_holds(native, products, out: Format, flushes: bool) -> np.ndarray:
+    """Whether each element of a native GEMM's output is a value its exact `products` (float64, summed along
+    the last axis) admit, as check 2 holds a fused template GEMM natively (row 2084, link 1): accumulated in
+    fp32 in any order by adds that truncate (`TRUNCATING`), within γ_n of their magnitudes of the exact sum
+    plus what underflow loses past that (as `_terms_hold`), then rounded once to nearest in `out`, the
+    output's format. Rounding is monotone, so the output lies between the nearest `out` values of the
+    allowance's two ends."""
+    low, high = _native_dot_ends(products, out, flushes)
     native = np.asarray(native, np.float64)
     return np.isfinite(native) & (native >= low) & (native <= high)
+
+
+def tf32_operand(values) -> np.ndarray:
+    """fp32 operands' values (as float64) as a tensor core multiplies them in a TF32 product (an fp32 product
+    at the default precision, src/dew/nn/kernels/templates/product.py): rounded to TF32 to nearest, a tie away
+    from zero (PTX's cvt.rna.tf32.f32), as the GEMM template's Triton launches read both operands of the
+    forward's, the input gradient's and the kernel gradient's products on an A100 and an H100 (row 2084, link
+    2: each of 38,400 values of each operand, 30% of them ties, read so, where 85% were their round to
+    nearest even and 35% their truncation). A product of two is exact in float64 (22 bits), as
+    `native_dot_holds` takes."""
+    return rounded_away(values, TFLOAT32)
+
+
+def promoted_step_holds(before, after, products, flushes: bool) -> np.ndarray:
+    """Whether each native fp32 accumulator after one depth step of exact sums (`after`) is the IEEE sum,
+    rounded to nearest, of the accumulator before the step (`before`) and the step's own partial: an fp32
+    value the step's exact `products` admit as a tensor core sums them from zero (`native_dot_holds`, into
+    fp32). So a product declared above the default precision into an fp32 output adds each depth step's
+    partial apart (src/dew/nn/kernels/templates/product.py's `promoted`; row 2084, link 2). Rounding to
+    nearest is monotone in the partial, so `after` lies between the sums' roundings at its two ends."""
+    accumulator = FORMATS["float32"]
+    low, high = _native_dot_ends(products, accumulator, flushes)
+    before, after = np.asarray(before, np.float64), np.asarray(after, np.float64)
+    least = _rounded_on_lane(*two_sum(before, low), accumulator, flushes)
+    most = _rounded_on_lane(*two_sum(before, high), accumulator, flushes)
+    return np.isfinite(after) & (after >= least) & (after <= most)
 
 
 def _floats(operands, flushes: bool):
