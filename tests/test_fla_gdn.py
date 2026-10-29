@@ -233,7 +233,7 @@ def test_the_dv_local_kernel_is_flas(dtype, shape):
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(1, 128, 2, 2, 128, 64), (1, 128, 1, 2, 128, 128)])
 def test_the_dqkwg_kernel_is_flas(dtype, shape):
-    """fla's bwd_dqkwg per chunk and head, its key blocks' decay gradients summed and grouped value
+    """fla's bwd_dqkwg per chunk and head, its key blocks' decay gradient terms summed and grouped value
     heads summed onto their key head, against the same products in XLA."""
     batch, length, key_heads, value_heads, width, columns = shape
     keys = jax.random.split(jax.random.key(11), 8)
@@ -252,7 +252,8 @@ def test_the_dqkwg_kernel_is_flas(dtype, shape):
     kernel = functools.partial(fla_gdn.chunk_bwd_dqkwg, scale=scale, interpret=INTERPRETED)
     states = (support.entered_states(h), dv, do, support.left_grads(dh))
     got = kernel(q, k, v, w, g, *states)
-    for name, mine, theirs in zip(("dq", "dk", "dw", "dg"), got, want, strict=True):
+    names = ("dq", "dk", "dw", "decay pairs", "decay from the start")
+    for name, mine, theirs in zip(names, jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
         assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
         assert relative(mine, theirs) < (3e-2 if dtype == jnp.bfloat16 else 1e-5), name
 
