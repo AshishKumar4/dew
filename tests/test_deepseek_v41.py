@@ -520,6 +520,21 @@ def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeyp
     assert wrapper_route("embed.weight", record) == ("language_model", "embed.weight")
 
 
+def test_a_bundle_loaded_text_only_is_its_text_checkpoint(tmp_path):
+    """The bundle with its ViT, loaded `text_only`, reads as the family's text checkpoint: the model the
+    text-only checkpoint builds, its variables leaf for leaf that checkpoint's, so neither the tower, the
+    aligner nor the routers' image-span bias is read, and its logits bit for bit."""
+    text = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference",
+                           text_only=True)
+    plain = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
+    assert text.model == plain.model
+    assert jax.tree.structure(text.variables) == jax.tree.structure(plain.variables)
+    jax.tree.map(np.testing.assert_array_equal, text.variables, plain.variables)
+    ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
+    np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)),
+                                  np.asarray(plain.model.apply(plain.variables, ids)))
+
+
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):
     """Routing the image span by the text bias moves the prefill's logits
     further from the float64 truth than rounding can, and the image
