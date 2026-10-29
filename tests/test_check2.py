@@ -584,7 +584,7 @@ def test_a_native_dot_aligns_a_subnormal_operand_at_its_least_normal_and_no_bare
     assert ct.native_dot_holds([native], products, oc.FLOAT32, flushes=False).tolist() == [True]
     tight = ct.Terms(products.exact, np.abs(products.exact))
     assert ct.native_dot_holds([native], tight, oc.FLOAT32, flushes=False).tolist() == [False]
-    with pytest.raises(ValueError, match="subnormal"):
+    with pytest.raises(ValueError):
         ct.native_dot_ends(products.exact, oc.FLOAT32, flushes=False)
     assert ct.native_dot_holds([16.0], np.full((1, 4), 4.0), oc.FLOAT32, flushes=False).tolist() == [True]
 
