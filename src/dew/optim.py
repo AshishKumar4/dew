@@ -1538,6 +1538,11 @@ class ScheduleBase:
         one factor, a param group's multiplier."""
         raise NotImplementedError
 
+    def peak(self) -> float:
+        """The highest value the schedule takes: its largest rate-valued field, a warmup's or decay's
+        ends, where its formula reaches no higher."""
+        return max(self.rates().values(), default=1.0)
+
 
 @dataclasses.dataclass(frozen=True)
 class Cosine(ScheduleBase):
@@ -1605,6 +1610,10 @@ class Power(ScheduleBase):
 
     def warmup(self, steps: int | None) -> int:
         return self._warmup(self.warmup_steps, steps, None if self.tail is None else self.tail.steps)
+
+    def peak(self) -> float:
+        """`peak_value`, the cap the power law climbs to."""
+        return self.peak_value
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
@@ -1733,6 +1742,10 @@ class Exponential(ScheduleBase):
     end_value: float = dataclasses.field(metadata={'rate': True})
     decay_steps: int | None = None
     offset: float = dataclasses.field(default=0.0, metadata={'rate': True})
+
+    def peak(self) -> float:
+        """Its higher end, `offset` added."""
+        return self.offset + max(self.init_value, self.end_value)
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
@@ -1960,8 +1973,8 @@ class OptimConfig:
         modules at `FRESH_LEARNING_RATE` at the peak of this config's schedule, on its shape (its rate
         times their quotient), or at its own where that is higher, and every other parameter at its own,
         each sparing what the ungrouped decay spares (`ParamGroup.spared`)."""
-        rates = rates_of(self.learning_rate)
-        peak = rates.get("peak_value", max(rates.values()))
+        rate = self.learning_rate
+        peak = rate.peak() if isinstance(rate, ScheduleBase) else rate
         multiplier = max(1.0, FRESH_LEARNING_RATE / peak) if peak > 0 else 1.0
         return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier, spared=True),
                 ParamGroup("base", ("*",), spared=True))

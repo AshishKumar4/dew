@@ -255,6 +255,19 @@ def _flag_json(text: str) -> JSON:
     return None if text == "None" else json.loads(text)
 
 
+def recorded_param_groups(saved: epath.Path) -> tuple[ParamGroup, ...] | None:
+    """The param groups the run whose record is `saved` trained in, read alone: the rest of the record,
+    a data chain only its Python holds among it, may not rebuild here. () for a record written before
+    runs took groups; None where the record holds no optimizer, a run defined in Python without one."""
+    fields = json.loads(saved.read_text()).get("fields")
+    optim = fields.get("optim") if isinstance(fields, Mapping) else None
+    if not isinstance(optim, Mapping):
+        return None
+    held = optim.get("fields", optim)
+    groups = held.get("param_groups", []) if isinstance(held, Mapping) else []
+    return from_record(tuple[ParamGroup, ...], groups)
+
+
 def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str]) -> tuple[str, ...]:
     """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree
     is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
@@ -1638,8 +1651,10 @@ class RunConfig:
             if not named:
                 checkpoints = self.trainer.checkpoints(name)
                 saved = epath.Path(checkpoints.directory) / RUN_FILE
-                if checkpoints.resumed(self.trainer.resume) is not None and saved.exists():
-                    return to_record(RunConfig.load(str(saved)).optim.param_groups, tuple[ParamGroup, ...])
+                recorded = recorded_param_groups(saved) if checkpoints.resumed(
+                    self.trainer.resume) is not None and saved.exists() else None
+                if recorded is not None:
+                    return to_record(recorded, tuple[ParamGroup, ...])
             groups = named or self.optim.fresh_groups()
             modules = trained_modules(objective, objective.fresh_modules()) if any(
                 group.fresh for group in groups) else ()
