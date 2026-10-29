@@ -28,6 +28,16 @@ def documented(gen_api):
     return (package, *gen_api.documented(package, gen_api.P.pages))
 
 
+def test_the_condition_encoder_contract_has_its_own_reference_page(documented):
+    """Both public contract types have their defining module as their reference home, including
+    ConditionWork, which the encoder implementations import but do not themselves define."""
+    _, pages, homes = documented
+    assert homes.get("dew.inputs.condition.ConditionWork") == "dew.inputs.condition"
+    assert homes.get("dew.inputs.condition.ConditionEncoder") == "dew.inputs.condition"
+    entries = {entry.canonical for entry in pages["dew.inputs.condition"].entries}
+    assert {"dew.inputs.condition.ConditionWork", "dew.inputs.condition.ConditionEncoder"} <= entries
+
+
 def test_a_name_bound_in_one_cell_is_resolved_in_the_next(gen_api, documented, tmp_path):
     notebook = tmp_path / "two.ipynb"
     notebook.write_text(json.dumps({"cells": [

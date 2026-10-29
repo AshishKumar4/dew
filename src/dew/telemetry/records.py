@@ -129,6 +129,9 @@ class FitStarted:
     """The run's cadences and schedule warmups as it resolved them, a share of the run among them
     (`dew.training.budget.every_step`, `dew.optim.OptimConfig.warmups`): steps, committed tokens or a
     duration by name."""
+    groups: Mapping[str, str] | None = None
+    """Where the optimizer's split sent each parameter and why, by its path (`dew.optim.OptimConfig.groups`:
+    Muon's matrices beside AdamW's vectors, lookups and filters); None for an optimizer that splits none."""
 
 
 @dataclasses.dataclass(frozen=True)
