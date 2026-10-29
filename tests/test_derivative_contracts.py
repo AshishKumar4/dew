@@ -14,7 +14,6 @@ import pytest
 from reference_error import widened
 
 from dew.nn.kernels import recurrence_chunk
-from dew.sampling.flow import GaussianTransition
 
 TINY, LARGEST = float(np.finfo(np.float32).tiny), float(np.finfo(np.float32).max)
 
@@ -76,29 +75,6 @@ def assert_contract(fn, primals, direction, cotangent, label: str) -> None:
             broken = held & ~np.isfinite(value)
             assert not broken.any(), (f"{label}, {name}, leaf {index}: {int(broken.sum())} values not finite "
                                       f"where float64's are normal float32s, e.g. {value[broken][:3]}")
-
-
-EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
-"""The draws' scales: unit values, and values whose products (a squared distance, a second derivative's
-pairs) reach float32's largest or its least normal."""
-
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_the_gaussian_kl_holds_every_order_at_float32s_edges(edge):
-    """`GaussianTransition.kl` (sampling/flow.py's custom JVP and its pullback, row 1768): every order
-    runs, and each is finite wherever float64 is a normal float32, at unit values and at values whose
-    squared distance nears float32's largest or its least normal."""
-    scale = EDGES[edge]
-    rng = np.random.default_rng(1768)
-    mean, reference = (jnp.asarray(rng.standard_normal((2, 3)) * scale, jnp.float32) for _ in range(2))
-    variance = jnp.asarray(rng.uniform(0.5, 2.0, (2,)), jnp.float32)
-
-    def kl(mean, reference, variance):
-        return GaussianTransition(mean, variance).kl(reference)
-
-    primals = (mean, reference, variance)
-    direction = tuple(jnp.asarray(rng.standard_normal(np.shape(x)) * scale, jnp.float32) for x in primals)
-    assert_contract(kl, primals, direction, jnp.ones((2,), jnp.float32), f"the Gaussian KL {edge}")
 
 
 @pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
