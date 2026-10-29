@@ -1094,16 +1094,19 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-BACKWARD_GATE = [(width, accurate) for width in (64, 128, 256) for accurate in (False, True)]
-"""The backward resource gate's cases: a causal call's head widths, each form."""
+BACKWARD_GATE = [(generation_name, width, accurate) for generation_name in ("sm90", "sm80")
+                 for width in (64, 128, 256) for accurate in (False, True)]
+"""The backward resource gate's cases: each qualified family's GPU (an H100, an A100), a causal call's head
+widths, each form."""
 
 
-@pytest.mark.parametrize(("width", "accurate"), BACKWARD_GATE)
-def test_the_backward_compiles_spill_free_as_its_model_decides_for_an_h100(width, accurate):
+@pytest.mark.parametrize(("generation_name", "width", "accurate"), BACKWARD_GATE)
+def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, width, accurate):
     """The backward at its derived tiles of a causal call `width` wide in the form `accurate` names, lowered
-    and compiled by ptxas for an H100 on this CPU (tests/kernel_compile.py): every launch within its shared
-    memory, spilling nothing, and its register model's decision ptxas's (`mosaic_failures`, each launch's
-    model `resources.register_model` at its own layout and consumers, `MosaicBackward._launch_registers`)."""
+    and compiled by ptxas for `generation_name` on this CPU (tests/kernel_compile.py): every launch within its
+    shared memory, spilling nothing, and its register model's decision ptxas's (`mosaic_failures`, each
+    launch's model `resources.register_model` at its own layout and consumers,
+    `MosaicBackward._launch_registers`)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1118,7 +1121,7 @@ def test_the_backward_compiles_spill_free_as_its_model_decides_for_an_h100(width
                                           accurate=accurate)
         return grads.query, grads.key, grads.value
 
-    with generation.assumed("sm90"):
+    with generation.assumed(generation_name):
         op, args = attention_mosaic._backward_call(jnp.zeros(query.shape, query.dtype), jnp.zeros(key.shape),
                                                   jnp.zeros(key.shape), spans, None, jnp.zeros(query.shape),
                                                   _residuals(query.shape), accurate=accurate, scale=None,
@@ -1129,7 +1132,7 @@ def test_the_backward_compiles_spill_free_as_its_model_decides_for_an_h100(width
         assert config is not None
         models = _backward_models(op, ba, config)
         found = compile_mosaic_kernels(
-            [KernelCase("backward", lambda: (backward, (query, key, key, query)), models)], "sm90")
+            [KernelCase("backward", lambda: (backward, (query, key, key, query)), models)], generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
