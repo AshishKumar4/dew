@@ -413,13 +413,17 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
     if len(labels) != len(set(labels)):
         raise ValueError("select each metric once; one Best.top already keeps all its winners")
     if plateau is not None:
-        metric = owned(plateau.metric)
-        if not isinstance(metric, (Metric, TrainingScalar, Summary)):
+        # A name binds as a Best of it does, to the metric fit scores under it, its split and direction.
+        metric = plateau.metric if isinstance(plateau.metric, str) else owned(plateau.metric)
+        if not isinstance(metric, (str, Metric, TrainingScalar, Summary)):
             raise TypeError(
                 "Plateau selects a declared metric object or summary, not a Best policy or score function"
             )
-        stopping = Best(metric, mode=plateau.mode, split=plateau.split).resolved(scored)
-        plateau = dataclasses.replace(plateau, metric=metric, mode=stopping.mode, split=stopping.split)
+        chosen = owned(Best(metric, mode=plateau.mode, split=plateau.split))
+        stopping = (chosen if isinstance(chosen, Best) else Best(chosen, mode=plateau.mode,
+                                                                 split=plateau.split)).resolved(scored)
+        plateau = dataclasses.replace(plateau, metric=stopping._source, mode=stopping.mode,
+                                      split=stopping.split)
     return selection, plateau, pause
 
 
