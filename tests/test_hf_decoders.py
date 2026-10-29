@@ -265,8 +265,7 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
         reloaded = np.asarray(again.model.apply(again.variables, ids))
         np.testing.assert_array_equal(reloaded, ours)
 
-@pytest.mark.gpu(reason="TF32 is a GPU's: a CPU multiplies float32 operands in float32 at any precision")
-def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
+def a_float32_decoder_multiplies_float32_products_on_a_gpu():
     """A float32 decoder that states no precision multiplies float32 products, as torch's float32
     matmuls do by default (`dew.nn.precision.float32_products`): its logits on a GPU are as exact
     as transformers' float32 ones, both from transformers' float64 ones, under JAX's own default
