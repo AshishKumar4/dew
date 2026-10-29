@@ -415,9 +415,10 @@ class Pretrained:
         another kind and names that kind.
 
         `text_only=True` loads a multimodal wrapper's language model alone, as its text family's own
-        checkpoint states it (Qwen3.5's `Qwen3_5ForCausalLM`): no tower, projector or audio encoder is
-        built, nor their tensors read, and the source saves as that text checkpoint. A source that is
-        a decoder already loads as it is; a pipeline or a fallback has no language model to take.
+        checkpoint states it (Qwen3.5's `Qwen3_5ForCausalLM`; DeepSeek-V4.1's bundle as its own text
+        checkpoint): no tower, projector or audio encoder is built, nor their tensors read, and the source
+        saves as that text checkpoint. A source that is a decoder already loads as it is; a pipeline or
+        a fallback has no language model to take.
 
         `prediction_depths` keeps the first that many of a decoder's multi-token prediction depths
         (DeepSeek V3's, GLM's and Qwen3.5's `mtp` blocks): None the ones the checkpoint holds, 0
@@ -1798,14 +1799,16 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
+        # A bundle its own family reads whole states its text checkpoint without its vision_config, its
+        # decoder's names and their codec unchanged; another wrapper's language model is its text family's
+        # checkpoint, under names its quantization's module selection does not follow.
         if decoders.bundles(config):
-            raise ValueError(f"{config.get('model_type')} reads its media bundle whole as one decoder "
-                             "family; text_only takes a wrapper whose language model is its own text "
-                             "family's checkpoint")
-        if source_quantization(config) is not None:
+            config = decoders.bundle_text_config(config)
+        elif source_quantization(config) is not None:
             raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
                              "names the wrapper's modules, which its text checkpoint renames")
-        config = decoders.language_model_config(config)
+        else:
+            config = decoders.language_model_config(config)
         route = source_route(config, remote=remote, pinned=pinned)
     elif isinstance(route, WrapperRoute):
         # Before any weight downloads, as the routing of the wrapper's names would (`_wrapper_sources`).
