@@ -77,7 +77,6 @@ from dew.distributed.placement import (
     Placement,
     Validation,
     device_mesh,
-    link_topology,
     placed_bytes,
     placed_shapes,
 )
@@ -142,7 +141,7 @@ from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
     check_stream,
-    link_bandwidth,
+    link_figure,
     link_figures,
     marked,
     microbatch,
@@ -345,7 +344,7 @@ class Trainer(Generic[Loss, Effects]):
         self._base_rung = None
         self._shape_rungs: dict[str, JSON] = {}
         self._resumed_shapes: dict[str, JSON] = {}
-        self._resumed_links: dict[str, float] = {}
+        self._resumed_links: dict[str, float | None] = {}
         # The microbatches a step's batch is read in, once decided (`split`,
         # 1 where `whole`, a pooling state's window, or the first plan), which
         # cut every batch the run reads (`_rows`, read off `fit`'s data).
@@ -854,6 +853,11 @@ class Trainer(Generic[Loss, Effects]):
             pending = jax.jit(allocate, out_shardings=placement)()
         return dataclasses.replace(state, accumulation=pending)
 
+    @functools.cached_property
+    def _ahead_links(self) -> dict[str, float | None]:
+        """The figures the step compiled ahead traced with (`AheadOfTime.links`), at the run's first trace."""
+        return {} if self._ahead is None else self._ahead.links
+
     def _links(self, mesh: Mesh) -> dict[str, Link]:
         """The links of `mesh`'s tensor and sequence axes, those it splits,
         for one trace. Every process lists the mesh's devices alike and
@@ -863,7 +867,7 @@ class Trainer(Generic[Loss, Effects]):
         axis's bandwidth is measured once per mesh, and not at all for a
         device the peak table does not name (a CPU's among them), where it
         decides nothing, or over a compile-only GPU (`dew.training.ahead`), which no process holds to
-        measure, so its axis spreads nothing; a link the run states (`links`) is taken as stated."""
+        measure; a link the run states (`links`) as stated, unless a step compiled ahead holds its own."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
@@ -871,7 +875,7 @@ class Trainer(Generic[Loss, Effects]):
         for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
             if mesh.shape.get(axis, 1) == 1:
                 continue
-            if axis in self._stated_links:
+            if axis in self._stated_links and axis not in self._ahead_links:
                 stated = self._stated_links[axis]
                 links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
                 continue
@@ -879,9 +883,8 @@ class Trainer(Generic[Loss, Effects]):
                 links[axis] = Link(None, peak)
                 continue
             if (mesh, axis) not in self._bandwidths:
-                # A resumed run takes the figure its checkpoint traced with, on this very placement.
-                self._bandwidths[mesh, axis] = None if peak is None else (
-                    self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
+                self._bandwidths[mesh, axis] = None if peak is None else link_figure(
+                    mesh, axis, self._ahead_links, self._resumed_links)
             links[axis] = Link(self._bandwidths[mesh, axis], peak)
         return links
 
