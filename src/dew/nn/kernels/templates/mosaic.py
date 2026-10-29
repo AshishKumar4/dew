@@ -29,7 +29,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import cost, product, resources
+from dew.nn.kernels.templates import cost, product, report, resources
 from dew.nn.sharding import per_shard
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
@@ -879,7 +879,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                             compiler_params=compiler_params(
                                 approx_math=approx_math,
                                 reduction_scratch=self.warpgroup_reduction_scratch * reducing_warpgroups),
-                            interpret=interpreted(interpret), kernel_name=name, cost_estimate=cost,
+                            interpret=interpreted(interpret), kernel_name=report.named(name),
+                            cost_estimate=cost,
                             **clustered)
 
     def scoped(self, body, *allocations, streams):
