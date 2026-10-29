@@ -214,16 +214,26 @@ class _Uncounted(grouped_matmul.MosaicGmm):
         return 0
 
 
+class _OnlyTile(_Uncounted):
+    """A launch with one tile shape, so refusing that shape exhausts its derivation."""
+
+    def candidate(self, ba, config, target):
+        return (config.block_m == 128 and config.block_n == 128 and config.warpgroups == 2
+                and super().candidate(ba, config, target))
+
+
 @lowers("sm90")
-def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once():
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhausted):
     """A compile that finds a template launch's kernel spilling (`report.compiled`, owner 10-29) refuses that
     launch's config and lowers once more, where the derivation takes its next tile by its own rule; a
     kernel spilling again is recorded and not stepped again. A paired SwiGLU forward whose model counts no
-    registers, compiled for a compile-only H100 on this CPU through ptxas."""
+    registers, compiled for a compile-only H100 on this CPU through ptxas. A derivation with no replacement
+    keeps its first program; the refusals saved with that program must derive it again."""
     from dew.nn.kernels.templates import report
     from dew.training.ahead import compile_only_gpus
 
-    launch = _Uncounted()
+    launch = _OnlyTile() if exhausted else _Uncounted()
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     placed = jax.sharding.NamedSharding(devices, PartitionSpec())
     shapes = [jax.ShapeDtypeStruct(shape, dtype, sharding=placed)
@@ -245,19 +255,24 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once():
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.compiled(lowered(), relower=lowered)
         misses, refused = report.misses(), report.refused_launches()
-    first, stepped = traced[:2]
-    assert stepped != first
-    assert [(miss.config, miss.stepped) for miss in misses][:1] == [(first, True)]
-    assert all(miss.config == stepped and not miss.stepped for miss in misses[1:])
-    # Another process seeded with the run's refusals (its plan's) derives the stepped-down tile at once.
+    first = traced[0]
+    if exhausted:
+        assert len(traced) == 1
+        assert [(miss.config, miss.stepped) for miss in misses] == [(first, False)]
+        assert not refused
+        kept = first
+    else:
+        first, kept = traced
+        assert kept != first
+        assert [(miss.config, miss.stepped) for miss in misses][:1] == [(first, True)]
+        assert all(miss.config == kept and not miss.stepped for miss in misses[1:])
+        assert [config for _, config, _ in refused] == [first]
+    # Another process seeded with the run's refusals (its plan's) derives the tile this compile kept.
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.refuse(refused)
         lowered()
-    refused_configs = {config for _, config, _ in refused}
-    assert first in refused_configs and traced[2] not in refused_configs
-    if stepped not in refused_configs:
-        assert traced[2] == stepped
+    assert traced[-1] == kept
 
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),

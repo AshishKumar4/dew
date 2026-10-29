@@ -24,6 +24,8 @@ from pathlib import Path
 import jax
 import tokamax
 
+from dew import cache
+
 DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
 """The settings that turn Mosaic GPU's reports on, written under `MOSAIC_GPU_DUMP_TO`."""
 DUMPING = threading.RLock()
@@ -82,10 +84,7 @@ def records() -> Path | None:
     the cache shares them and derives the configs it holds (a training pool's, an eval's, a server's):
     DEW_REFUSAL_RECORDS when set, else `dew-refusals.jsonl` in JAX's compilation cache directory, or nowhere
     when the process keeps no cache."""
-    if path := os.environ.get("DEW_REFUSAL_RECORDS"):
-        return Path(path)
-    cache = jax.config.jax_compilation_cache_dir
-    return None if not cache else Path(cache) / "dew-refusals.jsonl"
+    return cache.beside_compilation_cache("DEW_REFUSAL_RECORDS", "dew-refusals.jsonl")
 
 
 def _registry() -> _Registry:
@@ -251,6 +250,22 @@ def refusals() -> Iterator[None]:
         _SCOPE.reset(token)
 
 
+@contextlib.contextmanager
+def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[None]:
+    """Refusals visible while deriving and compiling a replacement, without changing the kept program's
+    registry or its file. A successful replacement commits them after this scope ends."""
+    registry = _registry()
+    with _GUARD:
+        proposed = dict(registry.refused)
+    for identity, kernel in entries:
+        proposed[identity] = proposed.get(identity, frozenset()) | {kernel}
+    token = _SCOPE.set(_Registry(refused=proposed))
+    try:
+        yield
+    finally:
+        _SCOPE.reset(token)
+
+
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
             kernels: frozenset[str] = frozenset()) -> None:
     registry = _registry()
@@ -269,32 +284,32 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     """`lowered` compiled, read through Mosaic's reports (`reported`): where a kernel of a template's launch
     spills, that launch's config is refused (`refused`), the miss recorded (`misses`, logged), and the
     program `relower`ed once and compiled; `relower` traces afresh, so each refused launch's derivation
-    takes the next config by its own rule. A kernel spilling again is refused and recorded, not stepped
-    again; a relowering whose derivations find no config left (`Exhausted`) keeps the first program, its
-    misses recorded as not stepped. A program loaded from the persistent compilation cache runs no ptxas
-    and reports nothing."""
+    takes the next config by its own rule. A kernel spilling again is recorded, neither refused nor stepped
+    again, so every process derives the program this compile keeps; a relowering whose derivations find no
+    config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. Refusals commit
+    only when a replacement compiles, so a later process derives the program kept here. A program loaded
+    from the persistent compilation cache runs no ptxas and reports nothing."""
     executable, spilling = _compiled_reported(lowered, options)
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
-    for refusal, kernel in refusals:
-        _record(refusal, None, frozenset({kernel}))
     if not refusals:
         _recorded(found, stepped=False)
         return executable
     try:
-        relowered = relower()
+        with _proposing(refusals):
+            relowered = relower()
+            replacement, spilling = _compiled_reported(relowered, options)
     except Exhausted as failed:
         _log.warning("relowering after a spill found no config: %s; the first program runs", failed)
         _recorded(found, stepped=False)
         return executable
+    for refusal, kernel in refusals:
+        _record(refusal, None, frozenset({kernel}))
     _recorded(found, stepped=True)
-    executable, spilling = _compiled_reported(relowered, options)
-    again = _misses_of(spilling)
-    for refusal, report, _ in again:
-        if refusal is not None:
-            _record(refusal, None, frozenset({report.kernel}))
-    _recorded(again, stepped=False)
-    return executable
+    # The kept program's own spills are misses alone: refused, they would have every process seeded with
+    # them derive a third program, not the one this compile keeps and runs.
+    _recorded(_misses_of(spilling), stepped=False)
+    return replacement
 
 
 def _misses_of(spilling: list["Report"]) -> list[tuple[tuple[str, Hashable] | None, "Report", Launch | None]]:

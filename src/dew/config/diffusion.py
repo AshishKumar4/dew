@@ -387,20 +387,18 @@ class DiffusionRunConfig(RunConfig):
         adapter's (`RunConfig.pinned`), `pretrained` and the alignment's encoder, so the record names
         the weights the run started from.
         """
-        from dew.interop import sources
-
-        def pin(source: str) -> str:
-            return sources.SourceReference.parse(source).pinned().spelled()
+        from dew.interop.sources import pinned_source
 
         objective = self.objective
         stated = objective.fields.get("alignment")
         if isinstance(stated, Mapping):
             alignment = from_record(Alignment, stated)
             if alignment.source is not None:
-                objective = dataclasses.replace(objective, fields={**objective.fields, "alignment": to_record(
-                    dataclasses.replace(alignment, source=pin(alignment.source)), Alignment)})
-        return dataclasses.replace(super().pinned(), objective=objective,
-                                   pretrained=None if self.pretrained is None else pin(self.pretrained))
+                pinned = dataclasses.replace(alignment, source=pinned_source(alignment.source))
+                objective = dataclasses.replace(
+                    objective, fields={**objective.fields, "alignment": to_record(pinned, Alignment)})
+        pretrained = None if self.pretrained is None else pinned_source(self.pretrained)
+        return dataclasses.replace(super().pinned(), objective=objective, pretrained=pretrained)
 
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its

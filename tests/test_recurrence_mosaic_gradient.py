@@ -93,7 +93,7 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector gives it the port or the
     portable math, whose check 1 test_recurrence_chunk holds (row 1926: no kernel falls back inside
     itself)."""
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
+    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
 
     # Packed documents bounded as a layer bounds them (`PACKED_DOCUMENTS`).
     bound = {'max_segments': PACKED_DOCUMENTS} if SHAPES[case].get('packed') else {}
@@ -132,7 +132,7 @@ def test_the_fast_backward_is_bitwise_the_same_each_run():
     adds the rest's in order, a step's adds done before the next (`_gradient_stored`); no add's order varies
     between runs."""
     case = 'packed documents'
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
+    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
     fn = on_the_mainloop(hooks, case, jnp.bfloat16)
     run = jax.jit(with_gradients(restarted(fn, case)))
     operands, cotangent = drawn(jnp.bfloat16, 0, **geometry(case))
@@ -154,13 +154,14 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     fill more than a wave), on par from float64 with the fla port's forward, or forward and gradient, over
     the case's draws (check 1, truth the recurrence a token at a time's): each role's columns, staging and
     stores its own. Off a GPU interpreted; a GPU that runs no Hopper kernels (an A100) skips it."""
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
+    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
     shape = {**geometry(case), 'value_width': 64}
     tiles = mainloop.Tiles(32, 1, walkers=2)
 
     def walked(given: Chunk):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
-                           tiles=tiles, scale=hooks.scale, family=bundles.of('sm90', jnp.bfloat16))
+                           tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound,
+                           family=bundles.of('sm90', jnp.bfloat16))
 
     reference = functools.partial(chunk_on, 'fla', hooks)
     truth = functools.partial(token_by_token, hooks)

@@ -401,10 +401,12 @@ def _merges(call: _Call) -> tuple:
     bits as the TF32 fla merges its blocks in, where the inverse is rounded to the call's 8 after. fla inverts
     its 16-row diagonal blocks by fp32 forward substitution and merges in TF32; every doubling level here
     rounds to fp16, about 2^-12 absolute on the inverse under aligned keys, a sixth of the bf16 rounding
-    both arms share. fp16's range holds the inverse of keys the layers normalize (`l2norm`: each entry at
-    most `beta |k_s| |k_t|`, at most one); unnormalized keys with `beta |k|^2` past two grow it
-    geometrically, past fp16's largest in about 16 tokens, where TF32's stays finite (template numerics
-    review 2026-10-26, P3-4)."""
+    both arms share. fp16's range holds the inverse and each merge's product of it where the call's form
+    proves its entries at most two (`recurrence.Hooks.inverse_bound`: unit keys, write gates at most two),
+    the call's contract (`template.inverse_refusal`). Unnormalized keys with `beta |k|^2` past two grow it
+    geometrically, past fp16's largest in about 16 tokens (row 2381): fp32's range in bf16 parts spilled the
+    solve on an A100 and an H100, one bf16 part put a normalized call's inverse 2.1 to 2.7 times as far from
+    float64, and Mosaic's mma.sync takes no TF32, so those calls take the port's or the portable math."""
     dtype, parts = (jnp.bfloat16, PARTS) if call.held.parts > 1 else (jnp.float16, 1)
     tile = (CHUNK, CHUNK)
     return tuple(tuple(plgpu.SMEM(tile, dtype) for _ in range(parts)) for _ in range(3))

@@ -16,6 +16,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import (
     FEWEST_SEEDS,
     assert_as_exact,
+    assert_as_exact_as_the_reference,
     assert_fp32_reduction_bound,
     chain_roundings,
     widened,
@@ -23,7 +24,7 @@ from reference_error import (
 
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
-from dew.nn.precision import float32_einsum
+from dew.nn.precision import float32_einsum, l2norm
 
 ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 8
 CHUNK = 16
@@ -35,19 +36,20 @@ norm magnifies every rounding before it, and the reference compared with itself 
 resolve (Mamba2's SSD with its norm over packed documents, at 512 seeds)."""
 
 HOOKS = [recurrence.Hooks(decay=decay, delta=delta, write_gate=not delta, skip=skip,
-                          scale=KEY_WIDTH ** -0.5 if delta else None)
+                          scale=KEY_WIDTH ** -0.5 if delta else None, write_bound=1.0 if delta else None)
          for decay, delta, skip in itertools.product(('none', 'scalar', 'vector'), (True, False),
                                                      (False, True))]
 """The decay kinds, the delta rule or a write gate alone (R = 0, Mamba2's SSD and the gated linear
-attentions), with and without the skip."""
+attentions), with and without the skip; the delta rule's declaring its draws' sigmoid write gates of unit
+keys (`write_bound`)."""
 
 FORMED = [
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(), l2norm=True),
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(write='step', limit=(0.0, 0.5)), delta=False,
                      skip=True),
-    recurrence.Hooks(decay='vector', l2norm=True, output=recurrence.OutputNorm(1e-6)),
+    recurrence.Hooks(decay='vector', l2norm=True, output=recurrence.OutputNorm(1e-6), write_bound=1.0),
     recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5,
-                     output=recurrence.OutputNorm(1e-5, 'sigmoid')),
+                     output=recurrence.OutputNorm(1e-5, 'sigmoid'), write_bound=1.0),
     recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True),
     recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True, output=recurrence.OutputNorm(1e-5)),
     recurrence.Hooks(decay='scalar', rated=True, l2norm=True),
@@ -395,28 +397,44 @@ def test_the_peeled_transition_carries_the_peeled_memory_and_its_adjoint(packed,
         np.testing.assert_array_equal(np.asarray(found, np.float64), exact[name], err_msg=name)
 
 
-@pytest.mark.parametrize('traced', ['values', 'queries', 'memory'])
-def test_a_scan_traced_for_its_tangent_is_no_reverse_mode_call(traced):
-    """A scan traced by `jax.jvp` asks its selector for a tangent (`scan_case`'s `reverse` False), which no
-    port's custom VJP gives, whether or not `forward_mode_attention` is set, whichever of its operands the
-    tangent traces alone (its values, its queries, its initial memory): they are JVP tracers. A gradient's
-    (`jax.grad`) is a reverse-mode call. `jax.jvp` of a Mamba-2 layer reached the SSD port on an A100,
-    which raised there."""
-    x, keys = jnp.ones((1, 8, 2, 16)), jnp.ones((1, 8, 1, 16))
-    found = {}
+@pytest.mark.parametrize('staged', ['jit', 'remat', 'scan'])
+def test_a_kernel_named_for_the_rule_takes_forward_mode_however_a_caller_stages_it(staged):
+    """`jax.jvp` of the delta rule on the port (named, `generation.chosen`; interpreted off a GPU) staged by a
+    jit, a remat or a scan, as layers stage it (`nn.remat`, `nn.scan`): its tangent the portable math's
+    (`_per_product`'s `generation.linear_tangent`), on par with the portable rule's from float64. Its
+    selector once routed by whether it saw a JVP tracer, which a remat or a scan hides from it, and there the
+    port's custom VJP raised (row 2395)."""
+    keys = jax.random.split(jax.random.key(41), 7)
+    length, heads, width = 64, 2, 64
+    query, key = (l2norm(jax.random.normal(k, (1, length, 1, width))) for k in keys[:2])
+    value = jax.random.normal(keys[2], (1, length, heads, width))
+    g = -jnp.exp(jax.random.normal(keys[3], (1, length, heads)) - 3.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, heads)))
+    state = 0.1 * jax.random.normal(keys[5], (1, heads, width, width))
+    operands = (query, key, value, g, beta, state)
+    directions = tuple(jax.random.normal(jax.random.fold_in(keys[6], index), x.shape)
+                       for index, x in enumerate(operands))
 
-    def traced_in(name):
-        def run(operand):
-            values = operand if traced == 'values' else x
-            others = () if traced == 'values' else (operand,)
-            found[name] = recurrence_chunk.scan_case(values, keys, 8, operands=others).reverse
-            return operand.sum()
-        return run
+    def rule(*operands):
+        return recurrence_chunk.chunk_gated_delta_rule(*operands)
 
-    operand = x if traced == 'values' else jnp.ones((1, 8, 1, 16))
-    jax.jvp(traced_in('tangent'), (operand,), (operand,))
-    jax.grad(traced_in('gradient'))(operand)
-    assert found == {'tangent': False, 'gradient': True}
+    def stage(fn):
+        if staged == 'jit':
+            return jax.jit(fn)
+        if staged == 'remat':
+            return jax.checkpoint(fn)
+        return lambda *operands: jax.lax.scan(lambda carry, _: (carry, fn(*operands)), None, length=1)[1]
+
+    def tangent(kernel, operands, directions):
+        with generation.chosen(gated_delta_rule=kernel):
+            return jax.tree.leaves(jax.jvp(stage(rule), operands, directions)[1])
+
+    mine, theirs = tangent('fla', operands, directions), tangent('xla', operands, directions)
+    with jax.enable_x64(new_val=True):
+        exact = tangent('xla', *(tuple(np.asarray(x, np.float64) for x in tree)
+                                 for tree in (operands, directions)))
+    for name, found, reference, truth in zip(('output', 'memory'), mine, theirs, exact, strict=True):
+        assert_as_exact_as_the_reference(found, reference, truth, f"{staged} {name}")
 
 
 @pytest.mark.parametrize('shards', [pytest.param(3, marks=pytest.mark.mesh(devices=3)),
@@ -489,19 +507,21 @@ forward mode."""
 
 
 def test_a_call_runs_its_products_kernels_apart():
-    """`_by_product`: a call's value is its forward kernel's, and its gradient its training kernel's own,
-    the two kernels' forward and pullback where a gradient is taken."""
-    def forward(x):
-        return 2.0 * x
+    """`_per_product`: a call's value is its forward kernel's where no derivative is taken; its gradient the
+    training kernel's forward and pullback; and its tangent the portable math's, `run('xla', ...)`."""
+    def run(kernel, x):
+        return {'forward': 2.0, 'training': 3.0, 'xla': 5.0}[kernel] * x
 
-    def training(x):
-        return 3.0 * x
+    def kernel_of(product):
+        return product
 
     x = jnp.arange(3.0)
-    np.testing.assert_array_equal(recurrence_chunk._by_product(forward, training, x), 2.0 * x)
-    value, grad = jax.value_and_grad(lambda x: recurrence_chunk._by_product(forward, training, x).sum())(x)
+    np.testing.assert_array_equal(recurrence_chunk._per_product(kernel_of, run, x), 2.0 * x)
+    value, grad = jax.value_and_grad(lambda x: recurrence_chunk._per_product(kernel_of, run, x).sum())(x)
     assert value == 3.0 * x.sum()
     np.testing.assert_array_equal(grad, jnp.full(3, 3.0))
+    np.testing.assert_array_equal(jax.jvp(functools.partial(recurrence_chunk._per_product, kernel_of, run),
+                                          (x,), (jnp.ones(3),))[1], jnp.full(3, 5.0))
 
 
 def portable_draw(seed: int, rows: int, packed: bool) -> tuple:
