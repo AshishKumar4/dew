@@ -58,20 +58,21 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
     import shutil
 
     import huggingface_hub.constants
-    from tool_support import load
+    from tool_support import run_from
 
     from dew.interop import PretrainedDecoder
 
-    reference = load("remote_code_reference")
-    repo, revision, files, _ = reference.RELEASES[name]
-    snapshot = tmp_path / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots" / revision
-    snapshot.mkdir(parents=True)
-    for file in files:
-        shutil.copy(reference.release_file(name, file), snapshot / file)
-    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
-    loaded = Pretrained.load(FIXTURES / name)
-    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "export")
-    (tmp_path / "scratch").mkdir()
-    checks = reference.opens(name, tmp_path / "export", tmp_path / "scratch")
+    # The tool imports its siblings in tools/, as it does run as a script.
+    with run_from("remote_code_reference", "tools") as reference:
+        repo, revision, files, _ = reference.RELEASES[name]
+        snapshot = tmp_path / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        for file in files:
+            shutil.copy(reference.release_file(name, file), snapshot / file)
+        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
+        loaded = Pretrained.load(FIXTURES / name)
+        PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "export")
+        (tmp_path / "scratch").mkdir()
+        checks = reference.opens(name, tmp_path / "export", tmp_path / "scratch")
     assert all(checks.values()), checks
 
