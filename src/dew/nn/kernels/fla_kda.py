@@ -926,7 +926,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
         h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, g, h0, g_lo=g_lo, **kernels)
     daqk, dv = bwd_dav(corrected, do, aqk, scale=scale, **kernels)
     dh, dh0, dv = fla_gdn.chunk_bwd_dhu(qg, kg, w, g, dht.astype(jnp.float32), do, dv, scale=scale,
-                                        **kernels)
+                                        g_lo=g_lo, **kernels)
     dq, dk, dv, db, dg, dakk = bwd_wy_dqkg(q, k, v, corrected, g, beta, akk, h, do, dh, dv, g_lo=g_lo,
                                            scale=scale, **kernels)
     dq, dk, db, dg = bwd_intra(q, k, g, beta, daqk, dakk, dq, dk, db, dg, **kernels)
