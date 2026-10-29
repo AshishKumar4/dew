@@ -39,7 +39,7 @@ import json
 import math
 import numbers
 import re
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path as FilePath
@@ -317,34 +317,46 @@ def _pinned(source: str) -> str:
     return source if FilePath(source).exists() else SourceReference.parse(source).pinned().spelled()
 
 
+def _adapter_selection(listed: Collection[str], weight_name: str | None) -> tuple[str, tuple[str, ...]]:
+    """What `LoRA.load` reads of an adapter whose files are `listed` (relative names): the path it
+    loads and the files it reads there. Inside `weight_name` where given (a Diffusers file, or a folder
+    of PEFT's files), else at the root: PEFT's pair, Diffusers' file, or the one `.safetensors` file.
+    Several such files with none named are refused."""
+    folder = "" if weight_name is None or weight_name in listed else weight_name.strip("/")
+    if weight_name is not None and not folder:
+        return weight_name, (weight_name,)
+    prefix = f"{folder}/" if folder else ""
+    here = {name.removeprefix(prefix) for name in listed if name.startswith(prefix)}
+    if PEFT_WEIGHTS in here and PEFT_CONFIG in here:
+        return folder, (prefix + PEFT_CONFIG, prefix + PEFT_WEIGHTS)
+    single = [DIFFUSERS_WEIGHTS] if DIFFUSERS_WEIGHTS in here else sorted(
+        name for name in here if "/" not in name and name.endswith(".safetensors"))
+    if len(single) != 1:
+        where = folder or "its root"
+        raise FileNotFoundError(f"the adapter holds no file Dew takes for it ({PEFT_WEIGHTS} with its "
+                                f"config, {DIFFUSERS_WEIGHTS} or one .safetensors file) at {where}: "
+                                f"{single}; name the file with --lora.weight-name")
+    return prefix + single[0], (prefix + single[0],)
+
+
 def _adapter_files(source: str, weight_name: str | None) -> FilePath:
-    """What `LoRA.load` reads of `source`: `weight_name` in it where given (a Diffusers file, or a
-    folder of PEFT's files), else its PEFT files, its Diffusers file, or the one `.safetensors` file at
-    its root, as Diffusers takes it; a Hub repo's are fetched at its pinned commit, and several root
-    files with none named are refused."""
-    if FilePath(source).exists():
-        return FilePath(source) if weight_name is None else FilePath(source) / weight_name
+    """The path `LoRA.load` reads of `source`, a local directory or file or a Hub repo at its pinned
+    commit, chosen alike from either's files (`_adapter_selection`); a Hub repo's selected files alone
+    are fetched."""
+    local = FilePath(source)
+    if local.is_file():
+        return local
+    if local.exists():
+        listed = [path.relative_to(local).as_posix() for path in local.rglob("*") if path.is_file()]
+        return local / _adapter_selection(listed, weight_name)[0]
     from dew.interop.sources import SourceReference, repo_files
 
     reference = SourceReference.parse(source)
     root = reference.metadata()
-    listed = repo_files(reference.name, root)
-    if weight_name is not None:
-        wanted = [name for name in listed if name == weight_name or name.startswith(f"{weight_name}/")]
-    elif PEFT_WEIGHTS in listed:
-        wanted = [PEFT_CONFIG, PEFT_WEIGHTS]
-    else:
-        wanted = [DIFFUSERS_WEIGHTS] if DIFFUSERS_WEIGHTS in listed else sorted(
-            name for name in listed if "/" not in name and name.endswith(".safetensors"))
-        if len(wanted) != 1:
-            raise FileNotFoundError(f"{source} holds no adapter file Dew takes for it ({PEFT_WEIGHTS}, "
-                                    f"{DIFFUSERS_WEIGHTS} or one root .safetensors file): {wanted}; name "
-                                    "the file with --lora.weight-name")
-    if not wanted:
-        raise FileNotFoundError(f"{source} holds no {weight_name}")
-    for name in wanted:
+    loaded, read = _adapter_selection(repo_files(reference.name, root), weight_name)
+    for name in read:
         reference.file(root, name)
-    return root / weight_name if weight_name is not None else root / wanted[-1] if len(wanted) == 1 else root
+    return root / loaded
 
 
 @dataclass(frozen=True)

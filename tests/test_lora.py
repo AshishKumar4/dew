@@ -1530,3 +1530,55 @@ def test_a_recorded_run_imports_its_adapter_from_the_hub_and_replays_it_offline(
         restored = Adapter.from_run(run, step=1)
         jax.tree.map(np.testing.assert_array_equal, thaw(restored.variables)["params"],
                      thaw(moved)["params"])
+
+
+ADAPT_IMPORTED = """
+import sys
+import jax.numpy as jnp
+import numpy as np
+from dew.interop.pretrained import Pretrained
+from dew.lora import LoRA
+
+decoder = Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference")
+spec = LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0, source=sys.argv[2], weight_name=sys.argv[3])
+bundled = decoder.adapt(spec, key=0)
+ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6) % decoder.model.vocab_size
+np.save(sys.argv[4], np.asarray(bundled.model.apply(bundled.variables, ids)))
+"""
+"""An imported adapter bound to a decoder in a process of its own, which reads `HF_ENDPOINT` as it
+imports the Hub client: the decoder, the adapter's source and its weight name, and where its logits go."""
+
+
+def test_an_adapter_named_by_its_folder_fetches_the_files_it_reads_alone(decoder, tmp_path):
+    """An adapter inside a checkpoint folder (`--lora.weight-name checkpoint-10`) beside the trainer's
+    own state loads from a local directory and from a Hub repo alike, computing the same logits, bit for
+    bit, as `LoRA.load` of that folder; from the Hub only its PEFT pair is fetched, the optimizer state
+    and the root's other files left there."""
+    import subprocess
+    import sys
+
+    from local_hub import LocalHub, hub_environment
+
+    drawn = decoder.adapt(LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0), key=0)
+    moved = {**drawn.variables, "params": jax.tree.map(lambda leaf: leaf + 0.05, drawn.variables["params"])}
+    checkpoint = tmp_path / "local" / "checkpoint-10"
+    drawn.adapter.save(moved, checkpoint)
+    (checkpoint / "optimizer.pt").write_bytes(b"\x80" * 64)
+    (tmp_path / "local" / "other.safetensors").write_bytes(b"\x00" * 16)
+    ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6) % decoder.model.vocab_size
+    expected = LoRA.load(decoder.model, decoder.variables, checkpoint, layouts=decoder.layouts)
+    logits = np.asarray(expected.model.apply(expected.variables, ids))
+    spec = LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0, source=str(tmp_path / "local"),
+                weight_name="checkpoint-10")
+    local = decoder.adapt(spec, key=1)
+    np.testing.assert_array_equal(np.asarray(local.model.apply(local.variables, ids)), logits)
+    served = {path.relative_to(tmp_path / "local").as_posix(): path
+              for path in (tmp_path / "local").rglob("*") if path.is_file()}
+    with LocalHub({"local/checkpoints": served}) as hub:
+        done = subprocess.run([sys.executable, "-c", ADAPT_IMPORTED, str(LLAMA), "local/checkpoints",
+                               "checkpoint-10", str(tmp_path / "hub.npy")],
+                              env=hub_environment(hub, tmp_path), capture_output=True, text=True, check=False)
+        assert done.returncode == 0, done.stderr[-3000:]
+        fetched = {read.file for read in hub.served if read.repo == "local/checkpoints" and read.file}
+    np.testing.assert_array_equal(np.load(tmp_path / "hub.npy"), logits)
+    assert fetched <= {"checkpoint-10/adapter_config.json", "checkpoint-10/adapter_model.safetensors"}
