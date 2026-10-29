@@ -276,6 +276,7 @@ def _offline_load(root, source, subfolder: str = ""):
                           text=True, env=env)
 
 
+@pytest.mark.whole_suite
 def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
     """A passed verification of a repository's own code is recorded under the Hub commit the load
     fetched that code at, beside the config, transformers, torch and Dew it ran under, so the same code
