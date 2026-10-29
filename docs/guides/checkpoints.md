@@ -294,6 +294,29 @@ On a CPU with performance and efficiency cores, such as Intel's hybrid parts, XL
 
 The grace period has to cover one step and one checkpoint write. When `dew launch` is told to stop a pool, it waits 300 seconds before it kills the ranks, and a second signal kills them at once ([Training on several nodes](multi-node.md)).
 
+## A run that outlives its Colab runtime
+
+A Colab runtime's disk goes with the runtime. Mounted Google Drive is a directory like any other to Dew, so a run that should resume on the next runtime keeps there what it cannot make again cheaply, and keeps the rest on the runtime's disk:
+
+```python
+from google.colab import drive
+
+import dew
+from dew.cache import enable_compilation_cache
+from dew.data import TFDS, presets
+
+drive.mount("/content/drive")
+root = "/content/drive/MyDrive/runs/flowers"
+
+enable_compilation_cache(f"{root}/xla")                      # compiled steps and the GPU's kernel picks
+train = TFDS("oxford_flowers102", path=f"{root}/data")         # the dataset as prepared once
+trainer = dew.Trainer(objective, checkpoints=dew.Checkpoints(
+    f"{root}/checkpoints", local_directory="/content/checkpoints", local_every=200))
+trainer.fit(train.pipe(presets.images, 64, batch=16, augment=True, cache=f"{root}/images"), steps=10_000)
+```
+
+On a new runtime the same cell mounts Drive again and calls `fit` with the same directory, which resumes from the latest checkpoint and its data position ([Preemption](#preemption) covers the stop). The compilation cache spares the new runtime its compiles only on the same GPU model and jaxlib, which a Colab runtime does not promise. Drive is slower than the runtime's disk and counts against its quota, so the run writes its frequent checkpoint to the runtime's disk (`local_directory`, every 200 steps) and the ones it keeps to Drive every `checkpoint_every` steps, `keep` of them ([Time cadence and retention](#time-cadence-and-retention)). A runtime that ends loses only the local one: the next resumes from the latest on Drive.
+
 ## Data position
 
 A plain Python generator cannot report its position. It trains and checkpoints, but its checkpoint holds no data position, and `fit` refuses to resume one, since the generator would start its data again from the top. Give the iterator `get_state` and `set_state`, as the example's does, read it through a built-in source, or declare that it yields the same batches each time it opens: wrap the reader in `dew.data.dataset.replayed`, or pass `replay=True` to `from_iter`. A declared stream is positioned by the batches it has read, and a resume reopens it and reads that many again.
