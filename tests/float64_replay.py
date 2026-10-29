@@ -9,7 +9,7 @@ from reference_error import _floating, as_given, equations
 
 REPLAYED = frozenset({
     "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "square", "exp", "expm1", "log", "erf",
-    "erf_inv", "sin", "cos", "ne", "dot_general", "conv_general_dilated", "broadcast_in_dim",
+    "erf_inv", "sin", "cos", "ne", "reduce_sum", "dot_general", "conv_general_dilated", "broadcast_in_dim",
     "concatenate", "convert_element_type", "gather", "iota", "reshape", "select_n", "slice", "squeeze",
     "stack", "stop_gradient", "transpose",
 })
@@ -90,6 +90,27 @@ def _replayed(graph, consts, arguments, used=None):
     return [read(variable) if kept else None for variable, kept in zip(graph.outvars, used, strict=True)]
 
 
+def _wide(dtype):
+    """`dtype`, a float widened to float64."""
+    return jnp.float64 if _floating(dtype) else dtype
+
+
+def _carried(body, consts: int, carries: int, used):
+    """Which of a scan body's results its used results read: a used carry or output, and every carry
+    a read result reads back in through the next step, until none is added."""
+    reading = list(used)
+    while True:
+        read = {variable for equation, _ in _read(body, reading) for variable in equation.invars}
+        read |= {variable for variable, kept in zip(body.outvars, reading, strict=True)
+                 if kept and not hasattr(variable, "val")}
+        added = [index for index in range(carries)
+                 if not reading[index] and body.invars[consts + index] in read]
+        if not added:
+            return reading
+        for index in added:
+            reading[index] = True
+
+
 def _replayed_equation(equation, values, used):
     name, params = equation.primitive.name, equation.params
     dtypes = [variable.aval.dtype for variable in (*equation.invars, *equation.outvars)
@@ -114,12 +135,20 @@ def _replayed_equation(equation, values, used):
         # Replayed eagerly, the branch index is concrete: the branch the program takes, alone.
         branch = params["branches"][int(values[0])]
         return _replayed(branch.jaxpr, branch.consts, values[1:], used)
+    if name in ("name", "optimization_barrier"):
+        return list(values)
     if name == "scan":
-        # The body, replayed in float64 for its operands' widened dtypes, as the scan's own.
+        # The body, replayed in float64 for its operands' widened dtypes, as the scan's own: of its
+        # results those the scan's used results read through every step (`_carried`), the rest zeros.
         body = params["jaxpr"]
-        widened = jax.make_jaxpr(lambda *operands: _replayed(body.jaxpr, body.consts, list(operands)))(
-            *(jax.ShapeDtypeStruct(variable.aval.shape, jnp.float64 if _floating(variable.aval.dtype)
-                                   else variable.aval.dtype) for variable in body.jaxpr.invars))
+        reading = _carried(body.jaxpr, params["num_consts"], params["num_carry"], used)
+
+        def step(*operands):
+            outputs = _replayed(body.jaxpr, body.consts, list(operands), reading)
+            return [jnp.zeros(variable.aval.shape, _wide(variable.aval.dtype)) if output is None else output
+                    for output, variable in zip(outputs, body.jaxpr.outvars, strict=True)]
+        widened = jax.make_jaxpr(step)(*(jax.ShapeDtypeStruct(variable.aval.shape, _wide(variable.aval.dtype))
+                                         for variable in body.jaxpr.invars))
         return equation.primitive.bind(*values, **{**params, "jaxpr": widened})
     if next(equations(params), None) is not None:
         # A call this replay does not open may hold float arithmetic its integer boundary hides.
