@@ -32,9 +32,15 @@ class KernelCase(NamedTuple):
     (`kernel_compile.mosaic_failures`)."""
 
 
-def _pinned(launch, tiles, *args, **kwargs):
+def _pinned(launch, tiles, *args, compensated: bool = False, terms: bool = False, **kwargs):
     """`launch`'s kernel on `args`, pinned to `tiles` (`tuning.pinned`): the function its module
-    names as the launch (`NAME`)."""
+    names as the launch (`NAME`); where `compensated`, the last of `args` the decay prefix's remainder
+    (`g_lo`), and where `terms`, the two before it the query side's decay terms (the WY backward's)."""
+    if compensated:
+        *args, kwargs["g_lo"] = args
+    if terms:
+        *args, pairs, after = args
+        kwargs["terms"] = (pairs, after)
     with tuning.pinned({type(launch): tiles}):
         return getattr(importlib.import_module(type(launch).__module__), launch.NAME)(*args, **kwargs)
 
@@ -62,14 +68,18 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
         "chunk_bwd_dv_local": (keyed, keyed, gated, valued),
         "chunk_bwd_dhu": (keyed, keyed, weighted, gated, state, valued, valued),
         "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, entered, valued, valued, entered),
-        "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed),
+        "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed, inverse, gated),
     }
     kwargs = {"chunk": chunk, "interpret": False}
     if kernel == "cumulated":
         kwargs.update(scale=fla_gdn.RCP_LN2, reverse=reverse)
     elif kernel in ("chunk_fwd_o", "chunk_bwd_dv_local", "chunk_bwd_dhu", "chunk_bwd_dqkwg"):
         kwargs["scale"] = width ** -0.5
-    return functools.partial(_pinned, launch, tiles, **kwargs), operands[kernel]
+    # Each launch as the rule calls it, the decay's prefix compensated: its remainder the last operand.
+    compensated = kernel != "cumulated"
+    return (functools.partial(_pinned, launch, tiles, compensated=compensated,
+                              terms=kernel == "prepare_wy_repr_bwd", **kwargs),
+            operands[kernel] + ((gated,) if compensated else ()))
 
 
 def kernel_cases(target: str, dtypes: tuple[str, ...] = ("bfloat16", "float32")) -> Iterator[KernelCase]:
@@ -322,8 +332,9 @@ def reference_dv_local(q, k, g, do, *, scale: float, chunk: int = 64):
 
 def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 64):
     """`chunk_bwd_dqkwg`'s math in XLA, per chunk, with the same casts, products widened, and a key
-    head's value heads summed in fp32 before `dq` and `dk` round. The decay's gradient is each
-    token's, its terms summed over the ranges through it (`fla_gdn._summed_back`)."""
+    head's value heads summed in fp32 before `dq` and `dk` round. The decay's gradient is its terms,
+    the pairs `[B, T, HV, BT]` and each token's from its chunk's start `[B, T, HV]`, as the kernel
+    leaves them for the WY backward to sum (`fla_gdn._dqkwg_kernel`)."""
     key_heads = q.shape[2]
     group = v.shape[2] // key_heads
     q_dtype, k_dtype = q.dtype, k.dtype
@@ -357,13 +368,14 @@ def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     pairs = pairs.at[..., -1, :].add(jnp.where(index < chunk - 1, leaving, 0.0))
     after = jnp.moveaxis(jnp.einsum('bnshk,bnshk->bnsh', dq, qc.astype(f32)), 3, 2)
     after = after.at[..., -1].add(dg_last)
-    dg = jnp.moveaxis(range_gradient(pairs, after), 2, 3)
+    terms = (jnp.moveaxis(pairs, 2, 3).reshape(batch, length, heads, chunk),
+             jnp.moveaxis(after, 2, 3).reshape(batch, length, heads))
     ds = ds.astype(k_dtype).astype(f32)
     dq = dq + jnp.einsum('bnhst,bnthk->bnshk', ds, kc.astype(f32), precision=exact)
     dk = dk + jnp.einsum('bnhst,bnshk->bnthk', ds, qc.astype(f32), precision=exact)
     shape = (batch, length, key_heads, group, q.shape[-1])
     dq, dk = dq.reshape(shape).sum(3).astype(q_dtype), dk.reshape(shape).sum(3).astype(k_dtype)
-    return dq, dk, dw.reshape(w.shape).astype(w.dtype), dg.reshape(batch, length, heads)
+    return dq, dk, dw.reshape(w.shape).astype(w.dtype), terms
 
 
 KDA_TRAINING = (1, 4096, 32, 128)

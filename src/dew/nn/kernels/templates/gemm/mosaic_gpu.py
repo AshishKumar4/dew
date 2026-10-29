@@ -47,6 +47,7 @@ output dtype.
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 
 import jax
 from jax import lax, numpy as jnp
@@ -175,27 +176,22 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     def tiled(consumers: int, programs: int) -> Tiles | None:
         role = family.role_rows * consumers
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
-        shapes = _shapes(layouts, consumers, columns, role, most_rows)
         shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
                                    multiprocessors=multiprocessors, grouped=grouped)
-        fallback = None
-        for block_m, block_n in shapes:
-            # The shape before a deeper step: it sets how many times a FLOP reads each operand, where a
-            # step's depth only sets how many steps a tile takes (and, in registers, its fragments').
-            for step in steps:
-                def launches_of(layout, block_m=block_m, block_n=block_n, step=step):
-                    shape = shaped(layout, block_m, block_n, step)
-                    return [launch_of(shape)] if candidate(shape) else None
 
-                found = resources.placed(launches_of, layouts, target, programs=programs)
-                if found is None:
-                    continue
-                layout, planned = found
-                tile = dataclasses.replace(shaped(layout, block_m, block_n, step), stages=planned[0].stages)
-                if tile.stages >= busy:
-                    return tile
-                fallback = fallback or tile
-        return fallback
+        held_tile = functools.partial(_held_tile, role=role, steps=steps, busy=busy, shaped=shaped,
+                                      candidate=candidate, launch_of=launch_of, layouts=layouts,
+                                      target=target, programs=programs)
+        # The width whose tile reads its operands fewest times a FLOP (1/rows + 1/columns), the wider on a
+        # tie, among those staging deep enough to stay busy where any does. mma.sync's one consumer at
+        # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
+        # (0.016 against 0.021 reads a FLOP; 64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's
+        # 1.10-1.14, FSA100POST32).
+        held = [held_tile(block_n, held_rows)
+                for block_n, held_rows in _held_widths(layouts, consumers, columns, role, most_rows)]
+        busy_tiles = [tile for tile, staged in held if tile is not None and staged]
+        tiles = busy_tiles or [tile for tile, _ in held if tile is not None]
+        return min(tiles, key=lambda tile: (1 / tile.block_m + 1 / tile.block_n, -tile.block_n), default=None)
 
     # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
     # does a call no cooperative tile holds (a wide epilogue's outputs past a block).
@@ -205,10 +201,35 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
                  if (tile := tiled(consumers, programs)) is not None), None)
 
 
-def _shapes(layouts: tuple, consumers: int, columns: list[int], role: int, most_rows: int) -> list[tuple]:
-    """`derived`'s tile shapes at `consumers`, in its order (its Shape): by their operand reads a FLOP, a
-    tile that stages too shallow giving way to the next, its registers the most generous of `layouts`' (a
-    layout holding fewer gives way at placement, `resources.placed`)."""
+def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], busy: int, shaped: Callable,
+               candidate: Callable, launch_of: Callable, layouts: tuple, target, programs: int
+               ) -> tuple["Tiles | None", bool]:
+    """`derived`'s tile at a width: the rows its registers hold there (`held_rows`), shortened where its
+    stages do not fit, at the first step that plans (a step's depth sets how many steps a tile takes, not
+    how many times a FLOP reads each operand); and whether it stages `busy` deep, enough to stay busy."""
+    fallback = None
+    for block_m in range(held_rows, 0, -role):
+        for step in steps:
+            def launches_of(layout, block_m=block_m, step=step):
+                shape = shaped(layout, block_m, block_n, step)
+                return [launch_of(shape)] if candidate(shape) else None
+
+            found = resources.placed(launches_of, layouts, target, programs=programs)
+            if found is None:
+                continue
+            layout, planned = found
+            tile = dataclasses.replace(shaped(layout, block_m, block_n, step), stages=planned[0].stages)
+            if tile.stages >= busy:
+                return tile, True
+            fallback = fallback or tile
+    return fallback, False
+
+
+def _held_widths(layouts: tuple, consumers: int, columns: list[int], role: int,
+                 most_rows: int) -> list[tuple[int, int]]:
+    """`derived`'s widths at `consumers` and the rows each holds in its consumers' registers (its Shape):
+    every column width up to the widest that holds a role's rows, its registers the most generous of
+    `layouts`' (a layout holding fewer gives way at placement, `resources.placed`)."""
     if not columns:
         return []
     area = max(resources.held_area(layout, consumers) for layout in layouts)
@@ -218,15 +239,7 @@ def _shapes(layouts: tuple, consumers: int, columns: list[int], role: int, most_
     def held(block_n: int) -> int:
         return min(most_rows, max(resources.held_rows(layout, consumers, block_n) for layout in layouts))
 
-    # Every shape at each column width up to the widest and each height its registers hold there, in the
-    # order of the fewest operand reads a FLOP (1/rows + 1/columns), the wider on a tie: a shape that
-    # does not plan (its registers, its stages) gives way to the next by that measure, never first to a
-    # shorter one of its width. mma.sync's one consumer at Qwen3-8B's gate/up so takes 128 x 128 where
-    # 128 x 192 does not hold, not 64 x 192 (0.016 against 0.021 reads a FLOP; 64 x 192 ran 1.21-1.30x
-    # XLA's time against 128 x 128's 1.10-1.14, FSA100POST32).
-    return sorted(((block_m, block_n) for block_n in columns if block_n <= widest
-                   for block_m in range(held(block_n), 0, -role)),
-                  key=lambda shape: (1 / shape[0] + 1 / shape[1], -shape[1]))
+    return [(block_n, held(block_n)) for block_n in columns if block_n <= widest and held(block_n) >= role]
 
 
 def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, programs: int, rows: int,
