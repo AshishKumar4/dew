@@ -1044,7 +1044,8 @@ class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
     own rows (`dew.batch.padded_rows`), and `VALID_ROWS` marking the real ones: those of
     its own a batch that marks them already marks real. Without `real` every
-    row is a repeat."""
+    row is a repeat. A whole batch marks every row real, so a read's batches, its short last one
+    among them, share one shape."""
 
     def __init__(self, rows: int, *, real: bool = True):
         self._rows, self._real = rows, real
@@ -1052,7 +1053,8 @@ class FilledBatch(pygrain.MapTransform):
     def map(self, element: Batch) -> Batch:
         held = rows_of(element)
         if held == self._rows and self._real:
-            return element
+            # A whole batch marks its rows real too, so every batch of the read is one shape, one program.
+            return element if VALID_ROWS in element else {**element, VALID_ROWS: np.ones(held, bool)}
         indices, repeats = padded_rows(held, self._rows)
         valid = ~repeats & self._real
         if VALID_ROWS in element:
