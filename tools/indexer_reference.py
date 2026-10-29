@@ -9,35 +9,34 @@ softmax from the head-summed, L1-normalised attention distribution, over
 every allowed key in the dense warm-up (`indexer_sparse_training=False`)
 and over the indexer's own top-k in sparse training; `Indexer.generate_mask`
 (:228-268) is the exact top-k the mask keeps, ties to the earliest key.
-Both are transcribed here in NumPy, line for line with the masks the
-reference adds (`DEFAULT_MASK_VALUE`, common_types.py:75; `EPS`,
-utils/globals.py:42), and run on fixed-seed tiny tensors. Dew's
-`dew.nn.mla.indexer_kl` and `top_k_keys` are tested against what lands
-under tests/fixtures/indexer, so the suite needs no maxtext install.
+Both are fetched at that commit and run as published under JAX
+(`published_methods`: EPS and DEFAULT_MASK_VALUE read from the same commit's
+globals.py and common_types.py, the config at base.yml's defaults: exact
+top-k, no head chunking, default matmul precision; the float64 run reads the
+loss's float32 casts as float64), behind `Indexer.__call__`'s masking and
+`jax.lax.top_k` (`published_loss`), each query's KL the published loss of
+that query alone. Dew's `dew.nn.mla.indexer_kl` and `top_k_keys` are tested
+against what lands under tests/fixtures/indexer, so the suite needs no
+maxtext install.
 
-    python tools/indexer_reference.py
+    PYTHONPATH=src:tools python tools/indexer_reference.py
 
 What it writes:
 
-- indexer_loss.npz: the inputs (the main heads' query and key, the
-  indexer's scores with exact-zero ties at the boundary, the causal and the
-  packed additive masks) and the outputs (per-query KL and its mean for the
-  dense and the sparse loss, the exact top-k mask).
+- indexer_loss.npz (`write_legacy`): tiny inputs (the main heads' query and
+  key, the indexer's scores with exact-zero ties at the boundary, a packed
+  row's segments) and, at float32, each mask's exact top-k selection and the
+  per-query KL and its mean for the dense and the sparse loss.
 - meta.json: the reference release and lines, and the tensor shapes.
-- maxtext.npz: `MLA.calculate_indexer_loss` and `Indexer.generate_mask`
-  themselves, fetched at that commit and run as published under JAX (EPS
-  and DEFAULT_MASK_VALUE read from the same commit's globals.py and
-  common_types.py, the config at base.yml's defaults: exact top-k, no head
-  chunking, default matmul precision; the float64 run reads the loss's
-  float32 casts as float64), behind `Indexer.__call__`'s masking
-  and `jax.lax.top_k`, on larger tensors: the dense loss over a causal and
-  a packed mask and the sparse loss over the causal one, each with its
-  gradient in the indexer's scores, in float32 and in float64, and the
-  exact top-k masks.
-- recorded_<case>.npz (`recording`), one a case: the same published functions
-  recorded over check 1's seeds, each seed's inputs drawn again by the test
-  (`published_inputs`), the float32 run's evidence from its float64 run kept
-  with that run's sketch (tools/recorded_references.py).
+- maxtext.npz (`write_published`): on larger tensors, the dense loss over a
+  causal and a packed mask and the sparse loss over the causal one, each
+  with its gradient in the indexer's scores, in float32 and in float64, and
+  the exact top-k masks.
+- recorded_<case>.npz (`recording`), one a case: the same published loss,
+  its gradient and each query's KL recorded over check 1's seeds, each
+  seed's inputs drawn again by the test (`published_inputs`), the float32
+  run's evidence from its float64 run kept with that run's sketch
+  (tools/recorded_references.py).
 
     PYTHONPATH=src:tools python tools/indexer_reference.py recording
 """
@@ -56,128 +55,52 @@ PUBLISHED = {"batch": 2, "length": 24, "heads": 4, "head_dim": 16, "top_k": 6, "
 """maxtext.npz's sizes: 1152 scores per mask, which the float64 rule's RMS
 settles over."""
 
-BATCH, LENGTH, HEADS, HEAD_DIM = 2, 7, 3, 8
-TOP_K = 3
-# MaxText common_types.py:75 and utils/globals.py:42.
-DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
-EPS = 1e-8
+LEGACY = {"batch": 2, "length": 7, "heads": 3, "head_dim": 8, "top_k": 3, "seed": 23}
+"""indexer_loss.npz's sizes: tiny tensors, two documents in the first row and one plus padding in the second,
+whose exact top-k selections the tests read whole."""
+LEGACY_SEGMENTS = np.array([[1, 1, 1, 2, 2, 2, 2], [1, 1, 1, 1, 1, 0, 0]], np.int32)
+"""indexer_loss.npz's two rows: the padding queries of the second attend nothing."""
 
 
-def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    x = x - np.max(x, axis=axis, keepdims=True)
-    e = np.exp(x)
-    return e / np.sum(e, axis=axis, keepdims=True)
+def write_legacy() -> None:
+    """indexer_loss.npz and meta.json: the tiny inputs, with ReLU-shaped scores whose exact zeros tie at the
+    top-k boundary, so the exact top-k's earliest-key rule decides the mask; and each mask's selection and
+    per-query KL, dense and (causal) sparse, from the published methods at float32."""
+    import jax.numpy as jnp
 
-
-def generate_mask(indexer_score: np.ndarray, topk_values: np.ndarray) -> np.ndarray:
-    """`Indexer.generate_mask` with `indexer_mask_exact_topk` (:245-264):
-    0.0 on the kept keys, DEFAULT_MASK_VALUE elsewhere."""
-    cutoff = topk_values[..., -1][..., None]
-    k = topk_values.shape[-1]
-    strictly_greater = indexer_score > cutoff
-    equal = indexer_score == cutoff
-    sg_rank = np.cumsum(strictly_greater.astype(np.int32), axis=-1)
-    eq_rank = np.cumsum(equal.astype(np.int32), axis=-1)
-    sg_kept = strictly_greater & (sg_rank <= k)
-    num_sg_kept = np.minimum(sg_rank[..., -1:], k)
-    num_eq_to_keep = k - num_sg_kept
-    selected = sg_kept | (equal & (eq_rank <= num_eq_to_keep))
-    return np.where(selected, np.float32(0.0), np.float32(DEFAULT_MASK_VALUE))
-
-
-def indexer_call(indexer_score: np.ndarray, attention_mask: np.ndarray, top_k: int
-                 ) -> tuple[np.ndarray, np.ndarray]:
-    """The tail of `Indexer.__call__` (:428-452): the attention mask goes
-    on before the top-k and again after it, and the masked score is what
-    the loss receives."""
-    indexer_score = indexer_score + attention_mask
-    topk_values = -np.sort(-indexer_score, axis=-1)[..., :top_k]
-    indexer_mask = generate_mask(indexer_score, topk_values)
-    indexer_mask = indexer_mask + attention_mask
-    return indexer_mask, indexer_score
-
-
-def calculate_indexer_loss(indexer_score: np.ndarray, query: np.ndarray, key: np.ndarray,
-                           attention_mask: np.ndarray, indexer_mask: np.ndarray,
-                           sparse_loss: bool, dtype=np.float32) -> tuple[np.ndarray, np.ndarray]:
-    """`MLA.calculate_indexer_loss` (:1117-1229) at scaling factor 1, the
-    native (unchunked) head path; returns the per-query KL sum with the
-    mean the reference reports. `dtype` is the precision its softmaxes are
-    cast to, float32 as published, float64 for its float64 run."""
-    if sparse_loss:
-        indexer_score = indexer_score + indexer_mask
-    indexer_probs = softmax(indexer_score.astype(dtype), axis=-1)
-    attention_scores = np.einsum("bthd,bshd->bhts", query, key)
-    if sparse_loss:
-        attention_scores = attention_scores + indexer_mask[:, None, :, :]
-    else:
-        attention_scores = attention_scores + attention_mask[:, None, :, :]
-    attention_probs = np.sum(softmax(attention_scores.astype(dtype), axis=-1), axis=1)
-    attention_probs = attention_probs / (np.sum(attention_probs, axis=-1, keepdims=True) + EPS)
-    log_attention_probs = np.log(attention_probs + EPS)
-    log_indexer_probs = np.log(indexer_probs + EPS)
-    kl_per_token = attention_probs * (log_attention_probs - log_indexer_probs)
-    per_query = np.sum(kl_per_token, axis=-1)
-    return per_query, np.asarray(np.mean(per_query), dtype)
-
-
-def causal_mask() -> np.ndarray:
-    keep = np.tril(np.ones((LENGTH, LENGTH), bool))
-    return np.broadcast_to(np.where(keep, 0.0, DEFAULT_MASK_VALUE).astype(np.float32),
-                           (BATCH, LENGTH, LENGTH)).copy()
-
-
-def packed_mask(segments: np.ndarray) -> np.ndarray:
-    """Block-diagonal and causal over `[B, S]` segment ids, segment 0 a
-    padding query that may attend nothing."""
-    inside = (segments[:, :, None] == segments[:, None, :]) & (segments[:, :, None] != 0)
-    keep = inside & np.tril(np.ones((LENGTH, LENGTH), bool))[None]
-    return np.where(keep, 0.0, DEFAULT_MASK_VALUE).astype(np.float32)
-
-
-def main() -> None:
-    rng = np.random.default_rng(23)
-    scale = np.float32(HEAD_DIM ** -0.5)
-    query = rng.normal(size=(BATCH, LENGTH, HEADS, HEAD_DIM)).astype(np.float32)
-    key = rng.normal(size=(BATCH, LENGTH, HEADS, HEAD_DIM)).astype(np.float32)
-    # ReLU-shaped scores with exact zeros, so the top-k boundary ties and
-    # the exact top-k's earliest-key rule decides the mask.
-    scores = np.maximum(rng.normal(scale=1.5, size=(BATCH, LENGTH, LENGTH)), 0).astype(np.float32)
-    # Two documents in the first row and one plus padding in the second;
-    # the padding queries of the second row attend nothing.
-    segments = np.array([[1, 1, 1, 2, 2, 2, 2], [1, 1, 1, 1, 1, 0, 0]], np.int32)
-    arrays = {"query": query, "key": key, "scores": scores, "segments": segments,
-              "scale": scale}
-    # MaxText's query carries the softmax scale (attention_mla.py:955).
-    scaled = query * scale
-    for name, mask in (("causal", causal_mask()), ("packed", packed_mask(segments))):
-        indexer_mask, masked_scores = indexer_call(scores, mask, TOP_K)
-        dense_kl, dense_loss = calculate_indexer_loss(
-            masked_scores, scaled, key, mask, indexer_mask, sparse_loss=False)
-        arrays[f"{name}_dense_kl"] = dense_kl
-        arrays[f"{name}_dense_loss"] = dense_loss
-        arrays[f"{name}_selected"] = indexer_mask == 0.0
-        if name == "causal":
-            # The sparse branch adds the mask twice, which overflows a fully
-            # masked (padding) row to nan in fp32; the reference never
-            # scores such a row sparsely, so only the causal case does.
-            sparse_kl, sparse_loss = calculate_indexer_loss(
-                masked_scores, scaled, key, mask, indexer_mask, sparse_loss=True)
-            arrays["causal_sparse_kl"] = sparse_kl
-            arrays["causal_sparse_loss"] = sparse_loss
+    batch, length, heads, dim = (LEGACY[name] for name in ("batch", "length", "heads", "head_dim"))
+    rng = np.random.default_rng(LEGACY["seed"])
+    scale = np.float32(dim ** -0.5)
+    query = rng.normal(size=(batch, length, heads, dim)).astype(np.float32)
+    key = rng.normal(size=(batch, length, heads, dim)).astype(np.float32)
+    scores = np.maximum(rng.normal(scale=1.5, size=(batch, length, length)), 0).astype(np.float32)
+    arrays = {"query": query, "key": key, "scores": scores, "segments": LEGACY_SEGMENTS, "scale": scale}
+    methods, mask_value = published_methods(jnp.float32)
+    for mask in ("causal", "packed"):
+        attention_mask = jnp.where(published_keep(mask, LEGACY_SEGMENTS), 0.0, mask_value).astype(jnp.float32)
+        # The sparse loss adds the mask twice, which overflows a fully masked (padding) row to nan in float32;
+        # the reference never scores such a row sparsely, so only the causal mask has a sparse case.
+        for sparse in (False, True) if mask == "causal" else (False,):
+            value, (indexer_mask, per_query) = published_loss(
+                methods, jnp.float32, jnp.asarray(scores), attention_mask, jnp.asarray(query) * scale,
+                jnp.asarray(key), sparse, LEGACY["top_k"])
+            phase = "sparse" if sparse else "dense"
+            arrays[f"{mask}_{phase}_kl"] = np.asarray(per_query)
+            arrays[f"{mask}_{phase}_loss"] = np.asarray(value)
+            if not sparse:
+                arrays[f"{mask}_selected"] = np.asarray(indexer_mask) == 0.0
     FIXTURES.mkdir(parents=True, exist_ok=True)
     np.savez(FIXTURES / "indexer_loss.npz", **arrays)
     meta = {
         "maxtext": "0.2.4",
-        "commit": "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45",
+        "commit": COMMIT,
         "source": {
             "calculate_indexer_loss": "src/maxtext/layers/attention_mla.py:1117-1229",
             "generate_mask": "src/maxtext/layers/attention_mla.py:228-268",
             "indexer_call_masking": "src/maxtext/layers/attention_mla.py:428-452",
             "query_scale": "src/maxtext/layers/attention_mla.py:955",
         },
-        "batch": BATCH, "length": LENGTH, "heads": HEADS, "head_dim": HEAD_DIM,
-        "top_k": TOP_K, "seed": 23,
+        **{name: LEGACY[name] for name in ("batch", "length", "heads", "head_dim", "top_k", "seed")},
     }
     (FIXTURES / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     for name, value in arrays.items():
@@ -217,21 +140,31 @@ def published_methods(dtype) -> tuple[dict, float]:
     return methods, scope["DEFAULT_MASK_VALUE"]
 
 
-def published_loss(methods: dict, dtype, raw, attention_mask, query, key, sparse: bool):
+def published_loss(methods: dict, dtype, raw, attention_mask, query, key, sparse: bool, top_k: int):
     """The published loss on the indexer's raw scores behind
     `Indexer.__call__`'s tail (:428-452): the attention mask goes on before
     `jax.lax.top_k` and again after `generate_mask`, and the masked score is
-    what the loss receives. Returns the loss and the indexer's mask."""
+    what the loss receives. Returns the loss, and the indexer's mask with each
+    query's KL: the published loss, a mean over every query, of the one query
+    alone, its row of scores and masks against every key."""
     import jax
 
     layer = types.SimpleNamespace(config=types.SimpleNamespace(
         indexer_mask_exact_topk=True, mla_qk_head_chunk_size=0, matmul_precision="default"), dtype=dtype)
     indexer_score = raw + attention_mask
-    topk_values, _ = jax.lax.top_k(indexer_score, k=PUBLISHED["top_k"])
+    topk_values, _ = jax.lax.top_k(indexer_score, k=top_k)
     indexer_mask = methods["generate_mask"](layer, indexer_score, topk_values) + attention_mask
     value = methods["calculate_indexer_loss"](layer, indexer_score, query, key, attention_mask, indexer_mask,
                                               sparse_loss=sparse, scaling_factor=1.0)
-    return value, indexer_mask
+
+    def alone(score, one, keys, row_mask, row_indexer_mask):
+        return methods["calculate_indexer_loss"](layer, score[None, None], one[None, None], keys[None],
+                                                 row_mask[None, None], row_indexer_mask[None, None],
+                                                 sparse_loss=sparse, scaling_factor=1.0)
+
+    per_query = jax.vmap(jax.vmap(alone, in_axes=(0, 0, None, 0, 0)))(indexer_score, query, key, attention_mask,
+                                                                         indexer_mask)
+    return value, (indexer_mask, per_query)
 
 
 def write_published() -> None:
@@ -280,9 +213,10 @@ def published_inputs(seed: int) -> dict[str, np.ndarray]:
     return {"query": query, "key": key, "scores": scores}
 
 
-def published_keep(mask: str) -> np.ndarray:
-    """The causal, or over PUBLISHED_SEGMENTS the packed causal, `[B, S, S]` keys a query may read."""
-    segments, length = PUBLISHED_SEGMENTS, PUBLISHED["length"]
+def published_keep(mask: str, segments: np.ndarray = PUBLISHED_SEGMENTS) -> np.ndarray:
+    """The causal, or over `segments` (`[B, S]`, 0 a padding query that may read nothing) the packed causal,
+    `[B, S, S]` keys a query may read."""
+    length = segments.shape[1]
     causal = np.tril(np.ones((length, length), bool))[None]
     if mask == "causal":
         return np.broadcast_to(causal, (segments.shape[0], length, length))
@@ -312,12 +246,13 @@ def write_published_recording(command: str) -> None:
                 methods, mask_value = published[dtype]
                 attention_mask = jnp.where(keep, 0.0, mask_value).astype(dtype)
                 scaled = jnp.asarray(inputs["query"], dtype) * dtype(scale)
-                (value, _), gradient = jax.value_and_grad(
+                (value, (_, per_query)), gradient = jax.value_and_grad(
                     lambda raw, methods=methods, attention_mask=attention_mask, scaled=scaled, dtype=dtype:
                     published_loss(methods, dtype, raw, attention_mask, scaled,
-                                   jnp.asarray(inputs["key"], dtype), sparse),
+                                   jnp.asarray(inputs["key"], dtype), sparse, PUBLISHED["top_k"]),
                     has_aux=True)(jnp.asarray(inputs["scores"], dtype))
-                found.append({"loss": np.asarray(value), "gradient": np.asarray(gradient)})
+                found.append({"loss": np.asarray(value), "gradient": np.asarray(gradient),
+                              "per query": np.asarray(per_query)})
             return found[0], found[1]
 
         def proxy(inputs, mask=mask, sparse=sparse):
@@ -325,10 +260,11 @@ def write_published_recording(command: str) -> None:
             region = top_k_keys(inputs["scores"], keep, PUBLISHED["top_k"]) if sparse else keep
 
             def loss(scores):
-                return jnp.mean(indexer_kl(scores, inputs["query"], inputs["key"], region, scale))
+                per_query = indexer_kl(scores, inputs["query"], inputs["key"], region, scale)
+                return jnp.mean(per_query), per_query
 
-            value, gradient = jax.value_and_grad(loss)(inputs["scores"])
-            return {"loss": value, "gradient": gradient}
+            (value, per_query), gradient = jax.value_and_grad(loss, has_aux=True)(inputs["scores"])
+            return {"loss": value, "gradient": gradient, "per query": per_query}
 
         with jax.enable_x64(new_val=True):
             recording = record_case(name, published_inputs, evaluate, proxy, truth_proxy=proxy,
@@ -350,9 +286,10 @@ def published_case(methods, mask_value, dtype, tail, query, key, scores, scale, 
     for name, (mask, sparse) in cases.items():
         attention_mask = jnp.where(keeps[mask], 0.0, mask_value).astype(dtype)
         scaled = jnp.asarray(query, dtype) * dtype(scale)
-        (value, indexer_mask), gradient = jax.value_and_grad(
+        (value, (indexer_mask, _)), gradient = jax.value_and_grad(
             lambda raw, attention_mask=attention_mask, scaled=scaled, dtype=dtype, sparse=sparse:
-            published_loss(methods, dtype, raw, attention_mask, scaled, jnp.asarray(key, dtype), sparse),
+            published_loss(methods, dtype, raw, attention_mask, scaled, jnp.asarray(key, dtype), sparse,
+                           PUBLISHED["top_k"]),
             has_aux=True)(jnp.asarray(scores, dtype))
         arrays[f"{name}/loss{tail}"] = np.asarray(value)
         arrays[f"{name}/grad{tail}"] = np.asarray(gradient)
@@ -365,5 +302,5 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["recording"]:
         write_published_recording("PYTHONPATH=src:tools python tools/indexer_reference.py recording")
     else:
-        main()
+        write_legacy()
         write_published()
