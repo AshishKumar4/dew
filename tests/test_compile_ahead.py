@@ -333,7 +333,7 @@ FAST = {"tensor": Link(1e18, 1e9)}
 spreads over it, as over a measured NVLink one may."""
 
 
-def latent(mesh, *, ahead=None, links=None):
+def latent(mesh, *, ahead=None, links=None, checkpoints=None):
     """A decoder of latent attention, whose down projection a tensor axis's link may spread
     (`dew.nn.sharding.down_projection`), trained over `mesh`."""
     from dew.nn.mla import MLAMixer
@@ -342,7 +342,7 @@ def latent(mesh, *, ahead=None, links=None):
                          mixer=MLAMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4,
                                         qk_rope_head_dim=4, v_head_dim=4))
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), ahead=ahead, links=links)
+                   layout=Layout(min_shard=TINY_SHARD), ahead=ahead, links=links, checkpoints=checkpoints)
 
 
 def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
@@ -363,20 +363,27 @@ def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
 @pytest.mark.mesh(devices=2)
 def test_a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_with(tmp_path):
     """A run on two GPUs whose link would spread a projection (`FAST`), handed a step compiled ahead
-    over compile-only GPUs that spread none, traces with the links the step records and trains from it,
-    rather than lowering another program and refusing it (row 2229)."""
+    over compile-only GPUs that spread none, traces with the link the step records and trains from it,
+    rather than lowering another program and refusing it; resumed from its checkpoint without the step,
+    it traces with that link again, not one it measures (row 2229)."""
+    from dew.checkpoints import Checkpoints
     from dew.nn.kernels.generation import chosen, device_generation
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     spec, path = MeshSpec(tensor=2), tmp_path / "step.dew-aot"
+    here = spec.build(jax.devices()[:2])
     with chosen(narrow_copies="off"):
         target = spec.build(compile_only_gpus(device_generation(), 2))
         compile_ahead(latent(target), batch).save(path)
-        run = latent(spec.build(jax.devices()[:2]), ahead=AheadOfTime.load(path), links=FAST)
+        saved = str(tmp_path / "run")
+        run = latent(here, ahead=AheadOfTime.load(path), links=FAST, checkpoints=Checkpoints(saved))
         state = run.fit(batch, steps=2, log_every=1)
+        resumed = latent(here, checkpoints=Checkpoints(saved))
+        again = resumed.fit(batch, steps=3, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
     assert int(state.step) == 2 and first["ahead"] is True
+    assert int(again.step) == 3 and resumed.links["tensor"].bytes_per_second is None
 
 
 @pytest.mark.gpu(reason="loads a selected split executable onto its target GPU")

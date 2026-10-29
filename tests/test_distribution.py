@@ -683,15 +683,12 @@ def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp
                        mesh=MeshSpec(tensor=2))
 
     saved = trainer()
-    # A figure measured on one placement, and on the other none, as a step compiled ahead traced with.
     saved._bandwidths[paired, "tensor"] = first
-    saved._bandwidths[crossed, "tensor"] = None
     rung = saved._checkpoint_rung()
-    figures = {link_topology(paired, "tensor"): first, link_topology(crossed, "tensor"): None}
-    assert rung["links"] == figures
+    assert rung["links"] == {link_topology(paired, "tensor"): first}
     resumed = trainer()
     resumed._resume_rung(rung)
-    assert resumed._resumed_links == figures
+    assert resumed._resumed_links == {link_topology(paired, "tensor"): first}
 
 
 @pytest.mark.mesh(devices=2)

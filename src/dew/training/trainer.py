@@ -872,7 +872,7 @@ class Trainer(Generic[Loss, Effects]):
         for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
             if mesh.shape.get(axis, 1) == 1:
                 continue
-            if axis in self._stated_links:
+            if axis in self._stated_links and axis not in self._ahead_links:
                 stated = self._stated_links[axis]
                 links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
                 continue
