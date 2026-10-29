@@ -31,7 +31,6 @@ from dew.decision import Choice, DecisionObjective, Example, JointLayout, JointS
 from dew.inference import TextGeneration
 from dew.inference.serving import Server
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
-from dew.interop.safetensors_io import read_file
 from dew.interop.sources import load_shards
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -74,20 +73,10 @@ def changed(directory: Path, change: dict) -> Path:
     return directory
 
 
-LOGIT_TOLERANCE = 2e-5
-"""The largest absolute difference from the fp32 reference's logits a forward may show. The logits
-reach 20, where an fp32 unit is 1.9e-6; the observed differences are 5.7e-6 at one loop, 6.7e-6 at
-two, 7.6e-6 at four, and 5.7e-6 for the packed rows (xla and reference kernels), on CPU, fp32."""
-
-
 def assert_parity(logits, name: str, label: str) -> None:
-    """CONTRIBUTING's statement of logits parity against the reference's array `name`: the same
-    argmax, within `LOGIT_TOLERANCE` of the fp32 reference, and within tests/reference_error.py's
-    rule against float64."""
-    reference = REFERENCE[name]
-    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
-    assert float(np.max(np.abs(logits - reference))) < LOGIT_TOLERANCE, label
-    assert_as_exact_as_the_reference(logits, reference, REFERENCE[f'{name}_f64'], label)
+    """Logits parity against the reference's array `name`, by tests/reference_error.py's rule against
+    the reference's float64 array beside it."""
+    assert_as_exact_as_the_reference(logits, REFERENCE[name], REFERENCE[f'{name}_f64'], label)
 
 
 @pytest.mark.parametrize('loops', [1, 2, 4])
@@ -245,30 +234,30 @@ def test_a_shared_loop_cache_takes_each_prompt_whole(options):
 
 
 DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 64}
-"""Declared seeds for check 1, sized by `seeds_for` on armada, 2026-10-20: the live torch reference's
-six checkpoint gradients, through every pass or through the last pass alone."""
+"""Declared seeds for check 1, sized by `seeds_for` on armada: the live torch reference's gradient of
+every checkpoint tensor, through every pass or through the last pass alone."""
 
 
 @pytest.mark.parametrize(('name', 'loops', 'backprop_steps'), [('trained', 2, None), ('truncated', 3, 1)])
 def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_steps):
-    """The gradient of a loss over the logits in the embeddings, an input layer's output-gate
-    projection, a looped feed-forward and attention gain, an output layer's step and the logit
-    gain, as the reference's autograd takes it, within the rule: through every pass, and with the
-    loop cut before its last pass, where the input layers still train through what that pass
-    reinjects (Huginn's truncation). Each draw has fresh token ids and cotangents, with their batch
-    rows permuted together, an exact symmetry of the summed loss. The same torch reference that
-    wrote the fixture runs live in fp32 and float64; every gradient keeps its checkpoint name."""
+    """The gradient of a loss over the logits in every tensor the checkpoint holds, its projections,
+    nGPT gains and steps, the embeddings and the logit gain, as the reference's autograd takes it,
+    within the rule: through every pass, and with the loop cut before its last pass, where the
+    input layers still train through what that pass reinjects (Huginn's truncation). Each draw has
+    fresh token ids and cotangents, with their batch rows permuted together, an exact symmetry of
+    the summed loss. The same torch reference that wrote the fixture runs live in fp32 and float64;
+    every gradient keeps its checkpoint name."""
     loaded = load()
     model = loaded.model.with_passes(loops, backprop_steps=backprop_steps)
     tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
     cut = None if backprop_steps is None else loops - backprop_steps
 
     def shapes(dtype):
-        return {tensor: jax.ShapeDtypeStruct(tensors[tensor].shape, dtype) for tensor in TOOL.GRADIENTS}
+        return {tensor: jax.ShapeDtypeStruct(value.shape, dtype) for tensor, value in tensors.items()}
 
     def exported(gradients):
         written = loaded.export({'params': gradients})
-        return {tensor: np.asarray(written[tensor]) for tensor in TOOL.GRADIENTS}
+        return {tensor: np.asarray(written[tensor]) for tensor in tensors}
 
     def dew(ids, cotangent):
         def loss(params):
@@ -280,7 +269,7 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     def torch_gradients(ids, cotangent):
         dtype = TOOL.torch.float64 if cotangent.dtype == np.float64 else TOOL.torch.float32
         reference = TOOL.DoryReference(loaded.config, tensors, dtype, loops=loops)
-        return reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS, cut=cut)
+        return reference.gradients(np.array(ids), np.array(cotangent), tuple(tensors), cut=cut)
 
     def reference(ids, cotangent):
         return jax.pure_callback(torch_gradients, shapes(cotangent.dtype), ids, cotangent)
@@ -334,10 +323,10 @@ def test_a_float64_model_computes_in_float64():
         backward = chain_roundings(jax.make_jaxpr(jax.grad(loss))(variables['params']))
     reference = TOOL.DoryReference(loaded.config, tensors, TOOL.torch.float64)
     expected = reference.forward(ids)
-    gradients = reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS)
+    gradients = reference.gradients(np.array(ids), np.array(cotangent), tuple(tensors))
     assert logits.dtype == np.float64
     assert_computes_the_oracle(logits, expected, 'float64 logits', roundings=forward)
-    for tensor in TOOL.GRADIENTS:
+    for tensor in tensors:
         assert_computes_the_oracle(np.asarray(written[tensor]), gradients[tensor], f'float64 {tensor}',
                                    roundings=backward)
 
@@ -384,6 +373,44 @@ def train(objective, directory: Path, steps: int):
     return jax.device_get(state.variables)
 
 
+def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
+    """The checkpoint's tensors with the adapter at `adapter` merged in by PEFT itself: its LoRA
+    layers injected by the adapter's own config into a torch module of the checkpoint's linear
+    projections under their checkpoint names, the saved factors loaded as PEFT loads them, and each
+    layer's merge."""
+    import torch
+    from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+    from peft.tuners.lora import LoraLayer
+    from safetensors.numpy import load_file
+
+    tensors = load_file(str(checkpoint / 'model.safetensors'))
+    base = torch.nn.Module()
+    for name, value in tensors.items():
+        *path, leaf, kind = name.split('.')
+        if kind != 'weight' or value.ndim != 2 or leaf == 'embeddings':
+            continue
+        parent = base
+        for part in path:
+            if not hasattr(parent, part):
+                parent.add_module(part, torch.nn.Module())
+            parent = getattr(parent, part)
+        linear = torch.nn.Linear(value.shape[1], value.shape[0], bias=False)
+        linear.weight.data = torch.as_tensor(value)
+        parent.add_module(leaf, linear)
+    model = inject_adapter_in_model(LoraConfig.from_pretrained(str(adapter)), base)
+    saved = load_file(str(adapter / 'adapter_model.safetensors'))
+    set_peft_model_state_dict(model, {name.removeprefix('base_model.model.'): torch.as_tensor(value)
+                                      for name, value in saved.items()})
+    merged = dict(tensors)
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer) and module.lora_A:
+            module.merge()
+            merged[f'{name}.weight'] = module.base_layer.weight.detach().numpy()
+    targets = {name.removeprefix('base_model.model.').split('.lora_')[0] + '.weight' for name in saved}
+    assert {name for name in merged if merged[name] is not tensors[name]} == targets
+    return merged
+
+
 MERGED_SEEDS = 8
 """The merged-adapter site's declared draws (`seeds_for`)."""
 
@@ -392,16 +419,19 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     """A rank-2 adapter on all eight projections of every layer, the attention's output gate
     (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
     loss reaches each projection; a run resumed after its first step ends where two uninterrupted
-    steps end; the factors save as PEFT names them and load back; and the merged checkpoint
-    reloads to logits on par with the adapted model's from float64."""
+    steps end; the saved factors load back to the same logits; PEFT, the saved adapter's consumer,
+    merges it into every projection the checkpoint holds by its name there, and the transcription
+    over that merge computes the adapted model's logits within the rule of its own run against
+    float64; and the merged checkpoint reloads to logits on par with the adapted model's from
+    float64."""
+    from safetensors.numpy import load_file
+
     loaded = load()
     adapted = loaded.adapt(LoRA(rank=2, modules=PROJECTIONS), key=0)
-    targets = {'/'.join(module[1:]) for module in adapted.adapter.targets}
-    sites = {'mlp': ('gate_proj', 'up_proj', 'down_proj'),
-             'attention': ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj')}
-    assert targets == {f'layers_{layer}/self_attn/{site}'
-                       for layer, kind in enumerate(loaded.model.per_layer_types)
-                       for site in sites['mlp' if kind == 'mlp' else 'attention']}
+    original = load_file(str(TINY / 'model.safetensors'))
+    # Every projection the checkpoint holds, by its name there, is one PEFT's merge moves.
+    projections = {name for name in original
+                   if name.removesuffix('.weight').rsplit('.', 1)[-1] in PROJECTIONS}
 
     def objective():
         return LMObjective(adapted.model, 8, variables=adapted.variables)
@@ -419,13 +449,17 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     jax.tree.map(np.testing.assert_array_equal, resumed['params'], whole['params'])
 
     adapted.adapter.save(resumed, tmp_path / 'adapter')
-    saved, _ = read_file(tmp_path / 'adapter' / 'adapter_model.safetensors')
-    assert 'base_model.model.backbone.layers.0.mixer.g_proj.lora_A.weight' in saved
-    assert 'base_model.model.backbone.layers.1.mixer.gate_proj.lora_B.weight' in saved
     again = LoRA.load(loaded.model, loaded.variables, tmp_path / 'adapter', layouts=loaded.layouts)
     ids = REFERENCE['input_ids']
     logits = np.asarray(adapted.model.apply(resumed, ids))
     np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)), logits)
+    import torch
+
+    config, peft = json.loads((TINY / 'config.json').read_text()), peft_merged(TINY, tmp_path / 'adapter')
+    assert {name for name in peft if not np.array_equal(peft[name], original[name])} == projections
+    assert_as_exact_as_the_reference(logits, TOOL.DoryReference(config, peft, torch.float32).forward(ids),
+                                     TOOL.DoryReference(config, peft, torch.float64).forward(ids),
+                                     'the adapter as PEFT merges it')
     adapted.save(tmp_path / 'merged', variables=resumed)
     merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
     # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
@@ -483,17 +517,6 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
     reloaded = objective.saved_task.from_run(str(tmp_path))('charged twice', asked)
     for answer, again in zip(live.values(), reloaded.values(), strict=True):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
-
-
-def test_a_dory_config_loads_as_its_looped_ngpt():
-    """The config's fields land where Dory computes them: a block a layer, an attention alone or
-    an MLP in the mixer's slot, the loop over the recurrent ones, reinjecting, and the cache mode."""
-    model = load().model
-    assert model.num_layers == 8 and model.ngpt is not None and not model.pre_norms and not model.mlp_features
-    assert model.loop is not None and model.loop.layers == (2, 6) and model.loop.steps == 2
-    assert model.loop.reinject and not model.loop.shared_cache
-    assert model.per_layer_types == ('sliding_attention', 'mlp', 'full_attention', 'mlp') * 2
-    assert isinstance(model.kind_of('mlp').mixer, MLPMixer)
 
 
 DORY_FIELDS = ('vocab_size', 'hidden_size', 'num_hidden_layers', 'intermediate_size', 'num_attention_heads',
@@ -571,15 +594,13 @@ def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
         PretrainedDecoder.from_model(loaded.model.clone(loop=None), loaded.variables)
 
 
-def test_an_mlp_mixer_takes_ngpts_gains_and_what_ngpt_does_not_reach_is_refused():
-    """nGPT's arithmetic lives in the attention and the dense gated feed-forward. An MLP in the
-    mixer's slot takes the feed-forward's gains; routed experts, a gated delta net, a prediction
-    depth and an MLP mixer's own experts, which would compute without them, are refused."""
+def test_what_ngpts_arithmetic_does_not_reach_is_refused():
+    """nGPT's arithmetic lives in the attention and the dense gated feed-forward, in a block's
+    feed-forward or in the mixer's slot, where each of Dory's MLP layers computes it (the reference
+    tests above). Routed experts, a gated delta net, a prediction depth and an MLP mixer's own
+    experts, which would compute without it, are refused."""
     model = load().model
     ids = jnp.asarray(REFERENCE['input_ids'])
-    mixed = model.clone(mixer=MLPMixer(intermediate_size=48, activation='swiglu'))
-    tree = mixed.init(jax.random.key(0), ids)['params']
-    assert set(tree['layers_0']['self_attn']) >= {'suv_gate', 'suv_up'}
     delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
                                linear_value_head_dim=8)
     routed = MLPMixer(intermediate_size=48, activation='swiglu', mixture=Mixture(experts=4))

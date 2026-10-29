@@ -18,8 +18,9 @@ layers, attentions and MLPs alternating as the release's do, over a width
 of 32 with a window of 5, its middle four layers looped, a tokenizer of the
 release's kind, fp32 and float64 logits at one, two and four loops and of
 the variant configs, both caches' greedy continuations with each step's
-logits, packed documents, prompts of two lengths, and the gradients of a
-loss over the logits through the loop and through its last pass alone.
+logits, packed documents, prompts of two lengths, and the cotangent of a
+loss over the logits, whose gradients the tests take from this reference
+live.
 """
 
 from __future__ import annotations
@@ -323,12 +324,6 @@ document's start in every row."""
 RAGGED = (3, 7)
 """The lengths of two prompts decoded side by side."""
 
-GRADIENTS = ('backbone.embeddings.weight', 'backbone.layers.0.mixer.g_proj.weight',
-             'backbone.layers.3.mixer.up_proj.weight', 'backbone.layers.4.mixer.sqk',
-             'backbone.layers.7.mlp_alpha', 'lm_head.logit_scale')
-"""Tensors whose gradients the fixture keeps: the embeddings, an input layer's output-gate
-projection, a looped feed-forward and attention gain, an output layer's step and the logit gain."""
-
 SPECIALS = ('<unk>', '<s>', '</s>', '[INST]', '[/INST]', '[AVAILABLE_TOOLS]', '[/AVAILABLE_TOOLS]',
             '[TOOL_RESULTS]', '[/TOOL_RESULTS]', '[TOOL_CALLS]', '<|im_start|>', '<|im_end|>')
 """The release's first twelve tokens, by id (tokenizer.json's added_tokens at b366b87f)."""
@@ -407,12 +402,6 @@ def write_tiny() -> None:
                                              for prompt in prompts])
 
     arrays['cotangent'] = rng.normal(size=(*ids.shape, CONFIG['vocab_size'])).astype(np.float32)
-    for name, loops, cut in (('trained', 2, None), ('truncated', 3, 2)):
-        for suffix, dtype in (('', torch.float32), ('_f64', torch.float64)):
-            gradients = DoryReference(CONFIG, tensors, dtype, loops).gradients(ids, arrays['cotangent'],
-                                                                               GRADIENTS, cut)
-            for tensor, gradient in gradients.items():
-                arrays[f'gradient_{name}{suffix}/{tensor}'] = gradient
     np.savez(FIXTURE / 'reference.npz', **arrays)
     (FIXTURE / 'source.json').write_text(json.dumps({
         'reference': 'vllm-project/vllm#60149 vllm/model_executor/models/dory.py at '
