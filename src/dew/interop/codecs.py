@@ -1732,14 +1732,16 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
                 "safetensors repo it was converted from (the model card's base_model)")
 
 
-def quantization_record(config: Mapping[str, object]) -> object:
+def quantization_record(config: Mapping[str, object]) -> Mapping[str, object] | None:
     """A config's `quantization_config`, or its text_config's where it declares it there alone (KimiK3Config
     lifts `text_config.quantization_config` onto itself, configuration_kimi_k3.py:282-283); None for
-    neither."""
+    neither, and ValueError for one that is no object."""
     quantization = config.get("quantization_config")
     text = config.get("text_config")
     if quantization is None and isinstance(text, Mapping):
         quantization = text.get("quantization_config")
+    if quantization is not None and not isinstance(quantization, Mapping):
+        raise ValueError(f"quantization_config must be an object, got {quantization!r}")
     return quantization
 
 
@@ -1758,8 +1760,6 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
     quantization = quantization_record(config)
     if quantization is None:
         return None
-    if not isinstance(quantization, Mapping):
-        raise ValueError(f"quantization_config must be an object, got {quantization!r}")
     method = quantization.get("quant_method")
     if method == "fp8" and ("expert_dtype" in quantization or "expert_dtype" in config):
         # `fp8_format`'s blocks under ue8m0 scales, the only kind an E8M0

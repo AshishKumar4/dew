@@ -1464,10 +1464,8 @@ class CausalTransformer(nn.Module):
         return self.embed_tokens(lookup)
 
     def stream_embeddings(self, tokens):
-        """Each token's row of the table at the stream's width, unscaled and without positions: the
-        embeddings a prediction depth pairs with `tokens` and a context's tokens as a cross-attention
-        reads them by the table (`encode_context`), `token_embeddings` through `project_in` where the
-        embedding has a width of its own (`embedding_features`)."""
+        """`token_embeddings` at the stream's width, through `project_in` past an embedding's own: what a
+        prediction depth pairs with `tokens`, and a context's tokens a cross-attention reads by the table."""
         looked = self.token_embeddings(tokens)
         return looked if self.embedding_features is None else self.project_in(looked)
 
@@ -2145,14 +2143,10 @@ class CausalTransformer(nn.Module):
         return prepared.astype(x.dtype)
 
     def output_table(self) -> OutputTable | None:
-        """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
-        the parameter itself, with `_logits`'s scale, bias, softcap and precision, the compute dtype
-        its product follows and a checkpoint's quantizer of its input, and past an embedding's own
-        width `project_out` as the states' `Projection`.
-        None where no matrix alone is the head: past a `head_transform` or a continuum level, or where
-        `lm_head`'s or `project_out`'s parameters are not its kernel alone: `dew.lora`'s factors
-        beside it, which its interceptor adds, or no kernel at all, a frozen FP8 layer's, whose codes
-        its FP8 product reads instead."""
+        """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables
+        (`_head_table`). None where no matrix alone is the head: past a `head_transform` or a continuum
+        level, or where `lm_head`'s or `project_out`'s parameters are not its kernel alone: `dew.lora`'s
+        factors beside it, which its interceptor adds, or no kernel, a frozen FP8 layer's."""
         layers = [*([] if self.tie_embeddings else [self.lm_head]),
                   *([] if self.embedding_features is None else [self.project_out])]
         if (self.head_transform is not None or self.continuum is not None
@@ -2175,9 +2169,8 @@ class CausalTransformer(nn.Module):
 
     def _head_table(self) -> OutputTable:
         """The head's matrix, as `lm_head`'s call multiplies by it (`applied_kernel`) or the tied
-        embeddings, with `_logits`'s scale, bias, softcap and precision, the compute dtype its
-        product follows and a checkpoint's quantizer of its input, past an embedding's own width
-        reached through `project_out` as its call multiplies (`Projection`)."""
+        embeddings, with `_logits`'s scale, bias, softcap, precision and compute dtype, a checkpoint's
+        quantizer of its input, and `project_out` before it past an embedding's own width (`Projection`)."""
         matrix = self.embed_tokens.embedding if self.tie_embeddings else self.applied_kernel("lm_head")
         projection = None if self.embedding_features is None else Projection(
             self.applied_kernel("project_out"), self.precision, compute=self.dtype,

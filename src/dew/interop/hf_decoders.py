@@ -560,7 +560,8 @@ QUANTIZED_MODULE_LISTS = ("modules_to_not_convert", "ignore", "exclude_modules",
 
 
 def language_model_quantization(hf_config: Mapping[str, object], record: WrapperFields,
-                                inventory: Callable[[], Collection[str] | None]) -> dict[str, object] | None:
+                                inventory: Callable[[], Collection[str] | None]
+                                ) -> Mapping[str, object] | None:
     """A wrapper's quantization_config as its language model's text checkpoint states it: every module
     selection under the text family's names (`wrapper_route`), a tower's or a projector's modules left
     out. The selections are the lists (`QUANTIZED_MODULE_LISTS`), ModelOpt's per-layer table
@@ -592,7 +593,7 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
         component, name = wrapper_route(f"{module}.weight", record)
         return name.removesuffix(".weight") if component == "language_model" else None
 
-    def projected(entries: object, field: str) -> list[str]:
+    def projected(entries: list[object], field: str) -> list[str]:
         out: list[str] = []
         for entry in _records.listed(entries, field, read=_records.text, what="module names"):
             if entry.startswith("re:"):
