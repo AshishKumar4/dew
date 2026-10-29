@@ -590,7 +590,9 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
                 slots.release("values")
                 coords = _coords(family, spans_of, row, first, k_first, shape, draw=draw)
                 params = _score_params(family, score_refs, kinds, row, head, first, s, k_first)
+                # Every entry's visibility, a tile whole too (`algebra.seen` gives None for one no mask cuts).
                 seen = algebra.seen(walk.spec, coords, s)
+                seen = jnp.ones(shape, bool) if seen is None else seen
                 logits, _ = algebra.tile_logits(walk.spec.score_mod, s, seen, coords.q_pos, coords.k_pos,
                                                 params, scale=walk.spec.scale if walk.how.factor is None
                                                 else 1.0, slopes=False)
