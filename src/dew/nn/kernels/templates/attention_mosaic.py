@@ -147,8 +147,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # A dQ launch's layout streams through a producer (`Family.stream`); a layout whose consumers feed
         # their own rings (`split_queries`) runs the forward and the dK/dV launches, the keys-first one and
         # the fused one, each consumer its own queries or keys over the stream they walk whole.
-        fed = isinstance(config, Tiles) or (config.fused and not config.dkv_apart)
-        return (family is not None and (fed or not split_queries(family))
+        walks_whole = isinstance(config, Tiles) or config.queries_first
+        return (family is not None and (walks_whole or not split_queries(family))
                 and whole_tiles(family, config) and self.refusal(ba, family) is None
                 and super().legal(ba, config, target))
 
@@ -550,7 +550,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # Each launch on its own layout (`BackwardTiles.dkv`).
         dkv_family = bundle_of(config.dkv, dtype)
         q_stages = min(config.stages, padded_q // config.block_q)
-        if config.fused and not config.dkv_apart:
+        if config.queries_first:
             launches = [(family, config, _fused_allocations(family, config, width, dtype, q_stages))]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
@@ -575,7 +575,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         for tiles, dq in ((config, True), (config.dkv, False)):
             family = bundle_of(tiles, query.dtype)
             width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
-            split = split_queries(family) and not (config.fused and not config.dkv_apart)
+            split = split_queries(family) and not config.queries_first
             counts.append(_backward_registers(family, tiles, width, value_width, query.dtype,
                                               accurate=self.accurate, dq=dq, split=split))
         return counts[0], counts[1]

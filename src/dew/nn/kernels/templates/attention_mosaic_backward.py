@@ -264,10 +264,8 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         keyed_acc = family.register_products(keyed_accs[0], keyed_parts, k_columns, walk.interpret)
     else:
         # The keyed sums rescaled by their row factor, then the tile's products added in place.
-        def rescale(value):
-            return value * algebra.expand(factor, value)
-
-        keyed_acc = family.rescaled_products(keyed_accs[0], rescale, keyed_parts, k_columns, walk.interpret)
+        keyed_acc = family.rescaled_products(keyed_accs[0], functools.partial(algebra.rescale, alpha=factor),
+                                             keyed_parts, k_columns, walk.interpret)
     return rows, (dq_acc, keyed_acc)
 
 
