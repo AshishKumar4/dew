@@ -71,6 +71,8 @@ PRODUCTS = {
     "memory_dq": "the output's gradient against the entered memory's transpose, `do S^T`",
     "memory_dk": "the corrected values against the leaving memory's gradient, `v dS^T`",
     "memory_dw": "the values' gradient against the entered memory's transpose, `dv S^T`",
+    "memory_trace": "the entered memory's transpose against the leaving one's gradient, `S^T dS`, whose "
+                    "diagonal sums `sum(S dS)` (a mainloop's `memory_gradients` launch)",
     "scores_dq": "the scores' gradient against the keys, `ds k`, and its transpose against the queries",
     "inverse_t": "the inverse's transpose against a gradient, `L^T dX` (`system_gradient`)",
     "inverse_dx": "a gradient against a weighted operand's transpose, `dw (k b exp(gc))^T`",
