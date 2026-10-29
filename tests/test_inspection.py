@@ -127,6 +127,47 @@ def test_a_loaded_runs_view_is_the_live_runs():
     assert offline == {name: value for name, value in live.items() if name.startswith("inspect/")}
 
 
+def test_a_custom_step_refuses_an_inspection():
+    """A custom step (`Trainer(step=...)`) commits no update an inspection reads, so asking for one is
+    refused as the trainer is built, not dropped."""
+    with pytest.raises(ValueError):
+        Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), inspection=Inspection(),
+                step=lambda objective, optimizer: None)
+
+
+def test_a_non_finite_parameter_shows_in_its_summary():
+    """A parameter holding an infinity reports it in its non-finite count and its largest magnitude,
+    not a finite stand-in."""
+    class Infinite(Pulled):
+        def fresh_variables(self, key, held):
+            return {"params": {"w": jnp.asarray([jnp.inf, 1.0, 2.0, 3.0])}}
+
+    logged = inspected(Trainer(Infinite(), optax.sgd(RATE), key=jax.random.key(0),
+                               inspection=Inspection(paths=("w",), targets=("params",))), {"x": ROWS})
+    assert logged["inspect/params/w/non_finite"] == 1 and logged["inspect/params/w/abs_max"] == np.inf
+
+
+def test_an_offline_view_builds_a_configured_optimizer():
+    """`inspected` builds a trainer's `OptimConfig` over the run's `steps`, as `fit` does, and reports
+    the sampled step's update: Adam's first, as Optax's own Adam makes it of the same gradient."""
+    from dew.optim import OptimConfig
+
+    configured = Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=RATE),
+                         key=jax.random.key(0), inspection=Inspection(paths=("w",), targets=("updates",)))
+    logged = inspected(configured, {"x": ROWS}, steps=4)
+
+    def update(dtype):
+        weight = np.arange(1, FEATURES + 1).astype(dtype)
+        gradient = 2 * (weight - ROWS.astype(dtype).mean(0)) / FEATURES
+        solver = optax.adam(RATE)
+        return np.linalg.norm(np.asarray(solver.update(gradient, solver.init(weight), weight)[0]))
+
+    with jax.enable_x64(new_val=True):
+        truth = update(np.float64)
+    assert_as_exact_as_the_reference(np.float32(logged["inspect/updates/l2"]), update(np.float32), truth,
+                                     "configured update")
+
+
 def test_a_recorded_run_inspects_what_its_command_line_names(tmp_path):
     """`dew train --set trainer.inspection=...` over a run.json samples what it names at its cadence."""
     record, runs = tmp_path / "record", tmp_path / "runs"
