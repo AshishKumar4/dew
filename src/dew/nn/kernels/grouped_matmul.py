@@ -1357,10 +1357,12 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 
 
 DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('mma.sync', 'grouped kernel_gradient'):
-        ('triton', "MWARPS2-a100 (08ceb321c, A100, each tile's warps split to read its operands least): the "
-                   "template's mma.sync tile 1.214x Triton's time, geomean of 6 grouped MoE rows (its input "
-                   "gradient 0.900x and forward 0.751x; MWARPS4, 00d05c0eb, 1.203x, 0.985x, 0.820x)"),
+    ('mma.sync', 'grouped input_gradient'):
+        ('triton', "FSCELLS1-a100 and FSCELLS2-a100 (base/kernels 9e1fd259c and 4c02f0c28, A100-SXM4-40GB, "
+                   "the routed experts' products of Qwen3-30B-A3B, Qwen3-235B-A22B, DeepSeek-V3, Mixtral "
+                   "8x7B and Kimi Linear, gate and down apart, groups balanced): the template 1.014x "
+                   "Triton's time, geomean of 10 rows (worst 2.00x, Mixtral's down; best 0.59x, "
+                   "Qwen3-30B-A3B's gate); its kernel gradient 0.880x and forward below 0.8x on those rows"),
     ('mma.sync', 'dense forward'):
         ('xla', "DENSE1 (A100, 2d1bbd051, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
                 "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens"),

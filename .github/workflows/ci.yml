@@ -80,8 +80,8 @@ jobs:
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
         base=$(git merge-base HEAD origin/main)
-        # A train's gates start before lanes' runs, as its suite does.
-        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; ci/stage-*) priority=--priority=5 ;; *) priority= ;; esac
+        # A train's gates, and a push to main's, start before lanes' runs, as their suites do.
+        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*|main) priority=--priority=10 ;; ci/stage-*) priority=--priority=5 ;; *) priority= ;; esac
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
           $priority --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
@@ -279,9 +279,12 @@ jobs:
         # (-10, verdict.sh's) within their pool of 48, so they never take containers from a train, a precheck or a
         # lane's targeted run (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger). A train staged
         # on the testing train's tip (ci/stage-*, its own concurrency group above) runs beside it, at 5: it publishes
-        # only after that train, so it takes what that train leaves (owner and Main, 2026-10-28).
+        # only after that train, so it takes what that train leaves (owner and Main, 2026-10-28). A push to main the
+        # queue did not grade (a direct push: a train's tip is proven and runs neither) is its tip's only test, and
+        # runs as a train's (Main, 2026-10-29: 34c949ee8's, at 0 on a full fleet, left a gang's fourth rank unplaced
+        # past its deadline).
         case "$GITHUB_REF_NAME" in
-          ci/batch-*|ci/fix-*) priority=--priority=10 ;;
+          ci/batch-*|ci/fix-*|main) priority=--priority=10 ;;
           ci/stage-*) priority=--priority=5 ;;
           ci/base-*|base/kernels|ci/full-whole-*) priority=--priority=-10 ;;
           *) priority= ;;
