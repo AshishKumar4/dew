@@ -70,7 +70,9 @@ def test_every_selection_names_its_tests_and_a_deleted_test_is_refused_before_th
     selections = {test for selection in (*(target.tests for target in TARGETS.values()),
                                          *FILE_TESTS.values()) for test in selection}
     assert selections and [test for test in sorted(selections) if not defined(test)] == []
-    assert not defined("tests/test_deleted.py") and not defined(f"{Path(__file__).relative_to(ROOT)}::deleted")
+    here = Path(__file__).relative_to(ROOT)
+    assert defined(f"{here}::defined") and not defined(f"{here}::deleted")
+    assert not defined("tests/test_deleted.py")
     gone = Target("src/dew/diffusion/schedules", ("tests/test_schedulers.py", "tests/test_deleted.py"))
     with pytest.raises(ValueError):
         run(gone, tmp_path / "session", 0, 1, 60.0)
