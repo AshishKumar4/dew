@@ -227,19 +227,18 @@ def separated(hi, lo):
 
 
 def between(later, earlier):
-    """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution at
-    any size: exp2 of the fractions' difference less its whole part, in (1/2, 2), scaled by the wholes'
-    difference and that whole part (`_scaled`), zero below 2^-124. A difference of the rounded sums lost the
-    fraction's last bits at the exponent's size, 1e-6 of the decay near -43, which put a port's decay
-    gradient under decays near zero 9 to 14 times the token-by-token recurrence's error from float64 (ledger
-    2098). Past 2^23 a whole part takes no carry from its fraction (`lo` up to half its ulp), so the
-    fractions' difference may pass one: its truncation joins the scale. Every pair's and range's decay, the
-    ports' of their separated prefix and the template's of its halves (`decayed`, `range_decay`); a decay
-    from the prefix's start is `raised`'s."""
+    """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution:
+    exp2 of the fractions' difference scaled by the wholes' difference (`_scaled`), zero below 2^-124. A
+    difference of the rounded sums lost the fraction's last bits at the exponent's size, 1e-6 of the decay
+    near -43, which put a port's decay gradient under decays near zero 9 to 14 times the token-by-token
+    recurrence's error from float64 (ledger 2098). The fractions' difference stays within two, its exp2
+    within `_scaled`'s range, for exponents under 2^24, where a fraction's remainder `lo` is at most one: a
+    chunk's prefix (its 64 tokens' at most 2^18 each). Truncating the difference into the scale, for any
+    size, cost the template's forward 1% on an H100 and 3% on an A100 (JS-954-57bf6dc05). Every pair's and
+    range's decay, the ports' of their separated prefix and the template's of its halves (`decayed`,
+    `range_decay`); a decay from the prefix's start is `raised`'s."""
     (whole, fraction), (other, its_fraction) = later, earlier
-    difference = fraction - its_fraction
-    step = difference.astype(jnp.int32).astype(difference.dtype)
-    return _scaled(jnp.exp2(difference - step), (whole - other) + step)
+    return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
 
 
 def grown_from(hi, lo, exp, unit: float = 1.0):
@@ -756,8 +755,8 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
         for c in range(columns):
             # Each tile read where it is used, a sub-chunk and key block at a time: few live at once.
             prefix = separated(*gates(c))
-            start_gate, start_low = reference(place // sub, c)
-            start = separated(start_gate[None, :], start_low[None, :])
+            start_whole, start_fraction = separated(*reference(place // sub, c))
+            start = start_whole[None, :], start_fraction[None, :]
             index, _ = _grid(prefix[0].shape)
             down = jnp.where((index >= place) & (index < place + sub), rows(c) * between(prefix, start), 0.0)
             up = jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)
