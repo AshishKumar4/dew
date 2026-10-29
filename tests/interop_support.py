@@ -195,6 +195,13 @@ def hub_cache(cache: Path, repo_id: str, source: Path,
     return commit
 
 
+def respelled(source: Path, directory: Path, edit) -> Path:
+    """`source`'s checkpoint copied to `directory` under the config `edit` returns from its own."""
+    shutil.copytree(source, directory)
+    (directory / "config.json").write_text(json.dumps(edit(json.loads((source / "config.json").read_text()))))
+    return directory
+
+
 def without_config_field(source: Path, directory: Path, *path: str) -> Path:
     """`source`'s checkpoint copied to `directory` with the config field at `path` (a key, nested
     keys after it) left out, as a config that leaves it to its default writes it."""

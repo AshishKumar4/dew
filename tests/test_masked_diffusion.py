@@ -307,9 +307,16 @@ def test_a_masked_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
     assert np.any(np.asarray(expected.terminated))
 
 
+def whole_response(source):
+    """`source`'s task walking the whole response with Dew's MDLM (`Unmask`), the native path every
+    masked family takes; LLaDA2's own task walks its release's blocks (`DecoderFamily.masked_walk`,
+    tests/test_blockwise_walk.py)."""
+    return replace(source.text_generation(), solver=Unmask(), block=None)
+
+
 def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
     source, inputs = masked_source
-    task = source.text_generation()
+    task = whole_response(source)
     key = jax.random.key(7)
     result = task(inputs, 8, key=key, steps=5).host()
     np.testing.assert_array_equal(result.tokens[:, :4], inputs.tokens)
@@ -333,7 +340,7 @@ def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
 
 def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
     source, inputs = masked_source
-    task = source.text_generation()
+    task = whole_response(source)
     single = task(inputs, 8, key=7, steps=5).host()
     many = task(inputs, 8, key=7, steps=5, n=3).host()
     np.testing.assert_array_equal(many.tokens.reshape(3, 3, 12)[:, 0], single.tokens)
@@ -433,8 +440,12 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
 
     source.save(tmp_path / "published", variables=resumed.variables)
     reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
-    expected = live(prompt, 8, key=7).host().tokens
-    np.testing.assert_array_equal(reloaded.text_generation()(prompt, 8, key=7).host().tokens, expected)
+    # A published source generates by its family's own recipe (LLaDA2's blockwise walk), which the
+    # run's task computes too under the same solver, block and steps.
+    published = reloaded.text_generation()
+    expected = replace(live, solver=published.solver, block=published.block, steps=published.steps)(
+        prompt, 8, key=7).host().tokens
+    np.testing.assert_array_equal(published(prompt, 8, key=7).host().tokens, expected)
     np.testing.assert_array_equal(pipeline(str(tmp_path / "published"), dtype="bfloat16")(
         prompt, 8, key=7).host().tokens, expected)
     raw = restored(["a", "bc"], 3, key=7, steps=3)

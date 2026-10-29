@@ -112,7 +112,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import fixture_ids, transformers_arms, transformers_model
+from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
 from model_support import flat_tree, llada_draw, llada_fields
 from reference_error import (
     as_given,
@@ -432,7 +432,7 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
 
     expected, attention_factor = ROPE_INIT_FUNCTIONS['yarn'](
         reference, None, layer_type='full_attention')
-    record = translate_config(released)['kinds']['full_attention']['yarn']
+    record = translate_config(released)['kinds']['full_attention']['rope_scaling']
     scaling = YarnScaling(**record)
     scaled = yarn_inv_freq(128, 5e5, scaling, dtype=np.float32)
     plain = 1.0 / (5e5 ** (np.arange(0, 128, 2, dtype=np.float32) / 128))
@@ -459,12 +459,47 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
 
 def _respelled(name, tmp_path, edit):
     """The fixture's checkpoint under the config `edit` returns from its own."""
-    from shutil import copytree
+    return respelled(FIXTURES / name, tmp_path / name, edit)
 
-    directory = copytree(FIXTURES / name, tmp_path / name)
-    config = edit(fixture_config(name))
-    (directory / "config.json").write_text(json.dumps(config))
-    return directory
+
+@pytest.mark.parametrize(("name", "change"), [
+    ("opt-tiny", {"activation_dropout": 0.1}), ("opt-tiny", {"do_layer_norm_before": False}),
+    ("opt-tiny", {"_remove_final_layer_norm": True}), ("opt-tiny", {"layer_norm_elementwise_affine": False}),
+    ("opt-tiny", {"word_embed_proj_dim": 16}), ("opt-tiny", {"layerdrop": 0.1}),
+    ("bloom-tiny", {"apply_residual_connection_post_layernorm": True}),
+    ("bloom-tiny", {"slow_but_exact": True, "pretraining_tp": 2}), ("bloom-tiny", {"n_head": 5})],
+    ids=["opt activation dropout", "opt post-norm", "opt no final norm", "opt unscaled norms",
+         "opt projected embeddings", "opt layer drop", "bloom post-norm residuals",
+         "bloom tensor-parallel exact path", "bloom heads not dividing the width"])
+def test_a_checkpoint_asking_what_its_family_does_not_compute_is_refused(name, change, tmp_path):
+    """An OPT or BLOOM checkpoint whose config asks what Dew's family does not compute (OPT's dropout
+    inside the feed-forward, post-residual or scaleless norms, no final norm, embeddings projected to
+    another width, dropped layers; BLOOM's residuals read after the norm, the tensor-parallel exact path
+    that drops projection biases, a width no whole number of heads divides) is refused at load rather
+    than computed without it."""
+    with pytest.raises(ValueError):
+        fp32_decoder(_respelled(name, tmp_path, lambda config: {**config, **change}))
+
+
+@pytest.mark.parametrize(("name", "embedding"), [("opt-tiny", "model.decoder.embed_tokens.weight"),
+                                                 ("bloom-tiny", "transformer.word_embeddings.weight")])
+def test_a_tied_checkpoint_keeping_its_embedding_under_the_head_name_alone_loads_the_same_model(
+        name, embedding, tmp_path):
+    """A tied checkpoint whose safetensors keep lm_head.weight and drop the embedding the config ties it
+    to, as SFconvertbot's conversion of OPT-125m does: the head is the embedding's one copy and fills it,
+    so the model loads leaf for leaf as the checkpoint storing the embedding does."""
+    from dew.interop.safetensors_io import save_hf_layout
+    from dew.interop.sources import load_shards
+
+    tensors = load_shards(FIXTURES / name)
+    tensors["lm_head.weight"] = tensors.pop(embedding)
+    save_hf_layout(tensors, fixture_config(name), tmp_path)
+    head_only = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    stored = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    assert jax.tree.structure(head_only.variables) == jax.tree.structure(stored.variables)
+    for ours, theirs in zip(jax.tree.leaves(head_only.variables), jax.tree.leaves(stored.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
 def _reference_logits(name, directory):
@@ -849,7 +884,6 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
 
 
 @pytest.mark.parametrize("name", [name for name in TINY if name not in (
-    'bloom-tiny',
     'falcon-mha-tiny',
     'falcon-tiny',
     'gpt-bigcode-tiny',
@@ -857,7 +891,6 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
     'gpt-neox-tiny',
     'gpt2-tiny',
     'gptj-tiny',
-    'opt-tiny',
     'phi-tiny',
     'phi3-tiny',
     'starcoder2-tiny',

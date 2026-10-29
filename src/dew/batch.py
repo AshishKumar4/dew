@@ -306,13 +306,18 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
                        right_padded=right_padded)
 
 
+LAYOUT_FIELDS = ("segment_ids", VALIDITY_FIELD, "positions")
+"""The flat token fields a call's layout is given in where it gives no `Coordinates`
+(`token_coordinates`): its documents, its validity and its places."""
+
+
 def token_coordinates(shape: tuple[int, int], given: Coordinates | None = None, *, segments=None,
                       valid=None, positions=None, right_padded: bool = False) -> Coordinates | None:
     """A call's token layout as one `Coordinates`, the one conversion of its fields: `given` as it is,
     else built (`coordinates`) from the flat fields `segment_ids` (`segments`), `attention_mask`
     (`valid`) and `positions`, None where the call gives none. A call giving both is refused: its
     `Coordinates` would silently drop its flat fields (ledger 1122)."""
-    fields = (("segment_ids", segments), (VALIDITY_FIELD, valid), ("positions", positions))
+    fields = zip(LAYOUT_FIELDS, (segments, valid, positions), strict=True)
     flat = [name for name, value in fields if value is not None] + (["right_padded"] if right_padded else [])
     if given is not None:
         if flat:
@@ -637,6 +642,7 @@ __all__ = [
     "FROZEN",
     "PARAMETER_ROOTS",
     "SCAN_BLOCKS",
+    "TEXT_KEY",
     "VALIDITY_FIELD",
     "VALID_ROWS",
     "Batch",
