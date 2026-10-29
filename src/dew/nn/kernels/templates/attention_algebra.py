@@ -434,7 +434,7 @@ def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
     and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite."""
     k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH)
-    first = jnp.trunc(k / 3)
+    first = jax.lax.div(k.astype(jnp.int32), jnp.int32(3)).astype(jnp.float32)
     second = jnp.trunc((k - first) / 2)
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
 
