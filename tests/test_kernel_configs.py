@@ -254,7 +254,7 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once():
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.refuse(refused)
         lowered()
-    refused_configs = {config for _, config in refused}
+    refused_configs = {config for _, config, _ in refused}
     assert first in refused_configs and traced[2] not in refused_configs
     if stepped not in refused_configs:
         assert traced[2] == stepped
