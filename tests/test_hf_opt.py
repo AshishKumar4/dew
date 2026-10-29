@@ -104,4 +104,4 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
     params = normed.init(jax.random.key(1), ids)
     assert not np.array_equal(np.asarray(normed.apply(params, ids)), np.asarray(plain.apply(params, ids)))
     with pytest.raises(ValueError):
-        base.clone(embedding_features=4, num_nextn_predict_layers=1)
+        base.clone(embedding_features=4, num_nextn_predict_layers=1).init(jax.random.key(1), ids)

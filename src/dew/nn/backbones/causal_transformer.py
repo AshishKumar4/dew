@@ -254,15 +254,11 @@ class CausalTransformer(nn.Module):
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
-    post_residual_norms: bool = False
-    """Whether each block norms its stream after each sublayer joins it, the original Transformer's post-LN
-    block (OPT-350m's), with no pre-norms (`BlockWiring.residual_norms`)."""
-    final_norm: bool = True
-    """Whether the trunk ends in a norm before the head; OPT-350m's post-LN decoder has none."""
+    post_residual_norms: bool = False  # norm the stream after each sublayer joins it: post-LN, OPT-350m's
+    final_norm: bool = True            # end the trunk in a norm; OPT-350m's post-LN decoder has none
     embedding_features: int | None = None
-    """The token embedding's width where it differs from the stream's (OPT-350m's word_embed_proj_dim): a
-    bias-free projection takes the lookup in (`project_in`) and another takes the final states out to it
-    before the head (`project_out`), which reads the table at this width."""
+    """The token embedding's width where it differs from the stream's (OPT-350m's word_embed_proj_dim),
+    bias-free `project_in` taking the lookup in and `project_out` the final states out to the head."""
     parallel_residual: bool = False
     """Whether attention and the feed-forward both read the same residual, as in GPT-NeoX."""
     shared_parallel_norm: bool = False
@@ -443,16 +439,6 @@ class CausalTransformer(nn.Module):
     layout either way."""
 
     def __post_init__(self):
-        if self.embedding_features is not None:
-            # The projections sit between the stream and an embedding of its own width; a head transform
-            # and a continuum level read the stream before `project_out`, and what reads the token
-            # embedding itself at the stream's width (a prediction depth, an encoded context) is refused.
-            beside = [name for name, held in (
-                ("num_nextn_predict_layers", self.num_nextn_predict_layers),
-                ("cross_attention", self.cross_attention)) if held]
-            if beside:
-                raise ValueError(f"embedding_features projects the embedding in and out of the stream, "
-                                 f"which {', '.join(beside)} would read at the stream's width")
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
         object.__setattr__(self, "embedding_zero_ids", tuple(self.embedding_zero_ids))
@@ -763,8 +749,7 @@ class CausalTransformer(nn.Module):
     def _root_flops(self, lengths, depth_counter) -> float:
         maps = self.projections()
         count = sum(projection_flops(lengths, *shape) for name, shape in maps.items()
-                     if name.startswith(('altup_projections_', 'altup_unembed_projections_'))
-                     or name == 'project_in')
+                     if name.startswith(('altup_projections_', 'altup_unembed_projections_', 'project_in')))
         if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
             count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
         if self.attention_residuals is not None:
@@ -843,9 +828,8 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
-        """The vocabulary matrix and optional prediction transform. A tied head
-        reads the embedding table, `vocab_size` rows of the embedding's width, which `project_out`
-        reaches from the stream's where the two differ."""
+        """The vocabulary matrix and optional prediction transform, `project_out`'s included. A tied
+        head reads the embedding table, `vocab_size` rows of the embedding's width."""
         projections = self.projections()
         tied = (self.embedding_features or self.emb_features, self.vocab_size)
         count = projection_flops(lengths, *projections.get('lm_head', tied))
@@ -934,32 +918,7 @@ class CausalTransformer(nn.Module):
         projections = self.projections()
         ple = self.per_layer_input_dim
 
-        self.embed_tokens = TokenEmbedding(
-            num_embeddings=self.vocab_size, features=self.embedding_features or self.emb_features,
-            dtype=self.dtype, name='embed_tokens', padding_idx=self.padding_idx,
-            embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
-                            else nn.initializers.normal(self.initializer_range)))
-        if self.embedding_features is not None:
-            self.project_in = Dense(projections['project_in'][1], use_bias=False, dtype=self.dtype,
-                                    precision=self.precision, name='project_in',
-                                    **normal_kernel(self.initializer_range))
-            self.project_out = Dense(projections['project_out'][1], use_bias=False, dtype=self.dtype,
-                                     precision=self.precision, name='project_out',
-                                     **normal_kernel(self.initializer_range))
-        if self.embedding_dropout_rate:
-            self.embedding_dropout = Dropout(self.embedding_dropout_rate, name="embedding_dropout")
-        if self.embedding_norm:
-            self.embedding_layernorm = decoder_norm(
-                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
-                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
-        if self.position_embedding == 'learned':
-            self.embed_positions = TokenEmbedding(
-                num_embeddings=self.position_rows,
-                features=self.emb_features, dtype=self.dtype, name='embed_positions',
-                embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
-                                else nn.initializers.normal(self.initializer_range)))
-            self.decode_cursor = DecodeCursor()
+        self._embeddings(projections)
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
@@ -1368,12 +1327,11 @@ class CausalTransformer(nn.Module):
         the bound model: a table's product and a bias, with no transform, logit softcap, nGPT gains or
         quantizer of the head's own input (`SteppedInContext`); a checkpoint's quantizer of the trunk's
         modules alone leaves it affine, and a tied head reads its table with none."""
-        quantizes = isinstance(self, QuantizesInputs)
-        # The head's own input is the final states (`lm_head`'s) and, past an embedding's own width,
-        # `project_out`'s before them.
-        heads = ([] if self.tie_embeddings else [self.lm_head]) + (
-            [] if self.embedding_features is None else [self.project_out])
-        quantized = quantizes and any(self.input_quantizer(head) is not None for head in heads)
+        # The head's own inputs: `lm_head`'s, and `project_out`'s before it past an embedding's own width.
+        heads = [*([] if self.tie_embeddings else [self.lm_head]), *([] if self.embedding_features is None
+                                                                  else [self.project_out])]
+        quantized = (isinstance(self, QuantizesInputs)
+                     and any(self.input_quantizer(head) is not None for head in heads))
         return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
                 and not quantized)
 
@@ -1397,8 +1355,7 @@ class CausalTransformer(nn.Module):
     def head_logits(self, x):
         """The fp32 head over states the continuum level already read (`continuum_states`), or a
         model without one's final states: `_logits` past the level."""
-        # A stream-width transform reads the final states before `project_out` takes them to the
-        # embedding's own width, which the vocabulary matrix meets.
+        # A stream-width transform reads the final states before `project_out` takes them to the table's.
         if self.head_transform is not None:
             x = self.head_norm(ungated_activation(self.head_transform, self.head_dense(x)))
         if self.embedding_features is not None:
@@ -2206,9 +2163,8 @@ class CausalTransformer(nn.Module):
 
     def vocabulary_rows(self) -> jax.Array:
         """Each vocabulary token's `[features]` row of the head (`OutputTable.rows`) where no exact
-        table is: past a `head_transform` the matrix's, which the transformed states meet, with an
-        adapter on the head its rows as the adapter updates them (`applied_kernel`), and past an
-        embedding's own width its rows in the stream's coordinates, through `project_out` as applied."""
+        table is: past a `head_transform` the matrix's, with an adapter on the head as it updates them
+        (`applied_kernel`), and past an embedding's own width in the stream's, through `project_out`."""
         rows = self._head_table().rows()
         if self.embedding_features is None:
             return rows
@@ -2243,6 +2199,33 @@ class CausalTransformer(nn.Module):
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 
     # The serving and training hooks (`dew.nn.protocols`).
+
+    def _embeddings(self, projections):
+        """The token and position embeddings, their dropout and norm, and their projections in and out."""
+        self.embed_tokens = TokenEmbedding(
+            num_embeddings=self.vocab_size, features=self.embedding_features or self.emb_features,
+            dtype=self.dtype, name='embed_tokens', padding_idx=self.padding_idx,
+            embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
+                            else nn.initializers.normal(self.initializer_range)))
+        if self.embedding_features is not None:
+            projection = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                           **normal_kernel(self.initializer_range))
+            self.project_in = projection(projections['project_in'][1], name='project_in')
+            self.project_out = projection(projections['project_out'][1], name='project_out')
+        if self.embedding_dropout_rate:
+            self.embedding_dropout = Dropout(self.embedding_dropout_rate, name="embedding_dropout")
+        if self.embedding_norm:
+            self.embedding_layernorm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
+        if self.position_embedding == 'learned':
+            self.embed_positions = TokenEmbedding(
+                num_embeddings=self.position_rows,
+                features=self.emb_features, dtype=self.dtype, name='embed_positions',
+                embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
+                                else nn.initializers.normal(self.initializer_range)))
+            self.decode_cursor = DecodeCursor()
 
     def _final_norm(self):
         """The norm before the head and between a loop's passes: under nGPT the unit norm itself,
