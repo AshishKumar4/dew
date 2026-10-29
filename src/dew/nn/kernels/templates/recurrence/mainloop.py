@@ -102,13 +102,16 @@ class Tiles:
     and head a walk program takes, one a consumer role beside one producer (`walkers`: the states and
     reverse launches'; their chains overlap on one multiprocessor and their keys stream once). `forward`
     are the tiles a forward without a gradient takes where they differ: no fast backward reads its states
-    launch's block, which a training call's tiles narrow to hold it."""
+    launch's block, which a training call's tiles narrow to hold it. `layout` names the bundle the launches
+    issue by where not the device's (`bundles.named`; a forward without a gradient's on warpgroup MMA, its
+    layout without a producer, `mosaic_sm90.FED`)."""
 
     block_v: int
     stages: int
     block_o: int | None = None
     walkers: int = 1
     forward: "Tiles | None" = None
+    layout: str | None = None
 
     @property
     def output_block(self) -> int:

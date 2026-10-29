@@ -29,7 +29,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import product, resources
+from dew.nn.kernels.templates import cost, product, resources
 from dew.nn.sharding import per_shard
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
@@ -1187,10 +1187,14 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
         return resources.entry_registers(consumers)
 
     def programs(self, consumers: int) -> int:
-        """`Family.programs`: as many as the register file holds at the program's entry registers, each of
-        its `consumers` warpgroups' threads at them (`registers`), no producer beside them: a one-warpgroup
-        program's 255 hold two a multiprocessor, where a producer's layout holds one."""
-        return max(1, 64 * 1024 // (consumers * resources.THREADS * (self.registers(consumers) + 1)))
+        """`Family.programs`: as many as the register file holds at the program's entry registers in the
+        allocator's unit (`registers` rounded up to `register_step`), each of its `consumers` warpgroups'
+        threads at them, no producer beside them, within the multiprocessor's 64 warps: a one-warpgroup
+        program's 255 (256 allocated) hold two a multiprocessor, 168 three, where a producer's layout holds
+        one (the recurrence's solved launch on an H100, two at a time: 0.245 -> 0.168 ms, JS-fed3)."""
+        allocated = -(-self.registers(consumers) // self.register_step) * self.register_step
+        held = cost.REGISTERS // (consumers * resources.THREADS * allocated)
+        return max(1, min(held, 64 * 32 // (consumers * resources.THREADS)))
 
     def warpgroups(self, consumers: int) -> int:
         return consumers
