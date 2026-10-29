@@ -20,10 +20,17 @@ from dew.nn.kernels.templates.attention_mosaic_program import Tiles
 
 variant = sys.argv[1]
 width = int(variant[1:]) if variant.startswith("d") else 128
-consumers = 2 if variant == "consumers2" else 1
+consumers = 2 if variant in ("consumers2", "consumers2forced") else 1
 stages = int(variant[-1]) if variant.startswith("stages") else 2
 residuals = variant != "noresiduals"
 causal = variant == "causal"
+
+if variant == "consumers2forced":
+    a.MosaicForward.register_budget = lambda self, config: 256
+if "swizzle64" in variant:
+    previous_staged = mosaic.staged
+    mosaic.staged = lambda shape, dtype, swizzle=None: previous_staged(
+        shape, dtype, 64 if swizzle is None else swizzle)
 
 if "nosetmax" in variant:
     def roles(wg, consumers, consumer, producer):
