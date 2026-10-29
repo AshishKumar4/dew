@@ -18,17 +18,20 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import cost, mosaic, resources
 from dew.nn.sharding import per_shard
 
-_TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
-_SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
-"""Mosaic GPU's tile transforms, which it declares as protocol classes (a type checker takes them for
-uninstantiable)."""
+
+def _staging(block: tuple, swizzle: int | None) -> tuple:
+    """A stream's tile's transforms: a tile's swizzled (its own, `swizzle` where a stream names one); a side
+    vector's none, in whole 16-byte cp.async chunks."""
+    shape, dtype = block
+    if len(shape) == 1:
+        return ()
+    return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
 
 
 def swizzled(shape: tuple[int, int], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
     bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
-    swizzle = plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8)
-    return _TILING((8, swizzle // jnp.dtype(dtype).itemsize)), _SWIZZLE(swizzle)
+    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8))
 
 
 class Slots:
@@ -53,6 +56,8 @@ class Pipeline:
 
     blocks: dict
     stages: int
+    swizzles: dict = dataclasses.field(default_factory=dict)
+    """The swizzle a stream's tiles stage at where `Mma.streams` names one (`mosaic.swizzle_for`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,6 +150,15 @@ class Mma(mosaic.Family):
         # (CONSUMERS2); two consumers in one program took 1.04 to 1.50 (CONSUMERS1).
         return cost.REGISTERS // (consumers * resources.THREADS * self.registers(consumers))
 
+    def column_registers(self, columns: int, dtype) -> int:
+        # The accumulator's tiles are `m_warps * 16` rows by `n_warps * 8` columns, each warp's 16 x 8 a
+        # thread's two columns a row (jax/experimental/mosaic/gpu/mma.py:63, `MMALayouts`' accumulator
+        # tiling), so a column vector broadcast over the rows holds two entries a thread in each of the
+        # vector's `columns / (n_warps * 8)` tiles: a quarter of its columns at four row warps, as
+        # warpgroup MMA's, an eighth at two, a sixteenth at one.
+        per_thread = -(-columns * 2 // (4 // self.m_warps * 8))
+        return -(-per_thread * jnp.dtype(dtype).itemsize // 4)
+
     def column_unit(self, dtype) -> int:
         # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
         # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64
@@ -196,17 +210,18 @@ class Mma(mosaic.Family):
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                             interpret=mosaic.interpreted(interpret), kernel_name=name, cost_estimate=cost)
 
-    def scoped(self, body, *allocations, streams) -> None:
-        pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
+    def scoped(self, body, *allocations, streams):
+        return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
 
     def roles(self, consumers: int, consumer, producer) -> None:
         _one(consumers)
         del producer
         consumer(0)
 
-    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = ()):
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
+                swizzles: dict[str, int] | None = None):
         _one(consumers, clustered=bool(multicast))
-        return Pipeline(blocks, stages)
+        return Pipeline(blocks, stages, dict(swizzles or {}))
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -268,11 +283,10 @@ class Mma(mosaic.Family):
                 slots = Slots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
-            # A tile's blocks staged swizzled for ldmatrix; a side vector's untiled, in whole 16-byte
-            # cp.async chunks.
+            # A tile's blocks staged swizzled for ldmatrix (`_staging`).
             specs = [plgpu.BlockSpec(blocks[name][0],
                                      lambda j, lo=lo, index_map=streams.views[name][1]: index_map(j + lo),
-                                     transforms=swizzled(*blocks[name]) if len(blocks[name][0]) > 1 else ())
+                                     transforms=_staging(blocks[name], streams.pipeline.swizzles.get(name)))
                      for name in names]
             pipeline = plgpu.emit_pipeline(body, grid=(hi - lo,), in_specs=specs,
                                            max_concurrent_steps=streams.pipeline.stages, init_carry=carry)
