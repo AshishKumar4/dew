@@ -81,8 +81,8 @@ def test_a_pickle_commit_loads_sfconvertbots_conversion_of_it_and_offline_what_i
     it, loads the conversion's safetensors: llama-tiny leaf for leaf, and not one byte of the pickle
     fetched. Offline, with the Hub gone, the same load reads the conversion its answers recorded."""
     files = {"config.json": FIXTURE / "config.json", "pytorch_model.bin": pickled(tmp_path / "pickles")}
-    conversion = Pull(CONVERSION, "SFconvertbot", {"config.json": FIXTURE / "config.json",
-                                                   "model.safetensors": FIXTURE / "model.safetensors"})
+    # The conversion adds the safetensors to the commit's tree, its pickle kept beside them.
+    conversion = Pull(CONVERSION, "SFconvertbot", {**files, "model.safetensors": FIXTURE / "model.safetensors"})
     with LocalHub({"local/pickled": files}, {"local/pickled": {1: conversion}}) as hub:
         assert_the_fixture(loaded("local/pickled", environment(hub, tmp_path), tmp_path / "online.npz"))
         assert hub.sent("local/pickled", "pytorch_model.bin") == []

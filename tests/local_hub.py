@@ -147,7 +147,8 @@ def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
                 self._missing("RepoNotFound", head=head)
                 return
             repo = match["repo"]
-            files, commit = hub.at(repo, None if match["revision"] is None else unquote(match["revision"]))
+            revision = (api["tree"] if api is not None and api["tree"] is not None else match["revision"])
+            files, commit = hub.at(repo, None if revision is None else unquote(revision))
             if api is not None:
                 hub.served.append(Served(self.command, repo, None, None, 0))
                 folder = unquote(api["folder"] or "").rstrip("/")
