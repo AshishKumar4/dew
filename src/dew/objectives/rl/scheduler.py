@@ -161,7 +161,6 @@ from .sessions import (
     rows_needed,
     sampled_values,
     session_metrics,
-    trained_reward,
 )
 
 
@@ -262,8 +261,6 @@ class _Tally:
     cancelled: int = 0
     abandoned: int = 0
     cut: int = 0
-    uniform: int = 0
-    """Complete groups left out whose trained returns all agreed (`RolloutScheduler.varied`)."""
 
 
 def _done(session: Session) -> Future[Session]:
@@ -534,8 +531,7 @@ class RolloutScheduler:
                  tasks: Callable[[Batch], Sequence[Task]] = task_ids, groups: int = 4, oversample: int = 0,
                  admit: int | None = None, estimator: str = "group", truncation: str = "mask",
                  credit: str = "session", support_capacity: int | None = None,
-                 log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
-                 overlong: tuple[int, int] | None = None):
+                 log: Callable[[SchedulerRecord], None] | None = None):
         for name, value, least in (("groups", groups, 2), ("oversample", oversample, 0)):
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
@@ -548,14 +544,6 @@ class RolloutScheduler:
         self.groups, self.oversample, self.admit = groups, oversample, admit
         self.estimator, self.truncation, self.credit, self.log = estimator, truncation, credit, log
         self.support_capacity = support_capacity
-        # DAPO's dynamic sampling (arXiv:2503.14476, equation 11): a group whose members' trained returns
-        # all agree gives every member a zero advantage, so it is left out and admission waits for one
-        # whose returns vary.
-        self.varied = varied
-        # DAPO's soft overlong punishment: the budget and the cache before it (`sessions.overlong_penalty`).
-        if overlong is not None and not (len(overlong) == 2 and 0 < overlong[1] <= overlong[0]):
-            raise ValueError("overlong is (L_max, L_cache), a positive cache within the budget")
-        self.overlong = overlong
         self.metrics: dict[str, float] = {}
         self._branch: str | None = None
 
@@ -564,8 +552,7 @@ class RolloutScheduler:
                 decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids),
                 groups: int = 4, max_new_tokens: int = 32, estimator: str = "group",
                 truncation: str = "score", sampling: Sampling | None = None,
-                log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
-                overlong: tuple[int, int] | None = None) -> RolloutScheduler:
+                log: Callable[[SchedulerRecord], None] | None = None) -> RolloutScheduler:
         """Draw `groups` completions of each prompt row from `objective`'s policy at every call and
         train on them (`PolicyCollector` over `prompt_tasks`; GRPO's synchronous loop). A completion
         that runs out of `max_new_tokens` trains on its reward, as `truncation='score'` says.
@@ -582,7 +569,7 @@ class RolloutScheduler:
         collector = PolicyCollector(objective, reward, decode, max_new_tokens,
                                     Sampling() if sampling is None else sampling)
         return cls(Synchronous(collector), tasks=prompt_tasks, groups=groups, estimator=estimator,
-                   truncation=truncation, log=log, varied=varied, overlong=overlong)
+                   truncation=truncation, log=log)
 
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
@@ -709,9 +696,6 @@ class RolloutScheduler:
                 f"one group of task {group.task.id} needs {alone} rows of {width} ids, "
                 f"more than rows={rows}; size rows for sessions whose calls split into chains"
             )
-        if self.varied and len({trained_reward(session, self.truncation) for session in group.done}) < 2:
-            tally.uniform += 1
-            return
         admitted = [length for complete in entry.complete for length in complete.lengths]
         if rows_needed([*admitted, *group.lengths], width) <= rows:
             entry.complete.append(group)
@@ -775,7 +759,7 @@ class RolloutScheduler:
                                      tally.cancelled, tally.abandoned, tally.cut, waited, metrics)
             self.metrics = {**metrics, "lag": float(record.lag), "groups": float(groups),
                             "resubmitted": float(sum(record.resubmitted.values())),
-                            "waited_seconds": waited, "uniform_groups": float(tally.uniform)}
+                            "waited_seconds": waited}
             if self.log is not None:
                 self.log(record)
         return packed
@@ -804,7 +788,7 @@ class RolloutScheduler:
         packed = pack(rollouts, self.acquisition.width,
                       rows=self.acquisition.rows(len(entry.tasks), self.groups),
                       estimator=self.estimator, truncation=self.truncation, credit=self.credit,
-                      support_capacity=self.support_capacity, overlong=self.overlong)
+                      support_capacity=self.support_capacity)
         if self.acquisition.rescore is None:
             packed[OLD_LOG_PROBS_KEY] = sampled_values(
                 packed, lambda index, call: _recorded(rollouts[index], call))
