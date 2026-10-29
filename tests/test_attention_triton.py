@@ -810,3 +810,25 @@ def test_the_accurate_form_lowers_and_compiles_on_tritons_compiler(target, sinks
                              KernelCase("backward", lambda: (backward, (shape,) * 4))], target)
     assert len(found) >= 2
     assert not failures(found), "\n".join(failures(found))
+
+
+@pytest.mark.parametrize("width", [64, 128])
+def test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block(width):
+    """An fp32 call's forward and backward at the configs the launches take themselves (no pin), compiled by
+    XLA's CUDA backend for a compile-only A100 on this CPU (tests/kernel_compile.py), within the 166912 bytes
+    a block holds: fp32 operands stage more than 16-bit ones in Triton's backward (CELLS-a100's template
+    arm asked 182272 at 128-wide heads), which its model must count, or the call fails to compile there."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    spans = template.spans(1024, 1024, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, 1024, 8, width), jnp.float32)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, width), jnp.float32)
+
+    def step(query, key, value, dout):
+        out, *residuals = attention_triton.forward(query, key, value, spans, residuals=True)
+        grads = attention_triton.backward(query, key, value, spans, None, dout, residuals=tuple(residuals))
+        return out, grads.query, grads.key, grads.value
+
+    found = compile_kernels([KernelCase("step", lambda: (step, (query, key, key, query)))], "sm80")
+    assert not failures(found), "\n".join(failures(found))

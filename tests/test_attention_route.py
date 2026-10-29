@@ -236,11 +236,10 @@ def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_he
     arm = None if shards is None else jax.jit(shares_on_one_device(routed, heads, kv_heads, shards))
 
     with nn.logical_axis_rules(rules):
+        # With `shards`, the one split run of each draw compared with both arms (row 2156).
         assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, label, seeds=MESH_SEEDS,
-                              truth_fn=truth, moves=moves, arm=arm)
-        if shards is not None:
-            assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, f"{label}, the reference path",
-                                  seeds=MESH_SEEDS, truth_fn=truth, moves=moves, arm=jax.jit(truth))
+                              truth_fn=truth, moves=moves, arm=arm,
+                              also=None if shards is None else ("the reference path", jax.jit(truth)))
 
 
 @pytest.mark.mesh(devices=8)
@@ -579,3 +578,23 @@ def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output
     assert attention_route.attend(query, key, value, spans, hooks).shape == (ROWS, QUERIES, HEADS, WIDTH)
     with pytest.raises(ValueError):
         attention_route.attend(query, key, value, spans, template.Hooks(output_mod=jnp.tanh))
+
+
+@pytest.mark.parametrize("generation_name", ["sm86", "sm120"])
+def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name):
+    """An fp32 call of 256-wide heads on a GPU whose block holds 99 KB of shared memory, past the least any
+    frozen Triton config stages (100 KB), forward and backward: the route takes another mainloop and the
+    call lowers for that GPU, no launch that cannot run chosen (`attention_triton.unfitted`)."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import attention as template, attention_route
+
+    query = jax.ShapeDtypeStruct((1, 128, 1, 256), jnp.float32)
+    spans = template.spans(128, 128, 1, causal=True)
+
+    def loss(query, key, value):
+        return attention_route.attend(query, key, value, spans).sum()
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+        traced = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(query, query, query)
+        traced.lower(lowering_platforms=("cuda",))

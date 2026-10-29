@@ -143,7 +143,11 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     consumer role (`Tiles.walkers`, warpgroup MMA's bundle, which the derivation gives a call whose walks
     fill more than a wave), on par from float64 with the fla port's forward, or forward and gradient, over
     the case's draws (check 1, truth the recurrence a token at a time's): each role's columns, staging and
-    stores its own."""
+    stores its own. Off a GPU interpreted; on one whose family has no two consumer roles (an A100's
+    mma.sync), whose device lowers no Hopper copy, refused rather than covered."""
+    family = mainloop.family_of()
+    if family is not None and family.consumers < 2:
+        pytest.skip(f"the {family.name} bundle takes one consumer role a program, no two-role walk")
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
     shape = {**geometry(case), 'value_width': 64}
     tiles = mainloop.Tiles(32, 1, walkers=2)

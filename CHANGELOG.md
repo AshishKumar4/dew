@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Masked diffusion walks a block at a time, as LLaDA2's releases generate: `DiscreteProcess.generate(...,
+  block=)` unmasks each block of counted places over its own steps, each position reading its document
+  through its own block, and `dew.diffusion.discrete.Confident` reveals as LLaDA2 does (the draws past a
+  confidence threshold, else a quota's most confident).
 - Liquid's LFM3 (`lfm3`, LiquidAI/LFM3-1.7B and the text backbone of LFM3-VL and d1) loads, trains, decodes
   and saves: its gated short convolution layers are a mixer of their own (`short_conv`, its last inputs
   through the decode cache), and attention gates each head by its own sigmoid (`gate_projection='head'`).

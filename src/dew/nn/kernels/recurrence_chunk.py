@@ -672,17 +672,16 @@ PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('mma.sync', 'forward'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
                                      "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against "
                                      "0.942 on Qwen3-Next's (SE-family-a100-1a31d279a)"),
-    ('mma.sync', 'training'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward and gradient 4.77 ms "
-                                      "against the template's 5.53 on Qwen3.5-27B's gated delta net (its "
-                                      "gradient the port's, the fast backward's launches not holding an "
-                                      "A100's registers) (SE-family-a100-1a31d279a)"),
 }
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
 port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
-shrinks as the template wins its cells, and no cell is picked or ranked at run time. Training on an H100 is
-the template's: its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff; 2.56
-against 3.14 on an H100 PCIe, SE-family-h100-e0de17766)."""
+shrinks as the template wins its cells, and no cell is picked or ranked at run time. Training is the
+template's: on an H100 its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff;
+2.56 against 3.14 on an H100 PCIe, SE-family-h100-e0de17766); on an A100 SXM4 40GB its forward and gradient
+4.56 ms against the port's 4.83 on Qwen3.5-27B's gated delta net and 3.44 against 4.69 on Qwen3-Next's, its
+keys launch a key block a program and its query/key launch's memory sum a product
+(JS-train80-a100-db2c4aca0)."""
 
 def _trains(call: base.Call | None) -> bool:
     """Whether the recurrence template's gradient runs the call (`Mosaic.trains`)."""
@@ -807,6 +806,35 @@ def _by_product(forward, training, *operands):
 
     rule.defvjp(ahead, back)
     return rule(*operands)
+
+
+def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, state=None):
+    """The memory this shard of a sequence the mesh axis `axis` splits enters its slice with, `[B, Hv, Dk,
+    Dv]` in at least fp32, inside a `shard_map` that holds `axis` manual: fla's context-parallel
+    summary-then-states (fla/ops/cp/chunk_delta_h.py, fla-core 0.5.2). A delta rule's slice is affine in
+    the memory it enters, `S = F S_0 + Z` (each token's transition on the left, `recurrence.update`), so
+    each shard's summary is `rule`'s final memory over its slice from `[0 | I]` with values `[v | 0]`, in
+    at least fp32 (rounding the identity block's products to the operands' dtype would round the
+    transfer): `Z` the write its last document leaves from zero, `F` its transfer, zero where that document
+    starts inside the slice. The summaries are each shard's span (`recurrence_algebra.Span`), whose exclusive
+    prefix over `axis` (`recurrence_algebra.entering`) from the row's `state` (zero where None) on the first
+    shard is the memory each enters, `E_r = F_{r-1} E_{r-1} + Z_{r-1}`; a slice that starts a document (its
+    first token's `starts`) enters from zero. `rule(query, key, value, g, beta, state, *, starts)` returns
+    `(output, final memory)`."""
+    batch, _, heads, columns = value.shape
+    width = key.shape[-1]
+    wide = at_least_fp32(value.dtype)
+    shard = jax.lax.axis_index(axis)
+    begins = (jnp.zeros((batch,), bool) if starts is None else jnp.asarray(starts[:, 0], bool)) & (shard > 0)
+    zero = rows_like(jnp.zeros((batch, heads, width, columns), wide), value)
+    identity = jnp.where(begins[:, None, None, None], 0.0,
+                         jnp.broadcast_to(jnp.eye(width, dtype=wide), (batch, heads, width, width)))
+    widened = jnp.concatenate([value.astype(wide), jnp.zeros((*value.shape[:-1], width), wide)], axis=-1)
+    _, summary = rule(query.astype(wide), key.astype(wide), widened, g, beta.astype(wide),
+                      jnp.concatenate([zero, identity], axis=-1), starts=starts)
+    span = algebra.Span(summary[..., columns:], summary[..., :columns])
+    memory = algebra.entering(span, axis, None if state is None else state.astype(wide))
+    return jnp.where(begins[:, None, None, None], 0.0, memory)
 
 
 def kernel_routed(query, key, value, g, beta, *, floor: float | None = None) -> bool:
@@ -950,8 +978,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     # tracer).
     @jax.custom_vjp
     def rule(query, key, value, g, beta, state, starts, firsts):
+        # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
+        alone = {**run, "tiles": tiles.forward or tiles}
         return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
-                                max_segments=max_segments, scale=scale, delta=delta, wide=wide, **run)
+                                max_segments=max_segments, scale=scale, delta=delta, wide=wide, **alone)
 
     def forward(*operands):
         if not fast:

@@ -18,17 +18,20 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import cost, mosaic, resources
 from dew.nn.sharding import per_shard
 
-_TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
-_SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
-"""Mosaic GPU's tile transforms, which it declares as protocol classes (a type checker takes them for
-uninstantiable)."""
+
+def _staging(block: tuple, swizzle: int | None) -> tuple:
+    """A stream's tile's transforms: a tile's swizzled (its own, `swizzle` where a stream names one); a side
+    vector's none, in whole 16-byte cp.async chunks."""
+    shape, dtype = block
+    if len(shape) == 1:
+        return ()
+    return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
 
 
 def swizzled(shape: tuple[int, int], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
     bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
-    swizzle = plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8)
-    return _TILING((8, swizzle // jnp.dtype(dtype).itemsize)), _SWIZZLE(swizzle)
+    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8))
 
 
 class Slots:
@@ -53,6 +56,8 @@ class Pipeline:
 
     blocks: dict
     stages: int
+    swizzles: dict = dataclasses.field(default_factory=dict)
+    """The swizzle a stream's tiles stage at where `Mma.streams` names one (`mosaic.swizzle_for`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,6 +109,14 @@ class Mma(mosaic.Family):
         return cls(jnp.dtype(dtype), m_warps)
 
     @property
+    def transposed_rows(self) -> int:
+        # The transposed stage casts to the products' left-operand layout in whole row atoms, `m_warps`
+        # warps of 16 rows: a 32-row step at two row warps lowers, where the 64-row role it was held to
+        # left an A100's dense kernel gradients 18 to 29% slower (BC-A100-DW-AB2: Llama 3 8B o's 1.680 to
+        # 1.378 ms, gate_up's 10.95 to 7.80).
+        return self.m_warps * 16
+
+    @property
     def lhs_copies(self) -> int:
         return 4 // self.m_warps
 
@@ -137,10 +150,28 @@ class Mma(mosaic.Family):
         # (CONSUMERS2); two consumers in one program took 1.04 to 1.50 (CONSUMERS1).
         return cost.REGISTERS // (consumers * resources.THREADS * self.registers(consumers))
 
+    def column_registers(self, columns: int, dtype) -> int:
+        # The accumulator's tiles are `m_warps * 16` rows by `n_warps * 8` columns, each warp's 16 x 8 a
+        # thread's two columns a row (jax/experimental/mosaic/gpu/mma.py:63, `MMALayouts`' accumulator
+        # tiling), so a column vector broadcast over the rows holds two entries a thread in each of the
+        # vector's `columns / (n_warps * 8)` tiles: a quarter of its columns at four row warps, as
+        # warpgroup MMA's, an eighth at two, a sixteenth at one.
+        per_thread = -(-columns * 2 // (4 // self.m_warps * 8))
+        return -(-per_thread * jnp.dtype(dtype).itemsize // 4)
+
     def column_unit(self, dtype) -> int:
-        # Its stores move a row through registers, laid over the role's threads, one element or more each.
+        # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
+        # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64
+        # columns; row 2078's probe: every attention launch on sm80 at 64-column tiles).
         del dtype
-        return resources.THREADS
+        return resources.THREADS // 2
+
+    def stores_columns(self, columns: int, rows: int) -> bool:
+        # Its store ladder reloads each rung's rows from shared memory through registers, whose strided
+        # layout wants a multiple of a role's threads in elements: its least rung, `rows` of `columns`, must
+        # hold one (BC-RAGGED-STORE: a grouped call's one-row rung at 64 columns finds no layout, a dense
+        # call's rungs of 8 rows do; UNIT64-2: a 192-column row, a thread and a half's, none either).
+        return rows * columns % resources.THREADS == 0
 
     def depths(self, dtype) -> tuple[int, ...]:
         # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
@@ -168,25 +199,29 @@ class Mma(mosaic.Family):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None) -> Callable:
-        # Its one warpgroup is its consumer, no producer beside it, and no cluster.
+               cluster: int = 1, cost: pl.CostEstimate | None = None,
+               reducing_warpgroups: int = 0) -> Callable:
+        # Its one warpgroup is its consumer, no producer beside it, and no cluster; its kernels' default
+        # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
+        del reducing_warpgroups
         _one(consumers, clustered=cluster > 1)
         per_shard(name or self.name)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                             interpret=mosaic.interpreted(interpret), kernel_name=name, cost_estimate=cost)
 
-    def scoped(self, body, *allocations, streams) -> None:
-        pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
+    def scoped(self, body, *allocations, streams):
+        return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
 
     def roles(self, consumers: int, consumer, producer) -> None:
         _one(consumers)
         del producer
         consumer(0)
 
-    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = ()):
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
+                swizzles: dict[str, int] | None = None):
         _one(consumers, clustered=bool(multicast))
-        return Pipeline(blocks, stages)
+        return Pipeline(blocks, stages, dict(swizzles or {}))
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -224,7 +259,7 @@ class Mma(mosaic.Family):
                 pl.when(active)(lambda: consumer(0, tile, walk, store, active=True))
                 pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
 
-        pl.run_scoped(tiled, *(plgpu.SMEM(shape, dtype) for shape, dtype in outputs))
+        pl.run_scoped(tiled, *self.output_staging(outputs, consumers))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
@@ -248,11 +283,10 @@ class Mma(mosaic.Family):
                 slots = Slots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
-            # A tile's blocks staged swizzled for ldmatrix; a side vector's untiled, in whole 16-byte
-            # cp.async chunks.
+            # A tile's blocks staged swizzled for ldmatrix (`_staging`).
             specs = [plgpu.BlockSpec(blocks[name][0],
                                      lambda j, lo=lo, index_map=streams.views[name][1]: index_map(j + lo),
-                                     transforms=swizzled(*blocks[name]) if len(blocks[name][0]) > 1 else ())
+                                     transforms=_staging(blocks[name], streams.pipeline.swizzles.get(name)))
                      for name in names]
             pipeline = plgpu.emit_pipeline(body, grid=(hi - lo,), in_specs=specs,
                                            max_concurrent_steps=streams.pipeline.stages, init_carry=carry)

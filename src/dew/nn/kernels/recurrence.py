@@ -19,12 +19,14 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
+import inspect
 from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from dew._hashing import fmix32
 from dew.nn.precision import (
     L2NORM_EPS,
     at_least_fp32,
@@ -118,14 +120,12 @@ def round_to_bf16(state, key, value):
     smaller than half a bf16 step still moves the state on average, where
     rounding to nearest would hold it. The noise is a hash of the value's
     bits and the token's `key` `[..., Dk]` and `value` `[..., Dv]`, so it is
-    deterministic and differs from token to token (`precision.stochastic_bf16`, its rounding)."""
+    deterministic and differs from token to token (`fmix32`, the mixer every Dew noise takes;
+    `precision.stochastic_bf16`, its rounding)."""
     bits = jax.lax.bitcast_convert_type(state, jnp.uint32)
     salt = (jax.lax.bitcast_convert_type(key, jnp.uint32)[..., :, None] * jnp.uint32(0x9E3779B1)
             + jax.lax.bitcast_convert_type(value, jnp.uint32)[..., None, :] * jnp.uint32(0x85EBCA77))
-    mixed = bits ^ salt
-    mixed = (mixed ^ (mixed >> 16)) * jnp.uint32(0x7FEB352D)
-    mixed = (mixed ^ (mixed >> 15)) * jnp.uint32(0x846CA68B)
-    return stochastic_bf16(state, mixed ^ (mixed >> 16))
+    return stochastic_bf16(state, fmix32(bits ^ salt))
 
 
 def update(state, query, key, value, decay, write, *, delta: bool):
@@ -171,19 +171,25 @@ def gated_rms(out, z, weight, norm: OutputNorm):
     return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
 
 
+ROW = {"rows": True}
+"""A field's metadata where it holds an entry a row (`Step`'s; a decode launch keys its rows' count bucketed,
+`StepLaunch.ROWS`)."""
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class Gated:
     """The operands the hooks read beside the queries, keys and values, a decode token's (`Step`) and a
     chunked sequence's (`recurrence_chunk.Chunk`) alike, each None where its hook is off: the log
     decay, the gates' pre-activations, the write gate, the skip's `D`, the epilogue's gate and
-    weight, and a rated decay's rate. A value kind the hooks gain is a field here."""
-    log_decay: jax.Array | None = None
-    gate: jax.Array | None = None
+    weight, and a rated decay's rate. A value kind the hooks gain is a field here, an entry a row where its
+    metadata says so (`ROW`)."""
+    log_decay: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    gate: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     log_a: jax.Array | None = None
     bias: jax.Array | None = None
-    beta: jax.Array | None = None
+    beta: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     skip: jax.Array | None = None
-    z: jax.Array | None = None
+    z: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     weight: jax.Array | None = None
     rate: jax.Array | None = None
 
@@ -202,15 +208,16 @@ class Step(Gated):
     `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by `round_to_bf16`), or wider for the reference.
     `active` `[rows]` marks the rows that draw. A pytree
     of its arrays, so it crosses `jit` and a transformation as a token's operands do; the `Hooks` are
-    its static form."""
-    state: jax.Array
-    query: jax.Array | None = None
-    key: jax.Array | None = None
-    value: jax.Array | None = None
-    token: jax.Array | None = None
-    held: jax.Array | None = None
+    its static form. Its fields are the decode launch's operands and their names (`OPERANDS`, `StepLaunch`),
+    those an entry a row marked (`ROW`)."""
+    state: jax.Array = dataclasses.field(metadata=ROW)
+    query: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    key: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    value: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    token: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    held: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     taps: jax.Array | None = None
-    active: jax.Array | None = None
+    active: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
 
 
 def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, channels: int):
@@ -224,9 +231,8 @@ def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, ch
     return key_heads
 
 
-OPERANDS = ('state', 'query', 'key', 'value', 'token', 'held', 'taps', 'log_decay', 'gate', 'beta', 'log_a',
-            'bias', 'skip', 'z', 'weight', 'rate')
-"""`StepLaunch`'s array operands after `active`, in its order."""
+OPERANDS = tuple(field.name for field in dataclasses.fields(Step) if field.name != 'active')
+"""`StepLaunch`'s array operands beside `active`, by name: `Step`'s fields."""
 
 
 def _names(hooks: Hooks) -> tuple[str, ...]:
@@ -252,6 +258,20 @@ def read(hooks: Hooks, operands, *, optional: tuple[str, ...] = ()) -> dict:
     return {name: array for name, array in given.items() if array is not None}
 
 
+def _activated(pre, conv: Conv):
+    """The conv's sums `pre` activated as `conv` says: SiLU, or as they are."""
+    return pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
+
+
+def _split(convolved, key_heads: int, value_heads: int, key_width: int, value_width: int):
+    """A conv's channels `[rows, C]` as the queries and keys `[rows, Hk, Dk]` and the values `[rows, Hv,
+    Dv]` they hold, in that order: the one splitter the reference's conv and its one-tap form share."""
+    rows = convolved.shape[0]
+    query, key, value = jnp.split(convolved, [key_heads * key_width, 2 * key_heads * key_width], axis=-1)
+    return (query.reshape(rows, key_heads, key_width), key.reshape(rows, key_heads, key_width),
+            value.reshape(rows, value_heads, value_width))
+
+
 def _prologue(hooks: Hooks, given: dict, work):
     """The reference's queries `[rows, Hv, Dk]`, keys, values `[rows, Hv, Dv]`, each in `work`, and
     the moved history (None without a conv): the conv's sums in `work` over the history rounded to
@@ -262,13 +282,13 @@ def _prologue(hooks: Hooks, given: dict, work):
         token, held = given['token'], given['held']
         key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
         window = jnp.concatenate([held.astype(token.dtype), token[:, None]], axis=1).astype(work)
-        pre = jnp.sum(window * jnp.swapaxes(given['taps'].astype(work), 0, 1)[None], axis=1)
-        convolved = pre if hooks.conv.activation is None else pre * jax.nn.sigmoid(pre)
-        rows = token.shape[0]
-        split = [key_heads * key_width, 2 * key_heads * key_width]
-        query, key, value = jnp.split(convolved, split, axis=-1)
-        query, key = (x.reshape(rows, key_heads, key_width) for x in (query, key))
-        value = value.reshape(rows, value_heads, value_width)
+        taps, width = given['taps'].astype(work), window.shape[1]
+        # Each tap's inputs a slice of the window and its weights a column of the taps, the conv's one
+        # multiply and add a tap.
+        pre = short_conv.preactivation([window[:, tap:tap + 1] for tap in range(width)],
+                                       [taps[:, tap] for tap in range(width)], None)[:, 0]
+        query, key, value = _split(_activated(pre, hooks.conv), key_heads, value_heads, key_width,
+                                   value_width)
         # The history and the token, then all but the oldest: a one-tap conv holds none.
         history = jnp.concatenate([held, token[:, None].astype(held.dtype)], axis=1)[:, 1:]
     else:
@@ -495,7 +515,7 @@ class _ConvRefs:
         streams = []
         for stream, (first, width) in zip(windows, self.pieces, strict=True):
             taps = [self.taps[pl.ds(first, width), j].astype(jnp.float32) for j in range(len(stream))]
-            pre = short_conv._preactivation(stream, taps, None)
+            pre = short_conv.preactivation(stream, taps, None)
             streams.append(pre if conv.activation is None
                            else pre * short_conv._sigmoid(pre, interpret=interpret))
         return tuple(x[0] for x in streams)
@@ -535,6 +555,20 @@ COLUMNS = Launch(32, 8)
 """The launch over value columns: 32 a program, 16 to 64 measured within 3% on an RTX 4080."""
 
 
+def _operands_named(fwd):
+    """`fwd` (`StepLaunch._fwd`) with its operands, `Step`'s fields (`OPERANDS`), named in its signature as
+    keyword arguments, which a launch's arguments bind to by name (`tuning`'s keys and stored launches), each
+    an array or None as tokamax serializes a launch it describes."""
+    parameter = inspect.Parameter
+    given = inspect.signature(fwd).parameters.values()
+    fwd.__signature__ = inspect.Signature([
+        *(each for each in given if each.kind is parameter.POSITIONAL_OR_KEYWORD),
+        *(parameter(name, parameter.KEYWORD_ONLY, default=None, annotation=jax.Array | None)
+          for name in OPERANDS),
+        *(each for each in given if each.kind is parameter.KEYWORD_ONLY)])
+    return fwd
+
+
 @dataclasses.dataclass(frozen=True)
 class StepLaunch(tuning.KernelOp):
     """A decode token in one launch over rows and value heads (`_kernel`), its `hooks` inlined. Off a GPU
@@ -542,28 +576,21 @@ class StepLaunch(tuning.KernelOp):
 
     config_cls: ClassVar[type[Launch]] = Launch
 
-    ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay',
-                                       'gate', 'beta', 'z', 'state')
+    ROWS: ClassVar[tuple[str, ...]] = tuple(field.name for field in dataclasses.fields(Step)
+                                            if field.metadata.get('rows'))
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats and every row active, so a timed launch steps each row's state and history."""
         return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
                 for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
 
-    def _fwd(self, active: jax.Array, state: jax.Array, query: jax.Array | None, key: jax.Array | None,
-             value: jax.Array | None, token: jax.Array | None, held: jax.Array | None, taps: jax.Array | None,
-             log_decay: jax.Array | None, gate: jax.Array | None, beta: jax.Array | None,
-             log_a: jax.Array | None, bias: jax.Array | None, skip: jax.Array | None, z: jax.Array | None,
-             weight: jax.Array | None, rate: jax.Array | None, *, hooks: Hooks, dtype: str, interpret: bool,
-             config: Launch,
-             return_residuals: bool = False):
+    @_operands_named
+    def _fwd(self, active: jax.Array, *, hooks: Hooks, dtype: str, interpret: bool, config: Launch,
+             return_residuals: bool = False, **operands):
         from jax.experimental.pallas import triton as plgpu
 
-        arrays = {'state': state, 'query': query, 'key': key, 'value': value, 'token': token, 'held': held,
-                  'taps': taps, 'log_decay': log_decay, 'gate': gate, 'beta': beta, 'log_a': log_a,
-                  'bias': bias, 'skip': skip, 'z': z, 'weight': weight, 'rate': rate}
-        given = {name: arrays[name] for name in _names(hooks)}
-        rows, value_heads, key_width, value_width = state.shape
+        given = {name: operands[name] for name in _names(hooks)}
+        rows, value_heads, key_width, value_width = given['state'].shape
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
                      if hooks.conv is not None else given['query'].shape[1])
 
@@ -608,7 +635,7 @@ class StepLaunch(tuning.KernelOp):
         flags = pl.BlockSpec((None, 1), lambda r, h, c: (r, 0))
         in_specs = [flags, *(specs[name](given[name]) for name in given)]
         out_specs = [held_state]
-        out_shape = [jax.ShapeDtypeStruct(state.shape, state.dtype)]
+        out_shape = [jax.ShapeDtypeStruct(given['state'].shape, given['state'].dtype)]
         if hooks.conv is not None:
             out_specs.append(per_row(given['held']))
             out_shape.append(jax.ShapeDtypeStruct(given['held'].shape, given['held'].dtype))
@@ -674,15 +701,13 @@ def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
     without a conv, the output in the token's dtype unless `dtype` names another, the empty history
     returned as it came."""
     token = given['token']
-    rows, (value_heads, key_width, value_width) = token.shape[0], given['state'].shape[1:]
+    value_heads, key_width, value_width = given['state'].shape[1:]
     key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
     work = at_least_fp32(token.dtype)
     pre = token.astype(work) * given['taps'][:, 0].astype(work)
-    convolved = pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
-    query, key, value = jnp.split(convolved, [key_heads * key_width, 2 * key_heads * key_width], axis=-1)
-    unconvolved = dataclasses.replace(
-        operands, token=None, held=None, taps=None, query=query.reshape(rows, key_heads, key_width),
-        key=key.reshape(rows, key_heads, key_width), value=value.reshape(rows, value_heads, value_width))
+    query, key, value = _split(_activated(pre, conv), key_heads, value_heads, key_width, value_width)
+    unconvolved = dataclasses.replace(operands, token=None, held=None, taps=None, query=query, key=key,
+                                      value=value)
     out, _, state = step(dataclasses.replace(hooks, conv=None), unconvolved,
                          dtype=token.dtype if dtype is None else dtype)
     return out, given['held'], state
@@ -707,19 +732,22 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     if 'log_decay' in given and hooks.decay == 'scalar':
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
     named = jnp.dtype(operand if dtype is None else dtype).name
-    # Positional, None where a hook is off.
-    state, *history, out = StepLaunch()(flags, *(given.get(name) for name in OPERANDS), hooks=hooks,
+    # By name, None where a hook is off.
+    state, *history, out = StepLaunch()(flags, **{name: given.get(name) for name in OPERANDS}, hooks=hooks,
                                         dtype=named, interpret=not triton_runs())
     return out, history[0] if history else None, state
 
 
-def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale: float | None, reverse: bool):
+def _cumsum_kernel(chunk_ref, s_ref, o_ref, *rest, chunk: int, aligned: bool, scale: float | None,
+                   reverse: bool):
     """fla's `chunk_local_cumsum_scalar_kernel` (fla/ops/utils/cumsum.py:33-73) for one chunk of one
     head, of each column of a gate per key dimension (fla's vector kernel, :90-133) too: forward, fla's
     inclusive cumulative sum over its tokens and its `scale`, in float64 and rounded once to fp32 (fla's
     fp32 sum and its fp32 scaling put Kimi delta attention's final memory 1.9 times fla's recorded torch's
     distance from float64, 1.8 with this, SE-dbg-kda-stage-1a95620b8); every kernel takes the difference
-    of two positions as a range's exponent. `reverse`, the decay's gradient,
+    of two positions as a range's exponent. With a second output (`rest`), the float64 sum's remainder
+    below its fp32 rounding, so a range's exponent is the his' difference and the los' (`algebra.apart`):
+    a steep step's rounding otherwise loses the mild steps after it. `reverse`, the decay's gradient,
     sums from the end compensated, each running sum a `(hi, lo)` pair (`compensated_add`) taken token
     by token and stored rounded once."""
     start, count = chunked_launch._chunk_of(chunk_ref, chunk, aligned)
@@ -729,8 +757,12 @@ def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale:
             tokens = chunked_launch.read_rows(chunked_launch._rows(s_ref, start, chunk), count)
             with jax.enable_x64():
                 total = jnp.cumsum(tokens.astype(jnp.float64), axis=0)
-                total = (total if scale is None else total * scale).astype(jnp.float32)
-            chunked_launch.write_rows(chunked_launch._rows(o_ref, start, chunk), count, total)
+                total = total if scale is None else total * scale
+                rounded = total.astype(jnp.float32)
+                remainder = (total - rounded.astype(jnp.float64)).astype(jnp.float32)
+            chunked_launch.write_rows(chunked_launch._rows(o_ref, start, chunk), count, rounded)
+            for lo_ref in rest:
+                chunked_launch.write_rows(chunked_launch._rows(lo_ref, start, chunk), count, remainder)
         return
 
     def step(i, total):
@@ -758,7 +790,7 @@ class ChunkLocalCumsum(chunked_launch._Launch):
 
     def _fwd(self, g: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,
              scale: float | None, reverse: bool, interpret: bool, config: chunked_launch.Tiles,
-             return_residuals: bool = False):
+             compensated: bool = False, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = chunked_launch.Sequences(chunk_spans, sequence_spans)
@@ -769,30 +801,34 @@ class ChunkLocalCumsum(chunked_launch._Launch):
         blocks = [min(64, width) for width in columns]
         tiles = [width // block for width, block in zip(columns, blocks, strict=True)]
         spec = pl.BlockSpec((batch * length, None, *blocks), lambda i_t, h, *i_k: (0, h, *i_k))
+        outputs = 1 + compensated
         out = pl.pallas_call(
             functools.partial(_cumsum_kernel, chunk=chunk, aligned=aligned, scale=scale, reverse=reverse),
             grid=(spans.chunks.shape[0], heads, *tiles),
-            in_specs=[chunked_launch._CHUNK, spec], out_specs=spec,
-            out_shape=jax.ShapeDtypeStruct((batch * length, heads, *columns), jnp.float32),
+            in_specs=[chunked_launch._CHUNK, spec], out_specs=[spec] * outputs,
+            out_shape=[jax.ShapeDtypeStruct((batch * length, heads, *columns), jnp.float32)] * outputs,
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="recurrence_cumulated",
         )(spans.chunks, *chunked_launch._flat(g))
-        return out.reshape(g.shape), None
+        out = tuple(part.reshape(g.shape) for part in out)
+        return (out if compensated else out[0]), None
 
 
 _CHUNK_LOCAL_CUMSUM = ChunkLocalCumsum()
 
 
 def cumulated(g, *, chunk: int = 64, scale: float | None = None, reverse: bool = False,
-              spans: chunked_launch.Sequences | None = None, interpret: bool = False):
+              compensated: bool = False, spans: chunked_launch.Sequences | None = None,
+              interpret: bool = False):
     """The chunked recurrences' first stage, their decay's prefix: `g` `[B, T, H]`, or `[B, T, H, K]`
     per key dimension, cumulated within each chunk of `chunk` tokens of each sequence (`spans`, the
     rows where None), fp32: fla's `chunk_local_cumsum`
     (cumsum.py:262-341), `scale` RCP_LN2 for the forward's base-2 decay, `reverse` for its gradient.
     Forward is the prefix summed and scaled in float64 and rounded once (fla's is plain fp32), whose
-    difference between two positions every kernel takes as a range's exponent; `reverse` the sums from
-    the end, each rounded once. fla autotunes only
-    `num_warps` over 1, 2, 4 and 8 here."""
+    difference between two positions every kernel takes as a range's exponent, or where `compensated`
+    its `(hi, lo)` halves, the remainder below the rounding too (`algebra.apart`); `reverse` the sums
+    from the end, each rounded once. fla autotunes only `num_warps` over 1, 2, 4 and 8 here."""
     batch, length = g.shape[:2]
     spans = chunked_launch.sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _CHUNK_LOCAL_CUMSUM(g, *spans, chunk=chunk, scale=scale, reverse=reverse, interpret=interpret)
+    return _CHUNK_LOCAL_CUMSUM(g, *spans, chunk=chunk, scale=scale, reverse=reverse, compensated=compensated,
+                               interpret=interpret)

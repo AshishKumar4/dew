@@ -963,6 +963,9 @@ def test_a_chunk_wider_than_its_places_dtype_holds_every_place_of_one_sign():
         wide = places.astype(jnp.int64)
         expected = document_mask(ids) & chunk_mask(wide, wide, 2 ** 31)[:, 0]
     np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+    # The scalar form counts chunks by the same owner (`visibility.chunk_of`), over the int32 places as given.
+    np.testing.assert_array_equal(np.asarray(document_mask(ids) & chunk_mask(places, places, 2 ** 31)[:, 0]),
+                                  np.asarray(expected))
 
 
 def test_a_block_of_unsigned_ids_is_whole_only_within_one_document():

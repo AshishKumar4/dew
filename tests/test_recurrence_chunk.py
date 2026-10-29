@@ -11,7 +11,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_fp32_reduction_bound, chain_roundings, widened
+from certified import assert_certified
+from jax.sharding import Mesh, PartitionSpec as P
+from reference_error import (
+    FEWEST_SEEDS,
+    assert_as_exact,
+    assert_fp32_reduction_bound,
+    chain_roundings,
+    widened,
+)
 
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -387,6 +395,42 @@ def test_the_peeled_transition_carries_the_peeled_memory_and_its_adjoint(packed,
         np.testing.assert_array_equal(np.asarray(found, np.float64), exact[name], err_msg=name)
 
 
+@pytest.mark.parametrize('shards', [pytest.param(3, marks=pytest.mark.mesh(devices=3)),
+                                    pytest.param(4, marks=pytest.mark.mesh(devices=4))])
+@pytest.mark.parametrize('dense', [True, False], ids=['dense', 'decay'])
+def test_each_shard_enters_with_the_spans_before_it_applied_in_turn(dense, shards):
+    """The memory each shard of a sequence enters its span with across a mesh axis (`recurrence_algebra
+    .entering`, a Kogge-Stone prefix of the shards' spans) is the spans before it applied in turn to the
+    initial memory (`Span.applied`), on par from float64 over the fewest draws: a dense transfer (the delta
+    rule's) and a head's decay (Mamba-2's), over a power of two of shards and a count that is not."""
+    batch, heads, width, columns = 2, 3, 4, 5
+
+    def drawn(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        transfer = (jax.random.normal(keys[0], (shards, batch, heads, width, width)) / width if dense
+                    else -jax.random.uniform(keys[0], (shards, batch, heads)))
+        return (transfer, jax.random.normal(keys[1], (shards, batch, heads, width, columns)),
+                jax.random.normal(keys[2], (batch, heads, width, columns)))
+
+    mesh = Mesh(np.asarray(jax.devices()[:shards]), ('shards',))
+
+    def entered(transfer, write, initial):
+        def shard(transfer, write, initial):
+            return algebra.entering(algebra.Span(transfer[0], write[0]), 'shards', initial)[None]
+
+        return jax.shard_map(shard, mesh=mesh, in_specs=(P('shards'), P('shards'), P()),
+                             out_specs=P('shards'))(transfer, write, initial)
+
+    def in_turn(transfer, write, initial):
+        memories = [initial]
+        for index in range(shards - 1):
+            memories.append(algebra.Span(transfer[index], write[index]).applied(memories[-1]))
+        return jnp.stack(memories)
+
+    assert_as_exact(jax.jit(entered), jax.jit(in_turn), drawn, f'{shards} shards entering, dense {dense}',
+                    seeds=FEWEST_SEEDS)
+
+
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
 @pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[8], HOOKS[6]], ids=str)
 def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
@@ -448,6 +492,34 @@ def portable_draw(seed: int, rows: int, packed: bool) -> tuple:
     starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
     operands = (query, key, value, g, beta)
     return operands, starts, tuple(jax.random.normal(keys[6], x.shape) for x in operands)
+
+
+CERTIFIED_SEEDS = 2
+"""The chunk ops' check-2 draws: every element of every operation certified on each (tests/certified.py)."""
+
+
+@pytest.mark.parametrize("decay", ["gated", "none"])
+@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
+def test_the_chunk_ops_certify_element_by_element(packed, decay, monkeypatch):
+    """The portable delta rule's chunk ops (`chunk_delta_rule`: the decay's prefix, the chunks' WY
+    inverse and memories, the scan over chunks and the outputs), with a decay a head and with none, over
+    one sequence and packed documents: run one primitive at a time, every element of every operation,
+    each step of the scan included, within its own operation's certified bound (check 2, row 1340). The
+    program certified is the library's own, which every platform runs: without the test lane's wide CPU
+    arithmetic (`precision.WIDE_CPU_ARITHMETIC`, which only makes a CPU's float32 sums check 1's
+    references round once), each of its float32 sums certified as the sum it is."""
+    from dew.nn import precision
+
+    monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "0")
+    def draw(seed):
+        operands, starts, _ = portable_draw(seed, 1, packed)
+        query, key, value, g, beta = operands
+        return query, key, value, g if decay == "gated" else jnp.zeros_like(g), beta, starts
+
+    def rule(query, key, value, g, beta, starts):
+        return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=CHUNK, starts=starts)
+
+    assert_certified(rule, draw, f"the chunk ops, {decay} decay", seeds=CERTIFIED_SEEDS)
 
 
 @pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])

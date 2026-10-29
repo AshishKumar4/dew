@@ -634,7 +634,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post30
+jax==0.12.0.1.post32
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -1336,7 +1336,7 @@ pyzmq==27.2.0
     #   ipykernel
     #   jupyter-client
     #   jupyter-server
-qwix==0.1.8
+qwix==0.1.8.post2
     # via
     #   dewml (pyproject.toml)
     #   tokamax
