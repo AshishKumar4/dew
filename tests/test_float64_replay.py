@@ -187,3 +187,19 @@ def test_a_float_operation_without_a_float64_rule_refuses(name):
     with pytest.raises(NotImplementedError):
         float64_replay(REFUSED[name])(np.ones(3, np.float32))
 
+
+
+@pytest.mark.parametrize("name", sorted(DRAWS))
+def test_a_compiled_replay_of_a_draw_computes_its_eager_replay(name):
+    """A draw's replay compiled once (`compiled`, for an initializer whose eager replay costs seconds a
+    draw) reads the program's own bits and computes its eager replay, within the float64 rounding of
+    the draw's own arithmetic, at each of several keys through its one compiled program."""
+    from reference_error import assert_computes_the_oracle, chain_roundings
+
+    eager, compiled = float64_replay(DRAWS[name]), float64_replay(DRAWS[name], compiled=True)
+    for seed in range(3):
+        key = jax.random.key(seed)
+        with jax.enable_x64(new_val=True):
+            roundings = chain_roundings(jax.make_jaxpr(DRAWS[name])(key))
+        assert_computes_the_oracle(np.asarray(compiled(key)), np.asarray(eager(key)), f"{name} at {seed}",
+                                   roundings=roundings)

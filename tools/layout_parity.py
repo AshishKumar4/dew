@@ -462,8 +462,8 @@ def held_draw(model: str, layout: str, *, seeds: int, devices: int | None = None
     one device's draw (docs/design/testing.md, Layout invariance): over `seeds` keys, the layout's own
     draw (Dew's arm) and one device's (the reference), each the trainer's initializer compiled with the
     placement its mesh gives the parameters, held to their float64 truth, the one-device program
-    replayed in float64 from its own random bits (tests/float64_replay.py), which every layout draws
-    alike. The draws compile through Dew's seam (`compiler_options`), as the gate compiles a Dew arm
+    replayed in float64 from its own random bits (tests/float64_replay.py, compiled: an initializer's
+    eager replay costs seconds a draw), which every layout draws alike. The draws compile through Dew's seam (`compiler_options`), as the gate compiles a Dew arm
     (`dew_programs`). A layout Dew refuses raises its `LayoutRefused`."""
     import jax
     import numpy as np
@@ -496,7 +496,7 @@ def held_draw(model: str, layout: str, *, seeds: int, devices: int | None = None
 
     assert_as_exact(compiled(split, out_shardings=placement), compiled(alone),
                     lambda seed: (np.int32(seed),), f"{model} on {layout}: its initial parameters",
-                    seeds=seeds, truth_fn=float64_replay(drawing(alone)))
+                    seeds=seeds, truth_fn=float64_replay(drawing(alone), compiled=True))
 
 
 _initial: dict[tuple[str, int], Any] = {}

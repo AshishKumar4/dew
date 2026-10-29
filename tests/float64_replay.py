@@ -21,7 +21,7 @@ FORMATTED = frozenset({"bitcast_convert_type", "nextafter", "reduce_precision"})
 and widens a float they return."""
 
 
-def float64_replay(fn):
+def float64_replay(fn, *, compiled: bool = False):
     """`fn` as its float64 truth: its program, as traced, with every operation on a float run in
     float64 from operands widened exactly, so no float result is rounded but where the program
     names a format. Operations on integers, bits and keys run as traced, so a draw's random bits
@@ -38,10 +38,13 @@ def float64_replay(fn):
     random bits). It traces `fn` as the float32 program, x64 off, whatever the caller's mode and
     however widened its arguments arrive (check 1 hands a truth widened inputs under x64), and
     rounds each argument to its traced dtype before widening it, as the program would read it. It runs
-    eagerly, each operation its own float64 dispatch, so its bits are each operation's own (a
-    compiled replay's fusions would move them by ulps), and the gate runs it as given. `fn` is traced
-    once a signature of its arguments (their tree, shapes and dtypes), its program the same at every
-    call of one signature, as a pure function's is: a draw over many seeds replays one trace."""
+    eagerly, each operation its own float64 dispatch, so its bits are each operation's own, and the
+    gate runs it as given. `fn` is traced once a signature of its arguments (their tree, shapes and
+    dtypes), its program the same at every call of one signature, as a pure function's is: a draw over
+    many seeds replays one trace. `compiled` compiles that replay once a signature instead, for a
+    program whose eager replay costs a draw seconds (a model's initializer): XLA's fusions move its
+    float64 results by float64 roundings, which a float32 program's error dwarfs, and its formatted
+    operations stay the program's own."""
     traced: dict[tuple, tuple] = {}
 
     def run(*arguments):
@@ -51,12 +54,16 @@ def float64_replay(fn):
         if signature not in traced:
             with jax.enable_x64(new_val=False):
                 traced[signature] = jax.make_jaxpr(fn, return_shape=True)(*arguments)
-        graph, shapes = traced[signature]
+        graph, shapes, *program = traced[signature]
         native = [value if jax.dtypes.issubdtype(aval.dtype, jax.dtypes.extended)
                   else np.asarray(value).astype(aval.dtype)
                   for value, aval in zip(jax.tree.leaves(arguments), graph.in_avals, strict=True)]
         with jax.enable_x64(new_val=True):
-            outputs = _replayed(graph.jaxpr, graph.consts, native)
+            if compiled and not program:
+                program.append(jax.jit(lambda *native: _replayed(graph.jaxpr, graph.consts, list(native))))
+                traced[signature] = (graph, shapes, *program)
+            outputs = (program[0](*native) if compiled
+                       else _replayed(graph.jaxpr, graph.consts, native))
         return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
     return as_given(run)
 
