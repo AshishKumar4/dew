@@ -128,8 +128,11 @@ def neg(a: Iv) -> Iv:
 
 
 def mul(a: Iv, b: Iv) -> Iv:
+    """The exact products' range, outward but where it is an exact zero."""
     ends = np.stack(np.broadcast_arrays(a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi))
-    return _outward(ends.min(0), ends.max(0))
+    lo, hi = ends.min(0), ends.max(0)
+    return Iv(np.where(lo == 0, lo, np.nextafter(lo, -np.inf)),
+              np.where(hi == 0, hi, np.nextafter(hi, np.inf)))
 
 
 def where(mask, a: Iv, b: Iv) -> Iv:
@@ -483,29 +486,43 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                      starts=None if starts is None else starts[:, :n * CHUNK])[1]
                 for n in range(1, chunks)] if carried else []
     parts = 3 if jnp.dtype(dtype) == jnp.float32 else 1
+    # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
+    # call's come first where its documents start on the chunks' grid.
+    laid = np.shape(a)[0] // parts // CHUNK
 
     def summed(x, rows):
         return np.asarray(x, np.float64).reshape(parts, rows, -1).sum(0)
 
     def chunked(x, width):
-        return summed(x, chunks * CHUNK).reshape(chunks, CHUNK, heads, width).transpose(0, 2, 1, 3)
+        return summed(x, laid * CHUNK).reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
 
-    def host(x):
-        return np.asarray(np.asarray(x).astype(np.float32 if parts == 3 else x.dtype), np.float64)[0]
-
-    memories = summed(h, chunks * heads * key_width).reshape(chunks, heads, key_width, value_width)
+    memories = summed(h, laid * heads * key_width).reshape(laid, heads, key_width, value_width)[:chunks]
     stored = jnp.float32 if parts == 3 else dtype
     seams = np.asarray([np.array_equal(np.asarray(np.asarray(end[0]).astype(stored), np.float64),
                                        memories[n + 1]) for n, end in enumerate(ends)], bool)
     carries = [np.asarray(h0, np.float64)[0], *(np.asarray(end, np.float64)[0] for end in ends)]
     unknown = np.full(carries[0].shape, np.nan)
     carries += [unknown] * (chunks - len(carries)) + [np.asarray(kept_final, np.float64)[0]]
-    return Run(host(q), host(k), host(v), np.asarray(g, np.float64)[0],
-               np.asarray(jnp.asarray(beta).astype(dtype).astype(jnp.float32), np.float64)[0],
-               chunked(a, CHUNK), chunked(w, key_width), memories, chunked(c, value_width),
-               np.asarray(kept_o, np.float64)[0].reshape(chunks, CHUNK, heads, value_width).transpose(
+    return Run(**hosted(operands), a=chunked(a, CHUNK), w=chunked(w, key_width), h=memories,
+               c=chunked(c, value_width),
+               o=np.asarray(kept_o, np.float64)[0].reshape(chunks, CHUNK, heads, value_width).transpose(
                    0, 2, 1, 3),
-               np.stack(carries), seams)
+               carries=np.stack(carries), seams=seams)
+
+
+def hosted(operands: tuple) -> dict[str, np.ndarray]:
+    """A call's operands `(q, k, v, g, beta, h0)` as its launches read them, one row's, float64 (`Run`'s): the
+    queries, keys and values in their common dtype (fp32's three parts summed exactly), the write gate rounded
+    to it, the log decay fp32."""
+    import jax.numpy as jnp
+
+    q, k, v, g, beta, _ = operands
+    dtype = jnp.result_type(q, k, v)
+
+    def host(x):
+        return np.asarray(jnp.asarray(x).astype(dtype).astype(jnp.float32), np.float64)[0]
+
+    return {"q": host(q), "k": host(k), "v": host(v), "g": np.asarray(g, np.float64)[0], "beta": host(beta)}
 
 
 def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
@@ -577,3 +594,81 @@ def shifted(operands: tuple) -> tuple:
 
     *tokens, h0 = operands
     return (*map(later, tokens), h0)
+
+
+REGIMES = ("mild", "slow", "steep", "decay")
+"""Each draw's log decays a token (`draw`): Gated DeltaNet's (`-softplus(N(0, 1) - 1)`, as
+tests/test_recurrence_mosaic.py draws them), a memory kept across chunks (`-U(0, 0.01)`), one forgotten within
+a few tokens (`-U(1, 3)`), and a decay alone (`-0.4 (1 + U(0, 0.1))` and no write, `beta = 0`), whose fp32
+cumulative sums reach 2^4 within a chunk, where they round at 2^-20."""
+
+
+def draw(seed: int, regime: str, *, chunks: int = 3, heads: int = 1, width: int = 64):
+    """A bf16 call's operands `(q, k, v, g, beta, h0)` of one row of `chunks` chunks: unit queries and keys,
+    normal values, the regime's log decays (`REGIMES`), a write gate in (0, 1), an initial memory."""
+    import jax.numpy as jnp
+
+    rng = np.random.default_rng([2084, 3, seed, REGIMES.index(regime)])
+    length = chunks * CHUNK
+
+    def unit(shape):
+        x = rng.normal(size=shape)
+        return x / np.linalg.norm(x, axis=-1, keepdims=True)
+
+    q, k = unit((1, length, 1, width)), unit((1, length, 1, width))
+    v = rng.normal(size=(1, length, heads, width))
+    shape = (1, length, heads)
+    g = {"mild": lambda: -np.log1p(np.exp(rng.normal(size=shape) - 1.0)),
+         "slow": lambda: -0.01 * rng.uniform(size=shape), "steep": lambda: -rng.uniform(1, 3, shape),
+         "decay": lambda: -0.4 * (1 + 0.1 * rng.uniform(size=shape))}[regime]()
+    beta = 0.0 if regime == "decay" else 1 / (1 + np.exp(-rng.normal(size=shape)))
+    h0 = 0.3 * rng.normal(size=(1, heads, width, width))
+    return (jnp.asarray(q, jnp.bfloat16), jnp.asarray(k, jnp.bfloat16), jnp.asarray(v, jnp.bfloat16),
+            jnp.asarray(g, jnp.float32), jnp.asarray(np.broadcast_to(beta, shape), jnp.bfloat16),
+            jnp.asarray(h0, jnp.float32))
+
+
+def shifted_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """An off-by-one chunk boundary (`refusals`): the call run on its tokens one later (`shifted`), each
+    record held to the step on the call's own chunks' operands."""
+    faulty = recorded(*shifted(operands))
+    return refusals(faulty, dataclasses.replace(faulty, **hosted(operands)), lane)
+
+
+def cumsum_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """The decay from a difference of rounded cumulative sums (`refusals`, `rounded_cumsums`): the call run on
+    those log decays, each record held to the step on its own."""
+    import jax.numpy as jnp
+
+    q, k, v, g, beta, h0 = operands
+    faulty = recorded(q, k, v, jnp.asarray(rounded_cumsums(g)), beta, h0)
+    return refusals(faulty, dataclasses.replace(faulty, g=hosted(operands)["g"]), lane)
+
+
+def handed_refusals(operands: tuple, truth: Run, at: int, lane: Lane) -> tuple[np.ndarray, np.ndarray]:
+    """A state rounded to bf16 where fp32 is held: the call over the chunks from `at` on, from the fp32 memory
+    `truth`'s chunks before it leave rounded to bf16, its first chunk's leaving memory held to the step from
+    the memory unrounded (`refusals`)."""
+    import jax.numpy as jnp
+    import ml_dtypes as dtypes
+
+    carry = truth.carries[at]
+    handed = np.asarray(np.asarray(carry, np.float32).astype(dtypes.bfloat16), np.float32)
+    tail = recorded(*(x[:, at * CHUNK:] for x in operands[:5]), jnp.asarray(handed)[None])
+    claimed = dataclasses.replace(tail, carries=np.concatenate([carry[None], tail.carries[1:]]))
+    return refusals(tail, claimed, lane)["leaving"]
+
+
+def dropped_refusals(operands: tuple, truth: Run, at: int, lane: Lane) -> tuple[np.ndarray, np.ndarray]:
+    """A dropped carry: a document starting at chunk `at`'s first token (`starts`), whose stored entering
+    memory is the zero a new document starts from, held to the memory the step before it leaves, rounded as
+    stored; the fault's interval is that zero."""
+    import jax.numpy as jnp
+    from certified import separated
+
+    length = operands[0].shape[1]
+    starts = jnp.zeros((1, length), bool).at[0, at * CHUNK].set(True)
+    faulty = recorded(*operands, starts=starts, max_segments=2, carried=False)
+    leaving = enclosed(truth, lane)["leaving"]
+    stored = stored_memory(Iv(leaving.lo[at - 1], leaving.hi[at - 1]), lane)
+    return within(faulty.h[at], stored), separated(stored, point(np.zeros_like(stored.lo)))
