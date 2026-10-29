@@ -692,25 +692,13 @@ def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, r
     assert len(trainer.plan["probes"]) == 1
 
 
-def planner_branches() -> list[str]:
-    """One explicit policy of each branch the planner takes over an admitted one, by name the first of
-    `REMAT_POLICIES` whose model has a further remat rung (`Recomputing.recompute_more`), and the first
-    whose model is its ladder's last."""
-    found: dict[bool, str] = {}
-    for name in sorted(REMAT_POLICIES):
-        model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2,
-                                  mlp_features=32, max_seq_len=SEQ, remat=REMAT_POLICIES[name])
-        found.setdefault(model.recompute_more() is None, name)
-    return sorted(found.values())
-
-
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("remat", planner_branches())
+@pytest.mark.parametrize("remat", sorted(REMAT_POLICIES))
 def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeypatch, remat):
-    """A real fit over two devices keeps the explicit policy it is given once admitted, whether the
-    policy has a further rung or is its ladder's last (`planner_branches`): its step compiles once and
-    runs its one microbatch alone, no optional compile or trial hidden in fit's internally created
-    Trials (row 2153; the compile-once gate, row 2286)."""
+    """A real fit over two devices keeps each explicit policy it is given once admitted, whether the
+    policy has a further rung or is its ladder's last: its step compiles once and runs its one
+    microbatch alone, no optional compile or trial hidden in fit's internally created Trials (row 2153;
+    the compile-once gate, row 2286)."""
     free(monkeypatch, LIMIT)
     corpus = token_files(tmp_path)
     trainer = windowed(tmp_path, 1, remat=REMAT_POLICIES[remat], objective=Counted)

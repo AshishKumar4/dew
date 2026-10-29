@@ -704,3 +704,17 @@ def test_a_run_branches_into_the_cooldowns_its_command_line_names():
     assert run.trainer.cooldowns == Cooldowns(at=("20%", "40%"), length="10%", shape="linear")
     assert LMRunConfig.from_dict(run.to_dict()).trainer.cooldowns == run.trainer.cooldowns
     assert LMRunConfig.cli(["--trainer.multi-host", "False"]).trainer.cooldowns is None
+
+
+def test_a_run_whose_model_names_a_component_by_its_alias_reads_back_and_takes_an_override():
+    """A run whose model names a component by an alias of another kind (a mixer's `attention`) reads
+    back from its record as it was written, and takes an override, through the translation a record of
+    an earlier main's fields reads through (`dew.inference.tasks.earlier_model`, ledger 2423)."""
+    from dew.config.lm import LMRunConfig
+    from dew.registry import ModelConfig
+
+    fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2,
+              "mixer": {"class": "attention", "fields": {}}}
+    run = LMRunConfig(model=ModelConfig("causal_transformer", fields), trainer=TrainerConfig(steps=1))
+    assert LMRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))).model == run.model
+    assert run.override({"trainer.steps": 3}).model == run.model
