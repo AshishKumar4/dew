@@ -424,6 +424,11 @@ def test_the_kind_builds_from_the_configs_fields_and_is_nope():
     with pytest.raises(ValueError):
         mixer.build(MixerContext(emb_features=E, num_heads=H, num_kv_heads=H, head_dim=8,
                                  max_seq_len=16, kv_shared=True))
+    # It attends its own selection of the whole sequence: a window or a chunk would narrow it unread.
+    for narrowed in ({"sliding_window": 3}, {"attention_chunk": 4}):
+        with pytest.raises(ValueError):
+            mixer.build(MixerContext(emb_features=E, num_heads=H, num_kv_heads=H, head_dim=8,
+                                     max_seq_len=16, **narrowed))
 
 
 def test_a_gated_layer_gates_its_heads_context_as_latent_attention_does():
