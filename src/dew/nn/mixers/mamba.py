@@ -249,22 +249,18 @@ def _sequence_conv(mixed, segments, valid, weights, *, dtype):
 
 def _sequence_scan(xs, step, B, C, starts, weights, *, chunk_size: int):
     """This shard's slice of the selective scan, inside a `shard_map` that holds the sequence axis manual
-    (`over_sequence`), as Mamba-2's `_ssd` runs its own: the scan from zero, its output gaining
-    `C_t . exp(A cum_t) h` for the state `h` the earlier shards leave (`entering_state`), `cum_t` the
-    inclusive sum of this shard's steps, the term zero from a document's first token on; the span's log
-    decay is `A sum(dt)`, a document start in it zeroing it (`RESET_DECAY`). `weights` are the channels'
-    `A` and `D`."""
+    (`over_sequence`): run from zero, the state it leaves and its span's log decay `A sum(dt)` (a document
+    start in it zeroing the decay, `RESET_DECAY`) give the state the earlier shards leave it
+    (`entering_state`), and the scan runs again from that state, a start in it dropping it as on one
+    device. `weights` are the channels' `A` and `D`."""
     A, D = weights
-    out, leaving = selective_scan(xs, step, A, B, C, D, None, starts, chunk_size)
-    cumulative = jnp.cumsum(step, axis=1)                                   # [B, S, D]
-    decay = cumulative[:, -1, :, None] * A                                  # [B, D, N]
+    _, leaving = selective_scan(xs, step, A, B, C, D, None, starts, chunk_size)
+    decay = jnp.sum(step, axis=1)[..., None] * A                    # [B, D, N]
     if starts is not None:
         decay = jnp.where(jnp.any(starts, axis=1)[:, None, None], RESET_DECAY, decay)
-    entering = entering_state(decay, leaving, SEQUENCE_AXIS)
-    carried = float32_einsum('bsn,bdn,bsdn->bsd', C, entering, jnp.exp(cumulative[..., None] * A))
-    if starts is not None:
-        carried = jnp.where((jnp.cumsum(starts, axis=1) > 0)[..., None], 0, carried)
-    return out + carried.astype(out.dtype)
+    out, _ = selective_scan(xs, step, A, B, C, D, entering_state(decay, leaving, SEQUENCE_AXIS), starts,
+                            chunk_size)
+    return out
 
 
 class _StepProjection(nn.Module):
