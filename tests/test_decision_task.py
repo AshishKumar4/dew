@@ -203,11 +203,14 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
     several a window and each attending its own tokens alone: each row's logits on par with the row
     scored alone, a pass of its own, from the float64 task alone (check 1), over weights drawn about the
     task's, and the pass a few windows where a row a window would take one each."""
-    rows = every_case_row(decide)
-    shape = decide._shape(rows)
-    placed = decide._placed(rows, shape)
+    # Windows of the encoder's 256 positions, which hold several of these rows each.
+    task = replace(decide, layout=replace(decide.layout, max_len=256))
+    rows = every_case_row(task)
+    shape = task._shape(rows)
+    placed = task._placed(rows, shape)
     assert placed is not None and len(set(placed)) < len(rows) and shape.rows < len(rows)
-    wide = Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla")
+    wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
+                   layout=task.layout)
 
     def draw(seed):
         key = jax.random.key(seed)
@@ -215,12 +218,12 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
                              decide.variables),)
 
     def packed(variables) -> np.ndarray:
-        return np.concatenate([logits.ravel() for logits in decide.scored(rows, variables)])
+        return np.concatenate([logits.ravel() for logits in task.scored(rows, variables)])
 
     def alone(task: Decide):
         return lambda variables: np.concatenate([task.scored([row], variables)[0].ravel() for row in rows])
 
-    assert_as_exact(as_given(packed), as_given(alone(decide)), draw, "packed pass", seeds=PACKED_SEEDS,
+    assert_as_exact(as_given(packed), as_given(alone(task)), draw, "packed pass", seeds=PACKED_SEEDS,
                     truth_fn=alone(wide))
 
 
