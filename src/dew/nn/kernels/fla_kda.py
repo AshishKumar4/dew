@@ -277,8 +277,8 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, *refs, chunk: i
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
             gate = _gates(g_ref, start, taken, chunk, 0, columns)
-            raised = jnp.exp2(gate) if lo_ref is None else algebra.raised(
-                gate, _gates(lo_ref, start, taken, chunk, 0, columns))
+            raised = fla_gdn._raised(gate, None if lo_ref is None else _gates(lo_ref, start, taken, chunk, 0,
+                                                                            columns))
             scaled = (key * beta[:, None]) * raised
             if q_ref is not None and qg_ref is not None:
                 write(qg_ref, columns, read(q_ref, columns) * raised)
@@ -373,8 +373,8 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, *refs, chunk: int, a
         for block in range(q_ref.shape[-1] // bk):
             columns = pl.ds(block * bk, bk)
             query, gate = read(q_ref, columns), _gates(g_ref, start, taken, chunk, 0, columns)
-            raised = jnp.exp2(gate) if lo_ref is None else algebra.raised(
-                gate, _gates(lo_ref, start, taken, chunk, 0, columns))
+            raised = fla_gdn._raised(gate, None if lo_ref is None else _gates(lo_ref, start, taken, chunk, 0,
+                                                                            columns))
             gated = (query * raised).astype(query.dtype)
             out = out + _dot(gated, h_ref[entered, columns, :].astype(gated.dtype), exact=exact, ieee=True)
         out = out * scale
@@ -572,11 +572,11 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
             key = read(k_ref, keys)
             gate = _gates(g_ref, start, taken, chunk, 0, keys)
             final = _row(g_ref, (start + taken - 1, keys))
-            if lo_ref is None:
-                gate_exp, final_exp = jnp.exp2(gate), jnp.exp2(final)
-            else:
-                gate_exp = algebra.raised(gate, _gates(lo_ref, start, taken, chunk, 0, keys))
-                final_exp = algebra.raised(final, _row(lo_ref, (start + taken - 1, keys)))
+            gate_lo, final_lo = (None, None)
+            if lo_ref is not None:
+                gate_lo = _gates(lo_ref, start, taken, chunk, 0, keys)
+                final_lo = _row(lo_ref, (start + taken - 1, keys))
+            gate_exp, final_exp = fla_gdn._raised(gate, gate_lo), fla_gdn._raised(final, final_lo)
             decay_grad = decay_grad * final_exp
             dq = dq * gate_exp * scale
             dk = dk * jnp.exp2(_range(g_ref, lo_ref, start, taken, chunk, keys, gate))

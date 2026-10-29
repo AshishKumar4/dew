@@ -86,8 +86,13 @@ def _range(last, gate, last_lo=None, gate_lo=None):
 
 
 def _raised(gate, gate_lo=None):
-    """`exp2(g)`, of both halves where the remainder is given (`algebra.raised`)."""
-    return jnp.exp2(gate) if gate_lo is None else algebra.raised(gate, gate_lo)
+    """`exp2(g)`, of both halves where the remainder is given: `exp2(hi) exp2(lo)`, the hardware's base-2
+    exponential exact to its own rounding at any size (where a CPU's `exp(x ln 2)` is not; the template's
+    `algebra.raised` takes an exact power of two for it), two exponentials where `algebra.raised`'s exact
+    power of two cost a KDA tile 15 times its launch on an A100. Its one more product put the long-sequence
+    memory's error from float64 1.5 times the portable math's on a CPU, against 1.6 through
+    `algebra.raised`."""
+    return jnp.exp2(gate) if gate_lo is None else jnp.exp2(gate) * jnp.exp2(gate_lo)
 
 
 def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, bv: int, exact: bool,
