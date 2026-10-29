@@ -465,6 +465,45 @@ def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
                                   model.apply(state.variables, tokens))
 
 
+@pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "yarn"])
+def test_an_earlier_multimodal_record_reloads_its_saved_decoder(tmp_path, scaled):
+    """A multimodal run saved when its nested decoder, which the wrapper records as its fields alone
+    (`MultimodalTransformer.language_model`), wrote a `yarn` field of its own, unset or YaRN's, reloads
+    (`earlier_shapes`, ledger 2274): the restored model computes, bit for bit, what the trained one
+    does."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.rope import YarnScaling
+    from dew.nn.vision import Qwen35Projector, SiglipVision
+    from dew.objectives.lm import LMObjective
+
+    yarn = YarnScaling(factor=4.0, original_max_position_embeddings=8) if scaled else None
+    model = MultimodalTransformer(
+        CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                          max_seq_len=16, attention_impl="reference", rope_scaling=yarn),
+        SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1, num_heads=1, image_size=4,
+                     patch_size=2),
+        Qwen35Projector(hidden_size=4, spatial_merge_size=2, width=16, out_width=8, bias=True), "qwen3_5", 30)
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+    decoder = record["model"]["fields"]["language_model"]
+    # The earlier decoder wrote its YaRN, the fields alone, in a field of its own.
+    scaling = decoder.pop("rope_scaling")
+    decoder.update(rope_scaling=None, yarn=None if scaling is None else scaling["fields"])
+    with Checkpoints(str(tmp_path), keep=1) as checkpoints:
+        checkpoints.save(0, state, artifact=record)
+        checkpoints.wait()
+    restored = TextGeneration.from_run(str(tmp_path), step=0)
+    tokens = jnp.asarray([[1, 30, 4, 5, 6, 7, 8, 9, 10, 11]], jnp.int32)
+    conditioning = {"pixel_values": jnp.arange(48, dtype=jnp.float32).reshape(1, 1, 3, 4, 4) / 48,
+                    "image_lengths": jnp.asarray([[1]], jnp.int32)}
+    images = jnp.asarray([[-1, 0] + [-1] * 8], jnp.int32)
+    np.testing.assert_array_equal(
+        restored.model.apply(restored.variables, tokens, conditioning=conditioning, image_indices=images),
+        model.apply(state.variables, tokens, conditioning=conditioning, image_indices=images))
+
+
 def test_every_route_generates_through_the_same_packed_projections(tmp_path):
     """A run's task and a source's hold their query/key/value and gate/up packed, packed once at
     their load from the weights they own; a live objective's task keeps the trainer's own arrays,

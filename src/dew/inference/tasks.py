@@ -445,8 +445,10 @@ def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
     """A record's model with each component in today's fields (`earlier_shapes`), wherever the model
     nests it through another recorded wrapper: a Qwen or MiMo projector's earlier fields (ledger 1622),
     and a decoder's and its layer kinds' YaRN field beside their rope scaling (`_one_scaling`, ledger
-    1898). Carried until 1.0 (ledger 1552); current constructors and source codecs accept only their
-    current schema."""
+    1898), whether the decoder names its class or a wrapper declares the field it fills
+    (`MultimodalTransformer.language_model`, `DiffusionGemma.text`), which records its fields alone
+    (ledger 2274). Carried until 1.0 (ledger 1552); current constructors and source codecs accept only
+    their current schema."""
     def current(value):
         if isinstance(value, list | tuple):
             return [current(field) for field in value]
@@ -463,17 +465,39 @@ def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
             component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
                                    "width": width * merge ** 2, "bias": name == _EARLIER_PROJECTORS[0]}
         elif name in _DECODER:
-            kinds = fields.get("kinds")
-            component["fields"] = {**_one_scaling(fields), **({"kinds": {
-                kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
-                       else _one_scaling(held)) if isinstance(held, Mapping) else held
-                for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {})}
+            component["fields"] = _decoder_fields(fields)
             defaults = component.get("defaults")
             if isinstance(defaults, Mapping):
                 component["defaults"] = _one_scaling(defaults)
+        elif isinstance(name, str):
+            component["fields"] = _declared_decoders(name, fields)
         return component
 
     return {**record, "model": current(record["model"])}
+
+
+def _declared_decoders(name: str, fields: dict[str, object]) -> dict[str, object]:
+    """The fields of the component class `name` with each decoder its fields declare
+    (`dew.registry.declared_type`) and record as their fields alone translated (`_decoder_fields`)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import declared_type, imported, models
+
+    owner = models[name] if name in models.paths else imported(name)
+    if not isinstance(owner, type):
+        return fields
+    return {field: (_decoder_fields(value) if isinstance(value, Mapping) and "class" not in value
+                    and declared_type(owner, field) is CausalTransformer else value)
+            for field, value in fields.items()}
+
+
+def _decoder_fields(fields: Mapping[str, object]) -> dict[str, object]:
+    """A decoder's fields and its layer kinds' with an earlier YaRN field read as their rope scaling
+    (`_one_scaling`)."""
+    kinds = fields.get("kinds")
+    return {**_one_scaling(fields), **({"kinds": {
+        kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
+               else _one_scaling(held)) if isinstance(held, Mapping) else held
+        for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {})}
 
 
 def _one_scaling(fields: Mapping[str, object]) -> Mapping[str, object]:
