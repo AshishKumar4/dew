@@ -50,6 +50,7 @@ from dew.decision.layout import (
     Laid,
     Layout,
     MarkerLayout,
+    QuestionLayout,
     Specials,
     render,
     with_context,
@@ -741,7 +742,8 @@ class Decide(SavedRunTask):
         read = PackedRows(shape.length, compact, in_context)
         laid = [read.map(window) for window, _ in windows]
         batch = {name: np.stack([window[name] for window in laid]) for name in laid[0]}
-        inputs = laid_out(batch, bounds.segments, spans_in_context=in_context)
+        inputs = laid_out(batch, bounds.segments, spans_in_context=in_context,
+                          whole_blocks=whole_blocks_of(self.layout))
         padded = RowPlan(None, len(windows), shape.rows, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
         plan = RowPlan.over(mesh_of(held), shape.rows)
@@ -870,7 +872,8 @@ class Decide(SavedRunTask):
         scored = []
         segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context)
+            inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context,
+                              whole_blocks=whole_blocks_of(self.layout))
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -1259,11 +1262,12 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False
-             ) -> DecisionInputs:
+def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False,
+             whole_blocks: bool = False) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
     holding at most `max_segments` rows, the questions' spans in each row's context where
-    `spans_in_context` (`JointLayout.schema_in_context`)."""
+    `spans_in_context` (`JointLayout.schema_in_context`), each row's block the whole row where
+    `whole_blocks` (`whole_blocks_of`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -1278,7 +1282,12 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           context=given("context"), context_lengths=given("context_lengths"),
                           context_segments=given("context_segments"), question_rows=given("question_rows"),
                           blocks=given("blocks"), max_segments=max_segments,
-                          spans_in_context=spans_in_context)
+                          spans_in_context=spans_in_context, whole_blocks=whole_blocks and "blocks" in batch)
+
+
+def whole_blocks_of(layout: Layout) -> bool:
+    """Whether `layout`'s rows are each one block of the whole row (`QuestionLayout.split` 'whole')."""
+    return isinstance(layout, QuestionLayout) and layout.blocks and layout.split == "whole"
 
 
 def _restricted(question: Question, options: Sequence[str]) -> Choice:
