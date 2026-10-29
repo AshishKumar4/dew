@@ -327,7 +327,10 @@ def inputs(name: str, depends: list[str]) -> list[str]:
                 if path.startswith(("src/", "tools/")) and path.endswith(".py") and not path.startswith(HARNESS)
                 for parent in Path(path).parents
                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
-    return sorted({name, *depends, *packages})
+    # A build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
+    # (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files).
+    kept = (path for path in depends if not built(Path(path.removeprefix("probe:"))))
+    return sorted({name, *kept, *packages})
 
 
 @functools.cache
@@ -435,28 +438,41 @@ def reusable(python: str, names: list[str], common: str) -> set[str]:
         return set()
 
     def hit(name: str) -> bool:
-        for each in held:
-            found = recorded(record_key(python, row(python, name, ""), each, common), token)
-            if found is not None and fresh(found, name, common):
-                return True
-        return False
+        return green_record(python, name, "", common, token, held) is not None
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         return {name for name, found in zip(names, pool.map(hit, names), strict=True) if found}
 
 
+def green_record(python: str, name: str, split: str, common: str, token: str,
+                 classes: list[str]) -> dict | None:
+    """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
+    of `classes`, the first found; else None. The plan (`reusable`) and a task (`reused`) read it alike."""
+    for each in classes:
+        found = recorded(record_key(python, row(python, name, split), each, common), token)
+        if found is not None and fresh(found, name, common):
+            return found
+    return None
+
+
+def reused_classes(network: bool = False) -> list[str]:
+    """The classes whose green rows a task on this host reuses: every class the tasks are pinned to, where
+    this host's is one of them, as the plan counted a row green on any of them reusable (`reusable`), so the
+    task holding the files it kept reuses them wherever it lands; else this host's class alone."""
+    own, held = device_class(network), pinned_classes()
+    return held if own in held else [own]
+
+
 def reused(python: str, name: str, split: str, common: str, network: bool = False) -> dict | None:
-    """The green row of test file `name` (in `split`'s group) recorded on this host's class
-    (`device_class`), if it ran green there on exactly these inputs; else None. The record of the last
+    """The green row of test file `name` (in `split`'s group) recorded on a class this host reuses
+    (`reused_classes`), if it ran green there on exactly these inputs; else None. The record of the last
     run on these shared inputs decides: a key hashes them (`cache_key`), so no run on others, whose
     record the last run's may be, can be fresh here."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    found = recorded(record_key(python, row(python, name, split), device_class(network), common), token)
-    if found is None or not fresh(found, name, common):
-        return None
-    return found["row"]
+    found = green_record(python, name, split, common, token, reused_classes(network))
+    return None if found is None else found["row"]
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
@@ -831,7 +847,7 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), said."""
     rows = [found for name in tests if (found := reused(python, name, group, common, network))]
     if rows:
-        print(f"{len(rows)} files ran green on these inputs on {device_class(network)}; "
+        print(f"{len(rows)} files ran green on these inputs on {', '.join(reused_classes(network))}; "
               "their rows are reused")
     return rows
 

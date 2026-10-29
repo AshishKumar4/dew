@@ -1796,6 +1796,25 @@ def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recor
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
+def test_a_row_that_read_its_installs_metadata_is_reused_by_a_planner_without_it(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A run that read its editable install's metadata (setuptools' <name>.egg-info, which importlib.metadata
+    reads for a version, and which a task's environment writes into its checkout) keys no row on it: the
+    environment's build output is the locks' (`shared`), and a planner, whose checkout has none, reuses the
+    row (train 300: every record held src/dewml.egg-info's files, and its plan reused none of 501)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    metadata = tmp_path / "src/dewml.egg-info/PKG-INFO"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("Version: 1\n")
+    (tmp_path / "tests/test_a.py").write_text(
+        "from pathlib import Path\ndef test_a():\n"
+        "    assert Path('src/dewml.egg-info/PKG-INFO').read_text()\n"
+        "    with Path('runs-a').open('a') as runs: runs.write('x')\n")
+    armada_task(ci, monkeypatch, verdict)
+    shutil.rmtree(metadata.parent)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
 def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, monkeypatch, cache_worker):
     """The plan looks records up under the class .armada.json pins the tasks to, never its own host's: rows
     recorded on another class plan every file a task of its own, as before."""
@@ -1816,6 +1835,24 @@ def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
     armada_task(ci, monkeypatch, verdict)
     (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
+
+
+def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The files a plan keeps for reuse, their rows green on any class the tasks are pinned to, are reused by
+    the task that holds them on whichever pinned class it lands on, as the plan counted them: a task that
+    looked up its own class alone ran every kept file itself, in one task, past its deadline (2026-10-29: a
+    verdict's kept task of 182 files on 26/17 ran 76 of them into its 1680 s deadline, the rows green on
+    25/17)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17",
+                                        "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
+    monkeypatch.setattr(ci, "cpu_class", lambda: "AuthenticAMD-25-17")
+    rows = armada_task(ci, monkeypatch, verdict)
+    assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
 
 
 def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):

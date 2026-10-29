@@ -23,6 +23,7 @@ slots that end one before the row's last token.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Sequence
 from typing import Any, Literal
@@ -31,6 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from jax.sharding import Mesh
 from lm_eval import utils
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
@@ -38,6 +40,7 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
 from dew.batch import BLOCKS_FIELD
+from dew.distributed.placement import Layout, MeshSpec
 from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.interop.generation_config import source_decoding
 from dew.nn.inputs import ModelInputs, pad_token_rows
@@ -125,15 +128,19 @@ class DewLM(TemplateLM):
 
     @classmethod
     def from_run(cls, run: str, *, batch_size: int = 1, ema: bool | None = None,
-                 step: int | str | None = None, dtype: str | None = None,
+                 step: int | str | None = None, mesh: MeshSpec | Mesh | None = None,
+                 layout: Layout | None = None, dtype: str | None = None, param_dtype: str | None = None,
                  trust: Sequence[str] = ()) -> DewLM:
         """Load the run directory `run` as a harness model, the way `dew.pipeline` builds it.
 
         With `ema=None`, it uses the run's averaged weights when the run kept
-        them, and its live weights otherwise. `trust` is as `TextGeneration.from_run`
-        takes it.
+        them, and its live weights otherwise. `mesh`, `layout`, `dtype`, `param_dtype` and
+        `trust` are as `TextGeneration.from_run` takes them: a run sharded over a mesh, its
+        weights stored narrower. `--model_args` names the mesh by its axes' sizes,
+        `run=<directory>,fsdp=4,param_dtype=bfloat16` (`MeshSpec`'s fields).
         """
-        return cls(TextGeneration.from_run(run, ema=ema, step=step, dtype=dtype, trust=trust),
+        return cls(TextGeneration.from_run(run, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype,
+                                           param_dtype=param_dtype, trust=trust),
                    batch_size=batch_size)
 
     @classmethod
@@ -170,7 +177,11 @@ class DewLM(TemplateLM):
                 "--model dew evaluates a run directory; name it with "
                 "--model_args run=<directory>")
         batch = arguments.pop("batch_size", 1)
-        return cls.from_run(str(run), batch_size=int(batch), **dict(arguments))
+        # A mesh's fields are each a key of their own, as one arguments string cannot hold a record.
+        mesh = {field.name: arguments.pop(field.name) for field in dataclasses.fields(MeshSpec)
+                if field.name in arguments}
+        return cls.from_run(str(run), batch_size=int(batch), mesh=MeshSpec(**mesh) if mesh else None,
+                            **dict(arguments))
 
     @property
     def eot_token_id(self) -> int:
