@@ -23,7 +23,7 @@ import time
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from itertools import accumulate, pairwise
-from typing import TYPE_CHECKING, Generic
+from typing import TYPE_CHECKING, Generic, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -111,7 +111,7 @@ from dew.objectives.base import (
 from dew.optim import clips_qk, held_rates, learning_rate, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
+from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
     AxisLink,
@@ -156,14 +156,14 @@ from dew.training.distributed import (
 )
 from dew.training.evaluation import EvalSuite, Evaluation, Summary, admit_split
 from dew.training.footprint import candidate_footprint, traced_loss
-from dew.training.interval import Interval, Taken, TokenClock, held, throughput
+from dew.training.inspection import Inspection
+from dew.training.interval import Interval, Taken, TokenClock, held, logged_scalars
 from dew.training.memory import (
     climb_to,
     first_run,
     head_tile_of,
     local_devices,
     memory_record,
-    peak_memory_gib,
     recompute_record,
     refuse_wide_floats,
     rung_record,
@@ -173,7 +173,6 @@ from dew.training.memory import (
 from dew.training.model_flops import (
     TOKENS,
     TRAINING_FLOPS,
-    _TokenCount,
     batch_tokens,
     model_batch,
     prepare_counts,
@@ -220,12 +219,14 @@ StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
 the loss and the objective's report out."""
 
-CompiledStep = Callable[
-    [TrainState, Batch],
-    tuple[TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array, Committed | None]]
-"""A call returns the stepped state, the scalar loss, the objective's whole
-report (`Aux.metrics`), whether that loss was finite, and whether the
-step's microbatches were accepted, and the transaction's commit telemetry (None for a custom step)."""
+class CompiledStep(Protocol):
+    """A call returns the stepped state, the scalar loss, the objective's whole
+    report (`Aux.metrics`), whether that loss was finite, and whether the
+    step's microbatches were accepted, and the transaction's commit telemetry (None for a custom step);
+    `sampled`, the commit telemetry also summarizes what the run inspects (`Committed.inspected`)."""
+
+    def __call__(self, state: TrainState, batch: Batch, sampled: bool = False) -> tuple[
+            TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array, Committed | None]: ...
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
@@ -259,6 +260,7 @@ class Trainer(Generic[Loss, Effects]):
         tune_kernels: bool = False,
         record: bool = False,
         links: Mapping[str, Link] | None = None,
+        inspection: Inspection | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -283,6 +285,7 @@ class Trainer(Generic[Loss, Effects]):
         derived config. `record` makes each step return in its metrics what each evaluation, replays
         too, sampled or passed as a boundary (`taken_record`).
         `links` states an axis's `Link` by name in place of measuring it (`_links`).
+        `inspection` names what the run watches at its sampled steps (`dew.training.inspection`).
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -308,6 +311,23 @@ class Trainer(Generic[Loss, Effects]):
         self.records: list[Recorded] = []
         self.profile = profile
         self.lower_for, self._ahead, self.tune_kernels = lower_for, ahead, tune_kernels
+        self.inspection = inspection
+        self._fresh_compile_state(links)
+        # The microbatches a step's batch is read in, once decided (`split`,
+        # 1 where `whole`, a pooling state's window, or the first plan), which
+        # cut every batch the run reads (`_rows`, read off `fit`'s data).
+        self._split: int | None = 1 if whole is not None else split
+        self._rows: tuple[int, ...] | None = None
+        # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
+        self._ramp: tuple[Stage, ...] = ()
+        self._stage_starts: frozenset[int] = frozenset()
+        # The training batch's device steps, which the compiled step runs (`Loader.device`).
+        self._device: tuple[DeviceStep, ...] = ()
+        self._prefetch = PREFETCH_DEPTH
+
+    def _fresh_compile_state(self, links: Mapping[str, Link] | None) -> None:
+        """The state a trainer's compiles and reports start from: no step compiled, planned or validated,
+        the links `links` states, no rung taken or resumed, and its display."""
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The executable is the step as compiled, whose memory analysis a
         # benchmark reads; the program it was lowered from is released with its plan (`Planned.released`).
@@ -346,17 +366,6 @@ class Trainer(Generic[Loss, Effects]):
         self._shape_rungs: dict[str, JSON] = {}
         self._resumed_shapes: dict[str, JSON] = {}
         self._resumed_links: dict[str, float] = {}
-        # The microbatches a step's batch is read in, once decided (`split`,
-        # 1 where `whole`, a pooling state's window, or the first plan), which
-        # cut every batch the run reads (`_rows`, read off `fit`'s data).
-        self._split: int | None = 1 if whole is not None else split
-        self._rows: tuple[int, ...] | None = None
-        # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
-        self._ramp: tuple[Stage, ...] = ()
-        self._stage_starts: frozenset[int] = frozenset()
-        # The training batch's device steps, which the compiled step runs (`Loader.device`).
-        self._device: tuple[DeviceStep, ...] = ()
-        self._prefetch = PREFETCH_DEPTH
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -898,13 +907,16 @@ class Trainer(Generic[Loss, Effects]):
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
-    def _step_body(self, shapes, copies, split: int, fetch: Callable[[TrainState], TrainState] | None = None):
+    def _step_body(self, shapes, copies, split: int, fetch: Callable[[TrainState], TrainState] | None = None,
+                   sampled: bool = False):
         """The objective transaction over a step's batch read in `split` microbatches, which brings the
-        state's fields `fetch` brings to the device only once its gradient is ready, or a custom step
-        with no invented commit telemetry, which reads it whole."""
+        state's fields `fetch` brings to the device only once its gradient is ready, and, `sampled`,
+        summarizes what the run inspects at its commit; or a custom step with no invented commit
+        telemetry, which reads it whole."""
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
-                               split=split, record=self.record, fetch=fetch).step()
+                               split=split, record=self.record, fetch=fetch,
+                               inspection=self.inspection if sampled else None).step()
         custom = self.step(self.objective, self.optimizer)
 
         def run(current, batch, part, tokens):
@@ -944,9 +956,9 @@ class Trainer(Generic[Loss, Effects]):
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
         if self.host_master:
-            if self._ahead is not None:
-                raise ValueError("a step compiled ahead runs where the devices hold the state; this "
-                                 "layout keeps the variables on the host")
+            if self._ahead is not None or self.inspection is not None:
+                raise ValueError("a step compiled ahead or inspected runs where the devices hold the state; "
+                                 "this layout keeps the variables on the host")
             return self._compile_host(state, batch)
         planned = self._compiled_plan(state, batch, trials, capacity)
         return self._runner(planned.released(), self.device_mesh)
@@ -962,6 +974,7 @@ class Trainer(Generic[Loss, Effects]):
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule:
             planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity)
+            planned = planned.inspected(mesh)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
@@ -987,11 +1000,13 @@ class Trainer(Generic[Loss, Effects]):
         """The step `planned` compiled, which reads a batch in its microbatches."""
         # The program compiled above, not the jit: a call through the jit traces and compiles its own,
         # without the step's compiler options, which was 25 s of an A100's cold start.
-        split, candidate, executable = planned.split, planned.candidate, planned.executable
+        split, candidate = planned.split, planned.candidate
         parts = planned.parts(mesh)
         window = split * self.accumulation
 
-        def run(current, batch):
+        def run(current, batch, sampled: bool = False):
+            # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
+            executable = planned.sampled if sampled and planned.sampled is not None else planned.executable
             with self._traced_on(mesh):
                 # Each shape plans its copies (`_at_base_rung`), and a step reads the state with its own.
                 if not candidate.copies:
@@ -1107,8 +1122,11 @@ class Trainer(Generic[Loss, Effects]):
             lowered, launches = lower(), launches or "[]"
         footprint = None if self.step is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
+        sampled = None if self.inspection is None or self.step is not None else functools.partial(
+            self._jitted(shapes, copies, shardings, placement, replicated, split, sampled=True).lower,
+            *apart(prepared), batch, part)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
-                         lower.report(), footprint)
+                         lower.report(), footprint, sampled)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
                   narrow: bool | None = None):
@@ -1125,7 +1143,7 @@ class Trainer(Generic[Loss, Effects]):
         return shapes, copies, prepared
 
     def _jitted(self, shapes, copies: dict, shardings: Placement[TrainState], placement,
-                replicated: NamedSharding, split: int):
+                replicated: NamedSharding, split: int, sampled: bool = False):
         """The step over one of the `split` microbatches of a batch
         (`microbatch`), which counts the step at its last microbatch. It takes the state apart
         (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
@@ -1136,7 +1154,7 @@ class Trainer(Generic[Loss, Effects]):
         # from its start.
         late = () if self.step is not None else tuple(set(COMMIT_FIELDS) & set(self.layout.host))
         body = self._step_body(shapes, copies, split, (lambda state: self._fetched(state, shardings, late))
-                               if late else None)
+                               if late else None, sampled)
         moving, frozen = apart(shardings)
 
         def step(current, held, batch, part):
@@ -1230,7 +1248,8 @@ class Trainer(Generic[Loss, Effects]):
                                       record=self.record)
             body = transaction.step(realize=execution.realize, host=True)
 
-        def run(current, batch):
+        def run(current, batch, sampled: bool = False):
+            # A host-master run inspects nothing (`compile` refuses it), so no step of it is sampled.
             with self._traced_on(cpu):
                 batch = transfer(batch, batch_shardings(cpu, batch))
                 if self.accumulation > 1 and (current.accumulation is None or (
@@ -1466,7 +1485,9 @@ class Trainer(Generic[Loss, Effects]):
                     # reports that time apart from its steps'.
                     interval.compiling += time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted, committed = train_step(state, device)
+                    state, loss, aux, finite, accepted, committed = train_step(
+                        state, device, sampled=self.inspection is not None and self.inspection.samples(
+                            run.current + 1))
                 # Written off the loop, which never waits on it (row 2313).
                 self._read_taken(run, wait=False)
                 if self._unproven:
@@ -2301,47 +2322,14 @@ class Trainer(Generic[Loss, Effects]):
                 check()
 
     def _written(self, run: FitRun, taken: Taken) -> None:
-        """Read `taken` on the host, its losses checked, and report its interval on rank zero, on the run's
-        writer thread (`_read_taken`); every other rank has nothing to report.
-
-        Loss and objective aux metrics are the logged step's values. train/grad_norm is instead the mean
-        over admitted optimizer commits since the last log: bookkeep sums each window's native gradient
-        norm and its commit count on device, independently of the checkpoint loss sum. A tick with no
-        commit omits it. train/compiles counts this fit's StepCompiled records; persistent-cache counts
-        span all jitted programs in this process, as compilation_cache_counts describes. The optimizer
-        state supplies the last applied update's rate (`learning_rate`): a rejected attempt leaves it, and
-        an accumulation window moves it only when its update commits."""
+        """Read `taken` on the host, its losses checked, and report its interval's scalars
+        (`logged_scalars`) on rank zero, on the run's writer thread (`_read_taken`); every other rank has
+        nothing to report."""
         read, elapsed, run.writer.since = taken.read(self._display, run.writer.since)
         if jax.process_index() != 0:
             return
-        counts = taken.counts
-        # A work count a process refused (`_counted_batch`) is NaN here, and train/mfu absent.
-        work = None if read.training is None else float(read.training)
-        scalars = {"train/loss": float(read.loss),
-                   **{f"train/{k}": float(v) for k, v in read.aux.items()},
-                   **throughput(elapsed, counts.since_log, counts.samples, counts.flops,
-                                self.device_mesh.devices.size, waited=counts.waited,
-                                compiling=counts.compiling, training_flops=work,
-                                tokens=None if read.tokens is None else _TokenCount.host(read.tokens))}
-        scalars["train/accepted"] = float(read.accepted)
-        if read.committed is not None:
-            norms, commits = read.committed
-            if commits:
-                scalars['train/grad_norm'] = float(norms / commits)
-        scalars['train/compiles'] = float(counts.compiles)
-        scalars.update(compilation_cache_counts())
-        peak = peak_memory_gib()
-        if peak is not None:
-            scalars['train/peak_memory_gib'] = peak
-        if read.rate is not None:
-            scalars["train/learning_rate"] = float(read.rate)
-        if read.scale is not None:
-            scalars["train/loss_scale"] = float(read.scale)
-        if self.rollout is not None:
-            scalars["train/rollout_seconds"] = counts.rollout_seconds
-            scalars.update({f"rollout/{name}": float(value) for name, value in read.rollout.items()})
-        scalars.update(read.statistics)
-        scalars.update(self._startup.scalars())
+        scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
+                                    rollout=self.rollout is not None), **self._startup.scalars()}
         self._display.interval(taken.step, scalars)
         if self.tracker is not None:
             self.tracker.log(scalars, taken.step)

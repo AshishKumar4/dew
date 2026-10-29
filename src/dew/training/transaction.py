@@ -44,6 +44,7 @@ from dew.objectives.base import (
 )
 from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
+from dew.training.inspection import Inspection, summaries
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 
@@ -66,6 +67,9 @@ class Committed:
     norm: jax.Array
     count: jax.Array
     tokens: jax.Array
+    inspected: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
+    """A sampled step's summaries (`dew.training.inspection.summaries`), zero where it committed nothing;
+    none in a step that samples nothing."""
 
 
 def _chosen(take, taken, kept):
@@ -325,7 +329,8 @@ class Transaction:
     run; only where each phase executes differs.
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
-                 record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None):
+                 record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None,
+                 inspection: Inspection | None = None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -347,6 +352,8 @@ class Transaction:
         """
         self.fetch = fetch
         self.record = record
+        # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
+        self.inspection = inspection
         self.objective = objective
         self.optimizer = optimizer
         self.copies = copies or {}
@@ -555,14 +562,18 @@ class Transaction:
                 averaged = _chosen(self.objective.averages(current.updates),
                                    ema_update(averaged, params, self.objective.ema.decay(current.updates)),
                                    averaged)
+            inspected = {} if self.inspection is None else summaries(
+                self.inspection, stored, native, update, params["params"])
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=current.updates + 1)
+                                       updates=current.updates + 1), inspected
 
         if current.scale is None:
-            return apply(current), native_finite, norm
+            return *apply(current), native_finite, norm
         if self.size == 1:
-            return _chosen(native_finite, apply(current), current), native_finite, norm
-        return _only_when(native_finite, apply, lambda x: x, current), native_finite, norm
+            applied, inspected = apply(current)
+            return _chosen(native_finite, applied, current), inspected, native_finite, norm
+        unapplied = jax.tree.map(jnp.zeros_like, jax.eval_shape(apply, current)[1])
+        return *_only_when(native_finite, apply, lambda x: (x, unapplied), current), native_finite, norm
 
     def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens):
         """Commit the window when it is due, then advance the state's clocks.
@@ -601,10 +612,10 @@ class Transaction:
         def recopied(current):
             # A window of several microbatches reads one set of copies
             # throughout and rewrites them only as it commits.
-            committed, native_finite, norm = commit(current)
+            committed, inspected, native_finite, norm = commit(current)
             if committed.compute is not None:
                 committed = dataclasses.replace(committed, compute=narrowed(committed.variables, self.copies))
-            return committed, native_finite, norm
+            return committed, inspected, native_finite, norm
 
         due = pending.due & pending.active & accepted
         # The microbatch's real tokens (`tokens`, two uint32 words), which its window's commit trains on,
@@ -612,16 +623,17 @@ class Transaction:
         read = tokens
         held = read if previous is None or previous.tokens is None else _TokenCount.add(previous.tokens, read)
         if self.size == 1:
-            committed, native_finite, norm = commit(numerical)
+            committed, inspected, native_finite, norm = commit(numerical)
             numerical = _chosen(due, committed, numerical)
             native_finite = native_finite | ~due
         else:
             dtype = jnp.result_type(*jax.tree.leaves(state.variables["params"]), jnp.float32)
             zero = jnp.real(jnp.zeros((), dtype))
+            uncommitted = jax.tree.map(jnp.zeros_like, jax.eval_shape(recopied, numerical)[1])
             # The window goes round the commit, which never reads it: a
             # conditional copies what it passes through.
-            numerical, native_finite, norm = _only_when(
-                due, recopied, lambda x: (x, jnp.asarray(a=True), zero),
+            numerical, inspected, native_finite, norm = _only_when(
+                due, recopied, lambda x: (x, uncommitted, jnp.asarray(a=True), zero),
                 dataclasses.replace(numerical, accumulation=None))
             numerical = dataclasses.replace(numerical, accumulation=previous)
         finite = finite & native_finite
@@ -668,8 +680,10 @@ class Transaction:
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
         counted = due & accepted
-        return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
-                                              jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)))
+        return advanced, loss, aux, Committed(
+            jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
+            jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)),
+            {name: jnp.where(counted, value, 0.) for name, value in inspected.items()})
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.

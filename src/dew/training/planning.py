@@ -127,6 +127,9 @@ class Candidate:
     kernels: KernelReport
     footprint: Footprint | None
     """Its derived device footprint; None for a custom step not differentiating the objective."""
+    sampled: Callable[[], jax.stages.Lowered] | None = None
+    """The same step summarizing what the run inspects at its commit, lowered on call
+    (`dew.training.inspection`); None in a run that inspects nothing."""
 
     @property
     def lowered(self) -> jax.stages.Lowered:
@@ -290,6 +293,9 @@ class Planned:
     tile: tuple[int, int] | None
     fused: bool
     profiled: tuple[int, int] | None = None
+    sampled: jax.stages.Compiled | None = None
+    """The step that also summarizes what the run inspects (`Candidate.sampled`), compiled under the
+    plan's options and held to its fit check (`inspected`); None in a run that inspects nothing."""
 
     def record(self) -> dict[str, JSON]:
         record: dict[str, JSON] = {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
@@ -319,6 +325,20 @@ class Planned:
                                "bytes more than its tightest device has, where unguided it fits; train it "
                                "without AutoPGLE")
         return dataclasses.replace(self, executable=executable, profiled=(runs, len(profile)))
+
+    def inspected(self, mesh: Mesh) -> Planned:
+        """This plan with its sampled step compiled beside its own (`Candidate.sampled`), under the options
+        its executable compiled under and held to the fit check the plan passed: summaries that keep more
+        alive at once than fits are refused, rather than met at the first sampled step."""
+        if self.candidate.sampled is None:
+            return self
+        executable = self.candidate.sampled().compile(self.options)
+        fit, headroom = step_fits(executable, mesh, self.candidate.held)
+        if not fit:
+            raise RuntimeError(f"the step that summarizes what the run inspects needs {-(headroom or 0)} "
+                               "bytes more than its tightest device has, where the step alone fits; inspect "
+                               "fewer parameters (`Inspection.paths`)")
+        return dataclasses.replace(self, sampled=executable)
 
     def released(self) -> Planned:
         """This plan as the run keeps it once admitted: its executable without the program it was lowered

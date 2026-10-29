@@ -27,8 +27,14 @@ from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
 from dew.state import Accumulation
-from dew.telemetry.instrumentation import NO_FLOPS, StepFlops, model_flops_utilization
+from dew.telemetry.instrumentation import (
+    NO_FLOPS,
+    StepFlops,
+    compilation_cache_counts,
+    model_flops_utilization,
+)
 from dew.training.display import TrainingDisplay
+from dew.training.inspection import logged
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
 from dew.training.transaction import Committed
 
@@ -142,6 +148,8 @@ class Interval:
     waited: float = 0.0
     compiling: float = 0.0
     compiles: int = 0
+    inspected: tuple[jax.Array, Mapping[str, jax.Array]] | None = None
+    """The latest sampled commit's count and summaries since the last log (`Committed.inspected`)."""
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
               committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
@@ -159,6 +167,8 @@ class Interval:
         # A run's tokens are its committed updates' (`Committed.tokens`); a step of one's own
         # (`Trainer(step=)`), which reports no commit, is its own update.
         tokens = aux.get(TOKENS, self.fresh.tokens) if committed is None else committed.tokens
+        if committed is not None and committed.inspected:
+            self.inspected = (committed.count, committed.inspected)
         self.book = bookkeep(self.book, loss, finite, committed,
                              aux.get(TRAINING_FLOPS, self.fresh.training), tokens)
 
@@ -219,7 +229,8 @@ class Interval:
         reading = Reading(loss, aux, accepted, streak, rate, scale, rollout,
                           None if book is None else (book.norms, book.commits),
                           book.training if self.model_counted and book is not None else None,
-                          book.tokens if self.tokens_counted and book is not None else None, statistics)
+                          book.tokens if self.tokens_counted and book is not None else None, statistics,
+                          self.inspected)
         # The copies to the host begin now, so the log's read waits on nothing but the step itself.
         for leaf in jax.tree.leaves(reading):
             if isinstance(leaf, jax.Array):
@@ -232,6 +243,7 @@ class Interval:
         self.since_log, self.samples = 0, 0
         self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
         self.model_counted = self.tokens_counted = False
+        self.inspected = None
         if book is not None and self.fresh is not None:
             self.book = book._replace(training=self.fresh.training, tokens=self.fresh.tokens,
                                       norms=self.fresh.norms, commits=self.fresh.commits)
@@ -328,6 +340,8 @@ class Reading(NamedTuple):
     training: Number | None
     tokens: Number | None
     statistics: Mapping[str, float]
+    inspected: tuple[Number, Mapping[str, Number]] | None = None
+    """The latest sampled commit since the last log, its commit count and summaries, or None."""
 
 
 class Taken(NamedTuple):
@@ -370,6 +384,49 @@ class Taken(NamedTuple):
         if read.streak is not None:
             checked_streak(int(read.streak), self.step, display)
         return read, done - (self.counts.last_log_time if since is None else since), done
+
+
+def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int, *,
+                   rollout: bool) -> dict[str, float]:
+    """One logging interval's scalars, as a run logs them, from its reading on the host.
+
+    Loss and objective aux metrics are the logged step's values. train/grad_norm is instead the mean
+    over admitted optimizer commits since the last log: bookkeep sums each window's native gradient
+    norm and its commit count on device, independently of the checkpoint loss sum. A tick with no
+    commit omits it. train/compiles counts this fit's StepCompiled records; persistent-cache counts
+    span all jitted programs in this process, as compilation_cache_counts describes. The optimizer
+    state supplies the last applied update's rate (`learning_rate`): a rejected attempt leaves it, and
+    an accumulation window moves it only when its update commits. The latest sampled commit's
+    summaries go under `inspect/` (`dew.training.inspection`), where one committed."""
+    from dew.training.memory import peak_memory_gib
+
+    # A work count a process refused (`_counted_batch`) is NaN here, and train/mfu absent.
+    work = None if read.training is None else float(read.training)
+    scalars = {"train/loss": float(read.loss), **{f"train/{k}": float(v) for k, v in read.aux.items()},
+               **throughput(elapsed, counts.since_log, counts.samples, counts.flops, devices,
+                            waited=counts.waited, compiling=counts.compiling, training_flops=work,
+                            tokens=None if read.tokens is None else _TokenCount.host(read.tokens))}
+    scalars["train/accepted"] = float(read.accepted)
+    if read.committed is not None:
+        norms, commits = read.committed
+        if commits:
+            scalars['train/grad_norm'] = float(norms / commits)
+    scalars['train/compiles'] = float(counts.compiles)
+    scalars.update(compilation_cache_counts())
+    peak = peak_memory_gib()
+    if peak is not None:
+        scalars['train/peak_memory_gib'] = peak
+    if read.rate is not None:
+        scalars["train/learning_rate"] = float(read.rate)
+    if read.scale is not None:
+        scalars["train/loss_scale"] = float(read.scale)
+    if rollout:
+        scalars["train/rollout_seconds"] = counts.rollout_seconds
+        scalars.update({f"rollout/{name}": float(value) for name, value in read.rollout.items()})
+    if read.inspected is not None and int(read.inspected[0]):
+        scalars.update(logged(read.inspected[1]))
+    scalars.update(read.statistics)
+    return scalars
 
 
 class LogWriter:

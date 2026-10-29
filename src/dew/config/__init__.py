@@ -83,6 +83,7 @@ from dew.training.budget import Pause, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
+from dew.training.inspection import Inspection
 from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
@@ -536,6 +537,10 @@ class TrainerConfig:
     program, on a host of the topology it was compiled for; another program, from another config,
     data shape, Dew or a plan recorded for another rung, is refused before the run trains.
     """
+    inspection: Annotated[Inspection, tyro.conf.subcommand("inspect")] | None = None
+    """What the run watches at its sampled steps (`dew.training.inspection.Inspection`): parameter paths by
+    glob, the trees summarized there and every how many steps, `--trainer.inspection.paths '*norm*'
+    --trainer.inspection.every 100`; unset, the step compiles unchanged."""
     tune_kernels: bool = False
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
@@ -944,6 +949,7 @@ class RunConfig:
     """
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
+                                                   "trainer.inspection": "inspect",
                                                    "trainer.cooldowns": "cooldowns",
                                                    "trainer.compile-ahead": "ahead"}
     """The optional settings `cli` turns on by their own flags, each with the
@@ -1557,6 +1563,7 @@ class RunConfig:
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
             layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
             dynamic_scale=trainer.dynamic_scale, rollout=rollout, tune_kernels=trainer.tune_kernels,
+            inspection=trainer.inspection,
             **resources)
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,

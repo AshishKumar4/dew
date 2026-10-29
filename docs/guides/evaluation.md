@@ -118,6 +118,10 @@ full logits tensor is kept. The unprefixed name `accuracy` is reported as
 
 The trainer calls `Objective.preview` once per evaluation event, and only if you passed `fit(preview=True)`, process zero has a tracker, and there is a coordinated batch. A tracker that only takes scalars does not turn previews on. LM previews use the objective's `Samples` configuration. Diffusion draws at most four display samples. Masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference. The base `preview` reuses the first scoring artifacts, so JEPA's representation histogram needs no second encoder pass. Preview samples never enter the scoring metrics. Evaluation skips the scoring work when there are no metrics, and skips the preview work when there is no tracker.
 
+## Inspecting parameters, gradients and updates
+
+`Trainer(inspection=Inspection(paths=("*attn*",), every=100))` summarizes, at every hundredth step, each parameter whose path a glob selects: the parameters the update applies to, the gradient the optimizer is handed (unscaled, before its own transforms such as clipping), the optimizer's update and the parameters' actual change, each by its mean, root mean square, largest magnitude, non-finite count and zero fraction, beside each tree's L2 norm and the update-to-weight ratio. The summaries are reduced inside the step, over the global arrays, and logged under `inspect/` with the next log, off the step loop. A run that inspects nothing compiles its step unchanged; one that does compiles a second, sampled step beside it, held to the same memory check. A recorded run names it with `--trainer.inspection.paths` and `--trainer.inspection.every`, and `dew.training.inspected(trainer, batch)` gives the same view of a loaded run on one batch.
+
 ## Trackers
 
 Diagnostic messages go to a logger, separately from the scalar and record trackers. Dew logs
