@@ -12,6 +12,10 @@ tools/armada/install.sh, whose key holds every pin, or by hand), and the tests r
 awaiting its revision, with the store's catalog of every file it has held and the card made from it,
 reads each file back anonymously at that commit and checks it before the pin takes the revision.
 `check` is check.sh's rule: no recording over IN_GIT in git, and every pin whole and uploaded.
+A release's own file a test reads offline (a remote-code release's modeling code, its config) is the
+store's second kind (`RELEASE`, `pin_release`): kept whole whatever its size, under
+releases/<sha256>/<its name>, its pin naming the release and its license, read and checked by sha256
+as a recording is and held to none of the recordings' rules.
 
 Usage, from the checkout:
   python tools/fetched_fixtures.py fetch
@@ -41,6 +45,9 @@ LOCAL = "tests/fixtures/fetched"
 PINNED = ".fetched.json"
 CATALOG = "catalog.json"
 FIELDS = ("repo", "revision", "path", "sha256", "bytes", "reference", "license")
+RELEASE = "release"
+"""The `kind` of a pin that holds a release's own file (`pin_release`); a pin without one is a
+recording's."""
 REDRAWN = ".redraw.npy"
 """The member every recording holds (record_case's `<site>.redraw`, which `indexed_recording` reads),
 which marks an NPZ as one."""
@@ -75,7 +82,36 @@ def digest(data: bytes) -> str:
 
 
 def _stored(pin: dict, root: Path) -> Path:
+    if pin.get("kind") == RELEASE:
+        return root / LOCAL / pin["path"]
     return root / LOCAL / f"{pin['sha256']}.npz"
+
+
+def _store_path(pin: dict) -> str:
+    """Where the store keeps a pin's file: a recording's under its sha256, a release file's under its
+    sha256 and its own name (`pin_release`)."""
+    if pin.get("kind") == RELEASE:
+        return f"releases/{pin['sha256']}/{Path(pin['path']).name}"
+    return f"recordings/{pin['sha256']}.npz"
+
+
+def pin_release(path, data: bytes, *, reference: str, license: str, root: Path = REPO_ROOT) -> Path:
+    """Keep `data`, a release's own file, in the local store whole, pinned at `path` under
+    tests/fixtures/ with no revision until `upload`: by its sha256 and its own name, the release it
+    is from (`reference`, its repo, commit and file) and that release's `license`. Returns the stored
+    file, which `local(path)` reads."""
+    name = fixture(path, root)
+    if name is None:
+        raise ValueError(f"{path}: a release file is pinned under {FIXTURES}/")
+    sha = digest(data)
+    pin = {"repo": STORE, "revision": None, "path": f"releases/{sha}/{Path(name).name}", "sha256": sha,
+           "bytes": len(data), "reference": reference, "license": license, "kind": RELEASE}
+    stored = _stored(pin, root)
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_bytes(data)
+    (root / name).parent.mkdir(parents=True, exist_ok=True)
+    _pinned(name, pin, root)
+    return stored
 
 
 def _checked(data: bytes, pin: dict, name: str) -> bytes:
@@ -154,7 +190,8 @@ def fetch(root: Path = REPO_ROOT) -> None:
 def card(catalog: dict[str, dict]) -> str:
     """The store's card: what it holds, each file's fixture, size, reference and that reference's
     license, from its catalog."""
-    rows = "\n".join(f"| `{entry['fixture']}` | `recordings/{sha}.npz` | {entry['bytes']:,} | "
+    rows = "\n".join(f"| `{entry['fixture']}` | `{entry.get('path', f'recordings/{sha}.npz')}` | "
+                     f"{entry['bytes']:,} | "
                      f"{entry['reference']} | {entry['license']} |"
                      for sha, entry in sorted(catalog.items(), key=lambda item: item[1]["fixture"]))
     return ("---\nlicense: other\n---\n\n# Dew's recorded test fixtures\n\n"
@@ -186,7 +223,9 @@ def upload(root: Path = REPO_ROOT) -> None:
     except (EntryNotFoundError, RepositoryNotFoundError):
         catalog = {}
     catalog.update({pin["sha256"]: {"fixture": name, "bytes": pin["bytes"], "reference": pin["reference"],
-                                    "license": pin["license"]} for name, pin in due.items()})
+                                    "license": pin["license"],
+                                    **({"kind": RELEASE, "path": pin["path"]} if pin.get("kind") == RELEASE
+                                       else {})} for name, pin in due.items()})
     operations = [CommitOperationAdd(pin["path"], _checked(_stored(pin, root).read_bytes(), pin, name))
                   for name, pin in sorted(due.items())]
     listing = json.dumps(catalog, indent=1, sort_keys=True) + "\n"
@@ -226,13 +265,13 @@ def check(root: Path = REPO_ROOT) -> list[str]:
             problems.append(f"{name}: its pin holds no {', '.join(missing)}"
                             + (" (its upload is due)" if "revision" in missing else ""))
             continue
-        if not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"]) or (
-                pin["path"] != f"recordings/{pin['sha256']}.npz"):
+        if not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"]) or pin["path"] != _store_path(pin) or (
+                pin.get("kind") not in (None, RELEASE)):
             problems.append(f"{name}: its pin's sha256 {pin['sha256']!r} or path {pin['path']!r} is not "
                             f"of the store's form")
         if not re.fullmatch(r"[0-9a-f]{40}", pin["revision"]):
             problems.append(f"{name}: its pin's revision {pin['revision']!r} is not a commit")
-        if pin["bytes"] <= IN_GIT:
+        if pin["bytes"] <= IN_GIT and pin.get("kind") != RELEASE:
             problems.append(f"{name}: {pin['bytes']:,} bytes, at most {IN_GIT:,}, belongs in git")
         if name in tracked:
             problems.append(f"{name}: pinned and tracked by git alike")

@@ -38,3 +38,29 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
     forward = remote_code_site(source, site)
     assert_as_exact(lambda index, inputs: forward(inputs), reference, drawn, label, seeds=seeds,
                     truth_fn=truth)
+
+
+OPENED = {"lfm3-tiny": "transformers==5.18.0", "lfm3-biased-tiny": "transformers==5.18.0"}
+"""Each fixture whose Dew export carries its release's code (`DecoderFamily.release_code`), by the
+transformers its release's code runs under, which the whole suite's run overlays on the suite's own for
+its check alone (`release_env`)."""
+
+
+@pytest.mark.parametrize("name", [pytest.param(name, marks=pytest.mark.release_env(requirement))
+                                  for name, requirement in OPENED.items()])
+def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name, tmp_path):
+    """A Dew export of the fixture (`PretrainedDecoder.from_model(...).save`) opens offline through the
+    release's own transformers loader, under the transformers its code needs, as the release itself opens:
+    the same class, every weight matched, the same state tensor for tensor and the same logits bit for
+    bit over the fixture's ids (`remote_code_reference.opens`, the release's files vendored into the
+    fetched store; ledgers 2038, 2173)."""
+    from tool_support import load
+
+    from dew.interop import PretrainedDecoder
+
+    loaded = Pretrained.load(FIXTURES / name)
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "export")
+    (tmp_path / "scratch").mkdir()
+    checks = load("remote_code_reference").opens(name, tmp_path / "export", tmp_path / "scratch")
+    assert all(checks.values()), checks
+

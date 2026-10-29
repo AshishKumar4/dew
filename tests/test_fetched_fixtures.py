@@ -189,3 +189,28 @@ def test_upload_pins_a_revision_only_once_each_file_reads_back_anonymously_as_it
     # The catalog keeps every file the store has held, so the card names each one's source.
     assert set(json.loads(commits[-1][store.CATALOG].path_or_fileobj)) == {"0" * 64, pin["sha256"]}
     assert store.check(root) == []
+
+
+def test_a_release_file_is_pinned_whole_read_by_its_sha_and_leaves_recordings_as_they_were(store, tmp_path):
+    """A release's own file (`pin_release`) is kept whole in the store under its sha256 and its own name,
+    whatever its size, pinned with its release and license; read back as its pin's bytes, refused once
+    a bit flips, and checked to none of the recordings' rules (a small one is not sent back to git).
+    Beside it a recording pins, reads and checks exactly as before (ledger 2173)."""
+    root = _checkout(tmp_path)
+    recording = _saved(store, root)
+    before = dict(store.pins(root)[LARGE])
+    name, code = "tests/fixtures/hf/site/release/modeling_site.py", b"class Site:\n    pass\n"
+    stored = store.pin_release(name, code, reference="org/site@abc/modeling_site.py", license="apache-2.0",
+                               root=root)
+    pin = store.pins(root)[name]
+    held = f"releases/{pin['sha256']}/modeling_site.py"
+    assert (pin["kind"], pin["path"], pin["bytes"]) == ("release", held, len(code))
+    assert stored == root / store.LOCAL / pin["path"] and store.local(name, root) == stored
+    assert stored.read_bytes() == code
+    assert store.pins(root)[LARGE] == before and store.local(LARGE, root) == recording
+    _uploaded(store, root)
+    assert store.check(root) == []
+    stored.write_bytes(_flipped(code))
+    with pytest.raises(AssertionError):
+        store.local(name, root)
+
