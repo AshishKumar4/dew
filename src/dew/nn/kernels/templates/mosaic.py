@@ -777,6 +777,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         layout = self.layout if len(shape) == 2 else self.row
         return plgpu.layout_cast(jnp.full(shape, value, dtype), layout)
 
+    def column_full(self, columns: int, value: float) -> jax.Array:
+        """`value` fp32 in a column's layout, `[columns]`: a tile's per-column state where its rows are its
+        keys (a keys-first walk's maxima and denominators)."""
+        return plgpu.layout_cast(jnp.full((columns,), value, jnp.float32), self.column)
+
     def iota(self, shape: tuple[int, ...], dimension: int) -> jax.Array:
         """Indices along `dimension` of a tile in the accumulator's layout or a row's (`zeros`)."""
         layout = self.layout if len(shape) == 2 else self.row
