@@ -85,8 +85,8 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
         balance: ExpertBalance | None = None,
         ema_decay: float | None = 0.999,
-        solver: Unmask | Confident | Omitted = OMITTED,
-        steps: int | Omitted = OMITTED,
+        solver: Unmask | Confident | None = None,
+        steps: int | None = None,
         block: int | None | Omitted = OMITTED,
         samples: int = 4,
         decode: Callable[[Sequence[int]], str] | None = None,
@@ -101,11 +101,11 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         attend both ways (`TokenModel` with `causal` False), as
         `CausalTransformer(causal=False)`'s do. `solver`, `steps` and `block`
         set how generation unmasks in the task `pipeline` returns, and `solver`
-        and `steps` how the preview does, which walks whole rows; omitted, they
-        are a loaded source's own walk where its family declares one
-        (`masked_recipe`, LLaDA2.0's blocks), else `Unmask` over MDLM's steps
-        and the whole response. `samples` is how many rows the preview
-        draws. `decode` turns a row of ids into the text the artifact shows;
+        and `steps` how the preview does, which walks whole rows; None for
+        `solver` or `steps` and an omitted `block` take a loaded source's own
+        walk where its family declares one (`masked_recipe`, LLaDA2.0's
+        blocks), else `Unmask` over MDLM's steps and the whole response.
+        `samples` is how many rows the preview draws. `decode` turns a row of ids into the text the artifact shows;
         with None, the artifact shows the ids alone.
 
         `model` may be a loaded source, such as a released LLaDA or Dream
@@ -116,8 +116,8 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         # The source's own walk, where its family declares one, for what the caller omits.
         recipe = model.masked_recipe if isinstance(model, Walking) else None
         own_solver, own_steps, own_block = (_DEFAULT_SOLVER, MDLM_STEPS, None) if recipe is None else recipe
-        solver = own_solver if solver is OMITTED else solver
-        steps = own_steps if steps is OMITTED else steps
+        solver = own_solver if solver is None else solver
+        steps = own_steps if steps is None else steps
         block = own_block if block is OMITTED else block
         model = self.bind_model(model, variables=variables, processor=processor)
         if not isinstance(model, TokenModel) or model.causal:

@@ -321,9 +321,11 @@ def _llada2_walk(config: Mapping[str, object]) -> MaskedWalk | None:
     """LLaDA2's own generation, where Dew runs it: 2.0's `generate` walks blocks of 32 over 32 steps
     each at temperature 0, revealing past 0.95 (modeling_llada2_moe.py:1233-1247 at dad945c). 2.1's
     configs read as 2.0's and take the same walk, without the release's editing of revealed tokens,
-    which Dew does not run; 2.2's (its DELETE and SPLIT ids) generates with editing past another
-    threshold, and unmasks the whole response with Dew's MDLM instead."""
-    if config.get("delete_token_id") is not None or config.get("split_token_id") is not None:
+    which Dew does not run; 2.2's generates with editing past another threshold, and unmasks the whole
+    response with Dew's MDLM instead: a 2.2 config names its DELETE and SPLIT ids, or, as Dew's own
+    export writes it, its block routing (`block_size`, `expert_capacity`)."""
+    if any(config.get(field) is not None
+           for field in ("delete_token_id", "split_token_id", "block_size", "expert_capacity")):
         return None
     return MaskedWalk(block=32, steps=32, threshold=0.95, temperature=0.0)
 

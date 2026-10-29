@@ -153,6 +153,15 @@ def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
 
     source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="xla")
     solver, steps, block = source.masked_recipe
+    # LLaDA2.2 generates with an editing stage Dew does not run: its source, and a config Dew's export
+    # writes for it (its block routing, no DELETE or SPLIT ids), take MDLM.
+    from dew.interop.hf_decoders import family_entry
+
+    assert Pretrained.load(FIXTURES / "llada22-tiny").masked_recipe is None
+    exported = {**json.loads((FIXTURES / "llada22-tiny" / "config.json").read_text())}
+    for field in ("delete_token_id", "split_token_id"):
+        exported.pop(field)
+    assert family_entry("llada2_moe").masked_walk(exported) is None
     assert isinstance(pipeline(str(FIXTURES / "llada2-tiny")).solver, Confident)
     objective = MaskedDiffusionObjective(source, MDLM(mask_id=source.model.mask_token_id)(), 8,
                                          ema_decay=None, processor=RunProcessor(ByteTokenizer()))
