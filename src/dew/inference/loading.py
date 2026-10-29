@@ -25,6 +25,7 @@ from jax.typing import DTypeLike
 from dew.batch import Variables
 from dew.cache import persist_compilations
 from dew.checkpoints import PYTHON_RUN, RUN_FILE
+from dew.config import SourceOptions
 from dew.data.text import Tokenizer
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -49,6 +50,7 @@ def pipeline(
     step: int | str | None = None,
     revision: str | None = None,
     trust: Sequence[str] = (),
+    options: SourceOptions | None = None,
 ) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask:
     """Load the inference task for `source`, with its weights placed once.
 
@@ -69,7 +71,11 @@ def pipeline(
     selects a run's checkpoint and `revision` pins a Hub source; passing
     `revision` for a run directory or `step` for a source raises
     `ValueError`. `trust` names the packages outside Dew a run's record may
-    import, as `trust_remote_code` does in transformers.
+    import, as `trust_remote_code` does in transformers. `options` selects
+    what a source builds, as a run's `--source` options do (`SourceOptions`:
+    a wrapper's language model alone, the prediction depths kept, each layer
+    kind's attention); a run's record selects its own, so passing them for a
+    run directory raises `ValueError`.
 
     Loading a task also points XLA at the on-disk executable cache, unless a
     cache directory is already set, so a restarted process reuses what it
@@ -98,13 +104,16 @@ def pipeline(
     if root.is_dir() and (root / RUN_FILE).is_file():
         if revision is not None:
             raise ValueError("revision pins a Hub source; a run directory has checkpoints, selected by step")
+        if options is not None and options != SourceOptions():
+            raise ValueError("source options select what a source builds; a run's record selects its own "
+                             "model")
         return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
                          param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step,
                          trust=trust)
     if step is not None:
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
-                        revision=revision)
+                        revision=revision, options=SourceOptions() if options is None else options)
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
@@ -124,17 +133,19 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
-                 revision: str | None) -> SavedTask:
+                 revision: str | None, options: SourceOptions) -> SavedTask:
     from dew.distributed.placement import MeshSpec as DefaultMesh
     from dew.inference.projections import packed_owned
     from dew.interop import Pretrained, PretrainedPipeline
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
-    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
+    # What the source builds, as a run's source loads it (`SourceOptions.keywords`).
+    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
+                              **options.keywords())
               if dtype is None else
               Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
-                              layout=layout))
+                              layout=layout, **options.keywords()))
     if not isinstance(loaded, PretrainedPipeline):
         # The task owns the weights it loaded: their projections pack once, where they were placed.
         # (Public bundle.pipeline borrows weights; packing here may relinquish the unpacked device

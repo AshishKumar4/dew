@@ -1,0 +1,10 @@
+{
+ "bytes": 9263,
+ "kind": "release",
+ "license": "mit",
+ "path": "releases/a9dc00e2a0c2c172efd198f42e81e41c95472021b57c65366c06587d44038b62/config.json",
+ "reference": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD@6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8/config.json",
+ "repo": "dewml/fixtures",
+ "revision": "71b13b83a7424822681d2b8e3836ada21619b05d",
+ "sha256": "a9dc00e2a0c2c172efd198f42e81e41c95472021b57c65366c06587d44038b62"
+}

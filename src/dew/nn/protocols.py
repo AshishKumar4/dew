@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
-    from dew.nn.cross_attention import CrossAttention
+    from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dit import TextContext
     from dew.nn.dspark import DSpark
     from dew.nn.hyper_connections import HyperConnections
@@ -603,7 +603,7 @@ class CrossAttending(Protocol):
     """A decoder whose layers can read a conditioning sequence through gated
     cross-attention (`dew.nn.cross_attention`): CausalTransformer answers this."""
 
-    cross_attention: CrossAttention | None
+    cross_attention: CrossBlocks | None
 
     @property
     def context_width(self) -> int:
@@ -620,12 +620,16 @@ class CrossAttending(Protocol):
         of `context_lengths` tokens."""
         ...
 
+    def held_cross_flops(self, lengths, context_lengths) -> float:
+        """The part of `cross_flops` done by the decoder's own matrices, which train as its trunk does."""
+        ...
+
     def token_embeddings(self, tokens: jax.Array) -> jax.Array:
         """Each token's row of the model's own table, unscaled and without positions: a context's
         tokens as a cross-attention reads them by the table (`dew.nn.cross_attention.encode_context`)."""
         ...
 
-    def with_cross_attention(self, cross: CrossAttention | None) -> Self: ...
+    def with_cross_attention(self, cross: CrossBlocks | None) -> Self: ...
 
 
 @runtime_checkable

@@ -84,7 +84,7 @@ if TYPE_CHECKING:
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.attention import AttentionImpl
-    from dew.nn.cross_attention import CrossAttention
+    from dew.nn.cross_attention import CrossBlocks
 
 
 
@@ -512,7 +512,7 @@ class Pretrained:
                              base=None if self.origin is None else AdapterBase(self.origin, self.revision))
         return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
-    def with_cross_attention(self, cross: CrossAttention, *, key: int | jax.Array,
+    def with_cross_attention(self, cross: CrossBlocks, *, key: int | jax.Array,
                              frozen: bool = True) -> Self:
         """Return this source with gated cross-attention before the layers `cross` names, each
         block drawn from `key` (`dew.nn.cross_attention`).

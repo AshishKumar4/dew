@@ -243,18 +243,16 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
             "model trained on plain next-token prediction")
 
 def _cross_attention(model: CausalTransformer):
-    """Raise `ValueError` where `cross_attention` names a layer this model lacks, or a layer
-    with no feed-forward width to take."""
+    """Raise `ValueError` where `cross_attention` names a layer this model lacks, or one whose block
+    it cannot build (`CrossBlocks.block`)."""
     cross = model.cross_attention
     if cross is None:
         return
     outside = sorted(set(cross.layer_ids) - set(range(model.num_layers)))
     if outside:
         raise ValueError(f"cross-attention layers {outside} are outside the {model.num_layers} layers")
-    unsized = sorted(index for index in cross.layer_ids if not model.mlp_widths[index])
-    if cross.intermediate_size is None and unsized:
-        raise ValueError(f"layers {unsized} have no feed-forward whose width the cross-attention "
-                         "block takes; name its intermediate_size")
+    for index in cross.layer_ids:
+        cross.block(model, index)
 
 def _streams(model: CausalTransformer):
     """Raise `ValueError` for settings on mHC's residual streams that cannot be

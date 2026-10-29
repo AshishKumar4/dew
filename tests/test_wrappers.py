@@ -248,6 +248,30 @@ def test_a_text_only_load_is_the_wrappers_language_model_as_its_text_checkpoint(
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), logits)
 
 
+def test_the_pipeline_selects_what_a_source_loads(tmp_path):
+    """`dew.pipeline` takes what a source builds as a run's `--source` options state it (`SourceOptions`,
+    ledgers 2248 and 2412): text-only builds Qwen3.5's text task over its language model alone, no
+    prediction depth DeepSeek V3's without one, and an attention override reads each block of a row
+    whole; a run directory's record selects its own, so options are refused there."""
+    from dew.config import SourceOptions
+    from dew.inference import pipeline
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    blind = _without(FIXTURES / "qwen35-native-tiny", tmp_path / "blind",
+                     lambda name: name.startswith("model.visual."))
+    text = pipeline(str(blind), options=SourceOptions(text_only=True))
+    assert isinstance(text.model, CausalTransformer)
+    trimmed = pipeline(str(FIXTURES / "deepseek-v3-tiny"), options=SourceOptions(prediction_depths=0))
+    assert trimmed.model.num_nextn_predict_layers == 0
+    blocked = pipeline(str(blind), options=SourceOptions(
+        text_only=True, attention={"full_attention": "block_bidirectional"}))
+    assert blocked.model != text.model
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run" / "run.json").write_text("{}")
+    with pytest.raises(ValueError):
+        pipeline(str(tmp_path / "run"), options=SourceOptions(text_only=True))
+
+
 def test_a_text_only_load_takes_a_checkpoint_without_its_prediction_depth():
     """A Qwen3.5 release whose config names one prediction depth but whose checkpoint holds the trunk
     alone (re-saved by transformers, which builds no depth) loads text-only as that trunk."""

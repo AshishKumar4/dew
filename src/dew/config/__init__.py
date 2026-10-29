@@ -346,7 +346,7 @@ class SourceOptions:
         """The `modeling_overrides` these options state, None where they state none."""
         return None if self.attention is None else {"attention": dict(self.attention)}
 
-    def keywords(self) -> "SourceOptionsKeywords":
+    def keywords(self) -> "SourceBuild":
         """`Pretrained.load`'s keywords for what a run builds of its source. With `weights=False` beside
         them a load is the run's base as the run builds it, its config and its variables' shapes, read
         from the source's config and safetensors headers alone, no weight downloaded (a release of
@@ -366,13 +366,17 @@ class SourcePlacement(TypedDict, total=False):
     layout: Layout
 
 
-class SourceOptionsKeywords(SourcePlacement, total=False):
-    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`) and
-    where it reads it (`SourcePlacement`, `RunConfig.source_keywords`)."""
+class SourceBuild(TypedDict, total=False):
+    """`Pretrained.load`'s keywords for what a run builds of its source (`SourceOptions.keywords`)."""
 
     text_only: bool
     prediction_depths: int | None
     modeling_overrides: Mapping[str, object] | None
+
+
+class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
+    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`) and
+    where it reads it (`SourcePlacement`, `RunConfig.source_keywords`)."""
 
 
 @dataclasses.dataclass(frozen=True)
