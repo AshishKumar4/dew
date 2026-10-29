@@ -26,6 +26,9 @@ import ml_dtypes
 import numpy as np
 import pytest
 import recurrence_witness as rw
+from generation_support import generations, runs
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
 from native_certificates import (
     SUBNORMAL_CASE,
     Terms,
@@ -39,9 +42,6 @@ from native_certificates import (
     tf32_operand,
     truncating_step_ends,
 )
-from generation_support import generations, runs
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, Format, rounded, truncated
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
