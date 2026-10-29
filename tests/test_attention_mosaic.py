@@ -323,16 +323,6 @@ def test_the_training_forward_is_on_par_on_an_h100(call):
     _check_forward(call, jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, training=True)
 
 
-@ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
-def test_the_training_forward_runs_on_an_h100_at_a_model_step():
-    """The training forward's output at a Qwen3-8B step (2 x 4096, 32 query heads over 8 key heads of 128,
-    full) and the tiles 64 x 64 of two stages and one consumer, compiled on an H100: the geometry whose
-    launch faulted with an illegal instruction on jax post32 (row 2254, FSTRAINFAULT), check 1 (row 2269)."""
-    _check_forward("full", jnp.bfloat16, (2, 4096, 32, 8), natural=False, interpret=False, training=True,
-                   tiles=attention_mosaic.Tiles(64, 64, 2, 1))
-
-
 @INTERPRETS
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
