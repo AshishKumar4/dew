@@ -76,6 +76,7 @@ from typing import Any, Dict
 import numpy as np
 import torch
 from huggingface_hub import get_safetensors_metadata, hf_hub_download
+from reference_source import padded_probe
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -349,9 +350,7 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     write_tiny(name, model)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
-    mask = np.ones_like(ids, bool)
-    mask[1, :3] = False
-    np.save(directory / 'attention_mask.npy', mask)
+    np.save(directory / 'attention_mask.npy', padded_probe(ids)[0])
     model.eval()
     with torch.no_grad():
         generated = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
