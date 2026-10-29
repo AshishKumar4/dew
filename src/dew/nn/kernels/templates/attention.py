@@ -609,22 +609,35 @@ class Draw:
         every mainloop and the reference share, each taking its own scale for a kept entry. Where the draw
         holds the call's global `queries` and `keys` (a sequence exchange's slice, `DropPlaces`), the indices
         are local and read their global places there."""
+        return self.kept(self.words(queries), keys)
+
+    def words(self, queries: jax.Array) -> jax.Array:
+        """Each query's word of the draw (`keep`): the seed's two words, the domain tag, the row, the head
+        and the query's place mixed, a key's mixed in after (`kept`); a kernel takes it once a query."""
         # A padded tile's places past a table read its fill, and an empty table (a slice of no queries or
         # keys) is read at no place: no real entry draws there.
         if self.queries is not None and self.queries.shape[0]:
             queries = jnp.take(self.queries, queries)
-        if self.keys is not None and self.keys.shape[0]:
-            keys = jnp.take(self.keys, keys)
         word = fmix32(self.seed[0] ^ jnp.uint32(DROP_DOMAIN))
         for part in (self.seed[1], self.row, self.head, queries):
             word = fmix32(word ^ jnp.asarray(part).astype(jnp.uint32))
-        bits = fmix32(word ^ jnp.asarray(keys).astype(jnp.uint32))
+        return word
+
+    def kept(self, words: jax.Array, keys: jax.Array) -> jax.Array:
+        """Whether the draw keeps the entries of queries' `words` (`words`) at `keys`, which broadcast."""
+        if self.keys is not None and self.keys.shape[0]:
+            keys = jnp.take(self.keys, keys)
+        bits = fmix32(words ^ jnp.asarray(keys).astype(jnp.uint32))
         return bits >= jnp.uint32(int(self.rate * 2 ** 32))
 
     def __call__(self, queries: jax.Array, keys: jax.Array) -> jax.Array:
         """The kernels' multiplier of the entries at `queries` and `keys`: `bound` where kept, in fp32, the
         kernels' precision (a reference takes its own scale from `keep`)."""
-        return jnp.where(self.keep(queries, keys), jnp.float32(self.bound), jnp.float32(0.0))
+        return self.multiplied(self.keep(queries, keys))
+
+    def multiplied(self, kept: jax.Array) -> jax.Array:
+        """The multiplier of entries `kept` or not: `bound` where kept, else 0, in fp32."""
+        return jnp.where(kept, jnp.float32(self.bound), jnp.float32(0.0))
 
 
 def dropout_seed(dropout_rng) -> jax.Array:

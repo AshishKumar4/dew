@@ -112,6 +112,16 @@ def default_compilation_cache_dir() -> str:
     return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
 
 
+def beside_compilation_cache(variable: str, name: str) -> Path | None:
+    """Where a record every process sharing the persistent compilation cache shares lives (a step's rungs,
+    the kernels' refusals): the environment `variable` when set, else `name` in the directory JAX is
+    configured with (`jax_compilation_cache_dir`), or nowhere when the process keeps no cache."""
+    if path := os.environ.get(variable):
+        return Path(path)
+    cache = jax.config.jax_compilation_cache_dir
+    return None if not cache else Path(cache) / name
+
+
 def enable_compilation_cache(path: str):
     """Persist compiled executables so restarts skip XLA compilation, and the
     GPU autotuner's picks beside them.

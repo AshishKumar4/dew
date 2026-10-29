@@ -184,29 +184,39 @@ def _floor(x):
 
 
 def decayed(rows, rows_lo, columns, columns_lo):
-    """`exp2(rows - columns)` `[R, C]` of a compensated prefix's halves (`apart`) to fp32's resolution, as
-    `raised` takes it, each side's integer part apart from its fraction on its vector: the tile takes the
-    integers' difference (exact), the fractions' in (-1, 1) and the low halves', and one exp2 of their sum
-    scaled by the integers' power of two (`_scaled`). The exponent rounds at the fractions' scale, at least as
-    finely as the whole difference's, and the tile takes no floor and one integer add for its scaling: a
-    mainloop holds a few of its working tiles, not `raised`'s many (wgmma's output and reverse launches
-    spilled 128 and 260 bytes on them, and none with no pair decay, SE regs-probe90b)."""
-    row_whole, column_whole = _floor(rows), _floor(columns)
-    fraction = (((rows - row_whole)[:, None] - (columns - column_whole)[None, :])
-                + (rows_lo[:, None] - columns_lo[None, :]))
-    return _scaled(jnp.exp2(fraction), row_whole[:, None] - column_whole[None, :])
+    """`exp2(rows - columns)` `[R, C]` of a compensated prefix's halves at the tile's rows and columns, each
+    side's vector separated (`separated`, `between`): the tile takes the wholes' difference, exact, the
+    fractions', and one exp2 scaled by a power of two."""
+    (row_whole, row_fraction), (column_whole, column_fraction) = (separated(rows, rows_lo),
+                                                                  separated(columns, columns_lo))
+    return between((row_whole[:, None], row_fraction[:, None]),
+                   (column_whole[None, :], column_fraction[None, :]))
+
+
+def range_decay(later, later_low, earlier, earlier_low):
+    """`exp2(later - earlier)` of a compensated prefix's halves at two positions (broadcasting): `raised` of
+    their difference, compensated (`compensated_add`), so no rounding of the halves' difference reaches
+    it: a range's decay, which from the difference rounded to one fp32 lost a fraction's last bits at the
+    prefix's size (1e-6 of the decay near -43). The template's ranges, on its halves' vectors; separating
+    both sides for `between` held more registers, one of sm80's training launches spilling 48 bytes (a
+    port's prefix, stored separated, takes `between`)."""
+    return raised(*compensated_add((later, later_low), (-earlier, -earlier_low)))
 
 
 PAIR_FLOOR = -124.0
 """The least power of two `_scaled` scales by, past which a pair's decay is zero: `x 2^k` of an `x` at least
 1/4 stays a normal fp32 down to it, and a decay under 2^-122 weighs nothing beside the chunk's own token."""
 
+PAIR_CEILING = 120.0
+"""The largest power of two `_scaled` scales by, where it holds: the pairs past a token (a decay's inverse,
+which every caller masks) stay finite, and a key gated up from its sub-chunk's start (`key_decayed_pairs`)
+reaches it at most (`factored_range`)."""
+
 
 def _scaled(x, k):
     """`x * 2^k` of `x` in [1/4, 4) (`exp2` of a pair's fraction) and an integral `k`, exactly, by adding `k`
-    to `x`'s exponent bits: zero where `k` is under `PAIR_FLOOR`, and `k` held at 120 above, where the pairs
-    past a token (a decay's inverse, which every caller masks) stay finite."""
-    held = jnp.clip(k, PAIR_FLOOR, 120.0).astype(jnp.int32)
+    to `x`'s exponent bits: zero where `k` is under `PAIR_FLOOR`, and `k` held at `PAIR_CEILING` above."""
+    held = jnp.clip(k, PAIR_FLOOR, PAIR_CEILING).astype(jnp.int32)
     bits = jax.lax.bitcast_convert_type(x, jnp.int32) + jax.lax.shift_left(held, jnp.full_like(held, 23))
     return jnp.where(k < PAIR_FLOOR, 0.0, jax.lax.bitcast_convert_type(bits, jnp.float32))
 
@@ -220,17 +230,18 @@ def separated(hi, lo):
 
 
 def between(later, earlier):
-    """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution at
-    any size: exp2 of the fractions' difference less its whole part, in (1/2, 2), scaled by the wholes'
-    difference and that whole part (`_scaled`), zero below 2^-124. A difference of the rounded sums lost the
-    fraction's last bits at the exponent's size, 1e-6 of the decay near -43, which put a port's decay
-    gradient under decays near zero 9 to 14 times the token-by-token recurrence's error from float64 (ledger
-    2098). Past 2^23 a whole part takes no carry from its fraction (`lo` up to half its ulp), so the
-    fractions' difference may pass one: its truncation joins the scale."""
+    """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution:
+    exp2 of the fractions' difference scaled by the wholes' difference (`_scaled`), zero below 2^-124. A
+    difference of the rounded sums lost the fraction's last bits at the exponent's size, 1e-6 of the decay
+    near -43, which put a port's decay gradient under decays near zero 9 to 14 times the token-by-token
+    recurrence's error from float64 (ledger 2098). The fractions' difference stays within two, its exp2
+    within `_scaled`'s range, for exponents under 2^24, where a fraction's remainder `lo` is at most one: a
+    chunk's prefix (its 64 tokens' at most 2^18 each). Truncating the difference into the scale, for any
+    size, cost the template's forward 1% on an H100 and 3% on an A100 (JS-954-57bf6dc05). Every pair's
+    decay, the ports' of their separated prefix and the template's of its halves (`decayed`), and the ports'
+    ranges; the template's ranges (`range_decay`) and a decay from the prefix's start are `raised`'s."""
     (whole, fraction), (other, its_fraction) = later, earlier
-    difference = fraction - its_fraction
-    step = difference.astype(jnp.int32).astype(difference.dtype)
-    return _scaled(jnp.exp2(difference - step), (whole - other) + step)
+    return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
 
 
 def grown_from(hi, lo, exp, unit: float = 1.0):
@@ -688,7 +699,7 @@ def carried(state, keys: Load, values, decay, dtype, issue: Issue, last: tuple |
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
     """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
     memory's decay `exp2(g_last)`."""
-    gated = corrected_values * raised(last - gate, last_lo - gate_lo)[:, None]
+    gated = corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
     return gated, raised(last, last_lo)
 
 
@@ -724,9 +735,9 @@ def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, 
 def factored_range(floor: float, sub: int = SUB) -> bool:
     """Whether a decay a key dimension whose every token's log decay is at least `floor` (natural log, a
     layer's declared lower bound: Kimi delta attention's -5) factors over `sub`-token sub-chunks
-    (`key_decayed_pairs`): a sub-chunk's widest range in base 2, `-floor sub log2(e)`, under fp32's largest
-    power of two's exponent, so a key gated up from its sub-chunk's start stays finite."""
-    return -floor * sub * math.log2(math.e) < 126
+    (`key_decayed_pairs`): a sub-chunk's widest range in base 2, `-floor sub log2(e)`, under the largest power
+    of two a decay scales by (`PAIR_CEILING`), so a key gated up from its sub-chunk's start is exact."""
+    return -floor * sub * math.log2(math.e) < PAIR_CEILING
 
 
 def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
@@ -740,18 +751,18 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     `reference(s, c)` (a column's vectors) as its pairs' common point: its rows gated down to it,
     `r exp2(g - g_ref)`, against every key up to its end gated up from it, `k exp2(g_ref - g)`, one product a
     sub-chunk and key block ('pairs'): fla_kda's sub-chunk factoring, its diagonal sub-chunks' too, which a
-    declared floor bounds (`factored_range`). An exponent is its halves' difference summed, within a
-    sub-chunk's range of zero down the rows (and up the keys); past it every pair's true value underflows."""
+    declared floor bounds (`factored_range`). Each factor is of the separated prefix (`between`), its exponent
+    within a sub-chunk's range of zero down the rows (and up the keys); past it every pair's value is zero."""
     total = jnp.zeros((chunk, chunk), jnp.float32)
     for place in range(0, chunk, sub):
         for c in range(columns):
             # Each tile read where it is used, a sub-chunk and key block at a time: few live at once.
-            gate, low = gates(c)
-            start_gate, start_low = reference(place // sub, c)
-            exponent = (gate - start_gate[None, :]) + (low - start_low[None, :])
-            index, _ = _grid(exponent.shape)
-            down = jnp.where((index >= place) & (index < place + sub), rows(c) * jnp.exp2(exponent), 0.0)
-            up = jnp.where(index < place + sub, keys(c) * jnp.exp2(-exponent), 0.0)
+            prefix = separated(*gates(c))
+            start_whole, start_fraction = separated(*reference(place // sub, c))
+            start = start_whole[None, :], start_fraction[None, :]
+            index, _ = _grid(prefix[0].shape)
+            down = jnp.where((index >= place) & (index < place + sub), rows(c) * between(prefix, start), 0.0)
+            up = jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)
             total = total + issue("pairs", down, Transposed(up))
     lag = _lags(total.shape)
     return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
@@ -760,7 +771,7 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
 def key_decayed_write(key, gate, low, last, last_low):
     """A chunk's keys gated to its end under a decay a key dimension, `k exp2(g_last - g)` over both prefix
     halves, in the keys' arithmetic: the write the memory takes (`carried`)."""
-    return key * raised(last - gate, last_low - low)
+    return key * range_decay(last, last_low, gate, low)
 
 
 def key_gated(query, gates: tuple, scale: float):
@@ -816,7 +827,7 @@ def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad, queries: Tile
     halves as a row's vectors, `queries(i)` and `weights(i)` key slice `i`'s tiles."""
     dv = functools.reduce(jnp.add, (issue("values_dv", keys(i), part.astype(dtype))
                                     for i, part in enumerate(grad)))
-    dv = dv * raised(last - gate, last_low - low)[:, None] + local
+    dv = dv * range_decay(last, last_low, gate, low)[:, None] + local
     read = out_grad.astype(jnp.float32) * raised(gate, low)[:, None]
     kept = raised(last, last_low)[:, None]
     entered = [part * kept + issue("reads", queries(i).T, read) * scale
@@ -855,7 +866,7 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
     gradient through the memory the chunk leaves, `sum(S dS)` (a row's vector of it; None where a caller
     summing key blocks apart adds it once)."""
     row_decay = raised(gate, low)[:, None]
-    leaving_decay = raised(last - gate, last_low - low)[:, None]
+    leaving_decay = range_decay(last, last_low, gate, low)[:, None]
     leaving_terms, after = [], []
     for c in range(columns):
         dq = _summed(issue("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks))
