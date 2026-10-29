@@ -205,7 +205,7 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     and reports nothing."""
     executable, spilling = _compiled_reported(lowered, options)
     found = _misses_of(spilling)
-    refusals = [refusal for refusal, _ in found if refusal is not None]
+    refusals = [refusal for refusal, _, _ in found if refusal is not None]
     for refusal in refusals:
         _record(refusal, None)
     if not refusals:
@@ -220,7 +220,7 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     _recorded(found, stepped=True)
     executable, spilling = _compiled_reported(relowered, options)
     again = _misses_of(spilling)
-    for refusal, _ in again:
+    for refusal, _, _ in again:
         if refusal is not None:
             _record(refusal, None)
     _recorded(again, stepped=False)
