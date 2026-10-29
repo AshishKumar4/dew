@@ -668,7 +668,7 @@ class Dropout:
     and key is kept where its draw keeps it and multiplied by `1 / (1 - rate)`, while the softmax's
     denominator takes the undropped weights, so the output is the softmax over the values `z v`. `seed`
     holds the call's two uint32 words, `rows` `[B]` and `heads` `[H]` each local batch row's and query
-    head's global index (a shard's own positions are not, `dew.nn.attention_parallel.per_shard`),
+    head's global index (a shard's own positions are not, `dew.nn.attention_parallel.on_attention_shards`),
     `queries` `[Q]` and `keys` `[K]` each local query's and key's where a sequence exchange holds a slice
     of them (`DropPlaces`; local are global where None), and `rate` is static."""
 

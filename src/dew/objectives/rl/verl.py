@@ -335,7 +335,7 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
                               calls, Status(text(record["status"], "status")),
                               None if reward is None else finite(reward, "reward_score"),
                               MappingProxyType(components), text(record["detail"], "detail"),
-                              text(record.get("source", ""), "source"))
+                              text(record["source"], "source"))
             if dew.get("stamped", False):
                 for key in ("min_global_steps", "max_global_steps"):
                     extra.pop(key, None)

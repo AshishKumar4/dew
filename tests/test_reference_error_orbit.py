@@ -150,14 +150,16 @@ def test_an_orbit_still_fails_a_sum_that_differs():
 
 
 def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
-    """A recorded reference (`indexed_recording`'s, which it marks `recorded`) holds its recorded draws
-    alone, and an orbit holds the draw's own order and another."""
+    """A recorded reference (`indexed_recording`'s, which it marks `recorded`), the site's or a further one,
+    holds its recorded draws alone, and an orbit holds the draw's own order and another."""
     def recorded(terms):
         return _outer_first(terms)
     recorded.recorded = True
 
     with pytest.raises(ValueError):
         _drawn(_left_to_right, recorded, _cancelling_draw, range(2), orders=_swapped)
+    with pytest.raises(ValueError):
+        _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=_swapped, also=[recorded])
     with pytest.raises(ValueError):
         _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=lambda inputs: [inputs])
 
