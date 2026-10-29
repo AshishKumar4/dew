@@ -41,6 +41,8 @@ from dew.nn.dense import Dense
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
 from .sharding import logical_axes
 
+__all__ = ["Engram", "compressed_token_map"]
+
 _DEAD = -1
 """A compressed id no n-gram reaches across (engram.py:130)."""
 _LIMB = 8
