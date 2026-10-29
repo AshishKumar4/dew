@@ -45,21 +45,12 @@ def fields(value, names, optional=""):
         raise ValueError("unsupported model request fields")
 
 
-TERMS: dict | None = None
-"""The contract (contract.py's `written`, read from `contract.PATH` at first use), or the one a test sets."""
-
-
-def terms() -> dict:
-    global TERMS
-    if TERMS is None:
-        TERMS = contract.read()
-    return TERMS
-
-
 def guidance_record(value):
-    """A CFG record a cell sent, as Dew's CFG takes it (the contract's fields: each required one given, no
-    other), each field the service bounds within its bounds and any other at Dew's default."""
-    record = {entry["name"]: entry for entry in terms()["CFG"]}
+    """A CFG record a cell sent, as Dew's CFG takes it (its fields, `contract.record`: each required one
+    given, no other), each field the service bounds within its bounds and any other at Dew's default."""
+    from dew.sampling import CFG
+
+    record = {entry["name"]: entry for entry in contract.record(CFG)}
     if not isinstance(value, dict) or not {name for name, entry in record.items() if "default" not in entry
                                            and not entry.get("omitted")} <= set(value) <= set(record):
         raise ValueError("unsupported guidance fields")
@@ -112,17 +103,14 @@ def validate(request):
         solver = request["solver"]
         if solver is not None:
             fields(solver, "name args")
-            if solver["name"] not in terms()["solvers"] or solver["args"]:
+            if solver["name"] not in contract.SOLVERS or solver["args"]:
                 raise ValueError("the live sampler supports the displayed solvers with their default "
                                  "settings")
         guidance = request.get("guidance")
         if guidance is None or type(guidance) in (int, float):
             nullable(number, guidance, 0, 20)
-            text(request["repo"], 256)
-            if request["revision"] is not None:
-                text(request["revision"], 64)
-            return request
-        guidance_record(guidance)
+        else:
+            guidance_record(guidance)
     else:
         raise ValueError("unsupported model operation")
     text(request["repo"], 256)
@@ -146,7 +134,7 @@ class NativeModels:
         print("MODEL_PHASE", time.time(), "pipeline load", flush=True)
         self.np, self.progress = np, progress
         self.cfg = CFG
-        self.solvers = {name: getattr(sampling, name) for name in terms()["solvers"]}
+        self.solvers = {name: getattr(sampling, name) for name in contract.SOLVERS}
         self.repo, self.revision = (root / "text-to-image").read_text().strip().split("@")
         self.pipe = progress.Reporting(dew.pipeline(self.repo, revision=self.revision))
         self.text_servers = {}

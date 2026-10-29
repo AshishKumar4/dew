@@ -59,9 +59,10 @@ def read(path: str = PATH) -> dict:
 
 
 def written() -> dict:
-    """The contract, read from Dew: the records a cell builds (`CFG`, `Sampling`) and the signatures of the
-    calls it makes, with what the service serves."""
+    """The contract, read from Dew: the records a cell builds (`CFG`, `Sampling`, the solvers the service
+    serves) and the signatures of the calls it makes, with what the service serves."""
     import dew
+    from dew import sampling
     from dew.inference import TextGeneration, TextToImage
     from dew.interop import PretrainedDecoder
     from dew.sampling import CFG, Sampling
@@ -71,7 +72,8 @@ def written() -> dict:
             "sample": parameters(TextToImage.__call__), "load": parameters(PretrainedDecoder.load),
             "text_generation": parameters(PretrainedDecoder.text_generation),
             "generate": parameters(TextGeneration.__call__),
-            "solvers": list(SOLVERS), "loaded": LOADED, "greedy": GREEDY, "tokens": TOKENS}
+            "solvers": {name: record(getattr(sampling, name)) for name in SOLVERS},
+            "loaded": LOADED, "greedy": GREEDY, "tokens": TOKENS}
 
 
 if __name__ == "__main__":
