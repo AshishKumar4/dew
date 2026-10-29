@@ -2223,29 +2223,45 @@ def _applied(equation, inputs, given, wanted: bool):
                      for energy, value in zip(made, outputs, strict=True)]
 
 
-def _scanned(params, inputs, given):
-    """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time."""
-    body = params["jaxpr"]
+def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
+    """A scan (lax.scan's equation `params`) over `inputs` a step at a time, as the gate's evaluators
+    walk one (`float64_terms`, check 2's `certified`): each input a tuple of lanes, a value and what an
+    evaluator carries beside it, sliced at each step lane by lane (a lane of None stays None), and
+    `body(step, step_inputs)` the body's outputs for one step, carries first, tuples alike. The carries
+    thread from step to step and each further output stacks over the steps in scan order, a lane where
+    every step has one (else None); an empty scan's from its outvars' avals, its `lanes` - 1 others None."""
+    jaxpr = params["jaxpr"].jaxpr
     constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
     consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
                          inputs[constants + carries:])
-    held, carry_terms, xs_terms = (given[:constants], given[constants:constants + carries],
-                                   given[constants + carries:])
-    ys, ys_terms = [], []
+    ys = []
     steps = range(params["length"])
     for step in reversed(steps) if params["reverse"] else steps:
-        outputs, made = _evaluated(body.jaxpr, body.consts, [*consts, *carry, *(x[step] for x in xs)],
-                                   [*held, *carry_terms, *(None if t is None else t[step] for t in xs_terms)])
-        carry, carry_terms = outputs[:carries], made[:carries]
+        sliced = [tuple(None if lane is None else lane[step] for lane in x) for x in xs]
+        outputs = body(step, [*consts, *carry, *sliced])
+        carry = outputs[:carries]
         ys.append(outputs[carries:])
-        ys_terms.append(made[carries:])
     if params["reverse"]:
         ys.reverse()
-        ys_terms.reverse()
-    stacked = [jnp.stack(column) for column in zip(*ys, strict=True)] if ys else []
-    stacked_terms = [None if any(t is None for t in column) else jnp.stack(column)
-                     for column in zip(*ys_terms, strict=True)] if ys_terms else []
-    return [*carry, *stacked], [*carry_terms, *stacked_terms]
+    if not ys:
+        return [*carry, *((jnp.zeros((0, *var.aval.shape), var.aval.dtype), *(None,) * (lanes - 1))
+                          for var in jaxpr.outvars[carries:])]
+    return [*carry, *(tuple(None if any(entry is None for entry in lane) else jnp.stack(lane)
+                            for lane in zip(*column, strict=True))
+                      for column in zip(*ys, strict=True))]
+
+
+def _scanned(params, inputs, given):
+    """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time."""
+    body = params["jaxpr"]
+
+    def step(_, pairs):
+        outputs, made = _evaluated(body.jaxpr, body.consts, [value for value, _ in pairs],
+                                   [energy for _, energy in pairs])
+        return list(zip(outputs, made, strict=True))
+
+    walked = scanned_steps(params, list(zip(inputs, given, strict=True)), step, lanes=2)
+    return [value for value, _ in walked], [energy for _, energy in walked]
 
 
 def _looped(params, inputs, given):

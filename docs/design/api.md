@@ -293,9 +293,10 @@ text family's own checkpoint states it: the wrapper's text config typed as its t
 wrapper's head policy, dtype, modeling overrides and generation ids, and the language model's tensors
 under the text family's names. No tower, projector or audio encoder is built or read; the bundle is a
 decoder with the tokenizer, saves as that text checkpoint, and names no Hub origin, since the id alone
-loads the wrapper. A decoder or a fallback source is text already and loads as it is. A diffusion
-pipeline, a family that reads its media bundle as one decoder (DeepSeek-V4.1), and a quantized wrapper
-are refused. A checkpoint that holds none of the prediction depths its config names loads as its trunk;
+loads the wrapper. A family that reads its media bundle as one decoder (DeepSeek-V4.1) loads as its
+text checkpoint, the bundle's config without its vision_config and its decoder's tensors without those
+that serve the media alone (the routers' image-span bias). A decoder or a fallback source is text
+already and loads as it is. A diffusion pipeline and a quantized wrapper are refused. A checkpoint that holds none of the prediction depths its config names loads as its trunk;
 one holding some of them must hold all. `prediction_depths` chooses how many the load builds: None
 the ones the checkpoint holds, 0 none, `n` the first `n`; a DSpark drafter, whose stages draft as
 one with its heads on the last, is kept whole or at 0 not at all. The load reads the source as the checkpoint of those depths alone, its config's counts cut

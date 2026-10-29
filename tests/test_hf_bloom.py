@@ -4,13 +4,12 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
-from interop_support import fixture_ids, transformers_arms, transformers_model
+from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
 
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'bloom-tiny'
-RELEASE = Path(__file__).parent / 'fixtures' / 'hf' / 'bloom-560m'
 
 CACHED_SEEDS = 8
 """The cached padded rows' declared draws of ids against transformers' uncached forward (check 1), sized by
@@ -48,3 +47,16 @@ def test_bloom_padded_rows_prefill_and_decode_through_the_cache_as_the_reference
         joined = np.concatenate((ids[row, mask[row]], np.asarray(token[row])))[None]
         full = loaded.model.apply(loaded.variables, joined)
         np.testing.assert_array_equal(np.asarray(decoded[row, -1]).argmax(), np.asarray(full[0, -1]).argmax())
+
+
+def test_the_exact_path_of_one_tensor_parallel_rank_computes_bloom_itself(tmp_path):
+    """`slow_but_exact` over a single tensor-parallel rank is BLOOM's own computation: it loads and
+    computes the plain checkpoint's logits bit for bit."""
+    exact = Pretrained.load(
+        respelled(DIRECTORY, tmp_path / 'bloom',
+                  lambda config: {**config, 'slow_but_exact': True, 'pretraining_tp': 1}),
+        dtype='float32', attention_impl='reference')
+    plain = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
+    np.testing.assert_array_equal(np.asarray(exact.model.apply(exact.variables, ids)),
+                                  np.asarray(plain.model.apply(plain.variables, ids)))
