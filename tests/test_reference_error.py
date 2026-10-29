@@ -231,8 +231,8 @@ def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw(
     """`also`: one Dew arm against several references on the same draws, each judged by its own check 1
     under its own label, Dew and the truth evaluated once a draw for them all. A Dew arm on par with one
     reference and three times another's error fails against that one alone; a site with every
-    reference on par passes; a further reference of another kind than the reference's, or a site with
-    several and no named truth, is refused."""
+    reference on par passes; beside a plain Dew arm, a further reference of another kind than the
+    reference's is refused, as is a site with several and no named truth."""
     calls = {"dew": 0, "truth": 0}
 
     def draw(seed):
@@ -260,10 +260,16 @@ def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw(
         assert_as_exact(arm(3.0, "mine"), arm(3.0, "theirs"), draw, "one far", seeds=16, truth_fn=truth,
                         also={"another": arm(1.0, "other")})
     assert {finding.leaf for finding in failed.value.findings} == {"one far, against another['value']"}
-    for site in ({"truth_fn": None, "also": {"another": arm(1.0, "other")}},
-                 {"truth_fn": truth, "also": {"plain": lambda x, *_: {"value": x}}}):
-        with pytest.raises(ValueError):
-            assert_as_exact(dew, arm(1.0, "theirs"), draw, "refused", seeds=16, **site)
+    with pytest.raises(ValueError):
+        assert_as_exact(dew, arm(1.0, "theirs"), draw, "no truth", seeds=16,
+                        also={"another": arm(1.0, "other")})
+
+    def plain(x, *_):
+        return {"value": x}
+
+    with pytest.raises(ValueError):
+        assert_as_exact(plain, plain, draw, "two kinds", seeds=16, truth_fn=truth,
+                        also={"given": arm(1.0, "other")})
 
 
 def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references():

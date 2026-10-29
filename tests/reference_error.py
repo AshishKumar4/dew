@@ -1448,8 +1448,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     `also` names further references Dew is held to on the same draws, each judged by its own check 1
     as the reference is (its label `label`, against its name), Dew and the truth evaluated once a draw
     for them all (`_drawn`): one Dew arm against several references, the truth `truth_fn` (which a site
-    with several references names). Each runs as the reference's kind runs, plain or `as_given`, so one
-    compilation of Dew's arm pairs with every one (`_arms`).
+    with several references names). Each compiles paired with Dew's arm (`_arms`), and a plain Dew arm,
+    whose compilation its pairing decides, takes references of one kind, plain or `as_given`.
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
@@ -1463,12 +1463,14 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
                          f"the leaves it covers")
     also = dict(also or {})
-    if also and (truth_fn is None or any(_given(fn) != _given(reference_fn) for fn in also.values())):
-        raise ValueError(f"{label}: further references name the truth, and each runs as the reference's kind "
-                         f"runs, plain or as given, so one compilation of Dew's arm pairs with every one")
+    mixed = not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in also.values())
+    if also and (truth_fn is None or mixed):
+        raise ValueError(f"{label}: further references name the truth, and beside a plain Dew arm each is "
+                         f"of the reference's kind, plain or as given, so one compilation of Dew's pairs "
+                         f"with all")
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
-    further = [_arms(fn, reference_fn)[0] for fn in also.values()]
+    further = [_arms(dew_fn, fn)[1] for fn in also.values()]
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
     library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
     truth_fn = _truth_program(truth_fn)
