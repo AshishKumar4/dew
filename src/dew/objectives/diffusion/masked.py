@@ -33,7 +33,7 @@ from flax import linen as nn
 
 from dew.artifacts import TokenScores
 from dew.batch import TEXT_KEY, Batch, Variables, real_slots, thaw
-from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, DiscreteProcess, Unmask, aligned
+from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.moe import ROUTER_COLLECTION
@@ -76,8 +76,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
         balance: ExpertBalance | None = None,
         ema_decay: float | None = 0.999,
-        solver: Unmask = _DEFAULT_SOLVER,
+        solver: Unmask | Confident = _DEFAULT_SOLVER,
         steps: int = MDLM_STEPS,
+        block: int | None = None,
         samples: int = 4,
         decode: Callable[[Sequence[int]], str] | None = None,
         variables: Variables | None | Omitted = OMITTED,
@@ -113,6 +114,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         self.use_head(head_chunks, head_tile)
         self.solver = solver
         self.steps = steps
+        self.block = block
         self.samples = samples
         self.decode = decode
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
@@ -133,7 +135,8 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         """The row length, response budget, process, solver, sampling steps, end-of-sequence ids, and
         tokenizer or source processor: the task's own."""
         return MaskedSettings(seq_len=self.seq_len, max_new_tokens=self.seq_len, process=self.process,
-                              solver=self.solver, sampling_steps=self.steps, eos_token_ids=self.eos_token_ids,
+                              solver=self.solver, sampling_steps=self.steps, block=self.block,
+                              eos_token_ids=self.eos_token_ids,
                               tokenizer=recorded_tokenizer(self.processor),
                               processor=recorded_processor(self.processor))
 

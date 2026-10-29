@@ -724,18 +724,24 @@ class PretrainedMaskedDecoder(Pretrained):
     def text_generation(self) -> MaskedGeneration:
         """Build the masked generation task this source describes.
 
-        It uses Dew's MDLM sampler, which refines a whole response with Unmask, not
-        the source family's own generation recipe.
+        A family whose release walks in blocks (`DecoderFamily.masked_walk`, LLaDA2's) generates as
+        its release does: blocks of its size over its steps each, revealing past its threshold
+        (`Confident`, temperature 0 taking each position's best token). Any other refines a whole
+        response with Dew's MDLM sampler (`Unmask`), not its family's own recipe.
         """
-        from dew.diffusion.discrete import MDLM
+        from dew.diffusion.discrete import MDLM, Confident
+        from dew.interop.hf_decoders import family_entry
 
         config, generation = self.config, self.generation_config
         mask_id = self.model.mask_token_id
         if mask_id is None:
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
         audit_masked(config, generation)
+        walk = family_entry(str(config["model_type"])).masked_walk
+        recipe = {} if walk is None else {"solver": Confident(threshold=walk.threshold, temperature=0.0),
+                                          "steps": walk.steps, "block": walk.block}
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
-                                self.text_processor,
+                                self.text_processor, **recipe,
                                 eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),

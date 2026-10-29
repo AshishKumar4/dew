@@ -18,6 +18,7 @@ from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
+    MaskedWalk,
     Packed,
     Renames,
     Ropes,
@@ -628,4 +629,7 @@ LLADA2_MOE = DecoderFamily(
     # is 126081.
     defaults={'pad_token_id': 126081},
     padding_idx=True,
+    # LLaDA2's generate walks blocks of 32 over 32 steps each, revealing past 0.95
+    # (modeling_llada2_moe.py:1233-1247 at dad945c).
+    masked_walk=MaskedWalk(block=32, steps=32, threshold=0.95),
 )

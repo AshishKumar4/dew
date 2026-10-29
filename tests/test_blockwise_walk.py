@@ -78,6 +78,36 @@ def _release_reveal(confidence: np.ndarray, quota: int, threshold: float) -> np.
     return chosen
 
 
+def test_llada2s_task_walks_as_its_release_and_generates_the_recorded_prompts():
+    """LLaDA2's task (`text_generation`, what `dew.pipeline` and a run return) walks as its release's
+    `generate` defaults do: blocks of 32 over 32 steps each, revealing past 0.95 (`Confident`); and the
+    task, at the recording's settings, generates each recorded prompt's tokens through its own call, the
+    public path a user's request takes (ledger 2174). The settings a saved run records take the same
+    walk."""
+    from dew.inference.tasks import MaskedGeneration, MaskedSettings
+
+    recorded = json.loads((FIXTURES / "llada2-tiny" / "generate.json").read_text())
+    settings = recorded["settings"]
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
+    task = source.text_generation()
+    assert isinstance(task, MaskedGeneration) and isinstance(task.solver, Confident)
+    assert (task.solver.threshold, task.solver.temperature, task.block, task.steps) == (0.95, 0.0, 32, 32)
+    walked = replace(task, solver=Confident(threshold=settings["threshold"], top_k=settings["top_k"]),
+                     steps=settings["steps"], block=settings["block_length"],
+                     eos_token_ids=(settings["eos_id"],))
+    for row in recorded["rows"]:
+        generation = walked(jnp.asarray([row["prompt"]], jnp.int32), settings["gen_length"], key=0).host()
+        start = len(row["prompt"])
+        response = np.asarray(generation.tokens)[0, start:start + int(generation.lengths[0])]
+        assert response.tolist() == row["generated"], (row["prompt"], response.tolist())
+    saved = MaskedSettings(seq_len=16, max_new_tokens=8, tokenizer=None, processor=None,
+                           process=task.process, solver=walked.solver,
+                           sampling_steps=walked.steps, block=walked.block,
+                           eos_token_ids=walked.eos_token_ids)
+    rebuilt = MaskedGeneration.from_settings(task.model, task.variables, saved, task.processor)
+    assert (rebuilt.solver, rebuilt.block, rebuilt.steps) == (walked.solver, walked.block, walked.steps)
+
+
 def test_confident_spreads_a_fixed_quota_where_no_block_is_walked():
     """Without a block, `Confident`'s quota spreads the slots masked at the walk's first step over its
     steps, fixed: eight masked slots over three steps reveal 3, 3 and 2 at a threshold no draw passes,
