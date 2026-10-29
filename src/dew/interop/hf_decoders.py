@@ -1080,8 +1080,7 @@ def export_config(model) -> Mapping[str, object]:
 
     overrides = {}
     for name in set(model.per_layer_types):
-        mixer = model.kind_of(name).mixer or model.mixer or AttentionMixer()
-        if isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks:
+        if (model.kind_of(name).mixer or model.mixer or AttentionMixer()).reads_blocks:
             overrides[name] = "block_bidirectional"
     if overrides:
         config["modeling_overrides"] = {"attention": overrides}

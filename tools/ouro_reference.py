@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
-from reference_source import config_lookups, hub_modules, record_padding
+from reference_source import config_lookups, hub_modules, padded_probe, record_padding
 from torch_precision import float64, float64_twin
 
 REPO, REVISION = 'ByteDance/Ouro-1.4B', '574fa66cb8bf5abdc979642d01cf2b79b16bfab1'
@@ -80,10 +80,7 @@ def write_tiny(modeling) -> None:
     model = last_pass(model)
     model.save_pretrained(directory, safe_serialization=True)
     ids = probe_ids(config.vocab_size)
-    mask = np.ones_like(ids, bool)
-    mask[1, :3] = False
-    padded = np.where(mask, ids, 0)
-    positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
+    mask, padded, positions = padded_probe(ids)
     arrays = {'input_ids': ids, 'attention_mask': mask}
     arrays['logits'], arrays['exit_logits'] = outputs(model, ids)
     arrays['padded_logits'], _ = outputs(model, padded, mask, positions)

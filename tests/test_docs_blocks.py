@@ -35,8 +35,16 @@ PAGES = [page.relative_to(DOCS).as_posix() for page in sorted(DOCS.rglob("*.md")
              "from-flaxdiff.md", "guides/decision-models.md", "guides/multi-node.md", "recipes.md"}]
 
 
+WHOLE_SUITE = {
+    "concepts/language_models.md": "252 s on train 270's CI (main f58abb8a3), 138 s alone on armada: two "
+                                   "trainings, a masked-diffusion training and two exports, which share one "
+                                   "interpreter and cannot split (row 2124)"}
+"""The pages past a group's 120 s target, each run on the whole suite alone, with its measured time."""
+
+
 @pytest.mark.mesh(devices=0)
-@pytest.mark.parametrize("page", PAGES)
+@pytest.mark.parametrize("page", [pytest.param(page, marks=pytest.mark.whole_suite)
+                                  if page in WHOLE_SUITE else page for page in PAGES])
 def test_a_page_s_python_blocks_run_in_order(page, tmp_path):
     path = DOCS / page
     # Each block is compiled at its own lines of the page, so a traceback

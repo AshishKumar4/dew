@@ -35,6 +35,7 @@ from dew._distributions import counted, draw, row_draw, wellformed
 from dew._records import finite
 from dew.batch import (
     COORDINATES_FIELD,
+    POSITIONS_FIELD,
     Coordinates,
     Variables,
     coordinates,
@@ -516,7 +517,7 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
     if unruled:
         raise ValueError(f"masked generation cannot extend token fields {unruled}: a response has no "
                          f"rule for their slots (dew.nn.inputs.RESPONSE_FIELDS)")
-    positions = inputs.token_fields.get("positions")
+    positions = inputs.token_fields.get(POSITIONS_FIELD)
     if positions is not None and positions.ndim != 2:
         raise ValueError("positions must be [B, S] logical token positions")
 
@@ -542,7 +543,7 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
                             positions=token_positions(fields)).places()
     laid = fields.get(COORDINATES_FIELD)
     placed = ({**fields, COORDINATES_FIELD: replace(laid, positions=positions)}
-              if isinstance(laid, Coordinates) else {**fields, "positions": positions})
+              if isinstance(laid, Coordinates) else {**fields, POSITIONS_FIELD: positions})
     extended = replace(inputs, token_fields=with_validity(placed, valid)).extended(
         jnp.full((batch, width), mask_id, jnp.int32))
     response = jnp.arange(prompt + width) >= prompt

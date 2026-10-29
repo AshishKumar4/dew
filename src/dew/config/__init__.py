@@ -1611,7 +1611,7 @@ class RunConfig:
         assert target is not None
         mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
         with generation.chosen(attention_form=self.trainer.attention_form):
-            return target.compiled(self.built(objective, mesh, rollout), dataset, steps)
+            return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
