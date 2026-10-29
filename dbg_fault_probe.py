@@ -19,7 +19,7 @@ stages = int(variant[-1]) if variant.startswith("stages") else 2
 residuals = variant != "noresiduals"
 causal = variant == "causal"
 
-if variant == "nosetmax":
+if variant in ("nosetmax", "initfence_nosetmax"):
     def roles(wg, consumers, consumer, producer):
         pl.when(wg < consumers)(lambda: consumer(wg))
         pl.when(wg == consumers)(producer)
@@ -32,6 +32,14 @@ elif variant == "serialmma":
         self.settled()
         return result
     mosaic_sm90.Wgmma.register_products = serial
+
+if variant in ("initfence", "initfence_nosetmax"):
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+    previous_roles = mosaic.roles
+    def fenced_roles(wg, consumers, consumer, producer):
+        plgpu.commit_smem()
+        previous_roles(wg, consumers, consumer, producer)
+    mosaic.roles = fenced_roles
 
 rng = np.random.default_rng(0)
 q, k, v = (
