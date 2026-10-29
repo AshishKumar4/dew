@@ -8,11 +8,11 @@ facts with the run's own XLA flags.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
 import functools
-import inspect
 import threading
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
@@ -156,15 +156,20 @@ class OuterProgram:
     config is refused and the function traced afresh, by a new jit of a new callable past JAX's trace
     cache, and compiled once more, the launch's derivation taking the next config. Called as its jit
     is, it runs the executable that what jit keys its own on chooses (`_keyed`): the static arguments,
-    the others' structure, shapes, dtypes and placements, and the trace context; `lower` and `trace`
-    are its jit's."""
+    the others' structure, shapes, dtypes and placements, and the trace context, the `CACHED` latest;
+    `lower` and `trace` are its jit's. Called within another trace (a `jax.grad`, a `jax.vmap`, an
+    enclosing jit), it is its jit, which the enclosing program compiles as its own."""
+
+    CACHED: ClassVar[int] = 4096
+    """The executables a program keeps, the latest called, as jit's own cache is bounded."""
 
     def __init__(self, function: Callable, **arguments):
         self.function, self.arguments = function, arguments
         self.jitted = self._jitted()
-        self.numbers, self.names = _statics(function, arguments.get("static_argnums"),
-                                            arguments.get("static_argnames"))
-        self._executables: dict[Hashable, jax.stages.Compiled] = {}
+        # The static positions and names as jit resolved them, the ones given and those it inferred.
+        resolved = self.jitted._jit_info
+        self.numbers, self.names = resolved.static_argnums, frozenset(resolved.static_argnames)
+        self._executables: collections.OrderedDict[Hashable, jax.stages.Compiled] = collections.OrderedDict()
         self._compiling = threading.Lock()
 
     def _jitted(self) -> jax.stages.Wrapped:
@@ -174,12 +179,16 @@ class OuterProgram:
         return jax.jit(traced, **self.arguments)
 
     def __call__(self, *args, **kwargs):
+        if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves((args, kwargs))):
+            return self.jitted(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
-        executable = self._executables.get(key)
-        if executable is None:
-            with self._compiling:
-                executable = self._executables.get(key) or self.compiled(*args, **kwargs)
-                self._executables[key] = executable
+        with self._compiling:
+            executable = self._executables.get(key)
+            if executable is None:
+                executable = self._executables[key] = self.compiled(*args, **kwargs)
+                if len(self._executables) > self.CACHED:
+                    self._executables.popitem(last=False)
+            self._executables.move_to_end(key)
         return executable(*dynamic, **named)
 
     def compiled(self, *args, **kwargs) -> jax.stages.Compiled:
@@ -187,8 +196,18 @@ class OuterProgram:
         afresh where a kernel spills."""
         from dew.nn.kernels.templates import report
 
-        return report.compiled(self.jitted.lower(*args, **kwargs),
-                               relower=lambda: self._jitted().lower(*args, **kwargs))
+        relowered: list[jax.stages.Wrapped] = []
+
+        def relower() -> jax.stages.Lowered:
+            fresh = self._jitted()
+            lowered = fresh.lower(*args, **kwargs)
+            relowered.append(fresh)
+            return lowered
+        executable = report.compiled(self.jitted.lower(*args, **kwargs), relower=relower)
+        # Later calls trace as the relowering did, past the trace its refused config is in.
+        if relowered:
+            self.jitted = relowered[-1]
+        return executable
 
     def lower(self, *args, **kwargs) -> jax.stages.Lowered:
         return self.jitted.lower(*args, **kwargs)
@@ -203,32 +222,12 @@ class OuterProgram:
         dynamic = tuple(arg for number, arg in enumerate(args) if number not in numbers)
         named = {name: value for name, value in kwargs.items() if name not in self.names}
         leaves, structure = jax.tree.flatten((dynamic, named))
-        statics = (tuple((number, args[number]) for number in sorted(numbers)),
-                   tuple(sorted((name, value) for name, value in kwargs.items() if name in self.names)))
+        # A static value keys by its type too, as jit's do: True and 1 are two programs.
+        statics = (tuple((number, type(args[number]), args[number]) for number in sorted(numbers)),
+                   tuple(sorted((name, type(value).__qualname__, value) for name, value in kwargs.items()
+                                if name in self.names)))
         return (len(args), statics, structure, tuple(map(_signature, leaves)),
                 jax_config.trace_context()), dynamic, named
-
-
-def _statics(function: Callable, numbers: int | tuple[int, ...] | None,
-             names: str | tuple[str, ...] | None) -> tuple[tuple[int, ...], frozenset[str]]:
-    """The static positions and names of `function` as `jax.jit` reads them: the ones given, and
-    where only one kind is, the other's from its signature."""
-    numbers = () if numbers is None else (numbers,) if isinstance(numbers, int) else tuple(numbers)
-    names = () if names is None else (names,) if isinstance(names, str) else tuple(names)
-    if bool(numbers) == bool(names):
-        return numbers, frozenset(names)
-    try:
-        parameters = list(inspect.signature(function).parameters.values())
-    except (TypeError, ValueError):
-        return numbers, frozenset(names)
-    positional = [parameter.name for parameter in parameters
-                  if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
-    if names:
-        return tuple(positional.index(name) for name in names if name in positional), frozenset(names)
-    named = {parameter.name for parameter in parameters if parameter.kind == parameter.POSITIONAL_OR_KEYWORD}
-    return numbers, frozenset(positional[number] for number in numbers
-                              if -len(positional) <= number < len(positional)
-                              and positional[number] in named)
 
 
 def _signature(leaf) -> Hashable:
