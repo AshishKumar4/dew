@@ -854,20 +854,18 @@ class Trainer(Generic[Loss, Effects]):
         return dataclasses.replace(state, accumulation=pending)
 
     @functools.cached_property
-    def _ahead_links(self) -> dict[str, float | None]:
-        """The figures the step compiled ahead traced with (`AheadOfTime.links`), at the run's first trace."""
-        return {} if self._ahead is None else self._ahead.links
+    def _ahead_links(self) -> dict[str, Link]:
+        """The links the step compiled ahead traced with, at the run's first trace (`AheadOfTime.over`)."""
+        return {} if self._ahead is None else self._ahead.over(self._stated_links)
 
     def _links(self, mesh: Mesh) -> dict[str, Link]:
-        """The links of `mesh`'s tensor and sequence axes, those it splits,
-        for one trace. Every process lists the mesh's devices alike and
-        `link_bandwidth` agrees one figure across the pool, so every process
-        decides alike and compiles the same program. The peak is the fastest
-        device's, on which the FLOPs a spread saves take the least time. Each
-        axis's bandwidth is measured once per mesh, and not at all for a
-        device the peak table does not name (a CPU's among them), where it
-        decides nothing, or over a compile-only GPU (`dew.training.ahead`), which no process holds to
-        measure; a link the run states (`links`) as stated, unless a step compiled ahead holds its own."""
+        """The links of `mesh`'s tensor and sequence axes, those it splits, for one trace. Every process
+        lists the mesh's devices alike and `link_bandwidth` agrees one figure across the pool, so every
+        process decides alike and compiles the same program. The peak is the fastest device's, on which
+        the FLOPs a spread saves take the least time. Each axis's bandwidth is measured once per mesh, and
+        not at all for a device the peak table does not name (a CPU's among them), where it decides
+        nothing, or over a compile-only GPU (`dew.training.ahead`), which no process holds to measure; a
+        stated link (`links`) as stated, a step compiled ahead's over it (`AheadOfTime.over`)."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
@@ -875,16 +873,17 @@ class Trainer(Generic[Loss, Effects]):
         for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
             if mesh.shape.get(axis, 1) == 1:
                 continue
-            if axis in self._stated_links and axis not in self._ahead_links:
-                stated = self._stated_links[axis]
+            stated = self._ahead_links.get(axis, self._stated_links.get(axis))
+            if stated is not None:
                 links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
+                self._bandwidths[mesh, axis] = stated.bytes_per_second
                 continue
             if not all(device in jax.devices() for device in devices):
                 links[axis] = Link(None, peak)
                 continue
             if (mesh, axis) not in self._bandwidths:
                 self._bandwidths[mesh, axis] = None if peak is None else link_figure(
-                    mesh, axis, self._ahead_links, self._resumed_links)
+                    mesh, axis, self._resumed_links)
             links[axis] = Link(self._bandwidths[mesh, axis], peak)
         return links
 

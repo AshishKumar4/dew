@@ -31,8 +31,9 @@ import json
 import logging
 import pickle
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
 import jax
 import jax.experimental.topologies as topologies
@@ -42,6 +43,8 @@ from jax.experimental import serialize_executable
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.nn.kernels.generation import assumed, capability, gpu_target
+from dew.nn.sharding import Link
+from dew.registry import record_argument
 from dew.telemetry.instrumentation import StepFlops, step_flops
 from dew.training.profiling import pgle_runs
 
@@ -131,11 +134,12 @@ class AheadOfTime:
     alias_bytes: int
     temp_bytes: int
     code_bytes: int
-    links: dict[str, float | None]
-    """The bandwidth of each split axis's link the step decided its projections by (`Trainer.links`):
-    on compile-only GPUs none measured (None), so none spreads. A run handed the step traces with these
-    in place of measuring its own (`Trainer`'s `ahead`), which could spread a projection the step does
-    not and lower another program, and its checkpoints record them (`link_figures`)."""
+    links: dict[str, Link]
+    """Each split axis's link the step decided its projections by (`Trainer.links`), whole: on
+    compile-only GPUs none measured, so none spreads, unless the trainer stated one. A run handed the
+    step traces with these in place of its own (`Trainer`'s `ahead`), which could spread a projection
+    the step does not and lower another program, and its checkpoints record their bandwidths
+    (`link_figures`)."""
     plan: JSON = None
     """The plan the run's own fit search makes on those
     GPUs (`Trainer.plan`): every program it compiled, each with the footprint derived for it beside
@@ -152,6 +156,15 @@ class AheadOfTime:
         step's memory (`dew.training.memory.step_headroom`): its arguments, resident, its outputs that
         alias none of them, and its temporaries."""
         return self.argument_bytes + self.output_bytes - self.alias_bytes + self.temp_bytes
+
+    def over(self, stated: Mapping[str, Link]) -> dict[str, Link]:
+        """The links a run handed this step traces with, for every program it compiles: the step's own
+        (`links`), which the run's `stated` ones give way to, as it says once where they differ."""
+        differ = {axis: link for axis, link in stated.items() if self.links.get(axis, link) != link}
+        if differ:
+            _log.warning("this run states links %s, and the step compiled ahead traced with %s; the run "
+                         "traces with the step's", differ, {axis: self.links[axis] for axis in differ})
+        return self.links
 
     def save(self, path: str | Path) -> None:
         """Write the step to `path`, for `load` on a host of its topology."""
@@ -207,6 +220,13 @@ class AheadTarget:
     devices: int
     path: str
     capacity_gib: float | None = None
+    links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
+        default_factory=dict)
+    """The links of the split axes the step is compiled over, by axis name (`Trainer`'s `links`), which
+    no compile-only GPU measures: an axis it names spreads a projection as that link would, and the run
+    handed the step traces with it (`AheadOfTime.links`), `--trainer.compile-ahead.links
+    '{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`. Unnamed, an axis spreads
+    nothing."""
 
     @property
     def capacity(self) -> int | None:
@@ -304,4 +324,4 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
-        capacity=capacity, links={axis: link.bytes_per_second for axis, link in trainer.links.items()})
+        capacity=capacity, links=dict(trainer.links))
