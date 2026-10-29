@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Write tests/fixtures/lora_peft: PEFT's rsLoRA scaling and its branch
-dropout in training, run by PEFT 0.20.0 on tests/fixtures/hf/llama-tiny.
+"""Write tests/fixtures/lora_peft: PEFT's rsLoRA and branch-dropout adapters
+on tests/fixtures/hf/llama-tiny, and the PEFT runs tests/test_lora_peft.py
+holds Dew's training steps to in the test (`run_at`).
 
 - `rslora`: a rank 4, alpha 8 adapter on q_proj, v_proj and down_proj with
   `use_rslora=True`, a rank 2 on layer 1's v_proj and alpha 3 on down_proj,
@@ -8,42 +9,20 @@ dropout in training, run by PEFT 0.20.0 on tests/fixtures/hf/llama-tiny.
   rank. Its B factors are drawn so the adapter moves the logits.
 - `dropout`: the same targets at `lora_dropout=0.25`, the model in training
   mode. PEFT's `LoraLayer.forward` drops the branch's input,
-  `lora_B(lora_A(dropout(x))) * scaling`; here each target's dropout
+  `lora_B(lora_A(dropout(x))) * scaling`; in the test each target's dropout
   module keeps the mask Dew's own branch draws in the LM objective's first
-  training loss (`dew_masks`), torch's `nn.Dropout` with its random bits
-  fixed to Dew's: `x * mask / (1 - p)`.
+  training loss over the same ids (`dew_masks`), torch's `nn.Dropout` with
+  its random bits fixed to Dew's: `x * mask / (1 - p)`.
 
-Each case writes PEFT's adapter directory, the fixture's input ids, the
-base and adapted logits, the mean next-token cross entropy and its
-gradient with respect to every adapter factor, and every factor after two
-torch AdamW steps (`ADAMW`) on that loss, in float32 and in float64.
+Each case writes PEFT's adapter directory, run by the `peft` cohort of
+tools/reference_releases.py:
 
-The loss is one number, so one run of it against PEFT's is one rounding draw
-against another. `orders.npz` beside each case holds PEFT's float32 loss's
-distance from its float64 one over the K-order rule's residual orders
-(tests/reference_error.py, `ORDERS`): Dew writes the base model and the adapter
-in each order (`write_orders`, tests/residual_orders.py, the factors' residual
-sides read off their declared axes), with the dropout case's masks moved with
-the branch inputs that carry the residual, and PEFT's run reads them back
-(`record_orders`), on an AVX-512 (x86-64-v4) CPU, the CI runners' ISA: torch's
-float32 products sum in other orders on an AVX2 one.
-The dropout case reads its masks, one per target keyed by the target's
-PEFT module path, from `masks.npz` beside it, which Dew writes first over
-the committed adapter (`masks`, in Dew's environment); the PEFT run (the
-`peft` cohort of tools/reference_releases.py) follows, both steps on
-those masks:
-
-    PYTHONPATH=src python tools/lora_peft_reference.py masks
-    ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_peft_reference.py
-    PYTHONPATH=src python tools/lora_peft_reference.py write-orders <dir>
-    ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_peft_reference.py orders <dir>
+    PYTHONPATH=src:tools python tools/lora_peft_reference.py
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -94,11 +73,8 @@ def adapter(case: str, settings: dict, out: Path):
     return model
 
 
-MASKS = "masks.npz"
-"""The dropout case's keep masks, Dew's own (`dew_masks`), which the PEFT run reads."""
-
 ADAMW = {"lr": 1e-3, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 0.01}
-"""The optimizer of the two training steps each case records: torch's AdamW, its decay decoupled."""
+"""The optimizer of the two training steps each case runs: torch's AdamW, its decay decoupled."""
 
 
 def branch_dropout(adapter, context) -> str | None:
@@ -158,140 +134,15 @@ def dew_masks(adapter, tokens: np.ndarray) -> dict[str, np.ndarray]:
     return masks
 
 
-ORDER_SEED = 6
-"""The seed of the residual orders `write_orders` draws."""
-
-
-def write_orders(out: Path) -> None:
-    """Each case's base model and adapter written under `out`/<case>/<k>/ in each of `ORDERS`
-    residual orders (tests/residual_orders.py, `in_order`), order 0 the identity: the base
-    through `Pretrained.save`, the adapter through `Adapter.save`, and the dropout case's masks
-    in `MASKS`."""
-    sys.path.insert(0, str(ROOT / "tests"))
-    from reference_error import ORDERS
-    from residual_orders import orders, residual_width
-
-    from dew.interop.pretrained import Pretrained
-    from dew.lora import LoRA
-
-    decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
-    for case in CASES:
-        adapter = LoRA.load(decoder.model, decoder.variables, FIXTURE / case / "adapter",
-                            layouts=decoder.layouts)
-        whole, residual_inputs = adapter_orders(adapter)
-        drawn = orders(residual_width(whole), ORDERS, ORDER_SEED)
-        (out / case).mkdir(parents=True, exist_ok=True)
-        np.save(out / case / "orders.npy", drawn)
-        masks = None
-        if CASES[case]["lora_dropout"]:
-            with np.load(FIXTURE / case / MASKS) as saved:
-                masks = {key: saved[key] for key in saved}
-        for k, order in enumerate(drawn):
-            variables, moved_masks = in_order(adapter, whole, residual_inputs, order, masks)
-            decoder.save(out / case / str(k) / "base",
-                         variables={**decoder.variables, "params": variables["frozen"]})
-            adapter.save(variables, out / case / str(k) / "adapter")
-            if moved_masks is not None:
-                np.savez(out / case / str(k) / MASKS, **moved_masks)
-        print(f"{out / case}: {len(drawn)} orders, residual branch inputs {sorted(residual_inputs)}")
-
-
-def adapter_orders(adapter) -> tuple[dict, set[str]]:
-    """The adapter's frozen base and its factors as one `{"params": ...}` tree, which an order
-    permutes whole (tests/residual_orders.py, the factors' residual sides read off their declared
-    axes), and the PEFT module paths of the targets whose branch input is the residual stream:
-    those whose `lora_A`'s first declared axis is 'embed'."""
-    import jax
-
-    from dew.batch import thaw
-    from dew.nn.sharding import declarations, declared_axes, parameter_path
-
-    whole = thaw(adapter.variables)
-    declared = declarations(whole["params"])
-    residual_inputs = {
-        "model." + ".".join(parameter_path(path)[:-1]).replace("layers_", "layers.")
-        for path, leaf in jax.tree_util.tree_leaves_with_path(whole["params"])
-        if parameter_path(path)[-1] == "lora_A" and declared_axes(path, leaf.ndim, declared)[0] == "embed"}
-    return whole, residual_inputs
-
-
-def in_order(adapter, whole: dict, residual_inputs: set[str], order: np.ndarray,
-             masks: dict[str, np.ndarray] | None) -> tuple[dict, dict[str, np.ndarray] | None]:
-    """The adapter's variables with the residual stream's units in `order` (`adapter_orders`),
-    and `masks`, a dropout mask's last axis moved with its target's branch input where that input
-    is the residual stream."""
-    sys.path.insert(0, str(ROOT / "tests"))
-    from residual_orders import permuted
-
-    from dew.batch import freeze
-    from dew.lora import FACTORS
-
-    variables = freeze(permuted(whole, order), lambda path: path[-1] in FACTORS)
-    if masks is None:
-        return variables, None
-    return variables, {key: mask[..., order] if key in residual_inputs else mask
-                       for key, mask in masks.items()}
-
-
-def record_orders(drawn: Path) -> None:
-    """PEFT's float32 loss over each case's residual orders under `drawn` (`write_orders`), its
-    distance from the case's float64 loss, written to the case's `orders.npz` beside the orders.
-    A permutation of the residual stream leaves the loss exact, so every order's truth is the
-    identity's; order 0 must reproduce the case's recorded float32 loss bit for bit."""
-    from reference_releases import require
-
-    require("peft")
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM
-
-    input_ids = torch.from_numpy(np.load(LLAMA / "input_ids.npy")).long()
-    for case, settings in CASES.items():
-        with np.load(FIXTURE / case / "reference.npz") as stored:
-            recorded, truth = stored["loss"], np.float64(stored["loss_f64"])
-        drawn_orders = np.load(drawn / case / "orders.npy")
-        distances = []
-        for k in range(len(drawn_orders)):
-            base = AutoModelForCausalLM.from_pretrained(drawn / case / str(k) / "base", dtype=torch.float32)
-            model = PeftModel.from_pretrained(base, drawn / case / str(k) / "adapter", is_trainable=True)
-            masks = None
-            if settings["lora_dropout"]:
-                with np.load(drawn / case / str(k) / MASKS) as saved:
-                    masks = {key: saved[key] for key in saved}
-            loss = run_at(model, input_ids, torch.float32, masks, settings["lora_dropout"])["loss"]
-            if k == 0:
-                assert np.array_equal(loss, recorded), "order 0 must reproduce the case's recorded loss"
-            distances.append(abs(np.float64(loss) - truth))
-        np.savez(FIXTURE / case / "orders.npz",
-                 orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
-                 loss=np.asarray(distances))
-        print(f"{case}: {len(distances)} orders, loss distances / order 0's",
-              np.round(np.asarray(distances) / distances[0], 2))
-
-
-def write_masks() -> None:
-    """Write the dropout case's masks: Dew's draw over the committed adapter."""
-    from dew.interop.pretrained import Pretrained
-    from dew.lora import LoRA
-
-    decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
-    adapter = LoRA.load(decoder.model, decoder.variables, FIXTURE / "dropout" / "adapter",
-                        layouts=decoder.layouts)
-    drawn = dew_masks(adapter, np.load(LLAMA / "input_ids.npy"))
-    np.savez(FIXTURE / "dropout" / MASKS, **drawn)
-    print(f"{FIXTURE / 'dropout' / MASKS}: {len(drawn)} masks")
-
-
-@contextlib.contextmanager
-def widened(model):
+def twin(model):
     """`model`'s float64 twin (`float64_twin`): the same base and adapter built inside `float64`, so
     every value their constructors compute is float64's (the rotary tables' among them), loaded with
-    `model`'s weights and run inside `float64`, every float32 pin of transformers' Llama (5.16.1)
-    widened: its RMSNorm's cast (modeling_llama.py:64), its rotary tables' (:108, :115-117) and its
-    attention softmax's (:208)."""
+    `model`'s weights, to run inside `float64`, every float32 pin of transformers' Llama widened: its
+    RMSNorm's cast, its rotary tables' and its attention softmax's."""
     import copy
 
     from peft import get_peft_model
-    from torch_precision import float64, float64_twin
+    from torch_precision import float64_twin
     from transformers import AutoModelForCausalLM
 
     def build():
@@ -299,16 +150,7 @@ def widened(model):
                                                 dtype=torch.float64)
         return get_peft_model(base, copy.deepcopy(model.peft_config["default"]))
 
-    twin = float64_twin(model, build)
-    with float64():
-        yield twin
-
-
-def run(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | None, rate: float) -> dict:
-    if dtype == torch.float64:
-        with widened(model) as wide:
-            return run_at(wide, input_ids, dtype, drawn, rate)
-    return run_at(model.to(dtype), input_ids, dtype, drawn, rate)
+    return float64_twin(model, build)
 
 
 def run_at(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | None, rate: float) -> dict:
@@ -358,34 +200,10 @@ def main() -> None:
     from reference_releases import require
 
     require("peft")
-    from transformers import AutoModelForCausalLM
-
-    input_ids = torch.from_numpy(np.load(LLAMA / "input_ids.npy")).long()
-    with torch.no_grad():
-        base = AutoModelForCausalLM.from_pretrained(LLAMA, dtype=torch.float32)
-        base_logits = base(input_ids).logits.numpy()
     for case, settings in CASES.items():
-        model = adapter(case, settings, FIXTURE)
-        rate = settings["lora_dropout"]
-        drawn = None
-        if rate:
-            with np.load(FIXTURE / case / MASKS) as saved:
-                drawn = {key: saved[key] for key in saved}
-        arrays = {"input_ids": input_ids.numpy(), "base_logits": base_logits}
-        for dtype in (torch.float32, torch.float64):
-            arrays.update(run(model, input_ids, dtype, drawn, rate))
-        np.savez(FIXTURE / case / "reference.npz", **arrays)
-        moved = np.abs(arrays["adapted_logits_f64"] - base_logits).max()
-        print(f"{FIXTURE / case}: logits moved {moved:.3f}, "
-              f"{sum(1 for key in arrays if key.startswith('grad/') and key.endswith('_f64'))} gradients")
+        adapter(case, settings, FIXTURE)
+        print(f"{FIXTURE / case / 'adapter'}: written")
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["masks"]:
-        write_masks()
-    elif sys.argv[1:2] == ["write-orders"]:
-        write_orders(Path(sys.argv[2]))
-    elif sys.argv[1:2] == ["orders"]:
-        record_orders(Path(sys.argv[2]))
-    else:
-        main()
+    main()

@@ -109,13 +109,13 @@ def transformers_model(directory: Path, *, masked: bool = False, dtype: str = "f
                                 experts_implementation="eager", **options).eval()
 
 
-def transformers_arms(model, run, *, source=None):
+def transformers_arms(model, run, *, source=None, twin=None):
     """Check 1's reference and truth over the transformers `model`: `run(model, *inputs)` under
     `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by the float64
     twin (`tools.torch_precision.float64_twin`) of `source`, by default `model`, inside `float64`, each
     run `as_given`, its tensors returned as NumPy arrays, a bfloat16 one as the float32 it holds exactly.
     A narrower `model` (bfloat16) is measured from its stored weights' truth: `source`, the float32
-    load."""
+    load. `twin` is the twin itself where the reference builds its own (a PEFT model's)."""
     import torch
 
     from tools.torch_precision import float64, float64_twin
@@ -132,7 +132,9 @@ def transformers_arms(model, run, *, source=None):
                                     run(network, *map(tensor, inputs)))
         return given
 
-    return arm(model, contextlib.nullcontext), arm(float64_twin(model if source is None else source), float64)
+    if twin is None:
+        twin = float64_twin(model if source is None else source)
+    return arm(model, contextlib.nullcontext), arm(twin, float64)
 
 
 def next_token_losses(model, ids):

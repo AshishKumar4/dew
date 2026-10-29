@@ -30,9 +30,9 @@ import optax
 import pytest
 from affine_run import Replaying
 from flax import linen as nn
-from interop_support import extract_fixture, hub_cache
+from interop_support import extract_fixture, fixture_ids, hub_cache, transformers_arms
 from model_support import flat_tree
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, dew_programs, widened
 from safetensors.numpy import load_file
 from test_joined import row_joins
 
@@ -1103,6 +1103,11 @@ def _moved_b(tuned, seed: int):
                             if path[-1].key == "lora_B" else leaf), tuned.variables)
 
 
+PIPELINE_SEEDS = {"flux": 0, "sd3": 0, "sd": 0}
+"""Each pipeline's declared draws of sampling keys against the source's sample (check 1), sized by
+`seeds_for` paired with the adapted sample on the CPU."""
+
+
 @pytest.mark.parametrize("family", ["flux", "sd3", "sd"])
 def test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source(family, pipelines):
     """`source.adapt(LoRA(...))` binds the denoiser's projections the modules name,
@@ -1115,9 +1120,9 @@ def test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source(family, p
     into the reductions that read a projection (the RMSNorms after `to_q`
     and `to_k`), and how such a fusion vectorizes depends on the CPU: on
     CI's AMD runner the two sampled programs part by a few float32 ulps. So
-    the sample is held to rounding, the adapted run as exact as the source,
-    both measured from the source in float64 (`reference_error`); a branch
-    that moved the output at all would sit far outside it."""
+    the sample is held to rounding: the adapted run on par with the source,
+    both from the source in float64, over drawn sampling keys (check 1); a
+    branch that moved the output at all would sit far outside it."""
     source = pipelines[family]
     tuned = source.adapt(LoRA(rank=2, modules=DENOISER_MODULES), key=0)
     assert source.adapter is None and tuned.adapter is not None
@@ -1129,14 +1134,19 @@ def test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source(family, p
                          .raw(prepared.noise, time)) for bundle in (source, tuned)]
     np.testing.assert_array_equal(*called)
 
-    def sampled(bundle, inputs) -> np.ndarray:
-        return np.asarray(bundle.text_to_image()(inputs, steps=2, key=1, decode=False).host().latents)
+    def sampled(bundle):
+        @dew_programs
+        def run(inputs):
+            return bundle.text_to_image()(inputs, steps=2, key=1, decode=False).host().latents
+        return run
 
-    with jax.enable_x64():
-        wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64),
-                                   variables=widened(source.variables))
-        truth = sampled(wide, widened(prepared))
-    assert_as_exact_as_the_reference(sampled(tuned, prepared), sampled(source, prepared), truth, family)
+    def draw(seed):
+        return (task.prepare(PROMPTS, key=seed, steps=2),)
+
+    wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64),
+                               variables=widened(source.variables))
+    assert_as_exact(sampled(tuned), sampled(source), draw, family, seeds=PIPELINE_SEEDS[family],
+                    truth_fn=as_given(lambda inputs: np.asarray(sampled(wide)(inputs))))
     with pytest.raises(ValueError):
         source.adapt(LoRA(rank=2, modules=("q_proj",)), key=0)
     with pytest.raises(ValueError):
@@ -1238,30 +1248,56 @@ def _written_as_read(name: str, source, variables, directory: Path) -> Adapter:
     return LoRA.load(source.model, source.variables, EXPORTS / name, layouts=source.layouts)
 
 
+EXPORT_SEEDS = 0
+"""Each written adapter's declared draws of ids against PEFT's adapted and merged logits (check 1), sized
+by `seeds_for` paired with Dew's logits on the CPU."""
+
+
 @pytest.mark.parametrize("name", ["llama", "llama-rslora", "llama-patterns"])
 def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_path):
-    """tools/lora_export_reference.py records PEFT 0.20.0 reading the
-    adapter a case writes (a fresh one at a rank and alpha, one with
-    rsLoRA, and the committed one whose rank and alpha patterns Dew writes
-    back, each with its factors moved) onto transformers' llama-tiny: every
-    tensor of the file lands, and the adapted and `merge_and_unload` logits
-    are recorded in float32 and float64. The adapter written here, on this
-    device, reads back as written, in the layout of the files PEFT read, and
-    Dew's adapted and merged logits from those files hold the float64 rule
-    against PEFT's."""
-    from tools.lora_export_reference import CASES, export_case
+    """PEFT reads the adapter a case writes (tools/lora_export_reference.py's: a fresh one at a rank
+    and alpha, one with rsLoRA, and the committed one whose rank and alpha patterns Dew writes back,
+    each with its factors moved) onto transformers' llama-tiny, every tensor of the file landing, and
+    Dew reads it back as written. Dew's adapted and merged logits are on par with PEFT's adapted and
+    `merge_and_unload` logits, from its float64 twin's merged in float64, over drawn ids (check 1);
+    the adapter moves PEFT's logits by more than a unit."""
+    import copy
+
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    from tools.lora_export_reference import CASES, assert_landed, export_case
+    from tools.lora_peft_reference import twin
+    from tools.torch_precision import float64
 
     _, written = export_case(CASES[name], decoder, tmp_path)
-    adapter = _written_as_read(name, decoder, written, tmp_path)
-    variables, arrays = adapter.variables, _recorded(name)
-    ids = jnp.asarray(arrays["input_ids"])
-    adapted = adapter.model.apply(variables, ids)
-    merged = decoder.model.apply(adapter.merge(variables), ids)
-    assert np.abs(arrays["fp32.adapted"] - arrays["fp32.base"]).max() > 1
-    assert_as_exact_as_the_reference(np.asarray(adapted), arrays["fp32.adapted"], arrays["fp64.adapted"],
-                                     f"{name} adapted")
-    assert_as_exact_as_the_reference(np.asarray(merged), arrays["fp32.merged"], arrays["fp64.merged"],
-                                     f"{name} merged")
+    adapter = LoRA.load(decoder.model, decoder.variables, tmp_path, layouts=decoder.layouts)
+    for read, wrote in zip(jax.tree.leaves(adapter.variables["params"]), jax.tree.leaves(written["params"]),
+                           strict=True):
+        np.testing.assert_array_equal(np.asarray(read), np.asarray(wrote))
+    base = AutoModelForCausalLM.from_pretrained(LLAMA, dtype=torch.float32, attn_implementation="eager")
+    peft = PeftModel.from_pretrained(base, tmp_path).eval()
+    assert_landed(peft, load_file(str(tmp_path / "adapter_model.safetensors")))
+    wide = twin(peft)
+    with float64():
+        merged_wide = copy.deepcopy(wide).merge_and_unload()
+    merged = copy.deepcopy(peft).merge_and_unload()
+
+    def both(model, ids):
+        adapted_model, merged_model = model
+        return {"adapted": adapted_model(ids).logits, "merged": merged_model(ids).logits}
+
+    theirs, truth = transformers_arms((peft, merged), both, twin=(wide, merged_wide))
+    draw = fixture_ids(LLAMA)
+    variables = adapter.variables
+    assert_as_exact(lambda ids: {"adapted": adapter.model.apply(variables, ids),
+                                 "merged": decoder.model.apply(adapter.merge(variables), ids)},
+                    theirs, draw, f"{name} logits", seeds=EXPORT_SEEDS, truth_fn=truth)
+    (ids,) = draw(0)
+    with peft.disable_adapter(), torch.no_grad():
+        plain = peft(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
+    assert np.abs(theirs(ids)["adapted"] - plain).max() > 1
 
 
 @pytest.mark.parametrize("family", ["sd", "flux", "sd3"])
