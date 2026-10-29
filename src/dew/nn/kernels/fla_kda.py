@@ -843,8 +843,8 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
     (`fla_gdn.chunk_bwd_dhu`'s USE_GK branch), the fused WY and memory gradients, the intra-chunk
     terms, a key head's value heads summed (fla's GVA), and the decay's gradient: its terms through the
     range from a chunk's start summed back over the chunk, its pairs' summed over the ranges that hold
-    each token (`bwd_intra`'s), each sequence's first token's from its memory (`first_decay_grad`). A `wide` output's
-    cotangent is taken in the values' dtype (`fla_gdn._rule_bwd`)."""
+    each token (`bwd_intra`'s), each sequence's first token's from its memory (`first_decay_grad`). A
+    `wide` output's cotangent is taken in the values' dtype (`fla_gdn._rule_bwd`)."""
     q, k, v, (g, g_lo), beta, aqk, akk, h0, memory, spans = residual
     do, dht = cotangent
     do = do.astype(v.dtype) if wide else do
