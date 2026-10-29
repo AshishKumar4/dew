@@ -70,9 +70,9 @@ def test_a_heatmaps_cells_take_each_frames_strengths_and_its_marks_outline_their
         r, c = divmod(index, 3)
         strengths = [float(value) for value in held(root, square, "fill-opacity")]
         assert strengths == list(np.clip(frames[:, r, c], 0, 1))
-    outlined = [rect for rect in root.iter(f"{SVG}rect") if "stroke-width:1.75" in rect.get("style", "")]
-    assert [(float(rect.get("x")), float(rect.get("y"))) for rect in outlined] == \
-        [(float(filled[5].get("x")), float(filled[5].get("y")))]
+    outlined = [rect for rect in root.iter(f"{SVG}rect") if "fill:none" in rect.get("style", "")
+                and "animation" not in rect.get("style", "")]
+    assert [(rect.get("x"), rect.get("y")) for rect in outlined] == [(filled[5].get("x"), filled[5].get("y"))]
     wider = figures.heatmap(np.zeros((1, 2, 6)), rows=["q0", "q1"], columns=list("abcdef"), cell=cell)
     assert wider.width - figure.width == 3 * cell and wider.height == figure.height
 
@@ -120,8 +120,9 @@ def test_an_image_drawn_sharp_keeps_its_pixels():
 def test_a_scatters_dots_slide_by_their_moves_and_land_where_their_targets_are_drawn():
     """With `moved`, each dot of a scatter slides by its own move, scaled alike for every dot: two dots that
     move by the same amount slide alike, one that does not move stays, one that moves right alone slides right
-    alone. Where it ends is where the same dot is drawn when `moved` is where it starts: there, a dot at an
-    axis's tick sits on the tick's label."""
+    alone. Where it ends is where the same dot is drawn when `moved` is where it starts, both pictures on one
+    pair of axes (their ticks drawn alike): each dot's place plus its slide is its twin's place, at the 0.1 px
+    the slide is written to; there, a dot at an axis's tick sits on the tick's label."""
     start = {"base": [(0.0, 0.0), (5.0, 5.0)], "tuned": [(20.0, 20.0), (0.0, 20.0)]}
     end = {"base": [(10.0, 20.0), (15.0, 25.0)], "tuned": [(20.0, 20.0), (10.0, 20.0)]}
     moved = read(figures.points(start, x_label="x", y_label="y", joined=False, moved=end))
@@ -130,11 +131,20 @@ def test_a_scatters_dots_slide_by_their_moves_and_land_where_their_targets_are_d
     assert slides[0] == slides[1] and slides[2] == ("0.0", "0.0")
     assert float(slides[3][0]) > 0 and slides[3][1] == "0.0" and float(slides[0][1]) < 0
     landed = read(figures.points(end, x_label="x", y_label="y", joined=False, moved=start))
-    ticks = {text.text: float(text.get("x")) for text in landed.iter(f"{SVG}text")
-             if text.get("text-anchor") == "middle"}
-    drawn = [float(dot.get("cx")) for dot in landed.iter(f"{SVG}circle")
-             if "animation" in dot.get("style", "")]
-    assert drawn[0] == ticks["10"] and drawn[2] == ticks["20"]
+
+    def ticks(root) -> dict[str, tuple[str, str]]:
+        return {text.text: (text.get("x"), text.get("y")) for text in root.iter(f"{SVG}text")
+                if text.text and text.text.lstrip("-").isdigit()}
+
+    def dots(root) -> list:
+        return [dot for dot in root.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
+
+    assert ticks(moved) == ticks(landed)
+    for dot, twin, (dx, dy) in zip(dots(moved), dots(landed), slides, strict=True):
+        assert (f"{float(twin.get('cx')) - float(dot.get('cx')):.1f}",
+                f"{float(twin.get('cy')) - float(dot.get('cy')):.1f}") == (dx, dy)
+    drawn = [float(dot.get("cx")) for dot in dots(landed)]
+    assert drawn[0] == float(ticks(landed)["10"][0]) and drawn[2] == float(ticks(landed)["20"][0])
 
 
 @pytest.mark.parametrize(("x", "ticks"), [([1, 1000], {"1", "10", "100", "1000"}),
@@ -160,8 +170,9 @@ def test_a_log_axis_places_each_dot_at_its_logarithm():
 
 
 def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
-    """Each token's box holds its text, at least `cell` wide; a "none" fill leaves an outline; each row's note
-    sits beside the widest row; with `seconds`, the rows appear one after another."""
+    """Each token's box holds its text, at least `cell` wide (a wider `cell` widens a short token's box
+    alone); a "none" fill leaves an outline; each row's note sits beside the widest row; with `seconds`, the
+    rows appear one after another."""
     rows = [["<bos>", "a"], ["a_long_token", "b", "c"]]
     fills = [["accent_fill", "none"], ["tint0", "tint1", "none"]]
     root = read(figures.tokens(rows, fills=fills, notes=["prompt", "completion"], cell=27, seconds=4.0))
@@ -177,6 +188,11 @@ def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
     assert all(left + width <= right for left, width, right in zip(row, widths[2:], row[1:], strict=False))
     outlined = ["stroke:none" not in box.get("style") for box in boxes]
     assert outlined == [fill == "none" for row in fills for fill in row]
+    # `cell` is a floor: drawn 13 wider, each short token's box is 13 wider, the long one's as it was.
+    wider = read(figures.tokens(rows, fills=fills, cell=40))
+    grown = [float(box.get("width")) - width
+             for box, width in zip(wider.iter(f"{SVG}rect"), widths, strict=True)]
+    assert grown == [13.0 if token in {"a", "b", "c"} else 0.0 for row in rows for token in row]
     notes = {text.text: float(text.get("x")) for text in root.iter(f"{SVG}text")
              if text.text in {"prompt", "completion"}}
     right = max(float(box.get("x")) + width for box, width in zip(boxes, widths, strict=True))
@@ -188,10 +204,12 @@ def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
 
 
 def test_an_arrows_head_points_along_its_line_at_its_end():
-    """`Figure.arrow`'s head is a triangle whose tip is the line's end and whose base stands behind it, square
-    to the line and halved by it: along the x axis its corners share an x behind the tip and lie either side
-    of the line alike, along the y axis they share a y behind it; in a moved group the drawing is the same."""
-    for (x1, y1, x2, y2), along in (((0, 10, 100, 10), 0), ((40, 90, 40, 10), 1)):
+    """`Figure.arrow`'s head is a triangle whose tip is the line's end and whose base stands behind it,
+    square to the line and halved by it, one size whatever the line's length and direction: at the hundredths
+    the figure writes, its corners lie as far from the tip, their midpoint on the line behind the tip, and the
+    base and sides match every other arrow's; in a moved group the drawing is the same."""
+    heads = []
+    for x1, y1, x2, y2 in ((0, 10, 100, 10), (40, 90, 40, 10), (10, 90, 70, 10), (10, 90, 40, 50)):
         figure = figures.Figure(120, 120)
         with figure.group(5, 7) as moved:
             figure.arrow(x1, y1, x2, y2)
@@ -201,6 +219,14 @@ def test_an_arrows_head_points_along_its_line_at_its_end():
         head = next(root.iter(f"{SVG}path"))
         tip, a, b = [(float(x), float(y)) for x, y in re.findall(r"([-\d.]+),([-\d.]+)", head.get("d"))]
         assert tip == (float(line.get("x2")), float(line.get("y2")))
-        across = 1 - along
-        assert a[along] == b[along] and (a[along] - tip[along]) * ((x2, y2)[along] - (x1, y1)[along]) < 0
-        assert a[across] + b[across] == 2 * tip[across] and a[across] != b[across]
+        middle = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+        behind = ((tip[0] - middle[0]) * (x2 - x1) + (tip[1] - middle[1]) * (y2 - y1))
+        across = (middle[0] - x1) * (y2 - y1) - (middle[1] - y1) * (x2 - x1)
+        assert behind > 0 and round(across, 2) == 0
+
+        def apart(p, q):
+            return round((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2, 2)
+
+        assert apart(a, tip) == apart(b, tip)
+        heads.append((apart(a, tip), apart(a, b)))
+    assert len(set(heads)) == 1
