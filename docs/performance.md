@@ -1233,8 +1233,8 @@ SXM at batch 2 (Mistral 1), the RTX 4080 at batch 1, jax 0.11.2, median of 20:
 The 4080's backward takes no head over 192, so Gemma 3 stays off flash there. The sink rows are
 historical: flash no longer takes sinks (ledger 2410, 2026-10-29), its backward's D, `rowsum(dO O)` of
 the rounded output, misreading a row a sink dominates (32 to 512 times the reference's error from
-float64 on an H100, packed with a window). A call with sinks runs 'auto', the template on an H100 and
-xla elsewhere. Flash takes windows wherever its declared cell names it and it takes the call
+float64 on an H100, packed with a window). 'auto' runs a whole-sequence call with sinks on the
+template where the template takes it, and on the generic path otherwise. Flash takes windows wherever its declared cell names it and it takes the call
 (`FLASH_SUPPORTS`), its output and gradients within tests/reference_error.py's rule of the xla
 kernel's from float64, batched and packed (tests/test_kernels.py); the template takes every other GPU
 call it takes. A packed or key-masked windowed call keeps its band on cuDNN, which takes the band's
