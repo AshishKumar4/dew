@@ -686,7 +686,38 @@ def plan(target: float, timings: dict) -> list[dict]:
                         "tests": " ".join(names), "split": COLLECT,
                         "rows": [row(PYTHONS[-1], name, COLLECT) for name in names], "weight": target,
                         "cache": cache, "whole": cells})
-    return entries
+    # The whole suite's run alone runs the release checks, a task each requirement (`released`).
+    checks = released(every) if cells == "1" else {}
+    for index, (requirement, names) in enumerate(sorted(checks.items()), start=1):
+        entries.append({"name": f"{PYTHONS[0]}-release-{index}", "python": PYTHONS[0],
+                        "tests": " ".join(names), "split": "",
+                        "rows": [row(PYTHONS[0], name, f"{RELEASE}{requirement}") for name in names],
+                        "weight": target, "cache": cache, "whole": cells, "release": requirement})
+    return [{"release": "", **entry} for entry in entries]
+
+
+RELEASE = "release:"
+"""A release check's row, beside its file's own: `row`'s group, its requirement after it."""
+
+
+def released(files: list[str]) -> dict[str, list[str]]:
+    """The test files of `files` with release checks, by the requirement each check runs under: its
+    release_env(<requirement>) mark's argument, as the file's source writes it (2173: a release's own code
+    checked under a package pinned apart from the suite's, transformers>=5.18.0 for LFM3's)."""
+    checks: dict[str, list[str]] = {}
+    for name in files:
+        source = Path(name).read_text()
+        if "release_env" not in source:
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "release_env" and node.args):
+                continue
+            requirement = node.args[0]
+            if (isinstance(requirement, ast.Constant) and isinstance(requirement.value, str)
+                    and name not in checks.get(requirement.value, [])):
+                checks.setdefault(requirement.value, []).append(name)
+    return checks
 
 
 def node_of(case: ET.Element) -> str:
@@ -752,7 +783,8 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
-         grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False) -> int:
+         grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
+         release: str = "") -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -763,19 +795,22 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     file goes there (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them.
     return tested(python, tests, split, out, deadline, cache, grace, shared(python), {}, coverage,
-                  whole=whole)
+                  whole=whole, release=release)
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
-           network: bool = False, whole: bool = False) -> int:
+           network: bool = False, whole: bool = False, release: str = "") -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
-    Hub open, recorded on the network lane's class (`device_class`)."""
+    Hub open, recorded on the network lane's class (`device_class`). With `release`, the release checks that
+    requirement's marks name alone, their pytest under uv's overlay of it on the suite's environment, each
+    file's row the release's (`RELEASE`)."""
     began = time.monotonic()
+    group = split or (f"{RELEASE}{release}" if release else "")
     rows = [found for name in tests
-            if cache != "off" and (found := reused(python, name, split, common, network))]
-    tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
+            if cache != "off" and (found := reused(python, name, group, common, network))]
+    tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {device_class(network)}; "
               "their rows are reused")
@@ -787,13 +822,17 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     report = out.with_name(f"{out.name}.junit.xml")
     for stale in (report, executed_report, collection):
         stale.unlink(missing_ok=True)
-    grouping = ["-p", "split", f"--ci-group={split}"] if split else []
+    grouping = (["-p", "split", f"--ci-group={split}"] if split else []) + (
+        ["-p", "release", f"--ci-release={release}"] if release else [])
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["-m", "coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    command = [*selected(session.pytest_run(python, report, *measured), network, whole), "-p", "executed",
-               *tests, *grouping]
+    command = [*selected(session.pytest_run(python, report, *measured), network, whole, bool(release)),
+               "-p", "executed", *tests, *grouping]
+    # A release check's pytest runs with its requirement over the suite's environment: torch and jax its.
+    command = ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
+               *command[1:]] if release else command
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
@@ -872,7 +911,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         seconds = shares[name]
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
-        ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
+        ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([output[-4000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
@@ -1008,14 +1047,17 @@ def collected(python: str, marks: str) -> dict[str, int]:
     return counts
 
 
-def selected(command: list[str], network: bool, whole: bool = False) -> list[str]:
+def selected(command: list[str], network: bool, whole: bool = False, release: bool = False) -> list[str]:
     """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
     tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
     the whole suite's own run (`whole`: DEW_WHOLE_SUITE, every fifth publish's ci/full-whole-*), whatever
     the cache's policy: a policy-off train runs every file, never a whole-suite cell (Main, 2026-10-28:
-    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline)."""
+    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks
+    run in their own tasks alone (`release`), under a requirement the suite's environment lacks
+    (`released`)."""
     at = command.index(session.SELECTION[1])
-    cells = "" if whole else " and not whole_suite"
+    checks = " and release_env" if release else " and not release_env"
+    cells = checks + ("" if whole else " and not whole_suite")
     return [*command[:at], "network" if network else session.SELECTION[1] + cells, *command[at + 1:]]
 
 
@@ -1380,6 +1422,8 @@ def task_arguments(running: argparse.ArgumentParser) -> None:
         help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
     running.add_argument("--whole", choices=("0", "1"), default="0",
                          help="the plan's DEW_WHOLE_SUITE: 1 on the whole suite's run, which runs its cells")
+    running.add_argument("--release", default="",
+                         help="a release check's requirement (`released`): its marked tests alone, under it")
     running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
@@ -1491,7 +1535,7 @@ def main() -> int:
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage, whole=args.whole == "1")
+                coverage=args.coverage, whole=args.whole == "1", release=args.release)
 
 
 if __name__ == "__main__":
