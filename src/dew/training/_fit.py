@@ -9,24 +9,28 @@ import datetime
 import math
 import time
 import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
+import grain.python as pygrain
 import jax
+import jax.numpy as jnp
 import numpy as np
+import optax
 from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import position
 from dew._coordination import agreed_next
 from dew._records import JSON
-from dew.batch import CONSUMED_COUNT, EXAMPLES_CONSUMED, Batch, ConsumedCount
+from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
+from dew.data.compile import Handed, native
 from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
 from dew.distributed.placement import MeshSpec, Placement
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
-from dew.optim import OptimConfig
+from dew.optim import OptimConfig, reclocked
 from dew.state import TrainState
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
@@ -354,16 +358,16 @@ class FitRun:
             start_capture(profiler)
             self.tracing = True
 
-    def committed_examples(self, interval: Interval, points: Sequence[int],
-                           committed: Callable[[], bool]) -> tuple[int, int]:
-        """Where the state's update window has just committed (`committed`, read off the state only
-        while one of the cooldown `points` of examples lies past the last commit), the consumed examples
-        now and at that commit, which a point is crossed between (`dew.training.cooldown.Branch.due`),
-        so its branch starts where an update has committed, a rejected microbatch's window included;
-        none crossed otherwise."""
+    def committed_examples(self, interval: Interval, points: Sequence[int], state: TrainState,
+                           window: int) -> tuple[int, int]:
+        """Where the state's update window of `window` microsteps has just committed (read off `state`
+        only while one of the cooldown `points` of examples lies past the last commit), the consumed
+        examples now and at that commit, which a point is crossed between
+        (`dew.training.cooldown.Branch.due`), so its branch starts where an update has committed, a
+        rejected microbatch's window included; none crossed otherwise."""
         if not any(interval.consumed_committed < point <= interval.consumed for point in points):
             return 0, 0
-        if not committed():
+        if int(state.microstep) % window:
             return 0, 0
         crossed = interval.consumed, interval.consumed_committed
         interval.consumed_committed = interval.consumed
@@ -387,6 +391,21 @@ class FitRun:
         """Whether the stream ran out after the batch the run steps now (`ends_here`'s read found its
         end), not closed before it ran out."""
         return self.ahead is not None and self.ahead[0] is None
+
+    def closing(self, interval: Interval, batch: Batch, examples: int | None) -> tuple[Batch, bytes | None]:
+        """`batch` marked where it is the last of a run on the examples clock (`examples`, its bound;
+        `CLOSES_WINDOW`), so the update it ends commits with the microbatches its window holds, known by
+        reading ahead (`ends_here`), every batch of the run marked so the step keeps one program; and
+        the stream's position after it, taken before that read, which the step saves. Where its stream
+        ran out, at its bound (`clocked`), the last also consumes the examples the bound read that no
+        batch counted (`drained`). A run on another clock's batch is as read."""
+        if examples is None:
+            return batch, None
+        position = None if self.train is None else self.train.source_state
+        last = self.ends_here(interval)
+        if self.ran_out:
+            batch = drained(batch, interval.consumed, examples)
+        return {**batch, CLOSES_WINDOW: np.bool_(last)}, position
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
@@ -442,6 +461,36 @@ def drained(batch: Batch, consumed: int, bound: int) -> Batch:
     owed[0] = remainder
     credited = column + (jax.device_put(owed, column.sharding) if isinstance(column, jax.Array) else owed)
     return {**batch, EXAMPLES_CONSUMED: credited, CONSUMED_COUNT: ConsumedCount(held.examples + remainder)}
+
+
+def refuse_unclocked(state: TrainState, resume: int, examples: int | None) -> None:
+    """Refuse to resume a run on the examples clock (`examples`) from a checkpoint written before runs
+    kept the examples they consumed (`TrainState.consumed`), whose schedule counted steps ahead."""
+    if examples is not None and state.consumed is None:
+        raise ValueError(
+            f"step {resume}'s checkpoint was written before a run bounded in examples kept the examples "
+            "it consumed, so its schedule was counted in steps ahead of the run, which this Dew no "
+            "longer counts: resume it with the Dew that wrote it, or start a fresh run from its weights")
+
+
+def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:
+    """A state supplied to a fit, which reads its data afresh: its clock of examples at none consumed
+    where the run is on that clock (`examples`), none on another, and its schedules in the form the run's
+    own optimizer makes (`made`, its init's shapes; `dew.optim.reclocked`)."""
+    return dataclasses.replace(initial, consumed=None if examples is None else jnp.zeros((), jnp.int32),
+                               opt_state=reclocked(initial.opt_state, made))
+
+
+def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool) -> None:
+    """Refuse a validation cadence whose batches nothing would read: no metric, no loss `read` (the
+    objective's validation loss, a checkpointer's or a held best's) and no preview a tracker takes
+    (`previewed`). Only an objective with no validation loss (Flow-GRPO's) and none of the rest would
+    open nothing and report nothing, and that contradiction is refused before the run does any work."""
+    if not suite.metrics and not read and not previewed:
+        raise ValueError(
+            f"{name} is scored every {suite.every} steps and nothing consumes it: "
+            "pass metrics to score it, preview=True with a tracker to sample from it, "
+            "or leave eval_every unset")
 
 
 def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
@@ -552,8 +601,33 @@ def first_batch(loader: Loader, mesh: Mesh) -> Batch:
     return batch
 
 
-def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bool, seeded: bool,
-                     mesh: MeshSpec | Mesh | None, given: Mapping[str, object]) -> list[str]:
+type HandedSplits = (Dataset | pygrain.MapDataset | pygrain.IterDataset
+                     | Mapping[str, Dataset | Handed | Reader | EvalSuite])
+"""`fit`'s validation: a chain or a Grain dataset, the split `val`, or splits by name, each a chain, a
+Grain dataset, NumPy arrays, a reader or an evaluation suite."""
+
+
+def handed_splits(
+        validation: HandedSplits | None) -> Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None:
+    """`fit`'s validation with what was handed as it is read as handed (`dew.data.compile.native`): a
+    Grain dataset as the split `val`, and a named split's Grain dataset or NumPy arrays as that split.
+    Arrays are a split by name alone, as a mapping of splits is one by its names."""
+    if isinstance(validation, pygrain.MapDataset | pygrain.IterDataset):
+        return {"val": native(validation, training=False)}
+    if validation is None or isinstance(validation, Dataset):
+        return validation
+    return {name: _handed_split(entry) for name, entry in validation.items()}
+
+
+def _handed_split(entry: Dataset | Handed | Reader | EvalSuite) -> Dataset | Reader | EvalSuite:
+    """One split of `handed_splits`: read as handed where it is a Grain dataset or arrays."""
+    if isinstance(entry, Mapping | pygrain.MapDataset | pygrain.IterDataset):
+        return native(entry, training=False)
+    return entry
+
+
+def unrecorded_parts(objective: str, dataset: Dataset | Loader | Handed, *, optimized: bool,
+                     seeded: bool, mesh: MeshSpec | Mesh | None, given: Mapping[str, object]) -> list[str]:
     """Why a run's record cannot rebuild a trainer's run on `dataset`, each a part a
     `dew.config.RunConfig` states otherwise, read from the trainer's own fields
     (`Checkpoints.python_run`): an objective, of the class `objective` names, built in Python, an optax
@@ -570,6 +644,9 @@ def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bo
         reasons.append("the mesh is a jax.sharding.Mesh; a run's record states a MeshSpec")
     if isinstance(dataset, Loader):
         reasons.append("the data is a compiled Loader; a run's record states its chain")
+    elif not isinstance(dataset, Dataset):
+        reasons.append("the data was handed as it is, a Grain dataset or arrays; a run's record states "
+                       "a chain")
     reasons += [f"{name} is given to the trainer, which a run's record does not state"
                 for name, part in given.items() if part is not None]
     return reasons

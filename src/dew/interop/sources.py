@@ -258,36 +258,18 @@ def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
 
 
 def repo_files(name: str, directory: Path) -> set[str]:
-    """Every file of the snapshot's commit, by repo-relative name.
-
-    A dry run lists the Hub tree the metadata fetch has just cached. Offline
-    it cannot: without a cached tree it raises DryRunError, and with one it
-    raises LocalEntryNotFoundError for the first listed file that was never
-    downloaded. The cache is then all a load can read anyway, so the
-    snapshot directory's own files are the listing.
+    """Every file of the snapshot's commit, by repo-relative name: as the Hub lists it
+    (`_hub_files`), recorded so an offline load reads the same listing (`hub_answer`);
+    offline where it was never listed online, the files the cached snapshot holds, all
+    such a load can read anyway.
     """
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import DryRunError, LocalEntryNotFoundError
-
-    try:
-        return {entry.filename for entry in snapshot_download(name, revision=directory.name, dry_run=True)}
-    except (DryRunError, LocalEntryNotFoundError):
-        return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
-
-
-def has_file(repo_id: str, filename: str, revision: str | None) -> bool:
-    """Whether the Hub repo `repo_id` holds `filename` at `revision`.
-
-    It asks the Hub; offline (`HF_HUB_OFFLINE`) it answers from the local
-    cache, where a file never fetched counts as absent.
-    """
-    from huggingface_hub import file_exists, try_to_load_from_cache
     from huggingface_hub.errors import OfflineModeIsEnabled
 
     try:
-        return file_exists(repo_id, filename, revision=revision)
+        return set(hub_answer(("repo files", name, directory.name),
+                              functools.partial(_hub_files, name, directory.name)).value)
     except OfflineModeIsEnabled:
-        return isinstance(try_to_load_from_cache(repo_id, filename, revision=revision), str)
+        return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
 
 
 def snapshot(name_or_dir: str, revision: str | None, *,
@@ -396,20 +378,12 @@ class StoredWeights:
     def files(self, folder: str) -> tuple[str, ...]:
         """The repo-relative files that hold `folder`'s weights (`weight_files`): a directory's
         own, or the commit's, as the Hub lists them (`_hub_files`), recorded so an offline run
-        reads the same listing (`hub_answer`); offline where it was never listed online, those
-        the cached snapshot holds (`repo_files`)."""
-        from huggingface_hub.errors import OfflineModeIsEnabled
-
+        reads the same listing (`repo_files`)."""
         if os.path.isdir(self.name_or_dir):
             listing = {path.relative_to(self.directory).as_posix() for path in self.directory.rglob("*")
                        if path.is_file()}
         else:
-            try:
-                listing = set(hub_answer(("repo files", self.name_or_dir, self.directory.name),
-                                         functools.partial(_hub_files, self.name_or_dir,
-                                                           self.directory.name)).value)
-            except OfflineModeIsEnabled:
-                listing = repo_files(self.name_or_dir, self.directory)
+            listing = repo_files(self.name_or_dir, self.directory)
         selected = (Path(self.subfolder) / folder).as_posix()
         return weight_files(listing, "" if selected == "." else selected,
                             lambda name: json.loads((self.directory / name).read_text()))
