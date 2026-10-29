@@ -287,10 +287,15 @@ class Decide(SavedRunTask, InItsForm):
 
     @classmethod
     def default_step(cls, directory: str) -> int | None:
-        """The step the run's calibration (`TASK_FILE`) was fitted on, where `save` wrote one: a run that
-        ended on its best step (`restore_best`) calibrates that step and loads it; else its latest."""
+        """The step the run's calibration (`TASK_FILE`) was fitted on where that is the step the run
+        ranked best: a run that ended on its best step (`restore_best`) calibrates that step and loads
+        it. Else its latest, which refuses a calibration fitted on another (`calibration`)."""
         saved = _calibrated(directory)
-        return None if saved is None else saved[1].step
+        if saved is None:
+            return None
+        with Checkpoints(directory) as checkpoints:
+            best = checkpoints.best
+        return saved[1].step if saved[1].step == best else None
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
