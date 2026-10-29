@@ -7,6 +7,8 @@ The sources are English Wikipedia's 2023-11-01 dump (prose, `text`), The Stack v
 (`content`) and UltraChat 200k's SFT conversations (`messages`), each read as the Hub stores it, streamed from its
 own Parquet shards. Text and code are tokenized and ended by EOS; a conversation is rendered through the
 tokenizer's chat template, and keeps only its tokens, as a pretraining row does not weigh speakers apart. The
+tokenizer is SmolLM2's, whose template renders each message the same whatever follows it, as `chat.template`
+needs (Qwen3's drops an earlier turn's reasoning once a later one follows, which it refuses). The
 three are mixed at 70/20/10 by valid target tokens (`mix(by="tokens")`) and packed first-fit into rows of
 `SEQ_LEN + 1` tokens. `--show N` reads the first N mixed documents and prints what a run would log of them
 (`Dataset.stats`): each source's rows and tokens, whose shares stand beside the shares asked; `build` returns
@@ -20,7 +22,7 @@ import tyro
 from dew.data import Hub, chat, mix, text
 from dew.data.pipeline import Pipeline
 
-TOKENIZER, TOKENIZER_REVISION = "Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca"
+TOKENIZER, TOKENIZER_REVISION = "HuggingFaceTB/SmolLM2-360M-Instruct", "a10cc1512eabd3dde888204e902eca88bddb4951"
 SEQ_LEN = 2048
 WEIGHTS = {"web": 0.7, "code": 0.2, "chat": 0.1}
 
