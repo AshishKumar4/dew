@@ -2033,9 +2033,9 @@ def a_wheel(root: Path, name: str, version: str) -> Path:
 @pytest.mark.parametrize("mark", ["release_env()", "release_env(requirement='pinned==2.0')",
                                   "release_env('pinned==2.0', 'other==1.0')", "release_env(2)"])
 def test_a_release_mark_without_one_requirement_fails_its_files_collection(ci, tmp_path, monkeypatch, mark):
-    """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string) fails its
-    file's collection, naming its test: every suite task sets a marked test aside, and no release task would plan
-    it, so it would run nowhere (Main's read of b94d89999)."""
+    """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string)
+    fails its file's collection, naming its test: every suite task sets a marked test aside, and no release
+    task would plan it, so it would run nowhere (Main's read of b94d89999)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_release.py": f"import pytest\n@pytest.mark.{mark}\n"
                        "def test_under_the_release():\n    pass\n"
