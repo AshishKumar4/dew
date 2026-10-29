@@ -188,10 +188,87 @@ class Coordinates:
         return real_places(self.valid)
 
 
+SCAN_BLOCKS = 64
+"""How many blocks a running sum or maximum along a token axis cuts the axis into (`prefix_sum`): its scans
+run inside each block, so a mesh that splits the axis into up to this many shards keeps every scan on one
+shard, and the blocks' carries are one reduction over the blocks before each."""
+
+
+def prefix_sum(x, axis: int = 1, *, dtype=None, xp=jnp):
+    """`x`'s running sum along `axis`, `cumsum`'s, in `dtype` (as `cumsum` takes it where None: a bool's
+    or a narrow integer's in the default integer), as a program a mesh that splits the axis keeps
+    parallel: XLA's SPMD partitioner turns one scan along a split axis into a scan with a live carry,
+    which the GPU's associative-scan rewrite refuses, and runs it as a loop of one iteration a token (a
+    2xH100 training step ran ten times slower, ledger 1905). Here each of `SCAN_BLOCKS` blocks scans its
+    own slots along an axis no mesh splits, and each block adds the sum of the blocks before it, in the
+    result's dtype throughout, so an integer sum wraps as `cumsum`'s does. Exact for integers; a float's
+    sum is reassociated by blocks. `xp` numpy computes it on the host."""
+    if xp is np:
+        return np.cumsum(x, axis=axis, dtype=dtype)
+    x = jnp.asarray(x)
+    # The dtype `cumsum` sums `x` in, given `dtype` or not.
+    one = jax.ShapeDtypeStruct((1,), x.dtype)
+    summed = jax.eval_shape(lambda first: jnp.cumsum(first, dtype=dtype), one).dtype
+    return _blocked_scan(x.astype(summed), axis, lambda part, at: jnp.cumsum(part, axis=at, dtype=summed),
+                         lambda part, axis: jnp.sum(part, axis=axis, dtype=summed), jnp.add, 0)
+
+
+def prefix_max(x, axis: int = 1, *, xp=jnp):
+    """`x`'s running maximum along `axis`, `cummax`'s, as a program a mesh that splits the axis keeps
+    parallel (`prefix_sum`)."""
+    if xp is np:
+        return np.maximum.accumulate(x, axis=axis)
+    x = jnp.asarray(x)
+    return _blocked_scan(x, axis, lambda part, at: jax.lax.cummax(part, axis=at), jnp.max, jnp.maximum,
+                         _extreme(x.dtype, low=True))
+
+
+def prefix_min(x, axis: int = 1, *, reverse: bool = False, xp=jnp):
+    """`x`'s running minimum along `axis`, from its end where `reverse`, as a program a mesh that splits
+    the axis keeps parallel (`prefix_sum`)."""
+    flipped = xp.flip(xp.asarray(x), axis) if reverse else xp.asarray(x)
+    if xp is np:
+        running = np.minimum.accumulate(flipped, axis=axis)
+    else:
+        running = _blocked_scan(flipped, axis, lambda part, at: jax.lax.cummin(part, axis=at), jnp.min,
+                                jnp.minimum, _extreme(flipped.dtype, low=False))
+    return xp.flip(running, axis) if reverse else running
+
+
+def _extreme(dtype, *, low: bool):
+    """The identity of a running maximum (`low`) or minimum over `dtype`: a float's infinity, an integer's
+    bound, a bool's False or True."""
+    if jnp.issubdtype(dtype, jnp.floating):
+        return -jnp.inf if low else jnp.inf
+    if dtype == jnp.bool_:
+        return not low
+    bounds = jnp.iinfo(dtype)
+    return bounds.min if low else bounds.max
+
+
+def _blocked_scan(x, axis: int, scan, reduce, combine, identity):
+    """`scan` along `axis` of `x` cut into `SCAN_BLOCKS` blocks, each block's scan combined with the
+    `reduce` of the blocks' totals before it, the axis padded with `identity` to whole blocks. An empty
+    axis scans to itself."""
+    moved = jnp.moveaxis(x, axis, -1)
+    *lead, length = moved.shape
+    if length == 0:
+        return x
+    size = -(-length // SCAN_BLOCKS)
+    widths = [(0, 0)] * len(lead) + [(0, size * SCAN_BLOCKS - length)]
+    padded = jnp.pad(moved, widths, constant_values=jnp.asarray(identity, x.dtype))
+    inner = scan(padded.reshape(*lead, SCAN_BLOCKS, size), len(lead) + 1)
+    earlier = jnp.tril(jnp.ones((SCAN_BLOCKS, SCAN_BLOCKS), bool), -1)
+    carried = reduce(jnp.where(earlier, inner[..., None, :, -1], jnp.asarray(identity, x.dtype)), axis=-1)
+    joined = combine(inner, carried[..., None]).astype(x.dtype)
+    joined = joined.reshape(*lead, size * SCAN_BLOCKS)[..., :length]
+    return jnp.moveaxis(joined, -1, axis)
+
+
 def real_places(valid: jax.Array) -> jax.Array:
     """Each slot's rank among its row's real tokens under `valid` `[B, S]`: a real token's place, a
     padding slot's the rank before it, 0 before any (`Coordinates.places` where no positions are given)."""
-    return jnp.maximum(jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1, 0)
+    return jnp.maximum(prefix_sum(valid, dtype=jnp.int32) - 1, 0)
 
 
 def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=None, positions=None,
@@ -229,6 +306,24 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
                        right_padded=right_padded)
 
 
+def token_coordinates(shape: tuple[int, int], given: Coordinates | None = None, *, segments=None,
+                      valid=None, positions=None, right_padded: bool = False) -> Coordinates | None:
+    """A call's token layout as one `Coordinates`, the one conversion of its fields: `given` as it is,
+    else built (`coordinates`) from the flat fields `segment_ids` (`segments`), `attention_mask`
+    (`valid`) and `positions`, None where the call gives none. A call giving both is refused: its
+    `Coordinates` would silently drop its flat fields (ledger 1122)."""
+    fields = (("segment_ids", segments), (VALIDITY_FIELD, valid), ("positions", positions))
+    flat = [name for name, value in fields if value is not None] + (["right_padded"] if right_padded else [])
+    if given is not None:
+        if flat:
+            raise ValueError(f"a call's tokens are laid out by their coordinates or by their fields, not "
+                             f"both: coordinates with {', '.join(flat)}")
+        return given
+    if not flat:
+        return None
+    return coordinates(shape, segments=segments, valid=valid, positions=positions, right_padded=right_padded)
+
+
 def document_firsts(starts, documents: int, *, xp=jnp):
     """Each row's first `documents` documents' first slots in order `[B, min(documents, S)]`, the row's
     first slot and each of `starts` `[B, S]`, `S` past its last: a sort of each row's slots, which a mesh
@@ -250,9 +345,8 @@ def document_ranks(real, starts, *, xp=jnp):
     """Each slot's count of the real tokens before it in its document `[B, S]`, `starts` marking each
     document's first real token but a row's first, a padding slot taking the count before it (0
     before any)."""
-    rank = xp.cumsum(real, axis=1, dtype=np.int32) - 1
-    begun = xp.where(starts, rank, 0)
-    first = np.maximum.accumulate(begun, axis=1) if xp is np else jax.lax.cummax(begun, axis=1)
+    rank = prefix_sum(real, dtype=np.int32, xp=xp) - 1
+    first = prefix_max(xp.where(starts, rank, 0), xp=xp)
     return xp.maximum(rank - first, 0)
 
 
@@ -270,7 +364,7 @@ def document_starts(segments, valid, *, xp=jnp):
     """`[B, S]`: each real token whose segment differs from the previous real token's in its row, a
     row's first real token continuing what precedes the row and a padding slot starting nothing."""
     order, _ = valid_order(valid, xp=xp)
-    rank = xp.cumsum(valid, axis=1, dtype=np.int32) - 1
+    rank = prefix_sum(valid, dtype=np.int32, xp=xp) - 1
     compact = xp.take_along_axis(segments, order, axis=1)
     changed = xp.concatenate([xp.zeros_like(compact[:, :1], bool), compact[:, 1:] != compact[:, :-1]],
                              axis=1)
@@ -542,6 +636,7 @@ __all__ = [
     "EXAMPLE_ROWS",
     "FROZEN",
     "PARAMETER_ROOTS",
+    "SCAN_BLOCKS",
     "VALIDITY_FIELD",
     "VALID_ROWS",
     "Batch",
@@ -560,6 +655,9 @@ __all__ = [
     "owned_dicts",
     "padded_rows",
     "part",
+    "prefix_max",
+    "prefix_min",
+    "prefix_sum",
     "real_places",
     "real_slots",
     "scored_targets",
