@@ -517,10 +517,10 @@ def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementatio
 ])
 def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
         width, value_width, kv_heads, causal, window, sinks, without_deterministic_ops):
-    """FlashAttention with a sliding window, attention sinks or a value narrower than the query, as
-    'auto' sends such calls on sm80, sm89 and sm90: its output and the gradients of the query, key,
-    value and sinks lie within tests/reference_error.py's rule of the xla kernel's, both measured
-    from float64."""
+    """FlashAttention with a sliding window or a value narrower than the query, as 'auto' sends such calls
+    on sm80, sm89 and sm90, and 'auto' with attention sinks, which FlashAttention refuses (its backward
+    misreads a row a sink dominates, row 2410): the output and the gradients of the query, key, value and
+    sinks lie within tests/reference_error.py's rule of the xla kernel's, both measured from float64."""
     flash_here()
     rng = np.random.default_rng(57)
     query = jnp.asarray(rng.normal(size=(1, 1024, 8, width)), jnp.bfloat16)
@@ -534,7 +534,10 @@ def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float6
             q, k, v, implementation=implementation, causal=causal, sliding_window=window,
             sinks=s if sinks else None))
 
-    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value, logits)
+    if sinks:
+        with pytest.raises(KernelRefused):
+            kernel('flash')(query, key, value, logits)
+    fused = output_and_gradients(kernel('auto' if sinks else 'flash'), cotangent, query, key, value, logits)
     reference = output_and_gradients(kernel('xla'), cotangent, query, key, value, logits)
     sides = (-1, -1) if window is None else (window - 1, 0 if causal else window - 1)
     with jax.enable_x64(new_val=True):
@@ -594,7 +597,8 @@ def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(win
                                                                              without_deterministic_ops):
     """Rows packing documents of uneven lengths, padding after them, through flash as its varlen
     sequences (`segment_ids` with their declared `max_segments`), causal, also with a 128-key window
-    and sinks: every real token's output and query gradient, and every key and value gradient, lie
+    and sinks ('auto', which FlashAttention refuses them to): every real token's output and query
+    gradient, and every key and value gradient, lie
     within tests/reference_error.py's rule of the xla kernel's under the document mask, both measured
     from float64 per document. The padding attends among itself on flash and to nothing under the
     mask, and its rows carry no gradient."""
@@ -614,7 +618,10 @@ def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(win
             q, k, v, implementation=implementation, causal=True, sliding_window=window,
             sinks=s if sinks else None, segment_ids=jnp.asarray(segments), max_segments=3))
 
-    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value, logits)
+    if sinks:
+        with pytest.raises(KernelRefused):
+            kernel('flash')(query, key, value, logits)
+    fused = output_and_gradients(kernel('auto' if sinks else 'flash'), cotangent, query, key, value, logits)
     reference = output_and_gradients(kernel('xla'), cotangent, query, key, value, logits)
     sides = (-1, -1) if window is None else (window - 1, 0)
     truth = [np.zeros_like(x) for x in fused]

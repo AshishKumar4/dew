@@ -219,6 +219,13 @@ FLASH_SUPPORTS = (
     _Need('dropout', lambda case: not case.dropout,
           "the call drops attention weights, which FlashAttention's path here does not take",
           row='roadmap: attention dropout in FlashAttention'),
+    # Its backward's D is rowsum(dO·O) of the rounded output, so a row whose sink holds most of its
+    # softmax, dP - D the sink's share of dP, takes O's rounding at 2^-8 over that share (512 times the
+    # reference's error at packed rows with a window, gate-g02-judged-h100, row 2410); the template's D
+    # cancels.
+    _Need('sinks', lambda case: not case.sinks,
+          "the call has attention sinks, whose rows FlashAttention's backward misreads where a sink holds "
+          "most of the softmax", row=INHERENT),
     _ARITHMETIC,
     _Need('not_installed', _flash_installed, "dew_flash_attn is not installed", row=INHERENT),
     _Need('binary_arch', _flash_built,
@@ -227,8 +234,8 @@ FLASH_SUPPORTS = (
 )
 """FlashAttention's requirements (`flash_attention`): a GPU, bf16 or fp16 heads a multiple of 8 up to the
 width its backward takes, a causal or windowed call square or over another sequence's documents (which it
-aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias or softcap, no
-deterministic ops, and a wheel holding code for the target."""
+aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias, softcap or sinks,
+no deterministic ops, and a wheel holding code for the target."""
 
 CUDNN_SUPPORTS = (
     _ON_GPU,
