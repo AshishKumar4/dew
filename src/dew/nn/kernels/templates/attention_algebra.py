@@ -1585,6 +1585,16 @@ def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: 
                      state.own + taken(own))
 
 
+def nearer_centre(anchor: jax.Array, about_anchor: jax.Array, about_zero: jax.Array, key_index: jax.Array
+                  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """D's centre, the nearer to D of the anchor key's `dP` (`anchor`) and zero, each sum's difference from
+    it (`about_anchor`, `about_zero`): the centre, D less it, and the anchor key's index (`key_index`), -1
+    where zero is the nearer."""
+    anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
+    return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
+            jnp.where(anchored, key_index, -1))
+
+
 def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array, state_total: jax.Array,
                      mean0: jax.Array, key_index: jax.Array,
                      shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -1607,9 +1617,7 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
     about_zero = jnp.sum((others + own * anchor_value) * cotangent, axis=-1) + state_weight * mean0
     about_anchor = (jnp.sum((others - others_total * anchor_value) * cotangent, axis=-1)
                     + state_weight * (mean0 - anchor))
-    anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
-    return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
-            jnp.where(anchored, key_index, -1))
+    return nearer_centre(anchor, about_anchor, about_zero, key_index)
 
 
 def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
@@ -1635,9 +1643,7 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     about_zero = jnp.sum(split_output(others, own, anchor_value) * cotangent, axis=-1)
     about_anchor = (jnp.sum((others - expand(others_total, anchor_value) * anchor_value) * cotangent, axis=-1)
                     - state_weight * anchor)
-    anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
-    return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
-            jnp.where(anchored, key_index, -1))
+    return nearer_centre(anchor, about_anchor, about_zero, key_index)
 
 
 def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift: jax.Array) -> jax.Array:
