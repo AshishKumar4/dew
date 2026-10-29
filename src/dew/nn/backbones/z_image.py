@@ -26,10 +26,11 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import RMSNorm
+from dew.nn.attention import AttentionImpl
 from dew.nn.blocks import modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import patchify, unpatchify
@@ -78,7 +79,7 @@ class ZImageBlock(nn.Module):
     modulation: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def _feed_forward(self, name=None):
@@ -157,7 +158,7 @@ class ZImageTransformer(nn.Module):
     axes_lens: Sequence[int] = (1536, 512, 512)
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def projections(self, input_channels: int, text_features: int) -> dict[str, tuple[int, int]]:

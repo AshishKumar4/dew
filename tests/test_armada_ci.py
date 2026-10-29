@@ -4,6 +4,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1575,6 +1576,31 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         assert run() == runs
         assert run() == runs
 
+def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_path, monkeypatch, cache_worker):
+    """A tool added under tools/, or taken away, runs no file again whose tests imported no tool: the harness
+    its test process runs, tools/armada's recorder and plugins, is every row's input through its own files
+    (`SHARED`), not through tools/'s entries, which only a test that imports a tool by its name reads (Main,
+    2026-10-29: train 296 added tools/fla_float64.py and reused 1 of 1795 rows)."""
+    # The harness as a checkout holds it, under the checkout's root, beside the project it reads.
+    shutil.copytree(ROOT / "tools/armada", tmp_path / "tools/armada",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
+    module = load("ci", str(tmp_path / "tools/armada"))
+    monkeypatch.chdir(tmp_path)
+    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / "tests").mkdir()
+    written(tmp_path, {"test_a.py": "def test_a():\n    with open('runs', 'a') as runs: runs.write('x')\n"})
+    run = cached_runs(module, tmp_path, monkeypatch, cache_worker)
+
+    assert run() == 1
+    assert run() == 1
+    (tmp_path / "tools/new_tool.py").write_text("x = 1\n")
+    assert run() == 1
+    (tmp_path / "tools/new_tool.py").unlink()
+    assert run() == 1
+
+
 def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
         ci, tmp_path, monkeypatch, cache_worker):
     """A train that loses a head loses the test modules and modules the head added, and its other
@@ -1701,15 +1727,16 @@ def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
 
 
 def planned_checkout(ci, root: Path, monkeypatch, cache_worker,
-                     pinned: str) -> tuple[Path, Callable[[], list[str]]]:
+                     *pinned: str) -> tuple[Path, Callable[[], list[str]]]:
     """Three 3.12 test files, each weighing about a task of its own, run green on CPU class
     GenuineIntel-6-143 against the shared test cache (`cached_checkout`), in a checkout whose .armada.json
-    pins its tasks to `pinned` (vendor-family-model), with the cache's read token: where their verdict is
-    written, and the plan's 3.12 entries' files, each entry's sorted."""
+    pins its tasks to `pinned` (vendor-family-model, one or several), with the cache's read token: where
+    their verdict is written, and the plan's 3.12 entries' files, each entry's sorted."""
     verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
-    vendor, family, model = pinned.split("-")
+    classes = [{"vendor": vendor, "family": int(family), "model": int(model)}
+               for vendor, family, model in (each.split("-") for each in pinned)]
     config = json.loads((ROOT / ".armada.json").read_text())
-    config["task"]["cpu"] = {"vendor": vendor, "family": int(family), "model": int(model)}
+    config["task"]["cpu"] = classes[0] if len(classes) == 1 else classes
     (root / ".armada.json").write_text(json.dumps(config))
     names = ("a", "b", "c")
     written(root, {f"test_{name}.py": "from pathlib import Path\n"
@@ -1776,6 +1803,19 @@ def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, m
     armada_task(ci, monkeypatch, verdict)
     (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+
+
+def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Tasks pinned to several CPU classes (.armada.json's task.cpu a list) land on any of them, so the plan
+    reuses a file whose row ran green on these inputs on any pinned class, and plans the rest: rows split by
+    class, the plan reading each pinned class's (Main, 2026-10-29: the suite widened to 25/17 and 26/17, the
+    fleet's own classes, as one class starved lanes' verdicts)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17",
+                                        "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
 def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):

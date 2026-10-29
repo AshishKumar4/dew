@@ -21,7 +21,6 @@ from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
 from ..activations import GatedActivation, gated_product
-from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..cross_attention import NAME as CROSS_ATTENTION
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
@@ -42,6 +41,7 @@ from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
+from ..norms import LayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
@@ -75,7 +75,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
     """The decoder's norm factory, building each norm by its `name` as
     `specs` changes it there. 'layer' keeps torch's exact variance, the
     reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
-    (`dew.nn.attention.LayerNorm`), whose mean and square reduce in one pass,
+    (`dew.nn.norms.LayerNorm`), whose mean and square reduce in one pass,
     which the vision towers run."""
 
     def build(*, name: str) -> nn.Module:
@@ -98,7 +98,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
 
 @runtime_checkable
 class SeamNorm(Protocol):
-    """A pre-norm that owns a block's residual seam (`dew.nn.attention.RMSNorm`):
+    """A pre-norm that owns a block's residual seam (`dew.nn.norms.RMSNorm`):
     it adds a sublayer's branch to the stream it reads and hands that stream
     back beside the norm, `(x + branch, normed)`, so one fused pass takes the
     add, the norm and, in reverse, the stream's own cotangent."""

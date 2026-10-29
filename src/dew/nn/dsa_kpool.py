@@ -37,10 +37,10 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import valid_order
 
-from .attention import LayerNorm
 from .inputs import MixerCall, PredictionPhase, coordinates_of
 from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals
+from .norms import LayerNorm
 from .precision import at_least_fp32, float32_einsum
 from .sparse_selection import top_k_selection
 
