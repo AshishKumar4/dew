@@ -343,7 +343,8 @@ def test_a_cooldown_branch_on_a_step_that_ranks_a_weights_only_best_runs_on_past
     objective = Pulled()
     state = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
                     checkpoints=Checkpoints(str(tmp_path))).fit(
-        compile(Pipeline(Memory({"x": x})).repeat(1).batch(BATCH), read="memory"), steps=4, eval_every=2,
+        compile(Pipeline(Memory({"x": x})).repeat(1).batch(BATCH), read="memory",
+                validation=Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)), steps=4, eval_every=2,
         best=Best(objective.loss, weights_only=True), cooldowns=Cooldowns(at=(2,), length=1))
     assert int(state.step) == 4
 

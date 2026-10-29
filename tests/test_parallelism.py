@@ -225,7 +225,7 @@ def test_a_prefetcher_closed_while_held_stops_its_worker():
     and would otherwise place: the close returns, and the source is finalized."""
     import threading
 
-    released, closed = threading.Event(), threading.Event()
+    released, prepared, closed = threading.Event(), threading.Event(), threading.Event()
 
     def source():
         try:
@@ -235,10 +235,17 @@ def test_a_prefetcher_closed_while_held_stops_its_worker():
         finally:
             closed.set()
 
-    batches = DevicePrefetchIterator(source(), MeshSpec().build(), depth=4)
+    def prepare(batch):
+        # The worker prepares a batch after it read it and before it asks to place it.
+        if float(np.asarray(batch["x"])[0, 0]) == 1:
+            prepared.set()
+        return batch
+
+    batches = DevicePrefetchIterator(source(), MeshSpec().build(), depth=4, prepare=prepare)
     next(batches)
     with batches.held():
         released.set()
+        assert prepared.wait(timeout=60)
         batches.close()
     assert closed.is_set()
 
