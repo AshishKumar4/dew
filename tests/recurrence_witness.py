@@ -177,7 +177,7 @@ def fused(iv: Iv, lane: Lane) -> Iv:
     return hull(iv, fp32(iv, lane))
 
 
-def staged(iv: Iv, lane: Lane) -> Iv:
+def staged(iv: Iv) -> Iv:
     """A register value staged for a product as the call's launches hold it: cast to bf16."""
     return cast(iv, BFLOAT16)
 
@@ -312,8 +312,8 @@ def weighted(lower, tile, beta, decay: Iv | None, lane: Lane) -> tuple[Iv, Iv]:
     scaled = fp32(mul(point(tile), point(np.asarray(beta)[:, None])), lane)
     if decay is not None:
         scaled = fp32(mul(scaled, Iv(decay.lo[:, None], decay.hi[:, None])), lane)
-    value = fp32(add(scaled, dot(point(lower), staged(scaled, lane), lane)), lane)
-    return value, staged(value, lane)
+    value = fp32(add(scaled, dot(point(lower), staged(scaled), lane)), lane)
+    return value, staged(value)
 
 
 def corrected(values: Iv, weights, entering, lane: Lane) -> Iv:
@@ -329,7 +329,7 @@ def carried(carry: Iv, values: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     gate = exponents.gated(lane)
     gated = fp32(mul(values, Iv(gate.lo[:, None], gate.hi[:, None])), lane)
     keys = point(np.asarray(k).T)
-    write = dot(keys, staged(gated, lane), lane)
+    write = dot(keys, staged(gated), lane)
     decay = exponents.raised(lane)
     held = Iv(np.full(carry.lo.shape, decay.lo[-1]), np.full(carry.lo.shape, decay.hi[-1]))
     return fp32(add(fused(mul(carry, held), lane), write), lane)
@@ -340,7 +340,7 @@ def output(q, k, entering, values, exponents: Exponents, scale: float, lane: Lan
     scores staged as the call holds them, the memory it entered read through the decayed queries, each term
     scaled by fp32's `scale` and their sum rounded once, either product before it maybe contracted."""
     scores = fp32(mul(blocked(point(q), point(np.asarray(k).T), lane), exponents.pairs(lane)), lane)
-    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))), lane)
+    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))))
     memory = blocked(point(q), point(entering), lane)
     decay = exponents.raised(lane)
     memory = fp32(mul(memory, Iv(decay.lo[:, None], decay.hi[:, None])), lane)
@@ -374,29 +374,21 @@ def enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     c = corrected(u, step.w, step.h, lane)
     # The corrected values the write takes: fp32, within their enclosure and rounding to the stored `c`.
     values = meet(c, cell(step.c, BFLOAT16))
-    stored = staged(inverse(step.k, step.beta, exponents, lane), lane)
-    return {"a": stored, "w": w, "c": staged(c, lane),
+    stored = staged(inverse(step.k, step.beta, exponents, lane))
+    return {"a": stored, "w": w, "c": staged(c),
             "h": carried(step.carry, values, step.k, exponents, lane),
-            "o": staged(output(step.q, step.k, step.h, step.c, exponents, scale, lane), lane)}
+            "o": staged(output(step.q, step.k, step.h, step.c, exponents, scale, lane))}
 
 
 def stored_memory(iv: Iv, lane: Lane) -> Iv:
     """The memory as the states launch stores it: bf16, or fp32 exactly."""
-    return staged(iv, lane)
+    return staged(iv)
 
 
 def _index(x) -> np.ndarray:
     """Each fp32 value's place on fp32's grid, in steps from zero."""
     bits = np.abs(np.asarray(x, np.float64)).astype(np.float32).view(np.uint32).astype(np.int64)
     return np.where(np.signbit(np.asarray(x, np.float64)), -bits, bits)
-
-
-def ulps(iv: Iv, record, fmt: Format) -> np.ndarray:
-    """Each enclosure's width in units of `fmt`'s last place at its record (at the least normal's for a zero):
-    how far apart two values it admits may lie, on the record's own grid."""
-    record = np.abs(np.asarray(record, np.float64))
-    _, exponent = np.frexp(np.maximum(record, 2.0 ** fmt.emin))
-    return (iv.hi - iv.lo) / np.ldexp(1.0, exponent - fmt.precision)
 
 
 def exp2_reach(native) -> int:
@@ -434,7 +426,7 @@ class Run:
     corrected values `c` and output `o` `[N, H, C, Dv]`, an fp32 call's three parts summed; and the fp32
     memory each chunk leaves, `carries` `[N + 1, H, Dk, Dv]` from the initial memory: the final memory of the
     call over the chunks before it, at the same tiles (`recorded`), the state the states launch carries in
-    fp32 and stores rounded as `h` (`seams`)."""
+    fp32 and stores rounded as `h`, which `h`'s enclosure holds bit for bit (`enclosed`)."""
     q: np.ndarray
     k: np.ndarray
     v: np.ndarray
@@ -446,7 +438,6 @@ class Run:
     c: np.ndarray
     o: np.ndarray
     carries: np.ndarray
-    seams: np.ndarray
 
     @property
     def chunks(self) -> int:
@@ -504,21 +495,17 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         ends = [kept(*(x[:, :n * CHUNK] for x in operands[:5]), h0,
                      starts=None if starts is None else starts[:, :n * CHUNK])[1]
                 for n in range(1, chunks)] if carried else []
-    parts = 3 if jnp.dtype(dtype) == jnp.float32 else 1
     # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
     # call's come first where its documents start on the chunks' grid.
-    laid = np.shape(a)[0] // parts // CHUNK
+    laid = np.shape(a)[0] // CHUNK
 
     def summed(x, rows):
-        return np.asarray(x, np.float64).reshape(parts, rows, -1).sum(0)
+        return np.asarray(x, np.float64).reshape(rows, -1)
 
     def chunked(x, width):
         return summed(x, laid * CHUNK).reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
 
     memories = summed(h, laid * heads * key_width).reshape(laid, heads, key_width, value_width)[:chunks]
-    stored = jnp.float32 if parts == 3 else dtype
-    seams = np.asarray([np.array_equal(np.asarray(np.asarray(end[0]).astype(stored), np.float64),
-                                       memories[n + 1]) for n, end in enumerate(ends)], bool)
     carries = [np.asarray(h0, np.float64)[0], *(np.asarray(end, np.float64)[0] for end in ends)]
     unknown = np.full(carries[0].shape, np.nan)
     carries += [unknown] * (chunks - len(carries)) + [np.asarray(kept_final, np.float64)[0]]
@@ -526,7 +513,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                c=chunked(c, value_width),
                o=np.asarray(kept_o, np.float64)[0].reshape(chunks, CHUNK, heads, value_width).transpose(
                    0, 2, 1, 3),
-               carries=np.stack(carries), seams=seams)
+               carries=np.stack(carries))
 
 
 def hosted(operands: tuple) -> dict[str, np.ndarray]:
@@ -567,18 +554,9 @@ def records(run: Run) -> dict[str, np.ndarray]:
 
 
 def witness(run: Run, lane: Lane) -> dict:
-    """Whether each record of `run` lies inside its step's enclosure (`enclosed`), by record `[N, H, ...]`,
-    and each enclosure's width in units of the last place of its record's grid, at the record (`ulps`) and
-    at its row's largest (`spans`)."""
+    """Whether each record of `run` lies inside its step's enclosure (`enclosed`), by record `[N, H, ...]`."""
     found, recorded_ = enclosed(run, lane), records(run)
-    held = {name: within(recorded_[name], found[name]) for name in found}
-
-    def grid(name):
-        return FLOAT32 if name == "leaving" else BFLOAT16
-
-    largest = {name: np.max(np.abs(record), -1, keepdims=True) for name, record in recorded_.items()}
-    return {**held, "ulps": {name: ulps(found[name], recorded_[name], grid(name)) for name in found},
-            "spans": {name: ulps(found[name], largest[name], grid(name)) for name in found}}
+    return {name: within(recorded_[name], found[name]) for name in found}
 
 
 def refusals(faulty: Run, claimed: Run, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:

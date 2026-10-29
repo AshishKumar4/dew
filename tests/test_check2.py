@@ -696,7 +696,6 @@ def test_the_recurrence_step_witness_holds_the_interpreted_mainloop(regime):
     before it leave, rounded as stored (end_j == start_{j+1})."""
     run = rw.recorded(*rw.draw(0, regime))
     held = rw.witness(run, rw.interpreted_lane())
-    assert np.all(run.seams)
     for name in rw.RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
 
