@@ -233,6 +233,7 @@ INTEGRATES = {
                     ("karras",)),
     "flow_sde": ("flow",),
     "unmask": ("masked",),
+    "confident": ("masked",),
 }
 """The cases a solver that integrates one process family samples; it refuses
 every other family's (FAMILIES)."""
