@@ -1081,7 +1081,8 @@ class Trainer(Generic[Loss, Effects]):
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int, narrow: bool | None, launches: str | None, lowering: bool = True, *,
-                   mesh: Mesh | None = None, platforms: tuple[str, ...] | None = None) -> Candidate:
+                   mesh: Mesh | AbstractMesh | None = None, platforms: tuple[str, ...] | None = None
+                   ) -> Candidate:
         """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
         alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
         `launches` are its kernel launches where a record holds them, which settle their configs before it
@@ -1178,10 +1179,8 @@ class Trainer(Generic[Loss, Effects]):
         with assumed(generation), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
             split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
-            candidate = self._candidate(state, batch, schedule, batch_shardings(mesh, batch),
-                                        NamedSharding(mesh, P()), split, None, None, mesh=mesh,
-                                        platforms=('cuda',))
-            return candidate.lowered
+            return self._candidate(state, batch, schedule, batch_shardings(mesh, batch), NamedSharding(mesh, P()),
+                                   split, None, None, mesh=mesh, platforms=('cuda',)).lowered
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
