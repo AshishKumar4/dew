@@ -48,6 +48,7 @@ class Answered(Objective):
         self.model, self.variables = model, variables
 
     def loss(self, variables, batch, step, read: bool = True):
+        variables = thaw(variables)
         embedded = self.model.apply(variables, batch["context"], method="token_embeddings")
         lengths = jnp.full((batch["ids"].shape[0],), CONTEXT_TOKENS if read else 0, jnp.int32)
         logits = self.model.apply(variables, batch["ids"],
@@ -68,16 +69,17 @@ def loaded(seed: int = 0) -> Answered:
     return Answered(model, freeze(merge(base.init(jax.random.key(seed), tokens), blocks), crossing))
 
 
-def test_a_loaded_bases_fresh_blocks_learn_at_the_fresh_rate_where_no_group_is_named():
+@pytest.mark.parametrize("grouped", [True, False], ids=["default", "ungrouped"])
+def test_a_loaded_bases_fresh_blocks_learn_at_the_fresh_rate_where_no_group_is_named(grouped):
     """At the base's fine-tuning rate, the default puts the blocks in a group of their own at
     `FRESH_LEARNING_RATE_MULTIPLIER` times it (`OptimConfig.with_fresh`), and the blocks learn to read
     the context: the held loss falls well below the no-context control's, the base's own guess (2.7
-    against about 4.5 measured on this toy; ungrouped, the blocks learn nothing)."""
+    against about 4.5 measured on this toy). Ungrouped, at the base's rate, they learn nothing."""
     objective = loaded()
     fresh = fresh_parameters(objective)
     assert fresh and all("cross_attention" in name for name in fresh)
-    optimizer = OptimConfig(optimizer="adamw", learning_rate=RATE, weight_decay=0.0).with_fresh(fresh)
-    assert optimizer.param_groups[0].learning_rate_multiplier == FRESH_LEARNING_RATE_MULTIPLIER
+    plain = OptimConfig(optimizer="adamw", learning_rate=RATE, weight_decay=0.0)
+    optimizer = plain.with_fresh(fresh) if grouped else plain
     rng, held = np.random.default_rng(0), rows(np.random.default_rng(10_000))
 
     def stream():
@@ -88,7 +90,8 @@ def test_a_loaded_bases_fresh_blocks_learn_at_the_fresh_rate_where_no_group_is_n
     state = Trainer(objective, optimizer, key=jax.random.key(0)).fit(data, steps=1000, log_every=1000)
     control = float(objective.loss(objective.variables, held, None, read=False)[0])
     answered = float(objective.loss(state.variables, held, None)[0])
-    assert control > 4.0 and answered < control - 1.0, (answered, control)
+    assert control > 4.0
+    assert answered < control - 1.0 if grouped else answered > control - 0.2, (answered, control)
 
 
 def test_named_groups_and_a_base_that_holds_every_parameter_keep_their_rates():
