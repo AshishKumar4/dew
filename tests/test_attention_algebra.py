@@ -833,8 +833,9 @@ def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at
 def test_power2_is_exact_under_jit_at_every_exponent():
     """`algebra.power2` scales by powers of two exactly wherever the result is a normal fp32, compiled
     (where XLA computes `exp2` as an inexact `exp` and fuses a product of them into one `exp`, past fp32's
-    range), at exponents from -380 to 380 against exact float64 scaling, and zero stays zero."""
-    exponents = jnp.arange(-380.0, 381.0, dtype=jnp.float32)
+    range), at every integral exponent from -400 to 400 against exact float64 scaling (its split takes thirds by a
+    product with fp32's 1/3, the clip at POWER2_REACH among them), and zero stays zero."""
+    exponents = jnp.arange(-400.0, 401.0, dtype=jnp.float32)
     mantissas = jnp.asarray([0.0, 0.5, 0.75, 1.0, -0.6], jnp.float32)
     found = np.asarray(jax.jit(lambda x, k: algebra.power2(x[:, None], k[None, :]))(mantissas, exponents))
     exact = np.ldexp(np.asarray(mantissas, np.float64)[:, None], np.asarray(exponents, np.int64)[None, :])
