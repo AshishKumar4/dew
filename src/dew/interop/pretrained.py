@@ -234,8 +234,8 @@ class Pretrained:
     weights conversion may not be, when the save writes it."""
     fresh: tuple[str, ...] = ()
     """The modules of `model` drawn fresh beside the loaded weights, by their paths under `params`
-    (`layers_1/cross_attention`): what `with_cross_attention` adds, which a run's fresh group claims
-    (`Objective.fresh_modules`, `dew.optim.ParamGroup.fresh`)."""
+    (`layers_1/cross_attention`): what `with_cross_attention` adds, which a run trains in a fresh group
+    (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 

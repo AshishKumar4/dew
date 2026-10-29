@@ -960,8 +960,8 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def fresh_modules(self) -> tuple[str, ...]:
         """The modules this objective trains that are drawn fresh beside a loaded base, by their paths
-        under `params` (`backbone/layers_1/cross_attention`, `head`), which a run's fresh group claims
-        (`dew.optim.ParamGroup.fresh`): none by default, an objective declaring what it draws beside
+        under `params` (`backbone/layers_1/cross_attention`, `head`), which a run trains in a fresh group
+        (`dew.optim.OptimConfig.fresh_groups`): none by default, an objective declaring what it draws beside
         the base it holds and what its source drew (`Pretrained.fresh`). One drawn with no parameter, a
         tied readout, the group leaves out (`dew.config.trained_modules`)."""
         return ()

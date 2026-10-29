@@ -86,6 +86,16 @@ def _matrix_sides(axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]] 
     return tuple(sides[0]), tuple(sides[1])
 
 
+FRESH_LEARNING_RATE = 1e-3
+"""The peak rate a module drawn fresh beside a loaded base trains at where a run names no groups
+(`OptimConfig.fresh_groups`), on the run's own schedule's shape: a base fine-tunes at a rate a fresh
+module barely moves at. On a toy whose answer is in a context only cross-attention reads (a four-layer
+decoder, blocks before layers 1 and 3, AdamW, 1000 steps), the blocks learned nothing at a base's 1e-5
+(held loss 4.50 against the no-context control's 4.51), little with only their gates at 100 times
+(4.47), and as at 1e-3 throughout with every weight of theirs at 1e-3 (2.72). Ledger 2419's runs over
+a loaded Qwen3.5, under AdamW with decay and the Muon hybrid, adjust it."""
+
+
 def weight_decay_mask(params):
     """Mark every parameter but the biases and the vectors, which weight decay spares by default:
     nanoGPT's split (model.py, `GPT.configure_optimizers`), with Megatron Core's and timm's `bias`
@@ -1944,6 +1954,17 @@ class OptimConfig:
         with a decay it is given, Dew's own always, and never Muon, which decays as Moonlight does."""
         return self.optimizer not in ('muon', 'muonclip') and (self.optimizer in OPTIMIZER_MAP
                                                                or 'weight_decay' in opts)
+
+    def fresh_groups(self) -> tuple[ParamGroup, ...]:
+        """The groups a run takes where it names none and draws modules fresh beside a loaded base: those
+        modules at `FRESH_LEARNING_RATE` at the peak of this config's schedule, on its shape (its rate
+        times their quotient), or at its own where that is higher, and every other parameter at its own,
+        each sparing what the ungrouped decay spares (`ParamGroup.spared`)."""
+        rates = rates_of(self.learning_rate)
+        peak = rates.get("peak_value", max(rates.values()))
+        multiplier = max(1.0, FRESH_LEARNING_RATE / peak) if peak > 0 else 1.0
+        return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier, spared=True),
+                ParamGroup("base", ("*",), spared=True))
 
     def with_fresh(self, modules: Sequence[str]) -> OptimConfig:
         """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the

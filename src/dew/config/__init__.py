@@ -1543,7 +1543,7 @@ class RunConfig:
         # The record names the run's directory, so its run.json trains the same run again.
         self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
-        self = dataclasses.replace(self, optim=self.grouped(objective))
+        self = dataclasses.replace(self, optim=self.grouped(objective, name))
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
@@ -1626,19 +1626,30 @@ class RunConfig:
         with generation.chosen(attention_form=self.trainer.attention_form):
             return target.compiled(self.built(objective, mesh, rollout), dataset, steps)
 
-    def grouped(self, objective: Objective[Loss, Effects]) -> OptimConfig:
-        """The run's optimizer, each group that claims the modules its objective draws fresh beside a
-        loaded base matching those that hold a parameter (`ParamGroup.fresh`, `trained_modules`): the
-        groups every process agrees on before any records them, the same where none claims them."""
+    def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
+        """The run's optimizer as it trains under `name`: each group it names that claims the modules its
+        objective draws fresh beside a loaded base matching those that hold a parameter
+        (`ParamGroup.fresh`, `trained_modules`). Where it names none, a resumed run trains in the groups
+        its record names, as its optimizer state holds them (none for a record written before runs took
+        them), and a new run that draws such modules in their default groups (`OptimConfig.fresh_groups`).
+        Every process agrees on the groups before any records them."""
         def resolved() -> JSON:
-            optim = self.optim
-            if any(group.fresh for group in optim.param_groups):
-                optim = optim.with_fresh(trained_modules(objective, objective.fresh_modules()))
-            return to_record(optim.param_groups, tuple[ParamGroup, ...])
-        groups = agreed_same("run param groups", resolved)
-        if not any(group.fresh for group in self.optim.param_groups):
-            return self.optim
-        return dataclasses.replace(self.optim, param_groups=from_record(tuple[ParamGroup, ...], groups))
+            named = self.optim.param_groups
+            if not named:
+                checkpoints = self.trainer.checkpoints(name)
+                saved = epath.Path(checkpoints.directory) / RUN_FILE
+                if checkpoints.resumed(self.trainer.resume) is not None and saved.exists():
+                    return to_record(RunConfig.load(str(saved)).optim.param_groups, tuple[ParamGroup, ...])
+            groups = named or self.optim.fresh_groups()
+            modules = trained_modules(objective, objective.fresh_modules()) if any(
+                group.fresh for group in groups) else ()
+            if not named and not modules:
+                return to_record((), tuple[ParamGroup, ...])
+            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules)
+            return to_record(claimed.param_groups, tuple[ParamGroup, ...])
+        groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
+        return self.optim if groups == self.optim.param_groups else dataclasses.replace(
+            self.optim, param_groups=groups)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
