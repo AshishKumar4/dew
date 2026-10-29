@@ -237,7 +237,9 @@ class LoRA:
         one, refused unless it binds the projections `modules` selects at this spec's rank, alpha,
         rslora and dropout."""
         # The commit the run records (`resolved`), so what it loads is what it names.
-        adapter = LoRA.load(model, variables, _adapter_files(_pinned(source), self.weight_name),
+        from dew.interop.sources import pinned_source
+
+        adapter = LoRA.load(model, variables, _adapter_files(pinned_source(source), self.weight_name),
                             layouts=layouts, base=base)
         wanted = set(_named(bound_layouts(model, thaw(variables), layouts or {}), self.modules))
         stated = {"targets": sorted(wanted), "rank": self.rank, "alpha": scaling, "rslora": self.rslora,
@@ -258,7 +260,9 @@ class LoRA:
         """This spec with a Hub `source` at the commit its revision resolves to now
         (`SourceReference.pinned`; offline the commit the cache holds), as a run records it; a local
         source, or none, as it is."""
-        return self if self.source is None else dataclasses.replace(self, source=_pinned(self.source))
+        from dew.interop.sources import pinned_source
+
+        return self if self.source is None else dataclasses.replace(self, source=pinned_source(self.source))
 
     def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
                  modules: Sequence[str] | None = None,
@@ -307,14 +311,6 @@ class LoRA:
         tensors, metadata = read_file(file)
         configs = _diffusers_configs(tensors, metadata.get(DIFFUSERS_METADATA), str(file))
         return _place(model, bound, variables, _entries(_components(bound), tensors, configs, ""), base)
-
-
-def _pinned(source: str) -> str:
-    """`source` as a run records it, at the commit its revision resolves to (`SourceReference.pinned`);
-    a local path as it is."""
-    from dew.interop.sources import SourceReference
-
-    return source if FilePath(source).exists() else SourceReference.parse(source).pinned().spelled()
 
 
 def _adapter_selection(listed: Collection[str], weight_name: str | None) -> tuple[str, tuple[str, ...]]:
