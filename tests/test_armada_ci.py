@@ -4,6 +4,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1574,6 +1575,31 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
             (tmp_path / page).write_text(text)
         assert run() == runs
         assert run() == runs
+
+def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_path, monkeypatch, cache_worker):
+    """A tool added under tools/, or taken away, runs no file again whose tests imported no tool: the harness
+    its test process runs, tools/armada's recorder and plugins, is every row's input through its own files
+    (`SHARED`), not through tools/'s entries, which only a test that imports a tool by its name reads (Main,
+    2026-10-29: train 296 added tools/fla_float64.py and reused 1 of 1795 rows)."""
+    # The harness as a checkout holds it, under the checkout's root, beside the project it reads.
+    shutil.copytree(ROOT / "tools/armada", tmp_path / "tools/armada",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
+    module = load("ci", str(tmp_path / "tools/armada"))
+    monkeypatch.chdir(tmp_path)
+    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / "tests").mkdir()
+    written(tmp_path, {"test_a.py": "def test_a():\n    with open('runs', 'a') as runs: runs.write('x')\n"})
+    run = cached_runs(module, tmp_path, monkeypatch, cache_worker)
+
+    assert run() == 1
+    assert run() == 1
+    (tmp_path / "tools/new_tool.py").write_text("x = 1\n")
+    assert run() == 1
+    (tmp_path / "tools/new_tool.py").unlink()
+    assert run() == 1
+
 
 def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
         ci, tmp_path, monkeypatch, cache_worker):

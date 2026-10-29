@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import respelled
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained
@@ -177,13 +178,9 @@ def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_pa
     its config, which keeps the auto_map, and no other file of its: the directory opens through the
     release's own transformers loader as the release does (ledger 2038). The modules here stand in for
     the release's (`RELEASED`), which the network test loads through transformers."""
-    import shutil
 
-    source = tmp_path / 'release'
-    shutil.copytree(TINY, source)
-    config = json.loads((source / 'config.json').read_text())
     code = LFM3.release_code
-    (source / 'config.json').write_text(json.dumps({**config, 'auto_map': dict(code.auto_map)}))
+    source = respelled(TINY, tmp_path / 'release', lambda config: {**config, 'auto_map': dict(code.auto_map)})
     for file, text in {**RELEASED, 'unrelated.py': 'raise ImportError\n'}.items():
         (source / file).write_text(text)
     loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
@@ -198,13 +195,9 @@ def test_a_component_keeps_the_code_beside_its_config_and_none_outside_its_sourc
     """A release loaded from a component folder (`subfolder`) keeps the code beside that folder's config,
     not the source root's; a module whose relative import names a path outside the source refuses the
     save, which writes none of it (ledger 2038)."""
-    import shutil
-
     code = LFM3.release_code
-    component = tmp_path / 'release' / 'decoder'
-    shutil.copytree(TINY, component)
-    config = json.loads((component / 'config.json').read_text())
-    (component / 'config.json').write_text(json.dumps({**config, 'auto_map': dict(code.auto_map)}))
+    component = respelled(TINY, tmp_path / 'release' / 'decoder',
+                          lambda config: {**config, 'auto_map': dict(code.auto_map)})
     for file, text in RELEASED.items():
         (component / file).write_text(text)
     (tmp_path / 'release' / 'modeling_lfm3.py').write_text('raise ImportError\n')

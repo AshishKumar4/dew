@@ -169,6 +169,8 @@ COLLECT_TASKS = 4
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
+HARNESS = "tools/armada/"
+"""The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
           "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
           "tools/armada/watched.py")
@@ -317,9 +319,12 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     import it tried now finds), or an __init__.py added to a namespace package on the way to one, which
     executes as the import passes, changes its key; one added to a package it never imported does not.
     tools/ itself is among them, as a test puts it, or a directory under it, on sys.path and imports a tool
-    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`)."""
+    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`). The
+    harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
+    import of a test's, so their directories are none of its inputs (Main, 2026-10-29: tools/'s entries
+    keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
     packages = {str(parent) for path in depends
-                if path.startswith(("src/", "tools/")) and path.endswith(".py")
+                if path.startswith(("src/", "tools/")) and path.endswith(".py") and not path.startswith(HARNESS)
                 for parent in Path(path).parents
                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
     return sorted({name, *depends, *packages})
