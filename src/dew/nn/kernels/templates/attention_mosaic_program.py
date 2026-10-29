@@ -126,7 +126,8 @@ DROPPING = ("the Mosaic mainloop draws dropout at its own places; a sequence exc
             "global places, a table gather a tile (`DropPlaces`)")
 """Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 DROPPING_BACKWARD = ("the Mosaic backward takes no dropout's D yet: a dropping call's D is its dropped "
-                     "products' own pass over the keys (`algebra.dropout_centre`), which no Mosaic launch runs")
+                     "products' own pass over the keys (`algebra.dropout_centre`), which no Mosaic launch "
+                     "runs")
 """Why the Mosaic backward refuses a dropping call (`refused`); its forward draws it."""
 
 
