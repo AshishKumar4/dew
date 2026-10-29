@@ -45,7 +45,7 @@ from etils import epath
 
 import dew.io
 from dew import registry, training
-from dew._coordination import agree_process_phase, agreed
+from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._records import JSON, duration, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
@@ -253,6 +253,25 @@ _JSON_FLAG = tyro.constructors.PrimitiveConstructorSpec(
 def _flag_json(text: str) -> JSON:
     """A JSON flag's value: its JSON, or None for `None`, as every optional flag spells it."""
     return None if text == "None" else json.loads(text)
+
+
+def fresh_parameters(objective: Objective) -> tuple[str, ...]:
+    """The parameters a run draws fresh over the loaded base its objective holds (`held_variables`), by
+    name (`parameter_name`): each its objective trains that the held tree does not hold, a head or a
+    projector it draws (`Objective.complete_variables`), and each of a cross-attention block, which a
+    source draws beside its own weights (`Pretrained.with_cross_attention`, `crossing`). None for an
+    objective that holds no base, whose every parameter is drawn alike. An adapter's factors
+    (`Pretrained.adapt`) are the held tree's, and keep their rate."""
+    from dew.nn.cross_attention import crossing
+    from dew.optim import parameter_name
+
+    held = objective.held_variables()
+    if held is None:
+        return ()
+    loaded = {path for path, _ in jax.tree_util.tree_leaves_with_path(held.get("params", {}))}
+    trained = jax.eval_shape(lambda: objective.init(jax.random.key(0)))["params"]
+    return tuple(parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)
+                 if path not in loaded or crossing(tuple(getattr(entry, "key", entry) for entry in path)))
 
 
 def _best_argument():
@@ -1568,6 +1587,10 @@ class RunConfig:
 
             # The whole pool accepts the resume before its record is replaced or its state restored.
             agreed("run resume", check_resumed)
+            # A new run's modules drawn fresh over a loaded base learn at their own rate, which its
+            # record keeps, so its resume reads the groups it trained in (`OptimConfig.with_fresh`).
+            if agreed_same("run resumes", lambda: checkpoints.resumed(trainer.resume)) is None:
+                self = dataclasses.replace(self, optim=self.optim.with_fresh(fresh_parameters(objective)))
             agreed("run metadata", record_run)
             # The trainer (`built`) holds mesh, microbatches, layout, accumulation, split, dynamic_scale,
             # profile, tune_kernels and any step compiled ahead; prepare_process read the process fields,

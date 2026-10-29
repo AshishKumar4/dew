@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import functools
+import glob
 import inspect
 import json
 import math
@@ -83,6 +84,15 @@ def _matrix_sides(axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]] 
     if len(sides) != 2:
         return None
     return tuple(sides[0]), tuple(sides[1])
+
+
+FRESH_LEARNING_RATE_MULTIPLIER = 100.0
+"""How much faster than a loaded base the modules a run draws fresh over it learn by default
+(`OptimConfig.with_fresh`): a base fine-tunes at a rate a fresh module barely moves at. On a toy task
+whose answer is in a context only cross-attention reads (a four-layer decoder, blocks before layers 1
+and 3, AdamW, 1000 steps, tests/test_fresh_rate.py), the blocks learned nothing at the base's 1e-5
+(held loss 4.50 against the no-context 4.51), little with only their gates at 100 times (4.47), and as
+at 1e-3 throughout with every weight of theirs at 100 times (2.72)."""
 
 
 def weight_decay_mask(params):
@@ -1282,6 +1292,9 @@ class ParamGroup:
     patterns: tuple[str, ...]
     learning_rate_multiplier: float = 1.0
     weight_decay: float | None = None
+    spared: bool = False
+    """Whether the group's decay spares its biases and vectors as an ungrouped optimizer's does
+    (`weight_decay_mask`); False decays every parameter the group claims."""
     schedule: ScheduleBase | None = None
     b1: ScheduleBase | None = None
     bounds: tuple[float, float] | None = None
@@ -1881,12 +1894,12 @@ class OptimConfig:
             solvers = {}
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
-                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**opts, **decay})
+                spared = {'mask': weight_decay_mask} if group.spared and self._spares(opts) else {}
+                solvers[group.name] = group.solver(make, self.learning_rate, steps,
+                                                   {**opts, **decay, **spared})
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
-            # An Optax factory takes the split with a decay it is given; Dew's own take it always.
-            if self.optimizer not in ('muon', 'muonclip') and (self.optimizer in OPTIMIZER_MAP
-                                                                 or 'weight_decay' in opts):
+            if self._spares(opts):
                 opts['mask'] = weight_decay_mask
             solver = scheduled_solver(make, self.learning_rate, steps, opts)
 
@@ -1920,6 +1933,24 @@ class OptimConfig:
             return transformation
 
         return built
+
+    def _spares(self, opts: Mapping[str, object]) -> bool:
+        """Whether the optimizer's decay takes timm's split (`weight_decay_mask`): an Optax factory
+        with a decay it is given, Dew's own always, and never Muon, which decays as Moonlight does."""
+        return self.optimizer not in ('muon', 'muonclip') and (self.optimizer in OPTIMIZER_MAP
+                                                               or 'weight_decay' in opts)
+
+    def with_fresh(self, names: Sequence[str]) -> OptimConfig:
+        """This config with the parameters `names` (`parameter_name`s) learning at
+        `FRESH_LEARNING_RATE_MULTIPLIER` times its rate, in a group of their own, and every other at
+        its own (`param_groups`, each sparing what the ungrouped decay spares), where it names no
+        groups: a run's default for the modules it draws fresh over a loaded base. Unchanged where it
+        names groups, which say every parameter's rate, or where no parameter is fresh."""
+        if self.param_groups or not names:
+            return self
+        fresh = ParamGroup("fresh", tuple(glob.escape(name) for name in names),
+                           learning_rate_multiplier=FRESH_LEARNING_RATE_MULTIPLIER, spared=True)
+        return dataclasses.replace(self, param_groups=(fresh, ParamGroup("loaded", ("*",), spared=True)))
 
     def rates(self) -> dict[str | None, dict[str, float]]:
         """The rate fields each of `build`'s solvers holds in its state
