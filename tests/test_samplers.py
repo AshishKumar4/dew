@@ -1120,3 +1120,18 @@ def test_an_empty_lms_step_integrates_to_zero_with_the_basis_as_its_derivative()
 
         value, slope = jax.value_and_grad(integral)(jnp.float32(1.0))
         assert float(value) == 0.0 and float(slope) == at
+
+
+def test_the_prior_is_drawn_in_float32_whatever_the_default_dtype():
+    """`Process.noise` draws its prior's numbers in float32, as the samplers draw their innovations, so a
+    float64 walk from a key starts from the float32 walk's numbers (row 2416): under x64 the prior is that
+    float32 draw, exactly, times the schedule's float64 scale."""
+    process, _ = karras_process()
+    key, shape = jax.random.key(2416), (4, 8)
+    drawn = np.asarray(jax.random.normal(key, shape, jnp.float32), np.float64)
+    with jax.enable_x64(new_val=True):
+        wide = np.asarray(process.noise(key, shape))
+        scale = np.asarray(process.sampler_schedule.prior_scale(), np.float64)
+    assert wide.dtype == np.float64
+    np.testing.assert_array_equal(wide, drawn * scale)
+
