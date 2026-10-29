@@ -1478,6 +1478,26 @@ def test_a_reader_files_share_in_one_process_is_every_such_files_input(
     assert run() == [3, 3]
 
 
+def test_code_an_earlier_file_in_one_process_ran_is_a_later_files_input(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Code an earlier test file of a pytest process ran is the input of every file it ran after: a module
+    the first imports lazily inside a test, or a value it caches, serves the next without running again, so
+    a change to that module reruns both (row 2228; 256 test files hold ~2,300 imports inside tests)."""
+    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 1\n")
+    (tmp_path / "tests/conftest.py").write_text("import sys\nsys.path.insert(0, 'tests')\n")
+    body = ("from pathlib import Path\ndef test_{0}():\n"
+            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n"
+            "    import lazy_values\n    assert lazy_values.VALUE\n")
+    written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
+    packed(tmp_path, ["test_a.py", "test_b.py"])
+    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("a", "b"))
+
+    assert run() == [1, 1]
+    assert run() == [1, 1]
+    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 2\n")
+    assert run() == [2, 2]
+
+
 def test_an_open_after_the_tests_ended_is_the_records_input(ci, tmp_path, monkeypatch, cache_worker):
     """A data file opened after the last test ended, by a later session-finish hook, at exit or by a
     thread, is the task's input as well: the task's supervisor reads the watch once pytest and its process
