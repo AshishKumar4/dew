@@ -9,10 +9,14 @@ the counters each cadence owns.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import math
+import queue
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future
 from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
@@ -216,6 +220,10 @@ class Interval:
                           None if book is None else (book.norms, book.commits),
                           book.training if self.model_counted and book is not None else None,
                           book.tokens if self.tokens_counted and book is not None else None, statistics)
+        # The copies to the host begin now, so the log's read waits on nothing but the step itself.
+        for leaf in jax.tree.leaves(reading):
+            if isinstance(leaf, jax.Array):
+                leaf.copy_to_host_async()
         taken = Taken(step, self, dataclasses.replace(self), reading,
                       time.time() if isinstance(loss, _Settled) and loss.is_ready() else None)
         if self.tokens_counted and book is not None:
@@ -324,20 +332,23 @@ class Reading(NamedTuple):
 
 class Taken(NamedTuple):
     """One logging interval, taken at its last step, `step`, and read on the
-    host once the step after it is dispatched.
+    host by the run's log writer (`LogWriter`), off the step loop.
 
     Reading a step's numbers waits for that step, and read before the next
     step was dispatched, the wait left the devices idle while the host
     logged, read its next batch and dispatched: 22 ms of each 652 ms step of
-    Qwen3.5-0.8B on an A100 at log_every=1 (docs/performance.md). So the
-    loop reads a log one step late, as MaxText's metric logger writes its
-    metrics, and at once where the run waits on the devices anyway or ends:
-    before a compile, an evaluation or a checkpoint, and at the run's end.
+    Qwen3.5-0.8B on an A100 at log_every=1 (docs/performance.md). Read one
+    step late on the loop, as MaxText's metric logger writes its metrics, the
+    host still waited on the step before it. So the copies to the host begin
+    at the take and a writer thread reads and reports the log while the loop
+    steps on, never waiting (row 2313); the loop waits for the writer only
+    where it waits on the devices anyway or ends: before a compile, an
+    evaluation or a checkpoint, and at the run's end.
 
     `counts` is the live `interval` as it stood at the take. `done` is when
     the host first saw the step finished: at the take if it already was,
     else at the read, which waits for it. The read ends the interval's clock
-    there and starts the next one's.
+    there, and the next interval's clock starts there (`LogWriter.since`).
     """
 
     step: int
@@ -350,15 +361,66 @@ class Taken(NamedTuple):
         """Whether the read would not wait on the devices."""
         return all(leaf.is_ready() for leaf in jax.tree.leaves(self.reading) if isinstance(leaf, _Settled))
 
-    def read(self, display: TrainingDisplay) -> tuple[Reading, float]:
-        """The reading on the host, its losses' streak checked
-        (`checked_streak`) at the step it read, and the interval's seconds."""
+    def read(self, display: TrainingDisplay, since: float | None) -> tuple[Reading, float, float]:
+        """The reading on the host, its losses' streak checked (`checked_streak`) at the step it read, the
+        interval's seconds since `since`, the previous log's `done` (the interval's own start for the first),
+        and its `done`."""
         read = on_host(self.reading, self.step)
         done = time.time() if self.done is None else self.done
-        self.interval.last_log_time = done
         if read.streak is not None:
             checked_streak(int(read.streak), self.step, display)
-        return read, done - self.counts.last_log_time
+        return read, done - (self.counts.last_log_time if since is None else since), done
+
+
+class LogWriter:
+    """A fit's logs written off its step loop (row 2313): each one the loop takes (`Taken`) is read on the
+    host and reported by one daemon thread, in the order taken, while the loop steps on; the copies to
+    the host began at the take (`Interval.take`). A write's failure, a tracker's or a losses' streak, is
+    kept for the loop to raise at a point every process reaches alike (`raise_failure`), where it agrees
+    on it, never on the writer's thread. `since` is the last write's `done`, where the next interval's
+    clock starts."""
+
+    def __init__(self) -> None:
+        self._queue: queue.SimpleQueue[tuple[Callable[[], None], Future] | None] = queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
+        self._writes: collections.deque[tuple[Future, Callable[[], bool]]] = collections.deque()
+        self.unchecked = 0
+        """Writes handed over since the loop last waited on every one: alike on every process."""
+        self.since: float | None = None
+
+    def submit(self, write: Callable[[], None], ready: Callable[[], bool]) -> None:
+        """Hand `write` to the thread; `ready` says whether it can run without waiting on the devices."""
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._serve, name="dew-log-writer", daemon=True)
+            self._thread.start()
+        written: Future = Future()
+        self._queue.put((write, written))
+        self._writes.append((written, ready))
+        self.unchecked += 1
+
+    def _serve(self) -> None:
+        while (handed := self._queue.get()) is not None:
+            write, written = handed
+            try:
+                written.set_result(write())
+            except BaseException as error:
+                written.set_exception(error)
+
+    def raise_failure(self, *, wait: bool, ready_only: bool = False) -> None:
+        """Raise the first failed write's error among those done, or, where `wait`, among every write,
+        waiting for each; `ready_only` waits only for writes that wait on no device (a failed run's
+        cleanup, whose devices or peers may never finish a step)."""
+        while self._writes and (self._writes[0][0].done() or (wait and (
+                not ready_only or self._writes[0][1]()))):
+            self._writes.popleft()[0].result()
+        if wait:
+            self.unchecked = 0
+
+    def close(self) -> None:
+        """Stop the thread once it has written what it holds; a write that waits on a step that never
+        ends holds no process open, the thread being a daemon."""
+        if self._thread is not None:
+            self._queue.put(None)
 
 
 def on_host[TreeT](counters: TreeT, step: int) -> TreeT:

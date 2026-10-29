@@ -35,7 +35,7 @@ from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Tokens
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, Taken, TokenClock
+from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.observe import Observe
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
@@ -305,6 +305,8 @@ class FitRun:
     notice: PreemptionNotice | None = None
     endless: bool = False
     taken: Taken | None = None
+    writer: LogWriter = dataclasses.field(default_factory=LogWriter)
+    """Where the logs the loop takes are read and reported, off the loop (`Trainer._read_taken`)."""
     scored: frozenset[str] = frozenset()
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
     ahead: tuple[Batch | None] | None = None
