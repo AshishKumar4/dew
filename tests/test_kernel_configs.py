@@ -293,9 +293,9 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
         ("row scaled forward", gmm, (x, w, sizes, (), (vector((rows,)),)),
          {**forward, "hooks": hooks(epilogue=scaled_rows, epilogue_axes=(("rows",),))}),
         ("paired swiglu forward", gmm, (x, w, sizes, (), (), w),
-         {**forward, "hooks": hooks(epilogue=swiglu, paired=True)}),
+         {**forward, "hooks": hooks(epilogue=swiglu)}),
         ("paired forward", gmm, (x, w, sizes, (), (), w),
-         {**forward, "hooks": hooks(out_dtypes=("bfloat16", "bfloat16"), paired=True)}),
+         {**forward, "hooks": hooks(out_dtypes=("bfloat16", "bfloat16"))}),
     ]
 
 

@@ -102,12 +102,10 @@ class Hooks:
     epilogue_broadcast: tuple = ()
     prologue_dtypes: tuple = ()
     epilogue_dtypes: tuple = ()
-    paired: bool = False
-
-    @property
-    def accumulators(self) -> int:
-        """The accumulator tiles the epilogue takes before its side tiles."""
-        return 2 if self.paired else 1
+    accumulators: int = 1
+    """The accumulator tiles the epilogue takes before its side tiles: a launch's binding states them from
+    its bound operands (two where a second matrix is bound, `gmm_call`'s `paired`; `_GroupedLaunch.bind`),
+    never a caller."""
 
     def before(self):
         """The prologue as a kernel traces it: on the squeezed side tiles."""
@@ -243,7 +241,8 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
             hooks, prologue_dtypes=hooks.prologue_dtypes or (() if hooks.prologue is None else named(
                 ba.arguments['tokens'], *ba.arguments.get('prologue_operands', ()))),
             epilogue_dtypes=hooks.epilogue_dtypes or (() if hooks.epilogue is None else (
-                'float32', *named(*ba.arguments.get('epilogue_operands', ())))))
+                'float32', *named(*ba.arguments.get('epilogue_operands', ())))),
+            accumulators=1 if ba.arguments.get('paired') is None else 2)
         return ba if stated == hooks else type(ba)(ba.op, {**ba.arguments, 'hooks': stated})
 
     def traced(self, name: str, value: Callable | str | None) -> str | None:
@@ -266,7 +265,7 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
                                 program(value.after(), value.epilogue_axes, value.epilogue_dtypes,
                                         value.accumulators),
                                 value.prologue_axes, value.epilogue_axes, value.out_dtypes,
-                                value.prologue_broadcast, value.epilogue_broadcast, value.paired))
+                                value.prologue_broadcast, value.epilogue_broadcast, value.accumulators))
 
     def keyed(self, ba):
         """`tuning.KernelOp.keyed`, each side operand's dimension that follows the rows bucketed with the
@@ -629,7 +628,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         vectors = sum(family.column_registers(config.block_n, side.dtype)
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
                                             strict=True) if axes == ('columns',))
-        vectors += family.column_registers(config.block_n, jnp.float32) if hooks.paired else 0
+        vectors += family.column_registers(config.block_n, jnp.float32) if hooks.accumulators > 1 else 0
         return max(0, vectors + resources.CONTROL_REGISTERS - family.held_registers)
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
@@ -1456,8 +1455,8 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
-    return GroupedCase(placed, whole, product, arguments[0].shape[0], call, kind,
-                       paired=options.get('hooks', NO_HOOKS).paired)
+    paired = any(bound.arguments.get('paired') is not None for _, bound in call.bound.values())
+    return GroupedCase(placed, whole, product, arguments[0].shape[0], call, kind, paired=paired)
 
 
 def launched(launches, arguments, options, *, product: Product, whole: bool):

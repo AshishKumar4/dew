@@ -263,8 +263,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
                                      tuple(dtype.name for dtype in dtypes) if several else None,
                                      prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast,
                                      prologue_dtypes=_dtypes(prologue, lhs, before_sides),
-                                     epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides),
-                                     paired=paired is not None)
+                                     epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides))
         product = declared(lhs.dtype, precision, outputs=summed_as or dtypes, operands=(lhs.dtype, rhs.dtype))
         call = grouped_matmul.gmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, before_sides, after_sides,
                                        None if paired is None else paired.astype(lhs.dtype),
