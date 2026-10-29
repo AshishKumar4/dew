@@ -86,8 +86,10 @@ class Hooks:
     its callers hold and a port may take as given (mamba_ssm's kernels clamp each decay to at most
     one); a skip `D v`, and the epilogue; and `floor`, the least log decay a token a layer declares
     (Kimi delta attention's `lower_bound`, -5), which a decay a key dimension's factored chunk form reads
-    as its range's bound (`recurrence_algebra.factored_range`). The chunked op (`recurrence_chunk.chunk`)
-    takes the same form."""
+    as its range's bound (`recurrence_algebra.factored_range`); and `write_bound`, the largest write gate
+    a layer declares of l2-normalized keys (its config's: 1 for a sigmoid's, 2 for twice a sigmoid's, the
+    negative-eigenvalue delta rule's), which bounds the delta rule's chunk inverse (`inverse_bound`). The
+    chunked op (`recurrence_chunk.chunk`) takes the same form."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -99,6 +101,23 @@ class Hooks:
     skip: bool = False
     output: OutputNorm | None = None
     floor: float | None = None
+    write_bound: float | None = None
+
+    @property
+    def inverse_bound(self) -> float | None:
+        """The largest entry of the delta rule's chunk inverse `(I + A)^-1` its form proves, None where it
+        proves none: keys of unit norm (the op's `l2norm`, or as `write_bound` declares) and write gates at
+        most `b` (a sigmoid's from the `gates`, else the declared `write_bound`) with `b` at most two. Each
+        transition `I - beta k k^T` then has its eigenvalues in [1 - b, 1], within [-1, 1], and a decay
+        at most one scales it, so a product of them is no expansion; an entry below the diagonal is
+        `-beta_i k_i^T (T_{i-1} ... T_{j+1}) k_j` (decays included), at most `b`, and a product of a chunk's
+        partial inverse and its system, `w_i . k_j` with `|w_i| <= b`, too. Unnormalized keys with
+        `beta |k|^2` past two grow it geometrically (an eigenvalue past -1)."""
+        if not self.delta:
+            return None
+        sigmoid = self.gates is not None and self.gates.write == 'sigmoid'
+        bound = 1.0 if self.l2norm and sigmoid else self.write_bound
+        return bound if bound is not None and bound <= 2.0 else None
 
     @property
     def gated_write(self) -> bool:
@@ -670,16 +689,13 @@ def _whole(hooks: Hooks) -> bool:
     return hooks.conv is not None or hooks.output is not None
 
 
-def refusal(state, *, tangent: bool = False) -> Refusal | None:
+def refusal(state) -> Refusal | None:
     """Why the launch turns down a `[rows, heads, Dk, Dv]` `state`, or None where it takes it: it runs
     on a GPU Dew's Triton kernels run on (`triton_runs`), holds the state in fp32 or bf16 and computes
-    in fp32 (a float64 state keeps its own precision in `step_reference`), takes widths that are powers
-    of two (Triton's blocks), and updates the state in place, which JAX's Pallas gives no tangent, so a
-    token traced for forward-mode derivatives (`tangent`) is no launch's."""
+    in fp32 (a float64 state keeps its own precision in `step_reference`), and takes widths that are
+    powers of two (Triton's blocks)."""
     dk, dv = state.shape[-2:]
     return next((Refusal(code, detail, row) for holds, code, detail, row in (
-        (not tangent, 'forward_mode', "a JVP trace needs forward-mode derivatives; the launch updates its "
-         "state in place, which JAX's Pallas gives no tangent", INHERENT),
         (triton_runs(), 'capability', "the launch needs a GPU of sm80 or later", INHERENT),
         (state.dtype in (jnp.float32, jnp.bfloat16), 'precision',
          f"the launch holds a state in fp32 or bf16 and computes in fp32, not {state.dtype}", INHERENT),
@@ -713,7 +729,23 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     token's with a conv), the history in its dtype, the state as it is held and updated in place
     where the caller lets it go. A row `active` marks False keeps its history and state, its output
     zeros. A one-tap conv holds no history, so its token is a channel-wise scale: it is taken here
-    and the launch steps the queries, keys and values it makes."""
+    and the launch steps the queries, keys and values it makes. Differentiated at every order through
+    `step_reference` (`generation.linear_tangent`), the launch having no derivative of its own: a token
+    traced for `jax.jvp`, however a jit, a scan or a remat staged it, takes the reference's tangent and
+    the launch's value (row 2395)."""
+    def portable(operands):
+        return step_reference(hooks, operands, dtype=dtype)
+
+    def pulled(saved, operands, cotangent):
+        del saved
+        return jax.vjp(portable, *operands)[1](cotangent)
+
+    launched = functools.partial(_launched, hooks, dtype=dtype)
+    return linear_tangent(lambda operands: (launched(operands), ()), pulled, portable)(operands)
+
+
+def _launched(hooks: Hooks, operands: Step, *, dtype):
+    """`step`'s launch on its operands."""
     given = read(hooks, operands)
     if hooks.conv is not None and given['held'].shape[1] == 0:
         return _one_tap(hooks, hooks.conv, operands, given, dtype)

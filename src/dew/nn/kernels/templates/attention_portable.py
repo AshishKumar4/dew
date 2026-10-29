@@ -462,12 +462,13 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             logits, slopes = algebra.tile_logits(score_mod, interpreted_dot(by_power(q, prescale), k_tile.T),
                                                  seen, rows[:, None], columns[None, :], params, scale=factor,
                                                  slopes=True)
-            exponentials, weights = algebra.normalized(logits, m, denominator, how)
+            inverse_total = algebra.inverse(denominator)
+            exponentials, weights = algebra.normalized(logits, m, inverse_total, how)
             zt = None if draw is None else draw(rows[:, None], columns[None, :])
             cotangents = algebra.grad_scores(exponentials, interpreted_dot(do, v_tile.T),
                                              anchor[row, head, rows], delta[row, head, rows], seen,
                                              columns[None, :] == key_index[row, head, rows][:, None],
-                                             algebra.inverse(denominator), multiplier=zt)
+                                             inverse_total, multiplier=zt)
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
             dv = dv + transposed_dot(*algebra.value_operands(exponentials, weights, do, denominator,
                                                              multiplier=zt))
