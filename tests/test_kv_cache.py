@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import assert_as_exact
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -22,7 +22,6 @@ from dew.nn.kv_cache import (
     KVStore,
     _gather_pages,
     _gathered_attention,
-    _gathered_tangent,
     gpu_paged,
     hadamard,
     overflowed,
@@ -181,63 +180,54 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
                                                                              windowed, softcap, sunk):
     """Over reordered and shared pages and distinct key counts, from each
     row's first key under a window where `windowed`, with sinks where `sunk`,
-    the Pallas kernel's value is as exact as the gathered attention's through
-    the dispatch, measured from float64, and its gradients (the sinks' among
-    them) and its jvp are that attention's (`_gathered_attention`, in forward
-    mode `_gathered_tangent`): at 256-wide heads too, which cuDNN's backward
-    does not take before Hopper, as the derivative's own kernel needs nothing
-    of cuDNN."""
-    q = jax.random.normal(jax.random.key(3), (2, 4, width), jnp.bfloat16)
-    k = jax.random.normal(jax.random.key(4), (2, 4, 16, width), jnp.bfloat16)
-    v = jax.random.normal(jax.random.key(5), k.shape, jnp.bfloat16)
-    s = jnp.asarray([0.5, -1.0, 2.0, -3.0], jnp.float32)
+    the Pallas kernel's value, gradients (the sinks' among them) and jvp are
+    as exact as the gathered attention's (`_gathered_attention`, which its
+    derivatives delegate to, in forward mode by `_gathered_tangent`), each from
+    the gathered attention in float64 over the declared draws (check 1, row
+    1931): at 256-wide heads too, which cuDNN's backward does not take before
+    Hopper, as the derivative's own kernel needs nothing of cuDNN."""
     table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
     lengths = jnp.asarray([21, 32], jnp.int32)
     starts = jnp.asarray([5, 17], jnp.int32) if windowed else None
     argnums = (0, 1, 2, 3) if sunk else (0, 1, 2)
 
-    def old(q, k, v, s):
-        return _gathered_attention(q, k, v, table, lengths, starts, s if sunk else None, softcap=softcap)
-
-    def loss(function, q, k, v, s):
-        out = function(q, k, v, s)
-        return jnp.sum(out.astype(jnp.float32) ** 2), out
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(3), seed), 5)
+        q = jax.random.normal(keys[0], (2, 4, width), jnp.bfloat16)
+        k = jax.random.normal(keys[1], (2, 4, 16, width), jnp.bfloat16)
+        v = jax.random.normal(keys[2], k.shape, jnp.bfloat16)
+        s = jax.random.normal(keys[3], (4,), jnp.float32)
+        return q, k, v, s, jax.random.normal(keys[4], q.shape, jnp.bfloat16)
 
     def native(q, k, v, s):
         return gpu_paged(softcap)(q, k, v, table, lengths, starts, s if sunk else None)
-    (_, out), gradients = jax.jit(jax.value_and_grad(lambda *a: loss(native, *a), argnums=argnums,
-                                                     has_aux=True))(q, k, v, s)
-    (_, prior), previous = jax.jit(jax.value_and_grad(lambda *a: loss(old, *a), argnums=argnums,
-                                                      has_aux=True))(q, k, v, s)
-    for actual, expected in zip(gradients, previous, strict=True):
-        np.testing.assert_array_equal(actual, expected)
-    direction = jax.random.normal(jax.random.key(6), q.shape, jnp.bfloat16)
-    np.testing.assert_array_equal(
-        jax.jit(lambda q: jax.jvp(lambda q: native(q, k, v, s), (q,), (direction,))[1])(q),
-        jax.jit(lambda q: jax.jvp(lambda q: _gathered_tangent(q, k, v, table, lengths, starts,
-                                                              s if sunk else None, softcap=softcap),
-                                  (q,), (direction,))[1])(q))
 
-    with jax.enable_x64():
-        def reference(q, k, v, s):
-            return scaled_dot_product_attention(
-                q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
-                implementation="reference", key_value_seq_lengths=lengths,
-                key_value_seq_starts=starts, softcap=softcap, sinks=s if sunk else None,
-                precision=jax.lax.Precision.HIGHEST, force_fp32_for_softmax=False)[:, 0]
+    def gathered(q, k, v, s):
+        return _gathered_attention(q, k, v, table, lengths, starts, s if sunk else None, softcap=softcap)
 
-        def reference_loss(q, k, v, s):
-            value = reference(q, k, v, s)
-            return jnp.sum(value ** 2), value
+    def wide(q, k, v, s):
+        return scaled_dot_product_attention(
+            q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
+            implementation="reference", key_value_seq_lengths=lengths, key_value_seq_starts=starts,
+            softcap=softcap, sinks=s if sunk else None, precision=jax.lax.Precision.HIGHEST,
+            force_fp32_for_softmax=False)[:, 0]
 
-        (_, truth), derivatives = jax.jit(
-            jax.value_and_grad(reference_loss, argnums=argnums, has_aux=True)
-        )(*(x.astype(jnp.float64) for x in (q, k, v, s)))
-        for actual, expected in zip((out, *gradients), (truth, *derivatives), strict=True):
-            expected = np.asarray(expected)
-            assert np.abs(np.asarray(actual, np.float64) - expected).max() <= 2 ** -6 * np.abs(expected).max()
-    assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(prior, np.float32),
-                                     np.asarray(truth), "paged decode kernel")
+    def derivatives(attention):
+        """`attention`'s value, the gradients of its squared sum and its jvp along the drawn direction."""
+        @jax.jit
+        def run(q, k, v, s, direction):
+            def loss(*inputs):
+                out = attention(*inputs)
+                wide = out.astype(jnp.float32) if out.dtype != jnp.float64 else out
+                return jnp.sum(wide ** 2)
+            gradients = jax.grad(loss, argnums=argnums)(q, k, v, s)
+            tangent = jax.jvp(lambda q: attention(q, k, v, s), (q,), (direction,))[1]
+            return (attention(q, k, v, s), *gradients, tangent)
+        return run
+
+    assert_as_exact(derivatives(native), derivatives(gathered), draw, "paged decode kernel",
+                    seeds=PAGED_DERIVATIVE_SEEDS[width, windowed, softcap is not None, sunk],
+                    truth_fn=derivatives(wide))
 
 
 def greedy(layout):
@@ -361,6 +351,11 @@ def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_head
     arguments = (placed(params, mesh), placed(cache, mesh), placed(tokens, mesh, rows))
     tpu_lowering(step, arguments, mesh)
 
+
+PAGED_DERIVATIVE_SEEDS = {(width, windowed, capped, sunk): 16 for width in (64, 256)
+                          for windowed in (False, True) for capped in (False, True) for sunk in (False, True)}
+"""The native paged kernel's declared seeds, by width, window, softcap and sinks, sized on an A100 and an H100
+by paired `seeds_for` (the test runs only on a GPU)."""
 
 SOFTCAP_PAGED_SEEDS = 8
 """The softcapped paged decode's declared draws (check 1)."""
