@@ -126,7 +126,9 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
         if run.objective.saved_task is not task:
             raise ValueError(f"step {chosen} of {root}, which its task loads by default, was written by "
                              f"{run.objective.__name__}, whose task is another; load a step with `step`")
-    return task.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
+    loaded = task.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
+    # A Dew task traces in the attention form its run trained in (`SavedRun.formed`).
+    return run.formed(loaded) if isinstance(loaded, SavedRunTask) else loaded
 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,

@@ -69,7 +69,7 @@ from dew.decision.questions import (
 )
 from dew.files import write_atomically
 from dew.inference import scoring
-from dew.inference.tasks import SavedRun, SavedRunTask, length_ladder, shape_bucket
+from dew.inference.tasks import SavedRun, SavedRunTask, length_ladder, shape_bucket, traced_in_its_form
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
@@ -451,6 +451,7 @@ class Decide(SavedRunTask):
             checkpoints.save(self.weights.step, state, artifact=DecisionObjective(self).inference_record())
             checkpoints.wait()
 
+    @traced_in_its_form
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
         """Return one answer per question in `questions`, about `state` and any `images`.

@@ -295,7 +295,10 @@ class DewLM(TemplateLM):
                                      [len(rows[index]) - len(requests[index][2]) for index in batch],
                                      self.task.prefix)
             scoring = program(_scored, self.task.model, static_argnums=(0,))
-            probabilities, argmax = scoring(self._scorer(inputs.tokens.shape[1]), self.task.variables, inputs)
+            # Scored in the attention form the run trained in, as its generation is (`SavedRunTask.traced`).
+            with self.task.traced():
+                probabilities, argmax = scoring(self._scorer(inputs.tokens.shape[1]), self.task.variables,
+                                                inputs)
             values, matched = np.asarray(probabilities), np.asarray(argmax)
             for offset, index in enumerate(batch):
                 end = len(rows[index]) - 1

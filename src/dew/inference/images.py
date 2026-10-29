@@ -23,7 +23,7 @@ from dew._records import JSON
 from dew.artifacts import uint8_pixels
 from dew.batch import Variables, thaw
 from dew.diffusion.process import Conditioning, Process
-from dew.inference.tasks import SavedRun, SavedRunTask
+from dew.inference.tasks import SavedRun, SavedRunTask, traced_in_its_form
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, host_rows, local_rows, mesh_of, request_key
@@ -650,6 +650,7 @@ class TextToImage(SavedRunTask):
         return given, null, initial_state
 
 
+    @traced_in_its_form
     def __call__(
         self,
         prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs,
