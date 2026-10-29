@@ -444,8 +444,8 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down():
     key_heads, value_heads, key_width, value_width, _ = RESOURCE_SHAPES['qwen3.5-27b-gdn']
     rows, length = 1, 4096
     keys = jax.ShapeDtypeStruct((rows, length, key_heads, key_width), jnp.bfloat16)
-    shapes = (((rows, length, value_heads, value_width), jnp.bfloat16), ((rows, length, value_heads), jnp.float32),
-              ((rows, length, value_heads), jnp.bfloat16),
+    shapes = (((rows, length, value_heads, value_width), jnp.bfloat16),
+              ((rows, length, value_heads), jnp.float32), ((rows, length, value_heads), jnp.bfloat16),
               ((rows, value_heads, key_width, value_width), jnp.float32))
     args = [keys, keys, *(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in shapes)]
     bound = template.MOSAIC.bind(*args, None)
