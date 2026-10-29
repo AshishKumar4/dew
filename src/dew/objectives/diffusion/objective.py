@@ -69,8 +69,8 @@ from dew.objectives.base import (
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
 from dew.sampling.guidance import CFG, Guidance
-from dew.sampling.sample import sampling_modules, walk_and_decode
 from dew.sampling.solvers import DDIM, Consistency, Solver
+from dew.sampling.walks import sampling_modules, walk_and_decode
 
 if TYPE_CHECKING:
     from dew.data.pipeline import ObjectiveData
