@@ -521,8 +521,23 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 if config := _derived(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
                                       overlapped=False):
                     found.append(config)
+            # Queries first on the layout whose consumers feed their rings, each consumer its own keys over
+            # the query stream it feeds (FlashAttention 3's CTA), at the layout's consumers, whom no
+            # producer's warpgroup shares the registers with (ET-FFED3-h100, the fused launch: 2.40 against
+            # 2.71 ms causal and 4.32 against 5.54 full at Qwen3-8B's widths, 0.47 against 0.59 at width 64).
+            for layout in fed:
+                def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
+                    return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
+
+                if config := _derived(layout, query.dtype, key.shape[1], query.shape[1], fed_fused, fits,
+                                      overlapped=True):
+                    found.append(config)
             if found:
-                return max(found, key=lambda config: config.block_q * config.block_k)
+                # The most keys and queries a program's step takes, its consumers' keys over its query tile;
+                # on a tie the more consumers, one's softmax under the other's products (ET-FFED3-h100 at
+                # width 64: 64 x 64 on two consumers 0.47 ms against 128 x 64 on one, 0.59).
+                return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers,
+                                                      config.consumers))
         # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
         # Its logits' queries a stream of their own, else where that passes the block staged a step
