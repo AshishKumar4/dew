@@ -861,7 +861,8 @@ class Trainer(Generic[Loss, Effects]):
         device's, on which the FLOPs a spread saves take the least time. Each
         axis's bandwidth is measured once per mesh, and not at all for a
         device the peak table does not name (a CPU's among them), where it
-        decides nothing; a link the run states (`links`) is taken as stated."""
+        decides nothing, or over a compile-only GPU (`dew.training.ahead`), which no process holds to
+        measure, so its axis spreads nothing; a link the run states (`links`) is taken as stated."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
@@ -874,7 +875,8 @@ class Trainer(Generic[Loss, Effects]):
                 links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
                 continue
             if not all(device in jax.devices() for device in devices):
-                raise ValueError(f"compile-only {axis} axes require stated links; no GPU can measure them")
+                links[axis] = Link(None, peak)
+                continue
             if (mesh, axis) not in self._bandwidths:
                 # A resumed run takes the figure its checkpoint traced with, on this very placement.
                 self._bandwidths[mesh, axis] = None if peak is None else (
@@ -1089,9 +1091,10 @@ class Trainer(Generic[Loss, Effects]):
         # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
         last = state.accumulation
         rebuilt = last is not None and not last.replays(prepared.accumulation)
-        built = [(prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last)]
-        held = prefetched_bytes(batch, placement, self._prefetch) + placed_bytes(
-            [field for field, kept in built if kept is None and field is not None])
+        built = placed_bytes([field for field, kept in ((prepared.compute, state.compute),
+                                                         (prepared.accumulation, None if rebuilt else last))
+                              if kept is None and field is not None])
+        held = prefetched_bytes(batch, placement, self._prefetch) + built
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
         lower = Routed(functools.partial(jitted.lower, *apart(prepared), batch, part))
@@ -1102,8 +1105,8 @@ class Trainer(Generic[Loss, Effects]):
             lowered, launches = lower(), launches or "[]"
         footprint = None if self.step is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
-        return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches, lower.report(),
-                         footprint)
+        return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
+                         lower.report(), footprint)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
                   narrow: bool | None = None):

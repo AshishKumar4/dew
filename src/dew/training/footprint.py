@@ -5,11 +5,12 @@ first call builds beside it (`Candidate.held`) take a free block of every device
 state it reads is already resident. A footprint states those terms before any compile: the
 residuals the loss's pullback keeps between forward and backward at one microbatch, read off the
 pullback's traced program (`residual_bytes`), and the trained parameters' gradient, each a device's
-share. XLA's workspace beyond them is no term of it: what XLA's buffer assignment and scheduling make
-of a program is no function of its residuals (tools/benchmark_decoder_remat.py, RTX 4080: 326 MB of
-residuals against 138 MB of temporaries without recomputation, 13.5 against 31.9 at 'full'), so the
-run's one compile confirms the derivation, and the plan records each term beside what the compile
-measured.
+share. A step over several devices leaves its residuals' shares to XLA's partitioner, which their
+trace does not state, so there the residuals are unknown. XLA's workspace beyond them is no term of
+it: what XLA's buffer assignment and scheduling make of a program is no function of its residuals
+(tools/benchmark_decoder_remat.py, RTX 4080: 326 MB of residuals against 138 MB of temporaries without
+recomputation, 13.5 against 31.9 at 'full'), so the run's one compile confirms the derivation, and the
+plan records each term beside what the compile measured.
 """
 
 from __future__ import annotations
@@ -38,20 +39,16 @@ class Footprint:
     """What a candidate step takes of a device beside the state it reads, derived from its shapes:
     `residuals`, the bytes its loss's pullback keeps from forward to backward at one microbatch;
     `gradients`, the trained parameters' gradient; and `held`, what its first call builds beside the
-    resident state (`Candidate.held`), each a device's share."""
+    resident state (`Candidate.held`), each a device's share. `residuals` is None for a step over
+    several devices, whose shares of them the partitioner chooses."""
 
-    residuals: int
+    residuals: int | None
     gradients: int
     held: int
     resident: Mapping[str, int] = dataclasses.field(default_factory=dict)
     """The prepared state's logical bytes by field and device, before buffer assignment aliases
     anything. These are not additional temporary bytes: the state's existing allocations already
     count against allocator headroom, and newly built copies and accumulators are in `held`."""
-
-    @property
-    def temporaries(self) -> int:
-        """The temporaries the derivation names: the residuals and the gradient."""
-        return self.residuals + self.gradients
 
     def record(self) -> dict[str, JSON]:
         """The terms traced so far, not an admission decision: workspace and scheduled liveness are
@@ -127,16 +124,19 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           micro: Batch, window: int, prepared: TrainState,
                                           held: int) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
-    device beside that state (`Footprint`): its loss's residuals at one microbatch, each at the
-    sharding its trace states, its trained parameters' gradient, laid out as they are,
-    and `held`."""
-    loss, (variables, *rest) = traced_loss(objective, prepared, window)
-    variables = forward_variables(variables, prepared.compute)
+    device beside that state (`Footprint`): its loss's residuals at one microbatch on a step over
+    one device, its trained parameters' gradient, laid out as they are, and `held`."""
+    spans = max((len(leaf.sharding.device_set) for leaf in jax.tree.leaves(prepared)
+                 if leaf.sharding is not None), default=1)
+    residuals = None
+    if spans == 1:
+        loss, (variables, *rest) = traced_loss(objective, prepared, window)
+        variables = forward_variables(variables, prepared.compute)
 
-    def trained(params, variables, batch, *rest):
-        return loss({**variables, "params": params}, batch, *rest)
+        def trained(params, variables, batch, *rest):
+            return loss({**variables, "params": params}, batch, *rest)
 
-    residuals = residual_bytes(trained, variables["params"], (variables, micro, *rest))
+        residuals = residual_bytes(trained, variables["params"], (variables, micro, *rest))
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}

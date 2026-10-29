@@ -249,7 +249,7 @@ def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defa
 
 
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0,
-                  capacity: int | None = None) -> int | None:
+                  capacity: int | None = None, built: int = 0) -> int | None:
     """Return the bytes the tightest of `devices` has to spare once the step's memory is placed.
 
     The step's temporaries and new outputs are placed next to `held` more bytes
@@ -257,7 +257,8 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     a device reports no memory, a device stated `capacity` bytes reading as one
     that holds them (`compile_only_gpus`' devices state none). The arguments (the state and the batch) are
     already resident and counted as in use, and the donated state's buffers are
-    reused for the outputs that alias them.
+    reused for the outputs that alias them; on a stated device, `built` bytes of them, which `held`
+    counts as the step's first call builds them, are not yet.
 
     XLA's GPU step takes all its temporaries in one allocation, so it needs one
     free block that large, not that many free bytes in total (`placeable`). Where
@@ -268,7 +269,7 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
         return None
     # A device that states no memory, one compiled for and absent (`compile_only_gpus`), holds the
     # `capacity` it is stated to, the step's arguments in it as they would be.
-    memory = [device_memory(device, capacity, stats.argument_size_in_bytes) for device in devices]
+    memory = [device_memory(device, capacity, stats.argument_size_in_bytes - built) for device in devices]
     if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
@@ -416,17 +417,18 @@ def fits_everywhere(headroom: int | None) -> bool:
 
 
 def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
-              capacity: int | None = None) -> tuple[bool, int | None]:
+              capacity: int | None = None, built: int = 0) -> tuple[bool, int | None]:
     """Whether the compiled step fits in the free memory of every device of `mesh`,
     and this process's headroom (`step_headroom`), None where it reads none.
 
-    Each device must also hold `held` more bytes, and the processes that hold
-    them agree on the answer. A step that XLA refused for memory
-    (`compiled_if_it_fits`) does not fit, and its process still takes part in the
-    agreement.
+    Each device must also hold `held` more bytes, `built` of them among the step's arguments
+    (`step_headroom`), and the processes that hold them agree on the answer. A step that XLA
+    refused for memory (`compiled_if_it_fits`) does not fit, and its process still takes part in
+    the agreement.
     """
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    headroom = None if executable is None else step_headroom(executable, local, held=held, capacity=capacity)
+    headroom = None if executable is None else step_headroom(executable, local, held=held,
+                                                             capacity=capacity, built=built)
     return fits_everywhere(-1 if executable is None else headroom), headroom
 
 

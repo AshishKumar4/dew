@@ -120,6 +120,8 @@ class Candidate:
     shardings: Placement[TrainState]
     prepared: TrainState
     held: int
+    built: int
+    """The bytes of `held` the step's arguments hold: the copies and accumulator its first call builds."""
     program: jax.stages.Lowered | None
     launches: str
     kernels: KernelReport
@@ -460,8 +462,8 @@ class FitSearch[LossT, EffectsT]:
     run's tile `base` at each remat rung (`recompute_more`). It holds what it lowered, compiled and
     measured, and where on the ladder it stands.
 
-    The first rung climbed drops the narrow copies, which a plan above it takes
-    back where its rung and split fit with them. A split missing at a rung with a half rung
+    The first rung climbed drops the narrow copies, and a plan above it keeps them dropped: taking them
+    back would compile another plan once one fits. A split missing at a rung with a half rung
     (`remat_half`) is compiled there, the plan staying where it fits; climbing passes
     every half rung asked (`onward`). Each compile's measure (`Forecast`) orders the splits; `resumed`, a
     checkpoint's rung, is warned of where it misses; where nothing fits it raises with the closest
@@ -491,8 +493,6 @@ class FitSearch[LossT, EffectsT]:
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
-    dropped: str | None = None
-    """The rung (`rung`) the narrow copies were dropped at."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`)."""
@@ -557,7 +557,7 @@ class FitSearch[LossT, EffectsT]:
         else:
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
         seconds = time.perf_counter() - began
-        fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity)
+        fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
         return options, executable, dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
 
@@ -595,7 +595,6 @@ class FitSearch[LossT, EffectsT]:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.
         if self.narrow and any(candidate.copies for candidate in self.lowered.values()):
             self.narrow = False
-            self.dropped = self.rung()
             self.lowered.clear()
             return True
         # XLA's default options, but `required`, are the half rung above the step's own where those
@@ -608,11 +607,6 @@ class FitSearch[LossT, EffectsT]:
         return self.onward(lambda: recompute_more(self.objective, self.base))
 
     def found(self, split: int) -> Planned:
-        if not self.narrow and self.dropped not in (None, self.rung()):
-            # A rung above the copies' may recompute the casts they save: a plan keeps them where it fits.
-            kept, self.narrow = self.fitted, True
-            if not self.fits_here(split):
-                self.fitted, self.narrow = kept, False
         assert self.fitted is not None
         modules = tuple(entry.module for entry in self.objective.program_key())
         return Planned(split, *self.fitted, self.xla_defaults, self.narrow, self.current(), modules,
