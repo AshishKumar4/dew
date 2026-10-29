@@ -658,29 +658,18 @@ def test_the_recurrence_templates_records_certify_natively_a_step_at_a_time(gene
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively(
         generation_name):
-    """The native step witness's faults, each refused where it lands (`assert_refused`), a memory
-    kept across chunks (`REGIMES`' 'slow'): a document starting at the second chunk, whose zero memory is
-    refused at more than 95% of the memory the first chunk leaves (99.99% on an A100 and an H100); and the
-    second chunk run from that memory rounded to bf16 where fp32 is held, refused at more than 60% of the fp32
-    memory it leaves (74%)."""
+    """The native step witness's carry faults, each refused where it lands
+    (`recurrence_witness.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where
+    fp32 is held."""
     with generation.assumed(generation_name):
-        operands = rw.draw(1, "slow", chunks=2, heads=2)
-        truth = rw.recorded(*operands)
-        assert_refused(*rw.dropped_refusals(operands, truth, 1, mosaic_lane()), 0.95)
-        assert_refused(*rw.handed_refusals(operands, truth, 1, mosaic_lane()), 0.6)
+        rw.assert_carry_faults_refused(mosaic_lane(), heads=2)
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_recurrence_step_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary_natively(
         generation_name):
-    """The native step witness's faults, each refused where it lands (`recurrence_witness.assert_refusals`):
-    the decay from a difference of fp32 cumulative sums (row 2066's defect) in a decay alone, refused at more
-    than 50% of the fp32 memory each chunk leaves (75% on an A100 and an H100; the 16-bit records' grid hides
-    it, and a write beside the decay its rounding's share); and each chunk's boundary a token early, at more
-    than 95% of the weighted keys, corrected values and outputs (99.9%); no record held where its intervals
-    separate."""
+    """The native step witness's step faults, each refused where it lands
+    (`recurrence_witness.assert_step_faults_refused`): decays from a difference of fp32 cumulative sums
+    (row 2066's defect) and each chunk's boundary a token early."""
     with generation.assumed(generation_name):
-        rw.assert_refusals(rw.cumsum_refusals(rw.draw(1, "decay", chunks=2, heads=2), mosaic_lane()),
-                           {"leaving": 0.5})
-        rw.assert_refusals(rw.shifted_refusals(rw.draw(1, "mild", chunks=2, heads=2), mosaic_lane()),
-                           {"w": 0.95, "c": 0.95, "o": 0.95})
+        rw.assert_step_faults_refused(mosaic_lane(), heads=2)

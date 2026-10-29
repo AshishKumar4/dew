@@ -703,25 +703,13 @@ def test_the_recurrence_step_witness_holds_the_interpreted_mainloop(regime):
 @INTERPRETS
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
-    (`nc.assert_refused`), a memory kept across chunks (`REGIMES`' 'slow'): a document starting at the
-    second chunk, whose zero memory is refused at more than 95% of the memory the first chunk leaves; and the
-    second chunk run from that memory rounded to bf16 where fp32 is held, refused at more than 60% of the
-    fp32 memory it leaves."""
-    lane = rw.interpreted_lane()
-    operands = rw.draw(1, "slow", chunks=2)
-    truth = rw.recorded(*operands)
-    nc.assert_refused(*rw.dropped_refusals(operands, truth, 1, lane), 0.95)
-    nc.assert_refused(*rw.handed_refusals(operands, truth, 1, lane), 0.6)
+    (`rw.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where fp32 is held."""
+    rw.assert_carry_faults_refused(rw.interpreted_lane())
 
 
 @INTERPRETS
 def test_the_recurrence_step_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
-    (`nc.assert_refused`): the decay from a difference of fp32 cumulative sums (row 2066's defect) in
-    a decay alone, refused at more than 50% of the fp32 memory each chunk leaves (the 16-bit records' grid
-    hides it); and each chunk's boundary a token early, at more than 95% of the weighted keys, corrected
-    values and outputs, and no record held where its intervals separate."""
-    lane = rw.interpreted_lane()
-    rw.assert_refusals(rw.cumsum_refusals(rw.draw(1, "decay", chunks=2), lane), {"leaving": 0.5})
-    rw.assert_refusals(rw.shifted_refusals(rw.draw(1, "mild", chunks=2), lane),
-                       {"w": 0.95, "c": 0.95, "o": 0.95})
+    (`rw.assert_step_faults_refused`): decays from a difference of fp32 cumulative sums (row 2066's defect)
+    and each chunk's boundary a token early."""
+    rw.assert_step_faults_refused(rw.interpreted_lane())

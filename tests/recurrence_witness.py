@@ -682,3 +682,38 @@ def assert_refusals(found: dict, shares: dict) -> None:
         assert not np.any(held & apart), name
     for name, share in shares.items():
         assert_refused(*found[name], share)
+
+
+DROPPED_SHARE = 0.95
+"""The least share of the memory the first chunk leaves at which a dropped carry is refused (99.99% natively
+on an A100 and an H100)."""
+HANDED_SHARE = 0.6
+"""The least share of the fp32 memory the second chunk leaves at which its entering memory rounded to bf16,
+where fp32 is held, is refused (74% natively)."""
+CUMSUM_SHARES = {"leaving": 0.5}
+"""The least share of each chunk's leaving fp32 memory at which decays from a difference of fp32 cumulative
+sums (row 2066's defect) are refused (75% natively; the 16-bit records' grid hides it)."""
+SHIFTED_SHARES = {"w": 0.95, "c": 0.95, "o": 0.95}
+"""The least shares of the weighted keys, corrected values and outputs at which each chunk's boundary a
+token early is refused (99.9% natively)."""
+
+
+def assert_carry_faults_refused(lane: Lane, heads: int | None = None) -> None:
+    """A memory kept across chunks (`REGIMES`' 'slow'): a document starting at the second chunk, whose zero
+    memory is refused at `DROPPED_SHARE` of the memory the first chunk leaves; and the second chunk run from
+    that memory rounded to bf16 where fp32 is held, at `HANDED_SHARE` of the fp32 memory it leaves."""
+    from native_certificates import assert_refused
+
+    operands = draw(1, "slow", chunks=2, **({} if heads is None else {"heads": heads}))
+    truth = recorded(*operands)
+    assert_refused(*dropped_refusals(operands, truth, 1, lane), DROPPED_SHARE)
+    assert_refused(*handed_refusals(operands, truth, 1, lane), HANDED_SHARE)
+
+
+def assert_step_faults_refused(lane: Lane, heads: int | None = None) -> None:
+    """Decays from a difference of fp32 cumulative sums in a decay alone, refused at `CUMSUM_SHARES`; and each
+    chunk's boundary a token early, at `SHIFTED_SHARES`; no record held where its intervals separate."""
+    sized = {} if heads is None else {"heads": heads}
+    assert_refusals(cumsum_refusals(draw(1, "decay", chunks=2, **sized), lane), CUMSUM_SHARES)
+    assert_refusals(shifted_refusals(draw(1, "mild", chunks=2, **sized), lane), SHIFTED_SHARES)
+
