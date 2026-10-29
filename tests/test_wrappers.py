@@ -420,21 +420,16 @@ def test_a_text_only_load_keeps_what_the_wrapper_declares_for_its_language_model
     modeling overrides turn on still admits a future block mate, and its end-of-text id still ends
     generation; and a vision tensor stored under two disagreeing names, which the full load refuses,
     is never compared."""
-    import shutil
 
     from safetensors.numpy import save_file
 
     from dew.interop import Pretrained
     from dew.interop.generation_config import eos_ids
 
-    directory = tmp_path / "source"
-    shutil.copytree(FIXTURES / "qwen35-tiny-mm", directory)
-    config = json.loads((directory / "config.json").read_text())
-    config["modeling_overrides"] = {"attention": {
-        "full_attention": "block_bidirectional", "linear_attention": "causal"}}
-    config["eos_token_id"] = 3
-    config["text_config"] = {**config["text_config"], "eos_token_id": None}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURES / "qwen35-tiny-mm", tmp_path / "source", lambda config: {
+        **config, "modeling_overrides": {"attention": {"full_attention": "block_bidirectional",
+                                                       "linear_attention": "causal"}},
+        "eos_token_id": 3, "text_config": {**config["text_config"], "eos_token_id": None}})
     tensors = load_file(directory / "model.safetensors")
     spelled = next(name for name in tensors if name.startswith("model.visual."))
     tensors[spelled.removeprefix("model.")] = tensors[spelled] + 1

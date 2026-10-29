@@ -374,18 +374,15 @@ def test_an_olmo3_model_with_a_llama3_ramp_on_one_kind_writes_back_what_transfor
     """OLMo3 rotates each layer kind through its own rope_parameters entry, so a Llama-3 ramp on
     the full layers beside plain sliding ones loads, writes back in that spelling, and
     transformers' Olmo3 reads the export to the logits Dew computes."""
-    from shutil import copytree
 
     import torch
     from transformers import Olmo3ForCausalLM
 
-    source = tmp_path / "source"
-    copytree(FIXTURES / "olmo3-tiny", source)
     config = fixture_config("olmo3-tiny")
     config["rope_parameters"]["full_attention"] = {
         "rope_type": "llama3", "rope_theta": 500000.0, "factor": 8.0, "low_freq_factor": 1.0,
         "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
-    (source / "config.json").write_text(json.dumps(config))
+    source = respelled(FIXTURES / "olmo3-tiny", tmp_path / "source", lambda _: config)
     ids = np.load(FIXTURES / "olmo3-tiny" / "input_ids.npy")
     from dew.interop import PretrainedDecoder
 

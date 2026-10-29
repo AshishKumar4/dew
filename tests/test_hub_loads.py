@@ -61,4 +61,5 @@ def test_the_census_loads_each_model_without_its_weights_and_rows_each_refusal(t
     reads = hub.sent("local/decoder", "model.safetensors")
     assert reads and all(read.asked is not None and read.asked[0] in (0, 8) for read in reads), hub.served
     assert sum(read.sent for read in reads) < decoder["model.safetensors"].stat().st_size, hub.served
-    assert not [path for path in (tmp_path / "cache").rglob("*") if path.suffix in (".safetensors", ".bin")]
+    cached = Path(env["HF_HUB_CACHE"]).rglob("*")
+    assert not [path for path in cached if path.suffix in (".safetensors", ".bin")]

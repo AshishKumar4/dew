@@ -1436,26 +1436,36 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
     _same_files(tmp_path / "from-run", tmp_path / "in-process")
 
 
-def test_an_imported_adapter_binds_to_its_bundle_as_a_fresh_one_does(decoder, loaded, tmp_path):
-    """`source.adapt(LoRA(..., source=<PEFT directory>))` binds the imported adapter to the bundle as a
+def test_an_imported_adapter_binds_to_its_bundle_as_a_fresh_one_does(decoder, tmp_path):
+    """`source.adapt(LoRA(..., source=<PEFT directory>))` binds an imported adapter to the bundle as a
     fresh spec's does: its factors are the file's (the adapted model computes what `LoRA.load` binds,
-    bit for bit), the adapter saves under the source's names, and the bundle saves the merged weights
-    a plain load computes. A spec stating another rank, alpha, target, rslora or dropout than the file
-    holds is refused."""
-    stated = LoRA(rank=4, modules=("q_proj", "v_proj", "down_proj"), alpha=8, dropout=0.1,
-                  source=str(ADAPTER))
-    bundled = decoder.adapt(stated, key=0)
+    bit for bit), the adapter saves its factors back under the source's names, and the bundle saves the
+    merged weights a plain load computes. A spec stating another rank, alpha, target, rslora or dropout
+    than the file holds is refused, as is the PEFT fixture whose modules take ranks and alphas of their
+    own, which one spec cannot state."""
+    spec = LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0, dropout=0.0)
+    drawn = decoder.adapt(spec, key=0)
+    # Factors that move the logits, so the import is no identity.
+    trained = {**drawn.variables, "params": jax.tree.map(lambda leaf: leaf + 0.05, drawn.variables["params"])}
+    drawn.adapter.save(trained, tmp_path / "imported")
+    expected = LoRA.load(decoder.model, decoder.variables, tmp_path / "imported", layouts=decoder.layouts)
+    stated = dataclasses.replace(spec, source=str(tmp_path / "imported"))
+    bundled = decoder.adapt(stated, key=1)
     ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6) % decoder.model.vocab_size
-    np.testing.assert_array_equal(np.asarray(bundled.model.apply(bundled.variables, ids)),
-                                  np.asarray(loaded.model.apply(loaded.variables, ids)))
-    bundled.adapter.save(bundled.variables, tmp_path / "adapter")
-    again = LoRA.load(decoder.model, decoder.variables, tmp_path / "adapter", layouts=decoder.layouts)
-    jax.tree.map(np.testing.assert_array_equal, thaw(again.variables), thaw(loaded.variables))
+    found = np.asarray(bundled.model.apply(bundled.variables, ids))
+    np.testing.assert_array_equal(found, np.asarray(expected.model.apply(expected.variables, ids)))
+    assert not np.array_equal(found, np.asarray(decoder.model.apply(decoder.variables, ids)))
+    bundled.adapter.save(bundled.variables, tmp_path / "again")
+    again = LoRA.load(decoder.model, decoder.variables, tmp_path / "again", layouts=decoder.layouts)
+    jax.tree.map(np.testing.assert_array_equal, thaw(again.variables), thaw(expected.variables))
     bundled.save(tmp_path / "merged")
     merged = Pretrained.load(tmp_path / "merged", dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(np.asarray(merged.model.apply(merged.variables, ids)),
-                                  np.asarray(decoder.model.apply(loaded.merge(loaded.variables), ids)))
-    for other in ({"rank": 2}, {"alpha": 4}, {"modules": ("q_proj", "v_proj")}, {"rslora": True},
-                  {"dropout": 0.0}):
+                                  np.asarray(decoder.model.apply(expected.merge(expected.variables), ids)))
+    for other in ({"rank": 4}, {"alpha": 8.0}, {"modules": ("q_proj",)}, {"rslora": True},
+                  {"dropout": 0.1}):
         with pytest.raises(ValueError):
             decoder.adapt(dataclasses.replace(stated, **other), key=0)
+    with pytest.raises(ValueError):
+        decoder.adapt(LoRA(rank=4, modules=("q_proj", "v_proj", "down_proj"), alpha=8, dropout=0.1,
+                           source=str(ADAPTER)), key=0)

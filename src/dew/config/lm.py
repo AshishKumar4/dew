@@ -134,16 +134,13 @@ class LMRunConfig(DecoderRunConfig):
             run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))
         variables = None if source is None else source.variables
         if self.lora is not None:
-            # An imported adapter on the Hub is recorded at the commit it was read at.
-            lora = self.lora.resolved()
-            run = dataclasses.replace(run, lora=lora)
             if source is None:
                 key = jax.random.key(self.trainer.key)
                 base = model.init(key, jnp.zeros((1, tokens.seq_len), jnp.int32))
-                adapter = lora.apply(model, base, key=jax.random.fold_in(key, 1))
+                adapter = self.lora.apply(model, base, key=jax.random.fold_in(key, 1))
                 model, variables = adapter.model, adapter.variables
             else:
-                source = source.adapt(lora, key=self.trainer.key)
+                source = source.adapt(self.lora, key=self.trainer.key)
                 model, variables = source.model, source.variables
         if kind == "masked_diffusion":
             objective = self.masked_objective(model, fields, variables, source)

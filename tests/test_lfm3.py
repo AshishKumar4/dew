@@ -195,13 +195,9 @@ def test_a_component_keeps_the_code_beside_its_config_and_none_outside_its_sourc
     """A release loaded from a component folder (`subfolder`) keeps the code beside that folder's config,
     not the source root's; a module whose relative import names a path outside the source refuses the
     save, which writes none of it (ledger 2038)."""
-    import shutil
-
     code = LFM3.release_code
-    component = tmp_path / 'release' / 'decoder'
-    shutil.copytree(TINY, component)
-    config = json.loads((component / 'config.json').read_text())
-    (component / 'config.json').write_text(json.dumps({**config, 'auto_map': dict(code.auto_map)}))
+    component = respelled(TINY, tmp_path / 'release' / 'decoder',
+                          lambda config: {**config, 'auto_map': dict(code.auto_map)})
     for file, text in RELEASED.items():
         (component / file).write_text(text)
     (tmp_path / 'release' / 'modeling_lfm3.py').write_text('raise ImportError\n')

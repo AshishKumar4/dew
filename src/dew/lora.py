@@ -207,7 +207,7 @@ class LoRA:
             model = fp8_base.joined(model)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
         if self.source is not None:
-            return self._imported(model, variables, layouts, scaling)
+            return self._imported(self.source, model, variables, layouts, scaling, base)
         source, variables = variables, thaw(variables)
         bound = _named(bound_layouts(model, variables, layouts or {}), self.modules)
         targets: dict[Path, Target] = {}
@@ -223,11 +223,13 @@ class LoRA:
         return Adapter.bound(model, overlay(source, leaves), targets, self.rslora, self.dropout, bound,
                              bases)
 
-    def _imported(self, model: nn.Module, variables: Variables, layouts: Mapping[str, WeightLayout] | None,
-                  scaling: float) -> Adapter:
-        """The adapter `source` holds over `variables` (`load`), refused unless it binds the
-        projections `modules` selects at this spec's rank, alpha, rslora and dropout."""
-        adapter = LoRA.load(model, variables, _adapter_files(self.source), layouts=layouts)
+    def _imported(self, source: str, model: nn.Module, variables: Variables,
+                  layouts: Mapping[str, WeightLayout] | None, scaling: float,
+                  base: AdapterBase | None) -> Adapter:
+        """The adapter `source` holds over `variables` (`load`), bound to `base` where the bundle names
+        one, refused unless it binds the projections `modules` selects at this spec's rank, alpha,
+        rslora and dropout."""
+        adapter = LoRA.load(model, variables, _adapter_files(source), layouts=layouts, base=base)
         wanted = set(_named(bound_layouts(model, thaw(variables), layouts or {}), self.modules))
         stated = {"targets": sorted(wanted), "rank": self.rank, "alpha": scaling, "rslora": self.rslora,
                   "dropout": self.dropout}
@@ -239,19 +241,25 @@ class LoRA:
         differ = [name for name in stated
                   if held[name] != ({stated[name]} if name in ("rank", "alpha") else stated[name])]
         if differ:
-            raise ValueError(f"{self.source} holds another adapter than this spec states: its "
+            raise ValueError(f"{source} holds another adapter than this spec states: its "
                              + ", ".join(f"{name} {held[name]!r}, not {stated[name]!r}" for name in differ))
         return adapter
 
     def resolved(self) -> LoRA:
         """This spec with a Hub `source` named at the commit the Hub resolves it to, as a run records
-        it; a local source, or none, as it is."""
+        it, the answer recorded so the same run resolves it offline (`hub_answer`); a local source, a
+        source named at a commit, or none, as it is."""
         if self.source is None or FilePath(self.source).exists():
             return self
         repo, _, revision = self.source.partition("@")
+        if re.fullmatch(r"[0-9a-f]{40}", revision):
+            return self
         from huggingface_hub import HfApi
 
-        commit = HfApi().model_info(repo, revision=revision or None).sha
+        from dew.cache import hub_answer
+
+        commit = hub_answer(("adapter commit", repo, revision),
+                            lambda: HfApi().model_info(repo, revision=revision or None).sha).value
         return dataclasses.replace(self, source=f"{repo}@{commit}")
 
     def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
@@ -275,14 +283,16 @@ class LoRA:
 
     @staticmethod
     def load(model: nn.Module, variables: Variables, path: str | FilePath, *,
-             layouts: Mapping[str, WeightLayout] | None = None) -> Adapter:
+             layouts: Mapping[str, WeightLayout] | None = None, base: AdapterBase | None = None) -> Adapter:
         """Return the adapter a PEFT directory or Diffusers file holds, attached to `model`.
 
         The adapter goes over `variables` with its factors in place. `path` is a PEFT
         adapter directory or a Diffusers file (or the directory that holds one), and
         `layouts` is read as in `apply`. Targets the model does not have, tensors
         whose shapes do not fit the bound weight, ranks that disagree with the config,
-        and PEFT features this loader does not support are refused by name.
+        and PEFT features this loader does not support are refused by name. `base` names the
+        published model the adapter now binds to, in place of the base each config names, as
+        `apply`'s does.
         """
         _refuse_unadaptable(model)
         bound = bound_layouts(model, thaw(variables), layouts or {})
@@ -292,13 +302,13 @@ class LoRA:
             config = _Config.read(json.loads(FilePath(where).read_text()), where)
             tensors, _ = read_file(path / PEFT_WEIGHTS)
             return _place(model, bound, variables, _entries(_components(bound), tensors, {"": config},
-                                                            PEFT_PREFIX))
+                                                            PEFT_PREFIX), base)
         file = path if path.is_file() else path / DIFFUSERS_WEIGHTS
         if not file.is_file():
             raise FileNotFoundError(f"{path} holds neither {PEFT_WEIGHTS} nor {DIFFUSERS_WEIGHTS}")
         tensors, metadata = read_file(file)
         configs = _diffusers_configs(tensors, metadata.get(DIFFUSERS_METADATA), str(file))
-        return _place(model, bound, variables, _entries(_components(bound), tensors, configs, ""))
+        return _place(model, bound, variables, _entries(_components(bound), tensors, configs, ""), base)
 
 
 def _adapter_files(source: str) -> FilePath:
@@ -1208,7 +1218,7 @@ def _entries(components: frozenset[str], tensors: Mapping[str, np.ndarray],
 
 
 def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Variables,
-           entries: Sequence[_Entry]) -> Adapter:
+           entries: Sequence[_Entry], base: AdapterBase | None = None) -> Adapter:
     """Build the adapter the entries describe, its factors restored into the model's tree, which
     keeps training what it trained where it came split (`freeze`)."""
     source, variables = variables, thaw(variables)
@@ -1221,8 +1231,8 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
     (rslora, dropout), = settings
     # A pipeline file's components each name their own base, as the tool that wrote it bound each
     # (Diffusers writes each component's config apart).
-    bases = {_component(components, entry.module)[0]: entry.config.base for entry in entries
-             if entry.config.base is not None}
+    bases = {_component(components, entry.module)[0]: base or entry.config.base for entry in entries
+             if (base or entry.config.base) is not None}
     targets: dict[Path, Target] = {}
     bound: dict[str, WeightLayout] = {}
     leaves: dict = {}
