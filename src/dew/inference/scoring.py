@@ -3,7 +3,7 @@
 A scoring request reads no cache and draws nothing: a classifier's answer, a decision's, a reward or an
 embedding is a forward over its rows. `ScoringServer` queues such requests and runs one pass of the
 task's (`Scoring`) a `step`: the waiting rows oldest first, as many as the task says one pass holds
-(`Scoring.fits`), its compiled shapes bucketed so a compile is reused across passes. A request whose
+(`Scoring.planned`), its compiled shapes bucketed so a compile is reused across passes. A request whose
 rows outrun one pass carries its rows not yet scored to the next step, and is answered once its last
 row is. The task lays out each request as it is submitted, so a request it refuses is refused there,
 alone, and the server only batches what it admitted.
@@ -97,8 +97,9 @@ class _Request[Row, Payload, Output, Answer]:
 class ScoringServer[Request, Row, Payload, Output, Answer]:
     """Answers scoring requests through one task's passes, one pass a step.
 
-    A pass takes the waiting rows oldest first, as many as the task's `fits` allows, all laid out by
-    one task: a request admitted before a reload is scored by the task and weights that admitted it.
+    A pass takes the waiting rows oldest first, as many as the task's plan takes (`planned`), all
+    laid out by one task: a request admitted before a reload is scored by the task and weights that
+    admitted it.
     A step looks at most `rows` requests, cancelled ones among them. Build one with `from_task`.
     """
 

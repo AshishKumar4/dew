@@ -1159,7 +1159,7 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
         return _WirePlan(self.decide)
 
     def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
-        # The server chose these rows as one pass (`fits`), so they run as one, over the weights it
+        # The server chose these rows as one pass (`planned`), so they run as one, over the weights it
         # hands the pass; the task's compiled forwards are kept across passes.
         if rows[0].media is None:
             return self.decide.scored([row.encoded for row in rows], variables)
