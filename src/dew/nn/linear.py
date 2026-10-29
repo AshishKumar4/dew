@@ -891,7 +891,8 @@ class GatedDeltaNet(nn.Module):
         widths = (self.head_k_dim, self.head_k_dim, self.head_v_dim)
         rows, keys, values = (self._split_heads(part, width) for part, width in
                               zip(jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1), widths, strict=True))
-        ported = S > 1 and kernel_routed(rows, keys, values, g, beta)
+        # beta a sigmoid's, of the queries and keys the conv l2-normalized (`causal_conv1d`'s pieces).
+        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, write_bound=1.0)
 
         def scan(convolved, *, starts, valid, held):
             query, key, value = (self._split_heads(part, width)
@@ -905,7 +906,7 @@ class GatedDeltaNet(nn.Module):
                 # The batch's documents' firsts, built once with it (`Coordinates.firsts`).
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
                                               starts=starts, max_segments=tokens.max_segments,
-                                              firsts=tokens.firsts)
+                                              write_bound=1.0, firsts=tokens.firsts)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             if stepped and held is not None:

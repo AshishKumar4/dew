@@ -84,13 +84,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, g: jax.Array, beta: jax.Array,
              state: jax.Array | None = None, starts: jax.Array | None = None, *,
              firsts: jax.Array | None = None, max_segments: int | None = None, scale: float | None = None,
-             delta: bool = True, wide: bool = False, floor: float | None = None, config: mainloop.Tiles,
-             return_residuals: bool = False):
+             delta: bool = True, wide: bool = False, floor: float | None = None, bound: float | None = None,
+             config: mainloop.Tiles, return_residuals: bool = False):
         from dew.nn.kernels.recurrence_chunk import mosaic_rule
 
         del return_residuals
         return mosaic_rule(query, key, value, g, beta, state, tiles=config, starts=starts, firsts=firsts,
-                           max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor), None
+                           max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor,
+                           bound=bound), None
 
     @staticmethod
     def launched() -> generation.GpuTarget:
@@ -345,6 +346,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the mainloop runs the call on `target`: 16-bit or fp32 operands, a decay a key dimension's
         in a 16-bit call under a declared floor its sub-chunks factor under (`mainloop.per_key_refusal`), a
+        16-bit delta rule's solve under the inverse's bound its form proves (`mainloop.inverse_refusal`), a
         bundle for the target's
         family, the tensor rate its cost model reads, and a config whose launches the device holds at the
         call's widths (`fits`: their shared memory and registers). Off a GPU (a CPU's), where the rule runs
@@ -356,7 +358,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
         if dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):
             return False
         factored = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype, arguments.get("floor")) is None
-        if not (factored and bundle(target, dtype) is not None and target.tensor_rate("16bit") is not None):
+        ranged = mainloop.inverse_refusal(dtype, arguments.get("delta", True), arguments.get("bound")) is None
+        if not (factored and ranged and bundle(target, dtype) is not None
+                and target.tensor_rate("16bit") is not None):
             return False
         return bool(self.fits(ba, target))
 
