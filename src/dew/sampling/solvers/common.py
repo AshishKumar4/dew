@@ -164,10 +164,14 @@ class Multistep(NamedTuple):
         return self._replace(taken=self.taken + 1)
 
 
-def _multistep(x, times, depth: int) -> Multistep:
-    rates = jnp.ones((depth, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
-    return Multistep(jnp.zeros((depth, *x.shape), x.dtype), rates, rates,
-                     jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32))
+def _multistep(x, times, depth: int, process) -> Multistep:
+    # The rates' history in the dtypes the rates take at the run's times, as each step pushes them, so
+    # a float64 walk scans in float64 (ledger 2063).
+    alpha, sigma = process.rates(times[0], like=x)
+    shape = (depth, x.shape[0]) + (1,) * (x.ndim - 1)
+    return Multistep(jnp.zeros((depth, *x.shape), x.dtype), jnp.ones(shape, alpha.dtype),
+                     jnp.ones(shape, sigma.dtype), jnp.zeros((), jnp.int32),
+                     jnp.asarray(times.shape[0] - 1, jnp.int32))
 
 
 def _half_log_snr(alpha, sigma):
