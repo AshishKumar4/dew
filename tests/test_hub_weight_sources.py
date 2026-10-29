@@ -100,3 +100,36 @@ def test_a_directory_without_weights_dew_reads_is_refused(stored, tmp_path):
         (tmp_path / name).write_bytes(data)
     with pytest.raises(FileNotFoundError):
         Pretrained.load(tmp_path, dtype="float32")
+
+
+PINNED = """
+import json
+import sys
+from dew.config.lm import LMRunConfig
+from dew.decision.config import DecisionRunConfig
+
+print(json.dumps({"lm": LMRunConfig(pretrained="local/llama").pinned().pretrained,
+                  "decision": DecisionRunConfig(pretrained="local/llama").pinned().revision}))
+"""
+"""Each run kind's pinned record of a Hub backbone, in a process of its own, which reads `HF_ENDPOINT` as
+it imports the Hub client."""
+
+
+def test_an_lm_and_a_decision_run_record_their_hub_backbone_at_its_commit(tmp_path):
+    """An LM run's and a decision run's backbone named by its Hub repo alone is recorded at the commit the
+    Hub serves (`RunConfig.pinned`, through `SourceReference.pinned`), as their run.json writes it, and
+    offline, with the Hub gone, at the commit the cache holds."""
+    import json
+
+    files = {name: FIXTURE / name for name in ("config.json", "model.safetensors")}
+    with LocalHub({"local/llama": files}) as hub:
+        commit = hub.commit("local/llama")
+        online = subprocess.run([sys.executable, "-c", PINNED], env=hub_environment(hub, tmp_path),
+                                capture_output=True, text=True, check=False)
+    gone = hub_environment(None, tmp_path, offline=True)
+    offline = subprocess.run([sys.executable, "-c", PINNED], env=gone, capture_output=True, text=True,
+                             check=False)
+    for done in (online, offline):
+        assert done.returncode == 0, done.stderr[-3000:]
+        assert json.loads(done.stdout.strip().splitlines()[-1]) == {"lm": f"local/llama@{commit}",
+                                                                    "decision": commit}

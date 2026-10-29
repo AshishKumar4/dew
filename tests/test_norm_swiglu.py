@@ -250,8 +250,8 @@ def norm_operands(shape, dtype, scale_dtype, draw: int = 0):
     return (x, scale), seed
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("scale_dtype", [None, jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
+@pytest.mark.parametrize("scale_dtype", [None, jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("offset", [False, True])
 @pytest.mark.parametrize("after_cast", [False, True])
 def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast):
@@ -261,7 +261,7 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
             draw=lambda draw: norm_operands((2, 3, 31), dtype, scale_dtype, draw), seeds=SEEDS[(2, 3, 31)])
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("case", ["random-2x3x31", "random-3x257x17", "random-5x2x128", "aligned-1x128",
                                   "large-1x128", "small-1x128"])
 def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(dtype, case):
@@ -269,8 +269,9 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
     reduced in fp32 and rounded to the input's dtype before it multiplies, as DeepSeek-V4's and GLM's
     unweighted norms round it, and its reverse rounded where XLA's is; its output and input gradient
     within the float64 gate of XLA's, random rows, a row of 1.5 under a cotangent of ones, whose two
-    gradient contributions cancel, and rows of 0.5 under cotangents of 1.5 * 2**119, finite through
-    XLA's transposes, and of a subnormal (2**-140 in fp32, 2**-130 in bf16), which they do not halve."""
+    gradient contributions cancel, and rows of 0.5 under cotangents of 1.5 * 2**119 (2**7 in fp16), finite
+    through XLA's transposes, and of a subnormal (2**-140 in fp32, 2**-130 in bf16, 2**-20 in fp16), which
+    they do not halve."""
     def unweighted(x):
         return norms.unweighted_rmsnorm(x, 1e-6, implementation="xla")
 
@@ -279,7 +280,11 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
     if kind == "aligned":
         x, seed = jnp.full(shape, 1.5, dtype), jnp.ones(shape, dtype)
     elif kind in ("large", "small"):
-        cotangent = 1.5 * 2.0 ** 119 if kind == "large" else 2.0 ** (-140 if dtype == jnp.float32 else -130)
+        # A cotangent at each format's edge: 2**8 below its largest finite (fp16's 2**16, bf16's and fp32's
+        # 2**128), which the gradient's terms grow by within it, and a subnormal.
+        large, small = {jnp.dtype(jnp.float16): (7, -20), jnp.dtype(jnp.bfloat16): (119, -130)}.get(
+            jnp.dtype(dtype), (119, -140))
+        cotangent = 1.5 * 2.0 ** large if kind == "large" else 2.0 ** small
         x, seed = jnp.full(shape, 0.5, dtype), jnp.full(shape, cotangent, dtype)
     else:
         x = jax.random.normal(jax.random.key(26), shape).astype(dtype)
@@ -287,7 +292,7 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
     compare((unweighted, fused_unweighted(1e-6), unweighted), (x,), seed, ("y", "x"))
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     operands, seed = norm_operands(shape, dtype, jnp.float32)
@@ -296,7 +301,7 @@ def test_rms_ragged_widths_and_many_rows(dtype, shape):
             draw=lambda draw: norm_operands(shape, dtype, jnp.float32, draw), seeds=SEEDS[shape])
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     """Repeated tokens hold the row arithmetic fixed while the column sum grows to Qwen3.5-0.8B's size,
     isolating partial-sum error from bf16 midpoint flips: the weight gradient holds check 1 over the
@@ -333,7 +338,7 @@ def full_step(dtype, draw: int = 0):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("kernel", [norm_swiglu.RmsForward, norm_swiglu.RmsBackward])
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("operands", ["full step", "wide rows", "narrow rows"])
 def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, operands):
     """Each config the tuner may pick, at a step's rows, at rows wider than
@@ -360,7 +365,7 @@ def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, 
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("kernel", [norm_swiglu.SwigluForward, norm_swiglu.SwigluBackward])
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 def test_every_config_of_the_swiglu_kernels_holds_the_float64_gate(kernel, dtype):
     """Each block and warp count, over a ragged tail of elements."""
     shape = (3, 257, 17)
@@ -428,7 +433,7 @@ def stream_seam(dtype, joined: bool, *, fused: bool = False):
 
 
 @pytest.mark.parametrize("joined", [False, True])
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("shape", [(2, 3, 31), (3, 257, 17), (5, 1000)])
 def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape):
     """The kernel's sum is XLA's to the bit, and the weight's gradient accumulates as it should, on the
@@ -477,7 +482,7 @@ def assert_gated_norm_holds(draw, activation, output, name, seeds):
 
 
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("shape", [(2, 3, 4, 31), (2, 64, 16, 128)])
 @pytest.mark.parametrize("gate_dtype", ["same", jnp.bfloat16])
 def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, shape, gate_dtype):
@@ -510,7 +515,7 @@ def test_a_decode_steps_gated_norm_of_an_fp32_input_by_a_bf16_gate_holds_the_flo
     assert_gated_norm_holds(draw, activation, output, "decode gated norm", SEEDS[shape])
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("shape", [(2, 3, 1000), (3, 4096), (3, 257, 17)])
 def test_swiglu_forward_and_both_gradients(dtype, shape):
     operands = tuple(jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (31, 32))
@@ -520,7 +525,7 @@ def test_swiglu_forward_and_both_gradients(dtype, shape):
 
 
 @pytest.mark.parametrize("fused", [True, False])
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("shape", [(2, 3, 1000), (3, 4096), (3, 257, 17)])
 def test_a_packed_projections_swiglu_is_the_apart_one_read_in_place(fused, dtype, shape):
     """One packed projection's `[..., 2, H]` output, gate then up: the

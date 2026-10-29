@@ -151,12 +151,13 @@ def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None =
     """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s,
     or a kernel's own), times `weight`, times `activation(gate)` (`activation_and_slope`: Qwen3-Next's gated
     norm), in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after.
-    `rounded` rounds the normalized rows before the weight multiplies them (Llama's and Qwen3's cast first,
-    `RMSNorm.scale_after_cast`). The fused norm kernel, the recurrence's gated output norm and the portable
-    gated norm compute it alike, each keeping its own memory schedule and derivative."""
-    y = x * inverse
+    `rounded` rounds the normalized rows, before any weight multiplies them (Llama's and Qwen3's cast first,
+    `RMSNorm.scale_after_cast`; a norm computing in its input's dtype). The fused norm kernel, the
+    recurrence's gated output norm, the portable norm and the portable gated norm compute it alike, each
+    keeping its own statistics, memory schedule and derivative."""
+    y = x * inverse if rounded is None else rounded(x * inverse)
     if weight is not None:
-        y = (y if rounded is None else rounded(y)) * weight
+        y = y * weight
     return y if gate is None else y * activation_and_slope(gate, activation)[0]
 
 
