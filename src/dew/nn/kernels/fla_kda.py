@@ -863,7 +863,7 @@ def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: i
     aqk, akk = intra_solve(q, k, g, beta, scale=scale, **kernels)
     akk = checkpoint_name(akk, 'delta_inverse')
     w, u, kg, qg = recompute_w_u(k, v, beta, akk, g, q if keep else None, g_lo=g_lo, **kernels)
-    h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, g, h0, **kernels)
+    h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, g, h0, g_lo=g_lo, **kernels)
     o = chunk_fwd_o(q, corrected, g, aqk, h, scale=scale, wide=wide, **kernels)
     memory = checkpoint_name((w, kg, qg, h, corrected), 'delta_memory') if keep else None
     return (o, final), (q, k, v, (g, g_lo), beta, aqk, akk, h0, memory, spans)
@@ -902,7 +902,7 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
         w, kg, qg, h, corrected = memory
     else:
         w, u, kg, qg = recompute_w_u(k, v, beta, akk, g, q, g_lo=g_lo, **kernels)
-        h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, g, h0, **kernels)
+        h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, g, h0, g_lo=g_lo, **kernels)
     daqk, dv = bwd_dav(corrected, do, aqk, scale=scale, **kernels)
     dh, dh0, dv = fla_gdn.chunk_bwd_dhu(qg, kg, w, g, dht.astype(jnp.float32), do, dv, scale=scale,
                                         **kernels)
