@@ -233,17 +233,23 @@ class Decide(SavedRunTask):
         if not isinstance(bundle, PretrainedDecision):
             raise TypeError(f"{name} declares no decision task")
         # The name a caller asked for, a Hub folder included, not the cache path it resolved to.
-        task = cls.of(bundle, name=str(name) if subfolder is None else f"{name}/{subfolder}")
-        return replace(task, variables=_served(task.model, task.variables))
+        return cls._of(bundle, name=str(name) if subfolder is None else f"{name}/{subfolder}", owned=True)
 
     @classmethod
     def of(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
         """Build the declared decision task from a loaded composite bundle, without loading again.
         It answers under `name`, by default the Hub id the bundle resolved or else its directory."""
-        return cls(DecisionModel(bundle.model, bundle.head),
-                   joined({"backbone": bundle.variables, "head": bundle.head_variables}),
-                   bundle.layout, bundle.decision_tokenizer, bundle.specials, bundle.calibration,
-                   name=name or str(bundle.origin or bundle.source), processor=bundle.processor)
+        return cls._of(bundle, name=name, owned=False)
+
+    @classmethod
+    def _of(cls, bundle: "PretrainedDecision", *, name: str | None, owned: bool) -> Self:
+        """`of`, the bundle's weights packed as a task serves them (`_served`): in place where the
+        caller gives them up (`owned`), else into a tree of the task's own."""
+        model = DecisionModel(bundle.model, bundle.head)
+        variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
+        return cls(model, _served(model, variables, owned=owned), bundle.layout, bundle.decision_tokenizer,
+                   bundle.specials, bundle.calibration, name=name or str(bundle.origin or bundle.source),
+                   processor=bundle.processor)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,
@@ -540,12 +546,15 @@ class Decide(SavedRunTask):
     def _bounds(self) -> dict[int, Bounds]:
         """Each pass length's window bounds, as a run's windows of that length hold them
         (`DecisionObjective.bounds`): the layout's window and its halvings, none shorter than the
-        shortest row it lays out or the layout's own shortest (`Layout.shortest_row`)."""
-        smallest = max(len(self._probe[0].tokens), self.layout.shortest_row(self.tokenizer, self.specials))
+        shortest row it lays out (`_probe`). A length shorter than the rows its bounds count by
+        (`Layout.shortest_row`, a question of a one-character option) holds one row a window, of one
+        question unless the row asks more (`packing`)."""
+        shortest = self.layout.shortest_row(self.tokenizer, self.specials)
         held, segments = self.context_length, self._scoring.segments
         return {length: replace(self.layout, max_len=length).bounds(
             self.tokenizer, self.specials, held, segments, None if held is None else max(length, held))
-            for length in length_ladder(self.layout.max_len, smallest)}
+            if length >= shortest else Bounds(1, 1, None)
+            for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens))}
 
     @functools.cached_property
     def _packs(self) -> dict[tuple[int, int], Pack]:
@@ -1068,17 +1077,25 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
                                           details=self.details)
 
 
-def _served(model: DecisionModel, variables: Variables) -> Variables:
-    """A loaded task's weights as the model's own tree, each projection group a source or a run held
-    packed split back into its members (`dew.inference.projections.unpacked`): the one layout a task
-    holds whatever its source stored, a run's packed or an export's apart, so its loads compute one
-    program (ledger 2299), and the tree an adapter binds and an export writes. A task over a bundle's
-    borrowed weights (`Decide.of`) reads them as the bundle holds them."""
-    from dew.batch import part
-    from dew.inference.projections import unpacked
+def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -> Variables:
+    """A task's weights with its backbone's projections packed as a served decoder's are, in each
+    collection that holds the backbone (its trained parameters, or a frozen trunk's): the one layout a
+    task holds whatever its source stored, a run's packed or an export's apart, so its loads compute one
+    program (ledger 2299). Weights it owns (`owned`, a load's) pack in place, their members freed
+    (`packed_owned`); a bundle's borrowed ones (`Decide.of`) into a new tree that leaves the bundle's
+    whole (`inference_projections`). An adapter binds and an export writes the model's own tree
+    (`dew.inference.projections.unpacked`)."""
+    from dew.batch import FROZEN
+    from dew.inference.projections import inference_projections, packed_owned
 
-    return joined({"backbone": unpacked(model.backbone, part(variables, "backbone")),
-                   "head": part(variables, "head")})
+    pack = packed_owned if owned else inference_projections
+    held = dict(variables)
+    for collection in ("params", FROZEN):
+        if "backbone" in held.get(collection, {}):
+            trees = dict(held[collection])
+            trees["backbone"] = pack(model.backbone, {"params": trees["backbone"]})["params"]
+            held[collection] = trees
+    return held
 
 
 def decoded_images(images: object) -> list[Image.Image]:

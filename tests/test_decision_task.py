@@ -590,10 +590,12 @@ def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(deci
     adapter."""
     from dew.batch import part
     from dew.decision.model import DecisionModel
+    from dew.inference.projections import unpacked
     from dew.lora import LoRA
     from dew.objectives.base import joined
 
-    backbone = part(decide.variables, "backbone")
+    # An adapter binds the model's own tree, the projections a served task packs split back.
+    backbone = unpacked(decide.model.backbone, part(decide.variables, "backbone"))
     adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(decide.model.backbone, backbone, key=1)
     moved = jax.tree_util.tree_map_with_path(
         lambda path, leaf: leaf + 0.05 if "lora_B" in jax.tree_util.keystr(path) else leaf, adapter.variables)
