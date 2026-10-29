@@ -229,7 +229,7 @@ def refuse(entries) -> None:
     """Each `(identity, config, kernels)` of `entries` (`refused_launches`') refused in this context, as a
     compile's spill refuses it: a run seeding a plan's refusals before it lowers."""
     for identity, config, kernels in entries:
-        _record((identity, config), None, kernels)
+        _record((identity, config), None, frozenset(kernels))
 
 
 def misses() -> tuple[Miss, ...]:
@@ -251,14 +251,15 @@ def refusals() -> Iterator[None]:
         _SCOPE.reset(token)
 
 
-def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None", kernels=frozenset()) -> None:
+def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
+            kernels: frozenset[str] = frozenset()) -> None:
     registry = _registry()
     with _GUARD:
         if refusal is not None:
             known = registry.refused.get(refusal, frozenset())
-            registry.refused[refusal] = known | frozenset(kernels)
-            if registry is _PROCESS and not frozenset(kernels) <= known:
-                _kept(*refusal, frozenset(kernels))
+            registry.refused[refusal] = known | kernels
+            if registry is _PROCESS and not kernels <= known:
+                _kept(*refusal, kernels)
         if miss is not None:
             registry.missed.append(miss)
 
@@ -276,7 +277,7 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
     for refusal, kernel in refusals:
-        _record(refusal, None, {kernel})
+        _record(refusal, None, frozenset({kernel}))
     if not refusals:
         _recorded(found, stepped=False)
         return executable
@@ -291,7 +292,7 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     again = _misses_of(spilling)
     for refusal, report, _ in again:
         if refusal is not None:
-            _record(refusal, None, {report.kernel})
+            _record(refusal, None, frozenset({report.kernel}))
     _recorded(again, stepped=False)
     return executable
 
