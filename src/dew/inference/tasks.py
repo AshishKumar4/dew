@@ -316,7 +316,7 @@ class SavedRun:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
         objective = objectives[named(record['objective'], 'objective')]
         declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-        stray = set(record) - {'objective', 'model', UNREAD, *declared}
+        stray = set(record) - {'objective', 'model', 'attention_form', UNREAD, *declared}
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
