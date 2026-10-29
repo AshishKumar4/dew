@@ -236,7 +236,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
                  consistency: float = 0.0, context_window: int | None = None):
         held: Variables | None = None
-        widths: tuple[int, int] | None = None
+        widths: tuple[int | None, int] | None = None
         self.image_processor = None
         match backbone:
             case Decide():
@@ -248,10 +248,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                 tokenizer = tokenizer or backbone.tokenizer
                 specials = specials or backbone.specials
                 module = model.backbone
-                # A task's passes pad to its budget's widths, kept until the run's data binds its own.
+                # A task's passes pad its questions to its budget's options, kept until the run's data
+                # binds its own; a pass's question slots are its windows' (`Decide.pass_shapes`).
                 budget = backbone.budget
-                if budget.questions is not None and budget.options is not None:
-                    widths = (budget.questions, budget.options)
+                if budget.options is not None:
+                    widths = (None, budget.options)
             case Adapter() | Source():
                 module, held = backbone.model, joined({"backbone": backbone.variables})
                 if isinstance(backbone, Source):
@@ -297,8 +298,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
         self.segments = segments
-        # The most questions a row and options a question of the run's data hold, which its saved task
-        # pads each pass to (`DecideSettings.questions`), as its data binds them (`bind_widths`).
+        # The most questions a row and options a question of the run's data hold, which its run records
+        # (`DecideSettings.questions`, `DecideSettings.options`), its saved task padding each pass's
+        # questions to the options, as its data binds them (`bind_widths`).
         self.widths = widths
         held_context = self.context_length
         if context_window is not None and (held_context is None or context_window < held_context):
@@ -512,7 +514,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if processor is not OMITTED:
             raise TypeError("a Decide task encodes with the objective's tokenizer and takes no processor")
         averaged = not (ema is False or (ema is None and state.ema is None))
-        questions, options = self.widths or (None, None)
+        _, options = self.widths or (None, None)
         return Decide(
             self.model,
             self._pipeline_weights(state, ema),
@@ -521,5 +523,5 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             self.specials,
             weights=Weights(int(state.step), averaged),
             processor=self.image_processor,
-            budget=Budget(questions=questions, options=options),
+            budget=Budget(options=options),
         )

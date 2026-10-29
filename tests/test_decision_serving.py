@@ -257,3 +257,25 @@ def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(
         assert server.programs == declared.pass_shapes
         assert len(set(server.programs)) == len(server.programs) <= 16
         assert not compiled_while_serving(server)
+
+
+def test_a_reload_after_a_cancelled_request_plans_the_next_pass_with_the_new_task(decide):
+    """A request cancelled while it waits leaves the queue as its pass is chosen, and with it any plan of its
+    row, so the request after it, laid out by the task a reload put in place, is planned by that task: a
+    pass the old task's windows would hold, but not the new one's, splits into passes the new one holds."""
+    from dew.decision.task import Budget
+
+    wide = replace(decide, budget=Budget(rows=8))
+    server = ScoringServer(*wide.scoring(), rows=64)
+    dropped = server.submit(REQUEST)
+    assert dropped.cancel()
+    narrow = replace(decide, budget=Budget(rows=1))
+    task, variables = narrow.scoring()
+    server.reload(task, variables)
+    # A short state, so the old task's windows would hold several of its rows.
+    many = {**REQUEST, "state": "Hi.", "questions": {f"{name}{copy}": question for copy in range(3)
+                                                     for name, question in REQUEST["questions"].items()}}
+    answered = server.submit(many)
+    server.run()
+    alone = narrow.systemone(many)
+    assert answered.result() == alone

@@ -217,10 +217,13 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
                 plan = task.planned() if plan is None else plan
                 if not plan.add(request.scored.rows[request.taken]) and chosen:
                     return chosen
-                # A request runs from its first row's pass on; one cancelled before it leaves the queue.
+                # A request runs from its first row's pass on; one cancelled before it leaves the queue,
+                # and a plan of its row alone with it, so the next request, perhaps another task's after
+                # a reload, starts a plan of its own.
                 if request.taken == 0:
                     if not request.future.set_running_or_notify_cancel():
                         self._queue.remove(request)
+                        plan = plan if chosen else None
                         break
                     request.future.admitted = now
                 chosen.append((request, request.taken))
