@@ -13,6 +13,7 @@ import logging
 import math
 import re
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +30,9 @@ from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
+
+if TYPE_CHECKING:
+    from dew.training.footprint import Footprint
 
 _log = logging.getLogger(__name__)
 
@@ -291,6 +295,24 @@ def peak_memory_gib() -> float | None:
     peaks = [stats['peak_bytes_in_use'] for device in jax.local_devices()
              if (stats := device.memory_stats()) is not None and 'peak_bytes_in_use' in stats]
     return max(peaks) / 1024 ** 3 if peaks else None
+
+
+def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | None = None) -> int | None:
+    """The bytes a step whose derived footprint is `footprint` would leave free on its tightest device, as
+    `step_headroom` reads a compiled step's: its temporaries the derivation names, its residuals and
+    gradient, in one block beside what it holds (`Footprint.held`), twice where the allocator strands
+    them; None where the derivation names no residuals (a step over several devices) or a device
+    states no memory. The resident state is in use already, or, on a stated device, its arguments.
+    XLA's workspace beyond these is no term of it (`dew.training.footprint`): a compile confirms."""
+    if footprint.residuals is None:
+        return None
+    memory = [device_memory(device, capacity, sum(footprint.resident.values())) for device in devices]
+    if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
+        return None
+    temporaries = footprint.residuals + footprint.gradients
+    return min(placeable(m, unclaimed(d, m)) - footprint.held
+               - temporaries * (2 if strands_temporaries(d.platform, m) else 1)
+               for d, m in zip(devices, memory, strict=True))
 
 
 def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
