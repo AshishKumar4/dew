@@ -322,8 +322,11 @@ class BlockWiring:
     `pre_norms` norms each sublayer's input and `output_norms` norms its
     output. The input norms alone give the plain pre-norm block, both give
     Gemma's sandwich block, and the output norms alone give OLMo 3's post-norm
-    block. `ngpt` gives the normalized transformer's block, which has neither:
-    each sublayer reads the unit residual and joins it by a learned step along
+    block. `residual_norms` norms the stream itself after each sublayer joins it,
+    the original Transformer's post-LN block (OPT-350m's), through the same two
+    norms the pre-norm block reads its sublayers' inputs with. `ngpt` gives the
+    normalized transformer's block, which has neither: each sublayer reads the
+    unit residual and joins it by a learned step along
     the sphere (`dew.nn.ngpt.stepped`), `attn_alpha` and `mlp_alpha` its rates.
     The output norms are separate modules named for the sublayer outputs, so
     the input norms keep their names, and a checkpoint without
@@ -336,6 +339,7 @@ class BlockWiring:
     # OLMo 3's post-norm block: modeling_olmo3.py:249-266.
     pre_norms: bool = True
     output_norms: bool = False
+    residual_norms: bool = False
     parallel_residual: bool = False
     shared_parallel_norm: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
@@ -352,6 +356,10 @@ class BlockWiring:
                              "norms, parallel residual or layer scalar")
         if self.layer_scalar not in (None, "frozen", "trainable"):
             raise ValueError("layer_scalar must be None, frozen or trainable")
+        if self.residual_norms and (self.pre_norms or self.output_norms or self.parallel_residual
+                                    or self.ngpt is not None):
+            raise ValueError("a post-LN block norms its stream after each sublayer joins it: it takes no "
+                             "pre- or output norms, parallel residual or nGPT step")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -677,11 +685,17 @@ class DecoderBlock(nn.Module):
                 or self.altup is not None or self.residual_site is not None
                 or self.laurel_rank is not None or self.parallel is not None):
             raise ValueError('parallel_residual requires a plain pre-norm attention and feed-forward block')
-        if self.wiring.pre_norms and self.attention_norm:
+        normed = self.wiring.pre_norms or self.wiring.residual_norms
+        if normed and self.attention_norm:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        if self.wiring.pre_norms and self.feedforward is not None and not self.wiring.shared_parallel_norm:
+        if normed and self.feedforward is not None and not self.wiring.shared_parallel_norm:
             self.post_attention_layernorm = norm(name='post_attention_layernorm')
+        if self.wiring.residual_norms and (self.hyper_connections is not None or self.altup is not None
+                                           or self.residual_site is not None or self.laurel_rank is not None
+                                           or self.parallel is not None or not self.attention_norm):
+            raise ValueError("a post-LN block norms the plain stream: it takes no hyper-connections, AltUp, "
+                             "depth residuals, LAuReL or parallel experts")
         if self.wiring.output_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
             if self.feedforward is not None:
@@ -1019,6 +1033,9 @@ class DecoderBlock(nn.Module):
             # 556 of a 72-layer Dory prefill's 664 s compile on an A100 (ledger 635).
             stepped_x = jax.lax.optimization_barrier(stepped(state.x, output, alpha, self.wiring.ngpt.step))
             return state._replace(x=constrain(stepped_x, RESIDUAL))
+        if isinstance(state, _Plain) and self.wiring.residual_norms:
+            norm = self.input_layernorm if site == "attention" else self.post_attention_layernorm
+            return state._replace(x=constrain(norm(state.x + output), RESIDUAL))
         if isinstance(state, _Plain):
             return state._replace(x=constrain(state.x + output, RESIDUAL))
         if isinstance(state, _Streams):
