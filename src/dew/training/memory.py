@@ -248,22 +248,29 @@ def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defa
             'remat': recompute_record(objective), 'xla_defaults': xla_defaults, 'narrow': narrow}
 
 
-def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
+def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0,
+                  capacity: int | None = None, built: int = 0) -> int | None:
     """Return the bytes the tightest of `devices` has to spare once the step's memory is placed.
 
     The step's temporaries and new outputs are placed next to `held` more bytes
     that the loop keeps outside the step. The result is None if the executable or
-    a device reports no memory. The arguments (the state and the batch) are
+    a device reports no memory, a device stated `capacity` bytes reading as one
+    that holds them (`compile_only_gpus`' devices state none). The arguments (the state and the batch) are
     already resident and counted as in use, and the donated state's buffers are
-    reused for the outputs that alias them.
+    reused for the outputs that alias them; on a stated device, `built` bytes of them, which `held`
+    counts as the step's first call builds them, are not yet.
 
     XLA's GPU step takes all its temporaries in one allocation, so it needs one
     free block that large, not that many free bytes in total (`placeable`). Where
     the allocator `strands_temporaries`, they need room twice.
     """
     stats = executable.memory_analysis()
-    memory = [device.memory_stats() or {} for device in devices]
-    if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
+    if stats is None:
+        return None
+    # A device that states no memory, one compiled for and absent (`compile_only_gpus`), holds the
+    # `capacity` it is stated to, the step's arguments in it as they would be.
+    memory = [device_memory(device, capacity, stats.argument_size_in_bytes - built) for device in devices]
+    if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
     return min(placeable(m, unclaimed(d, m)) - beside
@@ -284,6 +291,18 @@ def peak_memory_gib() -> float | None:
     peaks = [stats['peak_bytes_in_use'] for device in jax.local_devices()
              if (stats := device.memory_stats()) is not None and 'peak_bytes_in_use' in stats]
     return max(peaks) / 1024 ** 3 if peaks else None
+
+
+def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
+    """What `device`'s allocator states (`Device.memory_stats`), empty where it states nothing: a CPU's,
+    or a compile-only GPU's (`dew.training.ahead.compile_only_gpus`), none of this process's own, which
+    holds no memory to read. A stated capacity models a fresh BFC pool with `arguments` resident:
+    its free block and temporary-stranding policy are read exactly as for that allocator."""
+    if device in jax.local_devices():
+        return device.memory_stats() or {}
+    return {} if capacity is None else {
+        'bytes_limit': capacity, 'bytes_in_use': arguments, 'pool_bytes': capacity,
+        'largest_free_block_bytes': capacity - arguments}
 
 
 def local_devices(mesh: Mesh) -> list:
@@ -318,7 +337,7 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
         for name in ("argument", "output", "alias", "temp", "generated_code")}
     devices_stats: list[JSON] = []
     for device in devices:
-        memory = device.memory_stats() or {}
+        memory = device_memory(device)
         reported: dict[str, JSON] = {key: int(memory[key]) for key in MEMORY_STATS if key in memory}
         devices_stats.append({"id": int(device.id), **reported,
                               "unclaimed": None if not memory else unclaimed(device, memory),
@@ -378,11 +397,11 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
     return memory['pool_bytes'] >= memory['bytes_limit'] and partitioning.lower() not in ('false', '0')
 
 
-def temporaries_factor(mesh: Mesh) -> int:
+def temporaries_factor(mesh: Mesh, capacity: int | None = None) -> int:
     """How many times its temporaries a step needs room for on this process's tightest device of
     `mesh` (`strands_temporaries`): 2 where an allocator can strand them, else 1."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return max((2 if (memory := device.memory_stats()) is not None
+    return max((2 if (memory := device_memory(device, capacity))
                 and strands_temporaries(device.platform, memory) else 1) for device in local)
 
 
@@ -397,17 +416,19 @@ def fits_everywhere(headroom: int | None) -> bool:
     return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
 
 
-def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0) -> tuple[bool, int | None]:
+def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
+              capacity: int | None = None, built: int = 0) -> tuple[bool, int | None]:
     """Whether the compiled step fits in the free memory of every device of `mesh`,
     and this process's headroom (`step_headroom`), None where it reads none.
 
-    Each device must also hold `held` more bytes, and the processes that hold
-    them agree on the answer. A step that XLA refused for memory
-    (`compiled_if_it_fits`) does not fit, and its process still takes part in the
-    agreement.
+    Each device must also hold `held` more bytes, `built` of them among the step's arguments
+    (`step_headroom`), and the processes that hold them agree on the answer. A step that XLA
+    refused for memory (`compiled_if_it_fits`) does not fit, and its process still takes part in
+    the agreement.
     """
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    headroom = None if executable is None else step_headroom(executable, local, held=held)
+    headroom = None if executable is None else step_headroom(executable, local, held=held,
+                                                             capacity=capacity, built=built)
     return fits_everywhere(-1 if executable is None else headroom), headroom
 
 

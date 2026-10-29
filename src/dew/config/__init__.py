@@ -521,6 +521,13 @@ class TrainerConfig:
     the CUDA plugin and no GPU, and writes it with what it costs: each device's peak bytes and the
     step's FLOPs, read before booking the GPUs. The program exits with status 0, and writes no
     checkpoint or tracking.
+
+    `--trainer.compile-ahead.capacity-gib 80` states each GPU's memory, and the run's own fit search
+    then plans the step there as a run would, its log and the saved step naming every program it
+    compiled, each with the bytes derived for it beside XLA's, and the plan it took, with the seconds
+    planning took. A run with its remat set compiles at that remat alone, and is told of no other;
+    this is how to ask what fits beside it: compile it ahead once at each remat policy its model
+    takes (the model's `remat` field) and compare the plans.
     """
     ahead: str | None = None
     """Run the step `compile_ahead` saved at this path as the run's first step, in place of compiling it.
@@ -1533,7 +1540,7 @@ class RunConfig:
         compile-only GPUs, with no checkpoints or tracker: what ends a run that compiles ahead."""
         target = self.trainer.compile_ahead
         assert target is not None
-        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices))
+        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
         return target.compiled(self.built(objective, mesh, rollout), dataset, steps)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
