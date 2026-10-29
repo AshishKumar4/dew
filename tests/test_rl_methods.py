@@ -33,8 +33,9 @@ from dew.rl import group_advantage, rloo_advantage
 from dew.training import Trainer
 from dew.training.transaction import with_ema
 
-LENGTHS = ((3, 5), (4, 2))
-"""Each row's two sessions' trained token counts."""
+LENGTHS = ((3, 5), (4, 2), (6, 4), (2, 7)) * 8
+"""Each row's two sessions' trained token counts: enough sessions that a loss's rounding is a sum of many
+terms', which check 1 resolves over its seeds."""
 WIDTH = 12
 SEEDS = dict.fromkeys(("grpo", "dapo", "dr_grpo", "gspo", "cispo", "gmpo", "reinforce_pp", "rloo"), 16)
 
