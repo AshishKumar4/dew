@@ -32,8 +32,8 @@ from .attention_masks import (
 )
 from .attention_parallel import (
     four_dimensional,
+    on_attention_shards,
     pad_rows,
-    per_shard,
     sequence_parallel_attention,
     shard_heads,
     split_with_queries,
@@ -138,7 +138,7 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     padded query row is sliced off and the padded key hidden by the kernel's
     key_value_seq_lengths, which never reach past the real keys.
     tests/test_kernels.py pins the equality with the xla path. On a mesh it
-    runs per shard (`per_shard`).
+    runs per shard (`on_attention_shards`).
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     # jax's cudnn call takes a mask or bias only at the full [.., Q, K]
@@ -171,7 +171,7 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
             local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
             implementation='cudnn')
 
-    out = per_shard(local, query, key, value,
+    out = on_attention_shards(local, query, key, value,
                     bias=(None if bias is None else four_dimensional(bias), SCORES),
                     mask=(None if mask is None else four_dimensional(mask), SCORES),
                     key_value_seq_lengths=(kv_lengths, ("activation_batch",)))
@@ -199,7 +199,7 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
     jax.nn's is aligned to the first, so a causal call is square, or reads
     another sequence's documents, each document's queries aligned to its last
     keys (`CrossDocuments`), which it orders by id. On a mesh it
-    runs per shard (`per_shard`). What it takes is its requirements'
+    runs per shard (`on_attention_shards`). What it takes is its requirements'
     (`attention_kernels.FLASH_SUPPORTS`), which the selector holds a call to before it runs here."""
     flash = importlib.import_module('dew_flash_attn')
     window = (-1, -1) if sliding_window is None else window_sides(causal, sliding_window)
@@ -247,7 +247,7 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
             f"packed flash attention reads each token by its document's id: queries {query.shape[:-2]} "
             f"beside ids {queries.shape}, keys {key.shape[:-2]} and values {value.shape[:-2]} beside ids "
             f"{keys.shape}")
-    return per_shard(local, query, key, value, sinks=(sinks, ("activation_heads",)),
+    return on_attention_shards(local, query, key, value, sinks=(sinks, ("activation_heads",)),
                       segment_ids=(queries, ("activation_batch", None)),
                       key_segment_ids=(keys if isinstance(segment_ids, CrossDocuments) else None,
                                        ("activation_batch", None)))
@@ -258,7 +258,7 @@ def triton_attention(query, key, value, causal: bool):
     tokamax's heuristic config, with jax.nn's default scale of 1/sqrt(D).
 
     It takes grouped key heads and any length itself. A Pallas call has no
-    partitioning rule, so on a mesh it runs per shard (`per_shard`).
+    partitioning rule, so on a mesh it runs per shard (`on_attention_shards`).
 
     The queries reach it scaled once, at its scale 1: its forward and dQ
     sweep scale the queries but its dK/dV sweep the keys (tokamax 0.0.15,
@@ -269,7 +269,7 @@ def triton_attention(query, key, value, causal: bool):
     xla's error).
     """
 
-    return per_shard(lambda query, key, value: tokamax.dot_product_attention(
+    return on_attention_shards(lambda query, key, value: tokamax.dot_product_attention(
         query * query.shape[-1] ** -0.5, key, value, scale=1.0, is_causal=causal,
         implementation='triton'), query, key, value)
 
@@ -283,9 +283,9 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook, a `bias` one
     term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the keys' logical places) a key score hook added after
     it (`template.key_biased`), and sinks are the softmax's initial state. On a mesh it runs per shard
-    (`per_shard`), as the decode kernel does: the key heads repeat until the tensor axes split them, the
-    sinks split with their heads, and the ids, lengths, starts, groups, validity and places with their rows.
-    Its requirements (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
+    (`on_attention_shards`), as the decode kernel does: the key heads repeat until the tensor axes split
+    them, the sinks split with their heads, and the ids, lengths, starts, groups, validity and places with
+    their rows. Its requirements (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
     """
     if sinks is not None and sinks.shape != (query.shape[2],):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
@@ -315,9 +315,10 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
 
     # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own
     # rows and heads. A dropping call's draw takes each shard's global rows and heads from the query's own
-    # split (`per_shard`'s coordinates), so it does not depend on the mesh or on the rules of the other axes.
+    # split (`on_attention_shards`'s coordinates), so it does not depend on the mesh or on the rules of the
+    # other axes.
     rows = ("activation_batch",)
-    return per_shard(local, query, key, value, coordinates=dropout_seed is not None,
+    return on_attention_shards(local, query, key, value, coordinates=dropout_seed is not None,
                       sinks=(sinks, ("activation_heads",)),
                       segment_ids=(segment_ids, ("activation_batch", None)), lengths=(lengths, rows),
                       starts=(starts, rows), block_groups=(block_groups, ("activation_batch", None)),
@@ -436,7 +437,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
-                                 force_fp32_for_softmax=True, implementation='auto',
+                                 force_fp32_for_softmax=True, implementation: AttentionImpl = 'auto',
                                  causal=False, sliding_window=None, mask=None, bias=None,
                                  sinks=None, softcap=None, segment_ids=None, max_segments=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
@@ -597,7 +598,7 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                                                sinks=sinks)
 
             rows = ("activation_batch",)
-            return per_shard(attend, query, key, value, lengths=(key_value_seq_lengths, rows),
+            return on_attention_shards(attend, query, key, value, lengths=(key_value_seq_lengths, rows),
                               starts=(starts, rows), sinks=(sunk[0] if sunk else None, ("activation_heads",)))
 
         def folded(query, key, value, *sunk):
@@ -667,7 +668,7 @@ def forward_mode_attention():
 
 
 def attention_kernel(query, key, value, dtype=None, precision=None,
-                     force_fp32_for_softmax=True, implementation='auto',
+                     force_fp32_for_softmax=True, implementation: AttentionImpl = 'auto',
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
                      softcap=None, segment_ids=None, max_segments=None, key_value_seq_lengths=None,
                      key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
@@ -691,7 +692,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             and places is None):
         # The grouped call carries key lengths and starts alone, so a call masking its keys otherwise
         # (key validity, runs, block or image groups, counted places) takes the whole path.
-        # The key heads repeated as each shard would hold them (`per_shard`), so the tensor axes
+        # The key heads repeated as each shard would hold them (`on_attention_shards`), so the tensor axes
         # split the groups as they split the query heads.
         key, value = split_with_queries(key, value, tensor_shards(query))
         return decode_attention.grouped_query(functools.partial(
@@ -908,7 +909,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     return case
 
 
-def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
+def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,
                            force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
                            sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
                            key_value_seq_lengths=None, key_value_seq_starts=None, block_groups=None,
@@ -940,8 +941,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     return select(DECODE, case, named).ran
 
 
-def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None, precision=None,
-                                 force_fp32_for_softmax=True) -> str:
+def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,
+                                 force_fp32_for_softmax=True) -> AttentionImpl:
     """Send a call that built an explicit mask to the xla kernel.
 
     cuDNN has no mask argument: jax hands it a bool mask as an additive bias of
@@ -960,10 +961,10 @@ def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None,
     case = dataclasses.replace(attention_case(query, key, dtype=dtype, precision=precision,
                                               force_fp32_for_softmax=force_fp32_for_softmax, named='xla'),
                                mask=True, folds=False)
-    return selected(ATTENTION, case, 'xla').name
+    return attention_implementation(selected(ATTENTION, case, 'xla').name)
 
 
-def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = False) -> bool:
+def cudnn_takes_mask(implementation: AttentionImpl, query, *, softcap=None, sinks: bool = False) -> bool:
     """Whether cuDNN may take a call's materialized mask as its additive bias:
     the call names cudnn or chooses ('auto'), cuDNN runs it (`cudnn_runs`,
     which also keeps the deterministic-ops lane off it) and it has no sinks,

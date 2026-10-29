@@ -399,6 +399,41 @@ def test_a_warm_host_run_traces_nothing():
     assert int(state.updates) == 3
 
 
+def test_a_host_master_steps_phases_compile_with_the_options_dew_compiles_with(tmp_path):
+    """A host-master step compiles each phase of its transaction on its own (`Transaction.step(host=True)`),
+    and each takes the options Dew's one seam holds open (`compiled_with`), as the step's own compile does:
+    with the seam naming a dump directory, every phase compiled writes its module there (row 2093: the
+    phases compiled with a bare `jax.jit`, so under the gate's options a host-master run compiled other
+    programs than its resident step)."""
+    from dew.nn.kernels.options import compiled_with
+    from dew.telemetry.instrumentation import Compiles
+    from dew.training.transaction import Transaction
+
+    objective = LMObjective(decoder(), 8, head_chunks=1)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, accumulation=2)
+    state, _, _ = trainer.place()
+    batch = tokens()
+    cached = jax.config.jax_enable_compilation_cache
+    # A program the persistent cache holds is fetched, not compiled, and writes no module: the dump
+    # directory keys no cache entry.
+    jax.config.update("jax_enable_compilation_cache", val=False)
+    try:
+        with Compiles(None) as compiles, compiled_with({"xla_dump_to": str(tmp_path)}):
+            step = trainer.compile(state, batch)
+            for _ in range(2):
+                state, *_ = step(state, batch)
+            jax.block_until_ready(state)
+    finally:
+        jax.config.update("jax_enable_compilation_cache", val=cached)
+    # A module's files are named `module_<id>.<its name>.<stage>.txt`; a program `jit(f)` is module `jit_f`.
+    dumped = {path.name.split(".")[1] for path in tmp_path.iterdir()}
+    methods = {name for name in vars(Transaction) if callable(getattr(Transaction, name))}
+    phases = {program.name[len("jit("):-1] for program in compiles.programs
+              if program.kind == "compiled" and program.name[len("jit("):-1] in methods}
+    assert int(state.updates) == 1 and phases
+    assert {f"jit_{phase}" for phase in phases} <= dumped, (sorted(phases), sorted(dumped))
+
+
 RESUMED = """
 import json, sys
 import jax, jax.numpy as jnp, numpy as np, optax

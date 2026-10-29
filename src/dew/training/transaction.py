@@ -29,6 +29,7 @@ from typing_extensions import TypeVar
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
+from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
@@ -679,7 +680,10 @@ class Transaction:
         inside `lax` control flow.
         """
         realize = self.realize if realize is None else realize
-        compile_phase = jax.jit if host else lambda f: f
+        # Each host phase is a program over the objective's modules, so it takes their options as the
+        # step's own compile does (`compiler_options`).
+        options = compiler_options(*self.objective.towers()) or None
+        compile_phase = functools.partial(jax.jit, compiler_options=options) if host else lambda f: f
         reduce = compile_phase(self.local_reduction)
         prepare = compile_phase(self.prepare_attempt)
         pooled = compile_phase(self.pooled_cotangent)
