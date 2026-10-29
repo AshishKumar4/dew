@@ -347,6 +347,32 @@ def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
                     "a reference with options", seeds=8)
 
 
+def test_an_arm_compiled_outside_the_gates_policy_is_refused():
+    """An arm compiled without YNNPACK's fusions (`without_ynn`) beside an arm run as given, where the
+    gate compiles Dew's arm with the fusions as its users run it, is refused rather than run unseen
+    without them (row 2287); beside another Dew arm, where the gate compiles without them too, it runs
+    as the gate would compile it. A plain jit is nested under the gate's own compile, whose options
+    apply; a jit with options of its own refuses that nesting itself (row 1800). Every other arm kind
+    runs: plain, as given, a window loop's."""
+    from reference_error import _arms, over_windows, without_ynn
+
+    def doubled(x):
+        return {"y": jnp.asarray(x) + jnp.asarray(x)}
+
+    given = as_given(lambda x: {"y": np.asarray(x) * 2})
+    with pytest.raises(TypeError):
+        _arms(without_ynn(doubled), given)
+    with pytest.raises(TypeError):
+        _arms(over_windows(without_ynn(doubled)), given)
+    x = np.ones(4, np.float32)
+    for dew, reference in ((without_ynn(doubled), doubled), (doubled, given), (jax.jit(doubled), given),
+                           (jax.jit(doubled), doubled), (doubled, doubled)):
+        mine, theirs = _arms(dew, reference)
+        np.testing.assert_array_equal(np.asarray(mine(x)["y"]), np.asarray(theirs(x)["y"]))
+    with pytest.raises(ValueError):
+        _arms(jax.jit(doubled, compiler_options={"xla_cpu_enable_fast_math": False}), doubled)[0](x)
+
+
 def test_a_float64_truth_runs_as_one_compiled_program():
     """The gate compiles a JAX truth (`_truth_program`): its first call runs as given and every later
     one is the compiled program's, whose values are the eager truth's own. A NumPy truth (its first
