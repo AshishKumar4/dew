@@ -148,6 +148,8 @@ def idefics_block(wide: bool):
     return run
 
 
+# The bfloat16 block runs in the whole suite alone (132 s, ledger 2158); every train computes and
+# differentiates it in float32.
 @pytest.mark.parametrize("dtype", [pytest.param(np.float32, id="float32"),
                                    pytest.param(jnp.bfloat16, id="bfloat16", marks=pytest.mark.whole_suite)])
 def test_the_block_computes_and_differentiates_as_idefics(dtype):
