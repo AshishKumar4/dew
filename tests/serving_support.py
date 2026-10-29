@@ -41,7 +41,8 @@ def served_inputs(row: np.ndarray, request: Served, vocab: int) -> ModelInputs:
 def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], label: str, *, serving: dict,
                            hits: Sequence[int] | None = None, rounds: Sequence[int] | None = None,
                            budget: int = SERVED_BUDGET, alone: bool = True,
-                           truth: tuple[nn.Module, Variables] | None = None) -> None:
+                           truth: tuple[nn.Module, Variables] | None = None,
+                           seeds: tuple[int, int] | None = None) -> None:
     """Check 1 of a server's draws: greedy requests through a server over `task` with `serving`, queued in
     `rounds` (how many go in together before the server runs them; all at once where None, one a round
     where `hits` is given), with `hits` the shared prefix tokens after each round (`prefix_hits`), draw
@@ -55,7 +56,8 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     draws, from one program of its arithmetic and another, tokens that need not agree, a lone task
     batched with itself among them. `truth` is the decoder and float variables whose float64 twin is the
     truth where the task's own do not widen to one (a served quantization's stored codes); the task's by
-    default."""
+    default. `seeds` are the served site's and the lone one's declared seeds, sized paired by `seeds_for`
+    on armada; None sizes them here, each run."""
     if rounds is None:
         rounds = (len(requests),) if hits is None else (1,) * len(requests)
     decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
@@ -129,8 +131,8 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     # their errors moving together across draws, which a hybrid stack's recurrence spreads too widely for
     # the reference compared with itself to resolve (`seeds_for`).
     reference, truth = explicit(decoder), explicit(wide, wide_weights=True)
-    seeds = seeds_for(reference, draw, label, truth_fn=truth, dew_fn=served)
-    assert_as_exact(served, reference, draw, label, seeds=seeds, truth_fn=truth)
+    count = seeds_for(reference, draw, label, truth_fn=truth, dew_fn=served) if seeds is None else seeds[0]
+    assert_as_exact(served, reference, draw, label, seeds=count, truth_fn=truth)
     if alone:
         return
 
@@ -144,5 +146,6 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
 
     # The lone task held to the same full forward: served and alone each on par with it, so with each other.
     lone = as_given(lambda row, drawn, scored: scored)
-    alone_seeds = seeds_for(reference, drawn_alone, f"{label} alone", truth_fn=truth, dew_fn=lone)
+    alone_seeds = (seeds_for(reference, drawn_alone, f"{label} alone", truth_fn=truth, dew_fn=lone)
+                   if seeds is None else seeds[1])
     assert_as_exact(lone, reference, drawn_alone, f"{label} alone", seeds=alone_seeds, truth_fn=truth)
