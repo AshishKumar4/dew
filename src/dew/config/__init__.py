@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.interop import Pretrained
+    from dew.nn.attention import AttentionImpl
     from dew.training.trainer import Trainer
 
 
@@ -940,7 +941,8 @@ _RANDOM_SEARCH = RandomSearch()
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     """A whole run's configuration. A kind of run subclasses it with its own
-    settings and builds what it trains from them (`prepare`); `run` trains it.
+    settings and builds what it trains from them (`build_run`, which `prepare` calls
+    on the run with its Hub sources pinned); `run` trains it.
     """
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
@@ -1116,6 +1118,14 @@ class RunConfig:
         keeps the source as it is). Every run kind that starts from a source loads it with these."""
         return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen)}
 
+    def source_attention(self) -> "AttentionImpl":
+        """The attention implementation a run that starts from a source loads it with: its model's
+        `attention_impl` field, auto unless set, refused unless it names one (`AttentionImpl`). Every run
+        kind that loads a source reads it here."""
+        from dew.nn.attention import attention_implementation
+
+        return attention_implementation(str(self.model.fields.get("attention_impl", "auto")))
+
     def built_fresh(self) -> None:
         """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
         `Pretrained.load` builds of a source (`source_keywords`) reaches nothing such a run builds."""
@@ -1260,9 +1270,14 @@ class RunConfig:
         return run_class.from_dict(named[1])
 
     def prepare(self) -> Prepared:
-        """Build what this run trains: the objective its record names around
-        its model, on its data. A kind of run with settings of its own builds
-        from them in its own `prepare`."""
+        """Build what this run trains, as `build_run` builds it from the run with its Hub sources pinned
+        (`pinned`), so the record names what it started from and is what it loads."""
+        return self.pinned().build_run()
+
+    def build_run(self) -> Prepared:
+        """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
+        pins them first): the objective its record names around its model, on its data. A kind of
+        run with settings of its own builds from them in its own `build_run`."""
         if self.objective is None or self.lora is not None:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
@@ -1335,10 +1350,10 @@ class RunConfig:
                                 f"{_chain_label(prepared.run.data)}/date-{run_timestamp()}")
         return prepared.train(name)
 
-    def pinned_adapter(self) -> Self:
-        """This run with its imported adapter's Hub source named at its commit (`LoRA.resolved`), so the
-        record names the factors the run started from: every kind's `prepare` prepares this run, which
-        loads the factors it records. Itself where nothing is left to pin."""
+    def pinned(self) -> Self:
+        """This run with its Hub sources named at the commits they resolve to now, as its record names
+        them and `prepare` loads them: here an imported adapter's (`LoRA.resolved`); a kind of run pins
+        its own sources beside it. Itself where nothing is left to pin."""
         lora = None if self.lora is None else self.lora.resolved()
         return self if lora == self.lora else dataclasses.replace(self, lora=lora)
 

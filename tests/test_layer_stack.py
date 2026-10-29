@@ -22,6 +22,7 @@ from model_support import largest_difference
 from reference_error import FEWEST_SEEDS, GateFailure, as_given, assert_as_exact, widened, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
+from whole_suite import timed
 
 from dew.distributed.batches import shard_batch
 from dew.interop import Pretrained
@@ -275,8 +276,12 @@ class ScanCase:
         return arm("scanned"), arm("plain"), truth
 
 
-@pytest.mark.parametrize("shape", [pytest.param(shape, marks=pytest.mark.whole_suite) if shape == "gemma3n"
-                                   else shape for shape in sorted(SHAPES)])
+PAST_TARGET = {"scan": {"gemma3n": 151}}
+"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (f58abb8a3, ledger 2137):
+Gemma 3n's scanned stack; every train scans the other shapes, the sparse gate's fault among them."""
+
+
+@pytest.mark.parametrize("shape", timed(PAST_TARGET, "scan", sorted(SHAPES)))
 def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     """The scanned stack's logits, loss and gradients on a stack deep enough to scan are as near a float64
     run as the plain loop's, over the shape's declared draws of token rows (check 1, `assert_as_exact`):

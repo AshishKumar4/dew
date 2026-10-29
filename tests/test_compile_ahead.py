@@ -28,9 +28,9 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1):
+def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
-              **({"attention_impl": "xla"} if xla else {})}
+              **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                    layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead)
@@ -71,12 +71,15 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
 
 def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_path, monkeypatch):
     """An absent GPU with less memory than even the arguments gets no executable to run. Its
-    refusal keeps every candidate's compile evidence, so the offline gate can check refusals too."""
+    refusal keeps every candidate's compile evidence, so the offline gate can check refusals too. The
+    step starts at its ladder's last remat rung and its split is pinned, so the refusal comes after the
+    few rungs left rather than after every policy's compile."""
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.training.ahead import compile_ahead, compile_only_gpus
     from dew.training.planning import PlanRefused
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
-    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), remat=REMAT_POLICIES["full"])
     with pytest.raises(PlanRefused) as refused:
         compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=1024)
     probes = refused.value.probes
