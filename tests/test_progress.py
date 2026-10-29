@@ -49,7 +49,7 @@ def test_a_run_s_loss_reads_the_updates_committed_before_each_step_and_its_end_o
     trained = Trainer(objective(), optax.sgd(0.0), key=0, tracker=tracker)
     state = trained.fit(data(), steps=3, log_every=1)
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
-    np.testing.assert_allclose(losses, [0.0, 1.0, 2.0])
+    np.testing.assert_array_equal(losses, [0.0, 1.0, 2.0])
     applied = Annealed().apply(jax.device_get(state.variables), jnp.zeros((1, 2)))
     np.testing.assert_array_equal(applied, [[-1.0]])
 

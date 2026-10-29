@@ -14,6 +14,7 @@ import contextvars
 import dataclasses
 import functools
 from collections.abc import Callable, Iterator
+from typing import Literal
 
 import jax
 
@@ -30,10 +31,10 @@ class Progress:
 END = Progress(None)
 """The run's end: a module's schedules all ended, as a model is evaluated and served."""
 
-_TRAINING = object()
+_TRAINING: Literal["training"] = "training"
 """A step the trainer traces, whose loss has not supplied its progress."""
 
-_CURRENT: contextvars.ContextVar[Progress | object | None] = contextvars.ContextVar(
+_CURRENT: contextvars.ContextVar[Progress | Literal["training"] | None] = contextvars.ContextVar(
     "dew_progress", default=None)
 
 
@@ -42,7 +43,7 @@ def progress() -> Progress:
     any training step; refused within a training step that supplied none (`training`), a custom
     step's, where any value would be a guess."""
     current = _CURRENT.get()
-    if current is _TRAINING:
+    if current == _TRAINING:
         raise ValueError("a module reads the training step's progress (dew.nn.progress), which this step "
                          "supplies none of: train it through an objective's loss, which supplies it")
     return END if current is None else current
