@@ -20,16 +20,17 @@ piece. FlashAttention-4's correction warpgroup, two-CTA products and lazy rescal
 import dataclasses
 import functools
 import math
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic_sm100
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, mosaic_sm100
 from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
 from dew.nn.kernels.templates.mosaic_sm100 import ROW, STORED, TCGEN05, TMEM
 
@@ -113,19 +114,20 @@ class _Scratch(NamedTuple):
     """A program's opened scratch: its query block and its load, the key and value rings
     (`mosaic_sm100.Ring`), `S`'s accumulator (`mosaic_sm100.Tensor`: the products commit it, the softmax
     releases it once read), the weights in tensor memory and their barrier, the output's accumulator and
-    the barrier each `P V` commits, and the epilogue's stages."""
+    the barrier each `P V` commits, and the epilogue's stages, which it writes by item (`ref[...] = `, which
+    no static type of JAX's refs declares)."""
 
-    q_smem: object
-    q_loaded: object
+    q_smem: mosaic.Ref
+    q_loaded: state_types.AbstractRef
     keys: mosaic_sm100.Ring
     values: mosaic_sm100.Ring
     scores: mosaic_sm100.Tensor
-    p_tmem: object
-    p_full: object
-    acc_tmem: object
-    o_done: object
-    o_smem: object
-    l_smem: object
+    p_tmem: mosaic.Ref
+    p_full: state_types.AbstractRef
+    acc_tmem: mosaic.Ref
+    o_done: state_types.AbstractRef
+    o_smem: Any
+    l_smem: Any
 
 
 class _Block(NamedTuple):
@@ -218,13 +220,13 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
         coords = algebra.Coords(q_pos, index * block_k + part * PART + columns, tile_keys=block_k)
         return algebra.logits_of(spec, read(part), coords, masked=masked)
 
-    def step(index, carry, *, masked):
+    def step(index, carry: tuple[jax.Array, jax.Array], *, masked):
         m, total = carry
         read = scratch.scores.read(index, PART, layout=TMEM)
         # The row's new maximum over the tile's parts, and the factor the state before takes to it.
         new = m
         for part in range(parts):
-            new, _ = algebra.peak(spec, new, *logits(read, index, part, masked))
+            new = algebra.peak(spec, new, *logits(read, index, part, masked))[0]
         m, alpha = algebra.peaked(spec, m, new)
 
         @pl.when(index > 0)

@@ -204,7 +204,8 @@ class KimiDeltaAttention(nn.Module):
                                     f"training sequences; a decode step holds one state per row. Decode on a "
                                     f"mesh with sequence=1.")
             rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
-                                     max_segments=tokens.max_segments, floor=self.lower_bound)
+                                     max_segments=tokens.max_segments, floor=self.lower_bound,
+                                     write_bound=1.0)
             out = over_sequence(functools.partial(split_delta_rule, widths=(self.head_dim,) * 3, parts=heads,
                                                   dtype=projected.dtype if ported else wide, rule=rule),
                                 shards, (projected, g, beta, tokens.segments, tokens.starts, valid), (taps,))

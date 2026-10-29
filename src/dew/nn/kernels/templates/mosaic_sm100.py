@@ -154,7 +154,7 @@ class Ring:
             plgpu.barrier_wait(barrier.at[slot])
         return tuple(buffer.at[slot] for buffer in self.buffers), self.consumed.at[slot]
 
-    def drain(self, tiles, steps: int) -> None:
+    def drain(self, tiles, steps: int | jax.Array) -> None:
         """The load warp's last releases, which no later load waited for (`drain`), after `tiles` tiles of
         `steps` turns each."""
         drain(self.consumed, tiles * steps, self.stages)

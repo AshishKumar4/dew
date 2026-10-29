@@ -12,7 +12,6 @@ import contextlib
 import contextvars
 import dataclasses
 import hashlib
-import json
 import logging
 import os
 import re
@@ -24,7 +23,7 @@ from pathlib import Path
 import jax
 import tokamax
 
-from dew import cache
+from dew.nn.kernels import generation
 
 DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
 """The settings that turn Mosaic GPU's reports on, written under `MOSAIC_GPU_DUMP_TO`."""
@@ -70,68 +69,16 @@ class _Registry:
 
 
 _PROCESS = _Registry()
-"""The process's registry, every thread's, seeded from and kept in `records()` where it is set."""
-_SEEDED: list[Path] = []
-"""The records file the process's registry was seeded from (`_registry`), once."""
+"""The process's registry, every thread's. A shared executable cache does not share these decisions:
+only an explicitly handed plan seeds them, after validating its program and target."""
 _SCOPE: contextvars.ContextVar[_Registry | None] = contextvars.ContextVar("refusals_scope", default=None)
 """A `refusals` scope's own registry, in its context alone."""
 _GUARD = threading.RLock()
-"""Serializes the registries' reads and updates between threads (a read may seed the process's)."""
-
-
-def records() -> Path | None:
-    """Where a process keeps its refusals beside the persistent compilation cache, so every process sharing
-    the cache shares them and derives the configs it holds (a training pool's, an eval's, a server's):
-    DEW_REFUSAL_RECORDS when set, else `dew-refusals.jsonl` in JAX's compilation cache directory, or nowhere
-    when the process keeps no cache."""
-    return cache.beside_compilation_cache("DEW_REFUSAL_RECORDS", "dew-refusals.jsonl")
+"""Serializes the registries' reads and updates between threads."""
 
 
 def _registry() -> _Registry:
-    scoped = _SCOPE.get()
-    if scoped is not None:
-        return scoped
-    path = records()
-    if path is not None and path not in _SEEDED:
-        with _GUARD:
-            if path not in _SEEDED:
-                _SEEDED.append(path)
-                for identity, config, kernels in _read(path):
-                    _PROCESS.refused[(identity, config)] = (
-                        _PROCESS.refused.get((identity, config), frozenset()) | kernels)
-    return _PROCESS
-
-
-def _read(path: Path) -> list[tuple[str, Hashable, frozenset[str]]]:
-    """The refusals `path` keeps, a JSON line each; a line this checkout cannot rebuild (another checkout's
-    config) is skipped."""
-    from dew.nn.kernels import tuning  # tuning traces launches under this module's names
-    if not path.exists():
-        return []
-    found = []
-    for line in path.read_text().splitlines():
-        try:
-            entry = json.loads(line)
-            found.append((entry["identity"], tuning.decoded(entry["config"]), frozenset(entry["kernels"])))
-        except (ValueError, KeyError, TypeError, tuning.Unreadable):
-            _log.warning("a refusal in %s this checkout cannot read: %.120s", path, line)
-    return found
-
-
-def _kept(identity: str, config: Hashable, kernels: frozenset[str]) -> None:
-    """A process refusal appended to `records()`, one line written at once (O_APPEND), so processes sharing
-    the file append whole lines."""
-    from dew.nn.kernels import tuning  # tuning traces launches under this module's names
-    path = records()
-    if path is None:
-        return
-    line = json.dumps({"identity": identity, "config": tuning.encoded(config), "kernels": sorted(kernels)})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-    try:
-        os.write(descriptor, (line + "\n").encode())
-    finally:
-        os.close(descriptor)
+    return _SCOPE.get() or _PROCESS
 
 
 class Exhausted(ValueError):
@@ -156,14 +103,19 @@ def _identity(op, arguments: tokamax.BoundArguments) -> str:
     """A launch's identity apart from its config, the same in every process: its op as its picks name it
     (`tuning.KernelOp.keyed`) and its arguments exactly, its arrays by their own shapes and dtypes (no
     key's bucket: two launches a key shares compile two kernels) and its hooks by what they compute
-    (`traced`)."""
+    (`traced`), and the target capacities that size its generated program. Clock rates are not code inputs
+    once its config is chosen: an attached device and its compile-only target may report different rates
+    while emitting exactly that config."""
     def described(name, value):
         if name in op.HOOKS:
             return op.traced(name, value)
         return jax.tree.map(lambda leaf: (tuple(leaf.shape), str(leaf.dtype)) if hasattr(leaf, "dtype")
                             and hasattr(leaf, "shape") else leaf, value)
-    return repr((op.keyed(arguments).op, tuple((name, described(name, value))
-                                               for name, value in sorted(arguments.arguments.items()))))
+    target = generation.gpu_target()
+    hardware = ((generation.device_generation(),) if target is None else
+                (target.generation, target.multiprocessors, target.shared_limit))
+    operands = tuple((name, described(name, value)) for name, value in sorted(arguments.arguments.items()))
+    return repr((hardware, op.keyed(arguments).op, operands))
 
 
 def _digest(text: str) -> str:
@@ -217,8 +169,8 @@ def spilled(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozense
 
 def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
     """Every (launch identity, config, spilled kernel names) refused in this context (a `refusals` scope's or
-    the process's), ordered: a run records them with its plan, so every process loading it seeds them
-    (`refuse`) and derives the stepped-down configs alike, and the compilation cache only holds those."""
+    the process's), ordered. A validated plan can hand them to another process explicitly (`refuse` within
+    `refusals`); a shared compilation cache alone must not transfer them between programs."""
     with _GUARD:
         return tuple(sorted(((identity, config, kernels)
                              for (identity, config), kernels in _registry().refused.items()), key=repr))
@@ -226,7 +178,8 @@ def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
 
 def refuse(entries) -> None:
     """Each `(identity, config, kernels)` of `entries` (`refused_launches`') refused in this context, as a
-    compile's spill refuses it: a run seeding a plan's refusals before it lowers."""
+    compile's spill refuses it. A handed plan seeds these inside its own `refusals` scope, not unioned with
+    unrelated decisions that the receiving process already holds."""
     for identity, config, kernels in entries:
         _record((identity, config), None, frozenset(kernels))
 
@@ -271,10 +224,7 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
     registry = _registry()
     with _GUARD:
         if refusal is not None:
-            known = registry.refused.get(refusal, frozenset())
-            registry.refused[refusal] = known | kernels
-            if registry is _PROCESS and not kernels <= known:
-                _kept(*refusal, kernels)
+            registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
         if miss is not None:
             registry.missed.append(miss)
 

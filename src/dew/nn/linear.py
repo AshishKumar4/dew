@@ -51,7 +51,7 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .joined import joined_dense, joins
 from .kernels import generation
-from .kernels.generation import INHERENT, Refusal, triton_runs
+from .kernels.generation import INHERENT, triton_runs
 from .kernels.recurrence_chunk import (
     CHUNK_SIZE,
     chunk_gated_delta_rule,
@@ -515,7 +515,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
 def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
     """`recurrent_gated_delta_rule` for one decode token `[B, 1, H, D]`
     through the recurrence's decode step (`dew.nn.kernels.recurrence.step`), which reads and writes
-    the state once (CUDA, where no `recurrence.refusal` turns the state down). A row `active`
+    the state once (CUDA, where no decode requirement, `_LAUNCH`, turns the state down). A row `active`
     `[B]` marks False keeps its state untouched and outputs zeros. On a mesh
     the step runs per shard (`manual_map`), each shard's rows and heads with
     their state, as `fla_rule` runs: the kernel has no partitioning rule, and
@@ -552,7 +552,7 @@ def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, fuses: bool) -> st
     """The kernel a decode token over `state` `[B, Hv, Dk, Dv]` runs on the target, as the decode selector
     reports it (`DELTA_DECODE`): a caller that has a conv, gates and a gated norm for the fused step to
     take (`fuses`)."""
-    return select(DELTA_DECODE, DecodeCase(recurrence.refusal(state), fuses)).kernel
+    return select(DELTA_DECODE, DecodeCase(state.shape, jnp.dtype(state.dtype), fuses)).kernel
 
 
 def decode_step(hooks: recurrence.Hooks, state: jax.Array, query: jax.Array, key: jax.Array,
@@ -575,25 +575,29 @@ STEP = recurrence.Hooks(decay='scalar')
 
 @dataclasses.dataclass(frozen=True)
 class DecodeCase:
-    """A gated delta net's decode token as the decode selector reads it (`DELTA_DECODE`): why the launch
-    turns its state down (`refusal`, `recurrence.refusal`: a token traced for `jax.jvp`, a GPU, the
-    state's precision and widths), None where it takes it, and whether the caller has a conv, gates and a
-    gated norm for the fused step to take (`fuses`)."""
+    """A gated delta net's decode token as the decode selector reads it (`DELTA_DECODE`): its state's
+    `[rows, heads, Dk, Dv]` `shape` and `dtype`, and whether the caller has a conv, gates and a gated norm
+    for the fused step to take (`fuses`)."""
 
-    refusal: Refusal | None
+    shape: tuple[int, ...]
+    dtype: np.dtype
     fuses: bool
 
 
-def _launches(code: str, row: str) -> Requirement[DecodeCase]:
-    """The launch's requirement `code` (`recurrence.refusal`'s), which the fused step and the step share."""
-    return Requirement[DecodeCase](code, lambda case: case.refusal is None or case.refusal.code != code,
-                                   lambda case: case.refusal.detail if case.refusal is not None else code,
-                                   row=row)
-
-
-_LAUNCH = tuple(_launches(code, row) for code, row in (
-    ('capability', INHERENT), ('precision', INHERENT),
-    ('widths', 'roadmap: recurrence step widths')))
+_LAUNCH: tuple[Requirement[DecodeCase], ...] = (
+    Requirement('capability', lambda case: triton_runs(), "the launch needs a GPU of sm80 or later",
+                row=INHERENT),
+    Requirement('precision', lambda case: case.dtype in (jnp.float32, jnp.bfloat16),
+                lambda case: f"the launch holds a state in fp32 or bf16 and computes in fp32, not "
+                             f"{case.dtype} (a float64 state keeps its own precision in `step_reference`)",
+                row=INHERENT),
+    Requirement('widths', lambda case: all(width > 0 and width & (width - 1) == 0
+                                           for width in case.shape[-2:]),
+                lambda case: "the launch's blocks take power-of-two widths, not {} by {}".format(
+                    *case.shape[-2:]), row='roadmap: recurrence step widths'),
+)
+"""What the decode launches need of a token's state, the fused step and the step alike: a GPU Dew's Triton
+kernels run on, a state in fp32 or bf16, and power-of-two widths (Triton's blocks)."""
 
 
 DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
@@ -928,7 +932,7 @@ class GatedDeltaNet(nn.Module):
                                     f"training sequences; a decode step holds one state per row. Decode on "
                                     f"a mesh with sequence=1.")
             rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
-                                     max_segments=tokens.max_segments)
+                                     max_segments=tokens.max_segments, write_bound=1.0)
             out = over_sequence(functools.partial(split_delta_rule, widths=widths, parts=heads,
                                                   dtype=operand if ported else wide, rule=rule),
                                 shards, (mixed, g, beta, tokens.segments, tokens.starts, valid),
