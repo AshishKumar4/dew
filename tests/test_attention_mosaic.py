@@ -62,9 +62,11 @@ FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_backward.split_queries`), as the derivation takes it."""
 BACKWARD_FORMS = {"default": (False, attention_mosaic.BackwardTiles(64, 64, 2, 1, **FED)),
-                  "accurate": (True, attention_mosaic.BackwardTiles(64, 64, 2, 1, **FED))}
+                  "accurate": (True, attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2, **FED))}
 """The backward's forms and schedules, `(accurate, config)`: the fast and the accurate form, each its dQ
-launch one consumer's beside a producer and its dK/dV launch two consumers sharing a key block (`FED`)."""
+launch one consumer's beside a producer and its dK/dV launch two consumers sharing a key block (`FED`); the
+accurate form's sums in two column halves, as its derivation takes them 128 wide (one whole holds 262
+registers a thread)."""
 FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
