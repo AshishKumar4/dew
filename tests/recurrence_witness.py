@@ -34,12 +34,15 @@ import ml_dtypes
 import numpy as np
 from op_certificates import BFLOAT16, FLOAT32, Format, rounded
 
+from dew.nn.kernels import recurrence_algebra
+from dew.nn.kernels.templates.recurrence import mainloop
+
 FLOAT16 = Format("float16", 11, -14, 15)
 """fp16, the inverse's merges' staged dtype in a 16-bit call (`mainloop._merges`)."""
 
 DTYPES = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16, "float16": np.float16}
-CHUNK = 64
-LOG2E = math.log2(math.e)
+CHUNK = mainloop.CHUNK
+LOG2E = mainloop.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
 """How far a position's prefix `hi + lo` (`mainloop.prefix`) lies from its exact `log2(e) cumsum(g)`, as a
 share of `log2(e) sum |g|` over the positions it spans: each compensated add rounds two adds of its
@@ -52,8 +55,8 @@ rounded twice to nearest."""
 PAIR_FRACTION = 2.0 ** -21
 """What `algebra.decayed` rounds off a pair's exponent: each side's fraction (where the side is under one, its
 distance from its floor rounds), their difference and its sum with the low halves', each under 2."""
-PAIR_FLOOR = -124
-"""`algebra.PAIR_FLOOR`: a pair whose integers differ by less weighs zero."""
+PAIR_FLOOR = recurrence_algebra.PAIR_FLOOR
+"""A pair whose integers differ by less weighs zero (`algebra.PAIR_FLOOR`)."""
 
 
 class Iv(NamedTuple):
@@ -150,9 +153,11 @@ class Lane:
     """The arithmetic a launch runs in: `exp2`'s reach (the most steps of the fp32 grid its result lies from
     its correctly rounded value) and whether fp32 results below the normal range flush to zero. The witness
     is of bf16 calls, whose launches store their values in bf16 (an fp32 call's, the template takes none at
-    these widths, is a later link's)."""
+    these widths, is a later link's), and `block`, its family's tile width, over which a product's
+    contraction is issued in column blocks (`mainloop.block_of`)."""
     reach: int
     flushes: bool
+    block: int
 
 
 def fp32(iv: Iv, lane: Lane) -> Iv:
@@ -202,10 +207,11 @@ def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
     return onto(_outward(terms.lo.sum(-1) - allowance, terms.hi.sum(-1) + allowance), FLOAT32)
 
 
-def blocked(a: Iv, b: Iv, lane: Lane, block: int = CHUNK) -> Iv:
-    """`a @ b` as the mainloop issues it over its contraction's `block`-wide column blocks: each block's
-    product a fresh accumulator (`dot`), summed in fp32 from zero (`sum`'s first add exact)."""
-    width = a.lo.shape[1]
+def blocked(a: Iv, b: Iv, lane: Lane) -> Iv:
+    """`a @ b` as the mainloop issues it over its contraction's column blocks, the lane's family's tile
+    width (`Lane.block`): each block's product a fresh accumulator (`dot`), summed in fp32 from zero
+    (`sum`'s first add exact)."""
+    width, block = a.lo.shape[1], lane.block
     total = None
     for start in range(0, width, block):
         part = dot(Iv(a.lo[:, start:start + block], a.hi[:, start:start + block]),
@@ -416,7 +422,8 @@ def interpreted_lane() -> Lane:
     import jax.numpy as jnp
     from certified import lane
 
-    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes)
+    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes,
+                mainloop.block_of(mainloop.INTERPRETED))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -471,7 +478,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     import jax.numpy as jnp
 
     from dew.nn.kernels import generation, recurrence_chunk, tuning
-    from dew.nn.kernels.templates.recurrence import mainloop, template
+    from dew.nn.kernels.templates.recurrence import template
 
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)

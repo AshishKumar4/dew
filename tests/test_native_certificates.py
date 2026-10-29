@@ -52,6 +52,7 @@ from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, Format, truncated
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import template
+from dew.nn.kernels.templates.recurrence import mainloop
 
 pytestmark = pytest.mark.gpu(reason="a native kernel, certified on the GPU that compiles it")
 
@@ -634,7 +635,7 @@ def mosaic_lane() -> rw.Lane:
         reaches.append(rw.exp2_reach(lambda x, run=run: run(x)[0]))
         flushes |= bool(np.any(run(np.full(128, 2.0 ** -30, np.float32))[1] == 0))
     assert max(reaches) <= PTX_EX2, reaches
-    return rw.Lane(max(reaches), flushes)
+    return rw.Lane(max(reaches), flushes, mainloop.block_of(mainloop.family_of(jnp.bfloat16)))
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
