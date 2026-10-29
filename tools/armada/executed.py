@@ -196,9 +196,9 @@ def tally(counts: dict[str, int], items) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
     tally(collected, items)
-    # Before any selection sets them aside, as every run but a release check's does (`ci.py selected`). A mark
-    # that names no one requirement string fails the collection: set aside from every run, no release task would
-    # plan its test, which would run nowhere.
+    # Before any selection sets them aside, as every run but a release check's does (`ci.py selected`).
+    # A mark that names no one requirement string fails the collection: set aside from every run, no
+    # release task would plan its test, which would run nowhere.
     for item in items:
         marks = list(item.iter_markers("release_env"))
         if not marks:
@@ -207,8 +207,9 @@ def pytest_collection_modifyitems(items):
                  if len(mark.args) == 1 and isinstance(mark.args[0], str) and not mark.kwargs}
         if len(named) != 1 or any(len(mark.args) != 1 or mark.kwargs for mark in marks):
             raise pytest.UsageError(
-                f"{item.nodeid}: release_env takes one requirement string, as release_env(\"transformers==5.18.0\"); "
-                f"it has {', '.join(f'args {mark.args} kwargs {mark.kwargs}' for mark in marks)}")
+                f"{item.nodeid}: release_env takes one requirement string, as "
+                f"release_env(\"transformers==5.18.0\"); it has "
+                f"{', '.join(f'args {mark.args} kwargs {mark.kwargs}' for mark in marks)}")
         checks = released.setdefault(item.nodeid.split("::")[0], {})
         checks.setdefault(named.pop(), []).append(item.nodeid)
 
