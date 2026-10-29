@@ -27,12 +27,12 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, links=None):
+def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, links=None, split=1):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
               **({"attention_impl": "xla"} if xla else {})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), split=1, ahead=ahead, links=links)
+                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, links=links)
 
 
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
@@ -306,3 +306,26 @@ def test_a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path
     assert int(state.step) == 2 and first["ahead"] is True
     assert any(not np.array_equal(np.asarray(new), np.asarray(old))
                for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))
+
+
+@pytest.mark.gpu(reason="loads a selected split executable onto its target GPU")
+def test_a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
+    """An offline plan for two microbatches is handed to a live run with its split unpinned. The
+    live planner takes the saved split before lowering, so the artifact's program is reused and its
+    two donated microbatch calls produce one committed update, not a mismatch or a recompile."""
+    from dew.nn.kernels.generation import chosen, device_generation
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    with chosen(narrow_copies="off"):
+        target = MeshSpec().build(compile_only_gpus(device_generation(), 1))
+        saved = compile_ahead(fine_tune(target, xla=True, split=2), batch)
+        path = tmp_path / "split.dew-aot"
+        saved.save(path)
+        here = MeshSpec().build(jax.devices()[:1])
+        run = fine_tune(here, ahead=AheadOfTime.load(path), xla=True, split=None)
+        state = run.fit(batch, steps=1, log_every=1)
+    plan = record(run.plan, "plan")
+    first, *_ = listed(plan["probes"], "probes", read=record, what="probes")
+    assert int(state.step) == 1 and int(state.updates) == 1
+    assert plan["split"] == 2 and first["ahead"] is True
