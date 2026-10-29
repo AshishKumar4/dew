@@ -515,68 +515,6 @@ def _row_sizes(truth: np.ndarray, terms=None) -> tuple[np.ndarray, np.ndarray]:
     return own, np.where(sized > RESOLUTION * leaf, sized, 0.0)
 
 
-def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tuple[str, float, str]]:
-    """Where Dew's rows are further from float64 than ROW_FACTOR times the
-    reference's (`row_errors`): its worst row over its own size against the
-    reference's worst, at least `floor` (an order floor in the rows' units),
-    and each row of size zero, a sum that cancels exactly before anything its
-    terms see (a query that keeps one key), against the reference's distance
-    on that same row, which is all the evidence such a row has: where the
-    reference is exactly the float64 zero, Dew must be too. Each as `(rule,
-    measure, message)`, a `Finding`'s rule, measure and message (RULES)."""
-    sizes, mine = row_errors(dew, truth, terms)
-    _, theirs = row_errors(reference, truth, terms)
-    sized = sizes > 0
-    over = []
-    if sized.any():
-        # Compared by their logs, so a row's error over its size orders where the quotient overflows.
-        row = float(np.max(_log_over(mine[sized], sizes[sized])))
-        their_row = float(np.max(_log_over(theirs[sized], sizes[sized])))
-        allowed = max(their_row, float(_log_over(floor, 1.0)))
-        if not row <= math.log(ROW_FACTOR) + allowed:
-            over.append(("row", row - allowed, f"the worst row is {_shown(row)} from float64 over its size, "
-                         f"the reference's {_shown(their_row)}, allowed "
-                         f"{_shown(math.log(ROW_FACTOR) + allowed)}"))
-    zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
-    if zero.any():
-        at = int(np.flatnonzero(zero)[0])
-        # The measure is the worst of them, the first the example.
-        over.append(("zero rows", log_ratio(mine[zero], theirs[zero]),
-                     f"{int(zero.sum())} rows of float64 zero are further from it than the reference's own, "
-                     f"row {at} by {mine[at]:.3e} against {theirs[at]:.3e}"))
-    return over
-
-
-def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms=None) -> None:
-    """Dew within FACTOR times the reference's RMS distance from float64, and
-    its rows within ROW_FACTOR times the reference's (`rows_over`), each
-    sized by its float64 `terms` where they are given (`float64_terms`)."""
-    mine, theirs = distance(dew, truth), distance(reference, truth)
-    if not (math.isfinite(mine) and math.isfinite(theirs)):
-        raise GateFailure([Finding(label, "not finite", 1, f"{label}: a value of dew, the reference or "
-                                   f"float64 is not finite (dew {mine:.3e} and the reference {theirs:.3e} "
-                                   f"from float64)")])
-    if not theirs > 0:
-        # No measure: Dew's own distance from float64 is what a change can make worse, and none at all
-        # is a site that cannot be judged (`no measure`), never a pass.
-        if mine > 0:
-            raise GateFailure([Finding(label, "exact reference", mine, f"{label}: the reference equals "
-                                       f"float64 and dew is {mine:.3e} from it (rms)")])
-        raise GateFailure([Finding(label, "no measure", 0.0, f"{label}: the reference and dew both equal "
-                                   f"float64, so the site measures nothing")])
-    found = []
-    if not within(mine, FACTOR * theirs):
-        found.append(("pooled", log_ratio(mine, theirs), f"dew is {mine:.3e} from float64 (rms), the "
-                      f"reference {theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})"))
-    # Every rule's findings at once, so a change that eases one rule and breaks another shows both.
-    found += rows_over(dew, reference, truth, terms)
-    if found:
-        raise GateFailure([Finding(label, rule, measure, f"{label}: {message}")
-                           for rule, measure, message in found],
-                          f"{label}: " + "; ".join(message for _, _, message in found))
-
-
-
 PARITY = 1.5
 """The gate's on-par factor: each leaf's RMS error from float64 within 1.5 times the
 reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
@@ -1423,6 +1361,34 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
                                   "narrow_leaves": narrow_leaves}) + "\n")
 
 
+def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn, library_row, library_leaves,
+          also, terms: bool):
+    """A check 1 site's arguments held to what it may ask (`assert_as_exact`): its term program, the
+    traced truth (refused run as given or recorded), and its further references; refused below
+    `FEWEST_SEEDS`, with a library arm not named by its row and leaves, or with further references of
+    mixed kinds beside a plain Dew arm."""
+    terms_fn = None
+    if terms:
+        terms_fn = truth_fn if truth_fn is not None else reference_fn
+        terms_fn = terms_fn.fn if isinstance(terms_fn, _Windowed) else terms_fn
+        if _given(terms_fn) or getattr(terms_fn, "recorded", False):
+            raise ValueError(f"{label}: term sizing traces the truth program; a truth run as given or "
+                             f"recorded has no terms")
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
+                                    f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                                    f"(`seeds_for`)")])
+    if (library_fn is None) != (library_row is None) or (library_fn is None) != (not library_leaves):
+        raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
+                         f"the leaves it covers")
+    also = dict(also or {})
+    mixed = not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in also.values())
+    if also and mixed:
+        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's "
+                         f"kind, plain or as given, so one compilation of Dew's pairs with all")
+    return terms_fn, also
+
+
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
@@ -1494,26 +1460,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
-    terms_fn = None
-    if terms:
-        terms_fn = truth_fn if truth_fn is not None else reference_fn
-        terms_fn = terms_fn.fn if isinstance(terms_fn, _Windowed) else terms_fn
-        if _given(terms_fn) or getattr(terms_fn, "recorded", False):
-            raise ValueError(f"{label}: term sizing traces the truth program; a truth run as given or "
-                             f"recorded has no terms")
-    if seeds < FEWEST_SEEDS:
-        raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
-                                    f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
-                                    f"(`seeds_for`)")])
+    terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
+                           library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
     narrow_leaves: list[str] = []
-    if (library_fn is None) != (library_row is None) or (library_fn is None) != (not library_leaves):
-        raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
-                         f"the leaves it covers")
-    also = dict(also or {})
-    mixed = not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in also.values())
-    if also and mixed:
-        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's "
-                         f"kind, plain or as given, so one compilation of Dew's pairs with all")
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
     further = [_arms(dew_fn, fn)[1] for fn in also.values()]
@@ -2049,52 +1998,6 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     return draw, reference, truth
 
 
-def assert_no_less_exact(dew, reference, truth, label: str) -> None:
-    """An unchanged computation has no larger float64 distance than its source."""
-    mine, theirs = distance(dew, truth), distance(reference, truth)
-    assert within(mine, theirs), (
-        f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
-
-
-def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
-                           rows: bool = True) -> None:
-    """Each leaf of the tree `dew` within FACTOR times the matching leaf of
-    `reference`'s RMS distance from float64 (`truth`), the three trees alike.
-
-    A port that sums `reductions` terms the reference sums in another order
-    rounds by up to sqrt(reductions) float32 units of what it sums in RMS,
-    so the reference's distance counts as at least that: one draw of
-    rounding below it is luck, not a bar, and a leaf that lost a term still
-    fails by orders of magnitude. What a leaf sums is its own float64 size,
-    or, where `terms` gives the tree of each leaf's terms (`float64_terms`),
-    the larger of that and their root sum of squares, the size of the
-    partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
-    bias's gradient does under the softmax's shift invariance, is held to
-    its terms' rounding, not to its own near-zero size; one whose terms'
-    signs are independent keeps about its own. Each leaf's rows are held to
-    the reference's too (`rows_over`), unless `rows` is false: after a
-    second training step a row inherits the first step's rounding through
-    the parameters it reads, which its own terms do not see, so such a
-    comparison holds each tensor alone and its first step holds the rows."""
-    unit = float(np.finfo(np.float32).eps)
-    spread = np.sqrt(reductions)
-    sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
-    over = []
-    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
-                 sizes, strict=True)
-    for (path, mine), theirs, true, summed in leaves:
-        scale = max(distance(true, 0), distance(summed, 0))
-        bar = FACTOR * max(distance(theirs, true), spread * unit * scale)
-        if not within(distance(mine, true), bar):
-            over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
-                        f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
-        # Each row over its own terms where they are given, the order floor in those units.
-        over += [f"{jax.tree_util.keystr(path)}: {message}"
-                 for _, _, message in (rows_over(mine, theirs, true, None if terms is None else summed,
-                                                 spread * unit) if rows else ())]
-    assert not over, "\n".join(over)
-
-
 SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
                   "scatter-add"})
 """The operations that sum terms: a leaf's terms are those its own sums add,
@@ -2511,3 +2414,12 @@ def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) ->
     assert within(apart, theirs / 4), (
         f"{label}: dew is {apart:.3e} from the reference (rms), whose own error is {theirs:.3e} "
         f"(ratio {apart / theirs:.2f}, allowed 0.25)")
+
+
+# The one-draw rule, its own module now, re-exported where its sites import it from.
+from one_draw import (  # noqa: E402
+    assert_as_exact_as_the_reference as assert_as_exact_as_the_reference,
+    assert_leaves_as_exact as assert_leaves_as_exact,
+    assert_no_less_exact as assert_no_less_exact,
+    rows_over as rows_over,
+)
