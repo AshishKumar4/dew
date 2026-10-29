@@ -25,6 +25,7 @@ from diffusion_support import (
 from flax import linen as nn
 from reference_error import as_given
 
+from dew.data import Memory
 from dew.data.dataset import Loader
 from dew.diffusion import broadcast_rates, expand, presets
 from dew.inputs import CharTable, Condition, Field, InputSpec, unit_range
@@ -581,3 +582,19 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     assert_as_exact(host, resident, moved_weights(template.variables), "host-master update",
                     seeds=HOST_MASTER_SEEDS,
                     truth_fn=lambda variables: truth(variables, float64_pixels(batch)))
+
+
+def test_a_fit_validates_on_an_unbatched_dataset_in_trainings_batches_its_caption_steps_after_them():
+    """A fit of a captioned diffusion objective over a batched training chain validates on a dataset that
+    states no batch of its own, read in training's batches, the objective's caption-encoding batch steps
+    after its batch as in training (row 2085: the validation chain was measured before its batch, so its
+    batch steps stood ahead of it and preparation refused the fit)."""
+    def captioned(count):
+        # Records as a source holds them: an image and its caption, which the objective encodes a batch at a
+        # time (`EncodeCaptions`).
+        images = np.random.default_rng(count).integers(0, 256, (count, RES, RES, 3), dtype=np.uint8)
+        return {"image": images, "caption": np.asarray(["a bird", "cat", "two dogs", "x"] * (count // 4))}
+
+    state = Trainer(make_objective(guidance=None), optax.sgd(0.0), key=0).fit(
+        Memory(captioned(8)).batch(8), validation=Memory(captioned(16)), steps=1, eval_every=1, log_every=1)
+    assert int(state.step) == 1
