@@ -148,18 +148,16 @@ def test_an_image_drawn_sharp_keeps_its_pixels():
 
 
 def test_a_scatters_dots_slide_by_their_moves_and_land_where_their_targets_are_drawn():
-    """With `moved`, each dot of a scatter slides by its own move: one that does not move stays, one that moves
-    right alone slides right alone, one that moves up and right slides up and right. Where it ends is where the
-    same dot is drawn when `moved` is where it starts, both pictures on one pair of axes (their ticks drawn
-    alike): each dot's place plus its slide is its twin's place, in the hundredths both are written to; there, a
-    dot at an axis's tick sits on the tick's label."""
+    """With `moved`, each dot of a scatter slides by its own move: one that does not move stays, one that
+    moves right alone slides right alone, one that moves up and right slides up and right. Where it ends is
+    where the same dot is drawn when `moved` is where it starts, both pictures on one pair of axes (their
+    ticks drawn alike): each dot's place plus its slide is its twin's place, in the hundredths both are
+    written to; there, a dot at an axis's tick sits on the tick's label."""
     start = {"base": [(0.0, 0.0), (5.0, 5.0)], "tuned": [(20.0, 20.0), (0.0, 20.0)]}
     end = {"base": [(10.0, 20.0), (15.0, 25.0)], "tuned": [(20.0, 20.0), (10.0, 20.0)]}
     moved = read(figures.points(start, x_label="x", y_label="y", joined=False, moved=end))
     slides = [re.search(r"translate\(([-\d.]+)px,([-\d.]+)px\)", dot.get("style")).groups()
               for dot in moved.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
-    assert slides[2] == ("0", "0") and float(slides[3][0]) > 0 and slides[3][1] == "0"
-    assert float(slides[0][0]) > 0 and float(slides[0][1]) < 0
     landed = read(figures.points(end, x_label="x", y_label="y", joined=False, moved=start))
 
     def dots(root) -> list:
@@ -169,6 +167,8 @@ def test_a_scatters_dots_slide_by_their_moves_and_land_where_their_targets_are_d
     for dot, twin, (dx, dy) in zip(dots(moved), dots(landed), slides, strict=True):
         assert hundredths(dot.get("cx")) + hundredths(dx) == hundredths(twin.get("cx"))
         assert hundredths(dot.get("cy")) + hundredths(dy) == hundredths(twin.get("cy"))
+    assert slides[2] == ("0", "0") and float(slides[3][0]) > 0 and slides[3][1] == "0"
+    assert float(slides[0][0]) > 0 and float(slides[0][1]) < 0
     drawn = [float(dot.get("cx")) for dot in dots(landed)]
     assert drawn[0] == ticks(landed)["10"] and drawn[2] == ticks(landed)["20"]
 
