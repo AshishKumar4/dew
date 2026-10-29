@@ -135,10 +135,8 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
         out = _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, rows)
     else:
         pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
-        case = short_conv.ConvCase(placed=triton_runs(),
-                                   reverse=not FORWARD_MODE.get() and not isinstance(x, JVPTracer),
-                                   whole=seen_whole(x), shape=x.shape, dtype=jnp.dtype(x.dtype), out=dtype,
-                                   taps=kernel.shape[-1], parts=pieces)
+        case = short_conv.ConvCase(placed=triton_runs(), whole=seen_whole(x), shape=x.shape,
+                                   dtype=jnp.dtype(x.dtype), out=dtype, taps=kernel.shape[-1], parts=pieces)
         if select(short_conv.CONV, case).kernel == 'pallas':
             out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
                                   None if segments is None else jnp.asarray(segments, jnp.int32),

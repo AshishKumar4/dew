@@ -711,7 +711,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
 
 
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
-                   live_cotangents: bool = False) -> Callable:
+                   live_cotangents: bool = False, primal: Callable | None = None) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
@@ -730,7 +730,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
-    cotangent is never formed."""
+    cotangent is never formed. `primal(*operands)` gives the output where no derivative is taken (a kernel
+    that saves nothing), `forward`'s where None."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -771,7 +772,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     @jax.custom_jvp
     def bounded(*operands):
-        return forward(*operands)[0]
+        return forward(*operands)[0] if primal is None else primal(*operands)
 
     def bounded_jvp(primals, tangents):
         output, saved = produced(*primals)
