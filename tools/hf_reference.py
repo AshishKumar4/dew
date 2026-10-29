@@ -1761,6 +1761,7 @@ def main() -> None:
     write_tiny("llama-tiny", tiny_llama())
     write_tiny("llama31-tiny", tiny_llama31())
     write_released_config("llama-3.1-8b", "unsloth/Llama-3.1-8B")
+    write_released_config("minicpm5-2b", "openbmb/MiniCPM5-2B", "f97400052a43d642bbc6e9975e2397e3ae6a6b52")
     write_tiny("mistral-tiny", tiny_mistral())
     write_tiny("mixtral-tiny", tiny_mixtral())
     write_tiny("qwen2-tiny", tiny_qwen2())
@@ -1790,6 +1791,9 @@ def main() -> None:
     write_released_config("diffusiongemma-26b", "google/diffusiongemma-26B-A4B-it")
     write_released_config("llada-8b", "GSAI-ML/LLaDA-8B-Base")
     write_released_config("dream-7b", "Dream-org/Dream-v0-Base-7B")
+    # Its configuration_dream.py and modeling_dream.py are Dream-v0's at 6572adb5 byte for byte.
+    write_released_config("diffucoder-7b", "apple/DiffuCoder-7B-Base",
+                          "a2c33054cbe99b9ab7af074f09b1d13943157ff1")
 
     real = FIXTURES / "qwen3-0.6b"
     real.mkdir(parents=True, exist_ok=True)
