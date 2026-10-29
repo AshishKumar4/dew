@@ -1924,7 +1924,9 @@ def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: ja
     the loop's running sums (`added_to`), each tile's rows summed compensated where loops are
     (`compensates_loops`). Each product is taken at `2^exponent` before the subtraction; no difference or
     sum overflows, and a power of two is exact where the product is normal."""
-    k = jnp.asarray(exponent, jnp.float32)
+    # The scale a Python float, exact (`centre_scale`'s exponent is within fp32's normal range), so no
+    # scalar arithmetic runs in a kernel (Mosaic GPU holds no rank-0 vector).
+    factor = 2.0 ** exponent
     nearest = jnp.min(jnp.where(seen, jnp.abs(products), jnp.inf), axis=-1)
     first = jnp.min(jnp.where(seen & (jnp.abs(products) == expand(nearest, products)), positions,
                               jnp.iinfo(jnp.int32).max), axis=-1)
@@ -1933,7 +1935,7 @@ def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: ja
     centre = jnp.where(state.seen, state.centre, tile_centre)
     # Whether a key of the tile counts, a row's maximum (a kernel's rows reduce no booleans).
     counted = jnp.max(jnp.where(seen, 1, 0), axis=-1) > 0
-    scaled = power2(products, k) - expand(power2(centre, k), products)
+    scaled = products * factor - expand(centre * factor, products)
 
     def row_sum(values):
         return (compensated_sum(values, (values.ndim - 1,)) if compensates_loops()
