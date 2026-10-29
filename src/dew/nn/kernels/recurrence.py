@@ -86,8 +86,10 @@ class Hooks:
     its callers hold and a port may take as given (mamba_ssm's kernels clamp each decay to at most
     one); a skip `D v`, and the epilogue; and `floor`, the least log decay a token a layer declares
     (Kimi delta attention's `lower_bound`, -5), which a decay a key dimension's factored chunk form reads
-    as its range's bound (`recurrence_algebra.factored_range`). The chunked op (`recurrence_chunk.chunk`)
-    takes the same form."""
+    as its range's bound (`recurrence_algebra.factored_range`); and `write_bound`, the largest write gate
+    a layer declares of l2-normalized keys (its config's: 1 for a sigmoid's, 2 for twice a sigmoid's, the
+    negative-eigenvalue delta rule's), which bounds the delta rule's chunk inverse (`inverse_bound`). The
+    chunked op (`recurrence_chunk.chunk`) takes the same form."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -99,6 +101,23 @@ class Hooks:
     skip: bool = False
     output: OutputNorm | None = None
     floor: float | None = None
+    write_bound: float | None = None
+
+    @property
+    def inverse_bound(self) -> float | None:
+        """The largest entry of the delta rule's chunk inverse `(I + A)^-1` its form proves, None where it
+        proves none: keys of unit norm (the op's `l2norm`, or as `write_bound` declares) and write gates at
+        most `b` (a sigmoid's from the `gates`, else the declared `write_bound`) with `b` at most two. Each
+        transition `I - beta k k^T` then has its eigenvalues in [1 - b, 1], within [-1, 1], and a decay
+        at most one scales it, so a product of them is no expansion; an entry below the diagonal is
+        `-beta_i k_i^T (T_{i-1} ... T_{j+1}) k_j` (decays included), at most `b`, and a product of a chunk's
+        partial inverse and its system, `w_i . k_j` with `|w_i| <= b`, too. Unnormalized keys with
+        `beta |k|^2` past two grow it geometrically (an eigenvalue past -1)."""
+        if not self.delta:
+            return None
+        sigmoid = self.gates is not None and self.gates.write == 'sigmoid'
+        bound = 1.0 if self.l2norm and sigmoid else self.write_bound
+        return bound if bound is not None and bound <= 2.0 else None
 
     @property
     def gated_write(self) -> bool:

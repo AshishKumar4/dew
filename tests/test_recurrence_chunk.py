@@ -36,19 +36,20 @@ norm magnifies every rounding before it, and the reference compared with itself 
 resolve (Mamba2's SSD with its norm over packed documents, at 512 seeds)."""
 
 HOOKS = [recurrence.Hooks(decay=decay, delta=delta, write_gate=not delta, skip=skip,
-                          scale=KEY_WIDTH ** -0.5 if delta else None)
+                          scale=KEY_WIDTH ** -0.5 if delta else None, write_bound=1.0 if delta else None)
          for decay, delta, skip in itertools.product(('none', 'scalar', 'vector'), (True, False),
                                                      (False, True))]
 """The decay kinds, the delta rule or a write gate alone (R = 0, Mamba2's SSD and the gated linear
-attentions), with and without the skip."""
+attentions), with and without the skip; the delta rule's declaring its draws' sigmoid write gates of unit
+keys (`write_bound`)."""
 
 FORMED = [
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(), l2norm=True),
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(write='step', limit=(0.0, 0.5)), delta=False,
                      skip=True),
-    recurrence.Hooks(decay='vector', l2norm=True, output=recurrence.OutputNorm(1e-6)),
+    recurrence.Hooks(decay='vector', l2norm=True, output=recurrence.OutputNorm(1e-6), write_bound=1.0),
     recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5,
-                     output=recurrence.OutputNorm(1e-5, 'sigmoid')),
+                     output=recurrence.OutputNorm(1e-5, 'sigmoid'), write_bound=1.0),
     recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True),
     recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True, output=recurrence.OutputNorm(1e-5)),
     recurrence.Hooks(decay='scalar', rated=True, l2norm=True),
