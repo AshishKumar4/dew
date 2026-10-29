@@ -121,22 +121,24 @@ def bound(call: str, served: set[str], *args, **kwargs) -> dict:
 def stand_ins() -> dict[str, type]:
     """The records and solvers a cell builds, from the contract, once: `CFG` and `Sampling` with Dew's fields
     and defaults, and each solver the service serves, whose type a call names it by."""
-    def built(name: str) -> type:
+    def built(name: str, entries: list[dict]) -> type:
         return dataclasses.make_dataclass(name, [
             (entry["name"], object, *([] if default(entry) is inspect.Parameter.empty else
                                       [dataclasses.field(default=default(entry))]))
-            for entry in terms()[name]], frozen=True)
+            for entry in entries], frozen=True)
 
-    return {"CFG": built("CFG"), "Sampling": built("Sampling"),
-            **{name: type(name, (), {}) for name in terms()["solvers"]}}
+    return {"CFG": built("CFG", terms()["CFG"]), "Sampling": built("Sampling", terms()["Sampling"]),
+            **{name: built(name, entries) for name, entries in terms()["solvers"].items()}}
 
 
 def solver_name(solver) -> str:
-    """The name the service runs `solver` by: one of the stand-ins' solvers (`stand_ins`), at its settings."""
+    """The name the service runs `solver` by: one of the stand-ins' solvers (`stand_ins`), each field at Dew's
+    default (`DPMSolverMultistep(order=2)` is its default `DPMSolverMultistep()`)."""
     named = {stand_ins()[name]: name for name in terms()["solvers"]}
-    if type(solver) not in named or vars(solver):
+    kind = type(solver)
+    if kind not in named or dataclasses.asdict(solver) != dataclasses.asdict(kind()):
         raise ValueError("the live sampler supports the displayed solvers with their default settings")
-    return named[type(solver)]
+    return named[kind]
 
 
 @dataclass(frozen=True)

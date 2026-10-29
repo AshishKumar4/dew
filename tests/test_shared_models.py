@@ -18,21 +18,10 @@ def service():
 
 def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_path):
     import numpy as np
-    from test_inference import make_run
 
-    from dew.inference import TextToImage
     from dew.sampling import CFG, Heun
 
-    progress = load("progress", "site/live/container")
-    client = load("model_client", "site/live/container")
-    client.TERMS = load("contract", "site/live/container").written()
-    make_run(tmp_path)
-    pipe = TextToImage.from_run(str(tmp_path))
-    native = service.NativeModels.__new__(service.NativeModels)
-    native.np, native.progress, native.cfg = np, progress, CFG
-    native.repo, native.revision = "model", "pinned"
-    native.pipe = progress.Reporting(pipe)
-    native.solvers = {"Heun": Heun}
+    client, pipe, native = live_kernel(service, tmp_path)
     request = {"repo": "model", "revision": "pinned", "prompt": "a lake", "negative": "",
                "prepare_key": 3, "prepare_steps": 4, "key": 5, "steps": 4,
                "solver": {"name": "Heun", "args": {}},
@@ -56,44 +45,101 @@ def stood_in(client):
     held = {name: module for name, module in sys.modules.items() if name.split(".")[0] == "dew"}
     try:
         client.install()
-        yield
+        yield held
     finally:
         for name in [name for name in sys.modules if name.split(".")[0] == "dew"]:
             del sys.modules[name]
         sys.modules.update(held)
 
 
-def test_the_live_sampler_cell_loads_the_model_the_live_image_serves(service, monkeypatch):
-    """The live editor's cell (site/src/data/sampler.py), run through the live kernel's stand-ins,
+def test_the_live_sampler_cell_runs_whole_through_the_stand_ins_as_dew_runs_it(service, tmp_path,
+                                                                                 monkeypatch):
+    """The live editor's cell (site/src/data/sampler.py), run whole through the live kernel's stand-ins,
     asks the shared model process for the model it loaded from the image's pin
-    (site/live/container/text-to-image), which serves that revision alone and refuses a page that
-    asks for another: a cell left on an earlier revision fails every unedited Run."""
-    progress = load("progress", "site/live/container")
-    client = load("model_client", "site/live/container")
-    client.TERMS = load("contract", "site/live/container").written()
-    native = service.NativeModels.__new__(service.NativeModels)
-    native.progress = progress
+    (site/live/container/text-to-image), which serves that revision alone, and its image is the one Dew's
+    own calls of the cell make, its solver and guidance included: a cell left on an earlier revision, or
+    calling what the stand-ins bind otherwise than Dew, fails every unedited Run (ledger 1159, 2339). A
+    tiny run stands in for the pinned model, under the pinned name, at 4 steps where the page takes 15."""
+    import numpy as np
+
+
+    client, pipe, native = live_kernel(service, tmp_path)
     pinned = (SITE / "live" / "container" / "text-to-image").read_text()
     native.repo, native.revision = pinned.strip().split("@")
     asked = []
 
     def shared(payload):
-        assert payload["op"] == "describe", payload
-        asked.append(payload)
-        return native.describe(payload)
+        asked.append(payload["op"])
+        with as_service(real):
+            request = service.validate(payload)
+            if payload["op"] == "describe":
+                return native.describe(request)
+            return native.sample(request, lambda _: None)
 
     monkeypatch.setattr(client, "request", shared)
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
-    # The cell up to its pipeline: what follows samples, which the shared process does with the
-    # pipeline the description names.
-    cell = ast.parse((SITE / "src" / "data" / "sampler.py").read_text())
-    loaded = next(index for index, statement in enumerate(cell.body)
-                  if isinstance(statement, ast.Assign) and ast.unparse(statement.targets[0]) == "pipe")
+    # The cell's calls as the page writes them, at 4 steps where it takes 15: the tiny run compiles each step.
+    tree = ast.parse((SITE / "src" / "data" / "sampler.py").read_text())
+    for keyword in ast.walk(tree):
+        if isinstance(keyword, ast.keyword) and keyword.arg == "steps":
+            keyword.value = ast.copy_location(ast.Constant(4), keyword.value)
+    cell = compile(tree, "sampler.py", "exec")
+    # Dew's own run of the cell first: the stand-ins, once installed, refuse every other Dew module to the
+    # rest of the test's process.
+    import dew
+
+    native_namespace = {}
+    with monkeypatch.context() as patched:
+        patched.setattr(dew, "pipeline", lambda *args, **kwargs: pipe)
+        exec(cell, native_namespace)
     namespace = {}
-    with stood_in(client):
-        exec(compile(ast.Module(cell.body[:loaded + 1], type_ignores=[]), "sampler.py", "exec"), namespace)
-    assert len(asked) == 1
+    with stood_in(client) as real:
+        exec(cell, namespace)
+    assert asked == ["describe", "sample"]
     assert (namespace["pipe"].repo, namespace["pipe"].revision) == (native.repo, native.revision)
+    np.testing.assert_array_equal(namespace["result"].host().images, native_namespace["result"].host().images)
+
+
+@contextlib.contextmanager
+def as_service(held):
+    """Dew's own modules (`held`, those `stood_in` put aside) for the block, as the shared model process holds
+    them, under a cell's stand-ins, which take theirs back after it: the service runs in a process of its
+    own."""
+    stood = {name: module for name, module in sys.modules.items() if name.split(".")[0] == "dew"}
+    finders = list(sys.meta_path)
+    sys.modules.update(held)
+    sys.meta_path[:] = [finder for finder in finders if type(finder).__name__ != "Elsewhere"]
+    try:
+        yield
+    finally:
+        for name in [name for name in sys.modules if name.split(".")[0] == "dew"]:
+            del sys.modules[name]
+        sys.modules.update(stood)
+        sys.meta_path[:] = finders
+
+
+def live_kernel(service, tmp_path):
+    """The live page's two sides over a tiny run: the guest's client (its contract read from Dew), the tiny
+    run's pipeline, and the shared process's native models serving it, behind the progress reporter, as
+    "model" at "pinned", with the guidance record and solvers it takes from Dew."""
+    import numpy as np
+    from test_inference import make_run
+
+    from dew import sampling
+    from dew.inference import TextToImage
+
+    progress = load("progress", "site/live/container")
+    client = load("model_client", "site/live/container")
+    client.TERMS = load("contract", "site/live/container").written()
+    make_run(tmp_path)
+    pipe = TextToImage.from_run(str(tmp_path))
+    native = service.NativeModels.__new__(service.NativeModels)
+    native.np, native.progress, native.pipe = np, progress, progress.Reporting(pipe)
+    native.cfg = sampling.CFG
+    native.solvers = {name: getattr(sampling, name)
+                      for name in ("DPMSolverMultistep", "EulerAncestral", "Heun")}
+    native.repo, native.revision = "model", "pinned"
+    return client, pipe, native
 
 
 def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_does_not_serve(
@@ -106,35 +152,26 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
     is a solver of the cell's own named as one the service runs; and the service refuses a solver outside the
     contract's (ledger 1159)."""
     import numpy as np
-    from test_inference import make_run
 
-    from dew.inference import TextToImage
-    from dew.sampling import Heun as HeunOfDew
+    from dew.sampling import CFG as CFGOfDew, DPMSolverMultistep as DPMOfDew, Heun as HeunOfDew
 
-    progress = load("progress", "site/live/container")
-    client = load("model_client", "site/live/container")
-    client.TERMS = load("contract", "site/live/container").written()
-    monkeypatch.setattr(service, "TERMS", client.TERMS)
-    make_run(tmp_path)
-    pipe = TextToImage.from_run(str(tmp_path))
-    native = service.NativeModels.__new__(service.NativeModels)
-    native.np, native.progress, native.cfg, native.solvers = np, progress, None, {"Heun": HeunOfDew}
-    native.repo, native.revision = "model", "pinned"
-    native.pipe = progress.Reporting(pipe)
+    client, pipe, native = live_kernel(service, tmp_path)
     monkeypatch.setattr(client, "request",
                         lambda payload: native.sample(service.validate(payload), lambda _: None))
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
     with pytest.raises(TypeError):
         pipe.prepare(["a lake"])
     with stood_in(client):
-        from dew.sampling import CFG, Heun, Sampling
+        from dew.sampling import CFG, DPMSolverMultistep, Heun, Sampling
 
         live = client.Pipeline("model", "pinned")
         with pytest.raises(TypeError):
             live.prepare(["a lake"])
         images = live(live.prepare(["a lake"], key=3), key=5).host().images
-        heun = live(["a lake"], key=5, steps=4, solver=Heun()).host().images
-        assert (CFG(2).interval, CFG(2).rescale) == ((0.0, 1.0), 0.0)
+        heun = live(["a lake"], key=5, steps=4, solver=Heun(), guidance=CFG(2)).host().images
+        defaults = live(["a lake"], key=5, steps=4, solver=DPMSolverMultistep(order=2)).host().images
+        with pytest.raises(ValueError):
+            live(["a lake"], key=5, steps=4, solver=DPMSolverMultistep(order=3))
         for decode in (False, 1):
             with pytest.raises(ValueError):
                 live(["a lake"], key=5, decode=decode)
@@ -150,7 +187,9 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
         with pytest.raises(ValueError):
             client.Decoder("model").text_generation(sampling=Sampling(temperature=0.5))
     np.testing.assert_array_equal(images, pipe(pipe.prepare(["a lake"], key=3), key=5).host().images)
-    np.testing.assert_array_equal(heun, pipe(["a lake"], key=5, steps=4, solver=HeunOfDew()).host().images)
+    np.testing.assert_array_equal(heun, pipe(["a lake"], key=5, steps=4, solver=HeunOfDew(),
+                                             guidance=CFGOfDew(2)).host().images)
+    np.testing.assert_array_equal(defaults, pipe(["a lake"], key=5, steps=4, solver=DPMOfDew()).host().images)
     request = {"op": "sample", "repo": "model", "revision": "pinned", "prompt": "a lake", "negative": None,
                "prepare_key": 3, "prepare_steps": None, "key": 5, "steps": None,
                "solver": {"name": "Euler", "args": {}}}
