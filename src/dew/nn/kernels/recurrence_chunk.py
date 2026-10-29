@@ -667,10 +667,6 @@ takes in their dtype. Packed documents take the port at any bound: it stores the
 as many as the tokens' chunks, a row's and one, whatever the bound (`chunked_launch.Sequences`)."""
 
 PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('wgmma', 'forward'): ('fla', "on an H100 80GB HBM3, 16-bit, the port's forward 0.440 ms against the "
-                                  "template's 0.559 on Qwen3.5-27B's gated delta net and 0.276 against 0.489 "
-                                  "on Qwen3-Next's (SE-family-h100-b0980aaff; on an H100 PCIe 0.602 against "
-                                  "0.776, SE-family-h100-e0de17766)"),
     ('mma.sync', 'forward'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
                                      "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against "
                                      "0.942 on Qwen3-Next's (SE-family-a100-1a31d279a)"),
@@ -682,7 +678,12 @@ shrinks as the template wins its cells, and no cell is picked or ranked at run t
 template's, its keys launch a key block a program and its query/key launch's memory sum a product: its
 forward and gradient on an H100 2.46 ms against the port's 3.12 on Qwen3.5-27B's gated delta net and 1.92
 against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an A100 SXM4 40GB 4.56 against 4.83 and
-3.44 against 4.69 (JS-train80-a100-db2c4aca0)."""
+3.44 against 4.69 (JS-train80-a100-db2c4aca0).
+An H100's forward is the template's, its solve launch two programs a multiprocessor on warpgroup MMA's layout
+without a producer (`mainloop._solving`): on an H100 80GB HBM3 0.364 ms against the port's 0.514 on
+Qwen3.5-27B's gated delta net and 0.279 against 0.327 on Qwen3-Next's (JS-solvefed-h100-92eacee68; on an
+H100 PCIe, before its states and output launches kept a producer, 0.520 against 0.691,
+JS-fed3-h100-9d3a38de3)."""
 
 def _trains(call: base.Call | None) -> bool:
     """Whether the recurrence template's gradient runs the call (`Mosaic.trains`)."""
