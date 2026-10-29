@@ -978,3 +978,32 @@ def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
 
     seeds = seeds_for(masked(decoder), draw, "mla prefix run loss", truth_fn=masked(wide))
     assert_as_exact(dew, masked(decoder), draw, "mla prefix run loss", seeds=seeds, truth_fn=masked(wide))
+
+
+def test_a_latent_attention_source_reads_its_blocks_whole_through_its_config_and_export(tmp_path):
+    """A DeepSeek-V3 source whose config states its attention block-bidirectional
+    (`modeling_overrides`) loads its latent attention reading blocks whole: a block group lets the
+    first token see a later one, which a causal read does not. Its export states the override again, and
+    the reload computes the same logits under the groups, bit for bit."""
+    from interop_support import respelled
+
+    from dew.interop import Pretrained
+
+    override = {"modeling_overrides": {"attention": {"full_attention": "block_bidirectional"}}}
+    source = respelled(Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tiny",
+                       tmp_path / "source", lambda config: {**config, **override})
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    tokens = jnp.asarray([[10, 11, 12, 13]], jnp.int32)
+    altered = tokens.at[0, 1].set(14)
+    groups = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
+
+    def first(state, ids, **metadata):
+        return np.asarray(state.model.apply(state.variables, ids, **metadata))[0, 0]
+
+    np.testing.assert_array_equal(first(loaded, tokens), first(loaded, altered))
+    assert np.any(first(loaded, tokens, block_groups=groups) != first(loaded, altered, block_groups=groups))
+    loaded.save(tmp_path / "exported")
+    again = Pretrained.load(tmp_path / "exported", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(
+        np.asarray(again.model.apply(again.variables, tokens, block_groups=groups)),
+        np.asarray(loaded.model.apply(loaded.variables, tokens, block_groups=groups)))

@@ -980,14 +980,18 @@ def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used
         specified = kind.get("mixer", config.get("mixer"))
         if mode == "causal" and specified is None:
             continue
+        # The family's own mixer, in place before the overrides read it (its translate_config ran): any that
+        # reads blocks whole takes the override, a latent attention's as attention's.
         mixer = AttentionMixer() if specified is None else from_record(MixerBase, specified)
-        if not isinstance(mixer, AttentionMixer):
+        if "bidirectional_blocks" not in {field.name for field in dataclasses.fields(mixer)}:
             if mode != "causal":
-                refuse(f"block-bidirectional {name}", "a recurrent kind remains causal")
+                refuse(f"block-bidirectional {name}", "its mixer reads no block whole; a recurrent kind "
+                       "remains causal")
             continue
-        fields = record_fields(mixer, AttentionMixer)
+        fields = record_fields(mixer, type(mixer))
         fields["bidirectional_blocks"] = mode == "block_bidirectional"
-        kind["mixer"] = {"class": "attention", "fields": fields}
+        kind["mixer"] = {"class": "attention" if specified is None
+                         else _records.record(specified, "mixer")["class"], "fields": fields}
         kinds[name] = kind
 
 
