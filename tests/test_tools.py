@@ -594,6 +594,26 @@ def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
             read.reference(last + 1)
 
 
+def test_a_judges_draws_ahead_keep_every_pending_draw_and_only_the_window():
+    """A judge's draws ahead are held in the order they were last asked for: a second layout restarting
+    its draws at 0 finds the first layout's pairs still held, so nothing it submitted is dropped and
+    drawn again, and past twice `AHEAD` finished pairs only are let go (ledgers 2166, 2167)."""
+    tool = load("layout_parity")
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    with jax.enable_x64(new_val=True):
+        judge = tool.Judge(reference, tool.References(), "jepa")
+        drawn = []
+        judge._drawn_reference = (lambda draw: lambda seed: drawn.append(seed) or draw(seed))(
+            judge._drawn_reference)
+        for _ in range(2):  # two layouts, each from draw 0
+            for seed in range(judge.AHEAD):
+                judge.ahead(seed)
+                judge.reference(seed)
+        # The second layout's reads find the first layout's draws: none is drawn twice.
+        assert len(drawn) == len(set(drawn)) and set(range(judge.AHEAD)) <= set(drawn), sorted(drawn)
+        assert len(judge._ahead) <= 3 * judge.AHEAD + 1
+
+
 def test_layout_parity_fails_a_run_with_an_inconclusive_row():
     """An inconclusive layout, or a model whose reference is refused, fails the run as a mismatch does;
     only a working or a refused-by-design layout passes it."""
