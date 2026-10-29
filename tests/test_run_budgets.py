@@ -475,13 +475,18 @@ def thin_fit(x, accumulation: int = 1, **fit):
                    checkpoints=fit.pop("checkpoints", None)).fit(chain, log_every=1, **fit)
 
 
-def test_a_clocked_run_a_take_ends_first_consumes_only_what_it_dispatched():
-    """A take after the batch ends a clocked run before its bound: the run consumed the examples whose last
-    rows its two batches held (ids 1 to 16, the rowless every third carried on), not the bound it never
-    read to, which only a stream that ran out at its bound gives its last batch."""
+def test_a_clocked_run_names_its_length_once():
+    """A clocked run's progress reaches its end where its read ends at its bound, so a take after the bound,
+    which would end it first, is refused before any step, as two lengths of one run are; a bound past what
+    the devices' clock counts is refused too."""
+    from dew.training._fit import CLOCK_LIMIT, clocked
+
     (x,) = clocked_records(0)
-    state = thin_fit(x, chain=clocked_chain(x).take(2), examples=CLOCKED_RECORDS)
-    assert int(state.step) == 2 and int(state.consumed) == 16
+    with pytest.raises(ValueError):
+        thin_fit(x, chain=clocked_chain(x).take(2), examples=CLOCKED_RECORDS)
+    with pytest.raises(ValueError):
+        clocked(CLOCK_LIMIT + 1, None, custom=False, rollout=False)
+    assert clocked(CLOCK_LIMIT, None, custom=False, rollout=False) == CLOCK_LIMIT
 
 
 def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_clock_keeps_none(tmp_path):

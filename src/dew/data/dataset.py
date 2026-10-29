@@ -715,8 +715,8 @@ class Loader:
     not bounded."""
     bound_ends: bool = True
     """Whether a read bounded in `examples` ends where its bound does, having read every one: no take or
-    slice after the bound ends it first. Its last batch then consumes the examples no batch counted
-    (`dew.training._fit.drained`)."""
+    slice after the bound ends it first, which a run on the examples clock refuses
+    (`dew.training._fit.clocked`), whose last batch consumes the examples no batch counted (`drained`)."""
     token_ends: tuple[int | None, ...] | None = None
     """The committed tokens each phase of a schedule ends at (`dew.data.pipeline.schedule`), the last
     where the data ends or None where it runs on, which the trainer reads its commits against and ends

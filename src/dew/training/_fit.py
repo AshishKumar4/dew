@@ -396,17 +396,31 @@ class FitRun:
         return next(self.train)
 
 
-def clocked(examples: int | None, steps: int | None, *, custom: bool, rollout: bool) -> int | None:
+CLOCK_LIMIT = 2 ** 31 - 1
+"""The most examples a clock counts: the devices hold it as int32 (`TrainState.consumed`)."""
+
+
+def clocked(examples: int | None, steps: int | None, *, custom: bool, rollout: bool,
+            bound_ends: bool = True) -> int | None:
     """The examples bound of a run that no plan counts steps ahead of, which keeps its progress in the
     examples its batches consume (`TrainState.consumed`), its schedule and cadences reading it; None for
     a run counted otherwise. The transaction hands the run's optimizer that progress and the batches
-    carry the count, which a `custom` step or a `rollout`'s batches do not: refused there."""
+    carry the count, which a `custom` step or a `rollout`'s batches do not: refused there. Its progress
+    reaches its end where its read ends at its bound (`Loader.bound_ends`), so a take or slice after
+    the bound, which would end it first, is refused, as is a bound past what the clock counts."""
     if examples is None or steps is not None:
         return None
     if custom or rollout:
         raise ValueError("a run bounded in examples that no plan counts ahead reads its progress off the "
                          "examples its batches consume, which a custom step= or a rollout does not carry; "
                          "give steps=, or read the data in a global order its plan counts")
+    if not bound_ends:
+        raise ValueError("a run bounded in examples that no plan counts ahead ends where its bound does, "
+                         "which its schedule's end reads; a take or slice after the bound would end it "
+                         "first: name the run's length once, by examples= or by the take")
+    if examples > CLOCK_LIMIT:
+        raise ValueError(f"examples={examples} is past the {CLOCK_LIMIT} a run's clock counts on its "
+                         "devices; bound the run in steps or tokens")
     return examples
 
 

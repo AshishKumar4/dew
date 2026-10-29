@@ -1313,7 +1313,7 @@ class Trainer(Generic[Loss, Effects]):
             accumulation=self.accumulation, startup=self._startup)
         self._device, self._prefetch = loader.device, device_prefetch
         self._examples = clocked(examples, steps, custom=self.step is not None,
-                                 rollout=self.rollout is not None)
+                                 rollout=self.rollout is not None, bound_ends=loader.bound_ends)
         self._schedule(None if steps is None else steps // self.accumulation)
         plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
                           written=(log_every, eval_every, checkpoint_every),
@@ -1428,7 +1428,7 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                batch, ahead = self._closes(run, interval, batch, plan.dataset.bound_ends)
+                batch, ahead = self._closes(run, interval, batch)
                 batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
                 device, _ = split_fields(batch)
                 inputs = self.objective.inputs
@@ -1492,18 +1492,17 @@ class Trainer(Generic[Loss, Effects]):
                     self._stop_trace(run, profile, profiler)
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
 
-    def _closes(self, run: FitRun, interval: Interval, batch: Batch,
-                bound_ends: bool) -> tuple[Batch, bytes | None]:
+    def _closes(self, run: FitRun, interval: Interval, batch: Batch) -> tuple[Batch, bytes | None]:
         """`batch` marked where it is a clocked run's last (`CLOSES_WINDOW`), so the update it ends commits
         with the microbatches its window holds, known by reading ahead (`FitRun.ends_here`), every batch
         of the run marked so the step keeps one program; and the stream's position after it, taken
-        before that read, which the step saves. Where its stream ran out at its bound (`bound_ends`), the
+        before that read, which the step saves. Where its stream ran out, at its bound (`clocked`), the
         last also consumes the examples the bound read that no batch counted (`drained`)."""
         if self._examples is None:
             return batch, None
         position = None if run.train is None else run.train.source_state
         last = run.ends_here(interval)
-        if run.ran_out and bound_ends:
+        if run.ran_out:
             batch = drained(batch, interval.consumed, self._examples)
         return {**batch, CLOSES_WINDOW: np.bool_(last)}, position
 
