@@ -1091,7 +1091,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once. With
     `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
     truth evaluated once for them all: the reference's draws, then each further reference's, a list."""
-    if orders is not None and getattr(reference_fn, "recorded", False):
+    if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
     mine, theirs, worst, zero_rows, finite, names, widths = [], [[] for _ in arms], [[] for _ in arms], \
