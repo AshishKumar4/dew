@@ -85,6 +85,7 @@ from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, Logi
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, backend, chosen_kernel, gpu_mesh, gpu_target
+from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     Link,
@@ -972,9 +973,10 @@ class Trainer(Generic[Loss, Effects]):
                 if not candidate.copies:
                     current = dataclasses.replace(current, compute=None)
                 elif current.compute is None:
-                    current = dataclasses.replace(current, compute=jax.jit(
-                        lambda variables: narrowed(variables, candidate.copies),
-                        out_shardings=candidate.shardings.compute)(current.variables))
+                    narrowing = jax.jit(lambda variables: narrowed(variables, candidate.copies),
+                                        out_shardings=candidate.shardings.compute,
+                                        compiler_options=compiler_options(*self.objective.towers()) or None)
+                    current = dataclasses.replace(current, compute=narrowing(current.variables))
                 if (window > 1 and self.step is None and (current.accumulation is None or (
                         (self._ramp or self._stage_starts)
                         and not current.accumulation.replays(candidate.prepared.accumulation)))):
