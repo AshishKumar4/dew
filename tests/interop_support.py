@@ -546,3 +546,14 @@ def token_draw(salt: int, vocab: int, shape: tuple[int, ...]):
     def draw(seed):
         return (np.random.default_rng([salt, seed]).integers(0, vocab, shape).astype(np.int32),)
     return draw
+
+
+def reference_read(case, directory, *, wide: bool):
+    """transformers' read of an export (`decoder_export_reference.reference_forward`) in fp32 or, `wide`, in
+    float64, run as given on a draw's ids."""
+    from reference_error import as_given
+
+    from tools.decoder_export_reference import reference_forward
+
+    forward = reference_forward(case, directory, wide=wide)
+    return as_given(lambda ids: forward(np.asarray(ids)))

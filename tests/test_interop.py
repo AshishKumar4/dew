@@ -388,9 +388,10 @@ def assert_transformers_reads_the_run(export, task, ids, *, seeds: int = RUN_EXP
     them, on par with its fp32 forward from its float64 one over drawn ids
     of the shape of `ids` (check 1), at the run's declared `seeds`.
     """
-    from reference_error import as_given, assert_as_exact
+    from interop_support import reference_read
+    from reference_error import assert_as_exact
 
-    from tools.decoder_export_reference import Case, reference_forward
+    from tools.decoder_export_reference import Case
 
     case = Case("run export", str(export))
     vocabulary = json.loads((Path(export) / "config.json").read_text())["vocab_size"]
@@ -399,8 +400,7 @@ def assert_transformers_reads_the_run(export, task, ids, *, seeds: int = RUN_EXP
         return (np.random.default_rng(seed).integers(0, vocabulary, np.shape(ids)).astype(np.int32),)
 
     def read(wide):
-        forward = reference_forward(case, export, wide=wide)
-        return as_given(lambda drawn: forward(np.asarray(drawn)))
+        return reference_read(case, export, wide=wide)
 
     assert_as_exact(lambda drawn: task.model.apply(task.variables, drawn), read(wide=False), draw,
                     "run export logits", seeds=seeds, truth_fn=read(wide=True))

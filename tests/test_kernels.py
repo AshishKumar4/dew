@@ -112,6 +112,14 @@ def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_dete
                         seeds=FLASH_SEEDS[f"{name} twin"], truth_fn=exact_attended(keep))
 
 
+def normal_draws(base: int, shape, count: int):
+    """A site's draw: `count` standard normal fp32 arrays of `shape` from key `base` folded with the seed."""
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(base), seed), count)
+        return tuple(jax.random.normal(key, shape, jnp.float32) for key in keys)
+    return draw
+
+
 SHARDED_SEEDS = 8
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
@@ -665,9 +673,7 @@ def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_e
     queries = jnp.asarray([[1] * 40 + [2] * 30 + [3] * 30 + [0] * 28])
     keys = jnp.asarray([[1] * 50 + [3] * 50 + [0] * 28])
 
-    def draw(seed):
-        return tuple(jax.random.normal(key, (1, 128, 2, 128), jnp.float32)
-                     for key in jax.random.split(jax.random.fold_in(jax.random.key(742), seed), 4))
+    draw = normal_draws(742, (1, 128, 2, 128), 4)
 
     def derivatives(implementation, precision=None):
         def attend(q, k, v):
@@ -807,9 +813,7 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     jax.nn.dot_product_attention's from float64, over drawn primals, tangents and cotangents."""
     from dew.nn.attention import forward_mode_attention
 
-    def draw(seed):
-        return tuple(jax.random.normal(key, (1, 300, 2, 16), jnp.float32)
-                     for key in jax.random.split(jax.random.fold_in(jax.random.key(880), seed), 7))
+    draw = normal_draws(880, (1, 300, 2, 16), 7)
 
     def reference(q, k, v):
         return scaled_dot_product_attention(q, k, v, implementation="reference", causal=True)
