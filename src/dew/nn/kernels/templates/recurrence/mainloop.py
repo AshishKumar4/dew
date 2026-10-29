@@ -535,8 +535,9 @@ class Launch:
     streams' slots and barriers and its staging tiles, as its bundle declares them), the registers a consumer
     thread holds at its program's peak (`resources.live_registers` of the tiles it states), its steps, the
     chunks in flight, the bytes a step streams in, a program's tensor FLOPs and exponentials, the bytes it
-    reads and writes in global memory, and the programs a multiprocessor holds of it at once
-    (`resources.plan`)."""
+    reads and writes in global memory, the programs a multiprocessor holds of it at once
+    (`resources.plan`), its consumer roles, and the bundle it issues by (`family`: the call's, or the
+    layout a launch takes for itself, `_solving`), which every check of it reads."""
 
     name: str
     programs: int
@@ -551,6 +552,7 @@ class Launch:
     device_bytes: int
     resident: int = 1
     consumers: int = 1
+    family: mosaic.Family | None = None
 
 
 _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned", default=None)
@@ -728,7 +730,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             flops = work.flops * _products(call.held.parts) * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
                                     held.registers(family), work.steps * each, stages, stepped, flops,
-                                    work.exponentials * each, moved, found.programs, consumers))
+                                    work.exponentials * each, moved, found.programs, consumers, family))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
         return recorded
@@ -1799,9 +1801,10 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
 
 def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> bool:
     """Whether each of `launches` fits a block of `shared` bytes and its consumer threads hold their registers
-    (`Launch.registers` within `Family.registers` at its consumer roles): a generated launch spills
-    nothing."""
-    return all(launch.shared <= shared and launch.registers <= family.registers(launch.consumers)
+    (`Launch.registers` within `Family.registers` at its consumer roles, of the bundle it issues by,
+    `Launch.family`, `family` where it names none): a generated launch spills nothing."""
+    return all(launch.shared <= shared
+               and launch.registers <= (launch.family or family).registers(launch.consumers)
                for launch in launches)
 
 

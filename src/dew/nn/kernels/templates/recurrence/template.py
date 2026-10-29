@@ -144,7 +144,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         family = bundle(target, _dtype(ba))
         if family is None:
             return super()._held(ba, config)
-        return all(launch.registers <= family.registers(launch.consumers)
+        return all(launch.registers <= (launch.family or family).registers(launch.consumers)
                    for launch in self._launches(ba, config, target, backward=False))
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
