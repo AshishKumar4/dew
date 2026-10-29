@@ -407,7 +407,9 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # (`BackwardTiles.staged_logits`; a third of the launch at Qwen3-8B, ET-SWAPABL-h100). dK from the call's
     # own, which the power would flush where a query is 2^-126 at the scale 2^-10.
     if logits_stage is not None:
-        logits_slot = family.staged(by_power(family.tile_of(q_slot), walk.spec.prescale), logits_stage)
+        # The share's rows (32 of a slot's 64 where its consumers split them) read in the layout their
+        # copy infers, not the accumulator's (warpgroup MMA's takes whole 64-row tiles).
+        logits_slot = family.staged(by_power(q_slot[...], walk.spec.prescale), logits_stage)
     s = family.product(k_smem, logits_slot.transpose((1, 0)), shape)
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
