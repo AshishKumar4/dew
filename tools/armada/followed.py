@@ -15,8 +15,10 @@ imports, so its two writes publish by a rename of their own rather than through 
 
 import atexit
 import dis
+import functools
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import sysconfig
@@ -126,10 +128,21 @@ def placed(name: str, root: str) -> str | None:
     return relative
 
 
+PROBES = ((os.path, ("exists", "lexists", "isfile", "isdir", "getsize")),
+          (pathlib.Path, ("exists", "is_file", "is_dir", "stat")))
+"""The existence and size probes a run's record keeps as reads (`opening`), which raise no audit event:
+`os.path`'s and `pathlib.Path`'s, which every test, collection, conftest, loader and followed child calls."""
+
+
 def opening(recorded: Callable[[str], None], root: str) -> None:
     """`os.open` wrapped, whose audit event names a path relative to `dir_fd` without the descriptor:
     such an open, once it has opened to read, is passed to `recorded` as what the descriptor it
-    opened names (`placed`)."""
+    opened names (`placed`). Each existence or size probe (`PROBES`) is passed to `recorded` as a read of
+    the path it asks after, there or not, whose contents the record then keys (ci.py's `contents`): a
+    fixture's arrival reruns its probers, and no other file (Main, 2026-10-29)."""
+    for owner, names in PROBES:
+        for name in names:
+            setattr(owner, name, probed(getattr(owner, name), recorded, root))
     plain = os.open
 
     def opened(path, flags, mode=0o777, *, dir_fd=None):
@@ -210,6 +223,19 @@ def _this_python(program) -> bool:
     path = os.fsdecode(program)
     return os.path.realpath(path if os.sep in path else os.path.join(sys.prefix, "bin", path)) == \
         os.path.realpath(sys.executable)
+
+
+def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: str) -> Callable[..., object]:
+    """`probe` (`PROBES`), which passes the path it is asked about to `recorded` before it answers."""
+
+    @functools.wraps(probe)
+    def asked(path, *arguments, **keywords):
+        if not isinstance(path, int) and (name := placed(os.path.abspath(os.fsdecode(os.fspath(path))),
+                                                          root)) is not None:
+            recorded(name)
+        return probe(path, *arguments, **keywords)
+
+    return asked
 
 
 def installed() -> None:

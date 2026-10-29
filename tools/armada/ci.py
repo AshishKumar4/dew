@@ -44,8 +44,9 @@ green row records the checkout's Python files its tests executed
 directories under src/ that hold them, however deep (so a module added
 beside one, or an __init__.py on the way to one, changes it), the file
 itself and what every file shares (`shared`: the environment's locks, the
-CI tools, every non-Python file under tests/ and src/, the names
-of the Python files under tests/ but the test modules, and src/'s entries).
+CI tools, the names of the non-Python files under tests/ but its fixtures and
+under src/, of the Python files under tests/ but the test modules, and src/'s
+entries). A fixture is the input of the runs that opened, listed or probed it.
 A test module, or a module in a package a file never imported, is no input
 of that file's: a train that loses a head reruns only the files the head's
 modules reached (the land queue's recompose after a pull). A task
@@ -220,25 +221,25 @@ def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
     .armada.json's parts a test process sees (`armada_seen`), and the names of the Python files under
     tests/ but its test modules and of src/'s own entries, whose arrival can change what an import finds
-    (a conftest.py, a helper or a top-level package that shadows another), and of every fixture and package
-    data file (an existence query no record sees), which a record does not see. A
-    module within a package under src/ is its importers' input alone, with its package's other modules
-    (`inputs`), a test module is no other file's, and a fixture or a package's data is its openers'
-    (executed.py's `Opens`): so a train that loses a head runs again only what that head's files reached
+    (a conftest.py, a helper or a top-level package that shadows another), and of every data file under
+    tests/ but its fixtures and under src/ (an existence probe before the recorder starts). A module within
+    a package under src/ is its importers' input alone, with its package's other modules (`inputs`), a test
+    module is no other file's, and a fixture is its openers', listers' and probers' (executed.py's `Opens`,
+    followed.py's `PROBES`): so a train that loses a head runs again only what that head's files reached
     (owner, 2026-10-27: 8 fixtures changed reran all 485 tasks of train 222's second round)."""
     digest = hashlib.sha256(python.encode())
     for path in sorted(Path("tests").rglob("*.py")):
         if "__pycache__" not in path.parts and not path.name.startswith("test_"):
             digest.update(str(path).encode())
-    # The names of every fixture and every package's data: a test may ask whether one exists (`Path.exists`,
-    # a collection by presence) without opening it, which no record sees, so an arrival or a removal is every
-    # file's input; a file's contents stay its openers' (train 253's review: a test asserting a fixture's
-    # absence was reused green once the fixture came).
-    # A build's output and a fetched payload, which a planner's checkout lacks, are not named: they are their
-    # build's and their manifest's (`built`, FETCHED, `contents`), whose names are.
+    # The names of every data file under tests/ but its fixtures, and of every package's data: an existence
+    # probe a library makes at import, before the recorder starts, is no record's. A fixture is its openers',
+    # listers' and probers' alone, as a run records every probe it makes (followed.py's `PROBES`; Main,
+    # 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures). A build's output and a fetched
+    # payload, which a planner's checkout lacks, are not named: they are their build's and their manifest's
+    # (`built`, FETCHED, `contents`), whose names are.
     for root in ("tests", "src"):
         for path in sorted(Path(root).rglob("*")):
-            if (path.is_file() and path.suffix != ".py" and not built(path)
+            if (path.is_file() and path.suffix != ".py" and not built(path) and FIXTURES not in path.parents
                     and not path.with_name(path.name + FETCHED).is_file()):
                 digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
@@ -255,6 +256,9 @@ def lane_inputs(python: str) -> str:
     return hashlib.sha256((shared(python) + contents(__file__).hex()).encode()).hexdigest()
 
 
+FIXTURES = Path("tests/fixtures")
+"""The tests' fixtures: each its openers', listers' and probers' input alone (`shared`), and a native reader's
+directories up to it (`native_inputs`)."""
 FETCHED = ".fetched.json"
 """A fetched fixture's manifest's suffix, beside the payload it pins (tools/fetched_fixtures.py)."""
 
@@ -931,6 +935,18 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     return 0
 
 
+def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
+    """The fixture directories, each up to tests/fixtures, of what a task's processes opened natively
+    (`watched`: an open no Python process recorded, as a tokenizer's Rust code makes): a native reader's
+    probe beside what it opened is no record's, as followed.py's `PROBES` are Python's. The fetched store
+    is none: its payloads are content-addressed, and a planner, which never downloads them, keys them as a
+    task does (`contents`)."""
+    store = FIXTURES / "fetched"
+    return {str(parent) for name in opened - recorded if FIXTURES in (path := Path(name)).parents
+            and store != path and store not in path.parents
+            for parent in path.parents if parent == FIXTURES or FIXTURES in parent.parents}
+
+
 def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False,
            opened: set[str] | None = None) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
@@ -944,6 +960,9 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
     # A run cut short, or whose collection failed, may have written no report, or none for a file.
     executed = json.loads(executed_report.read_text()) if executed_report.is_file() else {}
     held = device_class(network)
+    if opened is not None:
+        recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
+        opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
