@@ -114,16 +114,16 @@ Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and 
 | `host_parameters` | `()` | Globs of variables an inference placement keeps in pinned host memory |
 | `frozen_whole` | `False` | Keep the frozen collection (a LoRA run's base) whole over `fsdp`, split only over the other axes its rules give it |
 
-To change a few placements and keep the rest, put your rules ahead of the default table: earlier rules win, and the defaults stay behind them as fallbacks. This keeps the vocabulary off the `tensor` axis and leaves every other placement as it was:
+To change one name's placement and keep every other, drop the default table's rules for that name and put yours ahead of the rest. This keeps the vocabulary off the `tensor` axis, on `fsdp` where its size divides the vocabulary and whole where it does not:
 
 ```python
 from dew.mesh import DEFAULT_RULES
 from dew.training import Layout
 
-layout = Layout(rules=(("vocab", "fsdp"), *DEFAULT_RULES))
+layout = Layout(rules=(("vocab", "fsdp"), *(rule for rule in DEFAULT_RULES if rule[0] != "vocab")))
 ```
 
-A rules mapping, or a sequence without the defaults, replaces the table whole. The defaults name some axes more than once as fallbacks, and a mapping keeps one rule per name, so build a variant from them as above and not as `dict(DEFAULT_RULES)`.
+A rule put ahead of the defaults without dropping theirs is only a preference: where it cannot place the dimension (its axis has size 1, or does not divide it), the default rules for the name behind it still apply. A rules mapping, or a sequence without the defaults, replaces the table whole. The defaults name some logical axes more than once as fallbacks, and a mapping keeps one rule per name, so build a variant from them as above and not as `dict(DEFAULT_RULES)`.
 
 A parameter that no module declares logical axes for is split on its largest dimension that the `fsdp` size divides. `Layout.check` raises `LayoutRefused` when more than `tolerance` of the shardable elements stay replicated, and it lists the largest replicated parameters. Raising `tolerance` only hides the problem, so fix the placement. A rule that puts a parameter on `data` or `stage` is refused.
 
