@@ -67,21 +67,30 @@ def ran(order, label: str, name: str):
         raise AssertionError(f"{label}: its {name} does not run: {type(error).__name__}: {error}") from error
 
 
-def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None) -> None:
+def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None) -> None:
     """Every order of `fn` runs at the draw, and each leaf is finite wherever the same order of its float64
-    run is a normal float32: `fn`'s own in float64, or `truth_fn`'s, the plain float64 formula, where `fn`
+    run is a normal float32 and, given `plain_fn` (the plain float32 formula, JAX's own derivatives of it),
+    the plain formula's is finite: no less finite than the plain arithmetic (row 1768, a contraction Dew
+    overflowed where the plain formula did not), where float32 itself overflows a partial sum the float64
+    run cancels. The float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn`
     computes in a fixed precision whatever its inputs' (a declared dot algorithm)."""
     narrow = orders(fn, primals, direction, cotangent)
+    plain_orders = {} if plain_fn is None else orders(plain_fn, primals, direction, cotangent)
+    plain = {name: ran(order, f"{label}, plainly", name) for name, order in plain_orders.items()}
     with jax.enable_x64(new_val=True):
         wide_primals, wide_direction, wide_cotangent = widened((primals, direction, cotangent))
         wide = orders(truth_fn or fn, wide_primals, wide_direction, wide_cotangent)
         truths = {name: ran(order, f"{label} in float64", name) for name, order in wide.items()}
     for name, order in narrow.items():
         values = jax.tree.leaves(ran(order, label, name))
-        for index, (value, truth) in enumerate(zip(values, jax.tree.leaves(truths[name]), strict=True)):
+        plains = jax.tree.leaves(plain[name]) if plain else [None] * len(values)
+        for index, (value, truth, plainly) in enumerate(zip(values, jax.tree.leaves(truths[name]), plains,
+                                                            strict=True)):
             if not np.issubdtype(value.dtype, np.inexact):
                 continue
             held = normal_float32(truth) & np.isfinite(truth)
+            if plainly is not None:
+                held &= np.isfinite(plainly)
             broken = held & ~np.isfinite(value)
             assert not broken.any(), (f"{label}, {name}, leaf {index}: {int(broken.sum())} values not finite "
                                       f"where float64's are normal float32s, e.g. {value[broken][:3]}")
@@ -148,7 +157,13 @@ def test_a_bf16_dot_holds_every_order(edge):
         # The operands as the algorithm reads them, rounded to bf16, then multiplied in float64.
         return jnp.matmul(*(jnp.asarray(jnp.asarray(x, jnp.bfloat16), x.dtype) for x in (lhs, rhs)))
 
-    assert_contract(dot, primals, direction, cotangent, f"a bf16 dot {edge}", truth_fn=exact)
+    def plain(lhs, rhs):
+        # The operands rounded to bf16, their products summed in float32 by XLA's own dot.
+        return jnp.matmul(*(jnp.asarray(jnp.asarray(x, jnp.bfloat16), x.dtype) for x in (lhs, rhs)),
+                          preferred_element_type=jnp.float32)
+
+    assert_contract(dot, primals, direction, cotangent, f"a bf16 dot {edge}", truth_fn=exact,
+                    plain_fn=plain)
 
 
 def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch):
@@ -175,4 +190,16 @@ def test_a_grouped_gemm_holds_every_order():
         return template.gemm(rows, matrices, sizes, out_dtype=rows.dtype)
 
     assert_contract(grouped, primals, direction, cotangent, "a grouped GEMM")
+
+
+def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
+    """The rule's validation: a formula overflowing where the plain one does not (|x| as the root of its
+    square, past 2**64) is refused, at its primal and its derivatives; the plain formula against itself
+    holds, at the same edge, where float32's own arithmetic holds every value."""
+    x = (jnp.asarray([2.0**70, -3.0, 2.0**-70], jnp.float32),)
+    direction = (jnp.ones((3,), jnp.float32),)
+    cotangent = jnp.ones((3,), jnp.float32)
+    assert_contract(jnp.abs, x, direction, cotangent, "the plain formula", plain_fn=jnp.abs)
+    with pytest.raises(AssertionError, match="not finite where float64"):
+        assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a squared root", plain_fn=jnp.abs)
 
