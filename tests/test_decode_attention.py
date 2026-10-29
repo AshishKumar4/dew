@@ -21,6 +21,7 @@ from reference_error import (
 
 from dew.nn.attention import attention_case, scaled_dot_product_attention, with_key_lengths
 from dew.nn.decode_geometry import folded_attention
+from dew.nn.kernels import decode_attention
 from dew.nn.kernels.generation import chosen
 from dew.nn.precision import FP32_SUMS
 
@@ -82,7 +83,6 @@ def dense_case(dtype, windowed=False):
     float64 truth: 32 steps of the loop, a slice each at the most, so the slices of each config cut
     short rows to empty ones. `windowed` starts the rows within a block, at one, mid-row and a
     window of 300 keys before a full row's end, as a sliding window's decode reads them."""
-    from dew.nn.kernels import decode_attention
 
     rng = np.random.default_rng(0)
     capacity = 32 * decode_attention.BLOCK
@@ -298,7 +298,6 @@ def test_a_launch_reads_its_slices_at_its_rows_next_power_of_two():
     the GPU, so it takes one slice, though its own 66 programs would have taken 8."""
     from tuned import taken
 
-    from dew.nn.kernels import decode_attention
     from dew.nn.kernels.generation import assumed
 
     query = jax.ShapeDtypeStruct((33, 4, 2, 256), jnp.bfloat16)
@@ -321,7 +320,6 @@ def test_a_launch_without_a_measurement_fills_six_programs_a_multiprocessor(proc
     one a step: two programs over 108 multiprocessors take 32, sixteen over 132 take 32, and 32 and 64
     take 16 and 8, the H100's fastest for Qwen3-0.6B's 4 and 8 rows over 131072 keys; four steps take
     at most 4."""
-    from dew.nn.kernels import decode_attention
 
     assert decode_attention._heuristic(programs, steps, processors) == decode_attention.Split(splits)
     # The slices it may take hold the heuristic's, and none past one where the programs fill the GPU.
@@ -572,7 +570,6 @@ def test_a_decode_step_over_no_keys_returns_the_empty_result(generation):
     H100 (`generation.assumed`): the decode kernel's dense and paged layouts return the empty result, the
     reference's value product over no keys, zero, before any split config forms over no steps (audit K6:
     an IndexError on both GPUs)."""
-    from dew.nn.kernels import decode_attention
     from dew.nn.kernels.generation import assumed
 
     query, key = jnp.ones((1, 1, 1, 64), jnp.bfloat16), jnp.zeros((1, 0, 1, 64), jnp.bfloat16)
@@ -742,7 +739,6 @@ def paged_case(page_size, windowed=False):
     shuffled and shared between rows, their query heads sharing key heads as Qwen3-0.6B's do (16 over
     8 of 128), and the gathered rows' keys and values and the float64 truth. `windowed` starts the
     rows within a page, past a block and a window of 300 keys before a full row's end."""
-    from dew.nn.kernels import decode_attention
 
     rng = np.random.default_rng(0)
     per_row, kv_heads, heads, width = 32 * decode_attention.BLOCK // page_size, 8, 16, 128
@@ -806,7 +802,7 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
 
 COMPILED = [(kernel, variant, splits) for kernel, variants in
             (("dense", ("bfloat16", "float32")), ("natural", ("raw", "sinks")), ("paged", (16, 32)))
-            for variant in variants for splits in (1, 2, 4, 8, 16, 32)]
+            for variant in variants for splits in decode_attention.SPLITS]
 """The decode compile gate's cases: each kernel's variants at every slice count (`decode_attention.SPLITS`),
 a program shape each, so every case compiles one kernel (row 2123: a kernel's twelve together took 228 to
 263 s of a CPU task)."""
@@ -868,7 +864,6 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
                                                jax.ShapeDtypeStruct((8, per_row), jnp.int32),
                                                jax.ShapeDtypeStruct((8,), jnp.int32))
 
-    assert splits in decode_attention.SPLITS
     built = {"dense": lambda: dense(jnp.dtype(variant)), "natural": lambda: natural(variant == "sinks"),
              "paged": lambda: paged(variant)}[kernel]
     op = decode_attention.PagedDecodeAttention if kernel == "paged" else decode_attention.DecodeAttention

@@ -642,6 +642,7 @@ __all__ = [
     "FROZEN",
     "PARAMETER_ROOTS",
     "SCAN_BLOCKS",
+    "TEXT_KEY",
     "VALIDITY_FIELD",
     "VALID_ROWS",
     "Batch",

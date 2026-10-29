@@ -159,3 +159,43 @@ def test_a_run_imported_by_from_flaxdiff_samples_what_flaxdiffs_preview_did(tmp_
                    variables={**task.variables, "encoders": {keyword: condition.encoder.params},
                               "autoencoder": autoencoder.params})
     assert_as_exact_as_the_reference(sampled(wide), recorded["fp32_towers.images"], truth, "float32 towers")
+
+
+def flaxdiff_run(**change) -> dict:
+    """A FlaxDiff text-to-image run config of the kind Dew reads (the simple_udit fixture's model on the
+    EDM schedule, the SD VAE and one text condition), with `change` over its top-level records."""
+    model = json.loads((FIXTURE / "config.json").read_text())["model"]
+    run = {"model": model, "architecture": "simple_udit",
+           "input_config": {"conditions": [{"encoder": {"modelname": "openai/clip-vit-large-patch14"}}],
+                            "sample_data_shape": [32, 32, 4]},
+           "arguments": {"noise_schedule": "edm"}, "autoencoder": "stable_diffusion"}
+    return {**run, **change}
+
+
+@pytest.mark.parametrize("run", [
+    flaxdiff_run(architecture="unet"),
+    flaxdiff_run(arguments={"noise_schedule": "cosine"}),
+    flaxdiff_run(autoencoder="kl"),
+    flaxdiff_run(input_config={"conditions": [{"encoder": {"modelname": "a"}},
+                                              {"encoder": {"modelname": "b"}}],
+                               "sample_data_shape": [32, 32, 4]}),
+    flaxdiff_run(model={**flaxdiff_run()["model"], "learn_sigma": True}),
+], ids=["unet", "cosine schedule", "kl autoencoder", "two conditions", "learned variance"])
+def test_a_flaxdiff_run_dew_does_not_read_is_refused_before_its_weights(run, tmp_path):
+    """A FlaxDiff run of another kind than Dew reads (an older UNet, another schedule or autoencoder,
+    more than one text condition, the learned-variance head) is refused from its config, before any
+    checkpoint is read."""
+    from dew.inference import TextToImage
+
+    with pytest.raises(ValueError):
+        TextToImage.from_flaxdiff(tmp_path / "absent", run, jax_version="0.5.3")
+
+
+def test_a_2024_aggregate_checkpoint_is_refused(tmp_path):
+    """FlaxDiff's 2024 aggregate checkpoint, one default/checkpoint file, is refused by its layout rather
+    than read as a later step."""
+    step = tmp_path / "1" / "default"
+    step.mkdir(parents=True)
+    (step / "checkpoint").write_bytes(b"\x80")
+    with pytest.raises(ValueError):
+        read_checkpoint(tmp_path / "1")

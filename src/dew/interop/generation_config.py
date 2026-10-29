@@ -556,8 +556,9 @@ def masked_generation_config(max_new_tokens: int | None = None, pad_token_id: in
     """The generation_config.json a masked-diffusion export writes: no KV cache,
     the response budget, the pad id and the end-of-sequence ids, which
     `audit_masked` accepts and `PretrainedMaskedDecoder.text_generation` reads
-    back. Dew's solver and step count have no field there, so the reader's MDLM
-    defaults stand."""
+    back. Dew's solver and step count have no field there, so the reader's
+    defaults stand: its family's walk where it declares one (LLaDA2.0's), else
+    MDLM's."""
     values: dict[str, JSON] = {"use_cache": False, **eos_field(eos_token_ids)}
     if max_new_tokens:
         values["max_new_tokens"] = max_new_tokens

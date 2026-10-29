@@ -61,7 +61,7 @@ class Export:
 
 # The sources a derived export writes, which their own `save` writes too, as themselves.
 DERIVED = ('gpt-bigcode-tiny', 'gpt-bigcode-mha-tiny', 'starcoder2-tiny', 'falcon-tiny', 'falcon-mha-tiny',
-           'gptj-tiny', 'phi-tiny', 'phi3-tiny', 'mamba-tiny')
+           'gptj-tiny', 'phi-tiny', 'phi3-tiny', 'mamba-tiny', 'opt-tiny', 'bloom-tiny')
 
 
 EXPORTS = (
@@ -73,10 +73,10 @@ EXPORTS = (
     Export('gptj-tiny', derived=True),
     Export('phi-tiny', derived=True),
     Export('phi3-tiny', derived=True),
-    Export('bloom-tiny'),
+    Export('opt-tiny', derived=True),
+    Export('bloom-tiny', derived=True),
     Export('gpt2-tiny'),
     Export('gpt-neox-tiny'),
-    Export('opt-tiny'),
     Export('gpt-neo-tiny'),
     Export('mimo-v2-flash-tiny'),
     Export('mamba-tiny', derived=True),

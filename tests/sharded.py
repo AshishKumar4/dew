@@ -148,11 +148,15 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
         # A donated argument is consumed; the draw's own array goes on to the other arm and the truth.
         return [jnp.copy(arg) if index in donate else arg for index, arg in enumerate(args)]
 
-    drawn = functools.lru_cache(maxsize=None)(draw)
+    # With `also`, each draw's split run once though two comparisons read it: the draws and the split's
+    # outputs held for the second (row 2208: a caller without `also` holds none).
+    drawn = functools.lru_cache(maxsize=None)(draw) if also is not None else draw
     outputs: dict = {}
 
     def split(*args):
-        # Each draw's split run once, though `also` compares it a second time.
+        if also is None:
+            with jax.set_mesh(mesh):
+                return compiled(*put(kept(args)))
         if id(args[0]) not in outputs:
             with jax.set_mesh(mesh):
                 outputs[id(args[0])] = compiled(*put(kept(args)))
