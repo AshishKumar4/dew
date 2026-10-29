@@ -210,7 +210,7 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     chunks = block_k // CHUNK
 
     def logits(read, index, chunk, masked):
-        coords = algebra.Coords(q_pos, index * block_k + chunk * CHUNK + columns)
+        coords = algebra.Coords(q_pos, index * block_k + chunk * CHUNK + columns, tile_keys=block_k)
         return algebra.logits_of(spec, read(chunk), coords, masked=masked)
 
     def step(index, carry, *, masked):
