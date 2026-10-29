@@ -217,12 +217,9 @@ class LMRunConfig(DecoderRunConfig):
                              "is a number of tokens")
         reference = SourceReference.parse(self.pretrained)
         dtype = resolve_dtype(self.model.fields.get("dtype"))
-        from dew.nn.attention import attention_implementation
-
         loaded = Pretrained.load(reference.name, dtype=jnp.bfloat16 if dtype is None else dtype,
                                  param_dtype=self.pretrained_param_dtype,
-                                 attention_impl=attention_implementation(
-                                     str(self.model.fields.get("attention_impl", "auto"))),
+                                 attention_impl=self.source_attention(),
                                  max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
                                  **self.source_keywords(frozen=self.lora is not None))

@@ -1,5 +1,5 @@
-"""Attention over a sequence the mesh splits: a kernel run on each shard's rows and heads (`per_shard`),
-the heads exchanged all-to-all (`exchanged_heads_attention`) or the keys gathered
+"""Attention over a sequence the mesh splits: a kernel run on each shard's rows and heads
+(`on_attention_shards`), the heads exchanged all-to-all (`exchanged_heads_attention`) or the keys gathered
 (`gathered_keys_attention`), as `sequence_parallel_attention` chooses, causal rows striped so each
 shard does equal work (`stripe`).
 """
@@ -141,7 +141,7 @@ def split_with_queries(key, value, split: int):
     return repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
 
 
-def per_shard(local, query, key, value, *, coordinates: bool = False, **extras):
+def on_attention_shards(local, query, key, value, *, coordinates: bool = False, **extras):
     """`local(query, key, value, **extras)` on each shard's rows and heads
     (`manual_map`). The key heads a shard reads are the ones its key shard holds,
     at their offset in that shard, where the key heads' split begins with the query
@@ -205,7 +205,7 @@ def query_split(axes, leaf, queries: P, shape: tuple[int, ...]) -> P:
     """The spec of a per-shard argument `leaf` whose dimensions `axes` names, from the query's own split
     `queries` of its `shape`: a dimension of the rows, the queries or the query heads takes the query's,
     where it is as long (a broadcast dimension of 1 stays whole), any other none. Every manual map over
-    attention's rows splits its row-scoped arguments so (`per_shard`, the sequence exchanges, local
+    attention's rows splits its row-scoped arguments so (`on_attention_shards`, the sequence exchanges, local
     attention over a sequence), so a shard's masks, lengths and ids are its own rows' where axes contend for
     them, whatever the rules give those names alone."""
     of = {"activation_batch": 0, "activation_length": 1, "activation_heads": 2}
