@@ -15,7 +15,7 @@ from typing import Literal
 from dew import _records
 from dew._records import JSON, is_share, share
 from dew.training.budget import every_step, recorded
-from dew.training.cadence import Clock, Counted
+from dew.training.cadence import Counted
 
 
 @dataclasses.dataclass(frozen=True)
@@ -93,7 +93,7 @@ class Branch:
         return {"step": current, "steps": self.cooldowns.steps(current, accumulation),
                 "shape": self.cooldowns.shape}
 
-    def due(self, step: int, counts: Mapping[Clock, tuple[int, int]] | None = None) -> bool:
+    def due(self, step: int, counts: Mapping[str, tuple[int, int]] | None = None) -> bool:
         """Whether the step `step`, which brought each counted clock's count from the second of its
         `counts` to the first, branches: at its step, or where it crosses its point."""
         if isinstance(self.at, Counted):

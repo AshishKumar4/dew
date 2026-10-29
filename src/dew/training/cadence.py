@@ -21,13 +21,13 @@ class Counted:
     every: int
     clock: Clock = "tokens"
 
-    def due(self, counts: Mapping[Clock, tuple[int, int]]) -> bool:
+    def due(self, counts: Mapping[str, tuple[int, int]]) -> bool:
         """Whether the step that brought the clock's count from the second of its `counts` to the first
         passed a multiple."""
         now, before = counts[self.clock]
         return now // self.every > before // self.every
 
-    def crossed(self, counts: Mapping[Clock, tuple[int, int]]) -> bool:
+    def crossed(self, counts: Mapping[str, tuple[int, int]]) -> bool:
         """Whether the step crossed `every` itself, from before it to at or past it: a point once in the
         run, where a cooldown branches."""
         now, before = counts[self.clock]

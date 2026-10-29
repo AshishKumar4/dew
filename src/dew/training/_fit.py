@@ -35,7 +35,7 @@ from dew.optim import OptimConfig, reclocked
 from dew.state import TrainState
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
-from dew.training.cadence import Cadence, Clock, Counted
+from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, Taken, TokenClock
@@ -193,7 +193,7 @@ class FitPlan:
 
     @staticmethod
     def falls(every: Cadence | str | datetime.timedelta, step: int,
-              counts: Mapping[Clock, tuple[int, int]] | None = None) -> bool:
+              counts: Mapping[str, tuple[int, int]] | None = None) -> bool:
         """Whether a cadence of steps (`int`) or of a counted clock (`Counted`, the step having brought
         each clock's count from the second of its `counts` to the first) falls on `step`; a duration or
         none never does here."""
@@ -287,7 +287,7 @@ class FitPlan:
                                  'step': run.current, 'rule': rule}
         return stopping.should_stop
 
-    def due(self, step: int, counts: Mapping[Clock, tuple[int, int]] | None = None) -> tuple[str, ...]:
+    def due(self, step: int, counts: Mapping[str, tuple[int, int]] | None = None) -> tuple[str, ...]:
         """The suites whose own cadence falls on `step`, which brought each counted clock's count as
         `counts` says (`falls`)."""
         return tuple(name for name, suite in self.suites.items() if self.falls(suite.every, step, counts))
