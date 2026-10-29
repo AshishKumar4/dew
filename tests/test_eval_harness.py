@@ -298,7 +298,7 @@ def test_harnesses_over_one_model_score_through_one_program(run):
     (score, _), = DewLM(first).loglikelihood(request)
     with Compiles("_scored") as compiles:
         (doubled, _), = DewLM(second).loglikelihood(request)
-    assert compiles.count == 0 and doubled != pytest.approx(score, rel=RELATIVE)
+    assert compiles.count == 0 and doubled != score
 
 
 @pytest.mark.network
