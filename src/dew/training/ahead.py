@@ -24,6 +24,7 @@ compiling its first step, where it is the very program the run compiles first (`
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -31,6 +32,7 @@ import json
 import logging
 import pickle
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -193,6 +195,20 @@ class AheadOfTime:
                              "(--trainer.compile-ahead), with this Dew, and no plan recorded for another "
                              "rung")
         return self.loaded()
+
+
+@contextlib.contextmanager
+def handed(ahead: AheadOfTime | None) -> Iterator[None]:
+    """Within the block, the kernel launch configs refused are `ahead`'s alone, its compiles' refusals
+    (`AheadOfTime.refusals`), in a scope of their own (`report.refusals`): a run handed a step compiled
+    ahead lowers it as its compile did, whatever this process or its cache refused of other programs.
+    Without one, the process's own."""
+    if ahead is None:
+        yield
+        return
+    with report.refusals():
+        report.refuse(ahead.refusals)
+        yield
 
 
 def program_of(lowered: jax.stages.Lowered) -> str:

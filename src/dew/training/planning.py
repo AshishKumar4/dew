@@ -519,15 +519,13 @@ class FitSearch[LossT, EffectsT]:
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
-    is that program (`AheadOfTime.taken`): the launch configs its compiles refused are this process's
-    before the search lowers anything (`AheadOfTime.refusals`), so the step lowers as it did."""
+    is that program (`AheadOfTime.taken`), which the trainer searches within the launch configs its
+    compiles refused alone (`AheadOfTime.refusals`, `dew.training.trainer.Trainer._planned`)."""
     capacity: int | None = None
     """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
     compiled ahead for it states them (`AheadTarget.capacity`)."""
 
     def __post_init__(self):
-        if self.ahead is not None:
-            report.refuse(self.ahead.refusals)
         self.factor = temporaries_factor(self.mesh, self.capacity)
         self.started = self.remat_rung()
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
