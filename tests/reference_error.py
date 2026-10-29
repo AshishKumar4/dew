@@ -2416,10 +2416,13 @@ def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) ->
         f"(ratio {apart / theirs:.2f}, allowed 0.25)")
 
 
-# The one-draw rule, its own module now, re-exported where its sites import it from.
-from one_draw import (  # noqa: E402
-    assert_as_exact_as_the_reference as assert_as_exact_as_the_reference,
-    assert_leaves_as_exact as assert_leaves_as_exact,
-    assert_no_less_exact as assert_no_less_exact,
-    rows_over as rows_over,
-)
+def __getattr__(name: str):
+    """The one-draw rule's names (tests/one_draw.py), which their sites import from here: read from its
+    module on first use, which reads the gate's names from this one (`gate.`), so neither imports the
+    other at load."""
+    if name in ("assert_as_exact_as_the_reference", "assert_leaves_as_exact", "assert_no_less_exact",
+                "rows_over"):
+        import one_draw
+
+        return getattr(one_draw, name)
+    raise AttributeError(f"module 'reference_error' has no attribute {name!r}")
