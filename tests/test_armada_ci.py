@@ -1837,6 +1837,23 @@ def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
+def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(ci, tmp_path, monkeypatch, cache_worker):
+    """The files a plan keeps for reuse, their rows green on any class the tasks are pinned to, are reused by
+    the task that holds them on whichever pinned class it lands on, as the plan counted them: a task that
+    looked up its own class alone ran every kept file itself, in one task, past its deadline (2026-10-29: a
+    verdict's kept task of 182 files on 26/17 ran 76 of them into its 1680 s deadline, the rows green on
+    25/17)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17",
+                                        "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
+    monkeypatch.setattr(ci, "cpu_class", lambda: "AuthenticAMD-25-17")
+    rows = armada_task(ci, monkeypatch, verdict)
+    assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
+
+
 def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):
     """A test marked whole_suite runs on the whole suite alone (DEW_WHOLE_SUITE, every fifth publish's
     ci/full-whole-* run), and is set aside on every other run, a train's whatever the cache's policy: a
