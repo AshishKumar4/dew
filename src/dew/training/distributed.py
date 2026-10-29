@@ -112,16 +112,29 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
 
 
 def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:
-    """The link figures a checkpoint's rung keeps (`Trainer._checkpoint_rung`): each measured figure of
-    `bandwidths`, by mesh and axis, under the placement it was measured on (`link_topology`)."""
-    return {link_topology(mesh, axis): figure for (mesh, axis), figure in bandwidths.items()
-            if figure is not None}
+    """The link figures a checkpoint's rung keeps (`Trainer._checkpoint_rung`): each figure of
+    `bandwidths` a step traced with, by mesh and axis, under the placement it was taken on
+    (`link_topology`), None where a step compiled ahead took none (`AheadOfTime.links`)."""
+    return {link_topology(mesh, axis): figure for (mesh, axis), figure in bandwidths.items()}
 
 
-def resumed_link_figures(rung: JSON) -> dict[str, float]:
+def link_figure(mesh: Mesh, axis: str, ahead: Mapping[str, float | None],
+                resumed: Mapping[str, float | None]) -> float | None:
+    """The bandwidth a step over `mesh` decides `axis`'s projections by: a step compiled ahead's own
+    (`AheadOfTime.links`), else the one a resumed checkpoint traced with on this very placement
+    (`resumed_link_figures`), either None where it was unmeasured, else the one measured there
+    (`link_bandwidth`)."""
+    if axis in ahead:
+        return ahead[axis]
+    topology = link_topology(mesh, axis)
+    return resumed[topology] if topology in resumed else link_bandwidth(mesh, axis)
+
+
+def resumed_link_figures(rung: JSON) -> dict[str, float | None]:
     """`link_figures` as a checkpoint's rung recorded them; none where it recorded none."""
     links = record(record(rung, 'rung').get('links', {}), 'rung links')
-    return {topology: number(figure, f'link of {topology}') for topology, figure in links.items()}
+    return {topology: None if figure is None else number(figure, f'link of {topology}')
+            for topology, figure in links.items()}
 
 
 def _link_record(topology: str) -> Path | None:

@@ -179,8 +179,19 @@ def _kkt_solve_chunk(k_ref, g_ref, gl_ref, beta_ref, a_ref, start, taken, *, chu
         # The keys' products at the call's precision, the merges at its solve precision (`_dot`).
         return _dot(a, b, exact=exact, solve=k_ref.dtype if name == "merge" else None)
 
-    blocks = algebra.system(keys, lambda i, j: _paired(gates[i], gates[j], lows[i], lows[j]), betas,
-                            count, width // bk, issue)
+    def decay(i, j):
+        """The pairs' decays of sub-chunks `i` and `j`, `exp2` of the separated prefix's difference rounded
+        once: within a chunk the solve's pairs weigh nothing past fp32's resolution beside its unit
+        diagonal, and `algebra.between`'s exponential and power-of-two scaling here left a row's inverse
+        1 ulp apart alone and among its neighbours on a CPU (identical operands, the first diagonal block
+        from its fifth row; how XLA's code for it differs between the two programs is not established),
+        which a row's output keeps bitwise (tests/test_linear_attention.py)."""
+        rows, columns = gates[i], gates[j]
+        if lows[i] is None:
+            return jnp.exp2(rows[:, None] - columns[None, :])
+        return jnp.exp2((rows[:, None] - columns[None, :]) + (lows[i][:, None] - lows[j][None, :]))
+
+    blocks = algebra.system(keys, decay, betas, count, width // bk, issue)
     inverse = algebra.inverted(blocks, issue)
     # fla zero-fills A before its kernel stores the lower blocks; here the blocks above are stored as zeros.
     for i in range(count):
