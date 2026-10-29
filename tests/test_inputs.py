@@ -164,7 +164,7 @@ def test_tokens_laid_out_both_as_coordinates_and_as_fields_are_refused():
     for field, value in (("attention_mask", valid), ("segment_ids", jnp.ones(tokens.shape, jnp.int32)),
                          ("positions", jnp.zeros(tokens.shape, jnp.int32))):
         with pytest.raises(ValueError):
-            ModelInputs(tokens, {COORDINATES_FIELD: laid, field: value})
+            ModelInputs(tokens, {COORDINATES_FIELD: laid, field: value}).validate()
         with pytest.raises(ValueError):
             model.apply(variables, tokens, coordinates=laid, **{field: value})
     np.testing.assert_array_equal(model.apply(variables, tokens, coordinates=laid),
