@@ -1080,15 +1080,19 @@ class Trainer(Generic[Loss, Effects]):
         return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
-                   split: int, narrow: bool, launches: str | None) -> Candidate:
+                   split: int, narrow: bool | None, launches: str | None, *,
+                   mesh: Mesh | None = None, platforms: tuple[str, ...] | None = None) -> Candidate:
         """The step reading `batch` in `split` microbatches, lowered at the
         objective's current rung, with what the fit check holds beside it.
-        `launches` are its kernel launches where a record holds them, which
-        settle their configs before it lowers; otherwise, or where the run
-        measures configs (`tune_kernels`), its lowering records them (`tune`)."""
+        `launches` are its kernel launches where a record holds them, which settle their configs before
+        it lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records
+        them (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`_lowered_for`)."""
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation, narrow)
         shardings = self.shardings(prepared)
+        if mesh is not None:
+            shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
+                                     shardings)
         prepared = placed_shapes(prepared, shardings)
         # The check reads the state's arguments as already on the devices. The copies and accumulators
         # `run` builds on the first call are not yet, so they count with the prefetched batches beside
@@ -1101,8 +1105,10 @@ class Trainer(Generic[Loss, Effects]):
         held = prefetched_bytes(batch, placement, self._prefetch) + built
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        lower = Routed(functools.partial(jitted.lower, *apart(prepared), batch, part))
-        if self.tune_kernels:
+        lower = Routed(functools.partial(
+            lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
+            *apart(prepared), placed_shapes(batch, placement) if mesh is not None else batch, part))
+        if self.tune_kernels and platforms is None:
             lowered, launches = tuning.tune(lower, measure=True)
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
@@ -1171,16 +1177,10 @@ class Trainer(Generic[Loss, Effects]):
         with assumed(generation), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
             split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
-            placement = batch_shardings(mesh, batch)
-            replicated = NamedSharding(mesh, P())
-            micro = microbatch_shapes(batch, split)
-            shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
-            shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
-                                     self.shardings(prepared))
-            jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
-            traced = jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
-                                  jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated))
-            return traced.lower(lowering_platforms=('cuda',))
+            candidate = self._candidate(state, batch, schedule, batch_shardings(mesh, batch),
+                                        NamedSharding(mesh, P()), split, None, None, mesh=mesh,
+                                        platforms=('cuda',))
+            return candidate.lowered
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
