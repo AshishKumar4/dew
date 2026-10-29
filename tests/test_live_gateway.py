@@ -54,7 +54,8 @@ def created(port: int) -> str:
 
 
 def serving(port: int) -> bool:
-    request = urllib.request.Request(f"http://127.0.0.1:{port}/api", headers={"Authorization": f"token {TOKEN}"})
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/api",
+                                     headers={"Authorization": f"token {TOKEN}"})
     try:
         with urllib.request.urlopen(request, timeout=5):
             return True
@@ -74,7 +75,8 @@ def test_a_kernel_no_connection_holds_is_culled_once_idle_for_the_live_contracts
         [sys.executable, "-m", "kernel_gateway", "--KernelGatewayApp.kernel_manager_class=plain.Plain",
          "--KernelGatewayApp.ip=127.0.0.1", f"--KernelGatewayApp.port={port}"],
         env={**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(CONTAINER)]),
-             "KG_AUTH_TOKEN": TOKEN, "DEW_LIVE_IDLE_SECONDS": str(idle), "JUPYTER_RUNTIME_DIR": str(tmp_path)},
+             "KG_AUTH_TOKEN": TOKEN, "DEW_LIVE_IDLE_SECONDS": str(idle),
+             "JUPYTER_RUNTIME_DIR": str(tmp_path)},
         stdout=subprocess.DEVNULL, stderr=log.open("w"))
     try:
         deadline = time.monotonic() + 60
