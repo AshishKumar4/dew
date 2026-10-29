@@ -347,12 +347,13 @@ class Walk:
 TILE = Tile(rows=16, warps=4)
 """The forward's launch: 16 tokens a tile, each window loaded at once."""
 
-WALK = Walk(segments=8, steps=64, warps=4)
+WALK = Walk(segments=8, steps=32, warps=4)
 """The backward's launch, its runs no longer than a row's share: eight runs a tile, with a 128-channel
-block 1024 elements, eight an fp32 register of each of four warps' threads, and 64 tokens a run, whose
-K-1 extra tokens are 5% of it at the K of 4 every mixer uses. A run sums its taps' products token by
+block 1024 elements, eight an fp32 register of each of four warps' threads, and 32 tokens a run, whose
+K-1 extra tokens are 9% of it at the K of 4 every mixer uses. A run sums its taps' products token by
 token, so its rounding grows with its steps: runs of 128 put the 0.8B's bf16 tap gradients 2.06 times
-as far from float64 as XLA's on an A100, past the gate."""
+as far from float64 as XLA's on an A100, and runs of 64 1.57 times at the 0.8B's and 9B's training
+shapes on an H100 (row 2411), past the gate."""
 
 
 def _inputs(x, w, bias, valid, documents):
