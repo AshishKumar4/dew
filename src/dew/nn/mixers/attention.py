@@ -821,7 +821,8 @@ class CausalSelfAttention(nn.Module):
     def attend_context(self, query, gate, key, value, *, lengths, queries=None, segments=None,
                        max_segments=None):
         """The layer's own attention of `query` heads (`context_query`) over a context's `key` and
-        `value` heads (`context_keys`), each row's first `lengths` keys real and, where given, each
+        `value` heads (`context_keys`), each row's first `lengths` keys real (none for a row without
+        context, whose read its block leaves out) and, where given, each
         query reading its own document's keys alone (`queries` `[B, S]`, `segments` `[B, C]`): its
         unit sphere under nGPT, its sinks, logit softcap and kernel, unmasked by causality, then its
         output gate and projection. A context holds no token's own value, so exclusive self
@@ -829,16 +830,18 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.ngpt is not None:
             query, key = self._ngpt_rotated(self.ctx.ngpt, query, key)
         if not self.is_initializing() and self.is_mutable_collection("qk"):
-            # The read's logits through the layer's own projections, which its own call's maxima take in
-            # beside its own sequence's (`_attended`), so the QK-Clip bounds both.
-            seen = jnp.arange(key.shape[-3])[None, None, None, :] < lengths[:, None, None, None]
-            if queries is not None and segments is not None:
-                seen = seen & (queries[:, None, :, None] == segments[:, None, None, :])
+            # The read's logits through the layer's own projections over the keys it sees, which its own
+            # call's maxima take in beside its own sequence's (`_attended`), so the QK-Clip bounds both.
+            documents = None if queries is None or segments is None else CrossDocuments(queries, segments)
+            seen = visibility_mask(query.shape[1], key.shape[-3], causal=False, sliding_window=None,
+                                   segment_ids=documents, key_value_seq_lengths=lengths)
             self.sow("qk", CONTEXT_LOGITS, max_attention_logits(query, key, mask=seen))
+        # A row without context reads its first slot, so its softmax stays finite: one over no keys would
+        # be NaN, which the block's join drops forward but not from the gradients.
         attention = checkpoint_name(scaled_dot_product_attention(
             query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax, implementation=self.ctx.attention_impl,
-            key_value_seq_lengths=lengths, segment_ids=queries, key_segment_ids=segments,
+            key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
             max_segments=max_segments, sinks=self.sinks, softcap=self.ctx.attn_logit_softcap), 'context')
         B, S = query.shape[:2]
         return self._output(attention, gate, B, S, None)

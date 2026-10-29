@@ -164,10 +164,11 @@ class LayerSpec:
     unrolled, as a `provider` does; None for the rest."""
     attention_norm: bool = True
     """Whether the block norms its attention input; ModernBERT's first block does not."""
-    cross: Hashable | None = None
+    cross: tuple[Hashable] | None = None
     """What the layer's cross-attention block, which reads the call's context first, depends on beside
-    the decoder and its configuration (`CrossBlocks.layer_key`); None for a layer that reads none. Layers
-    of equal specs build one block, which a scanned run of them runs for each."""
+    the decoder and its configuration, held in a tuple of one (`CrossBlocks.layer_key`, whatever it is);
+    None for a layer that reads none. Layers of equal specs build one block, which a scanned run of them
+    runs for each."""
 
 
 def scan_groups(specs: Sequence[Hashable],

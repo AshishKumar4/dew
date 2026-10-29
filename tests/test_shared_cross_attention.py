@@ -209,9 +209,10 @@ def test_the_gates_train_alone_over_a_frozen_source():
 def test_a_context_reads_logits_enter_the_layers_qk_clip_maxima():
     """The QK-Clip bounds the logits of a layer's own projections wherever they run: a layer that reads
     a context through them sows one maximum a head, its own sequence's or the context's, whichever is
-    larger. At zero gates the reads leave every layer's own sequence as the base decoder's, so each
-    layer's maxima are the base's or more, the base's alike where it reads none, and a context scaled up
-    raises a reading layer's past them."""
+    larger, over the keys it sees. At zero gates the reads leave every layer's own sequence as the base
+    decoder's, so each layer's maxima are the base's or more, the base's alike where it reads none and
+    on a row with no context, whatever its padding holds, and a context scaled up raises a reading
+    layer's past them."""
     variables, ids, context, lengths = model_draw(SHARED_UNNORMED, gated=False)(2)
     base = dataclasses.replace(SHARED_UNNORMED, cross_attention=None)
 
@@ -228,6 +229,8 @@ def test_a_context_reads_logits_enter_the_layers_qk_clip_maxima():
     for path, leaf in scaled.items():
         reads = any(f"['layers_{index}']" in path for index in SHARED.layer_ids)
         assert np.all(plain[path] >= own[path]) and np.all(leaf >= own[path]), path
+        assert lengths[0] == 0
+        np.testing.assert_array_equal(leaf[0], own[path][0], err_msg=path)
         if reads:
             assert np.any(leaf > own[path]), path
         else:
@@ -246,6 +249,22 @@ class Alternating(CrossAttention):
 
     def layer_key(self, decoder, index):
         return CrossAttention.layer_key(self, decoder, index), index % 2
+
+
+@dataclasses.dataclass(frozen=True)
+class Unkeyed(SharedCrossAttention):
+    """The shared form whose layers' key is None, which a configuration may give."""
+
+    def layer_key(self, decoder, index):
+        return None
+
+
+def test_a_layer_keyed_none_still_reads_its_context():
+    """A layer's key is whatever its configuration gives (`CrossBlocks.layer_key`), None among them:
+    every named layer builds its block, and only those do."""
+    model = MODEL.clone(cross_attention=Unkeyed((0, 2), 6))
+    gates = {path for path in flat_tree(model_draw(model, gated=False)(0)[0]["params"]) if "alpha_" in path}
+    assert {path.split(".", 1)[0] for path in gates} == {"layers_0", "layers_2"}
 
 
 def test_a_configuration_of_its_own_scans_each_layers_own_block():

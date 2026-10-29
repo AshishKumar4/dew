@@ -1044,7 +1044,7 @@ class CausalTransformer(nn.Module):
                                else self.attention_residuals.site(index)),
                 engram=(None if self.engram is None or index not in self.engram.layer_ids
                         else self.engram.layer_ids.index(index)),
-                cross=(self.cross_attention.layer_key(self, index)
+                cross=((self.cross_attention.layer_key(self, index),)
                        if self.cross_attention is not None and index in self.cross_attention.layer_ids
                        else None),
                 prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers

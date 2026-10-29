@@ -506,11 +506,9 @@ class SharedGatedCrossAttention(nn.Module):
         else:
             assert embeddings is not None
             key, value = attention.context_keys(embeddings)
-        # A row without context reads its first slot, so its softmax stays finite (`GatedCrossAttention`).
         documents = ({} if context is None or context.segments is None
                      else {"queries": context.queries, "segments": context.segments})
-        branch = attention.attend_context(query, gate, key, value, lengths=jnp.maximum(lengths, 1),
-                                          **documents)
+        branch = attention.attend_context(query, gate, key, value, lengths=lengths, **documents)
         branch = Dropout(rate=self.dropout_rate)(branch, deterministic=not train)
         return _joined(self, "alpha_cross_attn", stream, branch, _present(stream, context, lengths),
                        ngpt=self.ngpt, precision=self.precision)
