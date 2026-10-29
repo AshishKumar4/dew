@@ -97,16 +97,21 @@ def test_the_kernels_take_forward_mode_however_a_caller_stages_them(staged):
     tangents = tuple(jnp.asarray(np.random.default_rng(3 + index).normal(size=t.shape), t.dtype)
                      for index, t in enumerate((x, weights, shift)))
 
-    def tangent(conv, *primals_and_tangents):
-        def pieces(x, weights, shift):
-            return conv(x, weights, True, shift, valid=None, segments=None, parts=parts, dtype=x.dtype)
+    def kernels(x, weights, shift):
+        return kernel_conv(x, weights, activation=True, shift=shift, valid=None, segments=None, parts=parts,
+                           dtype=x.dtype)
+
+    def xla(x, weights, shift):
+        return xla_conv1d(x, weights, activation=True, bias=shift, parts=parts, dtype=x.dtype)
+
+    def tangent(pieces, *primals_and_tangents):
         rule = jax.jit(pieces) if staged == "jit" else jax.checkpoint(pieces)
         return jax.jvp(rule, primals_and_tangents[:3], primals_and_tangents[3:])[1]
 
-    mine = tangent(kernel_conv, x, weights, shift, *tangents)
-    theirs = tangent(xla_conv1d, x, weights, shift, *tangents)
+    mine = tangent(kernels, x, weights, shift, *tangents)
+    theirs = tangent(xla, x, weights, shift, *tangents)
     with jax.enable_x64(new_val=True):
-        exact = tangent(xla_conv1d, *widened((x, weights, shift, *tangents)))
+        exact = tangent(xla, *widened((x, weights, shift, *tangents)))
     for index, (found, reference, value) in enumerate(zip(mine, theirs, exact, strict=True)):
         assert_as_exact_as_the_reference(found, reference, value, f"{staged} piece {index}")
 
