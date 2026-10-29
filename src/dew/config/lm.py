@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import Annotated, ClassVar, NamedTuple
+from typing import Annotated, ClassVar, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -90,7 +90,7 @@ class PromptRollout:
         if self.admit is not None and (type(self.admit) is not int or self.admit < 1):
             raise ValueError("admit is a positive number of each batch's prompts' groups, or None for all")
 
-    def objective_settings(self) -> dict:
+    def objective_settings(self) -> Mapping[str, object]:
         """The objective settings `method` fixes, which the run derives (`ObjectiveConfig.build`)."""
         from dew.objectives.rl.methods import method
 
@@ -102,8 +102,9 @@ class PromptRollout:
         from dew.objectives.rl.methods import Rollout, method
         from dew.registry import imported
 
+        # An import path names a function or a class, which an instance of at its defaults is a reward.
         named = imported(self.reward)
-        reward: Reward = named() if isinstance(named, type) else named
+        reward = cast("Reward", named() if isinstance(named, type) else named)
         settings = (Rollout(estimator=self.estimator or "group") if self.method is None
                     else method(self.method).rollout(self.max_new_tokens))
         return RolloutScheduler.sampled(objective, reward,
