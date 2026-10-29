@@ -54,6 +54,7 @@ from dew.nn.kernels.chunked_launch import (
 from dew.nn.precision import compensated_difference
 
 RCP_LN2 = 1 / math.log(2)
+LN2 = math.log(2)
 """1 / ln 2, fla's RCP_LN2 (whose 1.4426950216 rounds to the same fp32): its kernels take the cumulated
 decay in base 2 and exponentiate with exp2; the prefix converts in float64 (`recurrence.cumulated`)."""
 
@@ -86,13 +87,12 @@ def _range(last, gate, last_lo=None, gate_lo=None):
 
 
 def _raised(gate, gate_lo=None):
-    """`exp2(g)`, of both halves where the remainder is given: `exp2(hi) exp2(lo)`, the hardware's base-2
-    exponential exact to its own rounding at any size (where a CPU's `exp(x ln 2)` is not; the template's
-    `algebra.raised` takes an exact power of two for it), two exponentials where `algebra.raised`'s exact
-    power of two cost a KDA tile 15 times its launch on an A100. Its one more product put the long-sequence
-    memory's error from float64 1.5 times the portable math's on a CPU, against 1.6 through
-    `algebra.raised`."""
-    return jnp.exp2(gate) if gate_lo is None else jnp.exp2(gate) * jnp.exp2(gate_lo)
+    """`exp2(g)`, of both halves where the remainder is given: `exp2(hi) (1 + lo ln 2)`, the remainder's
+    factor to its first order, whose next term lies below fp32's resolution wherever `exp2(hi)` is a normal
+    fp32 (|lo| at most 2^-17 there); one product beside the hardware's exponential, where a second
+    exponential, or `algebra.raised`'s exact power of two, cost a KDA tile 4 and 15 times its launch on an
+    A100."""
+    return jnp.exp2(gate) if gate_lo is None else jnp.exp2(gate) * (1.0 + gate_lo * LN2)
 
 
 def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, bv: int, exact: bool,
