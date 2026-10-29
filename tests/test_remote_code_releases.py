@@ -48,19 +48,30 @@ its check alone (`release_env`)."""
 
 @pytest.mark.parametrize("name", [pytest.param(name, marks=pytest.mark.release_env(requirement))
                                   for name, requirement in OPENED.items()])
-def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name, tmp_path):
+def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name, tmp_path, monkeypatch):
     """A Dew export of the fixture (`PretrainedDecoder.from_model(...).save`) opens offline through the
     release's own transformers loader, under the transformers its code needs, as the release itself opens:
     the same class, every weight matched, the same state tensor for tensor and the same logits bit for
     bit over the fixture's ids (`remote_code_reference.opens`, the release's files vendored into the
-    fetched store; ledgers 2038, 2173)."""
+    fetched store; ledgers 2038, 2173). The export reads its release's code from the hub's cache, seeded
+    at the commit Dew holds it to from the same vendored files."""
+    import shutil
+
+    import huggingface_hub.constants
     from tool_support import load
 
     from dew.interop import PretrainedDecoder
 
+    reference = load("remote_code_reference")
+    repo, revision, files, _ = reference.RELEASES[name]
+    snapshot = tmp_path / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    for file in files:
+        shutil.copy(reference.release_file(name, file), snapshot / file)
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
     loaded = Pretrained.load(FIXTURES / name)
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "export")
     (tmp_path / "scratch").mkdir()
-    checks = load("remote_code_reference").opens(name, tmp_path / "export", tmp_path / "scratch")
+    checks = reference.opens(name, tmp_path / "export", tmp_path / "scratch")
     assert all(checks.values()), checks
 
