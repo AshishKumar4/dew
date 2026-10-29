@@ -85,7 +85,8 @@ def test_an_opt_350m_shaped_decoder_computes_transformers_logits(variant, tmp_pa
         drawn = source.generate(ids[:1, :4], max_new_tokens=6, min_new_tokens=6, do_sample=False)
     generated = generate(loaded.model, loaded.variables, np.asarray(ids[:1, :4]), 6, key=0,
                          sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(np.asarray(generated.tokens), drawn[:, 4:].numpy())
+    # Both hold the prompt and its continuation.
+    np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
 
 
 def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_and_keeps_loop_norms():
