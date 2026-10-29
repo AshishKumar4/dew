@@ -84,6 +84,7 @@ from dew.objectives.base import Metric, Objective, joined
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.data.tokens import FirstFit
     from dew.decision.objective import DecisionObjective
     from dew.decision.sources import PretrainedDecision
     from dew.distributed.placement import Layout as Placement, MeshSpec
@@ -493,7 +494,13 @@ class Decide(SavedRunTask):
     def fits(self, rows: Sequence[Encoded]) -> bool:
         """Whether `rows` are one of `logits`' passes: packed first-fit into the windows of a shape
         (`pass_shapes`), as a run's windows pack them (`packing`)."""
-        return self._placed(rows, self._shape(rows)) is not None
+        plan = self.planned()
+        return all(plan.add(row) for row in rows)
+
+    def planned(self) -> "PassPlan":
+        """An empty pass, which takes rows one at a time while they fit (`PassPlan`): what a server
+        grows a pass by, each row placed once."""
+        return PassPlan(self)
 
     @functools.cached_property
     def pass_shapes(self) -> tuple[PassShape, ...]:
@@ -516,16 +523,12 @@ class Decide(SavedRunTask):
         `fits` refuses. First-fit opens a window only where those before it have no room, so the
         windows it uses at a length are the same however many it may: one placement over the most a
         length declares gives the fewest that hold them."""
+        plan = self.planned()
+        if all(plan.add(row) for row in rows):
+            return plan.shape()
         longest = max(len(row.tokens) for row in rows)
         # The layout refuses a row past its window (`_encoded`), which the last length is.
-        lengths = sorted({shape.length for shape in self.pass_shapes if shape.length >= longest})
-        for length in lengths:
-            sized = [shape for shape in self.pass_shapes if shape.length == length]
-            placed = self._placed(rows, sized[-1])
-            if placed is not None:
-                used = max(placed) + 1
-                return next(shape for shape in sized if shape.rows >= used)
-        return [shape for shape in self.pass_shapes if shape.length == lengths[-1]][-1]
+        return [shape for shape in self.pass_shapes if shape.length >= longest][-1]
 
     def packing(self, shape: PassShape, questions: int | None = None) -> Pack:
         """How a pass of `shape` packs its rows: first-fit into its windows, each holding whole rows within
@@ -567,28 +570,6 @@ class Decide(SavedRunTask):
             packing(replace(self.layout, max_len=shape.length), self._bounds[shape.length],
                     None if held is None else max(shape.length, held), trained=False), bins=shape.rows)
             for shape in self.pass_shapes}
-
-    def _placed(self, rows: Sequence[Encoded], shape: PassShape) -> list[int] | None:
-        """The window of `shape` each of `rows` goes to, in order (`dew.data.tokens.FirstFit`), or None
-        where they do not all fit its windows."""
-        from dew.data.packing import window_fields
-        from dew.data.tokens import FirstFit
-
-        pack = self.packing(shape, max(len(row.questions) for row in rows))
-        lengths, paired = window_fields(pack)
-        placement = FirstFit([lengths[name] for name in paired], shape.rows, pack.segments)
-        placed = []
-        for row in rows:
-            # A row's tokens, its questions along each field of theirs, and its context's tokens.
-            sizes = [len(row.tokens) if name == "tokens" else len(row.context or ()) if name == "context"
-                     else len(row.questions) for name in paired]
-            if any(size > lengths[name] for size, name in zip(sizes, paired, strict=True)):
-                return None
-            window = placement.place(sizes)
-            if window is None:
-                return None
-            placed.append(window)
-        return placed
 
     def compile_scoring(self, variables: Variables | None = None) -> tuple[PassShape, ...]:
         """Compile every text pass's program (`pass_shapes`) over `variables` (the task's own by
@@ -692,8 +673,10 @@ class Decide(SavedRunTask):
         found: dict[int, np.ndarray] = {}
         start = 0
         while start < len(order):
+            plan = self.planned()
+            plan.add(rows[order[start]])
             stop = start + 1
-            while stop < len(order) and self.fits([rows[index] for index in order[start:stop + 1]]):
+            while stop < len(order) and plan.add(rows[order[stop]]):
                 stop += 1
             chosen = order[start:stop]
             found.update(zip(chosen, self.scored([rows[index] for index in chosen]), strict=True))
@@ -996,6 +979,93 @@ EXTENSIONS = ("images", "context")
 """The request fields `Decide.systemone` reads beyond Jev's, which `strict` drops."""
 
 
+@dataclass
+class _Placing:
+    """A length's first-fit placement of a pass's rows (`PassPlan`): the placement over its most windows,
+    each field's room, the fields a row is counted along, and each row's window so far."""
+
+    placement: "FirstFit"
+    rooms: dict[str, int]
+    paired: tuple[str, ...]
+    windows: list[int] = field(default_factory=list)
+
+    def place(self, row: Encoded) -> int | None:
+        """The window `row` goes to, which takes it, or None where none has room."""
+        # A row's tokens, its questions along each field of theirs, and its context's tokens.
+        sizes = [len(row.tokens) if name == "tokens" else len(row.context or ()) if name == "context"
+                 else len(row.questions) for name in self.paired]
+        if any(size > self.rooms[name] for size, name in zip(sizes, self.paired, strict=True)):
+            return None
+        window = self.placement.place(sizes)
+        if window is not None:
+            self.windows.append(window)
+        return window
+
+
+class PassPlan:
+    """A pass growing a row at a time (`Decide.planned`): each length a pass may take (`pass_shapes`)
+    keeps its first-fit placement of the rows so far over its most windows, so a row is placed once at
+    each length rather than every row replayed for each one more (ledger 2424). A length drops out when
+    a row is longer than its windows or finds no room in them; first-fit opens a window only where those
+    before it have no room, so no later row brings it back. The pass holds its rows while a length
+    does. A row that asks more questions than a length's windows hold widens them (`Decide.packing`),
+    its rows placed again; a row refused ends the plan, which takes none after it."""
+
+    def __init__(self, decide: Decide):
+        self.decide = decide
+        self.rows: list[Encoded] = []
+        self.questions = 0
+        self.alive = sorted({shape.length for shape in decide.pass_shapes})
+        self.placing: dict[int, _Placing] = {}
+
+    def _placed(self, length: int) -> _Placing | None:
+        """A fresh placement of the pass's rows at `length`, over its most windows and the pass's
+        questions, or None where they do not all fit."""
+        from dew.data.packing import window_fields
+        from dew.data.tokens import FirstFit
+
+        most = [shape for shape in self.decide.pass_shapes if shape.length == length][-1]
+        pack = self.decide.packing(most, self.questions)
+        rooms, paired = window_fields(pack)
+        placement = FirstFit([rooms[name] for name in paired], pack.bins, pack.segments)
+        placing = _Placing(placement, rooms, paired)
+        return placing if all(placing.place(row) is not None for row in self.rows) else None
+
+    def add(self, row: Encoded) -> bool:
+        """Take `row` into the pass where a length still holds every row so far and it; False where none
+        does, which ends the plan."""
+        if len(row.questions) > self.questions:
+            self.questions = len(row.questions)
+            self.placing = {}
+        held = []
+        for length in self.alive:
+            if length < len(row.tokens):
+                continue
+            if length not in self.placing:
+                placed = self._placed(length)
+                if placed is None:
+                    continue
+                self.placing[length] = placed
+            if self.placing[length].place(row) is not None:
+                held.append(length)
+        self.alive = held
+        if held:
+            self.rows.append(row)
+        return bool(held)
+
+    def shape(self) -> PassShape:
+        """The pass's shape: of the shortest length that holds its rows, the fewest windows declared that
+        hold them."""
+        length = self.alive[0]
+        used = max(self.placing[length].windows) + 1
+        return next(shape for shape in self.decide.pass_shapes
+                    if shape.length == length and shape.rows >= used)
+
+    def windows(self) -> list[int]:
+        """Each row's window at the pass's shape (`shape`)."""
+        return list(self.placing[self.alive[0]].windows)
+
+
 @dataclass(frozen=True)
 class _Admitted:
     """A Jev body as `WireScoring` admitted it: its questions and its rows, laid out by the task."""
@@ -1010,6 +1080,37 @@ class _Row:
 
     encoded: Encoded
     media: Images | None = None
+
+
+class _WirePlan:
+    """A wire pass growing a row at a time (`WireScoring.planned`): rows of text packed as `Decide`'s
+    passes pack them (`PassPlan`); rows of images, which run a row a batch row (`Decide._seen_pass`),
+    all of one length and their images alike, as many as one row a window of their length's most
+    windows (`pass_shapes`)."""
+
+    def __init__(self, decide: Decide):
+        self.decide = decide
+        self.text = decide.planned()
+        self.seen: list[_Row] = []
+        self.taken = 0
+
+    def add(self, row: _Row) -> bool:
+        if row.media is None:
+            if self.seen:
+                return False
+            self.taken += 1
+            return self.text.add(row.encoded)
+        if self.taken:
+            return False
+        first = self.seen[0] if self.seen else row
+        assert first.media is not None
+        length = len(first.encoded.tokens)
+        most = max((shape.rows for shape in self.decide.pass_shapes if shape.length >= length), default=1)
+        if (len(row.encoded.tokens) != length or not first.media.alike(row.media)
+                or len(self.seen) >= most):
+            return False
+        self.seen.append(row)
+        return True
 
 
 @dataclass(frozen=True)
@@ -1054,13 +1155,8 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
         self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
         return scoring.Scored(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
 
-    def fits(self, rows: Sequence[_Row]) -> bool:
-        seen = [row.media for row in rows if row.media is not None]
-        if not seen:
-            return self.decide.fits([row.encoded for row in rows])
-        encoded = [row.encoded for row in rows]
-        return (len(seen) == len(rows) and len({len(row.tokens) for row in encoded}) == 1
-                and all(seen[0].alike(media) for media in seen) and self.decide.fits(encoded))
+    def planned(self) -> "_WirePlan":
+        return _WirePlan(self.decide)
 
     def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
         # The server chose these rows as one pass (`fits`), so they run as one, over the weights it

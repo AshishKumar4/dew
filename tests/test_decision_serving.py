@@ -85,8 +85,8 @@ class Counted:
             self.all_in.set()
         return scored
 
-    def fits(self, rows):
-        return self.task.fits(rows)
+    def planned(self):
+        return self.task.planned()
 
     def forward(self, variables, rows):
         if not self.calls:

@@ -206,9 +206,8 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
     # Windows of the encoder's 256 positions, which hold several of these rows each.
     task = replace(decide, layout=replace(decide.layout, max_len=256))
     rows = every_case_row(task)
-    shape = task._shape(rows)
-    placed = task._placed(rows, shape)
-    assert placed is not None and len(set(placed)) < len(rows)
+    plan = task.planned()
+    assert all(plan.add(row) for row in rows) and len(set(plan.windows())) < len(rows)
     wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
                    layout=task.layout)
 

@@ -45,6 +45,15 @@ class Scored[Row, Payload]:
 
 
 @runtime_checkable
+class PassPlan[Row](Protocol):
+    """A pass a server grows a row at a time (`Scoring.planned`)."""
+
+    def add(self, row: Row) -> bool:
+        """Take `row` into the pass where it holds every row so far and it; False where not, which ends
+        the plan: it takes no row after."""
+        ...
+
+
 class Scoring[Request, Row, Payload, Output, Answer](Protocol):
     """A task served by forward passes over its requests' rows (`ScoringServer`). It holds no weights
     of its own: the server holds them resident, and hands them to every pass, so a task and the weights
@@ -55,9 +64,9 @@ class Scoring[Request, Row, Payload, Output, Answer](Protocol):
         refuses."""
         ...
 
-    def fits(self, rows: Sequence[Row]) -> bool:
-        """Whether `rows` are one pass of the task's: within its budget, and alike enough for one
-        compiled forward."""
+    def planned(self) -> PassPlan[Row]:
+        """An empty pass of the task's, which takes rows one at a time while they are one pass: within
+        its budget, and alike enough for one compiled forward."""
         ...
 
     def forward(self, variables: Variables, rows: Sequence[Row]) -> Sequence[Output]:
@@ -194,6 +203,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         from requests of one pair, a request's rows in order; at most `rows` requests looked at, a
         cancelled one dropped as it is looked at."""
         chosen: list[tuple[_Request[Row, Payload, Output, Answer], int]] = []
+        plan: PassPlan[Row] | None = None
         now = time.perf_counter()
         # The bounded prefix alone: a turn looks at no more than `rows` requests of the queue.
         for request in list(itertools.islice(self._queue, self.rows)):
@@ -201,8 +211,10 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
                 break
             task = request.served[0]
             while request.taken < len(request.scored.rows):
-                rows = [kept.scored.rows[index] for kept, index in chosen]
-                if chosen and not task.fits([*rows, request.scored.rows[request.taken]]):
+                # The pass grows a row at a time, each placed once (`Scoring.planned`); its first row
+                # runs whatever the plan says of it, a pass of its own.
+                plan = task.planned() if plan is None else plan
+                if not plan.add(request.scored.rows[request.taken]) and chosen:
                     return chosen
                 # A request runs from its first row's pass on; one cancelled before it leaves the queue.
                 if request.taken == 0:

@@ -247,7 +247,8 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
         return [row for picture in pictures
                 for row in reading.admit({**CASES["quickstart"], "state": state, "images": [picture]}).rows]
 
-    assert task.fits(rows_of(task, 0))
+    plan = task.planned()
+    assert all(plan.add(row) for row in rows_of(task, 0))
 
     forwards = {}
 
