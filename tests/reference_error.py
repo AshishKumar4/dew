@@ -68,7 +68,7 @@ import functools
 import hashlib
 import itertools
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -1100,7 +1100,7 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
 
 
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
-           library_fn=None, library_leaves: Sequence[str] = ()) -> _Draws:
+           library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = ()):
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -1110,10 +1110,12 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     orders, measured rows of float64 zero included, and its values finite at every one; its errors and
     its rows of float64 zero are the draw's own order's. With `library_fn`, the library arm runs beside
     the reference on Dew's own inputs, held to Dew's truth, and the draws are judged against the larger
-    of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once."""
+    of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once. With
+    `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
+    truth evaluated once for them all: the reference's draws, then each further reference's, a list."""
     if orders is not None and getattr(reference_fn, "recorded", False):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
-    arms = [reference_fn] + ([] if library_fn is None else [library_fn])
+    arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
     mine, theirs, worst, zero_rows, finite, names, widths = [], [[] for _ in arms], [[] for _ in arms], \
         [[] for _ in arms], [[] for _ in arms], None, None
 
@@ -1161,7 +1163,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     drawn = [_Draws(names, np.asarray(mine), np.asarray(theirs[at_arm]),
                     np.asarray(worst[at_arm]).reshape(len(mine), -1, 2), zero_rows[at_arm],
                     np.asarray(finite[at_arm]), widths) for at_arm in range(len(arms))]
-    return drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
+    first = drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
+    return [first, *drawn[len(arms) - len(also):]] if also else first
 
 
 def _leaf_paths(tree) -> list[str]:
@@ -1393,7 +1396,7 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None, library_fn=None, library_row: int | None = None,
-                    library_leaves: Sequence[str] = ()) -> None:
+                    library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1442,6 +1445,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (`library_leaves`, by their paths; `_Draws.against_larger`). Every other leaf, and every other rule,
     is as above; a site without it is judged against the reference alone.
 
+    `also` names further references Dew is held to on the same draws, each judged by its own check 1
+    as the reference is (its label `label`, against its name), Dew and the truth evaluated once a draw
+    for them all (`_drawn`): one Dew arm against several references, the truth `truth_fn` (which a site
+    with several references names). Each compiles paired with Dew's arm (`_arms`), and a plain Dew arm,
+    whose compilation its pairing decides, takes references of one kind, plain or `as_given`.
+
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
@@ -1453,24 +1462,43 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     if (library_fn is None) != (library_row is None) or (library_fn is None) != (not library_leaves):
         raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
                          f"the leaves it covers")
-    _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]))
+    also = dict(also or {})
+    mixed = not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in also.values())
+    if also and (truth_fn is None or mixed):
+        raise ValueError(f"{label}: further references name the truth, and beside a plain Dew arm each is "
+                         f"of the reference's kind, plain or as given, so one compilation of Dew's pairs "
+                         f"with all")
+    _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
+                       *also.values())
+    further = [_arms(dew_fn, fn)[1] for fn in also.values()]
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
     library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
     truth_fn = _truth_program(truth_fn)
+    # Each range's draws, every reference's, computed once for the stages of them all.
+    ranges: dict[tuple[int, int], list[_Draws]] = {}
 
-    def drawn(start, stop):
-        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
-                       library_fn=library_fn, library_leaves=library_leaves)
-        narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
-                            if width in NARROW_FACTORS]
-        return draws
+    def drawn_for(index: int):
+        def drawn(start, stop):
+            if (start, stop) not in ranges:
+                draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
+                               library_fn=library_fn, library_leaves=library_leaves, also=further)
+                ranges[start, stop] = draws if further else [draws]
+                narrow_leaves[:] = [name for name, width in zip(ranges[start, stop][0].names,
+                                                                ranges[start, stop][0].widths, strict=True)
+                                    if width in NARROW_FACTORS]
+            return ranges[start, stop][index]
+        return drawn
 
-    over, unresolved, stage = _staged(drawn, seeds, label)
-    _logged(label, stage, _verdict(over, unresolved), narrow_leaves)
-    if over:
-        raise GateFailure(over + unresolved)
-    if unresolved:
-        raise Inconclusive(unresolved)
+    overs, unresolveds = [], []
+    for index, named in enumerate([label, *(f"{label}, against {name}" for name in also)]):
+        over, unresolved, stage = _staged(drawn_for(index), seeds, named)
+        _logged(named, stage, _verdict(over, unresolved), narrow_leaves)
+        overs += over
+        unresolveds += unresolved
+    if overs:
+        raise GateFailure(overs + unresolveds)
+    if unresolveds:
+        raise Inconclusive(unresolveds)
 
 
 def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:
