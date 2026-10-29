@@ -7,6 +7,7 @@ import pathlib
 import queue
 import statistics
 import sys
+import threading
 import time
 import urllib.request
 
@@ -17,7 +18,8 @@ from shared_bridge import OOM_PROBE, load, processes
 from websockets.sync.client import connect
 
 CHANNELS = {}
-"""Each context's gateway channel, held open from its create to its delete (`created`, `deleted`)."""
+"""Each context's gateway channel and the reader that drains it, held from its create to its delete
+(`created`, `deleted`)."""
 
 
 def dump_processes():
@@ -34,14 +36,27 @@ def created(name):
     here waits while the others are measured."""
     kernel = request("/api/kernels", {"name": name})
     token = pathlib.Path("/run/dew/gateway-token").read_text()
-    CHANNELS[kernel["id"]] = connect(f"ws://127.0.0.1:8890/api/kernels/{kernel['id']}/channels",
-                                     additional_headers={"Authorization": "token " + token}, max_queue=None)
+    channel = connect(f"ws://127.0.0.1:8890/api/kernels/{kernel['id']}/channels",
+                      additional_headers={"Authorization": "token " + token})
+    # The gateway sends the channel the context's every output, which the IPC client reads already: each is
+    # read and dropped (`drained`), so none waits in memory and the connection stays read.
+    reader = threading.Thread(target=drained, args=(channel,), daemon=True)
+    reader.start()
+    CHANNELS[kernel["id"]] = channel, reader
     return kernel
+
+
+def drained(channel):
+    """Every message `channel` receives, read and dropped, until it closes."""
+    for _ in channel:
+        pass
 
 
 def deleted(identifier):
     """Context `identifier` deleted on the gateway, its channel closed (`created`)."""
-    CHANNELS.pop(identifier).close()
+    channel, reader = CHANNELS.pop(identifier)
+    channel.close()
+    reader.join()
     request("/api/kernels/" + identifier, method="DELETE")
 
 
