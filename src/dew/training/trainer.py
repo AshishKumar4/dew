@@ -1443,8 +1443,7 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                with run.held() if self.rollout is not None else contextlib.nullcontext():
-                    batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
+                batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval, run)
                 device, _ = split_fields(batch)
                 inputs = self.objective.inputs
                 if batch_signature(device) not in compiled and self.rollout is None and inputs is not None:
@@ -1824,10 +1823,9 @@ class Trainer(Generic[Loss, Effects]):
             self._take(plan, run, interval, state, unlogged=True)
             if checkpoints is not None and interval.resumable != current:
                 self._read_taken(run)
-                with run.held():
-                    run.other += self._saved_checkpoint(
-                        checkpoints, current, state, position, interval,
-                        training_best=not plan.validation and not plan.best, control=run.stop_control)
+                run.other += self._saved_checkpoint(
+                    checkpoints, current, state, position, interval,
+                    training_best=not plan.validation and not plan.best, run=run)
             if paused:
                 run.paused = current
             else:
@@ -1885,9 +1883,8 @@ class Trainer(Generic[Loss, Effects]):
                     batch = agreed_next("cooldown read", branched.train)
                     if batch is None:
                         break
-                    with branched.held() if self.rollout is not None else contextlib.nullcontext():
-                        batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked,
-                                           counted)
+                    batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
+                                       branched)
                     device, _ = split_fields(batch)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
@@ -1978,22 +1975,17 @@ class Trainer(Generic[Loss, Effects]):
         if (checkpoints is not None and interval.last_saved != current
                 and (run.checkpoint_due or candidate or (final and plan.checkpoint_final) or full)):
             self._read_taken(run)
-            # A save of weights alone is no step to resume from, so not the run's last (`FitRun.ends_here`),
-            # which may read the stream ahead: decided before its placements are held.
-            weights_only = (not run.checkpoint_due and not run.stopped and not full
-                            and not (final and plan.checkpoint_final) and bool(winners)
-                            and all(rank.weights_only for rank in winners) and not run.ends_here(interval))
-            with run.held():
-                run.other += self._saved_checkpoint(
-                    checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
-                    training_best=not plan.validation and not plan.best, control=run.stop_control,
-                    weights_only=weights_only)
+            # A save of weights alone is no step to resume from, so not the run's last (`FitRun.ends_here`).
+            run.other += self._saved_checkpoint(
+                checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
+                training_best=not plan.validation and not plan.best, run=run,
+                weights_only=not run.checkpoint_due and not run.stopped and not full
+                and not (final and plan.checkpoint_final) and bool(winners)
+                and all(rank.weights_only for rank in winners) and not run.ends_here(interval))
             run.last_checkpoint = time.perf_counter()
         if run.local_due and checkpoints is not None and run.last_local_saved != current:
             self._read_taken(run)
-            with run.held():
-                run.other += self._saved_local_checkpoint(
-                    checkpoints, current, state, position, interval, control=run.stop_control)
+            run.other += self._saved_local_checkpoint(checkpoints, current, state, position, interval, run)
             run.last_local_saved = current
 
     def _wind_down(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
@@ -2064,7 +2056,7 @@ class Trainer(Generic[Loss, Effects]):
             if cut and checkpoints is not None and interval.resumable != current:
                 # Whatever the final-save policy, the step the branch resumes from is written whole.
                 run.other += self._saved_checkpoint(checkpoints, current, state, position, interval,
-                                                    training_best=False, control=run.stop_control)
+                                                    training_best=False, run=run)
             run.preempted = current if cut else None
         if plan.observe:
             plan.observe.last(current, state)
@@ -2242,15 +2234,14 @@ class Trainer(Generic[Loss, Effects]):
         scores: Mapping[str, float] | None = None,
         ranking: Sequence[Ranking] = (),
         training_best: bool = True,
-        control: dict | None = None,
+        run: FitRun,
         weights_only: bool = False,
     ) -> float:
-        """Write one checkpoint with the interval's mean loss, report it and
-        start the next interval.
+        """Write one checkpoint with the interval's mean loss and `run`'s stop control, its stream
+        placing nothing meanwhile (`FitRun.held`), report it and start the next interval.
 
-        Returns the seconds it took, the reading of the interval's loss
-        included: that read waits on the device, and the wait is time the
-        steps did not have."""
+        Returns the seconds it took, the reading of the interval's loss included: that read waits
+        on the device, and the wait is time the steps did not have."""
         paused = time.perf_counter()
         self._display.status("writing a checkpoint")
         metadata = dict(scores or {})
@@ -2260,10 +2251,11 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         write = functools.partial(
             checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-            ranking=ranking, control={**(control or {}), **interval.token_control},
+            ranking=ranking, control={**run.stop_control, **interval.token_control},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
             boxed=self._boxed_axes())
-        self._report(CheckpointRequested(checkpoints.directory), step, write)
+        with run.held():
+            self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
         self._display.status("")
         return time.perf_counter() - paused
@@ -2275,20 +2267,21 @@ class Trainer(Generic[Loss, Effects]):
         state: TrainState,
         position: bytes | None,
         interval: Interval,
-        *,
-        control: dict | None = None,
+        run: FitRun,
     ) -> float:
-        """Write one checkpoint to the local directory, and report it.
+        """Write one checkpoint to the local directory with `run`'s stop control, its stream placing
+        nothing meanwhile (`FitRun.held`), and report it.
 
-        Returns the seconds it took. The local copy carries no metadata; it
-        is the one a restarted node reads back, not the run's record."""
+        Returns the seconds it took. The local copy carries no metadata; it is the one a restarted
+        node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         write = functools.partial(
             checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
-            control={**(control or {}), **interval.token_control}, rung=self._checkpoint_rung(),
+            control={**run.stop_control, **interval.token_control}, rung=self._checkpoint_rung(),
             artifact=self._artifact(), boxed=self._boxed_axes())
-        self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
+        with run.held():
+            self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
         return time.perf_counter() - paused
 
