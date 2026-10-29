@@ -164,15 +164,11 @@ def loaded(copies, issued: jax.Array | bool = True) -> None:
     """Each `(view, ref, barrier)` copied whole into shared memory, every copy issued before any is
     awaited: issued where `issued` (a role loading `ref` for every role that shares it), awaited by every
     caller."""
-    def issue():
+    @pl.when(issued)
+    def _():
         for view, ref, barrier in copies:
             plgpu.copy_gmem_to_smem(view, ref, barrier)
 
-    if isinstance(issued, bool):
-        if issued:
-            issue()
-    else:
-        pl.when(issued)(issue)
     for _, _, barrier in copies:
         plgpu.barrier_wait(barrier)
 
