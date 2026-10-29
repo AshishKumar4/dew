@@ -46,7 +46,6 @@ from dew.decision.layout import (
     QUESTION_FIELDS,
     DecisionInputs,
     Encoded,
-    JointLayout,
     Laid,
     Layout,
     MarkerLayout,
@@ -183,6 +182,12 @@ class DecideSettings:
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
+    questions: int | None = None
+    """The most questions a row of the run's data holds (`Layout.row_questions`), which a pass of its
+    task pads each row to (`Budget.questions`); None where the run recorded none, as before it did."""
+    options: int | None = None
+    """The most options a question of the run's data lays out, a "none of the above" it adds included,
+    which a pass of its task pads each question to (`Budget.options`); None as `questions`."""
 
 
 @dataclass(frozen=True)
@@ -262,8 +267,10 @@ class Decide(SavedRunTask):
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
+        # Its passes pad to the widths the run trained at, so a server compiles their programs up front.
+        budget = Budget(questions=settings.questions, options=settings.options)
         return cls(model, variables, settings.layout, tokenizer_for(settings.tokenizer), settings.specials,
-                   name=str(epath.Path(directory).name), weights=weights, processor=processor)
+                   name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget)
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
@@ -301,11 +308,15 @@ class Decide(SavedRunTask):
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
                 f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
+        budget = from_record(Budget, _records.json_value(settings["budget"], "budget"))
+        # A width the saved budget leaves None is the run's recorded one (`DecideSettings.questions`).
+        widths = {name: getattr(task.budget if getattr(budget, name) is None else budget, name)
+                  for name in ("questions", "options")}
+        budget = replace(budget, **widths)
         return replace(task, weights=fitted,
                        calibration=from_record(Calibration, _records.json_value(settings["calibration"],
                                                                                "calibration")),
-                       budget=from_record(Budget, _records.json_value(settings["budget"], "budget")),
-                       name=_records.text(settings["name"], "name"))
+                       budget=budget, name=_records.text(settings["name"], "name"))
 
     @classmethod
     def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
@@ -317,25 +328,30 @@ class Decide(SavedRunTask):
 
         The runs are one task's: their recorded settings (`DecideSettings`: head, layout, tokenizer,
         special tokens, processor and context encoder) the same; a run whose settings differ is
-        refused (ValueError), naming them. The task's `weights` record each run's directory, step and
-        whether its average was read, so it is no one run's: `save` writes it to a directory of its own
-        as a run, which `from_run` and `dew.pipeline` then load, whatever its layout."""
+        refused (ValueError), naming them. The widths a pass pads to are no part of the weights: the
+        average's are the widest any run recorded, None where none recorded one. The task's `weights`
+        record each run's directory, step and whether its average was read, so it is no one run's:
+        `save` writes it to a directory of its own as a run, which `from_run` and `dew.pipeline` then
+        load, whatever its layout."""
         from dew.checkpoints import averaged_pinned
         from dew.inference.tasks import saved_settings
 
         pinned = [SavedRun.pinned(directory, step) for directory in runs]
         recorded = [run.record for run in pinned]
-        first = saved_settings(recorded[0], DecideSettings) if recorded else None
-        for directory, saved in zip(runs, recorded, strict=True):
-            settings = saved_settings(saved, DecideSettings)
-            differing = [entry.name for entry in fields(DecideSettings)
-                         if getattr(settings, entry.name) != getattr(first, entry.name)]
+        settings = [saved_settings(saved, DecideSettings) for saved in recorded]
+        padded = ("questions", "options")
+        for directory, own in zip(runs, settings, strict=True):
+            differing = [entry.name for entry in fields(DecideSettings) if entry.name not in padded
+                         and getattr(own, entry.name) != getattr(settings[0], entry.name)]
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
         average = averaged_pinned(pinned, ema=ema)
         task = cls._recorded(runs[0], recorded[0], average.model.build(), average.variables,
                              Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
+        widest = {name: max((width for own in settings if (width := getattr(own, name)) is not None),
+                            default=None) for name in padded}
+        task = replace(task, budget=replace(task.budget, **widest))
         return task if calibrate_on is None else task.calibrated(calibrate_on)
 
     def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
@@ -576,14 +592,17 @@ class Decide(SavedRunTask):
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
-        rows = with_context(self.layout.rows(self.tokenizer, self.specials, state, questions, media=media),
-                            self.tokenizer, context, self.context_length)
-        for row in rows:
+        laid = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
+        for row in laid:
             # A row whose declared budgets cut its options alike is answered as its release answers it,
             # the cut in its usage; training leaves such a row out (`Layout.refusal`).
             if not self.layout.fits(row):
                 raise Refused("unfit", f"the question needs {len(row.tokens)} tokens besides the state, more "
                                        f"than the maximum context length, max_len={self.layout.max_len}")
+            if self.layout.refusal(row, self.context_length) == "unfit":
+                raise Refused("unfit", f"the question needs {len(row.context or ())} context tokens, more "
+                                       f"than the {self.context_length} the backbone's cross-attention reads")
+        rows = with_context(laid, self.tokenizer, context, self.context_length)
         self.model.head.validate_rows(rows)
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
@@ -767,8 +786,7 @@ class Decide(SavedRunTask):
         scored = []
         segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch, segments, spans_in_context=isinstance(self.layout, JointLayout)
-                              and self.layout.schema_in_context)
+            inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])

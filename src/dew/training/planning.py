@@ -504,7 +504,7 @@ class FitSearch[LossT, EffectsT]:
     step's peak (a decoder's step on an A100 peaked at 8.427 GB either way, node receipt
     TL-a100-offload-1338-c); a run keeps them there by its layout (`Layout.host`) alone. A remat policy
     that keeps its residuals in pinned host memory ('minimal_offloaded') keeps as many on the device as
-    'full' does (`test_model_protocols`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
+    'full' does (`tests/test_remat_rungs.py`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
     132,296), so it fits nowhere 'full' does not, and a run takes it by its own remat."""
     lower: Callable[[int, bool], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]

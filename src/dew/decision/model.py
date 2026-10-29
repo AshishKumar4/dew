@@ -136,21 +136,20 @@ class DecisionModel(HeadedModel):
         """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
         states, spanned = self._read(variables, inputs, media=media, train=train, rngs=rngs)
         head = thaw(part(variables, "head"))
+        # The questions' spans are pooled from the pass that holds them: the context's, where it holds
+        # them. A head that pools none reads a question in its context through the cross-attention alone.
+        pooled = {"spanned": spanned} if spanned is not None and self.head.pools_spans else {}
         if self.head.reads_labels:
-            if spanned is not None:
-                raise TypeError("a readout of labels reads its questions in the row, not in its context")
+            # A readout of labels reads its answer cue in the row.
             labels = self.head.tied_labels()
             tied = None if labels is None else self.readout_logits(variables, states, inputs, labels)
             # A head drawn from the vocabulary rows reads no table after its draw.
             table = None if self.head.draws_from_rows else self.output_table(variables)
-            logits = _array(self.head.apply(head, states, inputs, table, train=train, tied=tied, rngs=rngs))
+            logits = _array(self.head.apply(head, states, inputs, table, train=train, tied=tied, rngs=rngs,
+                                            **pooled))
         else:
             table = self.table(variables) if self.head.reads_table else None
-            # The questions' spans are pooled from the pass that holds them: the context's, where it
-            # holds the schema.
-            logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs)
-                            if spanned is None else
-                            self.head.apply(head, states, inputs, table, train, spanned, rngs=rngs))
+            logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs, **pooled))
         return jnp.where(inputs.options, logits, -jnp.inf)
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
