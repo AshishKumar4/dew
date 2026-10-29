@@ -75,9 +75,11 @@ and fp32 at its own count, whose per-pass cache qualifies the float64 truth as v
 ORDERS_SEED = 11
 ORDERS = 52
 """The orders a batch holds."""
-BATCHES = 4
-"""The batches of `ORDERS` orders a run is recorded under, the first's first the identity: check 1's
-seeds, as many as its declared count and redraw read (`summary`)."""
+BATCHES = {**dict.fromkeys(RUNS, 4), (2, 'last_loop', 'float32'): 8}
+"""The batches of `ORDERS` orders each run is recorded under, the first's first the identity: check 1's
+seeds, as many as its declared count and redraw read (`summary`). The fp32 last-loop run's reference
+compared with itself resolves within none of 4 batches' 208 orders (its TF32 window rows' error spreads
+to 7.7 times its median), so it is recorded under 8."""
 RECORDING = FIXTURE / 'recording.npz'
 """What the release test reads: each run's evidence over its seeds, its tokens and the provenance."""
 def tag(key: str) -> str:
@@ -359,14 +361,14 @@ def model_orders(directory: Path) -> None:
         window = slice(-len(probe[f'{key}/window_generated']), None)
         model, rows = model_code(config, tensors, loops, mode, getattr(torch, dtype), tf32=dtype == 'float32')
         truth = np.load(directory / f'upstream-{tag(key)}.npy')[window]
-        unpermuted = None
-        for batch in range(BATCHES):
+        unpermuted = permute(model, config, symmetry(config, 0, 0))
+        for batch in range(BATCHES[(loops, mode, dtype)]):
+            if (directory / f'model-rows-{tag(key)}-{batch}.npy').exists():
+                continue
             distances = np.zeros((ORDERS, len(truth)))
             for index in range(ORDERS):
                 drawn = symmetry(config, batch, index)
                 seen = permute(model, config, drawn)
-                if unpermuted is None:
-                    unpermuted = seen
                 assert np.array_equal(seen, unpermuted[drawn['residual']]), (
                     f'{key}: the model holds no order {batch}/{index}')
                 found = rows(probe['window'], probe[f'{key}/window_generated'], prompt_rows=False)
@@ -498,7 +500,11 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
     config = json.loads((FIXTURE / 'config.json').read_text())
     key = name(loops, mode, dtype)
     truth = np.load(directory / f'upstream-{tag(key)}.npy')
-    recorded = np.load(directory / f'{tag(key)}.npz')
+    # A batch already written stands: a rerun records the batches it lacks.
+    missing = [batch for batch in range(BATCHES[(loops, mode, dtype)])
+               if not (directory / f'engine-rows-{tag(key)}-{batch}.npy').exists()]
+    if not missing:
+        return
     llm = engine(loops, mode, dtype, logits_processors=['dory_vllm_forcing:Forced'])
 
     def rows() -> np.ndarray:
@@ -510,18 +516,17 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
             found.append(scores)
         return np.concatenate(found)
 
-    unpermuted = None
-    for batch in range(BATCHES):
+    (unpermuted,) = llm.apply_model(functools.partial(permute, config=config, drawn=symmetry(config, 0, 0)))
+    for batch in missing:
         distances = np.zeros((ORDERS, len(truth)))
         for index in range(ORDERS):
             drawn = symmetry(config, batch, index)
             (seen,) = llm.apply_model(functools.partial(permute, config=config, drawn=drawn))
-            if unpermuted is None:
-                unpermuted = seen
             assert np.array_equal(seen, unpermuted[drawn['residual']]), (
                 f'{key}: the engine holds no order {batch}/{index}')
             found = rows()
             if batch == index == 0:
+                recorded = np.load(directory / f'{tag(key)}.npz')
                 identity = np.concatenate([recorded[f'{part}_logprobs'] for part, _, _ in PARTS])
                 assert np.array_equal(found, identity), f'{key}: order 0 is not the recorded run'
             distances[index] = np.sqrt(np.mean(np.square(found - truth), axis=1))
@@ -533,13 +538,13 @@ def orders_run(directory: Path, loops: int, mode: str, dtype: str) -> None:
 def sums(directory: Path) -> None:
     """Each run's reference rows, gathered from the stages: the engine's (`orders_run`), and on a
     `SHARED` run's window rows the model code's (`model_orders`), each row's distance from float64 under
-    each order, `rows-{run}-vllm.npy` `[BATCHES, ORDERS, rows]`."""
+    each order, `rows-{run}-vllm.npy` `[BATCHES[run], ORDERS, rows]`."""
     probe = np.load(directory / 'probe.npz')
     for run in RUNS:
         key = name(*run)
         window = slice(-len(probe[f'{key}/window_generated']), None)
         batches = []
-        for batch in range(BATCHES):
+        for batch in range(BATCHES[run]):
             found = np.load(directory / f'engine-rows-{tag(key)}-{batch}.npy')
             if run in SHARED:
                 found[:, window] = np.load(directory / f'model-rows-{tag(key)}-{batch}.npy')
@@ -555,8 +560,8 @@ def invariance(directory: Path) -> None:
     """The evidence each order is an exact symmetry: vLLM's own model code in float64 (`model_code`,
     under tools/torch_precision.py's `float64`) on the sentence's prompt under every order of every
     batch (`symmetry`, `permute`), each order's largest distance from the identity's rows over their
-    largest magnitude, which float64 rounding alone moves, `invariance-{loops}.npy` `[BATCHES, ORDERS]`
-    float64 for each loop count."""
+    largest magnitude, which float64 rounding alone moves, `invariance-{loops}.npy` `[batches, ORDERS]`
+    float64 for each loop count, as many batches as any run is recorded under."""
     import torch
     from torch_precision import float64
 
@@ -566,8 +571,9 @@ def invariance(directory: Path) -> None:
         for loops in LOOPS:
             model, rows = model_code(config, tensors, loops, 'per_loop', torch.float64)
             identity = rows(probe['sentence'], probe['sentence'][:0], prompt_rows=True)
-            scale, apart = float(np.max(np.abs(identity))), np.zeros((BATCHES, ORDERS))
-            for batch in range(BATCHES):
+            batches = max(BATCHES.values())
+            scale, apart = float(np.max(np.abs(identity))), np.zeros((batches, ORDERS))
+            for batch in range(batches):
                 for index in range(ORDERS):
                     permute(model, config, symmetry(config, batch, index))
                     found = rows(probe['sentence'], probe['sentence'][:0], prompt_rows=True)
@@ -614,7 +620,8 @@ def summary(directory: Path) -> None:
         key, label = name(*run), site(*run)
         truth = {'log_probabilities': np.load(directory / f'upstream-{tag(key)}.npy')}
         rows = np.load(directory / f'rows-{tag(key)}-vllm.npy')
-        # The engine's sampler takes its log-probabilities in float32 at either dtype.
+        # Seed `batch * ORDERS + index`, every batch the run is recorded under. The engine's sampler
+        # takes its log-probabilities in float32 at either dtype.
         arrays.update(record_distances(label, lambda seed: symmetry(config, *divmod(seed, ORDERS)),
                                        {'log_probabilities': rows.reshape(-1, rows.shape[-1])},
                                        lambda seed, truth=truth: truth, {'log_probabilities': 'float32'}))
