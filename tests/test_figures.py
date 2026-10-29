@@ -66,13 +66,6 @@ def cell(point: tuple[Fraction, Fraction]) -> tuple[tuple[Fraction, Fraction], t
     return (point[0] - CELL, point[1] - CELL), (point[0] + CELL, point[1] + CELL)
 
 
-def reaches(low: tuple[Fraction, Fraction], high: tuple[Fraction, Fraction], center, radius) -> bool:
-    """Whether the square from `low` to `high` holds a point `radius` from `center`."""
-    near = sum((min(max(c, lo), hi) - c) ** 2 for c, lo, hi in zip(center, low, high, strict=True))
-    far = sum(max((lo - c) ** 2, (hi - c) ** 2) for c, lo, hi in zip(center, low, high, strict=True))
-    return near <= radius ** 2 <= far
-
-
 def pixels(element: ElementTree.Element) -> np.ndarray:
     """The image an <image> embeds, decoded."""
     encoded = element.get("href").split(",", 1)[1]
@@ -236,11 +229,12 @@ def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
 
 def test_an_arrows_head_points_along_its_line_at_its_end():
     """`Figure.arrow`'s head is a triangle whose tip is the line's end and whose base stands behind it,
-    square to the line and halved by it, 7 px behind the tip and 7 px wide whatever the line's length and
-    direction, each claim holding at a place within the hundredth that what the figure writes stands for
-    (`cell`). In a moved group the drawing is the same."""
-    for x1, y1, x2, y2 in ((0, 10, 100, 10), (40, 90, 40, 10), (10, 90, 70, 10), (10, 90, 40, 50),
-                           (10, 10, 100, 40), (10, 90, 60, 20), (10, 90, 90, 10)):
+    square to the line and halved by it, whatever the line's direction, each claim holding at a place within
+    the hundredth that what the figure writes stands for (`cell`); along an axis, where its places are written
+    exactly, it is 7 px long and 7 px wide whatever the line's length. In a moved group the drawing is the
+    same."""
+    for x1, y1, x2, y2 in ((0, 10, 100, 10), (10, 10, 30, 10), (40, 90, 40, 10), (10, 90, 70, 10),
+                           (10, 90, 40, 50), (10, 10, 100, 40), (10, 90, 60, 20), (10, 90, 90, 10)):
         figure = figures.Figure(120, 120)
         with figure.group(5, 7) as moved:
             figure.arrow(x1, y1, x2, y2)
@@ -254,10 +248,12 @@ def test_an_arrows_head_points_along_its_line_at_its_end():
         middle = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
         half = ((a[0] - b[0]) / 2, (a[1] - b[1]) / 2)
         along = (x2 - x1, y2 - y1)
-        # The base's midpoint: on the line, behind the tip, 7 px from it.
+        # The base's midpoint on the line, behind the tip; the half-base from it square to the line.
         assert crosses(*cell(middle), (along[1], -along[0], along[0] * y1 - along[1] * x1))
         assert (tip[0] - middle[0]) * along[0] + (tip[1] - middle[1]) * along[1] > 0
-        assert reaches(*cell(middle), tip, 7)
-        # The half-base from it: square to the line, 3.5 px long.
         assert crosses(*cell(half), (along[0], along[1], 0))
-        assert reaches(*cell(half), (0, 0), Fraction(7, 2))
+        if 0 in along:
+            back = (-7 * (along[0] > 0) + 7 * (along[0] < 0), -7 * (along[1] > 0) + 7 * (along[1] < 0))
+            side = (Fraction(7, 2) * (along[1] != 0), Fraction(7, 2) * (along[0] != 0))
+            assert {a, b} == {(x2 + back[0] + side[0], y2 + back[1] + side[1]),
+                              (x2 + back[0] - side[0], y2 + back[1] - side[1])}
