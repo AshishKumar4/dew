@@ -255,9 +255,9 @@ class LoRA:
         return adapter
 
     def resolved(self) -> LoRA:
-        """This spec with a Hub `source` named at the commit the Hub resolves it to, as a run records
-        it, the answer recorded so the same run resolves it offline (`hub_answer`); a local source, a
-        source named at a commit, or none, as it is."""
+        """This spec with a Hub `source` at the commit its revision resolves to now
+        (`SourceReference.pinned`; offline the commit the cache holds), as a run records it; a local
+        source, or none, as it is."""
         return self if self.source is None else dataclasses.replace(self, source=_pinned(self.source))
 
     def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,

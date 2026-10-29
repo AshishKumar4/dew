@@ -189,8 +189,19 @@ class LMRunConfig(DecoderRunConfig):
         return Samples(prompt=tokenizer.encode(self.prompt or "\n"), max_new_tokens=self.max_new_tokens,
                        sampling=self.sampling, decode=tokenizer.decode)
 
+    def pinned(self) -> LMRunConfig:
+        """This run with its Hub sources at their commits (`RunConfig.pinned`), `pretrained` among them
+        (`SourceReference.pinned`)."""
+        from dew.interop.sources import SourceReference
+
+        run = super().pinned()
+        if self.pretrained is None:
+            return run
+        pretrained = SourceReference.parse(self.pretrained).pinned().spelled()
+        return run if pretrained == self.pretrained else dataclasses.replace(run, pretrained=pretrained)
+
     def pretrained_source(self, written: str, vocab_size: int, context: int):
-        """The bundle `pretrained` names, and this run with it pinned to the commit it was read at.
+        """The bundle `pretrained` names, at the commit the run pinned it to (`pinned`), and this run.
 
         The checkpoint decides every architecture field, so the model flags
         may say only how far the KV cache reaches, the compute dtype and the
@@ -233,8 +244,7 @@ class LMRunConfig(DecoderRunConfig):
         if loaded.model.vocab_size < vocab_size:
             raise ValueError(f"{self.pretrained} has room for {loaded.model.vocab_size} ids and the token "
                              f"files use {vocab_size}")
-        pinned = reference.name if loaded.revision is None else f"{reference.name}@{loaded.revision}"
-        return loaded, dataclasses.replace(self, pretrained=pinned)
+        return loaded, self
 
     def masked_objective(self, model, fields, variables, source=None):
         """MDLM over a bidirectional model, its mask id from the model's fields.
