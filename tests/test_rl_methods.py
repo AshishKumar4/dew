@@ -14,9 +14,11 @@ import pytest
 from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
 from rl_support import TinyHead
 
+from dew.config import ObjectiveConfig
+from dew.config.lm import PromptRollout
 from dew.objectives.rl import RolloutScheduler, Synchronous
 from dew.objectives.rl.grpo import _Terms
-from dew.objectives.rl.methods import METHODS, method
+from dew.objectives.rl.methods import method
 from dew.objectives.rl.scheduler import scored_rows
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
@@ -74,11 +76,23 @@ SPANS = [(row, slice(start, start + length)) for row, lengths in enumerate(LENGT
 """Each session's token positions, `(row, columns)`, the same in every draw."""
 
 
+def composed(name, model, seq_len, *, max_new_tokens=8, overlong_cache=None, **fields):
+    """The method's objective over `model` and its scheduler's settings as a run composes them: a rollout
+    naming it (`PromptRollout.method`), whose settings the run derives into the objective's
+    (`ObjectiveConfig.build`, refusing `fields` the method fixes) and its scheduler's
+    (`PromptRollout.scheduler_settings`)."""
+    rollout = PromptRollout(reward="rl_support:completion_length", method=name, max_new_tokens=max_new_tokens,
+                            overlong_cache=overlong_cache)
+    objective = ObjectiveConfig("grpo", fields).build(model=model, seq_len=seq_len,
+                                                       **rollout.objective_settings())
+    return objective, rollout.scheduler_settings()
+
+
 def dew_term(name, **settings):
     """The method's loss term over a draw, its policy term (`GRPOObjective.policy_ratio`) and its
     reference penalty in the loss (`reference_penalty`, weighted by `beta`) as the loss adds them, and
     its gradient in the current log-probabilities."""
-    objective, _ = method(name).build(TinyHead(vocab_size=8), 7, max_new_tokens=8, **settings)
+    objective, _ = composed(name, TinyHead(vocab_size=8), 7, **settings)
 
     def term(policy, old, reference, advantage, mask, segments, weights):
         def value(current):
@@ -196,20 +210,22 @@ def test_each_method_is_its_papers_objective(name, formula, settings):
 def test_reinforce_pps_penalty_is_representable_where_its_value_is():
     """REINFORCE++'s k2 penalty, half a log-ratio's square, at a log-ratio of -2**64: 2**127, which float32
     holds, though the square alone would not."""
-    objective, _ = METHODS["reinforce_pp"].build(TinyHead(vocab_size=8), 7, max_new_tokens=8, beta=0.1)
+    objective, _ = composed("reinforce_pp", TinyHead(vocab_size=8), 7, beta=0.1)
     one = jnp.ones((1, 1), jnp.float32)
     penalty = objective.reference_penalty(jnp.full((1, 1), -2.0 ** 64, jnp.float32), 0 * one, one, one.sum())
     assert float(penalty.total) == 2.0 ** 127
 
 
 def test_a_method_fixes_its_composition_and_refuses_what_it_lacks():
-    """A method refuses an override of a part it fixes, a reference penalty where it has none (in the
-    loss or in the reward), and an unknown name."""
+    """A run's method refuses an objective argument of a part it fixes, a reference penalty where it has
+    none (in the loss or in the reward), an overlong window where it punishes no overlong response or
+    one past its budget, and an unknown name."""
     model = TinyHead(vocab_size=8)
     for name, override in (("dr_grpo", {"aggregation": "token-mean"}), ("gspo", {"beta": 0.1}),
-                           ("dapo", {"reward_kl": 0.1}), ("rloo", {"beta": 0.1})):
+                           ("dapo", {"reward_kl": 0.1}), ("rloo", {"beta": 0.1}),
+                           ("grpo", {"overlong_cache": 2}), ("dapo", {"overlong_cache": 9})):
         with pytest.raises(ValueError):
-            METHODS[name].build(model, 8, max_new_tokens=8, **override)
+            composed(name, model, 8, **override)
     with pytest.raises(ValueError):
         method("ppo-lite")
 
@@ -290,11 +306,12 @@ def per_session(packed, values):
 
 
 def test_dapo_admits_the_groups_whose_returns_vary_with_their_overlong_punishment():
-    """DAPO's rollout (`METHODS["dapo"].rollout`) over a batch of four tasks admitting two: a group whose
-    returns all agree is left out and the next task's group takes its place, the returns being what
-    the estimator compares, the verifier's reward with the step rewards a session's calls earned and the
-    soft overlong punishment (arXiv:2503.14476 equation 13) over its sampled ids alone, across its calls
-    and past its prompt's and the tool's ids, a truncated one trained on its reward. Equal terminal
+    """DAPO's rollout as a run composes it (`PromptRollout(method="dapo")`) over a batch of four tasks
+    admitting two: a group whose returns all agree is left out and the next task's group takes its
+    place, the returns being what the estimator compares, the verifier's reward with the step rewards
+    a session's calls earned and the soft overlong punishment (arXiv:2503.14476 equation 13) over its
+    sampled ids alone, across its calls and past its prompt's and the tool's ids, over the run's
+    overlong window (`overlong_cache`), a truncated one trained on its reward. Equal terminal
     rewards with unequal step rewards vary. The admitted ids hold their group's advantage of those
     returns, and the left-out and the surplus groups' ids are not packed."""
     budget, cache = 8, 4
@@ -308,8 +325,8 @@ def test_dapo_admits_the_groups_whose_returns_vary_with_their_overlong_punishmen
         # Varied, and past the two groups admitted.
         "3": [session(3, 0, 0.0, (2,)), session(3, 1, 1.0, (2,))],
     }
-    objective, rollout = METHODS["dapo"].build(TinyHead(vocab_size=VOCAB), 15, max_new_tokens=budget,
-                                               overlong_cache=cache)
+    objective, rollout = composed("dapo", TinyHead(vocab_size=VOCAB), 15, max_new_tokens=budget,
+                                  overlong_cache=cache)
     packed, scheduler, _ = scheduled(sessions, [0, 1, 2, 3], objective, groups=2, admit=2,
                                      truncation="score", **rollout)
 
@@ -334,7 +351,7 @@ def test_dapo_admits_the_groups_whose_returns_vary_with_their_overlong_punishmen
 def test_dapo_refuses_a_batch_none_of_whose_groups_vary():
     """A batch whose every group earned one return has nothing DAPO trains on: the call raises."""
     sessions = {"0": [session(0, 0, 1.0, (2,)), session(0, 1, 1.0, (2,))]}
-    objective, rollout = METHODS["dapo"].build(TinyHead(vocab_size=VOCAB), 15, max_new_tokens=8)
+    objective, rollout = composed("dapo", TinyHead(vocab_size=VOCAB), 15)
     with pytest.raises(RuntimeError):
         scheduled(sessions, [0], objective, groups=2, **rollout)
 
@@ -349,8 +366,7 @@ def test_rloo_pays_its_reference_penalty_in_the_reward_before_the_baseline():
     rewards = {(0, 0): 1.0, (0, 1): 0.0, (0, 2): 0.5, (1, 0): 0.25, (1, 1): 0.25, (1, 2): 1.0}
     sessions = {str(task): [session(task, sample, rewards[task, sample], (3, 2), raw=raws[task, sample])
                             for sample in range(3)] for task in range(2)}
-    objective, rollout = METHODS["rloo"].build(TinyHead(vocab_size=VOCAB), 15, max_new_tokens=8,
-                                               reward_kl=weight)
+    objective, rollout = composed("rloo", TinyHead(vocab_size=VOCAB), 15, reward_kl=weight)
     packed, _, state = scheduled(sessions, [0, 1], objective, groups=3, reference=objective, **rollout)
     # The reference's likelihood of each sampled id as the step scores the packed rows, and the
     # proximal policy's as they hold it (the calls' raw likelihoods).
