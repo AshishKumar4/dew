@@ -4,6 +4,8 @@ refused and the program lowered afresh, the launch's derivation taking its next 
 run keeps, its plan, its step compiled ahead and the executable it runs, is the program it lowered
 then. A program with no template launch compiles as jit compiles it."""
 
+import time
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -36,7 +38,11 @@ class Experts(nn.Module):
     """An MoE layer's paired SwiGLU up projection, each expert taking an equal share of the rows,
     through a launch whose register model misses (`_Uncounted`), and a trained scale over its outputs:
     the launch is the forward kernel alone, so the step differentiates the scale, not the launch. Its
-    initialization, traced for the host, draws the weights without launching it."""
+    initialization, traced for the host, draws the weights without launching it. `nonce`, added to the
+    rows, makes its step a program no compilation cache holds, whose compile runs ptxas and reports
+    what it finds: a cached program reports nothing."""
+
+    nonce: float = 0.0
 
     @nn.compact
     def __call__(self, x):
@@ -48,7 +54,7 @@ class Experts(nn.Module):
             return jnp.zeros((x.shape[0], WIDTH), jnp.bfloat16) * scale
         sizes = jnp.full((EXPERTS,), x.shape[0] // EXPERTS, jnp.int32)
         projected = _Uncounted()(
-            jax.lax.stop_gradient(x.astype(jnp.bfloat16)), gate, sizes, paired=up,
+            jax.lax.stop_gradient((x + self.nonce).astype(jnp.bfloat16)), gate, sizes, paired=up,
             hooks=grouped_matmul.Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16",
             trans_rhs=False, interpret=False)
         return projected * scale
@@ -58,8 +64,8 @@ def squared(outputs, batch):
     return jnp.square(outputs.astype(jnp.float32)).mean(axis=-1)
 
 
-def experts(mesh, ahead=None) -> Trainer:
-    return Trainer(Supervised(Experts(), squared, inputs=InputSpec(Field("x", (FEATURES,)))),
+def experts(mesh, nonce: float, ahead=None) -> Trainer:
+    return Trainer(Supervised(Experts(nonce), squared, inputs=InputSpec(Field("x", (FEATURES,)))),
                    optax.adam(1e-3), key=0, mesh=mesh, ahead=ahead)
 
 
@@ -67,22 +73,13 @@ BATCH = {"x": np.zeros((ROWS, FEATURES), np.float32)}
 
 
 @pytest.fixture
-def compiled_afresh():
-    """No persistent compilation cache for the test: a program the cache holds is fetched, runs no
-    ptxas and reports nothing, and a spill is seen at its compile alone (`report.compiled`). A run's
-    refusals are recorded beside the cache (`report.records`); a `refusals` scope keeps its own in
-    memory, beside programs an earlier test cached."""
-    cached = jax.config.jax_enable_compilation_cache
-    jax.config.update("jax_enable_compilation_cache", val=False)
-    try:
-        yield
-    finally:
-        jax.config.update("jax_enable_compilation_cache", val=cached)
+def nonce() -> float:
+    """A value no earlier run's step was compiled with (`Experts.nonce`)."""
+    return float(time.time_ns() % 10**9) / 10**12
 
 
 @lowers("sm90")
-@pytest.mark.usefixtures("compiled_afresh")
-def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config():
+def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(nonce):
     """A step compiled ahead for a compile-only H100 on this CPU, its launch's derived tile spilling at
     ptxas, is refused that tile and lowered once more at the next, the miss recorded (`report.misses`);
     the step it saves is that program and carries the refusal (`AheadOfTime.refusals`): a process that
@@ -90,7 +87,7 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config():
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     def compiled():
-        return compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1))), BATCH)
+        return compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1)), nonce), BATCH)
 
     with report.refusals():
         first = compiled()
@@ -105,8 +102,7 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config():
 
 @pytest.mark.gpu(reason="trains a step whose launch spills, and one compiled ahead, on this host's H100")
 @lowers("sm90")
-@pytest.mark.usefixtures("compiled_afresh")
-def test_a_run_steps_its_spilling_launch_down_and_one_handed_the_step_compiled_ahead_takes_it():
+def test_a_run_steps_its_spilling_launch_down_and_one_handed_the_step_compiled_ahead_takes_it(nonce):
     """On an H100, a run whose launch's derived tile spills steps it down once, the miss recorded, and
     trains (row 2384's proof); a run in a fresh process's registry handed that step compiled ahead
     refuses the compile's tile before it lowers (`FitSearch`), so it lowers the saved program and
@@ -116,13 +112,13 @@ def test_a_run_steps_its_spilling_launch_down_and_one_handed_the_step_compiled_a
 
     here = MeshSpec().build(jax.devices()[:1])
     with report.refusals():
-        state = experts(here).fit(BATCH, steps=1, log_every=1)
+        state = experts(here, nonce).fit(BATCH, steps=1, log_every=1)
         assert [miss.stepped for miss in report.misses()][:1] == [True]
     assert int(state.step) == 1
     with report.refusals():
-        ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1))), BATCH)
+        ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1)), -nonce), BATCH)
     with report.refusals():
-        run = experts(here, ahead=ahead)
+        run = experts(here, -nonce, ahead=ahead)
         state = run.fit(BATCH, steps=1, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
     assert int(state.step) == 1 and first["ahead"] is True
