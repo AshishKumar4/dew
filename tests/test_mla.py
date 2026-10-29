@@ -23,6 +23,7 @@ routed experts together, on the simulated mesh.
 
 import contextlib
 import functools
+import itertools
 import json
 import math
 from pathlib import Path
@@ -48,15 +49,17 @@ from reference_error import (
 from selection_margins import indexer_margins
 from tool_support import load
 
+from dew.batch import coordinates
 from dew.data.dataset import Loader
 from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import MixerCall
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache
-from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.mixer_base import MixerContext
+from dew.nn.mla import MLAMixer, MultiHeadLatentAttention
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import (
     LongRopeScaling,
@@ -67,6 +70,7 @@ from dew.nn.rope import (
     yarn_inv_freq,
     yarn_query_scale,
 )
+from dew.nn.visibility import prefix_groups
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, MeshSpec, Trainer
@@ -77,7 +81,7 @@ GENERATOR = load("mla_reference")
 """tools/mla_reference.py, whose configs and transformers classes build the reference blocks."""
 
 SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 8, "value columns": 8,
-         "yarn": 16}
+         "yarn": 16, "visibility": 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
 
@@ -634,3 +638,242 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
         model.init, jax.random.key(0), jnp.ones((1, 16), jnp.int32))
     shardings = trainer.layout.shardings(trainer.device_mesh, abstract)
     trainer.layout.check(abstract["params"], shardings["params"], trainer.device_mesh)
+
+
+# --------------------------------------------------------------------------
+# Dense MLA reads the shared attention core's visibility descriptors
+# --------------------------------------------------------------------------
+
+VIS_LENGTH = 12
+VIS_SLOTS = np.arange(VIS_LENGTH)
+VIS_CAUSAL = VIS_SLOTS[None, :] <= VIS_SLOTS[:, None]
+"""The keys causality keeps at `VIS_LENGTH`, written out here apart from Dew."""
+
+
+def visibility_module(**overrides) -> MultiHeadLatentAttention:
+    """A tiny dense latent attention on the reference kernel, for the descriptor scenarios."""
+    fields = {"emb_features": 16, "num_heads": 2, "max_seq_len": 32, "q_lora_rank": 8, "kv_lora_rank": 8,
+              "qk_nope_head_dim": 4, "qk_rope_head_dim": 4, "v_head_dim": 8, "attention_impl": "reference"}
+    return MultiHeadLatentAttention(**{**fields, **overrides})
+
+
+def kind_module(**context) -> MultiHeadLatentAttention:
+    """`visibility_module` as the `mla` kind builds it from a layer context (its window and chunk)."""
+    ctx = MixerContext(emb_features=16, num_heads=2, num_kv_heads=2, head_dim=8, max_seq_len=32,
+                       attention_impl="reference", **context)
+    kind = MLAMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4, qk_rope_head_dim=4,
+                    v_head_dim=8)
+    return kind.build(ctx)()
+
+
+def visibility_variables() -> dict:
+    """One drawn variable tree every descriptor scenario shares."""
+    return visibility_module().init(
+        jax.random.key(7), jnp.zeros((2, VIS_LENGTH, 16), jnp.float32))
+
+
+def visibility_draw(variables):
+    """Check 1's draw for the descriptor scenarios: the shared weights and a seed's hidden states."""
+    def draw(seed):
+        hidden = np.random.default_rng(seed).standard_normal((2, VIS_LENGTH, 16)).astype(np.float32)
+        return variables, jnp.asarray(hidden)
+    return draw
+
+
+def by_hand(rule: np.ndarray):
+    """The dense block under an explicit pairwise mask of `rule`'s keys `[B, Q, K]`, compiled."""
+    module = visibility_module()
+    call = MixerCall(metadata=AttentionMetadata(pairwise_mask=jnp.asarray(rule)))
+    return jax.jit(lambda variables, hidden: module.apply(variables, hidden, call))
+
+
+def test_dense_mla_reads_a_pairwise_mask_as_the_split_calls_do():
+    """A call's pairwise mask, both halves of the row read whole, computes what the same block
+    computes over the halves as separate non-causal calls, the second rotated at its own places:
+    on par with the split calls from them in float64 (check 1)."""
+    rule = np.broadcast_to((VIS_SLOTS[:, None] // 6) == (VIS_SLOTS[None, :] // 6),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    halves = visibility_module(causal=False)
+    later = MixerCall(metadata=AttentionMetadata(
+        coordinates=coordinates(positions=jnp.broadcast_to(
+            jnp.arange(6, VIS_LENGTH), (2, VIS_LENGTH - 6)))))
+
+    def split(variables, hidden):
+        return jnp.concatenate([halves.apply(variables, hidden[:, :6]),
+                                halves.apply(variables, hidden[:, 6:], later)], axis=1)
+
+    variables = visibility_variables()
+    assert_as_exact(by_hand(rule), jax.jit(split), visibility_draw(variables),
+                    "mla pairwise mask", seeds=SEEDS["visibility"])
+
+
+def test_dense_mla_reads_its_window_as_masking_by_hand():
+    """A windowed layer (the kind's `sliding_window`) computes what the plain block computes under
+    a pairwise mask of the window's keys written out by hand: on par with it from it in float64
+    (check 1)."""
+    rule = np.broadcast_to(VIS_CAUSAL & (VIS_SLOTS[:, None] - VIS_SLOTS[None, :] < 3),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    windowed = kind_module(sliding_window=3)
+    variables = visibility_variables()
+    assert_as_exact(jax.jit(lambda v, h: windowed.apply(v, h)), by_hand(rule),
+                    visibility_draw(variables), "mla window", seeds=SEEDS["visibility"])
+
+
+def test_dense_mla_reads_its_chunk_as_masking_by_hand():
+    """A chunked layer (the kind's `attention_chunk`) computes what the plain block computes under
+    a pairwise mask of the chunk rule, on par with it from it in float64 (check 1)."""
+    rule = np.broadcast_to(VIS_CAUSAL & ((VIS_SLOTS[:, None] // 4) == (VIS_SLOTS[None, :] // 4)),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    chunked = kind_module(attention_chunk=4)
+    assert_as_exact(jax.jit(lambda v, h: chunked.apply(v, h)), by_hand(rule),
+                    visibility_draw(visibility_variables()), "mla chunk", seeds=SEEDS["visibility"])
+
+
+VIS_BLOCKS = np.asarray([[-1, 0, 0, 0, -1, 1, 1, 1, -1, 2, 2, -1],
+                         [3, 3, 3, -1, -1, 4, 4, -1, 5, 5, 5, 5]], np.int32)
+VIS_IMAGES = np.asarray([[6, 6, 6, 6, -1, -1, 7, 7, 7, -1, -1, -1],
+                         [-1, 8, 8, -1, 9, 9, 9, 9, -1, -1, 10, 10]], np.int32)
+
+
+def whole_group_rule(groups: np.ndarray) -> np.ndarray:
+    """The keys a block read whole keeps beside causality, written out apart from Dew."""
+    same = (groups[:, :, None] == groups[:, None, :]) & (groups[:, :, None] >= 0)
+    return VIS_CAUSAL[None] | same
+
+
+@pytest.mark.parametrize("field,groups", [
+    ("bidirectional_blocks", VIS_BLOCKS),
+    ("bidirectional_images", VIS_IMAGES),
+    ("bidirectional_blocks", np.asarray(prefix_groups(
+        jnp.ones((2, VIS_LENGTH), jnp.int32), jnp.ones((2, VIS_LENGTH), bool), 5))),
+], ids=["blocks", "images", "prefix"])
+def test_dense_mla_reads_its_groups_whole_as_masking_by_hand(field, groups):
+    """A causal block that reads its block, image or prefix groups whole computes what the plain
+    block computes under a pairwise mask of the whole-group rule, on par with it (check 1). The rule
+    keeps keys a causal mask does not, so the groups are read."""
+    rule = whole_group_rule(np.asarray(groups))
+    assert (rule & ~VIS_CAUSAL[None]).any()
+    named = field.removeprefix("bidirectional_")[:-1] + "_groups"
+    metadata = AttentionMetadata(**{named: jnp.asarray(groups)})
+    module = visibility_module(**{field: True})
+    assert_as_exact(jax.jit(lambda v, h: module.apply(v, h, MixerCall(metadata=metadata))), by_hand(rule),
+                    visibility_draw(visibility_variables()), f"mla {field}", seeds=SEEDS["visibility"])
+
+
+def test_dense_mla_reads_key_runs_as_masking_by_hand():
+    """A call's key runs, two keys either side of each query, compute what the plain block
+    computes under a pairwise mask of their union, on par with it (check 1)."""
+    lo, hi = np.clip(VIS_SLOTS - 2, 0, None), np.clip(VIS_SLOTS + 2, None, VIS_LENGTH)
+    runs = np.broadcast_to(np.stack([lo, hi], -1)[:, None], (2, VIS_LENGTH, 1, 2)).astype(np.int32)
+    rule = np.broadcast_to((VIS_SLOTS[None, :] >= lo[:, None]) & (VIS_SLOTS[None, :] < hi[:, None]),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    call = MixerCall(metadata=AttentionMetadata(key_runs=jnp.asarray(runs)))
+    module = visibility_module()
+    assert_as_exact(jax.jit(lambda v, h: module.apply(v, h, call)), by_hand(rule),
+                    visibility_draw(visibility_variables()), "mla key runs", seeds=SEEDS["visibility"])
+
+
+def test_dense_mla_windows_its_key_runs_over_their_positions():
+    """Key runs over the whole row, windowed by a windowed layer over the keys' given positions
+    (runs of three places, then a gap), compute what masking by hand over those positions
+    computes, on par with it (check 1)."""
+    places = np.asarray([0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14], np.int32)
+    runs = np.broadcast_to(np.asarray([[[0, VIS_LENGTH]]]), (2, VIS_LENGTH, 1, 2)).astype(np.int32)
+    rule = np.broadcast_to(np.abs(places[:, None] - places[None, :]) <= 1,
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    metadata = AttentionMetadata(key_runs=jnp.asarray(runs),
+                                 key_positions=jnp.broadcast_to(places, (2, VIS_LENGTH)))
+    module = visibility_module(sliding_window=2)
+    assert_as_exact(jax.jit(lambda v, h: module.apply(v, h, MixerCall(metadata=metadata))), by_hand(rule),
+                    visibility_draw(visibility_variables()), "mla windowed key runs",
+                    seeds=SEEDS["visibility"])
+
+
+def test_dense_mla_reads_a_position_bias_as_masking_by_hand():
+    """A position bias that forbids the odd keys but a query's own computes what a pairwise mask
+    of the same keys computes, on par with it (check 1): the bias's -inf is the mask's."""
+    rule = VIS_CAUSAL & ((VIS_SLOTS[None, :] % 2 == 0) | (VIS_SLOTS[:, None] == VIS_SLOTS[None, :]))
+    bias = np.where(rule, 0.0, -np.inf).astype(np.float32)[None, None]
+    call = MixerCall(metadata=AttentionMetadata(position_bias=jnp.asarray(bias)))
+    module = visibility_module()
+    rule = np.broadcast_to(rule, (2, VIS_LENGTH, VIS_LENGTH))
+    assert_as_exact(jax.jit(lambda v, h: module.apply(v, h, call)), by_hand(rule),
+                    visibility_draw(visibility_variables()), "mla position bias", seeds=SEEDS["visibility"])
+
+
+def test_dense_mla_reads_packed_documents_under_a_window_as_the_split_calls_do():
+    """Packed documents under the layer's window compute what the same windowed block computes
+    over each document as its own call, on par with the split calls from them in float64
+    (check 1): no key crosses a document, and the window counts within it."""
+    segments = np.asarray([[1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3],
+                           [1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3]], np.int32)
+    windowed = kind_module(sliding_window=3)
+    packed = MixerCall(metadata=AttentionMetadata(
+        coordinates=coordinates(segments=jnp.asarray(segments))))
+
+    def split(variables, hidden):
+        rows = []
+        for row in range(segments.shape[0]):
+            cuts = [0, *(int(i) for i in np.flatnonzero(np.diff(segments[row])) + 1), VIS_LENGTH]
+            rows.append(jnp.concatenate(
+                [windowed.apply(variables, hidden[row:row + 1, lo:hi])
+                 for lo, hi in itertools.pairwise(cuts)], axis=1))
+        return jnp.concatenate(rows, axis=0)
+
+    variables = visibility_variables()
+    ours = jax.jit(lambda v, h: windowed.apply(v, h, packed))
+    assert_as_exact(ours, jax.jit(split), visibility_draw(variables),
+                    "mla documents under a window", seeds=SEEDS["visibility"])
+
+
+def test_dense_mla_reads_a_padded_row_under_a_window_as_its_unpadded_twin():
+    """A row with padding among its tokens, under the layer's window, computes at its real
+    tokens what the same windowed block computes over those tokens alone, on par with the twin
+    from it in float64 (check 1): the window counts real tokens, so a key two real tokens back
+    across a padding slot stays in it."""
+    kept = np.asarray([[0, 1, 3, 4, 5, 7, 8, 9, 11], [0, 2, 3, 4, 6, 7, 8, 10, 11]])
+    valid = np.zeros((2, VIS_LENGTH), bool)
+    np.put_along_axis(valid, kept, values=True, axis=1)
+    windowed = kind_module(sliding_window=3)
+    padded = MixerCall(metadata=AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid))))
+    slots = jnp.asarray(kept)
+
+    def ours(variables, hidden):
+        out = windowed.apply(variables, hidden, padded)
+        return jnp.take_along_axis(out, slots[:, :, None], axis=1)
+
+    def twin(variables, hidden):
+        return windowed.apply(variables, jnp.take_along_axis(hidden, slots[:, :, None], axis=1))
+
+    variables = visibility_variables()
+    assert_as_exact(jax.jit(ours), jax.jit(twin), visibility_draw(variables),
+                    "mla padded row under a window", seeds=SEEDS["visibility"])
+
+
+def test_a_windowed_dense_mla_decodes_as_it_prefills():
+    """A windowed block's one-token decode steps compute what its whole-sequence pass computes,
+    on par with that pass from it in float64 (check 1): the decode mask keeps the window's keys
+    by their cache slots."""
+    windowed = kind_module(sliding_window=3)
+    variables = visibility_variables()
+    decoded = jax.jit(lambda v, h: decode_loop(windowed, v, h))
+    full = jax.jit(lambda v, h: windowed.apply(v, h))
+    assert_as_exact(decoded, full, visibility_draw(variables), "mla windowed decode",
+                    seeds=SEEDS["visibility"])
+
+
+def test_a_mla_model_reads_key_runs_as_masking_by_hand():
+    """Through a decoder, whose block refuses a call field its mixer does not read, an mla model's
+    logits under key runs are its logits under a pairwise mask of their union, bit for bit."""
+    model = mla_model(CONFIG["v3"])
+    length = 9
+    ids = jax.random.randint(jax.random.key(2), (2, length), 0, 37)
+    params = model.init(jax.random.key(3), ids)
+    slots = np.arange(length)
+    lo, hi = np.clip(slots - 1, 0, None), np.clip(slots + 1, None, length)
+    runs = np.broadcast_to(np.stack([lo, hi], -1)[:, None], (2, length, 1, 2)).astype(np.int32)
+    rule = np.broadcast_to((slots[None, :] >= lo[:, None]) & (slots[None, :] < hi[:, None]),
+                           (2, length, length))
+    by_runs = model.apply(params, ids, attention_key_runs=jnp.asarray(runs))
+    by_mask = model.apply(params, ids, attention_pairwise_mask=jnp.asarray(rule))
+    np.testing.assert_array_equal(np.asarray(by_runs), np.asarray(by_mask))
