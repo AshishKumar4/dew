@@ -248,9 +248,9 @@ def pytest_sessionfinish(session):
         shutil.rmtree(children)
         lost = {name for name, child in found.items() if not child["followed"]}
         recorded = {}
-        # What the files this process ran before a file probed is that file's input too: a cached reader (a
-        # tokenizer's optional files, a checkpoint's processor) probed under an earlier file serves the file
-        # without probing again (the bundle's review). Code they ran is row 2228's.
+        # What the files this process ran before a file executed, read or probed is that file's input too: a
+        # module an earlier one imported lazily, a value it cached, a reader that probed a fixture, serve the
+        # file without running again (row 2228; the bundle's review). A child's are its own process's.
         earlier: set[str] = set()
         for name, files in own.items():
             child = found.get(name, {"files": set(), "reads": set(), "peak": None, "shares": 0, "pools": 0})
@@ -262,7 +262,7 @@ def pytest_sessionfinish(session):
                               "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere
                                               | child["reads"]),
                               "peak": peak, "shares": child["shares"], "pools": child["pools"]}
-            earlier |= {read for read in files if read.startswith(followed.PROBED)}
+            earlier |= files
         Path(out).write_text(json.dumps(recorded))
     # Each file's collection, which accounts for a file whose every test the selection set aside (`ci.py`).
     if counted := os.environ.get("DEW_COLLECTED"):
