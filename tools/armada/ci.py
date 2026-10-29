@@ -798,6 +798,18 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                   whole=whole, release=release)
 
 
+def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
+    """CI's pytest `run` over `tests`, with the plugins that record what ran (executed.py), keep one group
+    of a split file (`split`, split.py) and a release check's tests (`release`, release.py). A release
+    check's pytest runs with its requirement over the suite's environment, whose torch and jax it keeps:
+    uv's overlay."""
+    grouping = (["-p", "split", f"--ci-group={split}"] if split else []) + (
+        ["-p", "release", f"--ci-release={release}"] if release else [])
+    command = [*run, "-p", "executed", *tests, *grouping]
+    return ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
+            *command[1:]] if release else command
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "") -> int:
@@ -822,17 +834,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     report = out.with_name(f"{out.name}.junit.xml")
     for stale in (report, executed_report, collection):
         stale.unlink(missing_ok=True)
-    grouping = (["-p", "split", f"--ci-group={split}"] if split else []) + (
-        ["-p", "release", f"--ci-release={release}"] if release else [])
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["-m", "coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    command = [*selected(session.pytest_run(python, report, *measured), network, whole, bool(release)),
-               "-p", "executed", *tests, *grouping]
-    # A release check's pytest runs with its requirement over the suite's environment: torch and jax its.
-    command = ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
-               *command[1:]] if release else command
+    run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release))
+    command = pytest_command(run, tests, split, release)
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
