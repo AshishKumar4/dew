@@ -16,7 +16,6 @@ from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import (
     FEWEST_SEEDS,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
     assert_fp32_reduction_bound,
     chain_roundings,
     widened,
@@ -404,19 +403,19 @@ def test_a_kernel_named_for_the_rule_takes_forward_mode_however_a_caller_stages_
     (`_per_product`'s `generation.linear_tangent`), on par with the portable rule's from float64. Its
     selector once routed by whether it saw a JVP tracer, which a remat or a scan hides from it, and there the
     port's custom VJP raised (row 2395)."""
-    keys = jax.random.split(jax.random.key(41), 7)
     length, heads, width = 64, 2, 64
-    query, key = (l2norm(jax.random.normal(k, (1, length, 1, width))) for k in keys[:2])
-    value = jax.random.normal(keys[2], (1, length, heads, width))
-    g = -jnp.exp(jax.random.normal(keys[3], (1, length, heads)) - 3.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, heads)))
-    state = 0.1 * jax.random.normal(keys[5], (1, heads, width, width))
-    operands = (query, key, value, g, beta, state)
-    directions = tuple(jax.random.normal(jax.random.fold_in(keys[6], index), x.shape)
-                       for index, x in enumerate(operands))
 
-    def rule(*operands):
-        return recurrence_chunk.chunk_gated_delta_rule(*operands)
+    def draw(seed):
+        """The rule's operands, the queries and keys of unit norm, and a direction for each."""
+        keys = jax.random.split(jax.random.key(41 + seed), 7)
+        query, key = (l2norm(jax.random.normal(k, (1, length, 1, width))) for k in keys[:2])
+        value = jax.random.normal(keys[2], (1, length, heads, width))
+        g = -jnp.exp(jax.random.normal(keys[3], (1, length, heads)) - 3.0)
+        beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, heads)))
+        state = 0.1 * jax.random.normal(keys[5], (1, heads, width, width))
+        operands = (query, key, value, g, beta, state)
+        return (*operands, *(jax.random.normal(jax.random.fold_in(keys[6], index), x.shape)
+                             for index, x in enumerate(operands)))
 
     def stage(fn):
         if staged == 'jit':
@@ -425,16 +424,14 @@ def test_a_kernel_named_for_the_rule_takes_forward_mode_however_a_caller_stages_
             return jax.checkpoint(fn)
         return lambda *operands: jax.lax.scan(lambda carry, _: (carry, fn(*operands)), None, length=1)[1]
 
-    def tangent(kernel, operands, directions):
-        with generation.chosen(gated_delta_rule=kernel):
-            return jax.tree.leaves(jax.jvp(stage(rule), operands, directions)[1])
+    def tangent(kernel):
+        def tangents(*given):
+            with generation.chosen(gated_delta_rule=kernel):
+                found = jax.jvp(stage(recurrence_chunk.chunk_gated_delta_rule), given[:6], given[6:])[1]
+            return dict(zip(('output', 'memory'), jax.tree.leaves(found), strict=True))
+        return tangents
 
-    mine, theirs = tangent('fla', operands, directions), tangent('xla', operands, directions)
-    with jax.enable_x64(new_val=True):
-        exact = tangent('xla', *(tuple(np.asarray(x, np.float64) for x in tree)
-                                 for tree in (operands, directions)))
-    for name, found, reference, truth in zip(('output', 'memory'), mine, theirs, exact, strict=True):
-        assert_as_exact_as_the_reference(found, reference, truth, f"{staged} {name}")
+    assert_as_exact(tangent('fla'), tangent('xla'), draw, f"the rule's tangent, {staged}", seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize('shards', [pytest.param(3, marks=pytest.mark.mesh(devices=3)),
