@@ -43,3 +43,11 @@ def test_an_opt_dew_does_not_compute_is_refused(change, tmp_path):
     with pytest.raises(ValueError):
         Pretrained.load(respelled(DIRECTORY, tmp_path / 'opt', lambda config: {**config, **change}),
                         dtype='float32', attention_impl='reference')
+
+
+@pytest.mark.network
+def test_released_opt125m_logits_and_cached_greedy_generation(tmp_path):
+    from tools.classic_gpt_reference import check_checkpoint
+
+    check_checkpoint('facebook/opt-125m', tmp_path / 'parity.json',
+                     revision='27dcfa74d334bc871f3234de431e71c6eeba5dd6')
