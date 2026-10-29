@@ -18,6 +18,7 @@ streams each operand through a `Ring` whose counter runs across tiles, and takes
 
 import abc
 import dataclasses
+import functools
 import math
 from collections.abc import Callable
 
@@ -28,7 +29,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import resources
+from dew.nn.kernels.templates import product, resources
 from dew.nn.sharding import per_shard
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
@@ -398,6 +399,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """Whether a warpgroup's products run asynchronously, an issued product's accumulator held while the
     program goes on (warpgroup MMA's), where each mma.sync product completes before the next: a launch's
     products issued in turn hold their accumulators at once on the one, one at a time on the other."""
+    fixes_up: bool = False
+    """Whether a tile's steps may be walked by several programs in turn (`tail.Tail`), each but the first
+    leaving its fp32 partial in global memory behind a GPU-scope semaphore the first waits on (`fixed_up`,
+    `partials_ready`)."""
     stores_through_registers: bool
     """Whether a program copies its stored output tiles out through its registers (no TMA store before
     Hopper: `mosaic_sm80.Mma.persist`), so its epilogue holds its share of the stored tile beside the
@@ -647,6 +652,25 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def products(self, acc: Accumulator, lhs, rhs, interpret: bool) -> Accumulator:
         """`acc` with `lhs @ rhs` issued into it in place, both operands in shared memory (a GEMM's step)."""
 
+    def issued(self, acc: Accumulator, left: tuple, right: tuple, interpret: bool) -> Accumulator:
+        """`acc` with the products of `left`'s and `right`'s parts (`product.formed`, each a part's
+        shared-memory tile) issued into it in place, the pairs `product.terms` gives, smallest first
+        (`products`)."""
+        for i, j in product.terms(len(left), len(right)):
+            acc = self.products(acc, left[i], right[j], interpret)
+        return acc
+
+    def apart(self, shape: tuple[int, int], left: tuple, right: tuple, interpret: bool) -> jax.Array:
+        """The products of `left`'s and `right`'s parts (`issued`'s), each into its own fresh fp32
+        accumulator of `shape` (`summed`), added left to right in `product.terms`' order, so the smallest
+        meet first: a tensor core's accumulation truncates (mma.sync's), so a part accumulated onto a larger
+        one loses its last bit where a sum rounds it."""
+        def issue(i: int, j: int, acc: Accumulator) -> Accumulator:
+            return self.products(acc, left[i], right[j], interpret)
+
+        return functools.reduce(jnp.add, (self.summed(shape, functools.partial(issue, i, j), interpret)
+                                          for i, j in product.terms(len(left), len(right))))
+
     @abc.abstractmethod
     def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
         """`acc` with `parts`' products with `rhs` issued into it in place, each part's left operand in
@@ -662,6 +686,18 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     @abc.abstractmethod
     def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
         """`acc` taken by `scale(value)` in place, then `register_products` of `parts` with `rhs` into it."""
+
+    def partials_ready(self, shape: tuple[int, ...], interpret: bool):
+        """The semaphores of `shape` a tile's partials are signalled on across programs (`fixed_up`); none
+        interpreted, where the programs' order stands in for them (`tail.ordered`)."""
+        raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
+
+    def fixed_up(self, summed, partials, ready, program, start, gathered, store) -> None:
+        """A balanced tail's consumer's share of a tile (`tail.Tail`), `summed` from its program's steps:
+        left in `partials` (each program's, this consumer's) behind `ready` (`partials_ready`) where its
+        range starts inside the tile; otherwise added to every partial the programs after it up to
+        `gathered` left, each awaited, and stored (`store`)."""
+        raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
 
     @abc.abstractmethod
     def settled(self, pending: int = 0) -> None:
@@ -742,6 +778,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     bounded_loads = True
     operands_in_registers = False
     products_overlap = True
+    fixes_up = True
     # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).
     warpgroup_reduction_scratch = 2048
     stores_through_registers = False
@@ -933,6 +970,28 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         smem[...] = value
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(smem, view, reduction_op="add")
+
+    def partials_ready(self, shape: tuple[int, ...], interpret: bool):
+        return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
+
+    def fixed_up(self, summed, partials, ready, program, start, gathered, store) -> None:
+        # GPU-scope signals and waits, proven to lower and run on an H100 at the pinned JAX: TGHYBRID1-h100's
+        # SASS releases each partial with MEMBAR.GPU and a strong global add, and acquires it with a strong
+        # CAS. Interpreted, the partials are left before they are read (`tail.ordered`).
+        @pl.when(start > 0)
+        def _():
+            partials[program] = summed
+            if ready is not None:
+                plgpu.semaphore_signal(ready.at[program], memory_scope="gpu")
+
+        @pl.when(start == 0)
+        def _():
+            def added(other, running):
+                if ready is not None:
+                    plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
+                return running + partials[other]
+
+            store(lax.fori_loop(program + 1, gathered, added, summed))
 
     def held(self, ref: Ref) -> Operand:
         return ref

@@ -94,9 +94,6 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # float64 (`widened_reduction`).
     # Dew's test setting, never the library's default.
     environ.setdefault("DEW_WIDE_CPU_ARITHMETIC", "1")
-    # A frontier's first plan, untimed (`dew.training.planning.UNTIMED_FRONTIER`): two pools a run and
-    # its resume would otherwise each time their own. Dew's test setting, never the library's default.
-    environ.setdefault("DEW_UNTIMED_FRONTIER", "1")
 
 
 def configured(environ: Mapping[str, str]) -> dict[str, str]:

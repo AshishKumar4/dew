@@ -5,7 +5,13 @@ paths and applies them without editing the model. One call wraps the module,
 and the matmuls that run inside the wrapped methods run quantized.
 
 In Dew that call is `Quantization.apply`. A caller builds its model as
-usual, then wraps it before the objective ever sees it. A run that sets
+usual, then wraps it before the objective ever sees it. A direct
+`qwix.quantize_model` call works too: Dew's own GEMM kernels ask Qwix's
+public rule query (`qwix.pallas.get_current_rule`) and leave a matched
+product to Qwix. Quantize a model once, through either path. A direct
+call's traces are not keyed apart from the plain model's as
+`Quantization.apply`'s are (`dew.cache.QUANTIZED_TRACE`), so a jitted helper
+the two share needs Qwix's `disable_jit=True`. A run that sets
 `--trainer.quantization` passes the objective to `RunConfig.train` instead,
 and the model the objective holds is wrapped there, before anything
 initialises it (`dew.training.quantization.quantize_trunk`). This module is
@@ -218,10 +224,11 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
     Qwix holds one provider per model: it makes its class over the class the
     model's last Qwix call wrapped (qwix/_src/model.py:116-119), so a second
     call would drop the first quantization and every wrapper made over it,
-    an adapter included. A model that already computes under Qwix is refused.
+    an adapter included. A model that already computes under Qwix, through
+    Dew or a direct `qwix.quantize_model` call (`qwix.is_quantized`), is
+    refused.
     """
-    held = next((layer for layer in type(model).__mro__ if "_unquantized_type" in vars(layer)), None)
-    if held is not None:
+    if _qwix().is_quantized(model):
         raise ValueError(f"{type(model).__name__} already computes under a Qwix quantization, which a "
                          f"second one would replace; quantize the model once")
     wrapped = _quantized(model, provider, wrapper)

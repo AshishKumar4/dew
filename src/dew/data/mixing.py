@@ -569,6 +569,10 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         return _DeficitIterator(reads, self._weights, self._tokens, self._keys)
 
 
+_UNOPENED = "unopened"
+"""The key of a mix's corpus's position where the mix has not opened it (`_MixRead`)."""
+
+
 class _MixReads:
     """Every corpus of a mix, each opened and read only as the mix draws from it: a corpus the mix has
     not drawn holds no iterator, so no reader's threads, buffers or files, and no position but its
@@ -618,12 +622,10 @@ class _MixReads:
         self.parent(index).set_state(state)
 
     def started(self, index: int, counted: Mapping[str, object] | None) -> None:
-        """Corpus `index` back at its start, unopened, carrying the counters of `counted`; where it is
-        open and none are given, its own: a repeat rewinds a mix to where it opened none, and its
-        corpora go on counting (`rewound`)."""
+        """Corpus `index` back at its start, unopened, carrying the counters of `counted`, a position
+        it held (none where it is None): a repeat's rewind hands it the corpus's live position to go on
+        counting from (`rewound`), a restore the counts it saved."""
         self.states.pop(index, None)
-        if counted is None and index in self.opened:
-            counted = self.opened[index].get_state()
         self.close(index)
         if counted is not None:
             self.counted[index] = counted
@@ -637,7 +639,7 @@ class _MixReads:
 
 class _MixRead(pygrain.DatasetIterator[Batch]):
     """One corpus of a mix (`_MixReads`): its parent's position, or, unopened, the counters it carries
-    (`"unopened"`). A position a mix saved while it read each corpus's first row ahead holds the
+    (`_UNOPENED`). A position a mix saved while it read each corpus's first row ahead holds the
     corpus before that row, which a restore reads next; one that held a corpus's counts alone in its
     parent's place is a corpus at its start carrying them."""
 
@@ -651,12 +653,12 @@ class _MixRead(pygrain.DatasetIterator[Batch]):
     def get_state(self) -> Mapping[str, object]:
         state = self._group.state(self._index)
         if state is None:
-            return {"unopened": self._group.counts(self._index)}
+            return {_UNOPENED: self._group.counts(self._index)}
         return {"parent": state}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        if "unopened" in state:
-            counted = state["unopened"]
+        if _UNOPENED in state:
+            counted = state[_UNOPENED]
             self._group.started(self._index, None if counted is None else record(counted, "mixed corpus"))
             return
         parent = record(state["parent"], "mixed corpus")
@@ -710,7 +712,11 @@ def rewound(start: Mapping[str, object], current: Mapping[str, object]) -> Mappi
     """`start`, the position a repeat rewinds its pass to, with each counter's counts as `current`
     holds them (`_COUNTER`: its counts, run of rejections and warning): a pass read again goes on
     counting the corpus, where a restored position replaces its counts. Every other part of a
-    position is the iterator's own and is left as `start` has it."""
+    position is the iterator's own and is left as `start` has it. A mix's corpus the pass had not
+    opened at its start (`_MixRead`'s `_UNOPENED`) is rewound to that, carrying the position it holds
+    now, open or not, whose counters, every one its stages keep, it takes on as it opens again."""
+    if _UNOPENED in start:
+        return {_UNOPENED: current.get("parent", current.get(_UNOPENED))}
     shared = [key for key in start if key in current]
     parts = _rewound_parts([start[key] for key in shared], [current[key] for key in shared])
     kept = {**start, **dict(zip(shared, parts, strict=True))}

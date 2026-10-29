@@ -24,6 +24,18 @@ LM_MOE: dict[str, object] = {
     "vocab_size": 50304, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_features": 2048,
     "max_seq_len": 1024,
     "mixture": {"experts": 8, "top_k": 2, "layers": [1, 3, 5, 7, 9, 11], "dispatch": "global"}}
+LM_HYBRID: dict[str, object] = {
+    "vocab_size": 50304, "emb_features": 1024, "num_layers": 16, "num_heads": 16, "num_kv_heads": 4,
+    "mlp_features": 2816, "max_seq_len": 1024,
+    "layer_types": ["linear_attention"] * 3 + ["attention"] + ["linear_attention"] * 3 + ["attention"]
+    + ["linear_attention"] * 3 + ["attention"] + ["linear_attention"] * 3 + ["attention"],
+    "kinds": {"attention": {}, "linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
+        "linear_num_key_heads": 8, "linear_num_value_heads": 16, "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4}}}}}
+"""A Qwen3.5-style hybrid decoder, 16 layers 1024 wide: three gated delta nets of Qwen3.5's head widths to
+each attention layer. Its step's compile row gates the time to a hybrid step's first update, the recurrence
+template's kernels lowered once each however many layers call them (row 2102: a Qwen3.5-4B step waited 30
+minutes while each layer lowered its own)."""
 DIT_B: dict[str, object] = {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12,
                             "mlp_ratio": 4}
 """DiT-B/4: the large, compute-dominated SimpleDiT the parity study and the performance gate step."""

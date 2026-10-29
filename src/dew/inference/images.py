@@ -717,7 +717,7 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
     autoencoder's. The rest keep the dtypes they were saved in."""
     from dew._records import record
     from dew.batch import PARAMETER_ROOTS
-    from dew.inputs.encoders import ConditionEncoder
+    from dew.inputs.condition import ConditionEncoder
     from dew.registry import component
 
     roots: list[tuple[str, ...]] = list(PARAMETER_ROOTS)
