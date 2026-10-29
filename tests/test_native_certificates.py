@@ -26,7 +26,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import recurrence_witness as rw
-from generation_support import generations, runs
+from gpu_flow import Cell, run_cells
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from native_certificates import (
@@ -72,18 +72,18 @@ allowance (γ of a step's 64 products at 2^-23, of their magnitudes) falls below
 place, decides the add's rounding."""
 
 
-def cells(*pairs) -> list:
-    """`(kernel, generation)` pairs as parameters, each marked `runs` for its generation."""
-    return [pytest.param(kernel, name, marks=runs(name), id=f"{kernel}-{name}") for kernel, name in pairs]
+def launches(*pairs) -> list[tuple[str, str]]:
+    """`(kernel, generation)` pairs, each a cell's launch and the generation it runs under (`gpu_flow`)."""
+    return list(pairs)
 
 
-PLAIN = cells(*((kernel, name) for kernel in ("mosaic_gpu", "triton") for name in ("sm80", "sm90")))
+PLAIN = launches(*((kernel, name) for kernel in ("mosaic_gpu", "triton") for name in ("sm80", "sm90")))
 """The template's native launches of 16-bit products on the lanes' GPUs, each forced (`generation.chosen`),
 refusing rather than falling back to another route."""
-TRITON = cells(("triton", "sm80"), ("triton", "sm90"))
+TRITON = launches(("triton", "sm80"), ("triton", "sm90"))
 """The launches of fp32 operands, Triton's alone (Mosaic GPU's take 16-bit ones), and of a forward's exact
 sums (Mosaic GPU's forward takes none)."""
-EXACT = cells(("mosaic_gpu", "sm90"), ("triton", "sm80"), ("triton", "sm90"))
+EXACT = launches(("mosaic_gpu", "sm90"), ("triton", "sm80"), ("triton", "sm90"))
 """The launches of a kernel gradient's exact sums: Triton's, and Mosaic GPU's on Hopper alone (Ampere's
 bundle counts no running sum in its registers, `mosaic.Family.counts_hooks`, so it refuses them)."""
 GRADIENTS = {"mosaic_gpu": grouped_matmul.MosaicTgmm, "triton": grouped_matmul.Tgmm}
@@ -352,9 +352,7 @@ def everywhere(held, but=()) -> bool:
                if (group, j) not in but)
 
 
-@pytest.mark.parametrize("kernel, generation_name", PLAIN)
-@pytest.mark.parametrize("signed", [True, False], ids=["gaussian", "same sign"])
-def test_the_grouped_gemm_templates_products_certify_natively(kernel, generation_name, signed):
+def the_grouped_gemm_templates_products_certify_natively(kernel, generation_name, signed):
     """Every element of the native forward, input gradient and kernel gradient of 16-bit operands is a value
     its exact products admit (`native_dot_holds`), the forward's and the kernel gradient's in bf16 and in
     fp32: the null of row 2084's links 1 and 2."""
@@ -364,9 +362,7 @@ def test_the_grouped_gemm_templates_products_certify_natively(kernel, generation
                                     ((jnp.bfloat16, BFLOAT16), (jnp.float32, FLOAT32)), seed)
 
 
-@pytest.mark.parametrize("kernel, generation_name", TRITON)
-@pytest.mark.parametrize("signed", [True, False], ids=["gaussian", "same sign"])
-def test_fp32_operands_certify_natively_as_products_of_their_tf32_values(kernel, generation_name, signed):
+def fp32_operands_certify_natively_as_products_of_their_tf32_values(kernel, generation_name, signed):
     """At the default precision an fp32 product is TF32 (src/dew/nn/kernels/templates/product.py): every
     element of the native forward, input gradient and kernel gradient of fp32 operands is a value the exact
     products of their TF32 values admit (`tf32_operand`, `native_dot_holds`)."""
@@ -376,8 +372,7 @@ def test_fp32_operands_certify_natively_as_products_of_their_tf32_values(kernel,
                                     ((jnp.float32, FLOAT32),), seed)
 
 
-@pytest.mark.parametrize("kernel, generation_name", EXACT)
-def test_a_depth_step_of_exact_zeros_leaves_the_native_accumulator_bit_identical(kernel, generation_name):
+def a_depth_step_of_exact_zeros_leaves_the_native_accumulator_bit_identical(kernel, generation_name):
     """What `states_of` reads each step's output by: group 3's native exact-sums kernel gradient with its rows
     from a depth step on zeroed is bit for bit its gradient with the group ending at that step (the rows past
     it read under group 4), the same launch on the same shapes, at each of its later steps."""
@@ -393,9 +388,7 @@ def test_a_depth_step_of_exact_zeros_leaves_the_native_accumulator_bit_identical
             assert np.array_equal(np.float32(native).view(np.uint32), np.float32(ended).view(np.uint32)), step
 
 
-@pytest.mark.parametrize("kernel, generation_name", EXACT)
-@pytest.mark.parametrize("signed", [True, False], ids=["gaussian", "same sign"])
-def test_the_kernel_gradients_exact_sums_certify_natively_a_step_at_a_time(kernel, generation_name, signed):
+def the_kernel_gradients_exact_sums_certify_natively_a_step_at_a_time(kernel, generation_name, signed):
     """Above the default precision an fp32 kernel gradient's sums are exact (product.py's `promoted`): each
     group's native gradient after each depth step is the IEEE sum of the one before and the step's own partial
     (`promoted_step_holds`), at the step the launch takes (64 rows on both kernels), on draws at one scale and
@@ -409,9 +402,7 @@ def test_the_kernel_gradients_exact_sums_certify_natively_a_step_at_a_time(kerne
                 assert everywhere(held), seed
 
 
-@pytest.mark.parametrize("kernel, generation_name", TRITON)
-@pytest.mark.parametrize("signed", [True, False], ids=["gaussian", "same sign"])
-def test_the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time(kernel, generation_name, signed):
+def the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time(kernel, generation_name, signed):
     """Triton's forward takes exact sums too: each native fp32 output after each depth step (64 of the depth)
     is the IEEE sum of the one before and the step's own partial, on draws at one scale and falling past the
     first step."""
@@ -428,8 +419,7 @@ def test_the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time(kernel,
                 assert everywhere(forward_witnessed(rows, w, steps)), seed
 
 
-@pytest.mark.parametrize("kernel, generation_name", PLAIN)
-def test_the_kernel_gradients_certificate_refuses_a_lost_block_and_a_misrouted_row(kernel, generation_name):
+def the_kernel_gradients_certificate_refuses_a_lost_block_and_a_misrouted_row(kernel, generation_name):
     """The kernel gradient's faults, in an fp32 output, whose grid shows them, each the native kernel run
     around a defect, certified against the true operands and refused where it lands (`assert_refused`): a
     lost block of sixteen of group 3's rows, at more than `LOST_SHARE` of that group's gradient, and a row
@@ -447,8 +437,7 @@ def test_the_kernel_gradients_certificate_refuses_a_lost_block_and_a_misrouted_r
             assert np.all(np.delete(held, faulty, axis=0))
 
 
-@pytest.mark.parametrize("kernel, generation_name", EXACT)
-def test_the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_row(kernel, generation_name):
+def the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_row(kernel, generation_name):
     """The exact-sums witness's faults, each the native kernel gradient run around a defect, witnessed a step
     at a time against the true operands and refused where it lands (`assert_refused`): the default launch,
     whose tensor cores add each step's products into the accumulator itself by truncating adds
@@ -493,9 +482,7 @@ def test_the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_
         assert everywhere(held[3:])
 
 
-@pytest.mark.parametrize("kernel, generation_name", TRITON)
-@pytest.mark.parametrize("signed", [True, False], ids=["gaussian", "same sign"])
-def test_the_tf32_certificate_refuses_bf16_products_tf32_where_bf16_is_declared_and_a_truncated_read(
+def the_tf32_certificate_refuses_bf16_products_and_a_truncated_read(
         kernel, generation_name, signed):
     """The TF32 contract's faults, each the native forward of fp32 operands certified against products the
     call does not take and refused where it lands (`assert_refused`, `TF32_SHARES`): the operands rounded to
@@ -523,8 +510,7 @@ def test_the_tf32_certificate_refuses_bf16_products_tf32_where_bf16_is_declared_
             assert_refused(held, products_apart(declared, read(*operands), FLOAT32), share)
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
-def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narrow_partial(generation_name):
+def the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narrow_partial(generation_name):
     """The rule's faults, each the native kernel run around a defect, certified against the true operands
     and refused where it lands (`assert_refused`): a lost block of sixteen products (one MMA's depth) in one
     group's rows, at more than `LOST_SHARE` of those rows, every other row holding; a row read under its
@@ -558,17 +544,14 @@ def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narro
 
 
 SUBNORMAL_CELLS = [
-    pytest.param(dtype, kernel, name, marks=runs(name), id=f"{jnp.dtype(dtype).name}-{kernel}-{name}")
-    for dtype, kernel, name in (
-        (jnp.float16, "triton", "sm80"), (jnp.float16, "triton", "sm90"), (jnp.float16, "mosaic_gpu", "sm90"),
-        (jnp.bfloat16, "mosaic_gpu", "sm80"), (jnp.bfloat16, "mosaic_gpu", "sm90"),
-        (jnp.bfloat16, "triton", "sm80"), (jnp.bfloat16, "triton", "sm90"))]
+    (jnp.float16, "triton", "sm80"), (jnp.float16, "triton", "sm90"), (jnp.float16, "mosaic_gpu", "sm90"),
+    (jnp.bfloat16, "mosaic_gpu", "sm80"), (jnp.bfloat16, "mosaic_gpu", "sm90"),
+    (jnp.bfloat16, "triton", "sm80"), (jnp.bfloat16, "triton", "sm90")]
 """The template's launches of 16-bit products by dtype on the lanes' GPUs (Mosaic GPU's mma.sync bundle takes
 no fp16)."""
 
 
-@pytest.mark.parametrize("dtype, kernel, generation_name", SUBNORMAL_CELLS)
-def test_subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, kernel, generation_name):
+def subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, kernel, generation_name):
     """A subnormal 16-bit operand's products, which the tensor cores align by its exponent field
     (`aligned`): the native forward's element summing `SUBNORMAL_CASE`'s five fp16 products, and
     every element of a forward of rows a quarter of whose values are subnormals of `dtype` (Gaussian draws
@@ -639,9 +622,7 @@ def mosaic_lane() -> rw.Lane:
     return rw.Lane(PTX_EX2, flushes, mainloop.block_of(mainloop.family_of(jnp.bfloat16)))
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
-@pytest.mark.parametrize("regime", rw.REGIMES)
-def test_the_recurrence_templates_records_certify_natively_a_step_at_a_time(generation_name, regime):
+def the_recurrence_templates_records_certify_natively_a_step_at_a_time(generation_name, regime):
     """Every record of the recurrence template's native bf16 call of three chunks and two value heads on one
     key head, forced (`generation.chosen`, `recurrence_witness.recorded`), lies inside its launch step's
     enclosure on the native records the step reads, each chunk's from the fp32 memory it enters, under each
@@ -655,8 +636,7 @@ def test_the_recurrence_templates_records_certify_natively_a_step_at_a_time(gene
         assert np.all(held[name]), (name, np.mean(held[name]))
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
-def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively(
+def the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively(
         generation_name):
     """The native step witness's carry faults, each refused where it lands
     (`recurrence_witness.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where
@@ -665,11 +645,60 @@ def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded
         rw.assert_carry_faults_refused(mosaic_lane(), heads=2)
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
-def test_the_recurrence_step_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary_natively(
+def the_recurrence_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary(
         generation_name):
     """The native step witness's step faults, each refused where it lands
     (`recurrence_witness.assert_step_faults_refused`): decays from a difference of fp32 cumulative sums
     (row 2066's defect) and each chunk's boundary a token early."""
     with generation.assumed(generation_name):
         rw.assert_step_faults_refused(mosaic_lane(), heads=2)
+
+
+GENERATIONS = ("sm80", "sm90")
+"""The lanes' GPU generations, each cell run under its own (`gpu_flow.Cell`)."""
+SIGNED = (True, False)
+SIGNS = {True: "gaussian", False: "same sign"}
+
+
+def cell(check, *args) -> Cell:
+    """`check` on `args` as one cell of the flow, labelled by its name and arguments, run under the
+    generation among them (`gpu_flow.Cell`)."""
+    shown = [SIGNS[arg] if isinstance(arg, bool) else getattr(arg, "__name__", str(arg)) for arg in args]
+    generation = next((arg for arg in args if arg in GENERATIONS), None)
+    return Cell(f"{check.__name__.replace('_', ' ')}: {' '.join(shown)}", functools.partial(check, *args),
+                generation)
+
+
+def test_the_native_kernels_certify_on_this_gpu():
+    """Check 2's native certificates of the template kernels on this GPU, as one flow (`gpu_flow`, the
+    owner's rule: no unit tests on GPUs): every cell above on each generation this device runs, its
+    products admitted, its exact sums a depth step at a time, and each injected fault refused, each
+    cell's failure kept and all raised together."""
+    run_cells([
+        *(cell(the_grouped_gemm_templates_products_certify_natively, k, g, s)
+          for k, g in PLAIN for s in SIGNED),
+        *(cell(fp32_operands_certify_natively_as_products_of_their_tf32_values, k, g, s)
+          for k, g in TRITON for s in SIGNED),
+        *(cell(a_depth_step_of_exact_zeros_leaves_the_native_accumulator_bit_identical, k, g)
+          for k, g in EXACT),
+        *(cell(the_kernel_gradients_exact_sums_certify_natively_a_step_at_a_time, k, g, s)
+          for k, g in EXACT for s in SIGNED),
+        *(cell(the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time, k, g, s)
+          for k, g in TRITON for s in SIGNED),
+        *(cell(the_kernel_gradients_certificate_refuses_a_lost_block_and_a_misrouted_row, k, g)
+          for k, g in PLAIN),
+        *(cell(the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_row, k, g)
+          for k, g in EXACT),
+        *(cell(the_tf32_certificate_refuses_bf16_products_and_a_truncated_read, k, g, s)
+          for k, g in TRITON for s in SIGNED),
+        *(cell(the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narrow_partial, g)
+          for g in GENERATIONS),
+        *(cell(subnormal_operands_certify_natively_at_their_formats_least_normal, d, k, g)
+          for d, k, g in SUBNORMAL_CELLS),
+        *(cell(the_recurrence_templates_records_certify_natively_a_step_at_a_time, g, r)
+          for g in GENERATIONS for r in rw.REGIMES),
+        *(cell(the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively, g)
+          for g in GENERATIONS),
+        *(cell(the_recurrence_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary, g)
+          for g in GENERATIONS),
+    ])
