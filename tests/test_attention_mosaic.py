@@ -190,16 +190,17 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
     """The forward under the hooks `FORWARD_HOOKS[hooks]` over the template core's causal packed documents
-    under a window (`test_attention_triton`'s hook site), interpreted over its first row (its three
-    documents and its padding: a second row's took the interpreter 3.8 s a draw more, at 32 draws past the
-    CPU suite's 120 s target, row 2196), compiled over both."""
+    under a window (`test_attention_triton`'s hook site): a single hook over both rows, so each kind of
+    parameter is read at a second row; several at once interpreted over the first row alone (its three
+    documents and its padding: their 32 draws over a second row took the interpreter past the CPU suite's
+    120 s target, row 2196), compiled over both."""
     case = CASES["causal-documents-window"]
     queries, keys = core_geometry(case)
-    rows = 1 if interpret else ROWS
+    score, gate = FORWARD_HOOKS[hooks]
+    rows = 1 if interpret and len(score) + gate > 1 else ROWS
     called = {name: value[:rows] if hasattr(value, "shape") else value
               for name, value in arguments(case).items()}
     spans = template.spans(queries, keys, rows, **called)
-    score, gate = FORWARD_HOOKS[hooks]
     _check_spans("causal-documents-window", spans, (rows, queries, 4, 2), interpret=interpret, score=score,
                  gate=gate, dtype=dtype, natural=natural)
 
