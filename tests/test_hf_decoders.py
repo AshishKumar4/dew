@@ -112,6 +112,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import fixture_ids, transformers_arms, transformers_model
 from model_support import flat_tree, llada_draw, llada_fields
 from reference_error import (
     as_given,
@@ -217,19 +218,22 @@ def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_
         Pretrained.load(directory, dtype="float32")
 
 
+BIASED_SEEDS = 0
+"""The biased MLPs' declared draws of ids against the reference's logits (check 1), sized by `seeds_for`
+paired with Dew's logits on the CPU."""
+
+
 @pytest.mark.parametrize("name, head", [("llama-tiny", "causal"), ("nemotron-h-tiny", "causal"),
                                         ("modernbert-tiny", "masked")])
 def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name, head, tmp_path):
     """Llama's MLP, Nemotron-H's MLP layers and ModernBERT's GLU carry biases where their config
     states mlp_bias, which each reference reads (modeling_llama.py's LlamaMLP, NemotronHMLP,
-    ModernBertMLP's packed Wi): a checkpoint with random biases loads to logits as exact as the
-    reference's float32 ones, both from its float64 ones, and saves, from its source and (but for
-    Nemotron-H, whose hybrid pattern only its source writes) from the model and its variables
-    alone, to a checkpoint that reloads to the same logits."""
+    ModernBertMLP's packed Wi): a checkpoint with random biases loads to logits on par with the
+    reference's float32 ones from its float64 twin's over drawn ids (check 1), and saves, from its
+    source and (but for Nemotron-H, whose hybrid pattern only its source writes) from the model and
+    its variables alone, to a checkpoint that reloads to the same logits."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForMaskedLM
-
-    from tools.torch_precision import float64
 
     auto = AutoModelForCausalLM if head == "causal" else AutoModelForMaskedLM
     config = AutoConfig.from_pretrained(FIXTURES / name)
@@ -245,19 +249,14 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
                 parameter.copy_(0.1 * torch.randn(parameter.shape, generator=draws))
     source = tmp_path / "source"
     reference.save_pretrained(source)
-    ids = np.load(FIXTURES / name / "input_ids.npy")
-
-    def theirs(dtype):
-        with float64() if dtype == torch.float64 else torch.no_grad():
-            model = auto.from_config(config, dtype=dtype, attn_implementation="eager").eval()
-            model.load_state_dict(reference.state_dict())
-            with torch.no_grad():
-                return model(torch.from_numpy(ids).long()).logits.double().numpy()
+    draw = fixture_ids(FIXTURES / name)
 
     loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
-    ours = np.asarray(loaded.model.apply(loaded.variables, ids), np.float64)
-    assert_as_exact_as_the_reference(ours, theirs(torch.float32), theirs(torch.float64),
-                                     f"{name} logits with MLP biases")
+    theirs, truth = transformers_arms(reference.eval(), lambda model, ids: model(ids).logits)
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), theirs, draw,
+                    f"{name} logits with MLP biases", seeds=BIASED_SEEDS, truth_fn=truth)
+    (ids,) = draw(0)
+    ours = np.asarray(loaded.model.apply(loaded.variables, ids))
     loaded.save(tmp_path / "export")
     exports = [tmp_path / "export"]
     if name == "nemotron-h-tiny":
@@ -272,7 +271,7 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     for export in exports:
         again = Pretrained.load(export, dtype="float32", attention_impl="reference")
         reloaded = np.asarray(again.model.apply(again.variables, ids))
-        np.testing.assert_array_equal(reloaded, ours.astype(np.float32))
+        np.testing.assert_array_equal(reloaded, ours)
 
 @pytest.mark.gpu(reason="TF32 is a GPU's: a CPU multiplies float32 operands in float32 at any precision")
 def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
@@ -717,6 +716,11 @@ def test_the_llama3_ramp_matches_the_reference_frequencies(head_dim, theta, ramp
     assert np.sum(scaled != plain) >= head_dim // 4
 
 
+FP32_SEEDS = 0
+"""The hybrid and classic families' declared draws of ids against transformers' logits (check 1), sized by
+`seeds_for` paired with Dew's logits on the CPU."""
+
+
 @pytest.mark.parametrize("name", [name for name in TINY + ROUTED + HYBRID if name not in (
     'bloom-tiny',
     'falcon-mha-tiny',
@@ -730,25 +734,44 @@ def test_the_llama3_ramp_matches_the_reference_frequencies(head_dim, theta, ramp
     'phi3-tiny',
 )])
 def test_fp32_logits_match_the_reference_implementation(name):
-    """The parity claim: transformers' logits, our logits, same weights."""
+    """The parity claim: transformers' logits, our logits, same weights. A hybrid or classic family's
+    are on par with transformers' run in the test from its float64 twin's over drawn ids (check 1),
+    with its argmax on the first draw; every other family's within 1e-4 of the recorded logits, with
+    their argmax."""
     directory = FIXTURES / name
     model, variables = fp32_decoder(directory)
-    ids = np.load(directory / "input_ids.npy")
-    reference = np.load(directory / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
     if name in HYBRID + CLASSIC:
-        assert_as_exact_as_the_reference(logits, reference, np.load(directory / "logits_f64.npy"),
-                                         f"{name} logits")
+        draw = fixture_ids(directory)
+        theirs, truth = transformers_arms(transformers_model(directory), causal_logits)
+        assert_as_exact(lambda ids: model.apply(variables, ids), theirs, draw, f"{name} logits",
+                        seeds=FP32_SEEDS, truth_fn=truth)
+        (ids,) = draw(0)
+        reference = theirs(ids)
     else:
+        ids = np.load(directory / "input_ids.npy")
+        reference = np.load(directory / "logits.npy")
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    if name not in HYBRID + CLASSIC:
         difference = float(np.max(np.abs(logits - reference)))
         assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
     assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
+def causal_logits(model, ids):
+    """A transformers causal LM's logits over `ids`, uncached (a `transformers_arms` run)."""
+    return model(ids, use_cache=False).logits
+
+
+HYBRID_SEEDS = 0
+"""The Nemotron-H exports' declared draws of ids against transformers' logits over the fixture (check 1),
+sized by `seeds_for` paired with the export's logits on the CPU."""
+
+
 @pytest.mark.parametrize("name", HYBRID[1:])
 def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
-    """The native 3-D layout and transformers' per-expert save layout compute the same model."""
+    """The native 3-D layout and transformers' per-expert save layout compute the same model: the packed
+    source's logits on par with transformers' over the fixture from its float64 twin's over drawn ids
+    (check 1)."""
     from safetensors.numpy import save_file
 
     from dew.interop.sources import load_shards
@@ -774,15 +797,16 @@ def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
     assert exported.keys() == packed.keys()
     for key, tensor in packed.items():
         np.testing.assert_array_equal(tensor, exported[key])
-    ids = np.load(FIXTURES / name / "input_ids.npy")
-    assert_as_exact_as_the_reference(loaded.model.apply(loaded.variables, ids),
-                                     np.load(FIXTURES / name / "logits.npy"),
-                                     np.load(FIXTURES / name / "logits_f64.npy"), f"{name} packed logits")
+    theirs, truth = transformers_arms(transformers_model(FIXTURES / name), causal_logits)
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), theirs,
+                    fixture_ids(FIXTURES / name), f"{name} packed logits", seeds=HYBRID_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("name", HYBRID)
 def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, tmp_path):
-    """The loaded hybrid exports in its source layout, as Mamba-2 and Qwen3-Next do."""
+    """The loaded hybrid exports in its source layout, as Mamba-2 and Qwen3-Next do: transformers reads
+    the export to logits on par with its own over the fixture from its float64 twin's over drawn ids
+    (check 1)."""
     from dew.interop.sources import load_shards
 
     directory = FIXTURES / name
@@ -798,9 +822,10 @@ def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, 
     ids = np.load(directory / "input_ids.npy")
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
                                   restored.model.apply(restored.variables, ids))
-    assert_as_exact_as_the_reference(transformers_logits(destination, ids, tmp_path),
-                                     np.load(directory / "logits.npy"),
-                                     np.load(directory / "logits_f64.npy"), "Nemotron-H export logits")
+    exported, _ = transformers_arms(transformers_model(destination), causal_logits)
+    theirs, truth = transformers_arms(transformers_model(directory), causal_logits)
+    assert_as_exact(exported, theirs, fixture_ids(directory), "Nemotron-H export logits", seeds=HYBRID_SEEDS,
+                    truth_fn=truth)
 
 
 def test_the_bf16_gemma_forward_still_tracks_the_reference():
@@ -1380,7 +1405,7 @@ def nemotron_step_source(directory, *, seed: int = 7):
     (mtp_layers_block_type [attention, moe]), its tensors drawn under the
     released names `mtp.layers.{0,1}.*` (vLLM nemotron_h_mtp.py), written to
     `directory`; and the reference: transformers' own blocks composed as
-    vLLM composes the step, at `dtype`."""
+    vLLM composes the step, at `dtype`, its trunk loaded once a dtype."""
     import torch
     from safetensors.numpy import load_file, save_file
     from transformers.models.nemotron_h import modeling_nemotron_h as reference
@@ -1428,11 +1453,14 @@ def nemotron_step_source(directory, *, seed: int = 7):
     save_file(tensors, str(directory / "model.safetensors"))
     (directory / "config.json").write_text(json.dumps(hf))
 
+    models = {}
+
     def logits(ids, dtype):
-        model = reference.NemotronHForCausalLM.from_pretrained(str(source), dtype=dtype).eval()
-        # The eager experts run in float64, where torch's grouped matmul does not.
-        model.config._experts_implementation = "eager"
-        depth = step.to(dtype)
+        if dtype not in models:
+            models[dtype] = reference.NemotronHForCausalLM.from_pretrained(str(source), dtype=dtype).eval()
+            # The eager experts run in float64, where torch's grouped matmul does not.
+            models[dtype].config._experts_implementation = "eager"
+        model, depth = models[dtype], step.to(dtype)
         with torch.no_grad():
             hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state[:, :-1]
             fused = depth["eh_proj"](torch.cat([depth["enorm"](model.model.embeddings(ids[:, 1:])),
@@ -1445,15 +1473,18 @@ def nemotron_step_source(directory, *, seed: int = 7):
     return logits
 
 
+STEP_SEEDS = 0
+"""The prediction step's declared draws of ids against the composed reference's logits (check 1), sized
+by `seeds_for` paired with Dew's step on the CPU."""
+
+
 def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tmp_path):
     """Nemotron 3 Ultra's prediction step over the latent-MoE fixture loads as
     `mtp_0`: the attention block's mixer and pre-norm, the routed block in
     its feed-forward slot, the step's input maps and final norm. Its logits
-    are what transformers' own blocks give composed as vLLM composes the
-    step, within the reference's own distance from float64; and the LM
-    objective's `mtp_weight` trains the step's weights."""
-    from unittest.mock import patch
-
+    are on par with what transformers' own blocks give composed as vLLM
+    composes the step, from its float64 run, over drawn ids (check 1); and
+    the LM objective's `mtp_weight` trains the step's weights."""
     import torch
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -1467,22 +1498,25 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
     assert depth["block"]["mlp"]["experts"]["up_proj"]["kernel"].shape[0] == 8
     assert "mtp_0" in variables["moe"]
 
-    ids = np.load(FIXTURES / "nemotron-h-moe-latent-tiny" / "input_ids.npy")
-    hidden = model.apply(variables, jnp.asarray(ids, jnp.int32), method=CausalTransformer.hidden_states)
-    logits = np.asarray(model.apply(variables, hidden, jnp.asarray(ids, jnp.int32),
-                                    method=CausalTransformer.mtp_logits)[0])
-    tokens = torch.from_numpy(ids.astype(np.int64))
-    fp32 = reference(tokens, torch.float32)
-    widen = torch.Tensor.type
+    draw = fixture_ids(FIXTURES / "nemotron-h-moe-latent-tiny")
 
-    def wide_type(tensor, dtype=None, **kwargs):
-        # Nemotron's router pins .type(torch.float32), beyond the shared cast widener.
-        return widen(tensor, torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+    def step_logits(ids):
+        hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
+        return model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0]
 
-    with float64(), patch.object(torch.Tensor, "type", wide_type):
-        truth = reference(tokens, torch.float64)
-    assert_as_exact_as_the_reference(logits, fp32, truth, "nemotron-h prediction step logits")
-    assert np.array_equal(np.argmax(logits, -1), np.argmax(fp32, -1))
+    @as_given
+    def fp32(ids):
+        return reference(torch.from_numpy(np.asarray(ids, np.int64)), torch.float32)
+
+    @as_given
+    def truth(ids):
+        with float64():
+            return reference(torch.from_numpy(np.asarray(ids, np.int64)), torch.float64)
+
+    assert_as_exact(step_logits, fp32, draw, "nemotron-h prediction step logits", seeds=STEP_SEEDS,
+                    truth_fn=truth)
+    (ids,) = draw(0)
+    assert np.array_equal(np.argmax(np.asarray(step_logits(ids)), -1), np.argmax(fp32(ids), -1))
 
     import optax
 

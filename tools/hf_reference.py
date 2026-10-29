@@ -535,8 +535,7 @@ MODERNBERT_CONFIGS = (
 
 
 def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
-    """ModernBertForMaskedLM's logits, fp32 and float64, and ModernBertModel's states in bf16 and
-    float64, which the GPU's bf16 kernels are held to.
+    """ModernBertModel's states in bf16 and float64, which the GPU's bf16 kernels are held to.
 
     Four layers give the global, local, local, global pattern, and a local
     span of 6 (three keys either side) is shorter than the 12-token probe, so
@@ -555,7 +554,7 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
         global_rope_theta=160000.0, local_rope_theta=10000.0, norm_eps=3e-5,
         max_position_embeddings=64, pad_token_id=0, bos_token_id=1, eos_token_id=2,
         cls_token_id=1, sep_token_id=2))
-    write_tiny(name, model)
+    write_tiny(name, model, logits=False)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
     mask = np.ones_like(ids, bool)
@@ -570,14 +569,12 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
     import copy
 
     with torch.no_grad():
-        np.save(directory / 'logits.npy', model(tokens).logits.numpy())
         narrow = copy.deepcopy(model).to(torch.bfloat16)
         np.save(directory / 'hidden_bf16.npy', narrow.model(tokens).last_hidden_state.float().numpy())
     # Its float64 twin (`float64_twin`), whose inverse frequencies are built in float64.
     wide = float64_twin(model)
     with float64(), torch.no_grad():
         np.save(directory / 'hidden_f64.npy', wide.model(tokens).last_hidden_state.double().numpy())
-        np.save(directory / 'logits_f64.npy', wide(tokens).logits.double().numpy())
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
@@ -1511,7 +1508,7 @@ def write_float64_logits(name: str, model: PreTrainedModel) -> Path:
 
 
 def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False,
-               device: str = "cpu") -> None:
+               device: str = "cpu", logits: bool = True) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     scatter_weights(model, seed)
@@ -1520,23 +1517,14 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
 
     ids = probe_ids(model.config.vocab_size)
     np.save(directory / "input_ids.npy", ids)
-    np.save(directory / "logits.npy", reference_logits(model, ids))
+    if logits:
+        np.save(directory / "logits.npy", reference_logits(model, ids))
     if padded:
-        from torch_precision import float64, float64_twin
-
-        tokens = torch.from_numpy(ids.astype(np.int64))
-        valid = torch.ones_like(tokens)
-        tokens[1, :4] = 0
-        valid[1, :4] = 0
-        positions = (valid.cumsum(-1) - 1).clamp(min=0)
-        inputs = {'input_ids': tokens, 'attention_mask': valid, 'position_ids': positions, 'use_cache': False}
-        with torch.no_grad():
-            reference = model(**inputs).logits.numpy()
-        with float64(), torch.no_grad():
-            truth = float64_twin(model)(**inputs).logits.numpy()
-        np.savez(directory / 'padded.npz', input_ids=tokens.numpy().astype(np.int32),
-                 attention_mask=valid.numpy().astype(bool), position_ids=positions.numpy().astype(np.int32),
-                 logits=reference, logits_f64=truth)
+        # The left-padding the routed decoders' tests pad drawn ids under: their mask and positions.
+        valid = np.ones(ids.shape, bool)
+        valid[1, :4] = False
+        np.savez(directory / 'padded.npz', attention_mask=valid,
+                 position_ids=np.maximum(np.cumsum(valid, -1) - 1, 0).astype(np.int32))
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 

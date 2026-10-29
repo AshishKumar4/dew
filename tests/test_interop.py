@@ -403,7 +403,7 @@ def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None)
 
     from dew.inference.projections import inference_projections
     from dew.interop import Pretrained
-    from tools.decoder_export_reference import Case, reference_logits
+    from tools.decoder_export_reference import Case, reference_forward, reference_logits
 
     case = Case("run export", str(export))
     if ordered_export is None:
@@ -413,7 +413,8 @@ def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None)
             return (np.random.default_rng(seed).integers(0, vocabulary, np.shape(ids)).astype(np.int32),)
 
         def read(wide):
-            return as_given(lambda drawn: reference_logits(case, export, np.asarray(drawn), wide=wide))
+            forward = reference_forward(case, export, wide=wide)
+            return as_given(lambda drawn: forward(np.asarray(drawn)))
 
         assert_as_exact(lambda drawn: task.model.apply(task.variables, drawn), read(wide=False), draw,
                         "run export logits", seeds=RUN_EXPORT_SEEDS, truth_fn=read(wide=True))

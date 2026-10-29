@@ -96,23 +96,26 @@ def fixture_ids(directory: Path, mask=None):
     return draw
 
 
-def transformers_model(directory: Path, *, masked: bool = False):
+def transformers_model(directory: Path, *, masked: bool = False, dtype: str = "float32", **options):
     """transformers' own class for the checkpoint at `directory`, as its config names it, the masked LM
-    where `masked` and else the causal LM, in float32 on eager attention and eager experts, in eval mode:
-    the reference a tiny checkpoint's recorder ran (tools/hf_reference.py), run in the test."""
+    where `masked` and else the causal LM, in `dtype` (float32 unless a narrower run is the reference)
+    on eager attention and eager experts, in eval mode, `options` given to `from_pretrained` too: the
+    reference a tiny checkpoint's recorder ran (tools/hf_reference.py), run in the test."""
     import torch
     import transformers
 
     auto = transformers.AutoModelForMaskedLM if masked else transformers.AutoModelForCausalLM
-    return auto.from_pretrained(directory, dtype=torch.float32, attn_implementation="eager",
-                                experts_implementation="eager").eval()
+    return auto.from_pretrained(directory, dtype=getattr(torch, dtype), attn_implementation="eager",
+                                experts_implementation="eager", **options).eval()
 
 
-def transformers_arms(model, run):
+def transformers_arms(model, run, *, source=None):
     """Check 1's reference and truth over the transformers `model`: `run(model, *inputs)` under
-    `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by its float64
-    twin (`tools.torch_precision.float64_twin`) inside `float64`, each run `as_given`, its tensors returned
-    as NumPy arrays."""
+    `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by the float64
+    twin (`tools.torch_precision.float64_twin`) of `source`, by default `model`, inside `float64`, each
+    run `as_given`, its tensors returned as NumPy arrays, a bfloat16 one as the float32 it holds exactly.
+    A narrower `model` (bfloat16) is measured from its stored weights' truth: `source`, the float32
+    load."""
     import torch
 
     from tools.torch_precision import float64, float64_twin
@@ -125,10 +128,11 @@ def transformers_arms(model, run):
         @as_given
         def given(*inputs):
             with precision(), torch.no_grad():
-                return jax.tree.map(lambda out: out.numpy(), run(network, *map(tensor, inputs)))
+                return jax.tree.map(lambda out: (out.float() if out.dtype == torch.bfloat16 else out).numpy(),
+                                    run(network, *map(tensor, inputs)))
         return given
 
-    return arm(model, contextlib.nullcontext), arm(float64_twin(model), float64)
+    return arm(model, contextlib.nullcontext), arm(float64_twin(model if source is None else source), float64)
 
 
 def next_token_losses(model, ids):

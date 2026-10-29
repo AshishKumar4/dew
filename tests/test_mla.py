@@ -34,7 +34,7 @@ import numpy as np
 import optax
 import pytest
 import torch
-from interop_support import fixture_arrays
+from interop_support import fixture_arrays, fixture_ids, transformers_arms, transformers_model
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
@@ -537,10 +537,7 @@ def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by
     where the family read YaRN alone and refused the checkpoint (audit NN-04)."""
     import shutil
 
-    from transformers import AutoModelForCausalLM
-
     from dew.interop import Pretrained
-    from tools.torch_precision import float64, float64_twin
 
     source = Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tiny"
     for name in ("model.safetensors", "generation_config.json"):
@@ -551,24 +548,10 @@ def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by
     (tmp_path / "config.json").write_text(json.dumps(config))
     loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     # The eager experts, which run in float64 too: the grouped kernel takes float32 or narrower.
-    reference = AutoModelForCausalLM.from_pretrained(
-        tmp_path, dtype=torch.float32, attn_implementation="eager", experts_implementation="eager").eval()
-    shape = np.load(source / "input_ids.npy").shape
-    wide = float64_twin(reference)
-
-    def draw(seed):
-        return (np.random.default_rng(seed).integers(0, config["vocab_size"], shape).astype(np.int32),)
-
-    def logits_of(model, precision):
-        def run(ids):
-            with torch.no_grad(), precision():
-                return model(input_ids=torch.from_numpy(np.asarray(ids, np.int64))).logits.double().numpy()
-        return as_given(run)
-
-    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids),
-                    logits_of(reference, contextlib.nullcontext), draw,
-                    "a llama3-scaled DeepSeek V3's logits", seeds=LLAMA3_SCALED_SEEDS,
-                    truth_fn=logits_of(wide, float64))
+    reference, truth = transformers_arms(transformers_model(tmp_path),
+                                         lambda model, ids: model(input_ids=ids).logits)
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, fixture_ids(source),
+                    "a llama3-scaled DeepSeek V3's logits", seeds=LLAMA3_SCALED_SEEDS, truth_fn=truth)
 
 
 # --------------------------------------------------------------------------

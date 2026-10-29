@@ -336,9 +336,10 @@ def reference_model(case: Case, directory: Path, dtype=None):
     return model, report
 
 
-def reference_logits(case: Case, directory: Path, ids: np.ndarray, *, wide: bool = False) -> np.ndarray:
-    """transformers 5.16.1 over the exported directory on the eager path, in
-    fp32, or `wide` in float64: the model built and run under
+def reference_forward(case: Case, directory: Path, *, wide: bool = False
+                      ) -> Callable[[np.ndarray], np.ndarray]:
+    """transformers over the exported directory on the eager path, loaded once (`reference_model`), as a
+    function of ids: its logits in fp32, or `wide` in float64, the model built and run under
     `torch_precision.float64`, which widens its float32 pins too."""
     import contextlib
 
@@ -346,15 +347,25 @@ def reference_logits(case: Case, directory: Path, ids: np.ndarray, *, wide: bool
 
     from tools.torch_precision import float64
 
-    with float64() if wide else contextlib.nullcontext():
+    precision = float64 if wide else contextlib.nullcontext
+    with precision():
         model, _ = reference_model(case, directory, torch.float64 if wide else torch.float32)
-        model.eval()
-        model.set_attn_implementation("eager")
-        with torch.no_grad(), lower_index_ties(model):
+    model.eval()
+    model.set_attn_implementation("eager")
+
+    def forward(ids: np.ndarray) -> np.ndarray:
+        with precision(), torch.no_grad(), lower_index_ties(model):
             out = model(input_ids=torch.from_numpy(np.asarray(ids, np.int64)), use_cache=False)
-    if out.logits.dtype != (torch.float64 if wide else torch.float32):
-        raise TypeError(f"the reference returned {out.logits.dtype} logits")
-    return out.logits.numpy()
+        if out.logits.dtype != (torch.float64 if wide else torch.float32):
+            raise TypeError(f"the reference returned {out.logits.dtype} logits")
+        return out.logits.numpy()
+
+    return forward
+
+
+def reference_logits(case: Case, directory: Path, ids: np.ndarray, *, wide: bool = False) -> np.ndarray:
+    """`reference_forward`'s logits over `ids`, the model loaded for them alone."""
+    return reference_forward(case, directory, wide=wide)(ids)
 
 
 def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray:
