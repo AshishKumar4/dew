@@ -605,10 +605,12 @@ class Decide(SavedRunTask):
             with contextlib.nullcontext() if mesh is None else jax.set_mesh(mesh):
                 self._pass(self._probe, variables, shape)
 
-        # A layout that keeps a schema whole lays the probe out past a window too small for it, and
-        # that window's shapes compile on their first pass.
+        # A layout that keeps a schema whole lays the probe out past a window, or its schema past the
+        # context, too small for it, and those shapes compile on their first pass.
+        fits_context = self.context_length is None or all(
+            len(row.context or ()) <= self.context_length for row in self._probe)
         held = tuple(shape for shape in self.pass_shapes
-                     if shape.length >= max(len(row.tokens) for row in self._probe))
+                     if fits_context and shape.length >= max(len(row.tokens) for row in self._probe))
         with ThreadPoolExecutor(max_workers=max(1, len(held))) as pool:
             list(pool.map(compiled, held))
         return held
