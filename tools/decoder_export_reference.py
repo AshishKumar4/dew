@@ -146,7 +146,9 @@ class RoundTrip(Trip):
 
 
 def logits(source: Pretrained, variables: Variables, ids: np.ndarray) -> np.ndarray:
-    return np.asarray(source.model.apply(variables, jnp.asarray(ids, jnp.int32)), np.float32)
+    """The source's logits over `ids` from `variables`, its forward compiled once as Dew's users run it
+    (op by op, a decoder's forward compiles each of its thousands of primitives)."""
+    return np.asarray(jax.jit(source.model.apply)(variables, jnp.asarray(ids, jnp.int32)), np.float32)
 
 
 def train(case: Case, source: Pretrained, ids: np.ndarray):
@@ -603,7 +605,8 @@ def gradient_parity(trip: RoundTrip) -> dict[str, tuple[np.ndarray, np.ndarray]]
         return -jnp.mean(jnp.take_along_axis(
             jax.nn.log_softmax(logits[:, :-1], axis=-1), ids[:, 1:, None], axis=-1))
 
-    grads = {"params": jax.grad(loss)(source.variables["params"])}
+    # Compiled once as a training step runs it, not op by op.
+    grads = {"params": jax.jit(jax.grad(loss))(source.variables["params"])}
     upstream, converted, prediction_prefixes = _reference_gradients(trip)
     upstream_truth, truths, _ = _reference_gradients(trip, wide=True)
     # Prediction-owned serialized embedding/head copies alias trunk leaves;
@@ -685,7 +688,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, tuple[np.ndarray, 
     def loss(variables):
         return objective.scalar_loss({**source.variables, 'params': variables}, batch, step)[0]
 
-    our_loss, gradients = jax.value_and_grad(loss)(source.variables['params'])
+    our_loss, gradients = jax.jit(jax.value_and_grad(loss))(source.variables['params'])
 
     def reference(*, wide: bool):
         """The reference's loss and gradients by source name, fp32 or `wide` in float64."""
