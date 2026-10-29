@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import dataclasses
 import hashlib
+import json
 import logging
 import os
 import re
@@ -67,15 +68,71 @@ class _Registry:
 
 
 _PROCESS = _Registry()
-"""The process's registry, every thread's."""
+"""The process's registry, every thread's, seeded from and kept in `records()` where it is set."""
+_SEEDED: list[Path] = []
+"""The records file the process's registry was seeded from (`_registry`), once."""
 _SCOPE: contextvars.ContextVar[_Registry | None] = contextvars.ContextVar("refusals_scope", default=None)
 """A `refusals` scope's own registry, in its context alone."""
-_GUARD = threading.Lock()
-"""Serializes the registries' reads and updates between threads."""
+_GUARD = threading.RLock()
+"""Serializes the registries' reads and updates between threads (a read may seed the process's)."""
+
+
+def records() -> Path | None:
+    """Where a process keeps its refusals beside the persistent compilation cache, so every process sharing
+    the cache shares them and derives the configs it holds (a training pool's, an eval's, a server's):
+    DEW_REFUSAL_RECORDS when set, else `dew-refusals.jsonl` in JAX's compilation cache directory, or nowhere
+    when the process keeps no cache."""
+    if path := os.environ.get("DEW_REFUSAL_RECORDS"):
+        return Path(path)
+    cache = jax.config.jax_compilation_cache_dir
+    return None if not cache else Path(cache) / "dew-refusals.jsonl"
 
 
 def _registry() -> _Registry:
-    return _SCOPE.get() or _PROCESS
+    scoped = _SCOPE.get()
+    if scoped is not None:
+        return scoped
+    path = records()
+    if path is not None and path not in _SEEDED:
+        with _GUARD:
+            if path not in _SEEDED:
+                _SEEDED.append(path)
+                for identity, config, kernels in _read(path):
+                    _PROCESS.refused[(identity, config)] = (
+                        _PROCESS.refused.get((identity, config), frozenset()) | kernels)
+    return _PROCESS
+
+
+def _read(path: Path) -> list[tuple[str, Hashable, frozenset[str]]]:
+    """The refusals `path` keeps, a JSON line each; a line this checkout cannot rebuild (another checkout's
+    config) is skipped."""
+    from dew.nn.kernels import tuning  # tuning traces launches under this module's names
+    if not path.exists():
+        return []
+    found = []
+    for line in path.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+            found.append((entry["identity"], tuning.decoded(entry["config"]), frozenset(entry["kernels"])))
+        except (ValueError, KeyError, TypeError, tuning.Unreadable):
+            _log.warning("a refusal in %s this checkout cannot read: %.120s", path, line)
+    return found
+
+
+def _kept(identity: str, config: Hashable, kernels: frozenset[str]) -> None:
+    """A process refusal appended to `records()`, one line written at once (O_APPEND), so processes sharing
+    the file append whole lines."""
+    from dew.nn.kernels import tuning  # tuning traces launches under this module's names
+    path = records()
+    if path is None:
+        return
+    line = json.dumps({"identity": identity, "config": tuning.encoded(config), "kernels": sorted(kernels)})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(descriptor, (line + "\n").encode())
+    finally:
+        os.close(descriptor)
 
 
 class Exhausted(ValueError):
@@ -198,7 +255,10 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None", kernels=f
     registry = _registry()
     with _GUARD:
         if refusal is not None:
-            registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | frozenset(kernels)
+            known = registry.refused.get(refusal, frozenset())
+            registry.refused[refusal] = known | frozenset(kernels)
+            if registry is _PROCESS and not frozenset(kernels) <= known:
+                _kept(*refusal, frozenset(kernels))
         if miss is not None:
             registry.missed.append(miss)
 
