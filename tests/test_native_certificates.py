@@ -2,11 +2,11 @@
 each native kernel's output held element by element to the exact products of its operands, on the GPU
 that compiles it, never to another implementation's error. Link 1: the grouped GEMM template's plain
 forward and input gradient, each a sum of exact 16-bit products a tensor core accumulates in fp32 by
-truncating adds and rounds once to its output (`certified.native_dot_holds`). Link 2: the rest of the
+truncating adds and rounds once to its output (`native_dot_holds`). Link 2: the rest of the
 template's native launches, Mosaic GPU's and Triton's (CUTLASS's wheel is not installed on the lanes'
 GPUs): the kernel gradient; fp32 operands at the default precision, whose products are of their TF32
-values (`certified.tf32_operand`); and the exact sums a precision above the default declares for an fp32
-output, held a depth step at a time (`certified.promoted_step_holds`), each step's output the launch's own
+values (`tf32_operand`); and the exact sums a precision above the default declares for an fp32
+output, held a depth step at a time (`promoted_step_holds`), each step's output the launch's own
 on its operands zeroed from the next step on. The rule's validation: its nulls (Gaussian and same-sign
 draws certify) and its faults, each refused where it lands: a lost block of products, a row read under the
 wrong group, a partial sum rounded to bf16 mid-depth; bf16 products where TF32 is declared and the
@@ -26,7 +26,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import recurrence_witness as rw
-from certified import (
+from native_certificates import (
     SUBNORMAL_CASE,
     Terms,
     assert_refused,
@@ -146,7 +146,7 @@ def spans(sizes) -> list[tuple[int, int]]:
 
 
 def forward_products(x, w, sizes, fmt: Format = BFLOAT16) -> Terms:
-    """`[rows, width, depth]`: each output element's exact products of operands of `fmt` (`certified.terms`),
+    """`[rows, width, depth]`: each output element's exact products of operands of `fmt` (`terms`),
     its row times its group's column."""
     return terms(lambda x, w: x[:, None, :] * np.swapaxes(w[groups(sizes)], 1, 2), x, w, fmt=fmt)
 
@@ -589,7 +589,7 @@ no fp16)."""
 @pytest.mark.parametrize("dtype, kernel, generation_name", SUBNORMAL_CELLS)
 def test_subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, kernel, generation_name):
     """A subnormal 16-bit operand's products, which the tensor cores align by its exponent field
-    (`certified.aligned`): the native forward's element summing `SUBNORMAL_CASE`'s five fp16 products, and
+    (`aligned`): the native forward's element summing `SUBNORMAL_CASE`'s five fp16 products, and
     every element of a forward of rows a quarter of whose values are subnormals of `dtype` (Gaussian draws
     beside them), holds with each such operand counted at its format's least normal."""
     fmt = rw.FLOAT16 if dtype == jnp.float16 else BFLOAT16
@@ -677,7 +677,7 @@ def test_the_recurrence_templates_records_certify_natively_a_step_at_a_time(gene
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively(
         generation_name):
-    """The native step witness's faults, each refused where it lands (`certified.assert_refused`), a memory
+    """The native step witness's faults, each refused where it lands (`assert_refused`), a memory
     kept across chunks (`REGIMES`' 'slow'): a document starting at the second chunk, whose zero memory is
     refused at more than 95% of the memory the first chunk leaves (99.99% on an A100 and an H100); and the
     second chunk run from that memory rounded to bf16 where fp32 is held, refused at more than 60% of the fp32

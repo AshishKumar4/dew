@@ -185,8 +185,8 @@ def staged(iv: Iv, lane: Lane) -> Iv:
 
 def aligned(iv: Iv, fmt: Format) -> np.ndarray:
     """The largest magnitude a tensor core aligns a product by of an operand within `iv`
-    (`certified.aligned`: a subnormal of `fmt` at `fmt`'s least normal)."""
-    from certified import aligned as at
+    (`native_certificates.aligned`: a subnormal of `fmt` at `fmt`'s least normal)."""
+    from native_certificates import aligned as at
 
     return np.maximum(at(iv.lo, fmt), at(iv.hi, fmt))
 
@@ -195,8 +195,8 @@ def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
     """`a @ b` (`[M, K] @ [K, N]`) as one product the tensor cores accumulate in fp32: each term's exact range
     (products of 16-bit values of `fmt`, or of three bf16 parts an fp32 operand's, the six whose orders sum
     under three, within 2^-24 of the fp32 values' product), summed within the native-dot contract's bound
-    (`certified.native_dot_holds`: gamma_n at a truncating add's unit, n the terms that may be nonzero, an add
-    of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's magnitudes are the
+    (`native_certificates.native_dot_holds`: gamma_n at a truncating add's unit, n the terms that may be
+    nonzero, an add of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's magnitudes are the
     terms' as the tensor cores align them (`aligned`): a subnormal operand's at `fmt`'s least normal, the
     exponent its field holds."""
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
@@ -591,8 +591,8 @@ def witness(run: Run, lane: Lane) -> dict:
 def refusals(faulty: Run, claimed: Run, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """A fault's refusals, by record: `faulty`'s records held to the enclosures `claimed` gives them (the
     call's own operands and memories, about `faulty`'s records), and where those are separated from the
-    enclosures on what the faulty kernel was given (`faulty`'s own, `certified.separated`)."""
-    from certified import separated
+    enclosures on what the faulty kernel was given (`faulty`'s own, `native_certificates.separated`)."""
+    from native_certificates import separated
 
     truth, fault, found = enclosed(claimed, lane), enclosed(faulty, lane), records(faulty)
     return {name: (within(found[name], truth[name]), separated(truth[name], fault[name])) for name in truth}
@@ -691,7 +691,7 @@ def dropped_refusals(operands: tuple, truth: Run, at: int, lane: Lane) -> tuple[
     memory is the zero a new document starts from, held to the memory the step before it leaves, rounded as
     stored; the fault's interval is that zero."""
     import jax.numpy as jnp
-    from certified import separated
+    from native_certificates import separated
 
     length = operands[0].shape[1]
     starts = jnp.zeros((1, length), bool).at[0, at * CHUNK].set(True)
@@ -703,8 +703,9 @@ def dropped_refusals(operands: tuple, truth: Run, at: int, lane: Lane) -> tuple[
 
 def assert_refusals(found: dict, shares: dict) -> None:
     """A fault's refusals by record (`refusals`): no record held where its intervals separate, and those more
-    than `shares[record]` of each record where the fault is claimed to land (`certified.assert_refused`)."""
-    from certified import assert_refused
+    than `shares[record]` of each record where the fault is claimed to land
+    (`native_certificates.assert_refused`)."""
+    from native_certificates import assert_refused
 
     for name, (held, apart) in found.items():
         assert not np.any(held & apart), name
