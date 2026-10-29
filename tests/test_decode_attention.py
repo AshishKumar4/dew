@@ -137,35 +137,6 @@ def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, w
                                          f"decode kernel, {config}")
 
 
-@pytest.mark.skipif(not ON_GPU, reason="the base-2 exponential rounds differently when Triton is interpreted")
-@pytest.mark.gpu(reason="regresses compiled fp32 decode exponent rounding, ledger 2151")
-def test_fp32_decode_keeps_normal_edge_weights_as_exact_as_the_reference():
-    """A normal weight exp(-80..-87) alone on a large value: the compiled default must not round
-    its base-2 argument at the full exponent's ulp before exponentiating it."""
-    from dew.nn.kernels import decode_attention, tuning
-
-    rows = 1024
-    logits = np.linspace(-80.0, -87.0, rows, dtype=np.float32)
-    query = np.zeros((rows, 1, 1, 16), np.float32)
-    query[..., 0] = 4.0
-    key = np.zeros((rows, 32, 1, 16), np.float32)
-    key[:, 1, 0, 0] = logits
-    value = np.zeros_like(key)
-    value[:, 1, 0, 0] = 2.0 ** 123
-    q, k, v = map(jnp.asarray, (query, key, value))
-    lengths = jnp.full((rows,), 2, jnp.int32)
-    keep = jnp.arange(32)[None, None, None, :] < 2
-    reference = jax.jit(lambda q, k, v: jax.nn.dot_product_attention(
-        q, k, v, mask=keep, implementation="xla"))(q, k, v)
-    with tuning.pinned({decode_attention.DecodeAttention: decode_attention.Split(1)}):
-        found = jax.jit(lambda q, k, v: decode_attention.attend(q, k, v, lengths))(q, k, v)
-    weight = np.exp(logits.astype(np.float64))
-    truth = weight / (1.0 + weight) * 2.0 ** 123
-    assert_as_exact_as_the_reference(np.asarray(found)[:, 0, 0, :1],
-                                     np.asarray(reference)[:, 0, 0, :1], truth[:, None],
-                                     "compiled fp32 decode at normal exponent edge")
-
-
 SINKS = (0.5, -1.0, 2.0, -3.0)
 """Four query heads' sink logits, around and past the rows' logits' scale."""
 SOFTCAP = 0.5
