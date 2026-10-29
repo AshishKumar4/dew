@@ -665,6 +665,168 @@ def bwd_wy_dqkg(q, k, v, corrected, g, beta, a, h, do, dh, dv, *, scale: float, 
                         interpret=interpret)
 
 
+@dataclasses.dataclass(frozen=True)
+class _SubChunk:
+    """One program's sub-chunk of its chunk (`_bwd_intra_kernel`): the launch's refs by name, the chunk's
+    first token `start` and real tokens `taken`, the sub-chunk's index `i` and first row `first`, and the
+    reads its terms take: a sub-chunk's rows of a ref, its decays and their remainder (`lo`, where
+    compensated), and the difference of two positions' decays over both halves (`apart`)."""
+
+    refs: dict
+    start: jax.Array
+    taken: jax.Array
+    i: jax.Array
+    first: jax.Array
+    aligned: bool
+    count: int
+    exact: bool
+
+    def left(self, at):
+        """The chunk's rows from `at`: a whole sub-chunk's where every chunk is whole."""
+        return SUB if self.aligned else self.taken - at
+
+    def tile(self, name: str, at):
+        return self.tile_of(self.refs[name], at)
+
+    def tile_of(self, ref, at):
+        return read_rows(_rows(ref, self.start + at, SUB), self.left(at)).astype(jnp.float32)
+
+    def scores(self, name: str, row, column):
+        return read_rows(_rows(self.refs[name], self.start + row, SUB, pl.ds(column, SUB)),
+                         self.left(row)).astype(jnp.float32)
+
+    def row(self, name: str, at):
+        return self.refs[name][self.start + at].astype(jnp.float32)
+
+    def gates(self, at):
+        """The cumulated decay of the sub-chunk's rows from `at`, and its remainder."""
+        lo = self.refs.get("lo")
+        return (_gates(self.refs["g"], self.start + at, self.left(at), SUB),
+                None if lo is None else _gates(lo, self.start + at, self.left(at), SUB))
+
+    def decayed(self, at):
+        """The cumulated decay at the chunk's row `at`, `[1, K]`, and its remainder."""
+        lo = self.refs.get("lo")
+        return (_row(self.refs["g"], self.start + at)[None, :],
+                None if lo is None else _row(lo, self.start + at)[None, :])
+
+    def apart(self, later, earlier):
+        """`g_later - g_earlier`, of both halves where compensated."""
+        return later[0] - earlier[0] if later[1] is None else compensated_difference(later, earlier)
+
+    def solved(self, left_operand, right_operand):
+        return _dot(left_operand, right_operand, exact=self.exact, solve=self.refs["k"].dtype)
+
+    def earlier(self, j):
+        """Sub-chunk `j`'s keys decayed to this one's first row, `k_t exp2(g_first - g_t)`."""
+        return self.tile("k", j * SUB) * jnp.exp2(self.apart(self.decayed(self.first), self.gates(j * SUB)))
+
+    def written(self, j):
+        """Sub-chunk `j`'s keys by their write gate, `k beta` in the operands' dtype as fla's b_kb."""
+        refs = self.refs
+        return read_rows(_rows(refs["k"], self.start + j, SUB), self.left(j)) * read_rows(
+            _rows(refs["beta"], self.start + j, SUB), self.left(j))[:, None]
+
+
+def _from_before(sub: _SubChunk):
+    """`dAqk` and `dAkk`'s terms from the sub-chunks before to the sub-chunk's rows, `[SUB, K]` each:
+    fla's blocks below the diagonal, factored at the sub-chunk's first row."""
+    def before(j, sums):
+        gated = sub.earlier(j)
+        return (sums[0] + sub.solved(sub.scores("daqk", sub.first, j * SUB), gated),
+                sums[1] + sub.solved(sub.scores("dakk", sub.first, j * SUB), gated))
+
+    empty = jnp.zeros((SUB, sub.refs["k"].shape[-1]), jnp.float32)
+    dq2, dk2 = jax.lax.fori_loop(0, sub.i, before, (empty, empty))
+    ahead = jnp.exp2(sub.apart(sub.gates(sub.first), sub.decayed(sub.first)))
+    return dq2 * ahead, dk2 * ahead
+
+
+def _to_after(sub: _SubChunk, closing):
+    """The terms from the sub-chunks after to the sub-chunk's columns, `[SUB, K]`: fla's blocks right of
+    the diagonal, factored at the sub-chunk's last row `closing`."""
+    def after(j, dkt):
+        behind = jnp.exp2(sub.apart(sub.gates(j * SUB), closing))
+        reads = sub.tile("q", j * SUB) * behind
+        dkt = dkt + sub.solved(sub.scores("daqk", j * SUB, sub.first).T, reads)
+        return dkt + sub.solved(sub.scores("dakk", j * SUB, sub.first).T,
+                                sub.written(j * SUB).astype(jnp.float32) * behind)
+
+    empty = jnp.zeros((SUB, sub.refs["k"].shape[-1]), jnp.float32)
+    dkt = jax.lax.fori_loop(sub.i + 1, sub.count, after, empty)
+    return dkt * jnp.exp2(sub.apart(closing, sub.gates(sub.first)))
+
+
+def _spanning(sub: _SubChunk):
+    """The decay's gradient every token of the sub-chunk takes alike, `[K]`: the pairs from the sub-chunks
+    before to the sub-chunks after, factored at its first row (both factors at or below one), and the
+    write's terms to the chunk's last token from the tokens before it."""
+    origin = sub.decayed(sub.first)
+
+    def across(j, total):
+        through = jnp.exp2(sub.apart(sub.gates(j * SUB), origin))
+        reads, writes = sub.tile("q", j * SUB) * through, sub.written(j * SUB).astype(jnp.float32) * through
+
+        def from_before(b, total):
+            gated = sub.earlier(b)
+            return total + jnp.sum(reads * sub.solved(sub.scores("daqk", j * SUB, b * SUB), gated)
+                                   + writes * sub.solved(sub.scores("dakk", j * SUB, b * SUB), gated), axis=0)
+
+        return jax.lax.fori_loop(0, sub.i, from_before, total)
+
+    total = jax.lax.fori_loop(sub.i + 1, sub.count, across,
+                              jnp.zeros((sub.refs["k"].shape[-1],), jnp.float32))
+    return jax.lax.fori_loop(0, sub.i, lambda j, total: total + jnp.sum(sub.tile("last", j * SUB), axis=0),
+                             total)
+
+
+def _own_pairs(sub: _SubChunk, tokens, carry, held, leaving):
+    """The sub-chunk's own pairs, its tokens one by one (`tokens` of them) as a column of its rows `s >= j`:
+    `dq2` and `dk2`'s terms, each pair's own decay, and the decay's gradient at each token `j`, the pairs
+    whose range holds it: from before to its rows (`held`), within it, from it to after (`leaving`) and the
+    write's to the chunk's last token."""
+    index = jnp.arange(SUB)
+    gate = sub.gates(sub.first)
+    query, key, beta = sub.tile("q", sub.first), sub.tile("k", sub.first), sub.tile("beta", sub.first)
+    weighted, writes = key * beta[:, None], sub.tile("last", sub.first)
+
+    def diagonal(j, carry):
+        dq2, dk2, running, ranged = carry
+        token = sub.first + j
+        causal = (index >= j)[:, None]
+        own = sub.row("k", token)[None, :] * jnp.exp2(sub.apart(gate, sub.decayed(token)))
+        column = pl.ds(token, 1)
+        qk = read_rows(_rows(sub.refs["daqk"], sub.start + sub.first, SUB, column), sub.left(sub.first))
+        kk = read_rows(_rows(sub.refs["dakk"], sub.start + sub.first, SUB, column), sub.left(sub.first))
+        closed = (jnp.sum(jnp.where(causal, held + running, 0.0), axis=0)
+                  + jnp.sum(jnp.where(causal, 0.0, leaving + writes), axis=0))
+        pairs = jnp.where(causal, (qk * query + kk * weighted) * own, 0.0)
+        return (dq2 + jnp.where(causal, qk * own, 0.0), dk2 + jnp.where(causal, kk * own, 0.0),
+                running + pairs, jnp.where((index == j)[:, None], closed[None, :], ranged))
+
+    empty = jnp.zeros_like(held)
+    return jax.lax.fori_loop(0, tokens, diagonal, (*carry, empty, empty))
+
+
+def _own_columns(sub: _SubChunk, tokens, dkt):
+    """The sub-chunk's own terms to its columns `t <= r`, its tokens `r` one by one (`tokens` of them):
+    the query and write-gated key decayed by each pair's own decay."""
+    index = jnp.arange(SUB)
+    gate = sub.gates(sub.first)
+
+    def own(j, dkt):
+        token = sub.first + j
+        reads, gated = sub.row("q", token), sub.row("k", token) * sub.row("beta", token)
+        decay = jnp.exp2(sub.apart(sub.decayed(token), gate))
+        causal = (index <= j)[:, None]
+        qk = sub.refs["daqk"][sub.start + token, pl.ds(sub.first, SUB)]
+        kk = sub.refs["dakk"][sub.start + token, pl.ds(sub.first, SUB)]
+        dkt = dkt + jnp.where(causal, qk[:, None] * reads[None, :] * decay, 0.0)
+        return dkt + jnp.where(causal, kk[:, None] * gated[None, :] * decay, 0.0)
+
+    return jax.lax.fori_loop(0, tokens, own, dkt)
+
+
 def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_ref, dq_ref, dk_ref,
                       last_ref, *refs, chunk: int, aligned: bool, exact: bool, compensated: bool = False):
     """fla's `chunk_kda_bwd_kernel_intra` (fla/ops/kda/chunk_intra.py:395-679), safe_gate off, for one
@@ -687,136 +849,25 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
     i = pl.program_id(1) % count
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     first = i * SUB
+    named = {"q": q_ref, "k": k_ref, "g": g_ref, "beta": beta_ref, "daqk": daqk_ref, "dakk": dakk_ref,
+             "last": last_ref, **({} if lo_ref is None else {"lo": lo_ref})}
+    sub = _SubChunk(named, start, taken, i, first, aligned, count, exact)
 
     @pl.when(first < taken)
     def _():
-        index = jnp.arange(SUB)
-        width = k_ref.shape[-1]
-        own_tokens = SUB if aligned else jnp.minimum(SUB, taken - first)
-        aligned_tokens = chunk if aligned else taken
-
-        def left(at):
-            """The chunk's rows from `at`: a whole sub-chunk's where every chunk is whole."""
-            return SUB if aligned else taken - at
-
-        def tile(ref, at):
-            return read_rows(_rows(ref, start + at, SUB), left(at))
-
-        def gates(at):
-            """The cumulated decay of the sub-chunk's rows from `at`, and its remainder."""
-            return (_gates(g_ref, start + at, left(at), SUB),
-                    None if lo_ref is None else _gates(lo_ref, start + at, left(at), SUB))
-
-        def scores(ref, row, column):
-            return read_rows(_rows(ref, start + row, SUB, pl.ds(column, SUB)), left(row)).astype(jnp.float32)
-
-        def row(ref, at):
-            return ref[start + at].astype(jnp.float32)
-
-        def decayed(at):
-            """The cumulated decay at the chunk's row `at`, `[1, K]`, and its remainder."""
-            return (_row(g_ref, start + at)[None, :],
-                    None if lo_ref is None else _row(lo_ref, start + at)[None, :])
-
-        def apart(later, earlier):
-            """`g_later - g_earlier`, of both halves where compensated."""
-            return later[0] - earlier[0] if lo_ref is None else compensated_difference(later, earlier)
-
-        gate = gates(first)
-        key = tile(k_ref, first).astype(jnp.float32)
-        beta = tile(beta_ref, first).astype(jnp.float32)
-        query = tile(q_ref, first).astype(jnp.float32)
-        weighted = key * beta[:, None]
-        origin = decayed(first)
-
-        def solved(left_operand, right_operand):
-            return _dot(left_operand, right_operand, exact=exact, solve=k_ref.dtype)
-
-        def earlier(j):
-            """Sub-chunk `j`'s keys decayed to this one's first row, `k_t exp2(g_first - g_t)`."""
-            return tile(k_ref, j * SUB).astype(jnp.float32) * jnp.exp2(apart(origin, gates(j * SUB)))
-
-        def before(j, sums):
-            gated = earlier(j)
-            return (sums[0] + solved(scores(daqk_ref, first, j * SUB), gated),
-                    sums[1] + solved(scores(dakk_ref, first, j * SUB), gated))
-
-        empty = jnp.zeros((SUB, width), jnp.float32)
-        dq2, dk2 = jax.lax.fori_loop(0, i, before, (empty, empty))
-        ahead = jnp.exp2(apart(gate, origin))
-        dq2, dk2 = dq2 * ahead, dk2 * ahead
+        tokens = SUB if aligned else jnp.minimum(SUB, taken - first)
+        query, key, beta = sub.tile("q", first), sub.tile("k", first), sub.tile("beta", first)
+        dq2, dk2 = _from_before(sub)
         # The pairs from the sub-chunks before to each of its rows, through the row.
-        held = query * dq2 + weighted * dk2
-        closing = decayed(first + own_tokens - 1)
-
-        def after(j, dkt):
-            behind = jnp.exp2(apart(gates(j * SUB), closing))
-            # k beta in the operands' dtype, as fla's b_kb, then widened by the decay.
-            later = (tile(k_ref, j * SUB) * tile(beta_ref, j * SUB)[:, None]).astype(jnp.float32)
-            reads = tile(q_ref, j * SUB).astype(jnp.float32) * behind
-            dkt = dkt + solved(scores(daqk_ref, j * SUB, first).T, reads)
-            return dkt + solved(scores(dakk_ref, j * SUB, first).T, later * behind)
-
-        dkt = jax.lax.fori_loop(i + 1, count, after, empty) * jnp.exp2(apart(closing, gate))
-        # The pairs from each of its tokens to the sub-chunks after.
-        leaving = key * dkt
-
-        def across(j, total):
-            """The pairs from the sub-chunks before to sub-chunk `j` after, through this one's first row."""
-            through = jnp.exp2(apart(gates(j * SUB), origin))
-            reads = tile(q_ref, j * SUB).astype(jnp.float32) * through
-            writes = (tile(k_ref, j * SUB) * tile(beta_ref, j * SUB)[:, None]).astype(jnp.float32) * through
-
-            def from_before(b, total):
-                gated = earlier(b)
-                return total + jnp.sum(reads * solved(scores(daqk_ref, j * SUB, b * SUB), gated)
-                                       + writes * solved(scores(dakk_ref, j * SUB, b * SUB), gated), axis=0)
-
-            return jax.lax.fori_loop(0, i, from_before, total)
-
-        spanning = jax.lax.fori_loop(i + 1, count, across, jnp.zeros((width,), jnp.float32))
-        # The write's terms to the chunk's last token from the tokens before the sub-chunk.
-        spanning = jax.lax.fori_loop(0, i, lambda j, total: total + jnp.sum(tile(last_ref, j * SUB), axis=0),
-                                     spanning)
-        writes = tile(last_ref, first)
-
-        def diagonal(j, carry):
-            """The sub-chunk's token `j` as a column of its rows `s >= j`: its key decayed by each pair's own
-            decay, and the decay's gradient at `j`, the pairs whose range holds it."""
-            dq2, dk2, running, ranged = carry
-            token = first + j
-            decay = jnp.exp2(apart(gate, decayed(token)))
-            causal = (index >= j)[:, None]
-            own = row(k_ref, token)[None, :] * decay
-            column = pl.ds(token, 1)
-            qk = read_rows(_rows(daqk_ref, start + first, SUB, column), left(first))
-            kk = read_rows(_rows(dakk_ref, start + first, SUB, column), left(first))
-            closed = (jnp.sum(jnp.where(causal, held + running, 0.0), axis=0)
-                      + jnp.sum(jnp.where(causal, 0.0, leaving + writes), axis=0))
-            pairs = jnp.where(causal, (qk * query + kk * weighted) * own, 0.0)
-            return (dq2 + jnp.where(causal, qk * own, 0.0), dk2 + jnp.where(causal, kk * own, 0.0),
-                    running + pairs, jnp.where((index == j)[:, None], closed[None, :], ranged))
-
-        dq2, dk2, _, ranged = jax.lax.fori_loop(0, own_tokens, diagonal, (dq2, dk2, empty, empty))
-        beta_grad = jnp.sum(dk2 * key, axis=1)
-        dk2 = dk2 * beta[:, None]
-        write_rows(_rows(dq2_ref, start + first, SUB), left(first), dq2 + tile(dq_ref, first))
-
-        def own(j, dkt):
-            token = first + j
-            reads = row(q_ref, token)
-            gated = row(k_ref, token) * row(beta_ref, token)
-            decay = jnp.exp2(apart(decayed(token), gate))
-            causal = (index <= j)[:, None]
-            qk = daqk_ref[start + token, pl.ds(first, SUB)]
-            kk = dakk_ref[start + token, pl.ds(first, SUB)]
-            dkt = dkt + jnp.where(causal, qk[:, None] * reads[None, :] * decay, 0.0)
-            return dkt + jnp.where(causal, kk[:, None] * gated[None, :] * decay, 0.0)
-
-        dkt = jax.lax.fori_loop(0, own_tokens, own, dkt)
-        write_rows(_rows(dk2_ref, start + first, SUB), left(first), dk2 + tile(dk_ref, first) + dkt)
-        write_rows(_rows(dg2_ref, start + first, SUB), left(first), ranged + spanning[None, :])
-        write_rows(_rows(db2_ref, start + first, SUB), left(first), beta_grad)
+        held = query * dq2 + key * beta[:, None] * dk2
+        dkt = _to_after(sub, sub.decayed(first + tokens - 1))
+        dq2, dk2, _, ranged = _own_pairs(sub, tokens, (dq2, dk2), held, key * dkt)
+        write_rows(_rows(dq2_ref, start + first, SUB), sub.left(first), dq2 + sub.tile_of(dq_ref, first))
+        write_rows(_rows(db2_ref, start + first, SUB), sub.left(first), jnp.sum(dk2 * key, axis=1))
+        dkt = _own_columns(sub, tokens, dkt)
+        write_rows(_rows(dk2_ref, start + first, SUB), sub.left(first),
+                   dk2 * beta[:, None] + sub.tile_of(dk_ref, first) + dkt)
+        write_rows(_rows(dg2_ref, start + first, SUB), sub.left(first), ranged + _spanning(sub)[None, :])
 
 
 @dataclasses.dataclass(frozen=True)
