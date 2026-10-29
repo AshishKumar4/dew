@@ -529,10 +529,10 @@ def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, whol
     (`generation.chosen`), its forward and backward lowered for an H100 on a mesh splitting its rows or its
     heads in two (`generation.gpu_mesh`): no array of any Mosaic launch holds the call's whole count of rows
     or heads, and each launch's operands hold a shard's own, half the call's
-    (`attention_parallel.per_shard`; the counts no other axis takes), so no device runs the global batch;
-    and the lowered program's own operations move no operand between devices (`sharded.MOVES`, as a
-    `shard_map` body would issue them; what the partitioner inserts after lowering is the compiled
-    program's, which this CPU does not build)
+    (`attention_parallel.on_attention_shards`; the counts no other axis takes), so no device runs the
+    global batch; and the lowered program's own operations move no operand between devices
+    (`sharded.MOVES`, as a `shard_map` body would issue them; what the partitioner inserts after lowering
+    is the compiled program's, which this CPU does not build)
     (bible §7: a new accelerator route qualifies through its real target lowering on a multi-device
     mesh)."""
     import math
