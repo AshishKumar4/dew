@@ -100,7 +100,7 @@ def test_joined_projections_keep_the_dtype_their_promotion_gives_a_wider_bias():
     assert_as_exact_as_the_reference(np.asarray(joined), np.asarray(apart), np.asarray(truth), "joined")
 
 
-@pytest.mark.parametrize("wrapped", ["direct", "dew", "input", "input_lora"])
+@pytest.mark.parametrize("wrapped", ["direct", "nested", "dew", "input", "input_lora"])
 def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrapped):
     from flax.errors import ScopeParamShapeError
 
@@ -108,7 +108,7 @@ def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrap
 
     layer = GatedMLP(hidden_features=96, out_features=64)
     inputs = jax.random.normal(jax.random.key(7), (2, 17, 64))
-    if wrapped == "direct":
+    if wrapped in ("direct", "nested"):
         qwix = pytest.importorskip("qwix")
         provider = qwix.QtProvider([qwix.QtRule(module_path=".*gate_proj", weight_qtype=jnp.int8,
                                                act_qtype=jnp.int8)])
@@ -122,6 +122,11 @@ def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrap
                 return self.child(x)
 
         quantized = Parent(quantized)
+        if wrapped == "nested":
+            # A parent quantized by a provider of its own, whose rules match nothing at the projections:
+            # the child's provider owns their products (`qwix.pallas.get_current_rule` reaches it).
+            quantized = qwix.quantize_model(quantized, qwix.QtProvider(
+                [qwix.QtRule(module_path="no_module", weight_qtype=jnp.int8)]))
     elif wrapped == "dew":
         quantized = Quantization().apply(layer)
     else:
