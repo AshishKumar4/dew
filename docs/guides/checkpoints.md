@@ -298,7 +298,9 @@ The grace period has to cover one step and one checkpoint write. When `dew launc
 
 A Colab runtime's disk goes with the runtime. Mounted Google Drive is a directory like any other to Dew, so a run that should resume on the next runtime keeps there what it cannot make again cheaply, and keeps the rest on the runtime's disk:
 
+<!-- not run: needs a Colab runtime with Google Drive; its objective, optimizer and key are the run's -->
 ```python
+import tensorflow_datasets as tfds
 from google.colab import drive
 
 import dew
@@ -309,13 +311,16 @@ drive.mount("/content/drive")
 root = "/content/drive/MyDrive/runs/flowers"
 
 enable_compilation_cache(f"{root}/xla")                      # compiled steps and the GPU's kernel picks
-train = TFDS("oxford_flowers102", path=f"{root}/data")         # the dataset as prepared once
-trainer = dew.Trainer(objective, checkpoints=dew.Checkpoints(
+# Prepared on the first runtime; a later one finds it there and prepares nothing.
+tfds.builder("oxford_flowers102", data_dir=f"{root}/data").download_and_prepare(file_format="array_record")
+train = TFDS("oxford_flowers102", path=f"{root}/data")
+trainer = dew.Trainer(objective, optimizer, key=key, checkpoints=dew.Checkpoints(
     f"{root}/checkpoints", local_directory="/content/checkpoints", local_every=200))
-trainer.fit(train.pipe(presets.images, 64, batch=16, augment=True, cache=f"{root}/images"), steps=10_000)
+trainer.fit(train.pipe(presets.images, 64, batch=16, augment=True, cache=f"{root}/images"), steps=10_000,
+            checkpoint_every=1_000)
 ```
 
-On a new runtime the same cell mounts Drive again and calls `fit` with the same directory, which resumes from the latest checkpoint and its data position ([Preemption](#preemption) covers the stop). The compilation cache spares the new runtime its compiles only on the same GPU model and jaxlib, which a Colab runtime does not promise. Drive is slower than the runtime's disk and counts against its quota, so the run writes its frequent checkpoint to the runtime's disk (`local_directory`, every 200 steps) and the ones it keeps to Drive every `checkpoint_every` steps, `keep` of them ([Time cadence and retention](#time-cadence-and-retention)). A runtime that ends loses only the local one: the next resumes from the latest on Drive.
+On a new runtime the same cell mounts Drive again and calls `fit` with the same directory, which resumes from the latest checkpoint and its data position ([Preemption](#preemption) covers the stop). The compilation cache spares the new runtime its compiles only on the same GPU model and jaxlib, which a Colab runtime does not promise. Drive is slower than the runtime's disk and counts against its quota, so the run writes its frequent checkpoint to the runtime's disk (`local_directory`, every 200 steps) and the ones it keeps to Drive every 1,000 steps (`checkpoint_every`), `keep` of them ([Time cadence and retention](#time-cadence-and-retention)). A runtime that ends loses only the steps since the last one on Drive, which the next resumes from. `TFDS(path=...)` reads data already prepared there and prepares none, so the cell prepares it with TFDS (Colab has TensorFlow) before reading it.
 
 ## Data position
 

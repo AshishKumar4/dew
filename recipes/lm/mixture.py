@@ -7,13 +7,13 @@ The sources are English Wikipedia's 2023-11-01 dump (prose, `text`), The Stack v
 functions (`content`) and UltraChat 200k's SFT conversations (`messages`), each read as the Hub stores it,
 streamed from its own Parquet shards. Text and code are tokenized and ended by EOS; a conversation is rendered
 through the tokenizer's chat template, and keeps only its tokens, as a pretraining row does not weigh speakers
-apart. The
-tokenizer is SmolLM2's, whose template renders each message the same whatever follows it, as `chat.template`
-needs (Qwen3's drops an earlier turn's reasoning once a later one follows, which it refuses). The
-three are mixed at 70/20/10 by valid target tokens (`mix(by="tokens")`) and packed first-fit into rows of
-`SEQ_LEN + 1` tokens. `--show N` reads the first N mixed documents and prints what a run would log of them
-(`Dataset.stats`), then each source's tokens among them and its share beside the share asked; `build` returns
-the batched pipeline for `trainer.fit`.
+apart. The tokenizer is SmolLM2's, whose template renders each message the same whatever follows it, as
+`chat.template` needs (Qwen3's drops an earlier turn's reasoning once a later one follows, which it refuses).
+The three are mixed at 70/20/10 by valid target tokens (`mix(by="tokens")`), cut into pieces of at most
+`SEQ_LEN + 1` tokens, overlapping by one so every target stays beside its input, and packed first-fit into
+rows of that length. `--show N` reads the first N mixed documents and prints what a run would log of them
+(`Dataset.stats`), then each source's valid targets among them, the count the mix weighs, and its share beside
+the share asked; `build` returns the batched pipeline for `trainer.fit`.
 """
 
 import dataclasses
@@ -22,6 +22,7 @@ import tyro
 
 from dew.data import Hub, chat, mix, text
 from dew.data.pipeline import Pipeline
+from dew.data.steps.text import ValidTargets
 
 TOKENIZER = "HuggingFaceTB/SmolLM2-360M-Instruct"
 TOKENIZER_REVISION = "a10cc1512eabd3dde888204e902eca88bddb4951"
@@ -58,8 +59,10 @@ def mixed(tok) -> Pipeline:
 
 
 def build(batch: int, seed: int = 0) -> Pipeline:
-    """Rows of `SEQ_LEN + 1` tokens, packed first-fit and shuffled, in batches of `batch`."""
-    return mixed(tokenizer()).pack(seq_len=SEQ_LEN + 1).shuffle(seed=seed, window=10_000).batch(batch)
+    """Rows of `SEQ_LEN + 1` tokens, a document longer than one cut first, packed first-fit and shuffled, in
+    batches of `batch`."""
+    return (mixed(tokenizer()).flat_map(text.Chunks(SEQ_LEN + 1, overlap=1)).pack(seq_len=SEQ_LEN + 1)
+            .shuffle(seed=seed, window=10_000).batch(batch))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,13 +76,14 @@ def main(args: Args) -> None:
     counts = mixed(tok).stats(records=args.show)
     for metric, value in sorted(counts.items()):
         print(f"{metric}: {value:g}")
-    # The mix read each source's first rows in order: the same rows read alone hold its tokens.
+    # The mix read each source's first rows in order: the same rows read alone hold its targets.
     parts = sources(tok)
-    tokens = {name: parts[name].stats(records=int(counts[f"data/rows/{name}"]))["data/tokens"]
-              for name in WEIGHTS}
-    total = sum(tokens.values())
+    targets = {name: sum(map(ValidTargets(), parts[name].take(int(counts[f"data/rows/{name}"]))))
+               for name in WEIGHTS}
+    total = sum(targets.values())
     for name, weight in WEIGHTS.items():
-        print(f"{name}: {tokens[name]:.0f} tokens, {tokens[name] / total:.3f} of the mix (asked {weight})")
+        print(f"{name}: {targets[name]} valid targets, {targets[name] / total:.3f} of the mix "
+              f"(asked {weight})")
 
 
 if __name__ == "__main__":
