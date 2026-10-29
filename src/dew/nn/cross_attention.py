@@ -187,6 +187,11 @@ class CrossBlocks(Protocol):
         `context_lengths` tokens."""
         ...
 
+    def held_flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
+        """The part of `flops` done by matrices the decoder holds, its layer's own, which train as its
+        trunk does: a frozen trunk's take no weight gradient (`dew.nn.flops.frozen_training_flops`)."""
+        ...
+
 
 @runtime_checkable
 class AttendsContext(Protocol):
@@ -202,6 +207,8 @@ class AttendsContext(Protocol):
     def context_heads(self) -> tuple[int, int, int]: ...
 
     def context_flops(self, lengths, context_lengths) -> float: ...
+
+    def context_projection_flops(self, lengths, context_lengths) -> float: ...
 
     def context_query(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]: ...
 
@@ -296,6 +303,10 @@ class CrossAttention:
         """Layer `index`'s block's work (`GatedCrossAttention.cross_flops`)."""
         return self.block(decoder, index)(parent=None).cross_flops(lengths, context_lengths)
 
+    def held_flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
+        """None: the block's matrices are its own, which train with it."""
+        return 0.0
+
 
 @dataclasses.dataclass(frozen=True)
 class SharedCrossAttention:
@@ -340,12 +351,21 @@ class SharedCrossAttention:
         """Layer `index`'s attention's read of the context (`AttendsContext.context_flops`)."""
         return self._attention(decoder, index).context_flops(lengths, context_lengths)
 
+    def held_flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
+        """Its read's projections, the layer's own matrices (`AttendsContext.context_projection_flops`):
+        all of its work but the attention between them."""
+        return self._attention(decoder, index).context_projection_flops(lengths, context_lengths)
+
     @staticmethod
     def _attention(decoder: CausalTransformer, index: int) -> AttendsContext:
         mixer = decoder.mixer_of(index)
-        if not isinstance(mixer, AttendsContext) or not mixer.reads_context:
-            raise ValueError(f"layer {index}'s mixer ({type(mixer).__name__}) projects no keys and values of "
-                             "its own to read a context with")
+        if not isinstance(mixer, AttendsContext):
+            raise ValueError(f"layer {index}'s mixer ({type(mixer).__name__}) reads no context through its "
+                             "own attention (AttendsContext, which CausalSelfAttention implements); name "
+                             "layers of standard attention, or read the context with CrossAttention's block")
+        if not mixer.reads_context:
+            raise ValueError(f"layer {index} shares its keys and values with an earlier layer, so it "
+                             "projects none of its own to read a context with")
         return mixer
 
 

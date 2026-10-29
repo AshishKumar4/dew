@@ -158,8 +158,8 @@ def test_a_scanned_stack_reads_through_each_layers_own_attention_as_the_plain_on
 
 
 def test_a_layer_with_no_attention_of_its_own_is_refused():
-    """A layer whose mixer projects no keys of its own (a state space mixer, a KV-sharing layer) has no
-    attention to read a context through, so the decoder that names it is refused as it is built."""
+    """A layer whose mixer reads no context through its own attention (a state space mixer) or projects
+    no keys of its own (a KV-sharing layer) is refused as the decoder that names it is built."""
     ids = jnp.ones((1, 4), jnp.int32)
     hybrid = CausalTransformer(
         vocab_size=37, emb_features=8, num_layers=2, num_heads=2, num_kv_heads=1, head_dim=4, mlp_features=16,
@@ -181,9 +181,62 @@ def test_cross_flops_count_each_layers_own_attention_over_the_context():
     lengths, context = np.array([5, 3]), np.array([6, 0])
     tokens, context_tokens, pairs = 8, 6, 5 * 6
     width, queries, keys = 32, 4 * 8, 2 * 8
-    per_read = (2 * 2 * width * queries * tokens + 2 * 2 * width * keys * context_tokens
-                + 2 * 4 * (8 + 8) * pairs)
+    projections = 2 * 2 * width * queries * tokens + 2 * 2 * width * keys * context_tokens
+    per_read = projections + 2 * 4 * (8 + 8) * pairs
     assert SHARED_MODEL.cross_flops(lengths, context) == len(SHARED.layer_ids) * per_read
+    # The projections are the layer's own matrices, which train as its trunk does; IDEFICS's block holds
+    # none of the decoder's.
+    assert SHARED_MODEL.held_cross_flops(lengths, context) == len(SHARED.layer_ids) * projections
+    assert MODEL.held_cross_flops(lengths, context) == 0
+
+
+def test_a_frozen_trunk_counts_no_weight_gradient_for_its_reads_through_its_own_matrices():
+    """Attached frozen to a source, the shared form trains its gates alone: the training count is a fully
+    trained decoder's less every trunk and head matrix's weight gradient and the weight gradient of the
+    reads' own projections (`held_cross_flops`), each a frozen layer's own matrix (row 2413)."""
+    from test_cross_attention import LLAMA
+
+    from dew.interop.pretrained import Pretrained
+    from dew.nn.inputs import ModelInputs
+    from dew.objectives.lm import LMObjective
+
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    attached = source.with_cross_attention(SharedCrossAttention((1,), 3), key=0)
+    width = attached.model.context_width
+    rng = np.random.default_rng(0)
+    batch = {"text": ModelInputs(jnp.asarray(rng.integers(0, 256, (2, 8)), jnp.int32), conditioning={
+        CONTEXT: jnp.asarray(rng.standard_normal((2, 3, width)), jnp.float32),
+        CONTEXT_LENGTHS: jnp.asarray([3, 1], jnp.int32)})}
+    frozen, trained = LMObjective(attached, 7), LMObjective(attached.model, 7)
+    rows, targets = frozen.real_lengths(batch), np.full(2, 7, np.int64)
+    held = attached.model.held_cross_flops(rows, np.asarray([3, 1]))
+    assert held > 0
+    weights = attached.model.parameter_flops(rows) + attached.model.logits_flops(targets) + held
+    assert trained.training_flops(None, batch) - frozen.training_flops(None, batch) == weights
+
+
+def test_a_row_without_context_sends_no_gradient_into_the_layers_projections():
+    """A row with no context reads its first slot so its softmax stays finite, and its block joins
+    nothing: the layer's key and value projections take the same gradient with that row's context
+    anything at all."""
+    variables, ids, context, lengths = model_draw(SHARED_MODEL)(3)
+    lengths = np.asarray(lengths).copy()
+    lengths[0] = 0
+
+    def projections(context):
+        def loss(params):
+            return jnp.sum(SHARED_MODEL.apply({**variables, "params": params}, ids,
+                                              conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths}))
+        grads = flat_tree(jax.grad(loss)(variables["params"]))
+        return {path: np.asarray(leaf) for path, leaf in grads.items()
+                if "k_proj" in path or "v_proj" in path}
+
+    moved = np.asarray(context).copy()
+    moved[0] = 1e3
+    plain, other = projections(context), projections(moved)
+    assert plain
+    for path, leaf in plain.items():
+        np.testing.assert_array_equal(leaf, other[path], err_msg=path)
 
 
 def test_the_gates_train_alone_over_a_frozen_source():

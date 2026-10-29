@@ -266,6 +266,10 @@ class MultimodalTransformer(DecoderWrapper):
         return self.language_model.cross_flops(lengths, context_lengths)
 
     @nn.nowrap
+    def held_cross_flops(self, lengths, context_lengths) -> float:
+        return self.language_model.held_cross_flops(lengths, context_lengths)
+
+    @nn.nowrap
     def with_cross_attention(self, cross: CrossBlocks | None) -> Self:
         return self._over(self.language_model.with_cross_attention(cross))
 

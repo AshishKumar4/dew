@@ -1132,6 +1132,16 @@ class CausalTransformer(nn.Module):
                    for index in cross.layer_ids)
 
     @nn.nowrap
+    def held_cross_flops(self, lengths, context_lengths) -> float:
+        """The part of `cross_flops` done by the decoder's own matrices (`CrossBlocks.held_flops`),
+        which train as its trunk does."""
+        cross = self.cross_attention
+        if cross is None:
+            return 0.0
+        return sum(self.layer_passes(index) * cross.held_flops(self, index, lengths, context_lengths)
+                   for index in cross.layer_ids)
+
+    @nn.nowrap
     def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec,
                            gated_mlp, routed, wiring: BlockWiring) -> list[MTPBlock]:
         """The multi-token prediction depths."""

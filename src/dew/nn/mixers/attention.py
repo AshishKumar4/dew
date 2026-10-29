@@ -850,15 +850,21 @@ class CausalSelfAttention(nn.Module):
     @nn.nowrap
     def context_flops(self, lengths, context_lengths) -> float:
         """Its read of a context's work over rows of `lengths` tokens reading `context_lengths`
-        (`attend_context`): the query, gate and output projections over the rows, the key and value
-        projections over the context, and the attention between them."""
+        (`attend_context`): its projections' (`context_projection_flops`) and the attention between
+        them."""
+        return self.context_projection_flops(lengths, context_lengths) + cross_attention_flops(
+            lengths, context_lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim)
+
+    @nn.nowrap
+    def context_projection_flops(self, lengths, context_lengths) -> float:
+        """The part of its read of a context done by its own matrices: the query, gate and output
+        projections over the rows of `lengths` tokens, the key and value projections over the context's
+        `context_lengths`."""
         maps = self.projections()
         rows = sum(projection_flops(lengths, *maps[name]) for name in ('q_proj', 'gate_proj', 'o_proj')
                    if name in maps)
-        context = sum(projection_flops(context_lengths, *maps[name]) for name in ('k_proj', 'v_proj')
-                      if name in maps)
-        return rows + context + cross_attention_flops(lengths, context_lengths, self.ctx.num_heads,
-                                                      self.ctx.head_dim, self.value_dim)
+        return rows + sum(projection_flops(context_lengths, *maps[name]) for name in ('k_proj', 'v_proj')
+                          if name in maps)
 
     def _turned(self, heads):
         """Query or key heads in the layout their rotation reads: with
