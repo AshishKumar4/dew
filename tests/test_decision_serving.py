@@ -213,8 +213,8 @@ def test_a_saved_run_records_its_widths_and_a_server_of_it_compiles_its_passes_u
         written.save(1, state, artifact=earlier)
         written.wait()
     today, before = (Decide.from_run(str(tmp_path / name)) for name in ("today", "earlier"))
-    assert (today.budget.questions, today.budget.options) == widths
-    assert (before.budget.questions, before.budget.options) == (None, None)
+    # A pass's question slots are its windows' (`Decide.pass_shapes`): its options pad to the run's.
+    assert today.budget.options == widths[1] and before.budget.options is None
     server = ScoringServer.from_task(*today.scoring())
     assert server.programs and server.programs == today.pass_shapes
     assert not ScoringServer.from_task(*before.scoring()).programs

@@ -807,7 +807,7 @@ def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refi
 
 
 def test_runs_whose_data_hold_other_widths_average_padded_to_the_widest(decide, tmp_path):
-    """The widths a pass pads to are no part of a run's weights (`DecideSettings.questions`): runs whose
+    """The options a pass pads to are no part of a run's weights (`DecideSettings.options`): runs whose
     data hold other widths average, the average padding each pass to the widest either recorded."""
     narrow = [Example("a short state", {"q": Choice("Which?", ["one", "two"])}, {"q": "one"})] * 4
     runs = (trained_runs(decide, tmp_path, 1)
@@ -815,8 +815,7 @@ def test_runs_whose_data_hold_other_widths_average_padded_to_the_widest(decide, 
     budgets = [Decide.from_run(run).budget for run in runs]
     assert budgets[0].options is not None and budgets[1].options == 2 < budgets[0].options
     average = Decide.averaged(runs).budget
-    assert (average.questions, average.options) == (max(budget.questions for budget in budgets),
-                                                    budgets[0].options)
+    assert average.options == budgets[0].options
 
 
 def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
