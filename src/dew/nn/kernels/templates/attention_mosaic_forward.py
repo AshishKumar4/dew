@@ -331,7 +331,8 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
               q_loaded, out_smem, row_smem, streams, turn, streamed: tuple, first, spans: _Spans | None,
               hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
-              residuals: _Residuals | None, anchors: tuple | None = None, interpret: bool):
+              residuals: _Residuals | None, anchors: tuple | None = None, interpret: bool,
+              fed: bool = False):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -367,8 +368,13 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                                 family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,)))
         start = start if live is None else algebra.headroomed(start, live)
     pl.when(consumer == 1)(turn)
-    # The slots before this block's first tile its partner reads, the turns it would have taken.
-    family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
+    if fed:
+        # Its consumers feed the stream themselves (`ConsumerFed`, `Family.fed`): every consumer walks the
+        # program's tiles, a tile none of its queries sees masked whole.
+        lo, hi = streamed
+    else:
+        # The slots before this block's first tile its partner reads, the turns it would have taken.
+        family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
 
     def scored(index, slots):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
@@ -418,8 +424,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                                    ((tiles.block_q, value_width),), interpret, first=streamed[0],
                                    initial=(start.acc,))
         state = algebra.Partial(acc, *rows)
-    # The slots past this block's last tile (a causal block whose diagonal ends first) its partner reads.
-    family.passed(streams, hi, streamed[1], first=streamed[0], between=lambda: (turn(), turn()))
+    if not fed:
+        # The slots past this block's last tile (a causal block whose diagonal ends first) its partner reads.
+        family.passed(streams, hi, streamed[1], first=streamed[0], between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
     overflowed = jnp.where(algebra.overflowed(state.acc), 1.0, 0.0)
     family.stored((family.as_row(state.m), family.as_row(overflowed)), status_views, smem=row_smem)
@@ -578,10 +585,12 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                                        stages[0].at[index])
             else:
                 out_view = outputs[0].at[rows]
+            fed = isinstance(family, mosaic.ConsumerFed)
+            walked = family.fed(streams, views, *streamed, index) if fed else streams
             _consumer(program, spec, index, q_ref.at[rows], out_view, status, q_smem.at[index],
-                      q_loaded.at[index], out_smem.at[index], row_smem.at[index], streams, turn, streamed,
+                      q_loaded.at[index], out_smem.at[index], row_smem.at[index], walked, turn, streamed,
                       first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)), hooks=hooks,
-                      residuals=residuals, anchors=anchors_of, interpret=interpret)
+                      residuals=residuals, anchors=anchors_of, interpret=interpret, fed=fed)
 
         def producer():
             family.stream(streams, views, *streamed)

@@ -146,7 +146,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # A forward's and a dQ launch's layout streams through a producer (`Family.stream`); a layout whose
         # consumers feed their own rings (`split_queries`) runs the dK/dV launches alone: the keys-first one,
         # and the fused one, each consumer its own keys over the stream they walk whole.
-        fed_alone = isinstance(config, BackwardTiles) and config.fused and not config.dkv_apart
+        fed_alone = ((isinstance(config, BackwardTiles) and config.fused and not config.dkv_apart)
+                     or (isinstance(config, Tiles) and ba.arguments.get("residuals") is not True))
         return (family is not None and (fed_alone or not split_queries(family))
                 and whole_tiles(family, config) and self.refusal(ba, family) is None
                 and super().legal(ba, config, target))
