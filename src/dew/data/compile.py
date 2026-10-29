@@ -1450,6 +1450,12 @@ def fitted[Entry](
     training batch, and is read and loaded as it asks. A Loader is already
     compiled, and an entry that is no Dataset (a reader, an evaluation suite)
     is passed on as it is."""
+    if not isinstance(dataset, (Dataset, Loader)):
+        if examples is not None:
+            raise ValueError("examples= counts a Dataset chain's source examples, and data handed as it "
+                             "is has none: read it as a chain (dew.data.Grain, dew.data.Memory), or set "
+                             "steps=")
+        dataset = native_loader(dataset)
     named = {"val": validation} if isinstance(validation, Dataset) else validation
     # Every chain the run reads binds the widths measured over them all (`run_widths`), each measured
     # once, as its read prepares it, and read on from there.
@@ -1474,14 +1480,7 @@ def fitted[Entry](
                          widths=widths, read=read, measured=measured)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
-        if isinstance(dataset, Loader):
-            loader = dataset
-        elif examples is not None:
-            raise ValueError("examples= counts a Dataset chain's source examples, and data handed as it "
-                             "is has none: read it as a chain (dew.data.Grain, dew.data.Memory), or set "
-                             "steps=")
-        else:
-            loader = native_loader(dataset)
+        loader = dataset
     if named is None:
         return loader, None
     return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed, widths=widths,
