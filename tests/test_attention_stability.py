@@ -883,7 +883,7 @@ PAST_TARGET = {
                     ("a resumed state beside an overflowing column",): 120,
                     ("a column near fp32's least normal beside an overflowing one",): 119,
                     ("a cotangent on a small column beside an overflowing one",): 118},
-    "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "natural"): 143}}
+    "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "default"): 143}}
 """The cases past or within 5 s of a group's 120 s target, by test and case, each its seconds on armada in
 train 281's or 283's CI (5861ec46b, 8089624e4; rows 2117, 2193, 2204): the whole suite's run holds them
 (`timed`), every other case of their tests runs each train."""
@@ -1107,10 +1107,11 @@ def test_gradients_at_a_scale_far_below_one_are_on_par(options, name, dtype):
 DECODED = [(family, form) for family, form in FAMILY_RUNS
            if FAMILIES[family].draw(0)[0].shape[1] == 1 and FAMILIES[family].draw(0)[0].shape[3] >= 16
            and not isinstance(FAMILIES[family].draw(0)[3], tuple)
-           and not (form == "default" and jnp.dtype(FAMILIES[family].dtype) == jnp.float32)]
+           and not (form == "natural" and jnp.dtype(FAMILIES[family].dtype) == jnp.float32)]
 """The families a decode step is: one query a row, a head width the decode kernel takes (16 to 256),
-sinks or none (a resumed state is the template's); fp32 operands in the natural form alone, which is the
-decode kernel's default for them (ledger 2151)."""
+sinks or none (a resumed state is the template's); fp32 operands in the default form alone, which resolves
+to natural logits for them (`decode_attention._spec`, ledger 2151), so the resolution a caller gets is the
+one checked."""
 
 
 def _cache(array: jax.Array) -> jax.Array:
