@@ -435,9 +435,9 @@ def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite."""
     k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH)
     # k's third by its product with fp32's 1/3, the integer quotient for every integral |k| the clip leaves
-    # (POWER2_REACH): k * fl(1/3) exceeds k / 3 by under |k| * 2^-25, far below the 1/3 by which a non-multiple
-    # of 3 falls short of the next integer, so the truncation lands where the division's would. An integer
-    # division costs the Mosaic mainloops registers they don't have (sm80's GDN training cases spilled).
+    # (POWER2_REACH): k * fl(1/3) exceeds k / 3 by under |k| * 2^-25, far below the 1/3 by which a
+    # non-multiple of 3 falls short of the next integer, so the truncation lands where the division's would.
+    # An integer division costs the Mosaic mainloops registers they don't have (sm80's GDN training spilled).
     first = jnp.trunc(k * np.float32(1 / 3))
     second = jnp.trunc((k - first) / 2)
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
