@@ -34,11 +34,12 @@ from dew.nn.precision import (
     l2norm,
     products_dtype,
     rms_statistics,
+    rms_weighted,
     stochastic_bf16,
 )
 
 from ..sharding import explicit_spec
-from . import chunked_launch, norm_swiglu, short_conv, tuning
+from . import chunked_launch, short_conv, tuning
 from .generation import INHERENT, Refusal, linear_tangent, triton_runs
 
 
@@ -167,7 +168,7 @@ def gated_rms(out, z, weight, norm: OutputNorm):
     """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`, its
     inverse RMS the one statistic every norm takes (`rms_statistics`)."""
     inverse = rms_statistics(out, norm.epsilon)[1]
-    return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
+    return rms_weighted(out, inverse, weight=weight, gate=z, activation=norm.activation)
 
 
 ROW = {"rows": True}
