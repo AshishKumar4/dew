@@ -407,22 +407,24 @@ def exp2_reach(native) -> int:
 @dataclasses.dataclass(frozen=True)
 class Run:
     """A call's operands as its launches read them and its records, one row: `q`, `k` `[T, Hk, Dk]`, `v` `[T,
-    H, Dv]`, `g`, `beta` `[T, H]`, `h0` `[H, Dk, Dv]` (float64 of their dtypes' values), and each chunk and
-    head's stored inverse less its diagonal `a` `[N, H, C, C]`, weighted keys `w` `[N, H, C, Dk]`, entering
-    memory `h` `[N, H, Dk, Dv]`, corrected values `c` and output `o` `[N, H, C, Dv]`, and the final memory
-    `final` `[H, Dk, Dv]`, an fp32 call's three parts summed."""
+    H, Dv]`, `g`, `beta` `[T, H]` (float64 of their dtypes' values); each chunk and head's stored inverse less
+    its diagonal `a` `[N, H, C, C]`, weighted keys `w` `[N, H, C, Dk]`, entering memory `h` `[N, H, Dk, Dv]`,
+    corrected values `c` and output `o` `[N, H, C, Dv]`, an fp32 call's three parts summed; and the fp32
+    memory each chunk leaves, `carries` `[N + 1, H, Dk, Dv]` from the initial memory: the final memory of the
+    call over the chunks before it, at the same tiles (`recorded`), the state the states launch carries in
+    fp32 and stores rounded as `h` (`seams`)."""
     q: np.ndarray
     k: np.ndarray
     v: np.ndarray
     g: np.ndarray
     beta: np.ndarray
-    h0: np.ndarray
     a: np.ndarray
     w: np.ndarray
     h: np.ndarray
     c: np.ndarray
     o: np.ndarray
-    final: np.ndarray
+    carries: np.ndarray
+    seams: np.ndarray
 
     @property
     def chunks(self) -> int:
@@ -432,28 +434,23 @@ class Run:
     def heads(self) -> int:
         return self.a.shape[1]
 
-    def step(self, n: int, head: int, lane: Lane, *, carry: Iv | None = None) -> Step:
-        """Chunk `n` and value head `head`'s step: its operands, its records and the carry entering it (the
-        first chunk's initial memory exactly; an fp32 call's stored memory; a 16-bit call's the fp32 values
-        rounding to its stored memory), unless given."""
+    def step(self, n: int, head: int, *, carry: Iv | None = None) -> Step:
+        """Chunk `n` and value head `head`'s step: its operands, its records and the fp32 memory it enters
+        (`carries`), unless given."""
         rows, key = slice(n * CHUNK, (n + 1) * CHUNK), head // (self.heads // self.k.shape[1])
-        if carry is None:
-            carry = (point(self.h0[head]) if n == 0 else point(self.h[n, head]) if lane.held is None
-                     else cell(self.h[n, head], lane.held))
         return Step(self.q[rows, key], self.k[rows, key], self.v[rows, head], self.g[rows, head],
                     self.beta[rows, head], self.a[n, head], self.w[n, head], self.h[n, head], self.c[n, head],
-                    carry)
-
-    def leaving(self, n: int, head: int) -> np.ndarray:
-        """The memory chunk `n` leaves in its record: the next chunk's stored memory, or the final memory."""
-        return self.h[n + 1, head] if n + 1 < self.chunks else self.final[head]
+                    point(self.carries[n, head]) if carry is None else carry)
 
 
-def recorded(q, k, v, g, beta, h0, *, starts=None) -> Run:
+def recorded(q, k, v, g, beta, h0, *, starts=None, carried: bool = True) -> Run:
     """The records of the gated delta rule's call on the template, forced (`generation.chosen`) at JAX's own
     default precision as a model runs it: `mainloop.kept_forward` at the tiles the route takes
     (`tuning.seen`), its output and final memory bit for bit the route's own (the certify build is the
-    production program), on the device's bundle, interpreted off a GPU. Operands `[1, T, ...]`."""
+    production program), on the device's bundle, interpreted off a GPU. Operands `[1, T, ...]`. With
+    `carried`, each chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to
+    it, whose final memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`,
+    each chunk's: end_j == start_{j+1}); without, the initial and the final memories alone."""
     import jax
     import jax.numpy as jnp
 
@@ -461,24 +458,30 @@ def recorded(q, k, v, g, beta, h0, *, starts=None) -> Run:
     from dew.nn.kernels.templates.recurrence import mainloop, template
 
     operands = (q, k, v, g, beta, h0)
+    dtype = jnp.result_type(q, k, v)
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with tuning.seen() as launches:
             o, final = jax.jit(lambda *x: recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts))(
                 *operands)
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
-        dtype = jnp.result_type(q, k, v)
-        kept = jax.jit(lambda *x: mainloop.kept_forward(
-            *x, tiles=tiles, starts=starts, scale=k.shape[-1] ** -0.5,
-            family=mainloop.family_of(dtype) or mainloop.INTERPRETED,
-            interpret=generation.backend() != "gpu"))(*operands)
-    kept_o, kept_final, (a, (w, h, c)) = kept
-    for native, own in ((o, kept_o), (final, kept_final)):
-        assert np.array_equal(np.asarray(native).view(np.uint8), np.asarray(own).view(np.uint8)), \
-            "the certify build is the production program"
+
+        def kept(*x, starts=starts):
+            return jax.jit(lambda *x: mainloop.kept_forward(
+                *x, tiles=tiles, starts=starts, scale=k.shape[-1] ** -0.5,
+                family=mainloop.family_of(dtype) or mainloop.INTERPRETED,
+                interpret=generation.backend() != "gpu"))(*x)
+
+        kept_o, kept_final, (a, (w, h, c)) = kept(*operands)
+        for native, own in ((o, kept_o), (final, kept_final)):
+            assert np.array_equal(np.asarray(native).view(np.uint8), np.asarray(own).view(np.uint8)), \
+                "the certify build is the production program"
+        _, length, heads, value_width = v.shape
+        key_width, chunks = k.shape[-1], length // CHUNK
+        ends = [kept(*(x[:, :n * CHUNK] for x in operands[:5]), h0,
+                     starts=None if starts is None else starts[:, :n * CHUNK])[1]
+                for n in range(1, chunks)] if carried else []
     parts = 3 if jnp.dtype(dtype) == jnp.float32 else 1
-    _, length, heads, value_width = v.shape
-    key_width, chunks = k.shape[-1], length // CHUNK
 
     def summed(x, rows):
         return np.asarray(x, np.float64).reshape(parts, rows, -1).sum(0)
@@ -489,37 +492,46 @@ def recorded(q, k, v, g, beta, h0, *, starts=None) -> Run:
     def host(x):
         return np.asarray(np.asarray(x).astype(np.float32 if parts == 3 else x.dtype), np.float64)[0]
 
+    memories = summed(h, chunks * heads * key_width).reshape(chunks, heads, key_width, value_width)
+    stored = jnp.float32 if parts == 3 else dtype
+    seams = np.asarray([np.array_equal(np.asarray(np.asarray(end[0]).astype(stored), np.float64),
+                                       memories[n + 1]) for n, end in enumerate(ends)], bool)
+    carries = [np.asarray(h0, np.float64)[0], *(np.asarray(end, np.float64)[0] for end in ends)]
+    unknown = np.full(carries[0].shape, np.nan)
+    carries += [unknown] * (chunks - len(carries)) + [np.asarray(kept_final, np.float64)[0]]
     return Run(host(q), host(k), host(v), np.asarray(g, np.float64)[0],
                np.asarray(jnp.asarray(beta).astype(dtype).astype(jnp.float32), np.float64)[0],
-               np.asarray(h0, np.float64)[0], chunked(a, CHUNK), chunked(w, key_width),
-               summed(h, chunks * heads * key_width).reshape(chunks, heads, key_width, value_width),
-               chunked(c, value_width),
+               chunked(a, CHUNK), chunked(w, key_width), memories, chunked(c, value_width),
                np.asarray(kept_o, np.float64)[0].reshape(chunks, CHUNK, heads, value_width).transpose(
                    0, 2, 1, 3),
-               np.asarray(kept_final, np.float64)[0])
+               np.stack(carries), seams)
 
 
-def witness(run: Run, lane: Lane) -> dict[str, np.ndarray]:
+def witness(run: Run, lane: Lane) -> dict:
     """Whether each record of `run` lies inside its step's enclosure (`enclosures`), by record `[N, H, ...]`:
-    `a`, `w`, `c`, `o`, the entering memory `h` (the first chunk's its initial memory stored), and `leaving`,
-    each chunk's leaving memory (the next chunk's stored, or the final memory, fp32), with each enclosure's
-    width in its record's units of the last place (`ulps`) under `ulps`."""
+    `a`, `w`, `c`, `o`, the stored memory each chunk enters `h` (the first's its initial memory stored), and
+    `leaving`, the fp32 memory each chunk leaves (`Run.carries`), each step from the fp32 memory it enters;
+    and each enclosure's width in units of the last place of its record's grid, at the record (`ulps`) and
+    at its row's largest (`spans`)."""
     scale = run.k.shape[-1] ** -0.5
-    held: dict[str, list] = {name: [] for name in ("a", "w", "c", "o", "leaving")}
-    widths: dict[str, list] = {name: [] for name in held}
+    names = ("a", "w", "c", "o", "h", "leaving")
+    held: dict[str, list] = {name: [] for name in names}
+    widths: dict[str, list] = {name: [] for name in names}
+    spans: dict[str, list] = {name: [] for name in names}
     for n in range(run.chunks):
         for head in range(run.heads):
-            step = run.step(n, head, lane)
+            step = run.step(n, head)
             found = enclosures(step, scale, lane)
-            last = n + 1 == run.chunks
-            found["leaving"] = found["h"] if last else stored_memory(found["h"], lane)
-            records = {"a": step.a, "w": step.w, "c": step.c, "o": run.o[n, head],
-                       "leaving": run.leaving(n, head)}
+            found["leaving"] = found["h"]
+            found["h"] = stored_memory(point(run.carries[n, head]), lane)
+            records = {"a": step.a, "w": step.w, "c": step.c, "o": run.o[n, head], "h": step.h,
+                       "leaving": run.carries[n + 1, head]}
             for name, record in records.items():
                 held[name].append(within(record, found[name]))
-                grid = FLOAT32 if name == "leaving" and last else lane.held or FLOAT32
+                grid = FLOAT32 if name == "leaving" else lane.held or FLOAT32
                 widths[name].append(ulps(found[name], record, grid))
-    first = within(run.h[0], stored_memory(point(run.h0), lane))
+                spans[name].append(ulps(found[name], np.max(np.abs(record), -1, keepdims=True), grid))
     shaped = {name: np.stack(values).reshape(run.chunks, run.heads, *values[0].shape)
               for name, values in held.items()}
-    return {**shaped, "h": first, "ulps": {name: np.stack(values) for name, values in widths.items()}}
+    return {**shaped, "ulps": {name: np.stack(values) for name, values in widths.items()},
+            "spans": {name: np.stack(values) for name, values in spans.items()}}
