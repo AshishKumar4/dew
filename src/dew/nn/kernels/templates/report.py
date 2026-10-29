@@ -56,8 +56,18 @@ class Launch:
     config: Hashable
 
 
-_TRACING: contextvars.ContextVar[str | None] = contextvars.ContextVar("tracing_launch", default=None)
-"""The digest of the launch tracing now (`launching`), which its kernels' names carry (`named`)."""
+@dataclasses.dataclass
+class _Pending:
+    """The launch tracing now. Its identity is evaluated only if a Mosaic kernel asks for its name;
+    bound arguments live in this tracing scope, never in the process's launch registry."""
+    identity: Callable[[], str]
+    op: str
+    config: Hashable
+    digest: str | None = None
+
+
+_TRACING: contextvars.ContextVar[_Pending | None] = contextvars.ContextVar("tracing_launch", default=None)
+"""The pending launch whose Mosaic kernels acquire their digest through `named`."""
 _LAUNCHES: dict[str, Launch] = {}
 """Each launch this process traced, by its digest."""
 @dataclasses.dataclass
@@ -126,11 +136,7 @@ def _digest(text: str) -> str:
 def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterator[None]:
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
     the same in every process, and their reports name the launch (`Report.launch`, `traced`)."""
-    identity = _identity(op, arguments)
-    digest = _digest(f"{identity}|{config!r}")
-    with _GUARD:
-        _LAUNCHES.setdefault(digest, Launch(identity, type(op).__name__, config))
-    token = _TRACING.set(digest)
+    token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config))
     try:
         yield
     finally:
@@ -140,8 +146,16 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
 def named(name: str | None) -> str | None:
     """A kernel's name carrying the launch tracing it (`launching`; `kernel` for an unnamed one), as is
     where none is."""
-    digest = _TRACING.get()
-    return name if digest is None else f"{name or 'kernel'}__l{digest}"
+    pending = _TRACING.get()
+    if pending is None:
+        return name
+    if pending.digest is None:
+        identity = pending.identity()
+        digest = _digest(f"{identity}|{pending.config!r}")
+        with _GUARD:
+            _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config))
+        pending.digest = digest
+    return f"{name or 'kernel'}__l{pending.digest}"
 
 
 def traced(digest: str) -> Launch | None:
