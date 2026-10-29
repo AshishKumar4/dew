@@ -2030,6 +2030,22 @@ def a_wheel(root: Path, name: str, version: str) -> Path:
     return wheel
 
 
+@pytest.mark.parametrize("mark", ["release_env()", "release_env(requirement='pinned==2.0')",
+                                  "release_env('pinned==2.0', 'other==1.0')", "release_env(2)"])
+def test_a_release_mark_without_one_requirement_fails_its_files_collection(ci, tmp_path, monkeypatch, mark):
+    """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string) fails its
+    file's collection, naming its test: every suite task sets a marked test aside, and no release task would plan
+    it, so it would run nowhere (Main's read of b94d89999)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_release.py": f"import pytest\n@pytest.mark.{mark}\n"
+                       "def test_under_the_release():\n    pass\n"
+                       "def test_plain():\n    pass\n"})
+    (tmp_path / ".verdict").mkdir()
+    [row] = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
+    assert row["exitCode"] != 0, row["output"]
+    assert "tests/test_release.py::test_under_the_release" in row["output"] and "release_env" in row["output"]
+
+
 def test_a_release_check_runs_in_the_whole_suites_second_job_under_its_requirement(ci, tmp_path, monkeypatch,
                                                                                    capsys):
     """A test marked release_env(<requirement>) checks a release's own code under a package pinned apart from
