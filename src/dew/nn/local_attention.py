@@ -13,18 +13,15 @@ from dew.batch import prefix_sum, valid_order
 from dew.mesh import SEQUENCE_AXIS, logical_spec
 
 from .attention import (
-    SPLASH_LANES,
     attention_kernel,
-    chunk_mask,
-    combined_attention_mask,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
-    query_split,
     resolve_implementation,
     scaled_dot_product_attention,
-    split_with_queries,
-    tensor_shards,
 )
+from .attention_kernels import SPLASH_LANES
+from .attention_masks import chunk_mask, combined_attention_mask
+from .attention_parallel import query_split, split_with_queries, tensor_shards
 from .documents import with_documents
 from .inputs import sequence_blocks
 from .kernels.selection import forced
