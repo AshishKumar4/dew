@@ -38,6 +38,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
+from model_support import decode_through
 from quantized_basis import dequantized_in_own_basis
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
@@ -454,19 +455,6 @@ def test_a_paged_drafting_cache_drafts_what_the_compact_cache_drafts(source, qua
                                   drafted(KVCache(quantized=quantized)))
 
 
-def window_decode_loop(module, variables, hidden):
-    """One-token decode steps of a V4 attention layer over `hidden`, from an empty cache."""
-    state = module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True))
-    state = {**state, "params": variables["params"]}
-    outputs = []
-    for step in range(hidden.shape[1]):
-        out, mutated = module.apply(state, hidden[:, step:step + 1], MixerCall(decode=True),
-                                    mutable=["cache"])
-        state = {**state, "cache": mutated["cache"]}
-        outputs.append(out)
-    return jnp.concatenate(outputs, axis=1)
-
-
 def uncached_window_steps(module, variables, hidden, quantized: str):
     """A sliding V4 layer's per-step outputs over `hidden` with no cache: every position's
     projections computed once, the shared window head dequantized in its own basis as the keys
@@ -520,8 +508,8 @@ def test_a_quantized_window_cache_decodes_what_dequantizing_in_the_own_basis_com
     hidden = jax.random.normal(jax.random.key(7), (2, 6, 32))
     variables = {"params": module.init(jax.random.key(3), hidden[:, :1],
                                        MixerCall(decode=True))["params"]}
-    decoded = np.asarray(jax.jit(lambda variables, hidden: window_decode_loop(module, variables, hidden))(
-        variables, hidden))
+    decoded = np.asarray(jax.jit(
+        lambda variables, hidden: decode_through(module, variables, hidden, prefill=1)[0])(variables, hidden))
     own = np.asarray(jax.jit(
         lambda variables, hidden: uncached_window_steps(module, variables, hidden, quantized))(
         variables, hidden))

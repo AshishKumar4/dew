@@ -27,8 +27,9 @@ def hadamard_basis(size: int) -> np.ndarray:
 def dequantized_in_own_basis(values, quantized: str, *, keys: bool):
     """`values` [..., D] as a `quantized` cache reads them back in their own basis: quantized
     per vector and dequantized, int8 keys through the Hadamard rotation and back, in `values`'
-    dtype. The rotations sum in float64 and round once, as the cache's own do, so where a
-    consumer reads the same values back in this basis its steps agree bit for bit."""
+    dtype. The rotations sum in float64 and round once, where the cache's own sum in float32
+    (`dew.nn.kv_cache.rotated`): an int8 consumer agrees with them to check 1, and float8, which
+    stores its values unrotated, bit for bit."""
     def rotated(v, basis):
         with jax.enable_x64():
             return jnp.einsum("...d,de->...e", v.astype(jnp.float64), jnp.asarray(basis)).astype(v.dtype)

@@ -37,6 +37,7 @@ import pytest
 import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
+from model_support import decode_through
 from quantized_basis import dequantized_in_own_basis
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
@@ -301,16 +302,8 @@ def test_yarn_over_a_partial_rotary_ramps_the_rotated_width_and_refuses_a_propor
 
 
 def decode_loop(module, variables, tokens):
-    """Prefill plus one-token steps, the sampler's decode protocol."""
-    state = module.init(jax.random.key(0), tokens[:, :1], MixerCall(decode=True))
-    state = {**state, "params": variables["params"]}
-    outputs = []
-    for position in range(tokens.shape[1]):
-        out, mutated = module.apply(
-            state, tokens[:, position:position + 1], MixerCall(decode=True), mutable=["cache"])
-        state = {**state, "cache": mutated["cache"]}
-        outputs.append(out)
-    return jnp.concatenate(outputs, axis=1)
+    """One-token steps through the decode cache, the sampler's decode protocol (`decode_through`)."""
+    return decode_through(module, {"params": variables["params"]}, tokens, prefill=1)[0]
 
 
 SETTINGS = {"mla_v3": "v3", "mla_v3n": "v3n", "mla_v32": "v32"}
@@ -1063,3 +1056,98 @@ def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
 
     seeds = seeds_for(masked(decoder), draw, "mla prefix run loss", truth_fn=masked(wide))
     assert_as_exact(dew, masked(decoder), draw, "mla prefix run loss", seeds=seeds, truth_fn=masked(wide))
+
+
+def test_a_latent_attention_source_reads_its_blocks_whole_through_its_config_and_export(tmp_path):
+    """A DeepSeek-V3 source whose config states its attention block-bidirectional
+    (`modeling_overrides`) loads its latent attention reading blocks whole: a block group lets the
+    first token see a later one, which a causal read does not. Its export states the override again, and
+    the reload computes the same logits under the groups, bit for bit."""
+    from interop_support import respelled
+
+    from dew.interop import Pretrained
+
+    override = {"modeling_overrides": {"attention": {"full_attention": "block_bidirectional"}}}
+    source = respelled(Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tiny",
+                       tmp_path / "source", lambda config: {**config, **override})
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    tokens = jnp.asarray([[10, 11, 12, 13]], jnp.int32)
+    altered = tokens.at[0, 1].set(14)
+    groups = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
+
+    def first(state, ids, **metadata):
+        return np.asarray(state.model.apply(state.variables, ids, **metadata))[0, 0]
+
+    np.testing.assert_array_equal(first(loaded, tokens), first(loaded, altered))
+    assert np.any(first(loaded, tokens, block_groups=groups) != first(loaded, altered, block_groups=groups))
+    loaded.save(tmp_path / "exported")
+    again = Pretrained.load(tmp_path / "exported", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(
+        np.asarray(again.model.apply(again.variables, tokens, block_groups=groups)),
+        np.asarray(loaded.model.apply(loaded.variables, tokens, block_groups=groups)))
+
+
+def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_prefix_whole(tmp_path):
+    """Row 41 through a recorded run (`LMRunConfig`, `dew train`'s): a decoder whose layer kind windows a
+    latent attention that reads blocks whole trains with an lm prefix over token files, and the model the
+    run saved scores tokens on par with an explicit mask written apart from Dew (`block_causal`: the
+    prefix a block read whole, every other key within the window), from that mask's float64 run
+    (check 1), the prefix's own targets left out."""
+    from block_support import block_causal
+    from reference_error import seeds_for
+    from token_support import write_token_corpus
+
+    from dew.batch import TEXT_KEY
+    from dew.config import ObjectiveConfig
+    from dew.config.lm import LMRunConfig
+    from dew.data import Loading, presets
+    from dew.data.sources.tokens import TokenFiles
+    from dew.inference import TextGeneration
+    from dew.objectives.lm.objective import batch_text
+    from dew.registry import ModelConfig
+
+    seq, prefix, window, vocabulary = 8, 3, 3, 256
+    rng = np.random.RandomState(0)
+    corpus = write_token_corpus(tmp_path / "tokens", rng.randint(1, 250, 40 * seq).astype(np.uint8))
+    settings = CONFIG["v3"]
+    mixer = mla_record(settings)
+    mixer["fields"]["bidirectional_blocks"] = True
+    fields = {"emb_features": settings["hidden_size"], "num_layers": 1,
+              "num_heads": settings["num_attention_heads"],
+              "head_dim": settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"], "mlp_features": 48,
+              "qk_norm": False, "mixer": mixer, "attention_impl": "reference", "dtype": "float32",
+              "layer_types": ["local"], "kinds": {"local": {"window": window}}}
+    chain = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=seq, batch=8, pack=None)
+    default = LMRunConfig(data=chain.loading(Loading(workers=0)),
+                          model=ModelConfig("causal_transformer", fields),
+                          objective=ObjectiveConfig("lm", {"prefix": prefix}), max_new_tokens=0)
+    LMRunConfig.cli(["--trainer.steps", "2", "--trainer.name", "prefix", "--trainer.checkpoint-dir",
+                     str(tmp_path / "runs"), "--trainer.compilation-cache-dir", "None",
+                     "--trainer.multi-host", "False", "--trainer.log-every", "1", "--trainer.eval-every",
+                     "None", "--trainer.checkpoint-every", "2"], default=default).run()
+    restored = TextGeneration.from_run(str(tmp_path / "runs" / "prefix"))
+    objective = LMObjective(restored.model, seq, prefix=prefix)
+    blocks = np.broadcast_to(np.where(np.arange(seq + 1) < prefix, 1, -1), (2, seq + 1)).astype(np.int32)
+    keep = jnp.asarray(block_causal(blocks, window=window)[:, :-1, :-1])
+    counted = ~((blocks[:, :-1] == blocks[:, 1:]) & (blocks[:, :-1] >= 0))
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.fold_in(jax.random.key(7), seed), (2, seq + 1), 1, vocabulary),)
+
+    def masked(model, variables):
+        def losses(tokens):
+            logits = model.apply(variables, tokens[:, :-1], attention_pairwise_mask=keep)
+            lost = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
+            return lost, jnp.asarray(counted, lost.dtype)
+        return losses
+
+    def dew(tokens):
+        scores = objective.token_scores(restored.variables,
+                                        batch_text({TEXT_KEY: tokens, "text_block_groups": blocks}))
+        return scores.losses, scores.weights
+
+    # The gate runs the truth in float64 (check 1), the float64 model over the saved weights.
+    truth = masked(restored.model.clone(dtype=jnp.float64), restored.variables)
+    reference = masked(restored.model, restored.variables)
+    seeds = seeds_for(reference, draw, "recorded mla prefix run", truth_fn=truth)
+    assert_as_exact(dew, reference, draw, "recorded mla prefix run", seeds=seeds, truth_fn=truth)
