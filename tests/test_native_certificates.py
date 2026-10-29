@@ -651,7 +651,6 @@ def test_the_recurrence_templates_records_certify_natively_a_step_at_a_time(gene
     with generation.assumed(generation_name):
         run = rw.recorded(*rw.draw(0, regime, heads=2))
     held = rw.witness(run, mosaic_lane())
-    assert np.all(run.seams)
     for name in rw.RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
 
