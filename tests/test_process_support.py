@@ -169,13 +169,14 @@ def gone_within(pid: int, seconds: float) -> bool:
 
 
 def test_groups_started_and_stopped_from_many_threads_at_once_each_end_as_their_own(tmp_path):
-    """Groups started and stopped from many threads at once (CI's gpu-lane runs its tests in a pool of threads),
-    some ending by themselves meanwhile, each run to their own end: none is killed by another's lifeline, and no
-    start or stop fails on a pipe another thread closed."""
+    """Groups started and stopped from many threads at once (CI's gpu-lane runs its tests in a pool of
+    threads), some ending by themselves meanwhile, each run to their own end: none is killed by another's
+    lifeline, and no start or stop fails on a pipe another thread closed."""
     from concurrent.futures import ThreadPoolExecutor
 
     def ran(index: int) -> int:
-        process = start_process([sys.executable, "-c", f"import time; time.sleep({index % 3} / 100)"], devices=1)
+        process = start_process([sys.executable, "-c", f"import time; time.sleep({index % 3} / 100)"],
+                                devices=1)
         if index % 2:
             # Ends by itself, its lifeline let go by a later start in any thread.
             return process.wait(timeout=60)
