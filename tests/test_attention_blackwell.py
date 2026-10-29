@@ -92,3 +92,48 @@ def test_the_blackwell_forward_compiles_for_a_b200_within_its_resources(width):
         found = compile_mosaic_kernels([support.KernelCase(f"blackwell attention {width}", call)], "sm100")
     assert len(found) == 1 and found[0].get("kernels"), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def _forward_of(query, key, value, *, causal: bool = False, **options):
+    """The forward interpreted over one row's call, full or causal, in float32 for comparing."""
+    spans = template.spans(query.shape[1], key.shape[1], 1, causal=causal)
+    out = attention_blackwell.forward(query, key, value, spans, interpret=True, **options)
+    return np.asarray(out, np.float32)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
+def test_the_blackwell_forward_keeps_finite_the_sums_that_pass_fp32s_largest_interpreted(natural):
+    """Two keys of zero queries and keys weigh their values of 2^127 equally: their sum passes fp32's
+    largest though their mean does not. The rows whose sums overflowed walk again shifting
+    (`algebra.walked_launches`), so the output is the mean, 2^127, not infinity."""
+    width = 64
+    query = jnp.zeros((1, 128, 1, width), jnp.bfloat16)
+    key = jnp.zeros((1, 2, 1, width), jnp.bfloat16)
+    value = jnp.full((1, 2, 1, width), 2.0 ** 127, jnp.bfloat16)
+    np.testing.assert_array_equal(_forward_of(query, key, value, natural=natural), 2.0 ** 127)
+
+
+@INTERPRETS
+def test_the_blackwell_forward_keeps_finite_a_logit_its_scale_keeps_finite_interpreted():
+    """A query of 2^127 over a key of 8, 64 wide: the unscaled product, 2^130, passes fp32's largest, the
+    default-scaled logit, 2^127, does not. The query is taken by the scale's power before the product
+    (`attention.prescaled`), so the call's one key weighs 1 and the output is its value."""
+    width = 64
+    query = jnp.zeros((1, 128, 1, width), jnp.bfloat16).at[..., 0].set(2.0 ** 127)
+    key = jnp.zeros((1, 1, 1, width), jnp.bfloat16).at[..., 0].set(8.0)
+    value = jnp.ones((1, 1, 1, width), jnp.bfloat16) * 3
+    np.testing.assert_array_equal(_forward_of(query, key, value), 3.0)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("tiles", [attention_blackwell.Tiles(64, 2), attention_blackwell.Tiles(192, 2)],
+                         ids=["64-keys", "192-keys"])
+def test_the_blackwell_forward_reads_the_calls_keys_at_every_key_tile_interpreted(tiles):
+    """Zero queries and keys over unit values at key tiles of 64 and 192, 64 and 192 queries and keys: every
+    query weighs the call's keys equally and none of the padding, so every output is 1, and every query's
+    row is written (its query blocks the call's padded to whole query and key tiles)."""
+    for tokens in (64, 192):
+        query = jnp.zeros((1, tokens, 1, 64), jnp.bfloat16)
+        value = jnp.ones((1, tokens, 1, 64), jnp.bfloat16)
+        np.testing.assert_array_equal(_forward_of(query, query, value, tiles=tiles), 1.0)

@@ -19,6 +19,7 @@ piece. FlashAttention-4's correction warpgroup, two-CTA products and lazy rescal
 
 import dataclasses
 import functools
+import math
 from typing import NamedTuple
 
 import jax
@@ -28,8 +29,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic_sm100
-from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic_sm100
+from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
 from dew.nn.kernels.templates.mosaic_sm100 import ROW, STORED, TCGEN05, TMEM
 
 CHUNK = 32
@@ -75,13 +76,30 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     if reason := refused(query, spans, hooks):
         raise NotImplementedError(reason)
     value_width = value.shape[-1]
-    call = padded_call(query, key, value, spans, Hooks(), max(TCGEN05.rows, tiles.block_k))
-    spec = algebra.Forward(spans.form, spans.keys, ids=False,
-                           scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural)
+    # The query taken by its scale's power of two before its products (`prescaled`), so a logit finite at
+    # the call's scale is finite in the product.
+    query, scale, power = prescaled(query, query.shape[3] ** -0.5 if scale is None else scale)
+    # Queries and keys padded to whole tiles of both: a program's query block and a walk's key tile.
+    call = padded_call(query, key, value, spans, Hooks(), math.lcm(TCGEN05.rows, tiles.block_k))
+    spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=scale, natural=natural,
+                           headroom=algebra.headroom(value.dtype), prescale=power)
     # Swizzled tiles hold whole 64-element rows of 16-bit operands.
     query, key, value = (jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % 64),))
                          for array in (call.query, call.key, call.value))
-    out = _forward(query, key, value, spec=spec, tiles=tiles, interpret=interpret)
+
+    def launch(form: algebra.Forward, live: jax.Array | None):
+        if live is None:
+            return _forward(query, key, value, spec=form, tiles=tiles, interpret=interpret)
+        # The rows whose weighted values overflowed, rewalked shifting on the plain-JAX mainloop (the
+        # rare launch, `algebra.walked_launches`); its maxima and overflows are not read.
+        out, _ = attention_portable.padded_walk(form, call, Hooks(), block_q=TCGEN05.rows,
+                                                block_k=tiles.block_k, residuals=False)
+        return out[..., :query.shape[3]], jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
+
+    def kept(live: jax.Array, guarded: jax.Array, plain: jax.Array) -> jax.Array:
+        return jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded, plain)
+
+    out = algebra.walked_launches(spec, launch, kept)
     return out[:, :call.queries, :, :value_width]
 
 
@@ -176,11 +194,13 @@ def _products(block: _Block, scratch: _Scratch) -> None:
     scratch.scores.drain(block.steps)
 
 
-def _softmax(block: _Block, scratch: _Scratch, out_ref, *, spec: algebra.Forward, tiles: Tiles, blocks: int,
+def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, tiles: Tiles, blocks: int,
              dtype) -> None:
     """The reading warpgroup: each step's `S` through the algebra, the output's accumulator taken to the
     step's maximum once the last `P V` is in it, the narrowed weights into tensor memory; then the
-    epilogue."""
+    epilogue: the output, and each row's maximum and whether its weighted values overflowed
+    (`algebra.walked_launches`' guards)."""
+    out_ref, maxima_ref, over_ref = outs
     rows, block_k = TCGEN05.rows, tiles.block_k
     value_width = scratch.acc_tmem.shape[1]
     q_pos = block.first + plgpu.broadcasted_iota(jnp.int32, (rows, block_k), 0, layout=TMEM)
@@ -235,15 +255,26 @@ def _softmax(block: _Block, scratch: _Scratch, out_ref, *, spec: algebra.Forward
     scratch.o_smem[...] = out.astype(dtype)
     plgpu.commit_smem()
     plgpu.copy_smem_to_gmem(scratch.o_smem, out_ref.at[block.row, pl.ds(block.first, rows), block.head])
+    places = (block.row, block.head, pl.ds(block.first, rows))
+    # The rows' maxima, and the overflows of their sums, through the denominator's stage.
+    for ref, row in ((maxima_ref, m), (over_ref, algebra.overflowed(acc).astype(jnp.float32))):
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        scratch.l_smem[...] = row
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(scratch.l_smem, ref.at[places])
     plgpu.wait_smem_to_gmem(0)
 
 
 def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret: bool):
+    """The launch at `tiles`: the output `[B, Qp, H, Dv]` and each row's running maximum in the walk's units
+    and whether its weighted values overflowed, `[B, H, Qp]` each (`algebra.walked_launches`' plain
+    launch)."""
     batch, queries, heads, width = query.shape
-    keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
+    kv_heads, value_width = key.shape[2], value.shape[-1]
     group = heads // kv_heads
     rows, block_k, dtype = TCGEN05.rows, tiles.block_k, query.dtype
-    blocks = keys // block_k
+    # The key tiles holding the call's keys, none of padding alone.
+    blocks = -(-spec.keys // block_k)
     target = generation.gpu_target("sm100")
     transforms = mosaic_sm100.swizzled(dtype, width)
     key_stages = mosaic_sm100.Stages(tiles.stages, (((block_k, width), dtype, transforms),))
@@ -251,7 +282,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
                                                        mosaic_sm100.swizzled(dtype, value_width)),))
     scores = mosaic_sm100.Accumulators(1, rows, block_k)
 
-    def kernel(q_ref, k_ref, v_ref, out_ref, *refs):
+    def kernel(q_ref, k_ref, v_ref, out_ref, maxima_ref, over_ref, *refs):
         (q_smem, q_loaded, key_refs, value_refs, score_refs, p_tmem, p_full, acc_tmem, o_done, o_smem,
          l_smem) = refs
         scratch = _Scratch(q_smem, q_loaded, key_stages.opened(*key_refs), value_stages.opened(*value_refs),
@@ -260,8 +291,8 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
         TCGEN05.roles(
             functools.partial(_load, block, scratch, q_ref, k_ref, v_ref, group=group, tiles=tiles),
             functools.partial(_products, block, scratch),
-            functools.partial(_softmax, block, scratch, out_ref, spec=spec, tiles=tiles, blocks=blocks,
-                              dtype=dtype))
+            functools.partial(_softmax, block, scratch, (out_ref, maxima_ref, over_ref), spec=spec,
+                              tiles=tiles, blocks=blocks, dtype=dtype))
 
     tensor_core = functools.partial(plgpu.Barrier, orders_tensor_core=True)
     scratch = (plgpu.SMEM((rows, width), dtype, transforms=transforms), plgpu.Barrier(),
@@ -270,8 +301,11 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
                plgpu.TMEM((rows, value_width), jnp.float32), tensor_core(),
                plgpu.SMEM((rows, value_width), dtype, transforms=mosaic_sm100.swizzled(dtype, value_width)),
                plgpu.SMEM((rows,), jnp.float32))
-    return TCGEN05.kernel(
-        kernel, out_type=jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype),
+    rows_type = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
+    out, maxima, over = TCGEN05.kernel(
+        kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type,
+                          rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
         interpret=plgpu.InterpretGPUParams() if interpret else None, name="attention_forward_tcgen05",
     )(query, key, value)
+    return out, maxima, over > 0
