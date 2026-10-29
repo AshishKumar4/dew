@@ -6,6 +6,7 @@ entries; the overflow witnesses stay finite where the reference does, and the re
 in bf16.
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -472,11 +473,10 @@ def test_a_dropping_call_under_x64_on_fp32_inputs_keeps_fp32_gradients():
         assert bool(jnp.all(jnp.isfinite(array)))
 
 
-@pytest.mark.gpu(reason="the route's GPU mainloops refuse dropout where calls run on an sm80 GPU or later")
+@pytest.mark.gpu(reason="runs a dropping route call on a GPU")
 def test_a_dropping_route_call_on_a_gpu_runs_finite():
-    """On a GPU, whose Mosaic and frozen Triton mainloops draw no dropout yet (their legality rules refuse
-    it, `attention_mosaic.refused`, `attention_triton.refused`, ledger row 1521), a direct route call that
-    drops runs, finite, on a mainloop that draws it."""
+    """On a GPU, a direct route call that drops runs, finite, on a mainloop that draws it (the frozen Triton
+    mainloop's legality rule refuses it, `attention_triton.refused`, ledger row 1521)."""
     from dew.nn.kernels.templates import attention_route
 
     query, key, value = (jnp.ones((ROWS, 8, HEADS, WIDTH), jnp.bfloat16) for _ in range(3))
@@ -485,25 +485,28 @@ def test_a_dropping_route_call_on_a_gpu_runs_finite():
     assert bool(jnp.all(jnp.isfinite(call())))
 
 
-def test_the_gpu_mainloops_refuse_a_dropping_call_at_every_entry():
-    """Mosaic's and the frozen Triton mainloop's launches take no probability dropout yet: each entry point,
-    the forward and the backward called directly, refuses a dropping call before any launch rather than
-    run it undropped, and so does each legality rule (ledger row 1521)."""
+def test_the_gpu_mainloops_refuse_the_draws_they_do_not_take_at_every_entry():
+    """The frozen Triton mainloop takes no probability dropout, and Mosaic's none drawn at a sequence
+    exchange's global places (`template.DropPlaces`, a table gather a tile): each entry point, the forward
+    and the backward called directly, refuses such a call before any launch rather than run it undropped,
+    and so does each legality rule (ledger rows 1521 and 1303)."""
     query, key, value = (jnp.ones((ROWS, 8, HEADS, WIDTH), jnp.bfloat16) for _ in range(3))
     spans = template.spans(8, 8, ROWS)
     hooks = hooked(seed_words(0), ROWS, HEADS)
+    placed = template.Hooks(drop=dataclasses.replace(hooks.drop, queries=jnp.arange(8, dtype=jnp.int32),
+                                                     keys=jnp.arange(8, dtype=jnp.int32)))
     stats = jnp.zeros((ROWS, HEADS, 8), jnp.float32)
     residuals = (stats, stats, jnp.zeros((ROWS, HEADS, 8), jnp.int32),
                  template.Split(jnp.zeros((ROWS, HEADS, 8, WIDTH), jnp.float32), stats, stats, stats))
     for backward in (False, True):
-        assert attention_mosaic.refused(jnp.bfloat16, WIDTH, WIDTH, hooks, backward=backward,
+        assert attention_mosaic.refused(jnp.bfloat16, WIDTH, WIDTH, placed, backward=backward,
                                         family=mosaic_sm90.WGMMA) is not None
     assert attention_triton.refused(spans, hooks) is not None
     with generation.assumed("sm90"):
         with pytest.raises(NotImplementedError):
-            attention_mosaic.forward(query, key, value, spans, hooks, interpret=True)
+            attention_mosaic.forward(query, key, value, spans, placed, interpret=True)
         with pytest.raises(NotImplementedError):
-            attention_mosaic.backward(query, key, value, spans, hooks, query, residuals=residuals,
+            attention_mosaic.backward(query, key, value, spans, placed, query, residuals=residuals,
                                       interpret=True)
     with pytest.raises(NotImplementedError):
         attention_triton.forward(query, key, value, spans, hooks, interpret=True)

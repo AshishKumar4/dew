@@ -422,7 +422,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                                score_mod=self.score_mod, natural=self.natural, initial=initial is not None,
                                queries=queries if padded else None)
         launch = functools.partial(_launch_backward, spec=spec, accurate=self.accurate, tiles=config,
-                                   family=family, interpret=interpret)
+                                   family=family, interpret=interpret, drop=drop)
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,
                          block=_block(config), scale=self.scale, rounded=self.rounded), None
 

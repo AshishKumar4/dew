@@ -109,27 +109,40 @@ def _pinned(forward: attention_mosaic.Tiles | None = None,
 
 def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, width: int = 128,
                    value_width: int = 128, tiles: attention_mosaic.Tiles | None = None,
-                   training: bool = False, target: generation.GpuTarget | None = None):
+                   training: bool = False, target: generation.GpuTarget | None = None, drop: bool = False):
     """The forward, or with `training` the training forward's output, over the call form `call` of `shape`,
     its query and key heads `width` wide and its value heads `value_width`, at `tiles` (the default when
-    None)."""
+    None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`)."""
     spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
+    hooks = _dropping(shape) if drop else None
     draw = _drawn(shape, dtype, width=width, value_width=value_width)
 
     def ours(query, key, value, dout):
         del dout
         with _device(interpret, target), _pinned(tiles):
-            out = attention_mosaic.forward(query, key, value, spans, natural=natural, residuals=training,
-                                           interpret=interpret)
+            out = attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
+                                           residuals=training, interpret=interpret)
         return out[0] if training else out
 
     def reference(query, key, value, dout):
         del dout
-        return template.reference(query, key, value, spans)
+        return template.reference(query, key, value, spans, hooks)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
                     f"mosaic {'training ' if training else ''}forward {call} {jnp.dtype(dtype).name} "
-                    f"natural {natural} widths {width} {value_width}", seeds=SEEDS)
+                    f"natural {natural} widths {width} {value_width} drop {drop}", seeds=SEEDS)
+
+
+DROP_RATE = 0.25
+"""The probability a dropping check drops an entry at."""
+
+
+def _dropping(shape) -> template.Hooks:
+    """Hooks of probability dropout alone at `DROP_RATE` for a call of `shape` `[B, Q, H, D]`, each batch row
+    and query head its own global index, the seed fixed."""
+    return template.Hooks(drop=template.Dropout(
+        jax.random.bits(jax.random.PRNGKey(7), (2,), jnp.uint32), jnp.arange(shape[0], dtype=jnp.int32),
+        jnp.arange(shape[2], dtype=jnp.int32), DROP_RATE))
 
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
@@ -243,28 +256,30 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
                     residuals_from=None, target: generation.GpuTarget | None = None,
                     config: attention_mosaic.BackwardTiles | None = None, width: int = 128,
-                    value_width: int | None = None, spans: template.KeySpans | None = None):
+                    value_width: int | None = None, spans: template.KeySpans | None = None,
+                    drop: bool = False):
     """The backward in the form `form` names (`BACKWARD_FORMS`; None, the default form at `config`, else its
     derived one) over the call form `call` of `shape` (or `spans` where given; its keys `keys`, its query
     heads `width` wide and its value heads `value_width`) on `target` (`_device`), from the training
     forward's residuals at its pick: this mainloop's, or `residuals_from`'s (another mainloop's `forward`, as
-    the route feeds the Triton mainloop's)."""
+    the route feeds the Triton mainloop's), with `drop` under probability dropout (`_dropping`)."""
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call]) if spans is None else spans
+    hooks = _dropping(shape) if drop else None
     draw = _drawn(shape, jnp.bfloat16, width, keys=keys, value_width=value_width)
     accurate, config = (False, config) if form is None else BACKWARD_FORMS[form]
     trained = attention_mosaic.forward if residuals_from is None else residuals_from
 
     def ours(query, key, value, dout):
         with _device(interpret, target):
-            residuals = trained(query, key, value, spans, residuals=True, interpret=interpret)[1:]
+            residuals = trained(query, key, value, spans, hooks, residuals=True, interpret=interpret)[1:]
             with _pinned(backward=config):
-                grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                                   accurate=accurate, interpret=interpret)
         return grads.query, grads.key, grads.value
 
     def reference(query, key, value, dout):
-        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), query, key, value)
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form}", seeds=SEEDS)
@@ -352,6 +367,24 @@ def test_the_backward_is_on_par_at_head_widths_interpreted(width, value_width):
     causal call, under the interpreter: dK and dV each at its own head width."""
     _check_backward("causal", SHAPES["interpreted"], form=None, interpret=True, width=width,
                     value_width=value_width)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("training", [False, True], ids=["plain", "training"])
+@pytest.mark.parametrize("call", CALLS)
+def test_the_forward_is_on_par_dropping_interpreted(call, training):
+    """The forward and the training forward under probability dropout, its draw the reference's bit for bit
+    (`template.Draw`), under the interpreter."""
+    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True,
+                   training=training, drop=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("form", BACKWARD_FORMS)
+def test_the_backward_is_on_par_dropping_interpreted(form):
+    """The backward in each form under probability dropout over a causal call, its D the dropped products'
+    own pass (`attention_mosaic_backward._centre_launch`), under the interpreter."""
+    _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True)
 
 
 @INTERPRETS

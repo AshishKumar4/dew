@@ -44,6 +44,7 @@ from dew.nn.kernels.templates.attention import (
     within,
 )
 from dew.nn.precision import (
+    Running,
     added_to,
     compensated_sum,
     compensates_loops,
@@ -211,6 +212,12 @@ class Coords(NamedTuple):
     def keys(self, x: jax.Array, like: jax.Array) -> jax.Array:
         """A per-key `x` (`[bk]`) broadcast over the tile `like`."""
         return expand(x, like) if self.keys_first else across(x, like)
+
+    def query_places(self) -> jax.Array:
+        """The tile's queries' places, one a query (`[bq]`): `q_pos` reduced along the tile's key axis (exact:
+        a query's entries hold one place), which every mainloop's layouts take, a slice of a column not."""
+        tile = jnp.broadcast_to(self.q_pos, jnp.broadcast_shapes(self.q_pos.shape, self.k_pos.shape))
+        return jnp.max(tile, axis=0 if self.keys_first else -1)
 
     def key_count(self, like: jax.Array) -> int:
         """The keys the tile `like` holds."""
@@ -932,8 +939,18 @@ Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
 
 
 def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | None:
-    """A tile's dropout multipliers at `queries` and `keys` (`Coords.drop`), None where no call drops."""
-    return None if coords.drop is None else coords.drop(queries, keys)
+    """A tile's dropout multipliers at `queries` and `keys` (`Coords.drop`), None where no call drops. A
+    tile whose coordinates are its entries (a Mosaic program's, `queries` its `q_pos`) mixes each query's
+    word once, on its vector (`Draw.words`), its keys entry for entry: the same bits, half the hashing."""
+    if coords.drop is None:
+        return None
+    # A tile whose rows are its queries reduces along its own rows; one whose rows are its keys (the keys
+    # first, `Coords.keys_first`) would reduce across its warps, through scratch its launch holds none of.
+    if (queries is coords.q_pos and jnp.shape(queries) == jnp.shape(keys) and jnp.ndim(keys) == 2
+            and not coords.keys_first):
+        words = coords.queries(coords.drop.words(coords.query_places()), keys)
+        return coords.drop.multiplied(coords.drop.kept(words, keys))
+    return coords.drop(queries, keys)
 
 
 
@@ -991,11 +1008,14 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     mainloop's own running sums taking it where it holds them (`Keys.accumulate`, the state's `acc` in its
     form)."""
     m, factor, p, value, held = _softmax(spec, state, keys)
-    if held is None and keys.accumulate is not None:
-        acc = keys.accumulate(state.acc, lambda acc: carry_factor(acc, factor, None),
-                              ((narrow(p, value.dtype), None),), value)
-        return Partial(acc, m, denominator_after(state.total, factor, p))
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
+    if held is None and keys.accumulate is not None:
+        # The weights the walk accumulates dropped where the call drops (`_times`' parts); the denominator
+        # the undropped weights'.
+        parts = (((narrow(p, value.dtype), None),) if multiplier is None
+                 else weights_parts(p * multiplier, value.dtype))
+        acc = keys.accumulate(state.acc, lambda acc: carry_factor(acc, factor, None), parts, value)
+        return Partial(acc, m, denominator_after(state.total, factor, p))
     times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk_of(spec))
     return stepped(state, m, factor, p, times(p), held, times)
 
@@ -1016,8 +1036,10 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
     if multiplier is None:
         return ((others, None),), others, own_tile, anchor
     parts = weights_parts(jnp.where(at_anchor, 0.0, p) * multiplier, dtype)
-    anchor_draw = drawn(keys.coords, keys.coords.q_pos, anchor.key[:, None])
-    anchor = anchor._replace(multiplier=None if anchor_draw is None else anchor_draw[:, 0])
+    # The anchor's multiplier by its query's vector and its key's, no unit axis (a Mosaic program's lowers
+    # none beside a tile).
+    anchor_draw = drawn(keys.coords, keys.coords.query_places(), anchor.key)
+    anchor = anchor._replace(multiplier=anchor_draw)
     return parts, others, own_tile, anchor
 
 
@@ -1883,8 +1905,8 @@ class Centre(NamedTuple):
 
     centre: jax.Array
     seen: jax.Array
-    residual: jax.Array
-    mass: jax.Array
+    residual: Running
+    mass: Running
 
 
 def centre_scale(keys: int) -> float:
@@ -1913,20 +1935,24 @@ def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: ja
     the loop's running sums (`added_to`), each tile's rows summed compensated where loops are
     (`compensates_loops`). Each product is taken at `2^exponent` before the subtraction; no difference or
     sum overflows, and a power of two is exact where the product is normal."""
-    k = jnp.asarray(exponent, jnp.float32)
+    # The scale a Python float, exact (`centre_scale`'s exponent is within fp32's normal range), so no
+    # scalar arithmetic runs in a kernel (Mosaic GPU holds no rank-0 vector).
+    factor = 2.0 ** exponent
     nearest = jnp.min(jnp.where(seen, jnp.abs(products), jnp.inf), axis=-1)
     first = jnp.min(jnp.where(seen & (jnp.abs(products) == expand(nearest, products)), positions,
                               jnp.iinfo(jnp.int32).max), axis=-1)
-    picked = seen & (positions == first[:, None])
+    picked = seen & (positions == expand(first, products))
     tile_centre = jnp.sum(jnp.where(picked, products, 0.0), axis=-1)
     centre = jnp.where(state.seen, state.centre, tile_centre)
-    scaled = power2(products, k) - expand(power2(centre, k), products)
+    # Whether a key of the tile counts, a row's maximum (a kernel's rows reduce no booleans).
+    counted = jnp.max(jnp.where(seen, 1, 0), axis=-1) > 0
+    scaled = products * factor - expand(centre * factor, products)
 
     def row_sum(values):
         return (compensated_sum(values, (values.ndim - 1,)) if compensates_loops()
                 else values.sum(axis=-1))
 
-    return Centre(centre, state.seen | jnp.any(seen, axis=-1),
+    return Centre(centre, state.seen | counted,
                   added_to(state.residual, row_sum(jnp.where(seen, weights * scaled, 0.0))),
                   added_to(state.mass, row_sum(jnp.where(seen, weights, 0.0))))
 
