@@ -1116,7 +1116,7 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
     bf16, times the fp32 weight in fp32, rounded to bf16, exactly; the
     gradient of sum(out * c), the sum over rows of c * round(y), on par with
     NumPy's fp32 sum of it from its float64 sum over drawn inputs (check 1)."""
-    from dew.nn.attention import RMSNorm
+    from dew.nn.norms import RMSNorm
 
     x = (jax.random.normal(jax.random.key(0), (64, 512)) * 3).astype(jnp.bfloat16)
     weight = 1.0 + 0.1 * jax.random.normal(jax.random.key(1), (512,), jnp.float32)
