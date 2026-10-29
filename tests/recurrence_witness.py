@@ -477,8 +477,9 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     dtype = jnp.result_type(q, k, v)
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with tuning.seen() as launches:
+            # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
             o, final = jax.jit(lambda *x: recurrence_chunk.chunk_gated_delta_rule(
-                *x, starts=starts, max_segments=max_segments))(*operands)
+                *x, starts=starts, max_segments=max_segments, write_bound=1.0))(*operands)
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
 
