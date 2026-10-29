@@ -35,6 +35,10 @@ from dew.nn.kernels.templates.mosaic_sm100 import ROW, STORED, TCGEN05, TMEM
 
 CHUNK = 32
 """The output accumulator's columns the softmax rescales at a time."""
+PART = 16
+"""A step's tile's columns the softmax reads and weighs at a time: its chains over a row's whole tile spill
+(the natural relaunch's, 7.9 KB a thread at 128 columns), 80 bytes at 32 columns, none at 16 (ptxas for a
+B200, tests/test_attention_blackwell.py's compile at widths 64 and 128)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -203,40 +207,39 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     out_ref, maxima_ref, over_ref = outs
     rows, block_k = TCGEN05.rows, tiles.block_k
     value_width = scratch.acc_tmem.shape[1]
-    # A chunk of `CHUNK` columns of a step's tile at a time: the softmax's chains over one row's whole tile
-    # spill (a whole 128-column tile's natural exponential, 7.9 KB a thread at sm100).
-    q_pos = block.first + plgpu.broadcasted_iota(jnp.int32, (rows, CHUNK), 0, layout=TMEM)
-    columns = plgpu.broadcasted_iota(jnp.int32, (rows, CHUNK), 1, layout=TMEM)
-    chunks = block_k // CHUNK
+    # A step's tile `PART` columns at a time.
+    q_pos = block.first + plgpu.broadcasted_iota(jnp.int32, (rows, PART), 0, layout=TMEM)
+    columns = plgpu.broadcasted_iota(jnp.int32, (rows, PART), 1, layout=TMEM)
+    parts = block_k // PART
 
-    def logits(read, index, chunk, masked):
-        coords = algebra.Coords(q_pos, index * block_k + chunk * CHUNK + columns, tile_keys=block_k)
-        return algebra.logits_of(spec, read(chunk), coords, masked=masked)
+    def logits(read, index, part, masked):
+        coords = algebra.Coords(q_pos, index * block_k + part * PART + columns, tile_keys=block_k)
+        return algebra.logits_of(spec, read(part), coords, masked=masked)
 
     def step(index, carry, *, masked):
         m, total = carry
-        read = scratch.scores.read(index, CHUNK, layout=TMEM)
-        # The row's new maximum over the tile's chunks, and the factor the state before takes to it.
+        read = scratch.scores.read(index, PART, layout=TMEM)
+        # The row's new maximum over the tile's parts, and the factor the state before takes to it.
         new = m
-        for chunk in range(chunks):
-            new, _ = algebra.peak(spec, new, *logits(read, index, chunk, masked))
+        for part in range(parts):
+            new, _ = algebra.peak(spec, new, *logits(read, index, part, masked))
         m, alpha = algebra.peaked(spec, m, new)
 
         @pl.when(index > 0)
         def _():
             # The last step's P V is in the accumulator, its weights read: take the accumulator to this
-            # step's maximum, a chunk of columns at a time, before this step's weights overwrite them.
+            # step's maximum, `CHUNK` columns at a time, before this step's weights overwrite them.
             plgpu.barrier_wait(scratch.o_done)
             for start in range(0, value_width, CHUNK):
                 chunk = mosaic_sm100.columns(scratch.acc_tmem, start, CHUNK)
                 acc = plgpu.async_load_tmem(chunk, layout=TMEM)
                 plgpu.async_store_tmem(chunk, algebra.rescale(acc, alpha))
 
-        for chunk in range(chunks):
-            weights = algebra.weights(spec, logits(read, index, chunk, masked)[0], m)
-            total = (algebra.denominator_after(total, alpha, weights) if chunk == 0
+        for part in range(parts):
+            weights = algebra.weights(spec, logits(read, index, part, masked)[0], m)
+            total = (algebra.denominator_after(total, alpha, weights) if part == 0
                      else total + weights.sum(axis=-1))
-            plgpu.async_store_tmem(mosaic_sm100.columns(scratch.p_tmem, chunk * CHUNK, CHUNK),
+            plgpu.async_store_tmem(mosaic_sm100.columns(scratch.p_tmem, part * PART, PART),
                                    algebra.narrow(weights, dtype))
         # The next S may overwrite this one once it is read out (`Tensor.release`).
         scratch.scores.release(index)
