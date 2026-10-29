@@ -48,7 +48,7 @@ from flax.core.scope import Variable
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
-from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, Variables, coordinates, real_slots
+from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, Variables, real_slots, token_coordinates
 from dew.distributed.placement import Layout
 from dew.interop import sources, verify
 from dew.interop.decoder_parts import context_lengths
@@ -1281,11 +1281,10 @@ class TorchCausalLM(nn.Module):
         if not packing:
             return None
         laid = packing.get(COORDINATES_FIELD)
-        if isinstance(laid, Coordinates):
-            return laid
         batch, length = jnp.shape(tokens)[:2]
-        return coordinates((batch, length), segments=packing.get("segment_ids"),
-                           valid=packing.get(VALIDITY_FIELD), positions=packing.get("positions"))
+        return token_coordinates((batch, length), laid if isinstance(laid, Coordinates) else None,
+                                 segments=packing.get("segment_ids"), valid=packing.get(VALIDITY_FIELD),
+                                 positions=packing.get("positions"))
 
     def _run(self, tokens, train: bool, laid: Coordinates | None = None, *, visible=None, key_places=None,
              head_input=None) -> tuple[jax.Array, jax.Array]:

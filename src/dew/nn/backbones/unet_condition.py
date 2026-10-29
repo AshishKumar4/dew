@@ -23,7 +23,7 @@ from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
-    from dew.inputs.encoders import ConditionWork
+    from dew.inputs.condition import ConditionWork
 
 
 @dataclass(frozen=True)
