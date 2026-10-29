@@ -471,6 +471,11 @@ class CausalSelfAttention(nn.Module):
         return self.model_flops(lengths) - products
 
     @nn.nowrap
+    def head_outputs(self) -> tuple[int, int]:
+        """Its heads' count and each one's output width, which DEX extends (`dew.nn.dex.HeadOutputs`)."""
+        return self.ctx.num_heads, self.value_dim
+
+    @nn.nowrap
     def _dex_flops(self, lengths) -> float:
         """DEX's work on each token's chosen heads (`dew.nn.dex`): a `[Dv, Dv]` map of each, none
         without it."""

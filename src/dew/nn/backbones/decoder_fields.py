@@ -6,8 +6,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from ..dex import HeadOutputs
 from ..mixers import AttentionMixer
-from ..mixers.attention import CausalSelfAttention
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 
@@ -257,10 +257,10 @@ def _embedding_width(model: CausalTransformer):
 
 
 def softmax_attention_layers(model: CausalTransformer) -> frozenset[int]:
-    """`model`'s layers whose mixer is softmax attention (`CausalSelfAttention`), by index: those DEX
-    extends and its recipe trains the projections of (`dew.nn.dex`)."""
+    """`model`'s layers whose mixer's heads' outputs DEX extends (`dew.nn.dex.HeadOutputs`, softmax
+    attention), by index: those it extends and its recipe trains the projections of."""
     return frozenset(index for index in range(model.num_layers)
-                     if isinstance(model.mixer_of(index), CausalSelfAttention))
+                     if isinstance(model.mixer_of(index), HeadOutputs))
 
 
 def _dex(model: CausalTransformer):

@@ -24,13 +24,13 @@ extension and freezes the rest (`dew.optim.ParamGroup`).
 import dataclasses
 import math
 from collections.abc import Callable
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 
-__all__ = ["DEX_PARAMETERS", "DifferentialExtension", "LayerDex", "annealed", "diff_lambda_init",
-           "differential"]
+__all__ = ["DEX_PARAMETERS", "DifferentialExtension", "HeadOutputs", "LayerDex", "annealed",
+           "diff_lambda_init", "differential"]
 
 TRAINED_PROJECTIONS = ("k_proj", "v_proj", "o_proj")
 """The attention projections the paper's recipe trains beside the extension, the feed-forward and the
@@ -39,6 +39,16 @@ rest frozen."""
 DEX_PARAMETERS = ("dex_projection", "dex_lambda")
 """The parameters an attention layer adds for DEX, by name: its chosen heads' projections and its learned
 lambda (`dew.nn.mixers.attention.CausalSelfAttention`)."""
+
+
+@runtime_checkable
+class HeadOutputs(Protocol):
+    """A mixer whose heads' outputs DEX extends, before its output projection: softmax attention
+    (`dew.nn.mixers.attention.CausalSelfAttention`)."""
+
+    def head_outputs(self) -> tuple[int, int]:
+        """Its heads' count and the width of each one's output."""
+        ...
 
 
 def diff_lambda_init(depth: int) -> float:
