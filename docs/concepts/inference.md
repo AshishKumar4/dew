@@ -276,7 +276,7 @@ images = refiner(refiner.prepare(prompts, key=key, steps=steps, initial=latents,
 
 ## Serving
 
-`Server.from_task(task, slots=, capacity=)` keeps `slots` cache rows of `capacity` positions resident, and it admits queued requests into free rows while the other rows keep decoding. Each step is one compiled program that prefills the prompts admitted in that step and draws one token for every occupied row. A request leaves its row at EOS or when its budget runs out, and the next request takes the slot. A served request draws with the key it was submitted with, folded the way a one-row `TextGeneration` call folds it, so it draws the tokens it would draw alone.
+`Server.from_task(task, slots=, capacity=)` keeps `slots` cache rows of `capacity` positions resident, and it admits queued requests into free rows while the other rows keep decoding. Each step is one compiled program that prefills the prompts admitted in that step and draws one token for every occupied row. A request leaves its row at EOS or when its budget runs out, and the next request takes the slot. A served request draws with the key it was submitted with, folded the way a one-row `TextGeneration` call folds it, so it draws the tokens it would draw alone, except where the model's products round at boundaries that two programs' roundings cross (below, with the cache layouts).
 
 ```python
 from dew.inference.serving import Server

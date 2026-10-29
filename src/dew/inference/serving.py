@@ -482,7 +482,8 @@ class Server:
     row. A row leaves where the task's criteria end it (EOS, a stop string) or
     at its budget, and the next request takes its slot. Every request runs
     the task's policy and draws the same tokens it would draw through the
-    task alone with the same key.
+    task alone with the same key, except where the model's products round at
+    boundaries that the two programs' roundings cross (the module docstring).
 
     Build one with `from_task`. `admission` bounds the prompts one step
     prefills. A request whose prompt and budget do not fit the capacity is
