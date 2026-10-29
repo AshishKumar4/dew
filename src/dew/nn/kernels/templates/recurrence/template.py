@@ -70,7 +70,6 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     return _PLANS[key]
 
 
-@dataclasses.dataclass(frozen=True)
 def inverse_refusal(dtype, delta: bool, bound: float | None) -> str | None:
     """Why the mainloop refuses a call's delta-rule solve, None where it takes it: a 16-bit call's merges
     stage the chunk's inverse in fp16 (`mainloop._merges`), whose range holds it where the call's form
@@ -82,6 +81,7 @@ def inverse_refusal(dtype, delta: bool, bound: float | None) -> str | None:
             "declares keys of unit norm and write gates at most two (recurrence.Hooks.inverse_bound)")
 
 
+@dataclasses.dataclass(frozen=True)
 class Mosaic(base.Template[mainloop.Tiles]):
     """The chunked rule on the recurrence template's mainloop (`recurrence_chunk.mosaic_rule`), its config
     the forward's tiles. Its operands are the rule's: queries and keys `[B, T, H, Dk]`, values
