@@ -6,6 +6,8 @@ frozen, gains cross-attention blocks before layers 1 and 3, which train under Ad
 rate.
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -123,3 +125,31 @@ def test_the_loaded_group_steps_as_an_ungrouped_optimizer_does(optimizer):
     np.testing.assert_allclose(after["cross_attention"]["q"]["kernel"],
                                FRESH_LEARNING_RATE_MULTIPLIER * before["cross_attention"]["q"]["kernel"],
                                rtol=1e-6)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_decision_run_records_its_context_blocks_fresh_group_and_keeps_a_named_one(tmp_path):
+    """A decision run whose context layers draw cross-attention blocks over its loaded backbone records
+    the default's groups in its run.json, the blocks' and its fresh head's parameters fresh and an
+    adapter's factors among the loaded ones, which a resume of the record trains in; a run that names
+    groups records its own (row 2391)."""
+    from test_decision_recipe import QWEN
+    from test_run_options import decision, trained
+
+    from dew.config import RunConfig
+    from dew.lora import LoRA
+
+    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN), context_layers=(0,),
+                              context_length=16, lora=LoRA(rank=2, modules=("q_proj",)))
+    trained(run, tmp_path, "adapted")
+    fresh, loaded_group = RunConfig.load(str(tmp_path / "runs" / "adapted")).optim.param_groups
+    assert (fresh.name, loaded_group.name, loaded_group.patterns) == ("fresh", "loaded", ("*",))
+    assert fresh.learning_rate_multiplier == FRESH_LEARNING_RATE_MULTIPLIER
+    # The blocks and the head the objective draws are fresh; the adapter's factors are the base's.
+    assert any("cross_attention" in name for name in fresh.patterns)
+    assert all("cross_attention" in name or name.startswith("head/") for name in fresh.patterns)
+    assert not any("lora" in name for name in fresh.patterns)
+    named = (ParamGroup("all", ("*",)),)
+    trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=named)), tmp_path,
+            "named")
+    assert RunConfig.load(str(tmp_path / "runs" / "named")).optim.param_groups == named
