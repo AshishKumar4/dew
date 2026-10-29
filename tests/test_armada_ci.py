@@ -1453,20 +1453,23 @@ def packed(root: Path, names: list[str]) -> None:
 
 def test_a_reader_files_share_in_one_process_is_every_such_files_input(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A data file a reader opens or probes is the input of every test file its pytest process ran, not
-    only the one that opened or probed it: a session fixture's lazy reader, or a process-lived cache
-    (dew.data.text's load_tokenizer, which asks after a tokenizer's optional files), read under one file
-    serves the next without reading again, so a change to the data, or an optional file's arrival, reruns
-    both (train 239's review, row 1987; the CI bundle's review)."""
+    """A data file a reader opens or probes, and code it runs, is the input of every test file its pytest
+    process ran after it, not only the one that ran it: a session fixture's lazy reader, a process-lived
+    cache (dew.data.text's load_tokenizer, which asks after a tokenizer's optional files), or a module
+    imported inside a test, run under one file serves the next without running again, so a change to the
+    data, an optional file's arrival or a change to the module reruns both (train 239's review, row 1987;
+    the CI bundle's review; row 2228: 256 test files hold ~2,300 imports inside tests)."""
     (tmp_path / "tests/fixtures").mkdir(parents=True)
     (tmp_path / "tests/fixtures/shared.json").write_text("[1]\n")
+    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 1\n")
     (tmp_path / "tests/conftest.py").write_text(
-        "import functools, pytest\nfrom pathlib import Path\n"
+        "import functools, pytest, sys\nfrom pathlib import Path\nsys.path.insert(0, 'tests')\n"
         "@pytest.fixture(scope='session')\ndef vocabulary():\n"
         "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text()\n"
         "                           + str(Path('tests/fixtures/template.jinja').exists()))\n")
     body = ("from pathlib import Path\ndef test_{0}(vocabulary):\n"
-            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n")
+            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n"
+            "    import lazy_values\n    assert lazy_values.VALUE\n")
     written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
     packed(tmp_path, ["test_a.py", "test_b.py"])
     run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("a", "b"))
@@ -1477,26 +1480,8 @@ def test_a_reader_files_share_in_one_process_is_every_such_files_input(
     assert run() == [2, 2]
     (tmp_path / "tests/fixtures/template.jinja").write_text("{{ x }}\n")
     assert run() == [3, 3]
-
-
-def test_code_an_earlier_file_in_one_process_ran_is_a_later_files_input(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """Code an earlier test file of a pytest process ran is the input of every file it ran after: a module
-    the first imports lazily inside a test, or a value it caches, serves the next without running again, so
-    a change to that module reruns both (row 2228; 256 test files hold ~2,300 imports inside tests)."""
-    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 1\n")
-    (tmp_path / "tests/conftest.py").write_text("import sys\nsys.path.insert(0, 'tests')\n")
-    body = ("from pathlib import Path\ndef test_{0}():\n"
-            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n"
-            "    import lazy_values\n    assert lazy_values.VALUE\n")
-    written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
-    packed(tmp_path, ["test_a.py", "test_b.py"])
-    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("a", "b"))
-
-    assert run() == [1, 1]
-    assert run() == [1, 1]
     (tmp_path / "tests/lazy_values.py").write_text("VALUE = 2\n")
-    assert run() == [2, 2]
+    assert run() == [4, 4]
 
 
 def test_an_open_after_the_tests_ended_is_the_records_input(ci, tmp_path, monkeypatch, cache_worker):
