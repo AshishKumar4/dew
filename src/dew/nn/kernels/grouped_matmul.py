@@ -47,7 +47,7 @@ from jax.extend import core as jax_core
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic, resources
+from .templates import base, bundles, cost, mosaic, resources, tail as tail_of
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import Product
 
@@ -823,11 +823,16 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # The programs a multiprocessor runs at once share its shared memory.
         return resources.program_shared(super().program_shared(config, target), config.programs)
 
+    def _programs(self, config: mosaic_gpu.Tiles) -> int:
+        """The programs the persistent kernel's schedule spreads its tiles over: the tile's programs on each
+        multiprocessor (`Tiles.programs`)."""
+        return _multiprocessors(generation.gpu_target()) * config.programs
+
     def _launched(self, config: mosaic_gpu.Tiles, interpret: bool) -> int:
-        """The programs the persistent kernel launches: the tile's programs on each multiprocessor
-        (`Tiles.programs`); the interpreter runs one cluster (jax/_src/pallas/mosaic_gpu/interpret), one
-        program alone or a pair's two (`Tiles.cluster`)."""
-        return config.cluster if interpret else _multiprocessors(generation.gpu_target()) * config.programs
+        """The programs the persistent kernel launches: its schedule's (`_programs`); the interpreter runs
+        one cluster (jax/_src/pallas/mosaic_gpu/interpret), one program alone or a pair's two
+        (`Tiles.cluster`)."""
+        return config.cluster if interpret else self._programs(config)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -903,13 +908,26 @@ class MosaicTgmm(_Mosaic):
         # (`mosaic_gpu.split_count`) at the tile the split's own call, writing fp32 partials, derives; an
         # exact sum's order is its contract, so it takes no split.
         tile = super().derived(ba, target)
-        if tile is None or ba.arguments['exact_sums'] or self._splits(ba, tile, target) == 1:
+        if (tile is None or ba.arguments['exact_sums'] or self._balances(ba, tile, target)
+                or self._splits(ba, tile, target) == 1):
             return tile
         partials = self._partials(ba)
         sliced = super().derived(partials, target)
         if sliced is None or (splits := self._splits(partials, sliced, target)) == 1:
             return tile
         return dataclasses.replace(sliced, splits=splits)
+
+    def _balances(self, ba, tile: mosaic_gpu.Tiles, target) -> bool:
+        """Whether the call's last wave runs balanced over the programs (`tail.balanced`), which it
+        takes no split beside: a dense one, not of exact sums, on a family that fixes a tile up across
+        programs, its tail balanced."""
+        family = mosaic_gpu.family_of(tile, ba.arguments['tokens'].dtype)
+        if not (ba.arguments['dense'] and not ba.arguments['exact_sums'] and family.fixes_up):
+            return False
+        depth, _, width = self._generated_extents(ba)
+        tiles = depth // tile.block_m * (width // tile.block_n)
+        steps = -(-ba.arguments['tokens'].shape[0] // tile.block_k)
+        return tail_of.balanced(tiles, steps, _multiprocessors(target)) is not None
 
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
         depth, _, width = self._generated_extents(ba)
@@ -969,12 +987,11 @@ class MosaicTgmm(_Mosaic):
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: mosaic_gpu.Tiles,
              return_residuals: bool = False):
-        del dense  # a dense call is one group, as any
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=config, out_dtype=out_dtype,
-                               multiprocessors=self._launched(config, interpret),
+                               multiprocessors=self._programs(config),
                                interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
-                               exact_sums=exact_sums), None
+                               exact_sums=exact_sums, dense=dense), None
 
 
 @functools.cache

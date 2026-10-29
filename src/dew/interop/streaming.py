@@ -23,10 +23,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.distributed.host import evict
 from dew.interop.unread import Stored, valued
 from dew.interop.weights import swapped
-from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS
 
 
 @dataclass(frozen=True, eq=False)
