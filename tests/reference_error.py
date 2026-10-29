@@ -63,6 +63,7 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -76,6 +77,7 @@ import numpy as np
 from float64_terms import float64_terms
 
 from dew.accuracy import distance, reduction_bound, within
+from dew.nn.precision import FP32_SUMS
 
 FACTOR = 2.0
 
@@ -201,6 +203,23 @@ check 1 between the two across PARITY by host; without the fusions the verdicts 
 of different instruction sets, though the bits still part with the host (docs/performance.md, "The
 SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
 because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+
+
+def _summed_as_run():
+    """The scope a check runs each arm in (`_drawn`), the truth and its terms outside it: on the CPU lane,
+    the process's default backend (`jax.default_backend()`), fp32 products summed in fp32
+    (`dew.nn.precision.FP32_SUMS`), as an accelerator sums them and as a CPU does in any process but
+    the suite's, whose wide arithmetic (`WIDE_CPU_ARITHMETIC`) sums Dew's products in float64, so the
+    gate measures each arm as its users run it; elsewhere the process's own precision. A Dew arm that
+    sums wide only under the suite's setting is no nearer float64 here than its users' runs are, and
+    no route is kept off a CPU for summing narrower than that setting. The preset is JAX's default dot
+    algorithm in it: every dot of no stated precision takes float32 operands, a bfloat16's exactly,
+    and sums them in float32, as a GPU's fp32-accumulated product does, and a loop's running sum of
+    them is the plain one (`compensates_loops`); the setting's widened reductions, which are not
+    product sums, stay."""
+    if jax.default_backend() == "cpu":
+        return jax.default_matmul_precision(FP32_SUMS)
+    return contextlib.nullcontext()
 
 
 def without_ynn(fn, **jit_options):
@@ -1201,7 +1220,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
         rows = [None for _ in arms]
         for mine_at, theirs_at in ordered:
-            dew = dew_fn(*mine_at)
+            with _summed_as_run():
+                dew = dew_fn(*mine_at)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
@@ -1213,7 +1233,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 # sizing); the library arm runs on Dew's own inputs.
                 here, true_here, terms_here = ((theirs_at, their_truth, their_terms) if arm is reference_fn
                                                else (mine_at, truth, terms))
-                other = dew if dew_fn is arm and here is mine_at else arm(*here)
+                with _summed_as_run():
+                    other = dew if dew_fn is arm and here is mine_at else arm(*here)
                 evidence = _evidence(prepared, other, true_here, shared=true_here is truth,
                                      their_terms=terms_here)
                 rows[at_arm] = evidence if rows[at_arm] is None else [
