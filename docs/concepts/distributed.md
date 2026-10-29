@@ -114,7 +114,7 @@ Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and 
 | `host_parameters` | `()` | Globs of variables an inference placement keeps in pinned host memory |
 | `frozen_whole` | `False` | Keep the frozen collection (a LoRA run's base) whole over `fsdp`, split only over the other axes its rules give it |
 
-To change one name's placement and keep every other, drop the default table's rules for that name and put yours ahead of the rest. This keeps the vocabulary off the `tensor` axis, on `fsdp` where its size divides the vocabulary and whole where it does not:
+To change one name's placement and keep every other, drop the default table's rules for that name and put yours ahead of the rest. This keeps the vocabulary off the `tensor` axis, whether `fsdp` can split it or not:
 
 ```python
 from dew.mesh import DEFAULT_RULES
