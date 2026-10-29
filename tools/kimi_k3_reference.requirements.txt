@@ -1,0 +1,6 @@
+# The environment tools/kimi_k3_reference.py records the Kimi K3 fixture in (uv pip install -r).
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+transformers==4.56.2
+fla-core==0.5.2
+compressed-tensors==0.17.1

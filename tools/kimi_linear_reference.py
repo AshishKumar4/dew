@@ -7,8 +7,8 @@ kernels, whose 0.4.0 `fused_kda_gate` signature the release calls (0.5
 changed it), so this runs on a CUDA device, in fp32, with
 TRITON_F32_DEFAULT=ieee for every dot that leaves its precision unset.
 
-Environment (~/.cache/dew/reference-venvs/kimi-linear): torch 2.8.0+cu128,
-transformers 4.57.1, fla-core 0.4.0.
+Environment: tools/kimi_linear_reference.requirements.txt (torch 2.8.0+cu128,
+transformers 4.57.1, fla-core 0.4.0).
 
 Four things change how the reference runs, not what it computes:
 
@@ -67,6 +67,7 @@ from kimi_k3_reference import (
     float64_truth,
     greedy,
     record_orders,
+    record_picks,
     scatter,
     sgd_step,
     symmetric,
@@ -224,6 +225,7 @@ def main() -> None:
              logits=logits.detach().cpu().numpy(), loss=np.float32(loss.detach().cpu()),
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
              generated=generated, step_logits=step_logits, precision=matmul_precision())
+    record_picks(DESTINATION)
     print("wrote", DESTINATION, "tensors", len(tensors))
 
 

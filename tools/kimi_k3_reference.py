@@ -13,8 +13,8 @@ reference computes with the library's own decompression of them, so the
 packed file and the logits describe one model. `calculate_qparams` clamps
 the scale exponents and substitutes a finite scale for an all-zero group.
 
-Environment (~/.cache/dew/reference-venvs/kimi-k3): torch 2.8.0+cu128,
-transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1.
+Environment: tools/kimi_k3_reference.requirements.txt (torch 2.8.0+cu128,
+transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1).
 
 Three things change how the reference runs, neither what it computes:
 
@@ -73,6 +73,9 @@ ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 SOURCE = ROOT / "kimi-k3-source"
 DESTINATION = ROOT / "kimi-k3-tiny"
 LEARNING_RATE = 1e-2
+PICKS = "autotune.json"
+"""Where a fixture keeps the configuration each of fla's autotuned kernels took at each shape its run
+called it with (`record_picks`)."""
 
 
 def tiny_config() -> dict:
@@ -299,6 +302,7 @@ def main() -> None:
              generated=generated, step_logits=step_logits,
              situ_gate=gate.reshape(-1).numpy(), situ_up=up.reshape(-1).numpy(),
              situ=situ_out.reshape(-1).numpy(), precision=matmul_precision())
+    record_picks(DESTINATION)
     print("wrote", DESTINATION, "tensors", len(tensors))
 
 
@@ -408,6 +412,52 @@ def orders(drawn: Path) -> None:
                   matmul_precision())
 
 
+def autotuned() -> dict:
+    """Each autotuned Triton kernel of the fla modules this process has imported, by its function's
+    module and name, re-exports counted once."""
+    from triton.runtime.autotuner import Autotuner, Heuristics
+
+    kernels = {}
+    for module in [module for name, module in sys.modules.items() if name.startswith("fla.") and module]:
+        for kernel in vars(module).values():
+            while isinstance(kernel, Heuristics):
+                kernel = kernel.fn
+            if isinstance(kernel, Autotuner):
+                kernels[f"{kernel.base_fn.__module__}.{kernel.base_fn.__name__}"] = kernel
+    return kernels
+
+
+def picks() -> dict:
+    """The configuration each of fla's autotuned kernels took at each shape it ran, as `PICKS` keeps
+    them: its tiles, warps and stages, which a timing chose and which decide how its sums round."""
+    return {name: sorted([list(key), {"kwargs": config.kwargs, "num_warps": config.num_warps,
+                                      "num_stages": config.num_stages, "num_ctas": config.num_ctas}]
+                         for key, config in kernel.cache.items())
+            for name, kernel in sorted(autotuned().items()) if kernel.cache}
+
+
+def record_picks(destination: Path) -> None:
+    """Write this run's `picks` beside the fixture in `destination`."""
+    (destination / PICKS).write_text(json.dumps(picks(), indent=1, sort_keys=True) + "\n")
+
+
+def restore_picks(destination: Path) -> None:
+    """Set each of fla's autotuned kernels to the configurations the fixture's run in `destination`
+    took (`record_picks`), so each shape it runs takes its recorded configuration without timing: a
+    later run reproduces the fixture's bits from a cold cache, where timing could pick another tile
+    (ledger 568: four A100 runs of the orders could not reproduce order 0)."""
+    from triton import Config
+
+    recorded, kernels = json.loads((destination / PICKS).read_text()), autotuned()
+    if missing := sorted(set(recorded) - set(kernels)):
+        raise SystemExit(f"fla no longer autotunes {missing}, which the fixture's run did")
+    for name, taken in recorded.items():
+        kernels[name].cache.update({tuple(key): Config(config["kwargs"], num_warps=config["num_warps"],
+                                                       num_stages=config["num_stages"],
+                                                       num_ctas=config["num_ctas"])
+                                    for key, config in taken})
+
+
 def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
                   load: Callable[[torch.nn.Module, dict[str, torch.Tensor]], None],
                   trainable: Callable[[str], bool], precision: str) -> None:
@@ -415,9 +465,12 @@ def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
     order under `drawn`, each order's weights read in by `load`: its updated
     logits' RMS distance from float64 written to `destination`/orders.npz
     beside the orders (tests/reference_error.py's K-order rule). Order 0 is
-    the fixture's own run and must reproduce its updated logits bit for bit."""
+    the fixture's own run and must reproduce its updated logits bit for bit:
+    fla's kernels take the fixture's configurations (`restore_picks`), and no
+    shape is timed afresh."""
     from safetensors.torch import load_file
 
+    restore_picks(destination)
     ids, mask = fixture_batch()
     input_ids, attention_mask = torch.tensor(ids, device="cuda"), torch.tensor(mask, device="cuda")
     valid = mask.astype(bool)
@@ -432,6 +485,8 @@ def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
         if k == 0:
             assert np.array_equal(updated, recorded), "order 0 must reproduce the fixture's run"
         distances.append(np.sqrt(np.mean(np.square(updated[valid].astype(np.float64) - truth))))
+    assert picks() == json.loads((destination / PICKS).read_text()), \
+        "a kernel ran a shape the fixture's run did not"
     np.savez(destination / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
              updated_logits=np.asarray(distances), precision=precision)
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
