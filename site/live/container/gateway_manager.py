@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from guests import GUEST_UIDS, user
+from guests import GUEST_UIDS, idle_seconds, user
 from kernel_gateway.services.kernels.manager import (
     KernelGatewayIOLoopKernelManager,
     SeedingMappingKernelManager,
@@ -151,6 +151,21 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
 
 
 class LimitedMappingKernelManager(SeedingMappingKernelManager):
+    """The gateway's kernels, each launched isolated (`LimitedKernelManager`), and culled by jupyter-server's
+    own culler once no connection holds one and it has been idle for the live contract's idle time
+    (`guests.idle_seconds`), looked for every tenth of it: a kernel whose create the bridge gave up on while
+    the gateway went on making it, which no context, close or cleanup knows (ledger 843). A page's kernels
+    hold the bridge's channels, and an IPC client's (benchmark_gateway.py) is active while its requests
+    run."""
+
     @default("kernel_manager_class")
     def _kernel_manager_class_default(self):
         return "gateway_manager.LimitedKernelManager"
+
+    @default("cull_idle_timeout")
+    def _cull_idle_timeout_default(self):
+        return idle_seconds()
+
+    @default("cull_interval")
+    def _cull_interval_default(self):
+        return max(1, idle_seconds() // 10)
