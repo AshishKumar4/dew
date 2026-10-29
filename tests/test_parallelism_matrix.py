@@ -111,10 +111,14 @@ def references(tmp_path_factory):
 
 
 PAST_TARGET = {"test_each_layout_of_a_model_runs_or_is_refused_as_stated": {
-    ("edm2", "tensor4", None): 123.0, ("edm2", "fsdp2_tensor2", None): 131.7}}
-"""The run-once cells past a group's 120 s target, which the whole suite alone runs (`whole_suite.timed`):
-compile-bound, each timed alone on an armada 25/17 worker (om-edm2-time, 2026-10-29), about 1.35 times
-that on the fleet's 26/17 workers; no smaller model cuts the compile."""
+    ("edm2", "tensor4", None): 123.0, ("edm2", "fsdp2_tensor2", None): 131.7},
+    "test_each_split_draws_a_models_initial_parameters_as_one_device_does": {
+    ("unet", "fsdp2_tensor2", None): 158.8}}
+"""The cells past a group's 120 s target, which the whole suite alone runs (`whole_suite.timed`), all
+compile-bound: the run-once cells each timed alone on an armada 25/17 worker (om-edm2-time,
+2026-10-29), about 1.35 times that on the fleet's 26/17 workers, where no smaller model cuts the
+compile; the UNet's split draw as the whole suite timed it (verdict of 5d4a33c12, 2026-10-29), its
+four draw programs compiled with its float64 replay's."""
 
 
 def cells(*, judged: bool) -> list[tuple[str, str, int | None]]:
@@ -193,7 +197,9 @@ def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), split_draws(), ids=named(split_draws()))
+@pytest.mark.parametrize(("model", "layout", "devices"), timed(
+    PAST_TARGET, "test_each_split_draws_a_models_initial_parameters_as_one_device_does", split_draws()),
+    ids=named(split_draws()))
 def test_each_split_draws_a_models_initial_parameters_as_one_device_does(model, layout, devices, references):
     """A layout's own draw of a model's initial parameters, split over its mesh, and one device's draw
     are each held by check 1 to their float64 truth, the one-device program replayed in float64 from

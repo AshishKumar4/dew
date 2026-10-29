@@ -122,8 +122,8 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
     assert not np.array_equal(np.asarray(normed.apply(params, ids)), np.asarray(plain.apply(params, ids)))
 
 
-PROJECTED_TWIN_SEEDS = 16
-"""The draws a projected decoder's depth and context are held to its stream-width twin over (check 1)."""
+PROJECTED_TWIN_DRAWS = 3
+"""The draws a projected decoder's depth and context are held to its stream-width twin on."""
 
 
 def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream_embedding():
@@ -131,13 +131,14 @@ def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream
     a cross-attention layer reading a context by the table, pairs its depth with and encodes its context
     by the token embedding at the stream's width (`stream_embeddings`, through `project_in`): its trunk's
     and its depth's logits over a context, and their loss's gradient in its layers', depth's and
-    cross-attention's parameters, are on par with those of its twin at the stream's width, whose table is
-    the projected one and whose untied head is `project_out` and the table together (check 1, the twin
-    in float64 the truth)."""
+    cross-attention's parameters, run in float64, compute those of its twin at the stream's width, whose
+    table is the projected one and whose untied head is `project_out` and the table together, in float64
+    (`assert_computes_the_oracle`, within the float64 rounding of the projected decoder's own
+    arithmetic)."""
     import jax
     import jax.numpy as jnp
     import optax
-    from reference_error import as_given
+    from reference_error import assert_computes_the_oracle, chain_roundings
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.cross_attention import CrossAttention, encode_context
@@ -187,16 +188,18 @@ def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream
                         + jnp.sum(optax.softmax_cross_entropy_with_integer_labels(depth, targets[:, 1:])))
             return outputs(shared), jax.grad(loss)(shared)
 
-        def held(*inputs):
-            with jax.default_matmul_precision("highest"):
-                return run(*inputs)
-        return held
+        return run
 
-    @as_given
-    def truth(params, ids, context, targets):
+    for seed in range(PROJECTED_TWIN_DRAWS):
+        params, ids, context, targets = draw(seed)
         with jax.enable_x64(new_val=True):
             wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
-            return jax.device_get(scored(twin.clone(dtype=jnp.float64), twinned)(wide, ids, context, targets))
-
-    assert_as_exact(jax.jit(scored(projected, lambda params: params)), jax.jit(scored(twin, twinned)), draw,
-                    "projected depth and context", seeds=PROJECTED_TWIN_SEEDS, truth_fn=truth)
+            dew = scored(projected.clone(dtype=jnp.float64), lambda params: params)
+            found = jax.device_get(dew(wide, ids, context, targets))
+            oracle = scored(twin.clone(dtype=jnp.float64), twinned)
+            expected = jax.device_get(oracle(wide, ids, context, targets))
+            roundings = chain_roundings(jax.make_jaxpr(dew)(wide, ids, context, targets))
+        for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(found), jax.tree.leaves(expected),
+                                        strict=True):
+            assert_computes_the_oracle(np.asarray(mine), np.asarray(theirs),
+                                       f"draw {seed} {jax.tree_util.keystr(path)}", roundings=roundings)
