@@ -44,8 +44,9 @@ green row records the checkout's Python files its tests executed
 directories under src/ that hold them, however deep (so a module added
 beside one, or an __init__.py on the way to one, changes it), the file
 itself and what every file shares (`shared`: the environment's locks, the
-CI tools, every non-Python file under tests/ and src/, the names
-of the Python files under tests/ but the test modules, and src/'s entries).
+CI tools, the names of the non-Python files under tests/ but its fixtures and
+under src/, of the Python files under tests/ but the test modules, and src/'s
+entries). A fixture is the input of the runs that opened, listed or probed it.
 A test module, or a module in a package a file never imported, is no input
 of that file's: a train that loses a head reruns only the files the head's
 modules reached (the land queue's recompose after a pull). A task
@@ -220,25 +221,25 @@ def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
     .armada.json's parts a test process sees (`armada_seen`), and the names of the Python files under
     tests/ but its test modules and of src/'s own entries, whose arrival can change what an import finds
-    (a conftest.py, a helper or a top-level package that shadows another), and of every fixture and package
-    data file (an existence query no record sees), which a record does not see. A
-    module within a package under src/ is its importers' input alone, with its package's other modules
-    (`inputs`), a test module is no other file's, and a fixture or a package's data is its openers'
-    (executed.py's `Opens`): so a train that loses a head runs again only what that head's files reached
+    (a conftest.py, a helper or a top-level package that shadows another), and of every data file under
+    tests/ but its fixtures and under src/ (an existence probe before the recorder starts). A module within
+    a package under src/ is its importers' input alone, with its package's other modules (`inputs`), a test
+    module is no other file's, and a fixture is its openers', listers' and probers' (executed.py's `Opens`,
+    followed.py's `PROBES`): so a train that loses a head runs again only what that head's files reached
     (owner, 2026-10-27: 8 fixtures changed reran all 485 tasks of train 222's second round)."""
     digest = hashlib.sha256(python.encode())
     for path in sorted(Path("tests").rglob("*.py")):
         if "__pycache__" not in path.parts and not path.name.startswith("test_"):
             digest.update(str(path).encode())
-    # The names of every fixture and every package's data: a test may ask whether one exists (`Path.exists`,
-    # a collection by presence) without opening it, which no record sees, so an arrival or a removal is every
-    # file's input; a file's contents stay its openers' (train 253's review: a test asserting a fixture's
-    # absence was reused green once the fixture came).
-    # A build's output and a fetched payload, which a planner's checkout lacks, are not named: they are their
-    # build's and their manifest's (`built`, FETCHED, `contents`), whose names are.
+    # The names of every data file under tests/ but its fixtures, and of every package's data: an existence
+    # probe a library makes at import, before the recorder starts, is no record's. A fixture is its openers',
+    # listers' and probers' alone, as a run records every probe it makes (followed.py's `PROBES`; Main,
+    # 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures). A build's output and a fetched
+    # payload, which a planner's checkout lacks, are not named: they are their build's and their manifest's
+    # (`built`, FETCHED, `contents`), whose names are.
     for root in ("tests", "src"):
         for path in sorted(Path(root).rglob("*")):
-            if (path.is_file() and path.suffix != ".py" and not built(path)
+            if (path.is_file() and path.suffix != ".py" and not built(path) and FIXTURES not in path.parents
                     and not path.with_name(path.name + FETCHED).is_file()):
                 digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
@@ -255,6 +256,9 @@ def lane_inputs(python: str) -> str:
     return hashlib.sha256((shared(python) + contents(__file__).hex()).encode()).hexdigest()
 
 
+FIXTURES = Path("tests/fixtures")
+"""The tests' fixtures: each its openers', listers' and probers' input alone (`shared`), and a native reader's
+directories up to it (`native_inputs`)."""
 FETCHED = ".fetched.json"
 """A fetched fixture's manifest's suffix, beside the payload it pins (tools/fetched_fixtures.py)."""
 
@@ -689,6 +693,36 @@ def plan(target: float, timings: dict) -> list[dict]:
     return entries
 
 
+MARKED = ("whole_suite", "release_env")
+"""The marks a file's row names its tests by, as pytest resolved them (executed.py): its whole_suite
+cells, which `slow` reports as the whole suite's alone, and its release checks, which `release_plan`
+plans."""
+RELEASE = "release:"
+"""A release check's row, beside its file's own: `row`'s group, its requirement after it."""
+
+
+def release_plan(verdict: dict) -> list[dict]:
+    """The release checks of a whole suite's `verdict` (`armada verdict <sha> --json`), a task each
+    requirement: the files whose rows name checks under it (`release_env`, as pytest resolved each test's
+    mark before any selection: executed.py), which the run's own tasks set aside, as the suite's environment
+    lacks it (`selected`). Its run's second job runs them (.github/workflows/ci.yml, `release`)."""
+    checks: dict[str, set[str]] = {}
+    for found in verdict["rows"]:
+        for requirement in found.get("release_env", {}):
+            checks.setdefault(requirement, set()).add(parsed_row(found["name"])[1])
+    return [{"release": requirement, "python": PYTHONS[0], "tests": " ".join(sorted(names))}
+            for requirement, names in sorted(checks.items())]
+
+
+def release(python: str, tests: list[str], requirement: str, out: Path) -> int:
+    """`requirement`'s release checks in `tests` (`release_plan`), as a whole suite's second job runs each:
+    its rows in `out`, each red one named, exit 1 on any."""
+    task(python, tests, "", out, session.DEADLINE, "off", release=requirement)
+    red = [found["name"] for found in json.loads(out.read_text())["rows"] if found["exitCode"]]
+    for name in red:
+        print(f"RED {name}")
+    return 1 if red else 0
+
 def node_of(case: ET.Element) -> str:
     """A JUnit case's pytest node id, as tests/test_durations.json keys it."""
     parts = (case.get("classname") or "").split(".")
@@ -752,7 +786,8 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
-         grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False) -> int:
+         grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
+         release: str = "") -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -763,19 +798,32 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     file goes there (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them.
     return tested(python, tests, split, out, deadline, cache, grace, shared(python), {}, coverage,
-                  whole=whole)
+                  whole=whole, release=release)
+
+
+def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
+    """CI's pytest `run` over `tests`, with the plugins that record what ran (executed.py), keep one group
+    of a split file (`split`, split.py) and a release check's tests (`release`, release.py). A release
+    check's pytest runs with its requirement over the suite's environment, whose torch and jax it keeps:
+    uv's overlay."""
+    grouping = (["-p", "split", f"--ci-group={split}"] if split else []) + (
+        ["-p", "release", f"--ci-release={release}"] if release else [])
+    command = [*run, "-p", "executed", *tests, *grouping]
+    return ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
+            *command[1:]] if release else command
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
-           network: bool = False, whole: bool = False) -> int:
+           network: bool = False, whole: bool = False, release: str = "") -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
-    Hub open, recorded on the network lane's class (`device_class`)."""
+    Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's."""
     began = time.monotonic()
+    group = split or (f"{RELEASE}{release}" if release else "")
     rows = [found for name in tests
-            if cache != "off" and (found := reused(python, name, split, common, network))]
-    tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
+            if cache != "off" and (found := reused(python, name, group, common, network))]
+    tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {device_class(network)}; "
               "their rows are reused")
@@ -787,13 +835,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     report = out.with_name(f"{out.name}.junit.xml")
     for stale in (report, executed_report, collection):
         stale.unlink(missing_ok=True)
-    grouping = ["-p", "split", f"--ci-group={split}"] if split else []
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["-m", "coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    command = [*selected(session.pytest_run(python, report, *measured), network, whole), "-p", "executed",
-               *tests, *grouping]
+    run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release))
+    command = pytest_command(run, tests, split, release)
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
@@ -872,20 +919,32 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         seconds = shares[name]
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
-        ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
+        ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([output[-4000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
-                     **{key: cells for key, cells in counts.get(name, {}).items() if key == "whole_suite"},
+                     **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:
         # A traced run's rows, timed under tracing, are no rows to reuse.
         record(python, ran, executed_report, common, network, opened)
     return 0
+
+
+def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
+    """The fixture directories, each up to tests/fixtures, of what a task's processes opened natively
+    (`watched`: an open no Python process recorded, as a tokenizer's Rust code makes): a native reader's
+    probe beside what it opened is no record's, as followed.py's `PROBES` are Python's. The fetched store
+    is none: its payloads are content-addressed, and a planner, which never downloads them, keys them as a
+    task does (`contents`)."""
+    store = FIXTURES / "fetched"
+    return {str(parent) for name in opened - recorded if FIXTURES in (path := Path(name)).parents
+            and store != path and store not in path.parents
+            for parent in path.parents if parent == FIXTURES or FIXTURES in parent.parents}
 
 
 def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False,
@@ -901,6 +960,9 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
     # A run cut short, or whose collection failed, may have written no report, or none for a file.
     executed = json.loads(executed_report.read_text()) if executed_report.is_file() else {}
     held = device_class(network)
+    if opened is not None:
+        recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
+        opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
@@ -1008,14 +1070,17 @@ def collected(python: str, marks: str) -> dict[str, int]:
     return counts
 
 
-def selected(command: list[str], network: bool, whole: bool = False) -> list[str]:
+def selected(command: list[str], network: bool, whole: bool = False, release: bool = False) -> list[str]:
     """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
     tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
     the whole suite's own run (`whole`: DEW_WHOLE_SUITE, every fifth publish's ci/full-whole-*), whatever
     the cache's policy: a policy-off train runs every file, never a whole-suite cell (Main, 2026-10-28:
-    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline)."""
+    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks
+    run in their own tasks alone (`release`), under a requirement the suite's environment lacks
+    (`release_plan`)."""
     at = command.index(session.SELECTION[1])
-    cells = "" if whole else " and not whole_suite"
+    checks = " and release_env" if release else " and not release_env"
+    cells = checks + ("" if whole else " and not whole_suite")
     return [*command[:at], "network" if network else session.SELECTION[1] + cells, *command[at + 1:]]
 
 
@@ -1386,6 +1451,23 @@ def task_arguments(running: argparse.ArgumentParser) -> None:
                          help="run the files under coverage.py, its data file in this directory")
 
 
+def release_arguments(planning: argparse.ArgumentParser, checking: argparse.ArgumentParser) -> None:
+    """The `release-plan` and `release` operations' arguments: a whole suite's second job (`release_plan`)."""
+    planning.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
+    checking.add_argument("--python", choices=PYTHONS, required=True)
+    checking.add_argument("--tests", required=True)
+    checking.add_argument("--requirement", required=True)
+    checking.add_argument("--out", type=Path, required=True)
+
+
+def releasing(args: argparse.Namespace) -> int:
+    """`release-plan`'s tasks printed, or `release`'s checks run (`release_plan`, `release`)."""
+    if args.operation == "release-plan":
+        print(json.dumps(release_plan(json.loads(args.verdict.read_text()))))
+        return 0
+    return release(args.python, args.tests.split(), args.requirement, args.out)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/armada/ci.py")
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -1431,6 +1513,9 @@ def main() -> int:
     flagging.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
     flagging.add_argument("--new", type=Path, default=None,
                           help="the durations record the change is measured against: only the tests it lacks")
+    release_arguments(
+        operations.add_parser("release-plan", help="a whole suite verdict's release checks, a task each"),
+        operations.add_parser("release", help="one requirement's release checks; exit 1 on a red row"))
     recording = operations.add_parser("durations")
     recording.add_argument("verdict", type=Path, help="main's CI verdict: armada verdict <sha> --json")
     args = parser.parse_args()
@@ -1441,6 +1526,8 @@ def main() -> int:
         return 0
     if args.operation == "slow":
         return flagged(args.verdict, args.new)
+    if args.operation in ("release-plan", "release"):
+        return releasing(args)
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
         before = durations_record()

@@ -47,10 +47,6 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP021 is about every file: a private attribute of JAX's own objects
   (`JAX_PRIVATE`) is read nowhere (Dew reads no other library's private
   attributes), whose public way the finding names.
-- SLOP023 is about `tests`: a fixture's size or metadata is never read
-  without opening it (`stat`, `os.path.getsize` on a path that names a
-  fixture), since the test cache records a fixture as its openers' input and a
-  stat is no open; a test that ranks fixtures by size reads them.
 - SLOP022 is about every file outside `src/<package>`, where the torch
   float64 truths are: a torch module is never promoted to float64 after its
   construction, which keeps what its constructor computed in float32; its
@@ -667,26 +663,6 @@ def jax_private(module: Module) -> Iterator[Finding]:
         if isinstance(node, ast.Attribute) and node.attr in JAX_PRIVATE:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP021",
                           f"reads JAX's private {node.attr}; {JAX_PRIVATE[node.attr]}")
-
-
-def fixture_metadata(module: Module) -> Iterator[Finding]:
-    """SLOP023: a fixture's size or metadata read without opening it: `<path>.stat()`, `os.stat(<path>)` or
-    `os.path.getsize(<path>)` where the path's source names a fixture (FIXTURE, tests/fixtures), in a
-    test. The test cache records a fixture as its openers' input, and a stat is no open, so a resized
-    fixture would reuse a stale green (Main, 2026-10-28)."""
-    if not module.relative.startswith("tests/"):
-        return
-    for node in ast.walk(module.tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        stat = isinstance(func, ast.Attribute) and func.attr in ("stat", "lstat") and not node.args
-        called = ast.unparse(func) in ("os.stat", "os.lstat", "os.path.getsize", "os.path.getmtime")
-        target = func.value if stat else node.args[0] if called and node.args else None
-        if target is not None and "fixture" in ast.unparse(target).lower():
-            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP023",
-                          "reads a fixture's metadata without opening it; read the file (an open the test "
-                          "cache records)")
 
 
 def size(module: Module) -> Iterator[Finding]:
@@ -2127,7 +2103,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections)
-UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private, fixture_metadata)
+UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 
 def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]:

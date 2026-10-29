@@ -23,7 +23,7 @@ from jax import lax
 from jax.experimental import checkify
 
 from dew._distributions import row_draw, wellformed
-from dew.batch import Variables
+from dew.batch import Variables, prefix_sum
 from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.nn.scatter import DROPPED, gather_positions
@@ -155,7 +155,7 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
     propose = ops.propose
     if propose is None:
         return state, tuple(entry for entry in carry if entry is not None)
-    ordinal = prior_tokens[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    ordinal = prior_tokens[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
     upstream, tails = states, []
     for depth in range(ops.depths):
         head = carry[depth] if depth < len(carry) else None

@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.batch import document_ranks, document_starts, real_slots, token_layout
+from dew.batch import document_ranks, document_starts, prefix_sum, real_slots, token_layout
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import SteppedInContext
@@ -123,8 +123,8 @@ def window_keys(valid, documents, rows: int, length: int, window: int) -> tuple[
                  else jnp.asarray(documents, jnp.int32))
     starts = document_starts(documents, real)
     # A row's first real token opens its first run, which `document_starts` leaves to what precedes.
-    runs = jnp.cumsum(starts | (real & (jnp.cumsum(real, axis=1) == 1)), axis=1)
-    return runs, jnp.where(runs > 0, document_ranks(real, starts) // window, -1)
+    runs = prefix_sum(starts | (real & (prefix_sum(real, dtype=jnp.int32) == 1)), dtype=jnp.int32)
+    return jnp.asarray(runs), jnp.where(runs > 0, document_ranks(real, starts) // window, -1)
 
 
 def _rows(tree, rows: int):

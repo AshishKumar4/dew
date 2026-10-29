@@ -190,7 +190,7 @@ def build(args: argparse.Namespace) -> Run:
         return jax.device_put(rows(window_rows(order, step, args.batch)), placement)
 
     compile_start = time.perf_counter()
-    # As `fit` plans: a frontier the plan opens is timed, and the run goes on from the state it timed.
+    # As `fit` plans: keep the admitted plan, with trials only for explicitly enabled AutoPGLE.
     trials = Trials(state, batch(0))
     step = trainer.compile(state, batch(0), trials)
     return Run(trainer, trials.state, step, batch, schedule.schedule(schedule_steps), windows, seq, total,

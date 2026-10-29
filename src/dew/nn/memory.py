@@ -81,7 +81,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
 
-from dew.batch import valid_order
+from dew.batch import prefix_sum, valid_order
 from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
@@ -847,7 +847,7 @@ def _documents(steps: _Steps) -> tuple[jax.Array, jax.Array]:
     """Each document's first real token `[B, S]`, and the tokens of a call's first document `[B, S]`,
     every one up to its second document's first: in a cached call, the document its row holds."""
     begins = steps.real & (steps.places == 0)
-    return begins, jnp.cumsum(begins, axis=1) <= 1
+    return begins, prefix_sum(begins, dtype=jnp.int32) <= 1
 
 
 def _at_last(values: jax.Array, real: jax.Array, held: jax.Array) -> jax.Array:

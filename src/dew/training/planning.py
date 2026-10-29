@@ -14,7 +14,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-import os
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -45,7 +44,6 @@ from dew.training.memory import (
     head_tile_of,
     recompute_more,
     recompute_record,
-    remat_below,
     remat_half,
     remat_more,
     rung_record,
@@ -327,20 +325,6 @@ def step_seconds(step: Callable, state: TrainState, batch: Batch) -> list[float]
     return samples(stepped, warmup=TIMED_WARMUP, repeats=TIMED_REPEATS, calls=TIMED_STEPS)
 
 
-UNTIMED_FRONTIER = "DEW_UNTIMED_FRONTIER"
-"""The environment variable that, set to 1, has a process keep a frontier's first plan untimed: Dew's
-tests' setting (tests/lane_environment.py), never the library's. A frontier's choice follows its
-clock, so two runs timed apart may train different programs, by design; a test whose property is a
-resume's, two pools a run and its resume, would read that choice as its own, where no record pins a
-pool's plan (`dew.training.rungs.recorded_rung`). The choice itself stays tested through `Trainer.compile`'s
-own timer."""
-
-
-def untimed_frontier() -> bool:
-    """Whether this process keeps a frontier's first plan untimed (`UNTIMED_FRONTIER`)."""
-    return os.environ.get(UNTIMED_FRONTIER) == "1"
-
-
 def faster(timings: Sequence[Sequence[float]]) -> int:
     """The plan of a frontier's `timings` (each plan's samples, `step_seconds`) that runs faster: a later
     one only where its slowest sample beats every sample of the first's, the first otherwise. A choice
@@ -356,8 +340,9 @@ def faster(timings: Sequence[Sequence[float]]) -> int:
 @dataclasses.dataclass
 class Trials:
     """Trial runs of a plan's steps on `batch` from `state`, each on a copy of the state as it stood
-    (`run`): a frontier's timing (`seconds`), where `frontier` asks for it, and AutoPGLE's profile of the
-    plan admitted (`profiled`). A state the trials own (`owned`, `fit`'s) is stepped by the first trial
+    (`run`): an offline frontier's timing (`seconds`), explicitly called by its tool, and AutoPGLE's
+    profile of the plan admitted (`profiled`). Live compilation never invokes `seconds`. A state the
+    trials own (`owned`, `fit`'s) is stepped by the first trial
     and deleted, each later trial stepping a fresh copy from the host, so the devices hold one state at a
     time, and `state` is then a copy as it stood, for the run to go on from. One they borrow (a compile
     given none, `Trainer.compile`) is never stepped and stays `state`: each trial steps a copy beside it,
@@ -365,7 +350,6 @@ class Trials:
     state: TrainState
     batch: Batch
     owned: bool = True
-    frontier: bool = True
     restored: Callable[[], TrainState] | None = None
     """The moving state as it stood, copied to the host at the first trial (`snapshot`)."""
 
@@ -477,22 +461,14 @@ class Forecast:
 
 
 def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[Sequence[float]],
-            probes: Sequence[Probe], cheaper: dict[str, JSON] | None = None) -> dict[str, JSON]:
+            probes: Sequence[Probe]) -> dict[str, JSON]:
     """The record of `planned`, of `plans` a frontier timed at `seconds` a
     step (none where one plan fit first): every compile the search made,
-    `probes`, each timed plan's split, rows, rung and seconds, the planned
+    `probes`, each timed plan's split, rows, rung and seconds, and the planned
     step's kernels (`KernelReport.record`: each dispatch's route and each
-    kernel's lowered launches), which the run log states, and the cheapest
-    remat rung below the run's own that fits too (`FitSearch.cheaper`, its
-    `Probe.record`, measured now or by the run that recorded the plan), which
-    the run is told of."""
+    kernel's lowered launches), which the run log states."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
-    if cheaper is not None:
-        _log.warning("the run sets remat %r, and remat %r fits its plan of %s x %s rows too, with %s "
-                     "bytes to spare on the tightest device of the process that measured it, recomputing "
-                     "less: set remat to it to train faster", planned.rung["remat"], cheaper["remat"],
-                     cheaper["split"], cheaper["rows"], cheaper["headroom"])
-    return {**planned.record(), "kernels": planned.candidate.kernels.record(), "cheaper": cheaper,
+    return {**planned.record(), "kernels": planned.candidate.kernels.record(),
             "probes": [probe.record() for probe in probes],
             "timed": [{**plan.record(), "seconds": min(took)}
                       for plan, took in zip(plans, seconds, strict=True)] if seconds else None}
@@ -552,7 +528,6 @@ class FitSearch[LossT, EffectsT]:
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
-        self.started = self.remat_rung()
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
         self.required = compiler_options(*self.objective.towers()) or None
 
@@ -636,33 +611,6 @@ class FitSearch[LossT, EffectsT]:
                          "here the resumed run computes otherwise than the run it continues", self.resumed)
             self.resumed = None
         return False
-
-    def cheaper(self, admitted: Planned) -> Probe | None:
-        """The cheapest remat rung below the `admitted` plan's that fits its split too, measured at each
-        rung below from the cheapest (`remat_below`) with the plan's head, copies and options, until one
-        fits; None where the search climbed from the remat the run set itself, which it then kept. The
-        objective is left as it was. A run that sets its remat keeps it, as the search starts there and
-        only climbs (`planned`); this tells it what a cheaper one costs in memory instead (row 2026)."""
-        if json.dumps(admitted.rung["remat"], sort_keys=True) != self.started:
-            return None
-        held = [entry.module for entry in self.objective.program_key()]
-        tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
-        defaults, narrow = self.xla_defaults, self.narrow
-        try:
-            # The admitted plan's modules, as a frontier asked past it leaves the objective a rung up.
-            self.objective.substitute(list(admitted.modules))
-            self.objective.restore_head(admitted.tile, fused=admitted.fused)
-            self.xla_defaults, self.narrow = admitted.xla_defaults, admitted.narrow
-            for modules in remat_below(self.objective):
-                self.objective.substitute(modules)
-                _, _, probe = self.measured(admitted.split, self.lower(admitted.split, admitted.narrow))
-                if probe.fits:
-                    return probe
-            return None
-        finally:
-            self.objective.substitute(held)
-            self.objective.restore_head(tile, fused=fused)
-            self.xla_defaults, self.narrow = defaults, narrow
 
     def climb(self) -> bool:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.
