@@ -22,7 +22,7 @@
     "timeout": 1800,
     "mode": "fast",
     "speculative": true,
-    "cpu": { "vendor": "AuthenticAMD", "family": 25, "model": 17 },
+    "cpu": [{ "vendor": "AuthenticAMD", "family": 25, "model": 17 }, { "vendor": "AuthenticAMD", "family": 26, "model": 17 }],
     "secrets": ["DEW_XLA_CACHE_TOKEN"]
   }
 }
