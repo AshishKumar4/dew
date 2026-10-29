@@ -247,6 +247,40 @@ def test_a_synchronous_collection_refuses_a_ratio_read_at_another_temperature():
     collected(GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1))
 
 
+def test_a_run_names_a_method_that_builds_its_objective_and_its_rollout(tmp_path):
+    """A GRPO run whose rollout names a method (`--rollout.method rloo`) builds the method's objective and
+    scheduler from it: RLOO's reference penalty in the reward, weighted by the run's
+    `--objective.reward-kl`, keeps the frozen starting policy the step's rewards are penalized against.
+    The run records the method and loads with it, and a setting the method fixes, stated on the command
+    line (`--objective.beta` under DAPO, which penalizes no reference), is refused."""
+    import rl_support
+
+    from dew.config import ObjectiveConfig
+    from dew.config.lm import LMRunConfig, PromptRollout
+    from dew.data import Memory, presets
+    from dew.registry import ModelConfig
+
+    tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
+    rows = [{"prompt": "hi there", "data_source": "rule", "ground_truth": "a"}] * 8
+    rollout = PromptRollout(reward=f"{rl_support.__name__}:completion_length", groups=2, max_new_tokens=4)
+    model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
+                                               "dtype": "float32"})
+    default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),
+                          tokenizer=tokenizer, objective=ObjectiveConfig("grpo"), rollout=rollout,
+                          model=model, max_new_tokens=0)
+    flags = ["--trainer.steps", "1", "--trainer.name", "rloo", "--trainer.checkpoint-dir", str(tmp_path),
+             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False"]
+    config = LMRunConfig.cli([*flags, "--rollout.method", "rloo", "--objective.reward-kl", "0.05"],
+                             default=default)
+    state = config.run()
+    assert int(state.step) == 1 and state.ema is not None
+    assert LMRunConfig.load(str(tmp_path / "rloo")).rollout.method == "rloo"
+    refused = LMRunConfig.cli([*flags, "--trainer.name", "dapo", "--rollout.method", "dapo",
+                               "--objective.beta", "0.1"], default=default)
+    with pytest.raises(ValueError):
+        refused.run()
+
+
 def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
     """An LM run that names GRPO records its rollout as a field (`LMRunConfig.rollout`, `--rollout.reward`):
     over a prompts chain whose prompts fill its width it trains on the completions its policy draws,

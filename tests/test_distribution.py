@@ -861,6 +861,27 @@ def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_
 
 
 @pytest.mark.mesh(devices=2)
+def test_the_global_estimator_whitens_every_share_by_the_whole_batch(tmp_path):
+    """fsdp across two processes under REINFORCE++'s global estimator, the shares' returns spread apart
+    (`--estimator global`): each process packs its own rows, whitened by the moments of every share
+    pooled, so together they hold the advantages one process gives the whole batch, not each share's
+    own whitening."""
+    pool, _ = scheduled(tmp_path, {"fsdp": 2}, 2, "--estimator", "global")
+    alone, _ = scheduled(tmp_path, {"fsdp": 2}, 1, "--estimator", "global")
+
+    def rows(record: dict) -> dict[str, np.ndarray]:
+        """Every row every process handed the step, sorted: groups complete in any order."""
+        stacked = {name: np.concatenate(value) for name, value in record["rows"].items()}
+        order = np.lexsort(stacked["input_ids"].T[::-1])
+        return {name: value[order] for name, value in stacked.items()}
+
+    together, reference = rows(pool), rows(alone)
+    assert np.unique(np.abs(reference["advantages"])).size > 2
+    for name in ("input_ids", "response_mask", "advantages"):
+        np.testing.assert_array_equal(together[name], reference[name])
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_share_whose_calls_recorded_nothing_holds_the_records_its_peer_packed(tmp_path):
     """fsdp across two processes over a mixture, every call recording its
     routing and its sampler's support: the second share's tasks all

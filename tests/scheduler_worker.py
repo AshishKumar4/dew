@@ -7,10 +7,12 @@ source that answers every sample of a task with a completion the task fixes;
 with `--vary`, the answer also depends on the process, as independent draws
 from engines do. With `--records`, the model is a mixture and every call
 records its routing and its sampler's support, and the second half of the
-tasks truncate, so the share that holds them packs no record at all. The
-pool fits one update on `--mesh`, and process 0 writes the rows each process
-handed the step and the parameters the pool ended with. The same script on
-one process is the reference.
+tasks truncate, so the share that holds them packs no record at all. With
+`--estimator global`, each task's rewards are its samples' indices times its
+id, so the shares' returns spread apart. The pool fits one update on
+`--mesh`, and process 0 writes the rows each process handed the step and the
+parameters the pool ended with. The same script on one process is the
+reference.
 """
 
 import argparse
@@ -23,7 +25,7 @@ import numpy as np
 
 TINY_SHARD = 256
 TASKS = 8
-PACKED = ("input_ids", "response_mask", "old_log_probs", "behavior_log_probs")
+PACKED = ("input_ids", "response_mask", "old_log_probs", "behavior_log_probs", "advantages")
 
 
 def main() -> None:
@@ -33,6 +35,8 @@ def main() -> None:
     parser.add_argument("--vary", action="store_true", help="each process's draws depend on the process")
     parser.add_argument("--records", action="store_true",
                         help="calls record routing and supports, and the second half of the tasks truncate")
+    parser.add_argument("--estimator", default="group",
+                        help="the advantage estimator; under global, each task's rewards scale with its id")
     args = parser.parse_args()
 
     from dew.training.runtime import prepare_process
@@ -72,7 +76,8 @@ def main() -> None:
                 status = (Status.TRUNCATED if args.records and int(task.id) > TASKS // 2
                           else Status.COMPLETED)
                 future = Future()
-                future.set_result(Session(str(task.id), "", 0, 0, (call,), status, float(sample), {}, ""))
+                reward = float(sample) * (int(task.id) if args.estimator == "global" else 1)
+                future.set_result(Session(str(task.id), "", 0, 0, (call,), status, reward, {}, ""))
                 futures.append(future)
             return futures
 
@@ -112,7 +117,7 @@ def main() -> None:
     scheduler = RolloutScheduler(
         Asynchronous(Scripted(), Publisher(), objective, width=8, rows=partition.rows(TASKS), max_lag=1,
                      ahead=1),
-        groups=2, support_capacity=16 if args.records else None)
+        groups=2, support_capacity=16 if args.records else None, estimator=args.estimator)
     data = scheduler.tasks(Loader(train=share, val=None, records=TASKS, batch=TASKS))
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
     rows = multihost_utils.process_allgather({name: trained[0][name] for name in PACKED})
