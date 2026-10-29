@@ -126,10 +126,11 @@ from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
 
 table, root = sys.argv[1:3]
-rows = Files(table, format="csv").pipe(decisions, question="team").read("memory").batch(4)
+rows = Files(table, format="csv").pipe(decisions, question="team").read("memory").batch(8)
 DecisionRunConfig.cli(["--pretrained", "local/chat", "--trainer.name", "run",
-                       "--trainer.checkpoint-dir", root, "--trainer.steps", "1", "--trainer.compilation-cache-dir", "None",
-                       "--trainer.multi-host", "False", "--trainer.eval-every", "None",
+                       "--trainer.checkpoint-dir", root, "--trainer.steps", "1",
+                       "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+                       "--trainer.eval-every", "None",
                        "--trainer.checkpoint-every", "1", "--model.dtype", "float32", "--no-calibrate"],
                       default=DecisionRunConfig(data=rows.loading(Loading(workers=0)))).run()
 """
