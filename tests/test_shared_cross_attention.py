@@ -33,8 +33,9 @@ TIED = CrossAttention(layer_ids=(0, 2), context_length=6)
 """IDEFICS's block at the decoder's own width, which computes the shared form where its attention is the
 layer's, its input norm the layer's and its feed-forward's gate zero (`tied`)."""
 
-SHARED_SEEDS = {"shared fresh": 16, "shared idefics": 16, "shared decode": 16, "shared scan": 16}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
+SHARED_SEEDS = {"shared fresh": 8, "shared idefics": 64, "shared decode": 8, "shared scan": 8}
+"""Check 1's declared seeds for each site of the file, sized paired by `seeds_for` on armada at
+edf94b090 (job IGXSIZE)."""
 
 
 def test_a_fresh_shared_read_computes_the_decoder_it_was_attached_to():
