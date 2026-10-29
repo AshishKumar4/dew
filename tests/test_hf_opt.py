@@ -39,6 +39,17 @@ def test_released_opt125m_logits_and_cached_greedy_generation(tmp_path):
                      revision='27dcfa74d334bc871f3234de431e71c6eeba5dd6')
 
 
+@pytest.mark.network
+def test_released_opt350m_logits_and_cached_greedy_generation(tmp_path):
+    """OPT-350m as released, a 1024-wide post-LN stream over a 512-wide embedding projected in and out
+    of it, 24 layers and no final norm: its logits and a cached greedy continuation against
+    transformers' (`check_checkpoint`)."""
+    from tools.classic_gpt_reference import check_checkpoint
+
+    check_checkpoint('facebook/opt-350m', tmp_path / 'parity.json',
+                     revision='08ab08cc4b72ff5593870b5d527cf4230323703c')
+
+
 @pytest.mark.parametrize("variant", [
     {"do_layer_norm_before": False, "word_embed_proj_dim": 32},
     {"do_layer_norm_before": True, "_remove_final_layer_norm": True}],
@@ -47,7 +58,9 @@ def test_an_opt_350m_shaped_decoder_computes_transformers_logits(variant, tmp_pa
     """OPT-350m's decoder (post-LN blocks, no final norm, a 32-wide embedding projected in and out of a
     64-wide stream by bias-free projections), and a pre-norm one that drops its final norm, each drawn by
     transformers' own init: Dew loads them and computes transformers' logits on par from its float64
-    twin (check 1), and its export reloads in transformers to the same logits, bit for bit."""
+    twin (check 1), its export reloads in transformers to the same logits, bit for bit, and a cached
+    greedy continuation, the prompt's ids projected in on the decode path too, draws the tokens
+    transformers' generate draws."""
     import torch
     from transformers import OPTConfig, OPTForCausalLM
 
@@ -69,6 +82,10 @@ def test_an_opt_350m_shaped_decoder_computes_transformers_logits(variant, tmp_pa
     with torch.no_grad():
         np.testing.assert_array_equal(exported(ids, use_cache=False).logits.numpy(),
                                       source(ids, use_cache=False).logits.numpy())
+        drawn = source.generate(ids[:1, :4], max_new_tokens=6, min_new_tokens=6, do_sample=False)
+    generated = generate(loaded.model, loaded.variables, np.asarray(ids[:1, :4]), 6, key=0,
+                         sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(generated.tokens), drawn[:, 4:].numpy())
 
 
 def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_and_keeps_loop_norms():
