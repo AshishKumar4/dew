@@ -194,10 +194,13 @@ def decayed(rows, rows_lo, columns, columns_lo):
 
 
 def range_decay(later, later_low, earlier, earlier_low):
-    """`exp2(later - earlier)` of a compensated prefix's halves at two positions (broadcasting), each side
-    separated (`separated`, `between`): a range's decay, which from the halves' differences rounded to one
-    fp32 lost a fraction's last bits at the prefix's size (1e-6 of the decay near -43)."""
-    return between(separated(later, later_low), separated(earlier, earlier_low))
+    """`exp2(later - earlier)` of a compensated prefix's halves at two positions (broadcasting): `raised` of
+    their difference, compensated (`compensated_add`), so no rounding of the halves' difference reaches
+    it: a range's decay, which from the difference rounded to one fp32 lost a fraction's last bits at the
+    prefix's size (1e-6 of the decay near -43). The template's ranges, on its halves' vectors; separating
+    both sides for `between` held more registers, one of sm80's training launches spilling 48 bytes (a
+    port's prefix, stored separated, takes `between`)."""
+    return raised(*compensated_add((later, later_low), (-earlier, -earlier_low)))
 
 
 PAIR_FLOOR = -124.0
@@ -234,9 +237,9 @@ def between(later, earlier):
     recurrence's error from float64 (ledger 2098). The fractions' difference stays within two, its exp2
     within `_scaled`'s range, for exponents under 2^24, where a fraction's remainder `lo` is at most one: a
     chunk's prefix (its 64 tokens' at most 2^18 each). Truncating the difference into the scale, for any
-    size, cost the template's forward 1% on an H100 and 3% on an A100 (JS-954-57bf6dc05). Every pair's and
-    range's decay, the ports' of their separated prefix and the template's of its halves (`decayed`,
-    `range_decay`); a decay from the prefix's start is `raised`'s."""
+    size, cost the template's forward 1% on an H100 and 3% on an A100 (JS-954-57bf6dc05). Every pair's
+    decay, the ports' of their separated prefix and the template's of its halves (`decayed`), and the ports'
+    ranges; the template's ranges (`range_decay`) and a decay from the prefix's start are `raised`'s."""
     (whole, fraction), (other, its_fraction) = later, earlier
     return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
 
