@@ -140,6 +140,21 @@ def test_a_float32_program_replays_to_itself_run_in_float64(name):
     np.testing.assert_array_equal(replayed.view(np.uint64), direct.view(np.uint64))
 
 
+def test_what_a_programs_results_do_not_read_is_not_replayed():
+    """A program whose result drops a value it computed, as a module's init drops its forward pass,
+    replays without it: a float operation the replay has no rule for (`cos`) runs nowhere when no
+    result reads it, inside a jit as well, and the result is its program's in float64."""
+    x = np.random.default_rng(3).uniform(0.5, 2.0, (6, 7)).astype(np.float32)
+
+    def dropping(x):
+        return (jnp.cos(x), _arithmetic(x))[1]
+
+    replayed = np.asarray(float64_replay(jax.jit(dropping))(x))
+    with jax.enable_x64(new_val=True), jax.disable_jit():
+        direct = np.asarray(_arithmetic(jnp.asarray(x, jnp.float64)))
+    np.testing.assert_array_equal(replayed.view(np.uint64), direct.view(np.uint64))
+
+
 REFUSED = {
     "float": lambda x: jnp.cos(x),
     "complex": lambda x: jnp.cos(x.astype(jnp.complex64)).real,

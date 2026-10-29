@@ -10,7 +10,7 @@ from reference_error import _floating, as_given, equations
 REPLAYED = frozenset({
     "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "exp", "expm1", "log", "erf", "erf_inv",
     "broadcast_in_dim", "convert_element_type", "gather", "iota", "reshape", "slice", "squeeze",
-    "stack", "stop_gradient",
+    "stack", "stop_gradient", "transpose",
 })
 """The float operations `float64_replay` evaluates in float64: those an initializer's parameters
 depend on (the parallelism matrix's models', surveyed). Any other operation on a float refuses."""
@@ -27,6 +27,8 @@ def float64_replay(fn):
     is the program's value widened. The program's calls (`jit`), custom derivatives' calls and
     scans are replayed inside, each equation under the context it was traced in; a float
     operation outside `REPLAYED`, a complex one, and any other call of a program refuse by name.
+    Only what the results read is replayed: an initializer's forward pass, which a module's init
+    traces and whose outputs it drops, never runs (`_read`).
     Returns a function of `fn`'s arguments whose float results are float64, for check 1's
     `truth_fn` where a float64 run of `fn` would be another program (a float64 draw reads 64-bit
     random bits). It traces `fn` as the float32 program, x64 off, whatever the caller's mode and
@@ -53,30 +55,48 @@ def _widened(value):
     return jnp.asarray(value, jnp.float64) if _floating(dtype) else value
 
 
-def _replayed(graph, consts, arguments):
+def _read(graph, used):
+    """The equations of `graph` its results read, those of `used` (each result's), each with which
+    of its own results are read, in order: the rest, dead code, is not replayed."""
+    wanted = {variable for variable, kept in zip(graph.outvars, used, strict=True)
+              if kept and not hasattr(variable, "val")}
+    read = []
+    for equation in reversed(graph.eqns):
+        reading = [variable in wanted for variable in equation.outvars]
+        if any(reading):
+            read.append((equation, reading))
+            wanted.update(variable for variable in equation.invars if not hasattr(variable, "val"))
+    return read[::-1]
+
+
+def _replayed(graph, consts, arguments, used=None):
+    """`graph`'s results replayed (`_replayed_equation`), each of `used` (every one by default); a
+    result not used is None."""
+    used = [True] * len(graph.outvars) if used is None else used
     held = {variable: _widened(value) for variable, value in
             zip((*graph.constvars, *graph.invars), (*consts, *arguments), strict=True)}
 
     def read(variable):
         return _widened(variable.val) if hasattr(variable, "val") else held[variable]
 
-    for equation in graph.eqns:
+    for equation, reading in _read(graph, used):
         with equation.ctx.manager:
-            outputs = _replayed_equation(equation, [read(variable) for variable in equation.invars])
+            outputs = _replayed_equation(equation, [read(variable) for variable in equation.invars],
+                                         reading)
         held.update(zip(equation.outvars, outputs, strict=True))
-    return [read(variable) for variable in graph.outvars]
+    return [read(variable) if kept else None for variable, kept in zip(graph.outvars, used, strict=True)]
 
 
-def _replayed_equation(equation, values):
+def _replayed_equation(equation, values, used):
     name, params = equation.primitive.name, equation.params
     dtypes = [variable.aval.dtype for variable in (*equation.invars, *equation.outvars)
               if hasattr(variable.aval, "dtype")]
     if any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes):
         raise NotImplementedError(f"float64_replay has no float64 rule for complex {name}")
     if name == "jit":
-        return _replayed(params["jaxpr"].jaxpr, params["jaxpr"].consts, values)
+        return _replayed(params["jaxpr"].jaxpr, params["jaxpr"].consts, values, used)
     if name in ("custom_jvp_call", "custom_vjp_call"):
-        return _replayed(params["call_jaxpr"].jaxpr, params["call_jaxpr"].consts, values)
+        return _replayed(params["call_jaxpr"].jaxpr, params["call_jaxpr"].consts, values, used)
     if name == "scan":
         # The body, replayed in float64 for its operands' widened dtypes, as the scan's own.
         body = params["jaxpr"]
