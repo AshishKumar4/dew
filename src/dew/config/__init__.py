@@ -1110,7 +1110,7 @@ class RunConfig:
         keeps the source as it is). Every run kind that starts from a source loads it with these."""
         return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen)}
 
-    def source_attention(self) -> AttentionImpl:
+    def source_attention(self) -> "AttentionImpl":
         """The attention implementation a run that starts from a source loads it with: its model's
         `attention_impl` field, auto unless set, refused unless it names one (`AttentionImpl`). Every run
         kind that loads a source reads it here."""
