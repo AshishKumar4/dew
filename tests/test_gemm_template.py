@@ -1249,6 +1249,31 @@ def test_a_kernel_gradient_its_consumers_feed_holds_check_1(exact_sums):
                     seeds=SEEDS)
 
 
+@pytest.mark.parametrize("generation_name", generations("sm80"))
+def test_an_ampere_kernel_gradient_at_a_two_row_warp_step_holds_check_1(generation_name):
+    """On an A100, through the template, a kernel gradient pinned to a tile whose four warps split two
+    along its rows (`mosaic_sm80.Mma.for_tile` at 128 x 128) stepping 32 rows, its transposed stage's row
+    atom (`Mma.transposed_rows`), which the launch's legality takes: each group a tile of its own, groups
+    of no whole step, an empty one and one of a row among them, on par with XLA's over the draws (check 1),
+    truth float64's."""
+    tiles = mosaic_gpu.Tiles(128, 128, 32, 2, 1, warpgroups=1, family="mma.sync")
+
+    def ampere(x, dy):
+        # The default precision's sums, which mma.sync's launches take (exact sums are warpgroup MMA's).
+        return template.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision="default",
+                               interpret_on_cpu=True)
+
+    def plain(x, dy):
+        # XLA's product at the same precision, its fp32 operands' products a tensor core's on a GPU.
+        with jax.default_matmul_precision("default"):
+            return _kernel_gradient(x, dy, SIZES)
+
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"), \
+            tuning.pinned({grouped_matmul.MosaicTgmm: tiles}):
+        assert_as_exact(ampere, jax.jit(plain), _gradient_rows_draw, "ampere kernel gradient, 32-row steps",
+                        seeds=SEEDS)
+
+
 def _gradient_rows_draw(seed):
     """Rows and a cotangent for a kernel gradient, both bf16."""
     rng = np.random.default_rng(seed + 4)

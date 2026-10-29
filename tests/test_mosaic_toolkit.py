@@ -136,47 +136,49 @@ FED_STEPS = 5
 FED_ROWS, FED_WIDTH = 64, 128
 
 
-def _fed_products(p, x, *, interpret):
-    """`p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on warpgroup MMA without a
-    producer (`mosaic_sm90.FED`, two consumers): both consumers walk every step of one ring the first fills
-    (`Family.fed`), each multiplying its 32 of the step's rows (a 32-row contraction, its blocks staged at
-    `mosaic.swizzle_for`'s 64 bytes), and their sums meet before one store (`mosaic.summed_across`)."""
+def _fed_products(p, x, *, interpret, consumers: int = 2):
+    """`p @ x` and `2 * p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on
+    warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
+    first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
+    contraction, its blocks staged at `mosaic.swizzle_for`'s 64 bytes), and their sums meet before one
+    store each, twice in one scope reused (`mosaic.summed_across`), in a scope after the rings'
+    (`Family.scoped` returns)."""
     from dew.nn.kernels.templates import mosaic_sm90
-    family, consumers, half = mosaic_sm90.FED, 2, FED_ROWS // 2
-    swizzle = mosaic.swizzle_for(jnp.bfloat16, half)
+    family, share = mosaic_sm90.FED, FED_ROWS // consumers
+    swizzle = mosaic.swizzle_for(jnp.bfloat16, share)
 
-    def body(p_gmem, x_gmem, out_gmem):
+    def body(p_gmem, x_gmem, out_gmem, doubled_gmem):
         allocated = family.streams({'p': ((FED_ROWS, FED_ROWS), jnp.bfloat16),
                                     'x': ((FED_ROWS, FED_WIDTH), jnp.bfloat16)}, STAGES, consumers,
                                    swizzles={'p': swizzle, 'x': swizzle})
+        wg = jax.lax.axis_index("wg")
 
-        def scoped(*, streams):
-            rings, wg = family.opened(streams), jax.lax.axis_index("wg")
+        def walked(*, streams):
             views = {'p': (p_gmem, lambda j: (0, j)), 'x': (x_gmem, lambda j: (j, 0))}
-            feed = family.fed(rings, views, jnp.int32(0), jnp.int32(FED_STEPS), wg)
+            feed = family.fed(family.opened(streams), views, jnp.int32(0), jnp.int32(FED_STEPS), wg)
 
             def step(at, slots, carry, accumulators):
                 del at
                 (acc,) = accumulators
                 block, rows = slots['p'], slots['x']
-                product = family.products(acc, block.at[:, pl.ds(wg * half, half)],
-                                          rows.at[pl.ds(wg * half, half)], interpret)
+                product = family.products(acc, block.at[:, pl.ds(wg * share, share)],
+                                          rows.at[pl.ds(wg * share, share)], interpret)
                 return carry, (product,)
 
-            _, (summed,) = family.walk(feed, ((step, 0, FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),),
-                                       interpret)
+            return family.walk(feed, ((step, 0, FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),), interpret)[1][0]
 
-            def total(parts, ready):
-                mosaic.summed_across(summed, parts, ready, wg, consumers,
-                                     lambda value: out_gmem.__setitem__(slice(None), value))
+        summed = family.scoped(walked, streams=allocated)
 
-            pl.run_scoped(lambda parts, ready: total(parts, ready),
-                          **mosaic.summing((FED_ROWS, FED_WIDTH), consumers), collective_axes="wg")
+        def total(**scratch):
+            for value, out in ((summed, out_gmem), (summed * 2, doubled_gmem)):
+                mosaic.summed_across(value, scratch, wg, consumers,
+                                     lambda value, out=out: out.__setitem__(slice(None), value))
 
-        family.scoped(scoped, streams=allocated)
+        pl.run_scoped(total, **mosaic.summing((FED_ROWS, FED_WIDTH), consumers), collective_axes="wg")
 
-    return family.kernel(body, out_type=jax.ShapeDtypeStruct((FED_ROWS, FED_WIDTH), jnp.float32), grid=(1,),
-                         grid_names=("programs",), consumers=consumers, interpret=interpret, name="fed")(p, x)
+    out = jax.ShapeDtypeStruct((FED_ROWS, FED_WIDTH), jnp.float32)
+    return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=consumers,
+                         interpret=interpret, name="fed")(p, x)
 
 
 def _fed_operands():
@@ -187,31 +189,43 @@ def _fed_operands():
     return p, x
 
 
+def _fed_expected(p, x):
+    product = np.asarray(p, np.float32) @ np.asarray(x, np.float32)
+    return product, 2 * product
+
+
 @INTERPRETS
-def test_two_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store():
-    """Interpreted: two consumers with no producer walk every step of one ring through slot reuse (five
-    steps over two slots), each its half of a step's rows, and store their sum once: exactly the product."""
+@pytest.mark.parametrize("consumers", [1, 2])
+def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(consumers):
+    """Interpreted: consumers with no producer walk every step of one ring through slot reuse (five steps
+    over two slots), each its share of a step's rows, and store their sum once, twice through one scratch:
+    exactly the product and its double."""
     p, x = _fed_operands()
-    got = _fed_products(p, x, interpret=INTERPRETED)
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(p, np.float32) @ np.asarray(x, np.float32))
+    got = _fed_products(p, x, interpret=INTERPRETED, consumers=consumers)
+    for value, expected in zip(got, _fed_expected(p, x), strict=True):
+        np.testing.assert_array_equal(np.asarray(value), expected)
 
 
-def test_the_fed_walk_lowers_for_an_h100():
-    """The fed walk's kernel, its 32-row contraction staged at 64 bytes, lowers for an H100 on any host."""
+@pytest.mark.parametrize("consumers", [1, 2])
+def test_the_fed_walk_lowers_for_an_h100(consumers):
+    """The fed walk's kernel, two consumers' 32-row contraction staged at 64 bytes, lowers for an H100 on any
+    host."""
     p, x = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _fed_operands())
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(functools.partial(_fed_products, interpret=False)).trace(p, x).lower(
+        jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers)).trace(p, x).lower(
             lowering_platforms=("cuda",))
 
 
 @ON_HOPPER
 @pytest.mark.gpu(reason="runs the toolkit's kernels compiled, on an H100")
-def test_two_consumers_feeding_their_own_ring_split_a_step_on_an_h100():
+@pytest.mark.parametrize("consumers", [1, 2])
+def test_consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers):
     """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real."""
     p, x = _fed_operands()
-    got = jax.jit(functools.partial(_fed_products, interpret=False))(p, x)
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(p, np.float32) @ np.asarray(x, np.float32))
+    got = jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers))(p, x)
+    for value, expected in zip(got, _fed_expected(p, x), strict=True):
+        np.testing.assert_array_equal(np.asarray(value), expected)
 
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():

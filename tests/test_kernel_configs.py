@@ -8,7 +8,6 @@ import functools
 import os
 import tempfile
 from pathlib import Path
-from unittest import mock
 
 import fla_gdn_support as support
 import jax
@@ -341,21 +340,14 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
     return cases
 
 
-def _model(launch, ba, config) -> dict:
+def _model(launch, ba, config) -> resources.RegisterModel:
     """What a launch's model decides at `config` for the call `ba`, as the gate holds it to the compiled
-    kernel: its registers a consumer thread, its budget, its consumers, the most programs its family runs a
-    multiprocessor and its producer's registers where it has one, against ptxas's need
-    (`kernel_compile.decisions`); and the scratch the planner sized it by (`resources.scratch_bytes` of
-    `launch_of`'s allocations, its barriers apart), against the kernel's own."""
-    bundle = mosaic_gpu.family_of(config, jnp.bfloat16)
-    producer = bundle.warpgroups(config.warpgroups) > config.warpgroups
-    shared = resources.scratch_bytes(mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype),
-                                    launch.launch_of(ba, config).scope(config.stages))
-    return {"registers": launch.registers(ba, config), "budget": launch.register_budget(config),
-            "shared": shared,
-            "consumers": config.warpgroups, "most": bundle.programs(config.warpgroups),
-            "register_step": bundle.register_step,
-            "producer": resources.producer_registers(config.warpgroups) if producer else 0}
+    kernel (`resources.register_model`, `kernel_compile.decisions`), and the scratch the planner sized it by
+    (`resources.scratch_bytes` of `launch_of`'s allocations, its barriers apart), against the kernel's
+    own."""
+    family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+    shared = resources.scratch_bytes(family, launch.launch_of(ba, config).scope(config.stages))
+    return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared)
 
 
 def _derived_and_refused(launch, ba, target) -> tuple:
@@ -363,23 +355,17 @@ def _derived_and_refused(launch, ba, target) -> tuple:
     it refused for their registers alone (`resources.plan`: a ring its program's share holds, the registers
     not), whose need the gate checks refuses them too: a model over the need throws tiles away
     (`kernel_compile.decisions`). Each is the largest such of its rows, columns and layout, at the deepest
-    ring the planner holds without the registers, the one a derivation would take had they held."""
-    launch_of, asked = type(launch).launch_of, []
-
-    def recorded(self, ba, tile):
-        planned = launch_of(self, ba, tile)
-        asked.append((tile, planned))
-        return planned
-
-    with mock.patch.object(type(launch), "launch_of", recorded):
+    ring the planner holds without the registers, the one a derivation would take had they held (the
+    plans it asked, `resources.recording`)."""
+    with resources.recording() as asked:
         config = launch.derived(ba, target)
     refused: dict = {}
-    for tile, planned in asked:
-        family = mosaic_gpu.family_of(tile, ba.arguments['tokens'].dtype)
-        if resources.plan([planned], family, target, programs=tile.programs) is not None:
+    for each in asked:
+        (tile,) = each.tiles
+        if each.plans is not None:
             continue
-        held = resources.plan([dataclasses.replace(planned, registers=0)], family, target,
-                              programs=tile.programs)
+        held = resources.plan([dataclasses.replace(launch.launch_of(ba, tile), registers=0)], each.family,
+                              target, programs=each.programs)
         if held is not None:
             tile = dataclasses.replace(tile, stages=held[0].stages)
             shape = (tile.block_m, tile.block_n, tile.block_k, tile.warpgroups, tile.family)
@@ -390,9 +376,9 @@ def _derived_and_refused(launch, ba, target) -> tuple:
 def _emitted_forms(family, shape: str | None = None) -> set[str]:
     """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`): none without a bundle, the
     hooked and exactly summed ones where its register model counts what they hold (`Family.counts_hooks`);
-    at a projection `shape`, each whose output's width
-    steps by the family's column unit and whose contraction by its narrowest depth (`Family.column_unit`,
-    `Family.depths`: mma.sync stores a row over a role's 128 threads, so no output 64 wide)."""
+    at a projection `shape`, each whose output's width steps by the family's column unit, whose stores take
+    it (`Family.stores_columns`: a grouped product's rows ragged to one, a kernel gradient's whole role's)
+    and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
     forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ())}
@@ -405,7 +391,9 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
         # An input gradient's output is the depth wide, contracting the width; every other form's output
         # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
         columns, contracted = (depth, width) if "input gradient" in form else (width, depth)
-        return columns % unit == 0 and ("kernel gradient" in form or contracted % step == 0)
+        stored = family.role_rows if "kernel gradient" in form else 1
+        return (columns % unit == 0 and family.stores_columns(columns, stored)
+                and ("kernel gradient" in form or contracted % step == 0))
 
     return {form for form in forms if takes(form)}
 

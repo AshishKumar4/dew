@@ -637,6 +637,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).
         return mosaic_gpu.family_of(config, jnp.bfloat16).registers(config.warpgroups)
 
+    def _stored_rows(self, ba, config: mosaic_gpu.Tiles) -> int:
+        """The multiple a consumer's stored rows of an output tile come in: a grouped call's ragged to a
+        row, a dense call's whole `TMA_ROWS` (its rows padded to them, its tiles starting at whole ones)."""
+        del config
+        return mosaic_gpu.TMA_ROWS if ba.arguments.get('dense') else 1
+
     def _family(self, ba, target) -> mosaic.Family | None:
         """The bundle the launch runs on `target`: its instruction family's (`bundles.of`), none where the
         family has none (a TPU's launches are their own; a CPU interprets a GPU's only where
@@ -717,7 +723,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if steps is not None:
             # A ring deeper than its contraction's steps holds no more of them.
             most = min(most, max(2, steps))
-        return resources.Launch(scope, config.warpgroups, self.registers(ba, config), most=most)
+        return resources.Launch(scope, config.warpgroups, self.registers(ba, config), most=most, tile=config)
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` is a tile of the call on `target` apart from its resources: of the launch's
@@ -735,7 +741,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if (config.warpgroups > family.consumers or config.programs > family.programs(config.warpgroups)
                 or config.stages < 2
                 or config.block_m % (family.role_rows * config.warpgroups)
-                or config.block_n % family.column_unit(dtype) or config.block_k not in family.depths(dtype)):
+                or config.block_n % family.column_unit(dtype)
+                or not family.stores_columns(config.block_n, self._stored_rows(ba, config))
+                or config.block_k not in family.depths(dtype)):
             return False
         hooks = ba.arguments['hooks']
         axes = {axis for name, axes_of in (('prologue_operands', hooks.prologue_axes),
@@ -921,7 +929,7 @@ class MosaicTgmm(_Mosaic):
 
     def launch_of(self, ba, config: mosaic_gpu.Tiles) -> resources.Launch:
         ran, tile = self._ran(ba, config)
-        return super().launch_of(ran, tile)
+        return dataclasses.replace(super().launch_of(ran, tile), tile=config)
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`)."""
@@ -937,14 +945,19 @@ class MosaicTgmm(_Mosaic):
         rows, _, width = self._generated_extents(ba)
         return rows % config.block_m == 0 and width % config.block_n == 0
 
+    def _stored_rows(self, ba, config: mosaic_gpu.Tiles) -> int:
+        # Each consumer stores its depth half of a tile whole (`mosaic_gpu.tgmm`).
+        del ba
+        return config.block_m // config.warpgroups
+
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """`_Mosaic.candidate` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family
-        whose products read registers loading its transposed stage in whole roles of rows (the step,
-        `block_k`: a 32-row stage failed to cast to the 64-row layout, ns-regs2)."""
+        whose products read registers loading its transposed stage in whole row atoms of its products (the
+        step, `block_k`, in `Family.transposed_rows`)."""
         if config.cluster != 1 or not super().candidate(ba, config, target):
             return False
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        return not (family.operands_in_registers and config.block_k % family.role_rows)
+        return not (family.operands_in_registers and config.block_k % family.transposed_rows)
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:

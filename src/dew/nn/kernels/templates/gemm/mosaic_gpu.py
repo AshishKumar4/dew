@@ -440,7 +440,9 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     # [120, 8] at 64-row tiles read rows 120 to 183 unpredicated on an A100, cp.async's loads), as the
     # interpreter's are, whose slices past an array clamp rather than read zeros. On an H100 that copy was a
     # kernel of its own each call, 0.035 to 0.33 ms beside a dense product of 0.34 to 2.4 (BREAKDOWN1-h100:
-    # 0.33 ms of Llama 3 8B gate_up's 2.69 ms input gradient).
+    # 0.33 ms of Llama 3 8B gate_up's 2.69 ms input gradient). A dense call's tiles start at whole row
+    # tiles, so it reads to its last tile's end alone, no copy where its rows fill whole tiles: on an A100
+    # that copy was 0.094 ms of Llama 3 8B o's 1.52 ms forward (BC-A100-EXTENT-AB1, 6% of its time).
     lhs = rows_padded(lhs, 0, TMA_ROWS)
     m = lhs.shape[0]
     row_tile = tiles.block_m * tiles.cluster
@@ -450,7 +452,8 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                    jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
         table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
-    extent = m if family_of(tiles, lhs.dtype).bounded_loads and not interpret else row_extent(m, row_tile)
+    extent = (m if family_of(tiles, lhs.dtype).bounded_loads and not interpret
+              else -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile))
     lhs = _rows_extended(lhs, 0, extent)
     prologue_operands = tuple(_side_extended(side, axes, extent)
                               for side, axes in zip(prologue_operands, prologue_axes, strict=True))
@@ -553,7 +556,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 values = accs if epilogue is None else epilogue(*accs, *(smem[wg] for smem in side_smems))
                 values = values if isinstance(values, tuple) else (values,)
                 for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
-                    store(output, value, o_gmem, (part_row, first, stored, column, min(part[0], m)))
+                    store(output, value, o_gmem, (part_row, first, stored, column, min(part[0], m),
+                                                  TMA_ROWS if dense else 1))
 
             family.persist(streams, (grid[0] * grid[1],), schedule, consumer, consumers=consumers,
                            axis="programs", outputs=allocations.outputs,
