@@ -12,6 +12,9 @@ from model_support import flat_tree
 from reference_error import assert_as_exact
 from test_cross_attention import (
     MODEL,
+    SEQ,
+    VOCAB,
+    B,
     _without_blocks,
     assert_a_cached_context_decodes_as_the_full_forward,
     float64,
@@ -29,11 +32,16 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 SHARED = SharedCrossAttention(layer_ids=(0, 2), context_length=6)
 SHARED_MODEL = MODEL.clone(cross_attention=SHARED)
+"""The shared form over a decoder whose attention norms its queries and keys (qk_norm), which its reads
+of a context norm alike."""
 TIED = CrossAttention(layer_ids=(0, 2), context_length=6)
-"""IDEFICS's block at the decoder's own width, which computes the shared form where its attention is the
-layer's, its input norm the layer's and its feed-forward's gate zero (`tied`)."""
+"""IDEFICS's block at the decoder's own width, which computes the shared form over a decoder whose
+attention norms no query or key where its attention is the layer's, its input norm the layer's and its
+feed-forward's gate zero (`tied`)."""
+UNNORMED = MODEL.clone(qk_norm=False)
 
-SHARED_SEEDS = {"shared fresh": 8, "shared idefics": 64, "shared decode": 8, "shared scan": 8}
+SHARED_SEEDS = {"shared fresh": 8, "shared idefics": 64, "shared decode": 8, "shared scan": 8,
+                "alternating scan": 16}
 """Check 1's declared seeds for each site of the file, sized paired by `seeds_for` on armada at
 edf94b090 (job IGXSIZE)."""
 
@@ -48,7 +56,8 @@ def test_a_fresh_shared_read_computes_the_decoder_it_was_attached_to():
     assert len(added) == len(SHARED.layer_ids)
 
 
-TIED_MODEL = MODEL.clone(cross_attention=TIED)
+TIED_MODEL = UNNORMED.clone(cross_attention=TIED)
+SHARED_UNNORMED = UNNORMED.clone(cross_attention=SHARED)
 
 SHARED_LEAVES = {f"cross_attention.{name}.kernel": f"self_attn.{name}.kernel"
                  for name in ("q_proj", "k_proj", "v_proj", "o_proj")} | {
@@ -88,17 +97,39 @@ def tied(variables):
 
 
 
+def read(model: CausalTransformer, held=lambda variables: variables):
+    """`model`'s logits over a draw reading its context and their pullback into the context under the
+    draw's cotangent, from its variables as `held` gives them, compiled."""
+    run = logits(model)
+
+    @jax.jit
+    def pulled(variables, ids, context, lengths, cotangent):
+        out, pull = jax.vjp(lambda context: run(held(variables), ids, context, lengths), context)
+        return out, *pull(cotangent)
+    return pulled
+
+
+def read_draw(model: CausalTransformer):
+    """`model_draw`'s draw with a cotangent on the logits."""
+    draw = model_draw(model)
+
+    def drawn(seed):
+        rng = np.random.default_rng([seed, 1])
+        return (*draw(seed), rng.standard_normal((B, SEQ, VOCAB)).astype(np.float32))
+    return drawn
+
+
 def test_a_shared_read_is_idefics_block_over_the_layers_own_attention():
     """Gated, each layer's read through its own attention is IDEFICS's gated block whose attention is
-    the layer's own projections and whose input norm is the layer's, its feed-forward gated off (check 1,
-    from the shared decoder in float64): the layer's query over its normed residual and its keys and
-    values over the context, unrotated and uncausal, each row's real context tokens, then its output
-    projection."""
-    tied_logits = logits(TIED_MODEL)
-    assert_as_exact(logits(SHARED_MODEL),
-                    lambda variables, *inputs: tied_logits(tied(variables), *inputs),
-                    model_draw(SHARED_MODEL), "shared idefics", seeds=SHARED_SEEDS["shared idefics"],
-                    truth_fn=logits(float64(SHARED_MODEL)))
+    the layer's own projections and whose input norm is the layer's, its feed-forward gated off: the
+    layer's query over its normed residual and its keys and values over the context, unrotated and
+    uncausal, each row's real context tokens, then its output projection. The logits and their pullback
+    into the context on par with IDEFICS's block from its float64 (check 1), over a decoder whose
+    attention norms no query or key, which IDEFICS's block does not either; a decoder that norms them
+    norms the read's alike, through the projections' own code (`context_query`, `context_keys`)."""
+    assert_as_exact(read(SHARED_UNNORMED), read(TIED_MODEL, tied), read_draw(SHARED_UNNORMED),
+                    "shared idefics", seeds=SHARED_SEEDS["shared idefics"],
+                    truth_fn=read(float64(TIED_MODEL), tied))
     variables, ids, context, lengths = model_draw(SHARED_MODEL)(1)
     conditioning = {CONTEXT: context, CONTEXT_LENGTHS: lengths}
     moved = np.asarray(SHARED_MODEL.apply(variables, ids, conditioning=conditioning))
@@ -173,3 +204,68 @@ def test_the_gates_train_alone_over_a_frozen_source():
     assert isinstance(model, CausalTransformer)
     rebuilt = from_record(CausalTransformer, to_record(model, CausalTransformer))
     assert rebuilt.cross_attention == SharedCrossAttention((1,), 3)
+
+
+def test_a_context_reads_logits_enter_the_layers_qk_clip_maxima():
+    """The QK-Clip bounds the logits of a layer's own projections wherever they run: a layer that reads
+    a context through them sows one maximum a head, its own sequence's or the context's, whichever is
+    larger, so a context scaled up raises a reading layer's and leaves the rest at the base decoder's."""
+    variables, ids, context, lengths = model_draw(SHARED_UNNORMED)(2)
+    base = dataclasses.replace(SHARED_UNNORMED, cross_attention=None)
+
+    def maxima(model, variables, conditioning=None):
+        _, held = model.apply(variables, ids, conditioning=conditioning, mutable=["qk"])
+        named = ((jax.tree_util.keystr(path), leaf)
+                 for path, leaf in jax.tree_util.tree_leaves_with_path(held))
+        return {path: np.asarray(leaf) for path, leaf in named if "['max_logits']" in path}
+
+    own = maxima(base, _without_blocks(variables))
+    plain, scaled = (maxima(SHARED_UNNORMED, variables, {CONTEXT: scale * context, CONTEXT_LENGTHS: lengths})
+                     for scale in (1.0, 100.0))
+    assert own and set(plain) == set(scaled) == set(own)
+    for path, leaf in scaled.items():
+        assert np.all(leaf >= own[path]) and np.all(plain[path] >= own[path])
+        reads = any(f"['layers_{index}']" in path for index in SHARED.layer_ids)
+        assert bool(np.any(leaf > own[path])) == reads, path
+
+
+@dataclasses.dataclass(frozen=True)
+class Alternating(CrossAttention):
+    """IDEFICS's block whose feed-forward's activation alternates by layer: a configuration of its own
+    (`CrossBlocks`), whose layers' blocks differ though their shapes do not."""
+
+    def block(self, decoder, index):
+        return CrossAttention.block(dataclasses.replace(self, activation=("swiglu", "geglu")[index % 2]),
+                                    decoder, index)
+
+    def layer_key(self, decoder, index):
+        return CrossAttention.layer_key(self, decoder, index), index % 2
+
+
+def test_a_configuration_of_its_own_scans_each_layers_own_block():
+    """Any conforming configuration builds the blocks (`CrossBlocks`): one whose adjacent layers' blocks
+    differ in what they compute, not their shapes, scans each layer's own block as the plain loop does
+    (check 1, from float64), its layers' keys apart (`CrossBlocks.layer_key`)."""
+    every = MODEL.clone(cross_attention=Alternating(layer_ids=(0, 1, 2), context_length=6,
+                                                    context_features=24))
+    assert_as_exact(logits(every.clone(scan_layers=True)), logits(every), model_draw(every),
+                    "alternating scan", seeds=SHARED_SEEDS["alternating scan"],
+                    truth_fn=logits(float64(every)))
+
+
+def test_an_earlier_record_of_idefics_block_reads_as_its_class_record():
+    """A run recorded before a decoder's cross-attention was any configuration wrote IDEFICS's block by its
+    fields alone; the saved run's reader (`earlier_shapes`) reads it as the class record Dew writes now, and
+    the decoder rebuilds from it."""
+    from dew.inference.tasks import earlier_shapes
+    from dew.registry import from_record, to_record
+
+    record = to_record(MODEL, CausalTransformer)
+    fields = dict(record["fields"]) if "fields" in record else dict(record)
+    cross = fields["cross_attention"]
+    assert cross["class"] == "dew.nn.cross_attention:CrossAttention"
+    earlier = {**fields, "cross_attention": dict(cross["fields"])}
+    model = {"class": "dew.nn.backbones.causal_transformer:CausalTransformer", "fields": earlier}
+    current = earlier_shapes({"model": model})["model"]
+    assert current["fields"]["cross_attention"] == cross
+    assert from_record(CausalTransformer, current).cross_attention == MODEL.cross_attention

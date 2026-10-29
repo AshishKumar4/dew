@@ -249,6 +249,11 @@ class _Masking(NamedTuple):
     `key_places`, or None."""
 
 
+CONTEXT_LOGITS = "context_max_logits"
+"""The `qk` collection's entry of each head's largest logit over a context a layer's own attention read
+(`CausalSelfAttention.attend_context`), which the layer's own maxima take in."""
+
+
 @logical_axes({
     ("q_proj",): ("embed", "heads"),
     ("k_proj",): ("embed", "kv"),
@@ -823,6 +828,13 @@ class CausalSelfAttention(nn.Module):
         attention excludes none."""
         if self.ctx.ngpt is not None:
             query, key = self._ngpt_rotated(self.ctx.ngpt, query, key)
+        if not self.is_initializing() and self.is_mutable_collection("qk"):
+            # The read's logits through the layer's own projections, which its own call's maxima take in
+            # beside its own sequence's (`_attended`), so the QK-Clip bounds both.
+            seen = jnp.arange(key.shape[-3])[None, None, None, :] < lengths[:, None, None, None]
+            if queries is not None and segments is not None:
+                seen = seen & (queries[:, None, :, None] == segments[:, None, None, :])
+            self.sow("qk", CONTEXT_LOGITS, max_attention_logits(query, key, mask=seen))
         attention = checkpoint_name(scaled_dot_product_attention(
             query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax, implementation=self.ctx.attention_impl,
@@ -1070,7 +1082,11 @@ class CausalSelfAttention(nn.Module):
             # Over the keys the call sees, as its spans say them (`visibility_mask`).
             seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, block_groups=blocks,
                                    image_groups=images, key_valid=valid, key_runs=runs, places=held)
-            self.sow("qk", "max_logits", max_attention_logits(query, key, mask=seen, bias=bias))
+            found = max_attention_logits(query, key, mask=seen, bias=bias)
+            if self.has_variable("qk", CONTEXT_LOGITS):
+                # A context this call read through the same projections first (`attend_context`).
+                found = jnp.maximum(found, self.get_variable("qk", CONTEXT_LOGITS)[-1])
+            self.sow("qk", "max_logits", found)
             self.sow("qk", "kv_heads", jnp.asarray(key.shape[-2]))
             self.sow("qk", "head_dim", jnp.asarray(query.shape[-1]))
         if self.ctx.attention_dropout_rate and train:

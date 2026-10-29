@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Protocol, runtime_checkable
 
 import jax
@@ -176,6 +176,12 @@ class CrossBlocks(Protocol):
         refusing a layer the block cannot read the context at."""
         ...
 
+    def layer_key(self, decoder: CausalTransformer, index: int) -> Hashable:
+        """What layer `index`'s block depends on beside the decoder's fields and this configuration:
+        layers of equal specs and equal keys build one block, which a scanned run of them runs for each
+        (`dew.nn.backbones.layer_plan.LayerSpec.cross`)."""
+        ...
+
     def flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
         """Layer `index`'s block's forward work over rows of `lengths` tokens reading contexts of
         `context_lengths` tokens."""
@@ -214,6 +220,15 @@ class LayerReads(NamedTuple):
     attention: AttendsContext
 
 
+def named_layers(layer_ids) -> tuple[int, ...]:
+    """The layers a cross-attention names as ints, refused unless one or more, each once: every
+    `CrossBlocks` configuration's."""
+    named = tuple(int(layer) for layer in layer_ids)
+    if not named or len(set(named)) != len(named):
+        raise ValueError(f"cross-attention names one layer or more, each once, got {named}")
+    return named
+
+
 @dataclasses.dataclass(frozen=True)
 class CrossAttention:
     """The decoder layers that read a conditioning sequence, and its geometry.
@@ -236,9 +251,7 @@ class CrossAttention:
     activation: GatedActivation = "swiglu"
 
     def __post_init__(self):
-        object.__setattr__(self, "layer_ids", tuple(int(layer) for layer in self.layer_ids))
-        if not self.layer_ids or len(set(self.layer_ids)) != len(self.layer_ids):
-            raise ValueError(f"cross-attention names one layer or more, each once, got {self.layer_ids}")
+        object.__setattr__(self, "layer_ids", named_layers(self.layer_ids))
         widths = {"context_length": self.context_length, "context_features": self.context_features,
                   "intermediate_size": self.intermediate_size}
         small = sorted(name for name, width in widths.items() if width is not None and width < 1)
@@ -275,6 +288,10 @@ class CrossAttention:
             attention_impl=decoder.attention_impl, force_fp32_for_softmax=decoder.force_fp32_for_softmax,
             dtype=decoder.dtype, precision=decoder.precision)
 
+    def layer_key(self, decoder: CausalTransformer, index: int) -> Hashable:
+        """The width of layer `index`'s block's feed-forward, all its block takes of the layer."""
+        return self.intermediate_size or decoder.mlp_widths[index]
+
     def flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
         """Layer `index`'s block's work (`GatedCrossAttention.cross_flops`)."""
         return self.block(decoder, index)(parent=None).cross_flops(lengths, context_lengths)
@@ -296,9 +313,7 @@ class SharedCrossAttention:
     context_length: int
 
     def __post_init__(self):
-        object.__setattr__(self, "layer_ids", tuple(int(layer) for layer in self.layer_ids))
-        if not self.layer_ids or len(set(self.layer_ids)) != len(self.layer_ids):
-            raise ValueError(f"cross-attention names one layer or more, each once, got {self.layer_ids}")
+        object.__setattr__(self, "layer_ids", named_layers(self.layer_ids))
         if self.context_length < 1:
             raise ValueError(f"cross-attention's context_length must be positive, got {self.context_length}")
 
@@ -315,6 +330,11 @@ class SharedCrossAttention:
                                  heads=mixer.context_heads(), ngpt=decoder.ngpt is not None,
                                  dropout_rate=decoder.dropout_rate, dtype=decoder.dtype,
                                  precision=decoder.precision)
+
+    def layer_key(self, decoder: CausalTransformer, index: int) -> Hashable:
+        """Layer `index`'s attention's key heads and widths, all its block takes of the layer beside
+        the attention the layer hands it."""
+        return self._attention(decoder, index).context_heads()
 
     def flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
         """Layer `index`'s attention's read of the context (`AttendsContext.context_flops`)."""

@@ -1044,7 +1044,9 @@ class CausalTransformer(nn.Module):
                                else self.attention_residuals.site(index)),
                 engram=(None if self.engram is None or index not in self.engram.layer_ids
                         else self.engram.layer_ids.index(index)),
-                cross=self.cross_attention is not None and index in self.cross_attention.layer_ids,
+                cross=(self.cross_attention.layer_key(self, index)
+                       if self.cross_attention is not None and index in self.cross_attention.layer_ids
+                       else None),
                 prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers
                                    else None),
                 attention_norm=index > 0 or self.first_attention_norm)
@@ -1083,7 +1085,7 @@ class CausalTransformer(nn.Module):
                 dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
             cross=(self.cross_attention.block(self, index)
-                   if spec.cross and self.cross_attention is not None else None),
+                   if spec.cross is not None and self.cross_attention is not None else None),
             prediction_target=spec.prediction_target is not None,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
             attention_norm=spec.attention_norm,
@@ -2316,7 +2318,7 @@ class CausalTransformer(nn.Module):
         if any(mixer is not None and mixer.marks() is None for mixer in mixers):
             return frozenset(RESIDUALS)
         default = AttentionMixer.residuals or ()
-        feeds = (any(spec.routed or spec.width or spec.cross
+        feeds = (any(spec.routed or spec.width or spec.cross is not None
                      for spec in self._layer_specs(types, kinds, self.layer_mixer))
                  or self.num_nextn_predict_layers or self.dspark is not None)
         marked = (default if mixer is None else mixer.marks() or () for mixer in mixers)
