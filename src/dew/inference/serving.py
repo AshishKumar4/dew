@@ -114,7 +114,7 @@ from dew.inference.tasks import (
     shape_bucket,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
-from dew.nn.cross_attention import CrossAttention
+from dew.nn.cross_attention import CrossBlocks
 from dew.nn.inputs import (
     CONTEXT,
     CONTEXT_LENGTHS,
@@ -204,7 +204,7 @@ _KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
 """The shape and dtype of a default key's data, read without a device."""
 
 
-def _seed(key: int | jax.Array | None) -> int | jax.Array:
+def _seed(key: int | jax.Array) -> int | jax.Array:
     """A request's key as a row holds it: an integer seed as given, for
     `_row_keys` to make into a key, or a key's data. `_row_keys` makes and
     reads every row's key with the default PRNG implementation, so a key of
@@ -513,7 +513,7 @@ class Server:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
         self.model = model
-        self.cross: tuple[CrossAttention, int, np.dtype] | None = None
+        self.cross: tuple[CrossBlocks, int, np.dtype] | None = None
         """The model's cross-attention layers and its context's width and dtype, where a request may
         carry a context beside its prompt."""
         if isinstance(model, CrossAttending) and model.cross_attention is not None:
@@ -778,7 +778,7 @@ class Server:
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: int | jax.Array | None = None) -> Ticket:
+               key: int | jax.Array) -> Ticket:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
@@ -904,7 +904,7 @@ class Server:
         """A request's context as its real tokens on the host, `[length, features]`, in the dtype
         the model reads a context in (`CrossAttending.context_dtype`), refused where it is not one
         row of the model's width, counts tokens it does not hold, or holds more than the
-        cross-attention layers cache (`CrossAttention.context_length`)."""
+        cross-attention layers cache (`CrossBlocks.context_length`)."""
         assert self.cross is not None
         cross, features, dtype = self.cross
         # Checked where it is, on the host: admission places the batch (`_admit`), never the request.
@@ -964,7 +964,7 @@ class Server:
         prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
         max_new_tokens: int | None = None,
         *,
-        key: int | jax.Array | None = None,
+        key: int | jax.Array,
     ) -> list[Generation]:
         """Submit a batch, run it through, and return its generations in order.
 

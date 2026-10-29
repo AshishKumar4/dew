@@ -83,7 +83,8 @@ if TYPE_CHECKING:
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
-    from dew.nn.cross_attention import CrossAttention
+    from dew.nn.attention import AttentionImpl
+    from dew.nn.cross_attention import CrossBlocks
 
 
 
@@ -356,7 +357,7 @@ class Pretrained:
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
              param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
-             attention_impl: str = "auto", max_seq_len: int | None = None,
+             attention_impl: AttentionImpl = "auto", max_seq_len: int | None = None,
              revision: str | None = None, subfolder: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
@@ -511,7 +512,7 @@ class Pretrained:
                              base=None if self.origin is None else AdapterBase(self.origin, self.revision))
         return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
-    def with_cross_attention(self, cross: CrossAttention, *, key: int | jax.Array,
+    def with_cross_attention(self, cross: CrossBlocks, *, key: int | jax.Array,
                              frozen: bool = True) -> Self:
         """Return this source with gated cross-attention before the layers `cross` names, each
         block drawn from `key` (`dew.nn.cross_attention`).
@@ -901,7 +902,7 @@ def _no_language_model(name: str, kind: str) -> NoReturn:
 
 
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
-                          revision: str | None = None, attention_impl: str = "auto",
+                          revision: str | None = None, attention_impl: AttentionImpl = "auto",
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
                           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                           text: bool = True, text_only: bool = False,
@@ -974,7 +975,7 @@ def _pipeline_weights(source: sources.SourceReference, root: Path, index: Mappin
 
 def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: str | None,
                         placed: Callable[[Variables], Variables], *, streaming: bool, dtype: str,
-                        attention_impl: str, param_dtype: str, variables: Variables | None = None,
+                        attention_impl: AttentionImpl, param_dtype: str, variables: Variables | None = None,
                         text: bool = True, stored: sources.StoredWeights | None = None) -> PretrainedPipeline:
     """The pipeline `index` describes, assembled from the directory its
     source resolved to (a snapshot, a single file's conversion or a DDUF
@@ -1122,7 +1123,7 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
 
 def _pipeline_source(source: sources.SourceReference, root: Path, single_file: str | None,
                      dduf_file: str | None, placed: Callable[[Variables], Variables], *, dtype: str,
-                     attention_impl: str, param_dtype: str, streaming: bool,
+                     attention_impl: AttentionImpl, param_dtype: str, streaming: bool,
                      size: tuple[int, ...] | None = None, variables: Variables | None = None,
                      text: bool = True) -> PretrainedPipeline | None:
     """The source as a latent diffusion pipeline, or None when it is a decoder.
@@ -1184,7 +1185,7 @@ def _names_a_model(directory: Path) -> bool:
 def _loaded_kind(reference: sources.SourceReference, directory: Path, composite: CompositeSource | None, *,
                  fallback: str | None, gguf_file: str | None, single_file: str | None,
                  dduf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
-                 weights: bool, dtype: str, param_dtype: str, attention_impl: str,
+                 weights: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                  max_seq_len: int | None, overrides: Mapping[str, object] | None,
                  trust_remote_code: bool, text_only: bool,
                  prediction_depths: int | None = None) -> tuple[Pretrained, bool]:
@@ -1414,7 +1415,8 @@ class _Built(NamedTuple):
 
 
 def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperFields,
-                    tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str, attention_impl: str,
+                    tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str,
+                    attention_impl: AttentionImpl,
                     max_seq_len: int | None, param_dtype: str, lazy: bool,
                     checked: decoders.Checked) -> _Built:
     """A multimodal wrapper, `record` its translated config: the decoder under its text_config and the
@@ -1566,7 +1568,7 @@ def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransforme
 
 
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.Stored], directory: Path,
-                    route: DecoderRoute | VerifiedRoute, *, dtype: str, attention_impl: str,
+                    route: DecoderRoute | VerifiedRoute, *, dtype: str, attention_impl: AttentionImpl,
                     max_seq_len: int | None, param_dtype: str, lazy: bool, quantized: bool,
                     checked: decoders.Checked) -> _Built:
     """A decoder of a registered family, or of one it was verified as (tier 2), as `route` read it.
@@ -1676,7 +1678,7 @@ def _composite_description(directory: Path,
 
 def _load_composite_source(source: sources.SourceReference, root: Path,
                            description: CompositeSource, *, placed: Callable[[Variables], Variables],
-                           streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
+                           streaming: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                            max_seq_len: int | None, weights: bool,
                            overrides: Mapping[str, object] | None = None,
                            code: Path | None = None, prediction_depths: int | None = None) -> Pretrained:
@@ -1835,7 +1837,7 @@ class _Translated(NamedTuple):
 def _translated(config: Mapping[str, object],
                 route: DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute,
                 tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str, param_dtype: str,
-                attention_impl: str, max_seq_len: int | None, streaming: bool) -> _Translated:
+                attention_impl: AttentionImpl, max_seq_len: int | None, streaming: bool) -> _Translated:
     """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
     weights decoded, the decoder, media wrapper or DiffusionGemma translated and checked against its
     tree, and any stored input scales bound. No processor, generation config or bundle is built."""
@@ -1947,7 +1949,7 @@ def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
 
 def _load_native_source(source: sources.SourceReference, root: Path, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
-                        dtype: str, param_dtype: str, attention_impl: str,
+                        dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                         max_seq_len: int | None, weights: bool = True,
                         component: NativeComponent | None = None,
                         tensors: Mapping[str, unread.Stored] | None = None,

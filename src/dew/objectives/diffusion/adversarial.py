@@ -32,10 +32,10 @@ from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
-from dew.nn.attention import l2_normalized
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.conv import convolution
 from dew.nn.dit import TextContext, masked_mean
+from dew.nn.norms import l2_normalized
 from dew.nn.precision import accumulated, divided
 from dew.nn.protocols import Lacks
 from dew.nn.sharding import rows_taken

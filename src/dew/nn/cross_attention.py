@@ -14,7 +14,7 @@ frozen while the block trains (`dew.interop.Pretrained.with_cross_attention`).
 The reference layer is IDEFICS's `IdeficsGatedCrossAttentionLayer`
 (transformers' modeling_idefics.py), and its names are the names used here.
 Its attention is the one every cross-attention runs, a diffusion block's and
-Wan's alike (`dew.nn.attention.NormalAttention`), held in the block's own
+Wan's alike (`dew.nn.attention_blocks.NormalAttention`), held in the block's own
 scope, over the decoder's grouped key-value heads and keeping a cached call's
 keys and values; the gates, the feed-forward and the residual join are the
 block's.
@@ -28,7 +28,18 @@ for such a row, as it is for a call with no context at all. A cached call
 that carries the context keeps its keys and values in the cache, so later
 decode steps attend over them without it.
 
-The block reads and joins whatever residual its decoder carries: the plain
+That is one form of a decoder's cross-attention (`CrossBlocks`, which a decoder's
+`with_cross_attention` takes): `CrossAttention` names it. `SharedCrossAttention`
+is another, which adds no attention of its own: each named layer reads the
+conditioning sequence through its own attention's projections and norms,
+unrotated and uncausal, and joins the read through one tanh gate, zero at the
+start, the only weight it adds:
+
+    x = x + tanh(alpha_cross_attn) * self_attn.read(input_layernorm(x), context)
+
+Any configuration that builds a conforming block per layer is a third.
+
+A block reads and joins whatever residual its decoder carries: the plain
 stream (AltUp's active copy among them), mHC's streams, whose mean it reads
 and each of which its outputs join, Kimi K3's depth state, whose mixture it
 reads and whose partial block its outputs join, and nGPT's unit stream,
@@ -44,8 +55,9 @@ than torch's cascade sum over 640 terms, and its dot as close as torch's.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
-from typing import Literal
+import functools
+from collections.abc import Callable, Hashable, Mapping
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -56,11 +68,15 @@ from dew.batch import coordinates
 from dew.nn.dropout import Dropout
 
 from .activations import GatedActivation
-from .attention import CROSS_KEY, CROSS_VALUE, NormalAttention
+from .attention import AttentionImpl
+from .attention_blocks import CROSS_KEY, CROSS_VALUE, NormalAttention, kept_context
 from .documents import CrossDocuments, holds_keys
 from .flops import counted_flops
 from .inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext
 from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
+
+if TYPE_CHECKING:
+    from dew.nn.backbones.causal_transformer import CausalTransformer
 
 NAME = "cross_attention"
 """The module name of a decoder layer's cross-attention block, in every collection."""
@@ -136,6 +152,83 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
             **({} if segments is None else {CONTEXT_SEGMENTS: segments})}
 
 
+class CrossBlocks(Protocol):
+    """A decoder's cross-attention, which `with_cross_attention` takes: the layers that read a
+    conditioning sequence, the most tokens a row's context holds, which a decode cache keeps the keys
+    and values of, the width of its tokens (None for the decoder's own), and each layer's block, built
+    from the decoder. A block runs before its layer's own sublayers, reads the residual and the
+    context and joins the residual (`GatedCrossAttention`'s call); one that reads through its layer's
+    own attention says so (`reads_layer`) and is handed it (`LayerReads`). `CrossAttention` (IDEFICS's
+    gated block) and `SharedCrossAttention` (each layer's own projections behind one gate) are two;
+    any conforming configuration is a third."""
+
+    @property
+    def layer_ids(self) -> tuple[int, ...]: ...
+
+    @property
+    def context_length(self) -> int: ...
+
+    @property
+    def context_features(self) -> int | None: ...
+
+    def block(self, decoder: CausalTransformer, index: int) -> Callable[..., nn.Module]:
+        """Layer `index`'s block factory, which takes its module `name` (and flax's `parent`),
+        refusing a layer the block cannot read the context at."""
+        ...
+
+    def layer_key(self, decoder: CausalTransformer, index: int) -> Hashable:
+        """What layer `index`'s block depends on beside the decoder's fields and this configuration:
+        layers of equal specs and equal keys build one block, which a scanned run of them runs for each
+        (`dew.nn.backbones.layer_plan.LayerSpec.cross`)."""
+        ...
+
+    def flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
+        """Layer `index`'s block's forward work over rows of `lengths` tokens reading contexts of
+        `context_lengths` tokens."""
+        ...
+
+
+@runtime_checkable
+class AttendsContext(Protocol):
+    """A layer's own attention as a read of another sequence (`SharedCrossAttention`): whether it
+    projects keys and values of its own to read one with, the key heads' count and the widths of a
+    key and a value head, its query heads over the layer's input, its key and value heads over a
+    context, its attention of the one over the other through its output projection, and that read's
+    work (`dew.nn.mixers.attention.CausalSelfAttention`)."""
+
+    @property
+    def reads_context(self) -> bool: ...
+
+    def context_heads(self) -> tuple[int, int, int]: ...
+
+    def context_flops(self, lengths, context_lengths) -> float: ...
+
+    def context_query(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]: ...
+
+    def context_keys(self, context: jax.Array) -> tuple[jax.Array, jax.Array]: ...
+
+    def attend_context(self, query: jax.Array, gate: jax.Array | None, key: jax.Array,
+                       value: jax.Array, *, lengths: jax.Array, queries: jax.Array | None = None,
+                       segments: jax.Array | None = None, max_segments: int | None = None) -> jax.Array: ...
+
+
+class LayerReads(NamedTuple):
+    """What a block that reads through its layer (`reads_layer`) is handed: the layer's attention
+    input from the states a sublayer reads, normed as its attention reads it, and its attention."""
+
+    normed: Callable[[jax.Array], jax.Array]
+    attention: AttendsContext
+
+
+def named_layers(layer_ids) -> tuple[int, ...]:
+    """The layers a cross-attention names as ints, refused unless one or more, each once: every
+    `CrossBlocks` configuration's."""
+    named = tuple(int(layer) for layer in layer_ids)
+    if not named or len(set(named)) != len(named):
+        raise ValueError(f"cross-attention names one layer or more, each once, got {named}")
+    return named
+
+
 @dataclasses.dataclass(frozen=True)
 class CrossAttention:
     """The decoder layers that read a conditioning sequence, and its geometry.
@@ -158,14 +251,102 @@ class CrossAttention:
     activation: GatedActivation = "swiglu"
 
     def __post_init__(self):
-        object.__setattr__(self, "layer_ids", tuple(int(layer) for layer in self.layer_ids))
-        if not self.layer_ids or len(set(self.layer_ids)) != len(self.layer_ids):
-            raise ValueError(f"cross-attention names one layer or more, each once, got {self.layer_ids}")
+        object.__setattr__(self, "layer_ids", named_layers(self.layer_ids))
         widths = {"context_length": self.context_length, "context_features": self.context_features,
                   "intermediate_size": self.intermediate_size}
         small = sorted(name for name, width in widths.items() if width is not None and width < 1)
         if small:
             raise ValueError(f"cross-attention's {', '.join(small)} must be positive, got {widths}")
+
+    def block(self, decoder: CausalTransformer, index: int) -> Callable[..., GatedCrossAttention]:
+        """Layer `index`'s gated block (`CrossBlocks.block`): the decoder's norms, none under nGPT, a
+        gated MLP of the block's own activation at its width (the layer's own unless named), with nGPT's
+        gains under nGPT, and the decoder's attention heads, kernel, initializers and dtypes. A layer
+        with no feed-forward width to take needs `intermediate_size`."""
+        from .backbones.decoder_block import decoder_norm
+        from .mlp import GatedMLP
+
+        width = self.intermediate_size or decoder.mlp_widths[index]
+        if not width:
+            raise ValueError(f"layer {index} has no feed-forward whose width the cross-attention block "
+                             "takes; name its intermediate_size")
+        init_std, output_init_std = decoder.init_stds
+        return functools.partial(
+            GatedCrossAttention,
+            norm=None if decoder.ngpt is not None else decoder_norm(
+                decoder.norm_type, epsilon=decoder.norm_eps, bias=decoder.norm_bias,
+                scale_offset=decoder.scale_offset, scale_after_cast=decoder.scale_after_cast,
+                dtype=decoder.dtype, specs=decoder.norms),
+            ngpt=decoder.ngpt is not None,
+            feedforward=functools.partial(
+                GatedMLP, hidden_features=width, out_features=decoder.emb_features,
+                activation=self.activation, ngpt=decoder.ngpt, init_std=init_std,
+                output_init_std=output_init_std, dtype=decoder.dtype, precision=decoder.precision),
+            emb_features=decoder.emb_features, context_features=decoder.context_width,
+            context_length=self.context_length, heads=decoder.num_heads, kv_heads=decoder.kv_heads,
+            head_dim=decoder.features_per_head, dropout_rate=decoder.dropout_rate,
+            attention_impl=decoder.attention_impl, force_fp32_for_softmax=decoder.force_fp32_for_softmax,
+            dtype=decoder.dtype, precision=decoder.precision)
+
+    def layer_key(self, decoder: CausalTransformer, index: int) -> Hashable:
+        """The width of layer `index`'s block's feed-forward, all its block takes of the layer."""
+        return self.intermediate_size or decoder.mlp_widths[index]
+
+    def flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
+        """Layer `index`'s block's work (`GatedCrossAttention.cross_flops`)."""
+        return self.block(decoder, index)(parent=None).cross_flops(lengths, context_lengths)
+
+
+@dataclasses.dataclass(frozen=True)
+class SharedCrossAttention:
+    """Cross-attention through each named layer's own attention: before its sublayers, the layer in
+    `layer_ids` reads the conditioning sequence with its own query, key, value and output projections
+    and norms, its logit scale, sinks and softcap, unrotated and uncausal
+    (`AttendsContext`), and the read joins the residual through one tanh gate the layer adds, zero
+    at the start, so the decoder computes its own function until the gates train. The only weights
+    it adds are the gates; the context's tokens are the decoder's width, which the layer's key and
+    value projections read. `context_length` is the most tokens a row's context holds, which a
+    decode cache keeps the keys and values of. A layer of no attention, or a KV-sharing one, projects
+    no keys of its own and is refused."""
+
+    layer_ids: tuple[int, ...]
+    context_length: int
+
+    def __post_init__(self):
+        object.__setattr__(self, "layer_ids", named_layers(self.layer_ids))
+        if self.context_length < 1:
+            raise ValueError(f"cross-attention's context_length must be positive, got {self.context_length}")
+
+    @property
+    def context_features(self) -> None:
+        """None: the context is the decoder's width, as each layer's own projections read it."""
+        return None
+
+    def block(self, decoder: CausalTransformer, index: int) -> Callable[..., SharedGatedCrossAttention]:
+        """Layer `index`'s gate over its own attention's read (`CrossBlocks.block`), refused where
+        the layer's mixer reads no context (`AttendsContext`)."""
+        mixer = self._attention(decoder, index)
+        return functools.partial(SharedGatedCrossAttention, context_length=self.context_length,
+                                 heads=mixer.context_heads(), ngpt=decoder.ngpt is not None,
+                                 dropout_rate=decoder.dropout_rate, dtype=decoder.dtype,
+                                 precision=decoder.precision)
+
+    def layer_key(self, decoder: CausalTransformer, index: int) -> Hashable:
+        """Nothing: a layer's block takes its geometry from the layer's own attention, which the layer's
+        spec builds, and reads through the attention the layer hands it."""
+        return ()
+
+    def flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
+        """Layer `index`'s attention's read of the context (`AttendsContext.context_flops`)."""
+        return self._attention(decoder, index).context_flops(lengths, context_lengths)
+
+    @staticmethod
+    def _attention(decoder: CausalTransformer, index: int) -> AttendsContext:
+        mixer = decoder.mixer_of(index)
+        if not isinstance(mixer, AttendsContext) or not mixer.reads_context:
+            raise ValueError(f"layer {index}'s mixer ({type(mixer).__name__}) projects no keys and values of "
+                             "its own to read a context with")
+        return mixer
 
 
 class GatedCrossAttention(nn.Module):
@@ -180,6 +361,9 @@ class GatedCrossAttention(nn.Module):
     decoder's.
     """
 
+    reads_layer: ClassVar[bool] = False
+    """It reads the context with an attention of its own (`CrossBlocks`)."""
+
     norm: Callable[..., nn.Module] | None
     feedforward: Callable[..., nn.Module]
     emb_features: int
@@ -190,7 +374,7 @@ class GatedCrossAttention(nn.Module):
     head_dim: int
     ngpt: bool = False
     dropout_rate: float = 0.0
-    attention_impl: str = "auto"
+    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -238,7 +422,7 @@ class GatedCrossAttention(nn.Module):
             raise ValueError(f"this cross-attention reads {self.context_features}-wide context tokens, "
                              f"got {context.embeddings.shape[-1]}")
         if decode:
-            lengths = self._cached_lengths(x, context)
+            lengths = _held_lengths(self, x, context)
         elif context is None:
             return stream
         else:
@@ -254,20 +438,12 @@ class GatedCrossAttention(nn.Module):
         output = attention(self._normed("input_layernorm", x), embeddings,
                            key_value_seq_lengths=jnp.maximum(lengths, 1), cached=decode,
                            cache_dtype=x.dtype if self.dtype is None else self.dtype, **documents)
-        present = (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
-        if context is not None and context.segments is not None and context.queries is not None:
-            # A token whose document holds no context reads none, as its row alone would skip the block.
-            held = holds_keys(CrossDocuments(context.queries, context.segments))
-            present = held.reshape(held.shape[:2] + (1,) * (stream.ndim - 2))
+        present = _present(stream, context, lengths)
         dropout = Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
-            # The gate in at least float32, and in its own float64 where a run widens it.
-            alpha = self.param(name, nn.initializers.zeros, (1,), jnp.float32)
-            gate = jnp.tanh(alpha.astype(at_least_fp32(alpha.dtype)))
-            branch = dropout(branch, deterministic=not train)
-            return jnp.where(present, gated_join(stream, branch, gate, ngpt=self.ngpt,
-                                                 precision=self.precision), stream)
+            return _joined(self, name, stream, dropout(branch, deterministic=not train), present,
+                           ngpt=self.ngpt, precision=self.precision)
 
         stream = joined(stream, "alpha_cross_attn", output)
         hidden = self.feedforward(name="mlp")(self._normed("post_attention_layernorm", read(stream)))
@@ -276,17 +452,98 @@ class GatedCrossAttention(nn.Module):
     def _normed(self, name: str, x: jax.Array) -> jax.Array:
         return x if self.norm is None else self.norm(name=name)(x)
 
-    def _cached_lengths(self, x: jax.Array, context: CrossContext | None) -> jax.Array:
-        """Each row's real context tokens a cached call reads: a call that carries a context keeps
-        them once the cache is allocated, as its attention keeps the keys and values
-        (`NormalAttention.cached`); a call without one reads what the cache keeps."""
-        allocated = self.has_variable("cache", CROSS_LENGTHS)
-        lengths = self.variable("cache", CROSS_LENGTHS, jnp.zeros, x.shape[:1], jnp.int32)
-        if context is None:
-            return lengths.value
-        if allocated:
-            lengths.value = context.lengths
-        return context.lengths
+
+class SharedGatedCrossAttention(nn.Module):
+    """One layer's read of a conditioning sequence through its own attention
+    (`SharedCrossAttention`): the residual's states normed as the layer's attention reads them, its
+    query heads over them and its key and value heads over the context (`AttendsContext`), attended
+    and projected by the layer's own weights, the read joined through one tanh gate,
+    `alpha_cross_attn`, zero at the start. `heads` is the layer's key heads' count and the widths of
+    a key and a value head, which a decode cache keeps the context's keys and values at; a cached call
+    keeps them and each row's count, so later steps read them without the context. `ngpt` joins the
+    read as nGPT's step along the sphere (`gated_join`)."""
+
+    reads_layer: ClassVar[bool] = True
+    """It reads the context through its layer's own attention (`CrossBlocks`, `LayerReads`)."""
+
+    context_length: int
+    heads: tuple[int, int, int]
+    ngpt: bool = False
+    dropout_rate: float = 0.0
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    @nn.compact
+    def __call__(self, stream: jax.Array, context: CrossContext | None, *, layer: LayerReads,
+                 read: Callable[[jax.Array], jax.Array] | None = None, decode: bool = False,
+                 train: bool = False) -> jax.Array:
+        """`stream` after the block, as `GatedCrossAttention`'s call, its layer's attention input and
+        attention handed it (`layer`)."""
+        read = read or (lambda held: held)
+        x = read(stream)
+        if context is None and self.is_initializing():
+            # Without a context the gate never joins a read, and init would declare none.
+            context = CrossContext(jnp.zeros((x.shape[0], 1, x.shape[-1]), x.dtype),
+                                   jnp.ones(x.shape[:1], jnp.int32))
+        if context is not None and context.embeddings.shape[-1] != x.shape[-1]:
+            raise ValueError(f"a layer's own projections read {x.shape[-1]}-wide context tokens, the "
+                             f"decoder's width, got {context.embeddings.shape[-1]}")
+        if decode:
+            lengths = _held_lengths(self, x, context)
+        elif context is None:
+            return stream
+        else:
+            lengths = context.lengths
+        attention = layer.attention
+        query, gate = attention.context_query(layer.normed(x))
+        embeddings = None if context is None else context.embeddings
+        if decode:
+            key_heads, key_width, value_width = self.heads
+            key, value = kept_context(self, x.shape[0], self.context_length,
+                                      ((key_heads, key_width), (key_heads, value_width)),
+                                      x.dtype if self.dtype is None else self.dtype, embeddings,
+                                      attention.context_keys)
+        else:
+            assert embeddings is not None
+            key, value = attention.context_keys(embeddings)
+        documents = ({} if context is None or context.segments is None
+                     else {"queries": context.queries, "segments": context.segments})
+        branch = attention.attend_context(query, gate, key, value, lengths=lengths, **documents)
+        branch = Dropout(rate=self.dropout_rate)(branch, deterministic=not train)
+        return _joined(self, "alpha_cross_attn", stream, branch, _present(stream, context, lengths),
+                       ngpt=self.ngpt, precision=self.precision)
+
+
+def _held_lengths(module: nn.Module, x: jax.Array, context: CrossContext | None) -> jax.Array:
+    """Each row's real context tokens a cached call of a block reads: a call that carries a context
+    keeps them once the cache is allocated, as its attention keeps the keys and values
+    (`kept_context`); a call without one reads what the cache keeps."""
+    allocated = module.has_variable("cache", CROSS_LENGTHS)
+    lengths = module.variable("cache", CROSS_LENGTHS, jnp.zeros, x.shape[:1], jnp.int32)
+    if context is None:
+        return lengths.value
+    if allocated:
+        lengths.value = context.lengths
+    return context.lengths
+
+
+def _present(stream: jax.Array, context: CrossContext | None, lengths: jax.Array) -> jax.Array:
+    """Where a block's read joins `stream`: each row with context tokens and, where the context holds
+    several documents, each token whose document holds some, as its row alone would skip the block."""
+    if context is not None and context.segments is not None and context.queries is not None:
+        held = holds_keys(CrossDocuments(context.queries, context.segments))
+        return held.reshape(held.shape[:2] + (1,) * (stream.ndim - 2))
+    return (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
+
+
+def _joined(module: nn.Module, name: str, stream: jax.Array, branch: jax.Array, present: jax.Array, *,
+            ngpt: bool, precision: PrecisionLike) -> jax.Array:
+    """`stream` with `branch` joined through `module`'s tanh gate `name`, a parameter of one element,
+    zero at the start, in at least float32 and in its own float64 where a run widens it, where
+    `present` (`gated_join`)."""
+    alpha = module.param(name, nn.initializers.zeros, (1,), jnp.float32)
+    gate = jnp.tanh(alpha.astype(at_least_fp32(alpha.dtype)))
+    return jnp.where(present, gated_join(stream, branch, gate, ngpt=ngpt, precision=precision), stream)
 
 
 def gated_join(stream: jax.Array, branch: jax.Array, gate: jax.Array, *, ngpt: bool = False,
@@ -334,5 +591,6 @@ def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.
     return product[..., 0]
 
 
-__all__ = ["CROSS_CACHE", "CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "ContextEncoder",
-           "CrossAttention", "GatedCrossAttention", "crossing", "encode_context", "gated_join"]
+__all__ = ["CROSS_CACHE", "CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "AttendsContext",
+           "ContextEncoder", "CrossAttention", "CrossBlocks", "GatedCrossAttention", "LayerReads",
+           "SharedCrossAttention", "SharedGatedCrossAttention", "crossing", "encode_context", "gated_join"]
