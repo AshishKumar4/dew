@@ -41,7 +41,7 @@ from jax.experimental import serialize_executable
 
 from dew._records import JSON, record
 from dew.batch import Batch
-from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_target
+from dew.nn.kernels.generation import assumed, capability, gpu_target
 from dew.nn.kernels.templates import report
 from dew.telemetry.instrumentation import StepFlops, step_flops
 from dew.training.profiling import pgle_runs
@@ -146,10 +146,6 @@ class AheadOfTime:
     before its first step on those GPUs."""
     capacity: int | None = None
     """The stated bytes per target GPU, or None where no memory capacity was supplied."""
-    target: GpuTarget | None = None
-    """The facts of the GPU its kernels' launches were derived for (`gpu_target` within `assumed`): a
-    run handed the step derives its launches for them (`derived_for`), so it lowers this program on a
-    GPU whose measured clock or bandwidth differ from the table's, where they would derive another."""
     refusals: tuple = ()
     """The kernel launch configs its compiles found spilling and refused
     (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
@@ -186,23 +182,6 @@ class AheadOfTime:
         return serialize_executable.deserialize_and_load(self.executable, in_tree, out_tree,
                                                          backend=found[0].client)
 
-
-    def derived_for(self, device: GpuTarget) -> GpuTarget | None:
-        """The facts a run on a GPU of `device`'s facts derives its launches for, to lower this program:
-        the target it was compiled for, which the GPU holds, its generation and at least the shared
-        memory a block of its launches takes. Refused for a GPU of another generation or less shared
-        memory, on which the program's launches would not run. None for a step compiled before steps
-        recorded their target, whose run derives for its own GPU."""
-        if self.target is None:
-            return None
-        held = device.shared_limit is None or self.target.shared_limit is None or (
-            device.shared_limit >= self.target.shared_limit)
-        if device.generation != self.target.generation or not held:
-            raise ValueError(f"the step was compiled ahead for {self.target.device_kind} "
-                             f"({self.target.generation}, {self.target.shared_limit} bytes of shared memory "
-                             f"a block), whose launches this {device.device_kind} ({device.generation}, "
-                             f"{device.shared_limit} bytes) does not run; compile it ahead for this GPU")
-        return self.target
 
     def taken(self, lowered: jax.stages.Lowered) -> jax.stages.Compiled:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
@@ -316,7 +295,6 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     began = time.perf_counter()
     start = trainer._started()
     with assumed(generation):
-        target = gpu_target()
         planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
@@ -332,4 +310,4 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links={axis: link.bytes_per_second for axis, link in trainer.links.items()},
-        target=target, refusals=report.refused_launches())
+        refusals=report.refused_launches())
