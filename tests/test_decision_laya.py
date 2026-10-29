@@ -1,4 +1,5 @@
-"""dew.decision against Laya's own code (NandhaKishorM/laya a4a8921), under the float64 rule."""
+"""dew.decision against Laya's own code (NandhaKishorM/laya a4a8921): its layouts token for token, and
+its option logits over check 1's seeds of requests, recorded by tools/laya_reference.py `--record`."""
 
 import json
 import os
@@ -9,7 +10,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_moves,
+    declared_seeds,
+    indexed_recording,
+    recording,
+)
 
 from dew.decision import Decide, DecisionInputs, Encoded, Question
 
@@ -21,12 +30,13 @@ def cases() -> dict:
     return json.loads((FIXTURES / "cases.json").read_text())
 
 
-def rows(checkpoint: Decide, *, parallel: bool):
-    """Every question of every case, laid out by Dew, keyed as the fixture keys them."""
+def rows(checkpoint: Decide, *, parallel: bool, requests: dict | None = None):
+    """Every question of every case (`requests`, by default the fixture's), laid out by Dew, keyed as
+    the fixture keys them."""
     # The release's layout, its budgets as it states them, in each option order.
     layout = replace(checkpoint.layout, parallel=parallel)
     name = "parallel" if parallel else "sequential"
-    for case, request in cases().items():
+    for case, request in (cases() if requests is None else requests).items():
         state = layout.state(checkpoint.tokenizer, checkpoint.specials, request["state"])
         for qid, wire in request["questions"].items():
             question = Question.from_wire(wire)
@@ -55,63 +65,89 @@ def markers(encoded: Encoded) -> list[int]:
     return [start for start, _ in encoded.questions[0].options]
 
 
-def logits(checkpoint: Decide, *, parallel: bool) -> dict[str, np.ndarray]:
-    """Each question's option logits, one row per question as Laya runs them."""
+def logits(checkpoint: Decide, *, parallel: bool, requests: dict | None = None,
+           one_type: bool = False) -> dict[str, np.ndarray]:
+    """Each question's option logits, one row per question as Laya runs them, every row's question
+    type the first where `one_type`."""
     found = {}
-    for key, _, encoded in rows(checkpoint, parallel=parallel):
+    for key, _, encoded in rows(checkpoint, parallel=parallel, requests=requests):
         inputs = DecisionInputs.collate([encoded], checkpoint.specials.pad)
+        if one_type:
+            inputs = replace(inputs, kinds=jnp.zeros_like(inputs.kinds))
         found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[0, 0]
     return found
 
 
+RECORDING = TINY / "recorded_logits.npz"
+
+
+def recorded(*, parallel: bool):
+    """Check 1's draw, reference and truth over Laya's recording (`indexed_recording`) for one layout's
+    leaves, and its declared seeds; a draw is a seed's requests (tools/laya_reference.py
+    `drawn_cases`)."""
+    from tools.laya_reference import drawn_cases
+
+    stored, seeds = recording(RECORDING), declared_seeds(RECORDING)["laya"]
+    name = "parallel" if parallel else "sequential"
+    leaves = [key.removeprefix("laya.reference.") for key in stored
+              if key.startswith(f"laya.reference.{name}/")]
+    return (*indexed_recording(stored, "laya", seeds, inputs_of=drawn_cases, leaves=leaves), seeds)
+
+
+def drawn_requests(inputs) -> dict:
+    """The requests a draw holds (tools/laya_reference.py `requests`)."""
+    from tools.laya_reference import requests
+
+    return requests(inputs)
+
+
 @pytest.mark.parametrize("parallel", [False, True])
 def test_laya_logits_match_laya_under_the_float64_rule(parallel):
-    """Every case's option logits, sequential and parallel, held to twice
-    Laya's own fp32 distance from its float64 run."""
+    """Every case's option logits, sequential and parallel, on par with Laya's own fp32 run from its
+    float64 run over the recording's seeds of requests (check 1)."""
     checkpoint = Decide.from_pretrained(TINY, attention_impl="xla")
-    found = logits(checkpoint, parallel=parallel)
-    with np.load(TINY / "logits.npz") as reference:
-        keys = sorted(found)
-        assert_as_exact_as_the_reference(
-            np.concatenate([found[key] for key in keys]),
-            np.concatenate([reference[key] for key in keys]),
-            np.concatenate([reference[f"{key}/f64"] for key in keys]), "Laya logits")
+    draw, reference, truth, seeds = recorded(parallel=parallel)
+    ours = as_given(lambda index, inputs: logits(checkpoint, parallel=parallel,
+                                                 requests=drawn_requests(inputs)))
+    assert_as_exact(ours, reference, draw, f"Laya logits, {'parallel' if parallel else 'sequential'}",
+                    seeds=seeds, truth_fn=truth)
 
 
 def test_the_rule_catches_a_head_that_ignores_the_question_type():
     """The type embedding is the only place a choice and a noul differ in
-    the head; dropping it moves the logits past the rule."""
+    the head; dropping it moves the logits past rounding of Laya's own
+    (`assert_moves`, over the recording's seeds of requests)."""
     checkpoint = Decide.from_pretrained(TINY, attention_impl="xla")
-    with np.load(TINY / "logits.npz") as reference:
-        found = {}
-        for key, _, encoded in rows(checkpoint, parallel=False):
-            inputs = DecisionInputs.collate([encoded], checkpoint.specials.pad)
-            one_type = replace(inputs, kinds=jnp.zeros_like(inputs.kinds))
-            found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, one_type))[0, 0]
-        keys = sorted(found)
-        with pytest.raises(AssertionError):
-            assert_as_exact_as_the_reference(
-                np.concatenate([found[key] for key in keys]),
-                np.concatenate([reference[key] for key in keys]),
-                np.concatenate([reference[f"{key}/f64"] for key in keys]), "Laya logits, one type")
+    draw, reference, truth, seeds = recorded(parallel=False)
+    one_type = as_given(lambda index, inputs: logits(checkpoint, parallel=False,
+                                                     requests=drawn_requests(inputs), one_type=True))
+    assert_moves(reference, one_type, draw, "Laya logits, one type", seeds=seeds, truth_fn=truth)
 
 
 def test_padded_rows_score_as_they_do_alone():
     """Every question of every case in one batch: padding reaches neither
-    the encoder's nor the head's attention, so the batch is held to Laya's
-    one-row runs under the same rule, and a short row's missing options
-    score -inf."""
+    the encoder's nor the head's attention, so the batch is on par with
+    Laya's one-row runs over the recording's seeds of requests (check 1),
+    and a short row's missing options score -inf."""
     checkpoint = Decide.from_pretrained(TINY, attention_impl="xla")
-    laid = list(rows(checkpoint, parallel=False))
-    inputs = DecisionInputs.collate([encoded for _, _, encoded in laid], checkpoint.specials.pad)
-    batched = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[:, 0]
-    widths = [len(markers(encoded)) for _, _, encoded in laid]
-    assert all(np.all(np.isneginf(batched[row, width:])) for row, width in enumerate(widths))
-    with np.load(TINY / "logits.npz") as reference:
-        assert_as_exact_as_the_reference(
-            np.concatenate([batched[row, :width] for row, width in enumerate(widths)]),
-            np.concatenate([reference[key] for key, _, _ in laid]),
-            np.concatenate([reference[f"{key}/f64"] for key, _, _ in laid]), "batched Laya logits")
+
+    def batched(requests):
+        laid = list(rows(checkpoint, parallel=False, requests=requests))
+        inputs = DecisionInputs.collate([encoded for _, _, encoded in laid], checkpoint.specials.pad)
+        scores = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[:, 0]
+        widths = [len(markers(encoded)) for _, _, encoded in laid]
+        return {key: scores[row] for row, (key, _, _) in enumerate(laid)}, widths
+
+    scores, widths = batched(None)
+    assert all(np.all(np.isneginf(row[width:])) for row, width in zip(scores.values(), widths, strict=True))
+
+    @as_given
+    def ours(index, inputs):
+        found, widths = batched(drawn_requests(inputs))
+        return {key: row[:width] for (key, row), width in zip(found.items(), widths, strict=True)}
+
+    draw, reference, truth, seeds = recorded(parallel=False)
+    assert_as_exact(ours, reference, draw, "batched Laya logits", seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.network
