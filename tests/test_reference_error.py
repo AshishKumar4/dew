@@ -234,6 +234,52 @@ def noised_draw(seed):
     return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
 
 
+def cancelling(split: bool, *, leak: bool = False, residue: float = 0.0):
+    """A leaf of rows that cancel, rows of no terms and plain rows: rows 0-7 a dot less itself (the
+    reference's the same dot twice, exactly zero; split, Dew's second dot summed in two halves, an ulp
+    or so off zero; leaked, one term dropped from it), rows 8-11 the dot of zero rows (`residue` added),
+    and the rest the plain dot, every arm alike."""
+    def halves(x, w):
+        return x[:, :32] @ w[:32] + (x[:, 33:] @ w[33:] if leak else x[:, 32:] @ w[32:])
+
+    def arm(x, w):
+        whole = x @ w
+        other = halves(x, w) if split else x @ w
+        return {"rows": jnp.concatenate([whole[:8] - other[:8], whole[8:12] + residue, whole[12:]])}
+    return arm
+
+
+def cancelling_draw(seed):
+    """A [64, 64] by [64, 4] dot's operands, rows 8-11 of the first zero."""
+    rng = np.random.default_rng([2440, seed])
+    x = rng.standard_normal((64, 64))
+    x[8:12] = 0
+    return jnp.asarray(x, jnp.float32), jnp.asarray(rng.standard_normal((64, 4)), jnp.float32)
+
+
+def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
+    """Term sizing (`assert_as_exact`'s `terms`, owner 10-29): a row whose truth cancels exactly, Dew's an
+    ulp or so off its zero where the reference's sum cancels to it, is judged at its terms' size by the
+    row rule and admitted, where without terms it fails as a row of float64 zero against the reference's
+    exact zero; and nothing else is: a dropped term in that row is refused, a residue on rows whose terms
+    are zero too (no size) is refused as a row of float64 zero, and a truth with no terms (run as given)
+    is refused at the site."""
+    reference = cancelling(split=False)
+    assert_as_exact(cancelling(split=True), reference, cancelling_draw, "a cancelling dot", seeds=16,
+                    terms=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untermed", seeds=16)
+    with pytest.raises(GateFailure):
+        assert_as_exact(cancelling(split=True, leak=True), reference, cancelling_draw, "a leaked term",
+                        seeds=16, terms=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(cancelling(split=True, residue=1e-20), reference, cancelling_draw,
+                        "a residue on rows of no terms", seeds=16, terms=True)
+    with pytest.raises(ValueError):
+        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untraceable", seeds=16,
+                        terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
+
+
 def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw():
     """`also`: one Dew arm against several references on the same draws, each judged by its own check 1
     under its own label, Dew and the truth evaluated once a draw for them all. A Dew arm on par with one
