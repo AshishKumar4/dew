@@ -1,12 +1,15 @@
 """The rest of the common run layer's options, each set on `dew train` for every kind of run and
-observed where it acts, in the steps, checkpoints, scalars and records the run writes (row 1901):
-a pause, a split, a ranking, a cooldown, the final save, the run's length in epochs, examples and
-tokens, a batch ramp, a lowering for a GPU, a step compiled ahead and one handed to the run, and the
-options a kind's data or mesh refuses. The
-options each kind takes from Python and the rest of the command line are tests/test_run_options.py's.
-Nothing here reads a config's fields back."""
+observed where it acts, in the steps, checkpoints, scalars, records, traces and W&B files the run
+writes (row 1901): a pause, a plateau, a split, a ranking, a cooldown, the final save, the run's length
+in epochs, examples and tokens, a batch ramp, a profiler window, quantized training, microbatches
+through a pipeline's stages, an update's token budget, a lowering for a GPU, a step compiled ahead and
+one handed to the run, W&B tracking and publishing, a kernel tuner on a GPU, and the options a kind's
+data, model or mesh refuses. The options each kind takes from Python and the rest of the command line
+are tests/test_run_options.py's. Nothing here reads a config's fields back."""
 
+import dataclasses
 import json
+import typing
 from pathlib import Path
 
 import pytest
@@ -14,7 +17,11 @@ from test_run_options import KINDS, scalars
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
+from dew.config import RunConfig, TrainerConfig
+from dew.quantization import Quantization
+from dew.registry import to_record
 from dew.training._lowering import Lowered
+from dew.training.budget import Plateau
 
 pytestmark = pytest.mark.mesh(devices=8)
 
@@ -33,17 +40,21 @@ GLOBAL_ORDER = {"lm", "diffusion", "jepa"}
 """The kinds whose training data is compiled to one global record order, which a batch ramp cuts
 its growing batches out of; a decision run's shares cut their own."""
 
+STAGED = {"lm", "decision"}
+"""The kinds whose models run in pipeline stages: a decoder's layers, an LM's built and a decision's
+loaded backbone's."""
+
 MESH = {"tensor": 2}
 """Eight devices, two a tensor and four row shards of a batch of eight (`MeshSpec`'s data axis takes
 the rest): two rows each, which a split in two and a ramp's first batch of four still divide."""
 
 
-def trained(kind: str, root: Path, name: str, **settings: object) -> Path:
-    """`dew train` over `kind`'s run.json under `root`, its options `settings` (`--set path=value`, a
-    mapping as JSON), at most as many steps as it is given: the run's directory."""
+def trained(kind: str, root: Path, name: str, run: RunConfig | None = None, **settings: object) -> Path:
+    """`dew train` over `kind`'s run.json under `root`, or `run`'s where given, its options `settings`
+    (`--set path=value`, a mapping as JSON), at most as many steps as it is given: the run's directory."""
     record, data = root / f"record-{name}", root / name
     data.mkdir()
-    KINDS[kind](data, drawn=False).save(str(record))
+    (run or KINDS[kind](data, drawn=False)).save(str(record))
     given = {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.log_every": "1",
              "trainer.eval_every": "None", "trainer.checkpoint_every": "None", "trainer.mesh": MESH,
              "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", "val_metrics": "[]",
@@ -52,6 +63,11 @@ def trained(kind: str, root: Path, name: str, **settings: object) -> Path:
              for flag in ("--set", f"{path}={json.dumps(value) if isinstance(value, dict) else value}")]
     assert main(["train", str(record / "run.json"), *flags]) == 0
     return root / "runs" / name
+
+
+def trainer_record(field: str, value: object) -> object:
+    """`value` as the run's record holds `TrainerConfig.field`, the form `--set` reads it in."""
+    return to_record(value, typing.get_type_hints(TrainerConfig, include_extras=True)[field])
 
 
 def saved(run: Path) -> list[int]:
@@ -187,3 +203,99 @@ def test_a_kinds_run_is_tracked_on_wandb_offline_and_publishes_only_there(kind, 
     assert list((tmp_path / "wandb").glob("offline-run-*"))
     with pytest.raises(ValueError):
         trained(kind, tmp_path, "published", **{"trainer.steps": 2, "trainer.publish": "True"})
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_a_kinds_run_stops_on_a_plateau_of_its_training_loss(kind, tmp_path):
+    """A plateau of one evaluation of the training loss that nothing improves past (`stop`) stops a run of
+    six steps evaluated every step at its second evaluation, its last checkpoint there."""
+    plateau = trainer_record("stop", Plateau("train/loss", evals=1, min_delta=1e9))
+    run = trained(kind, tmp_path, "plateau", **{"trainer.steps": 6, "trainer.eval_every": 1,
+                                                  "trainer.checkpoint_every": 1, "trainer.keep": 6,
+                                                  "trainer.stop": plateau})
+    assert saved(run)[-1] == 2
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_a_kinds_run_is_profiled_and_trains_quantized_as_set(kind, tmp_path):
+    """A profiler window of a step after one of warmup (`profile`) writes a trace of the run's step where
+    the window names, and the run saves its final step alone (`checkpoint_final`, its default); a run
+    whose trunk trains quantized (`quantization`) computes its first step's loss otherwise than the
+    run in its compute dtype does, from the one key and data."""
+    window = {"directory": str(tmp_path / "trace"), "steps": 1, "warmup": 1}
+    profiled = trained(kind, tmp_path, "profiled", **{"trainer.steps": 3, "trainer.profile": window})
+    assert list((tmp_path / "trace").rglob("*.xplane.pb")) and saved(profiled) == [3]
+    quantized = trained(kind, tmp_path, "quantized", **{
+        "trainer.steps": 1, "trainer.quantization": trainer_record("quantization", Quantization())})
+    assert scalars(quantized)[1]["train/loss"] != scalars(profiled)[1]["train/loss"]
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_a_kinds_run_feeds_its_microbatches_through_its_stages_or_is_refused(kind, tmp_path):
+    """Over a mesh of two pipeline stages and two tensor shards, each data shard four rows, four
+    microbatches a step (`microbatches`) each hold half the rows two do, and the compiled step's
+    temporaries are fewer, where the kind's model runs in stages (an LM's decoder of two layers); a
+    kind whose model takes no stages refuses the mesh."""
+    staged = {"trainer.steps": 1, "trainer.mesh": {"stage": 2, "tensor": 2}}
+    if kind not in STAGED:
+        with pytest.raises(ValueError):
+            trained(kind, tmp_path, "staged", **staged, **{"trainer.microbatches": 4})
+        return
+    layers = {"model.num_layers": 2} if kind == "lm" else {}
+    temps = {count: recorded(trained(kind, tmp_path, f"staged-{count}", **staged, **layers,
+                                     **{"trainer.microbatches": count}), "StepCompiled")[0]
+             for count in (2, 4)}
+    assert temps[4]["memory"]["analysis"]["temp"] < temps[2]["memory"]["analysis"]["temp"]
+
+
+def test_an_lm_run_over_token_batches_accumulates_its_update_token_budget(tmp_path):
+    """An LM run over windows batched by their tokens (`Dataset.batch(tokens=)`) and an update's token
+    budget of two such batches (`update_tokens`) commits an update every second step, which its
+    gradient's norm marks; the other kinds batch rows, and refuse the budget
+    (`test_an_option_a_kinds_mesh_or_data_cannot_take_is_refused`)."""
+    from test_lm_recipe import SEQ, write_token_files
+    from test_run_options import read
+
+    from dew.data import presets
+    from dew.data.sources.tokens import TokenFiles
+
+    corpus = write_token_files(tmp_path / "budget-tokens", 40 * SEQ, 8 * SEQ)
+
+    def windows(path):
+        return read(TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack=None).batch(
+            tokens=8 * SEQ))
+    run = dataclasses.replace(KINDS["lm"](tmp_path, drawn=False), data=windows(corpus.train),
+                              validation=windows(corpus.val))
+    logged = scalars(trained("lm", tmp_path, "budgeted", run, **{"trainer.steps": 4,
+                                                                  "trainer.update_tokens": 16 * SEQ}))
+    assert sorted(step for step, row in logged.items() if "train/grad_norm" in row) == [2, 4]
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_trains(kind, tmp_path,
+                                                                                       monkeypatch):
+    """A run tracked on W&B offline that would publish its final checkpoint (`publish`) is refused before
+    it trains: publishing links the checkpoint into W&B's registry, which an offline run cannot reach,
+    and where it was not refused the run trained and then failed at its last call."""
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    with pytest.raises(ValueError):
+        trained(kind, tmp_path, "published", **{"trainer.steps": 1, "trainer.publish": "True",
+                                                  "trainer.wandb": {"project": "dew-tests", "offline": True}})
+    assert not (tmp_path / "runs" / "published").exists()
+
+
+@pytest.mark.gpu(reason="measures a run's kernel launches, which only a GPU runs")
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_a_kinds_run_measures_its_kernel_launches_as_set(kind, tmp_path):
+    """A run that measures its step's launches on this GPU (`tune_kernels`) keeps what it picked
+    beside its compilation cache (`dew.cache.kernel_picks_path`), where a later run reads them."""
+    import jax
+
+    cache, compiling = tmp_path / "cache", jax.config.jax_compilation_cache_dir
+    try:
+        trained(kind, tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
+                                              "trainer.compilation_cache_dir": str(cache)})
+    finally:
+        jax.config.update("jax_compilation_cache_dir", compiling)
+    (picks,) = cache.rglob("kernels/*.json")
+    assert json.loads(picks.read_text())["data"]
