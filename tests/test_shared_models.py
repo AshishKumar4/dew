@@ -101,8 +101,10 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
     """The live kernel's stand-ins take what Dew's own calls take, read from Dew (site/live/container/
     contract.py): a prepare without its key fails as Dew's does; a call naming no steps, solver or guidance
     takes the pipeline's own, the image the service returns the one Dew's call makes; `CFG` holds Dew's
-    defaults; an argument the service does not serve is refused by name; and the service refuses a solver
-    outside the contract's (ledger 1159)."""
+    defaults, and `Sampling` Dew's, so a greedy policy named in full is the greedy policy; an argument the
+    service does not serve, or one of another type than Dew's default (decode=1), is refused by name, and so is a
+    solver of the cell's own named as one the service runs; and the service refuses a solver outside the
+    contract's (ledger 1159)."""
     import numpy as np
     from test_inference import make_run
 
@@ -111,6 +113,7 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
     progress = load("progress", "site/live/container")
     client = load("model_client", "site/live/container")
     client.TERMS = load("contract", "site/live/container").written()
+    monkeypatch.setattr(service, "TERMS", client.TERMS)
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     native = service.NativeModels.__new__(service.NativeModels)
@@ -129,9 +132,24 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
         with pytest.raises(TypeError, match="key"):
             live.prepare(["a lake"])
         images = live(live.prepare(["a lake"], key=3), key=5).host().images
+        from dew.sampling import Heun, Sampling
+
         assert (CFG(2).interval, CFG(2).rescale) == ((0.0, 1.0), 0.0)
-        with pytest.raises(ValueError, match="decode stays at Dew's default"):
-            live(["a lake"], key=5, decode=False)
+        for decode in (False, 1):
+            with pytest.raises(ValueError, match="decode stays at Dew's default"):
+                live(["a lake"], key=5, decode=decode)
+
+        class Mine:
+            pass
+
+        Mine.__name__ = "Heun"
+        with pytest.raises(ValueError, match="displayed solvers"):
+            live(["a lake"], key=5, solver=Mine())
+        assert type(Heun()).__name__ == "Heun"
+        for greedy in (Sampling(temperature=0), Sampling(0), Sampling(temperature=0, top_p=1.0)):
+            client.Decoder("model").text_generation(sampling=greedy)
+        with pytest.raises(ValueError, match="decodes greedily"):
+            client.Decoder("model").text_generation(sampling=Sampling(temperature=0.5))
     np.testing.assert_array_equal(images, pipe(pipe.prepare(["a lake"], key=3), key=5).host().images)
     request = {"op": "sample", "repo": "model", "revision": "pinned", "prompt": "a lake", "negative": None,
                "prepare_key": 3, "prepare_steps": None, "key": 5, "steps": None,

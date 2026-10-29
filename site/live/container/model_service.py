@@ -45,6 +45,40 @@ def fields(value, names, optional=""):
         raise ValueError("unsupported model request fields")
 
 
+TERMS: dict | None = None
+"""The contract (contract.py's `written`, read from `contract.PATH` at first use), or the one a test sets."""
+
+
+def terms() -> dict:
+    global TERMS
+    if TERMS is None:
+        TERMS = contract.read()
+    return TERMS
+
+
+def guidance_record(value):
+    """A CFG record a cell sent, as Dew's CFG takes it (the contract's fields: each required one given, no
+    other), each field the service bounds within its bounds and any other at Dew's default."""
+    record = {entry["name"]: entry for entry in terms()["CFG"]}
+    if not isinstance(value, dict) or not {name for name, entry in record.items() if "default" not in entry
+                                           and not entry.get("omitted")} <= set(value) <= set(record):
+        raise ValueError("unsupported guidance fields")
+    bounds = {"scale": lambda scale: number(scale, 0, 20), "rescale": lambda rescale: number(rescale, 0, 1),
+              "interval": interval}
+    for name, given in value.items():
+        if name in bounds:
+            bounds[name](given)
+        elif given != record[name].get("default"):
+            raise ValueError(f"the live sampler takes CFG's {name} at its default")
+
+
+def interval(value):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("guidance interval needs two bounds")
+    number(value[0], 0, 1)
+    number(value[1], value[0], 1)
+
+
 def nullable(check, value, *bounds):
     """`check` of `value`, or None, where Dew takes a task's own default (contract.py)."""
     if value is not None:
@@ -78,7 +112,7 @@ def validate(request):
         solver = request["solver"]
         if solver is not None:
             fields(solver, "name args")
-            if solver["name"] not in contract.SOLVERS or solver["args"]:
+            if solver["name"] not in terms()["solvers"] or solver["args"]:
                 raise ValueError("the live sampler supports the displayed solvers with their default "
                                  "settings")
         guidance = request.get("guidance")
@@ -88,14 +122,7 @@ def validate(request):
             if request["revision"] is not None:
                 text(request["revision"], 64)
             return request
-        fields(guidance, "scale interval rescale")
-        number(guidance["scale"], 0, 20)
-        number(guidance["rescale"], 0, 1)
-        interval = guidance["interval"]
-        if not isinstance(interval, (list, tuple)) or len(interval) != 2:
-            raise ValueError("guidance interval needs two bounds")
-        number(interval[0], 0, 1)
-        number(interval[1], interval[0], 1)
+        guidance_record(guidance)
     else:
         raise ValueError("unsupported model operation")
     text(request["repo"], 256)
@@ -119,7 +146,7 @@ class NativeModels:
         print("MODEL_PHASE", time.time(), "pipeline load", flush=True)
         self.np, self.progress = np, progress
         self.cfg = CFG
-        self.solvers = {name: getattr(sampling, name) for name in contract.SOLVERS}
+        self.solvers = {name: getattr(sampling, name) for name in terms()["solvers"]}
         self.repo, self.revision = (root / "text-to-image").read_text().strip().split("@")
         self.pipe = progress.Reporting(dew.pipeline(self.repo, revision=self.revision))
         self.text_servers = {}
@@ -155,8 +182,8 @@ class NativeModels:
         options = request.get("guidance")
         guided = ({} if "guidance" not in request else
                   {"guidance": options if options is None or type(options) in (int, float) else
-                   self.cfg(options["scale"], interval=tuple(options["interval"]),
-                            rescale=options["rescale"])})
+                   self.cfg(**{name: tuple(given) if isinstance(given, list) else given
+                               for name, given in options.items()})})
         inputs = self.pipe.prepare([request["prompt"]], key=request["prepare_key"],
                                    steps=request["prepare_steps"], unconditional=request["negative"])
         previous = self.progress._show

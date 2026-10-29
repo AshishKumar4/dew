@@ -26,32 +26,36 @@ PATH = "/opt/live/contract.json"
 """Where the guest reads `written`'s record."""
 
 
+def defaulted(name: str, default) -> dict:
+    """An argument's entry: its name and its default, `default` where JSON holds it (a tuple as a list),
+    else `omitted`, a value only Dew holds, which a call that leaves the argument out takes."""
+    entry = {"name": name}
+    if default is inspect.Parameter.empty or default is dataclasses.MISSING:
+        return entry
+    held = list(default) if isinstance(default, tuple) else default
+    try:
+        json.dumps(held)
+        return {**entry, "default": held}
+    except TypeError:
+        return {**entry, "omitted": True}
+
+
 def parameters(function) -> list[dict]:
-    """`function`'s parameters but self and cls, each its name and kind and, where it has one, its default:
-    `default` where JSON holds it (a tuple as a list), else `omitted`, a value only Dew holds, which a call
-    that leaves the argument out takes."""
-    found = []
-    for parameter in inspect.signature(function).parameters.values():
-        if parameter.name in ("self", "cls"):
-            continue
-        entry = {"name": parameter.name, "kind": parameter.kind.name}
-        if parameter.default is not parameter.empty:
-            default = list(parameter.default) if isinstance(parameter.default, tuple) else parameter.default
-            try:
-                json.dumps(default)
-                entry["default"] = default
-            except TypeError:
-                entry["omitted"] = True
-        found.append(entry)
-    return found
+    """`function`'s parameters but self and cls, each its entry (`defaulted`) and kind."""
+    return [{**defaulted(parameter.name, parameter.default), "kind": parameter.kind.name}
+            for parameter in inspect.signature(function).parameters.values()
+            if parameter.name not in ("self", "cls")]
 
 
 def record(kind: type) -> list[dict]:
-    """A dataclass's fields as its constructor takes them: each name and, where it has one, its default."""
-    return [{"name": field.name, **({} if field.default is dataclasses.MISSING else
-                                    {"default": list(field.default) if isinstance(field.default, tuple)
-                                     else field.default})}
-            for field in dataclasses.fields(kind) if field.init]
+    """A dataclass's fields as its constructor takes them, in order, each its entry (`defaulted`)."""
+    return [defaulted(field.name, field.default) for field in dataclasses.fields(kind) if field.init]
+
+
+def read(path: str = PATH) -> dict:
+    """The contract `written` wrote, which the guest's stand-ins and the service both read."""
+    with open(path) as held:
+        return json.load(held)
 
 
 def written() -> dict:
@@ -62,7 +66,7 @@ def written() -> dict:
     from dew.interop import PretrainedDecoder
     from dew.sampling import CFG, Sampling
 
-    return {"CFG": record(CFG), "Sampling": [field["name"] for field in record(Sampling)],
+    return {"CFG": record(CFG), "Sampling": record(Sampling),
             "pipeline": parameters(dew.pipeline), "prepare": parameters(TextToImage.prepare),
             "sample": parameters(TextToImage.__call__), "load": parameters(PretrainedDecoder.load),
             "text_generation": parameters(PretrainedDecoder.text_generation),

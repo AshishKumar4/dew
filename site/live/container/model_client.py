@@ -74,52 +74,69 @@ def request(payload):
 TERMS: dict | None = None
 """The contract (contract.py's `written`, read from `contract.PATH` at first use), or the one a test sets."""
 OMITTED = object()
-"""A default only Dew holds (`contract.parameters`), which a call that leaves the argument out takes."""
+"""A default only Dew holds (`contract.defaulted`), which a call that leaves the argument out takes."""
 
 
 def terms() -> dict:
     global TERMS
     if TERMS is None:
-        TERMS = json.loads(Path(contract.PATH).read_text())
+        TERMS = contract.read()
     return TERMS
+
+
+def default(entry: dict):
+    """An entry's default as Dew holds it: a list a tuple again, OMITTED where only Dew holds it."""
+    if entry.get("omitted"):
+        return OMITTED
+    held = entry.get("default", inspect.Parameter.empty)
+    return tuple(held) if isinstance(held, list) else held
+
+
+def unchanged(value, held) -> bool:
+    """Whether `value` is the default `held` itself: the same object, or an equal one of the same type (so
+    `1` is not the default `True`, nor `1.0` the default `1`)."""
+    return value is held or (type(value) is type(held) and value == held)
 
 
 def bound(call: str, served: set[str], *args, **kwargs) -> dict:
     """`args` and `kwargs` bound as Dew's `call` binds them (the contract's signature: a missing or unknown
     argument fails as it does in Dew), its defaults applied; an argument the service does not serve
-    (outside `served`) must stay at Dew's default."""
-    defaults = {entry["name"]: OMITTED if entry.get("omitted") else
-                (tuple(entry["default"]) if isinstance(entry.get("default"), list) else
-                 entry.get("default", inspect.Parameter.empty)) for entry in terms()[call]}
+    (outside `served`) must stay at Dew's default, and a variadic one empty."""
+    entries = terms()[call]
     signature = inspect.Signature([
-        inspect.Parameter(entry["name"], getattr(inspect.Parameter, entry["kind"]),
-                          default=defaults[entry["name"]]) for entry in terms()[call]])
+        inspect.Parameter(entry["name"], getattr(inspect.Parameter, entry["kind"]), default=default(entry))
+        for entry in entries])
     given = signature.bind(*args, **kwargs)
     given.apply_defaults()
-    for name, value in given.arguments.items():
-        if name not in served and value is not defaults[name] and value != defaults[name]:
+    for entry in entries:
+        name, value = entry["name"], given.arguments.get(entry["name"])
+        variadic = entry["kind"] in ("VAR_POSITIONAL", "VAR_KEYWORD")
+        if name not in served and (bool(value) if variadic else not unchanged(value, default(entry))):
             raise ValueError(f"the live kernel serves {', '.join(sorted(served))} here; {name} stays at "
                              f"Dew's default on this page")
     return given.arguments
 
 
+@cache
 def stand_ins() -> dict[str, type]:
-    """The records and solvers a cell builds, from the contract: `CFG` with Dew's fields and defaults, the
-    solvers the service serves, `Sampling` taking Dew's field names."""
-    cfg = dataclasses.make_dataclass("CFG", [
-        (entry["name"], object, *([dataclasses.field(default=tuple(entry["default"]) if isinstance(
-            entry["default"], list) else entry["default"])] if "default" in entry else []))
-        for entry in terms()["CFG"]], frozen=True)
-    names = set(terms()["Sampling"])
+    """The records and solvers a cell builds, from the contract, once: `CFG` and `Sampling` with Dew's fields
+    and defaults, and each solver the service serves, whose type a call names it by."""
+    def built(name: str) -> type:
+        return dataclasses.make_dataclass(name, [
+            (entry["name"], object, *([] if default(entry) is inspect.Parameter.empty else
+                                      [dataclasses.field(default=default(entry))]))
+            for entry in terms()[name]], frozen=True)
 
-    class Sampling:
-        def __init__(self, **settings):
-            if unknown := sorted(set(settings) - names):
-                raise TypeError(f"Sampling got unexpected keyword arguments {unknown}")
-            self.settings = settings
+    return {"CFG": built("CFG"), "Sampling": built("Sampling"),
+            **{name: type(name, (), {}) for name in terms()["solvers"]}}
 
-    solvers = {name: type(name, (), {}) for name in terms()["solvers"]}
-    return {"CFG": cfg, "Sampling": Sampling, **solvers}
+
+def solver_name(solver) -> str:
+    """The name the service runs `solver` by: one of the stand-ins' solvers (`stand_ins`), at its settings."""
+    named = {stand_ins()[name]: name for name in terms()["solvers"]}
+    if type(solver) not in named or vars(solver):
+        raise ValueError("the live sampler supports the displayed solvers with their default settings")
+    return named[type(solver)]
 
 
 @dataclass(frozen=True)
@@ -175,13 +192,11 @@ class Pipeline:
         prompts, solver, guidance = given["prompts"], given["solver"], given["guidance"]
         prepared = prompts if isinstance(prompts, Prepared) else self.prepare(prompts, key=given["key"],
                                                                               steps=given["steps"])
-        if solver is not None and (type(solver).__name__ not in terms()["solvers"] or vars(solver)):
-            raise ValueError("the live sampler supports the displayed solvers with their default settings")
         result = request({"op": "sample", "repo": self.repo, "revision": self.revision,
                           "prompt": prepared.prompt, "negative": prepared.negative,
                           "prepare_key": prepared.key, "prepare_steps": prepared.steps,
                           "key": given["key"], "steps": given["steps"],
-                          "solver": None if solver is None else {"name": type(solver).__name__, "args": {}},
+                          "solver": None if solver is None else {"name": solver_name(solver), "args": {}},
                           **({} if guidance is OMITTED else
                              {"guidance": guidance if guidance is None or isinstance(guidance, (int, float))
                               else dataclasses.asdict(guidance)})})
@@ -221,8 +236,11 @@ class Decoder:
 
     def text_generation(self, *args, **kwargs):
         sampling = bound("text_generation", {"sampling"}, *args, **kwargs)["sampling"]
+        kind = stand_ins()["Sampling"]
         greedy = ", ".join(f"{name}={value}" for name, value in terms()["greedy"].items())
-        if getattr(sampling, "settings", None) != terms()["greedy"]:
+        # The policy with every default spelled out, so naming a default changes nothing.
+        if type(sampling) is not kind or dataclasses.asdict(sampling) != dataclasses.asdict(
+                kind(**terms()["greedy"])):
             raise ValueError(f"the shared model process decodes greedily: sampling=Sampling({greedy})")
         return TextTask(self.name)
 
