@@ -50,7 +50,8 @@ DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek
             "mamba2-tiny")
 
 
-DECODER_SEEDS = {"float32": {"mixtral-tiny": 16}, "bfloat16": {"mixtral-tiny": 512, "deepseek-v3-tiny": 0}}
+DECODER_SEEDS = {"float32": {"mixtral-tiny": 16},
+                 "bfloat16": {"mixtral-tiny": 512, "deepseek-v3-tiny": 0}}
 """Each decoder's declared draws of ids against transformers' forward in the same precision (check 1),
 sized by `seeds_for` paired with Dew's logits on the CPU: 8 where a decoder is not named. DeepSeek V3's
 bfloat16 logits do not resolve within the 512-seed cap, a finding its site reports Inconclusive."""
