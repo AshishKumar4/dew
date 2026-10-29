@@ -30,7 +30,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#86b89027297c4ae692f149a8bdb2bb7006d22a0c
+  ARMADA: github:AshishKumar4/armada#95f06182db1b5bfe010339c7fad98665385bcc88
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -193,12 +193,14 @@ jobs:
     # A straggler at the end runs again (task.speculative). Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
-    # Every suite task runs on AMD EPYC 25/17 (task.cpu): armada replaces a
-    # container on another CPU model before it takes a task. Of 1,264 containers
-    # in the 16 runs before 2026-10-20 15:00, 1,025 landed on 25/17.
-    # Per-test median time ratios against 25/17 were 2.0 on 25/1 and 1.35 on
-    # 26/17. In dew-20261020144644-dceff433, the three tasks on 25/1 were
-    # the run's three slowest.
+    # Every suite task runs on AMD EPYC 25/17 or 26/17 (task.cpu): armada
+    # replaces a container on another CPU model before it takes a task, and a
+    # row is recorded, and reused, on the class it ran on. Of 1,264 containers
+    # in the 16 runs before 2026-10-20 15:00, 1,025 landed on 25/17; on
+    # 2026-10-29 the fleet gave 26/17 and 25/1 so often that runs pinned to
+    # 25/17 alone ended unplaced. Per-test median time ratios against 25/17
+    # were 2.0 on 25/1 and 1.35 on 26/17. In dew-20261020144644-dceff433, the
+    # three tasks on 25/1 were the run's three slowest.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
     # unreported each fail it. A commit armada already graded green, as one
@@ -337,7 +339,7 @@ jobs:
           elif [ "$checks" != "[]" ]; then
             echo "$checks" | $armada map --commit=${{ github.sha }} --items=- --size=medium \
               --pool="$(echo "$checks" | jq length)" --deadline=1800 $priority --label="$GITHUB_REF_NAME" \
-              --cpu="$(jq -r '.task.cpu | "\(.vendor)/\(.family)/\(.model)"' .armada.json)" \
+              --cpu="$(jq -r '[.task.cpu] | flatten | map("\(.vendor)/\(.family)/\(.model)") | join(",")' .armada.json)" \
               -- python3 tools/armada/ci.py release --python={python} --tests={tests} --requirement={release} \
               --out=/tmp/dew-release.json || failed=1
           fi

@@ -51,13 +51,8 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.batch import prefix_sum, real_places, valid_order
 from dew.mesh import LogicalAxes
-from dew.nn.attention import (
-    RMSNorm,
-    causal_attention_mask,
-    reference_attention,
-    unweighted_rmsnorm,
-    visibility_mask,
-)
+from dew.nn.attention import reference_attention
+from dew.nn.attention_masks import causal_attention_mask, visibility_mask
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
@@ -65,6 +60,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places
 from dew.nn.kv_cache import KVCache, KVStore, cache_positions, cached_validity, open_kv_cache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.mla import IndexerFront
+from dew.nn.norms import RMSNorm, unweighted_rmsnorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import LongRopeScaling, Scaling, rotary_freqs, rotate
 from dew.nn.scatter import gather_positions
@@ -530,7 +526,7 @@ class DeepseekV4Attention(FakeQuantizing):
 
     `compressor` is None, 'hca', 'csa' or V4.1's 'csa2', with `compress_rate`
     its window; CSA needs `index_n_heads`, `index_head_dim` and `index_topk`.
-    `rope_theta` and `rope_scaling` are the layer's rope (`MixerContext.rotary_scaling`), shared by
+    `rope_theta` and `rope_scaling` are the layer's rope (`MixerContext.rope_scaling`), shared by
     its compressor and indexer. Compressed windows follow the physical row, so packed documents
     are refused. For 'csa2', `kv_shared` makes a Reuse layer and `reindex` a
     Reindex one, else a Full layer; `candidates` 'source' builds the candidate
@@ -970,7 +966,7 @@ class DeepseekV4Mixer(MixerBase):
             raise ValueError("a deepseek_v4 layer attends a sliding window, not a chunk")
         if ctx.kv_shared and self.compressor != 'csa2':
             raise ValueError("of the deepseek_v4 kinds only CSA2 shares its entries across layers")
-        scaling = ctx.rotary_scaling()
+        scaling = ctx.rope_scaling
         if isinstance(scaling, LongRopeScaling):
             raise ValueError("a deepseek_v4 layer takes YaRN or Llama 3.1's ramp, not LongRoPE: LongRoPE "
                              "picks a call's factors by how far its tokens reach, which the compressed "

@@ -37,10 +37,10 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import valid_order
 
-from .attention import LayerNorm
 from .inputs import MixerCall, PredictionPhase, coordinates_of
 from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals
+from .norms import LayerNorm
 from .precision import at_least_fp32, float32_einsum
 from .sparse_selection import top_k_selection
 
@@ -350,8 +350,10 @@ class KPoolSparseAttentionMixer(MixerBase):
             **latent_refusals(ctx),
             "force_fp32_for_softmax": False,  # forwarded
             "kv_shared": ctx.kv_shared,
+            "sliding_window": ctx.sliding_window,
+            "attention_chunk": ctx.attention_chunk,
         }, "the layer scales by its nope head dim, rotates nothing, attends its own selection of the "
-           "whole sequence and norms its latents, not its values")
+           "whole sequence, no window or chunk of it, and norms its latents, not its values")
         return functools.partial(
             KPoolSparseAttention,
             emb_features=ctx.emb_features,

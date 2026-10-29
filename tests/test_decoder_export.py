@@ -136,6 +136,9 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # too: dew's gradient of the next-token cross entropy, written back into
 # the source's tensor layout, against the reference's `.grad`.
 GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
+# Every case runs each train since the export checks compile Dew's forward (ledgers 2182, 2278): GLM-5's
+# released standalone export, 173 s in train 279's CI before, is 99 s on armada at c937fc46a after; the
+# gradients and the cases reading GLM-5 Next's round trip 41-55 s.
 
 
 @pytest.fixture(scope="module")
@@ -1223,11 +1226,12 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
     written = json.loads((tmp_path / "config.json").read_text())
     assert written["index_share_for_mtp_iteration"] == model.index_share_for_mtp_iteration
     if model.num_nextn_predict_layers:
-        states = model.apply(variables, jnp.asarray(ids), method="hidden_states")
-        prediction = model.apply(variables, states, jnp.asarray(ids), method="mtp_logits")[0]
-        reloaded_states = restored.model.apply(restored.variables, jnp.asarray(ids), method="hidden_states")
-        reloaded_prediction = restored.model.apply(
-            restored.variables, reloaded_states, jnp.asarray(ids), method="mtp_logits")[0]
+        # Each forward compiled once, as a user runs it, not op by op.
+        def depths(model, variables):
+            states = model.apply(variables, jnp.asarray(ids), method="hidden_states")
+            return model.apply(variables, states, jnp.asarray(ids), method="mtp_logits")[0]
+        prediction = jax.jit(functools.partial(depths, model))(variables)
+        reloaded_prediction = jax.jit(functools.partial(depths, restored.model))(restored.variables)
         np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
         np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
                                    prediction, atol=LOGITS, rtol=0)
@@ -1251,11 +1255,13 @@ def assert_same_tensors(written: dict, expected: dict) -> None:
         assert written[tensor].dtype == value.dtype and np.array_equal(written[tensor], value), tensor
 
 
-@pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny"])
+@pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny", "glm5-next-tiny"])
 def test_a_moe_decoder_saves_every_tensor_its_source_holds(name, tmp_path):
     """A causal MoE decoder saved in its source's layout writes every tensor the source checkpoint
     holds, each expert's projections split from their stacked kernel and DeepSeek V3's balancing
-    bias from the `moe` collection, bit for bit, and its config keeps `use_cache`."""
+    bias from the `moe` collection, bit for bit, and its config keeps `use_cache`. GLM-5 Next's is the
+    source-layout route its trained round trip exports by, every train while that runs in the whole
+    suite alone (`WHOLE_SUITE`)."""
     loaded = Pretrained.load(FIXTURES / name, dtype="float32", param_dtype="auto", attention_impl="xla")
     loaded.save(tmp_path)
     assert_same_tensors(written_tensors(tmp_path), written_tensors(FIXTURES / name))

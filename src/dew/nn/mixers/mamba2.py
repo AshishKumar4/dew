@@ -59,7 +59,6 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused
-from dew.nn.attention import repeat_kv_heads, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
@@ -71,6 +70,7 @@ from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, sequence_conv
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
+from dew.nn.norms import unweighted_rmsnorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
 from dew.nn.sharding import logical_axes, sequence_shards
 
@@ -108,30 +108,29 @@ SSD = Hooks(decay='scalar', rated=True, delta=False, skip=True)
 
 def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     """One token at a time, `mamba2_selective_state_update`
-    (modeling_mamba2.py:192-251) as a scan over time, in fp32 (the input's
-    own dtype where it is wider). Operands and results as `chunk_ssd`'s; a
-    token `starts` marks sees a zero state."""
+    (modeling_mamba2.py:192-251) as a scan over time, each token the shared
+    recurrence's decode step (`recurrence.step_reference` under `SSD`), in fp32
+    (the input's own dtype where it is wider). Operands and results as
+    `chunk_ssd`'s; a token `starts` marks sees a zero state."""
     work = at_least_fp32(jnp.result_type(x, B, C))
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, heads, head_dim = x.shape
-    # The `H // G` heads of one group read the same B and C, the reference's `repeat_interleave`.
-    B, C = repeat_kv_heads(B, heads), repeat_kv_heads(C, heads)
     if state is None:
         state = jnp.zeros((batch, heads, head_dim, B.shape[-1]), work)
     if starts is None:
         starts = jnp.zeros((batch, length), jnp.bool_)
 
     def one_token(s, step):
-        x_t, dt_t, B_t, C_t, start = step                   # [B, H, P], [B, H], [B, H, N], [B]
-        # The decode step's update without the delta rule (`recurrence.update`): `C` the query, `B` the
-        # key, `x` the value and `dt` the write, over the memory `[N, P]`; a document's first token
-        # decays the memory it enters to zero.
-        decay = jnp.where(start[:, None], 0.0, jnp.exp(dt_t * A))
-        read, s = recurrence.update(s, C_t, B_t, x_t, jnp.broadcast_to(decay[..., None], B_t.shape),
-                                    dt_t[..., None], delta=False)
-        return s, read + x_t * D[None, :, None]
+        x_t, dt_t, B_t, C_t, start = step                   # [B, H, P], [B, H], [B, G, N], [B]
+        # `C` the query, `B` the key (a group's heads reading it, the template's prologue), `x` the
+        # value, `dt` the write and `A dt` the log decay (`Hooks.rated`), `D` the skip; a document's
+        # first token enters a zero memory.
+        s = jnp.where(start[:, None, None, None], jnp.zeros((), s.dtype), s)
+        out, _, s = recurrence.step_reference(SSD, recurrence.Step(
+            state=s, query=C_t, key=B_t, value=x_t, beta=dt_t, rate=A, skip=D), dtype=work)
+        return s, out
 
-    # The SSD's memory is `[P, N]`, values by keys: the update's `[N, P]` transposed.
+    # The SSD's memory is `[P, N]`, values by keys: the step's `[N, P]` transposed.
     final, out = jax.lax.scan(
         one_token, jnp.swapaxes(jnp.asarray(state, work), -1, -2),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))

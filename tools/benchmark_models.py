@@ -317,9 +317,10 @@ def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> Model
                        {"pixel_values": pixels.astype(np.float32)})
 
 
-def global_batch(case: Case) -> Batch:
-    """The case's whole batch, drawn the same on every process."""
-    rng = np.random.default_rng(0)
+def global_batch(case: Case, seed: int = 0) -> Batch:
+    """The case's whole batch, drawn the same on every process: draw `seed` of it, seed 0 the one a
+    benchmark runs."""
+    rng = np.random.default_rng(seed)
     batch: Batch = {}
     if case.is_lm:
         vocab = case.config["vocab_size"]

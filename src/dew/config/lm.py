@@ -90,7 +90,7 @@ class LMRunConfig(DecoderRunConfig):
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")
 
-    def prepare(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The objective this run names over its token files.
 
         The files decide the vocabulary; training and sampling decide the
@@ -216,7 +216,7 @@ class LMRunConfig(DecoderRunConfig):
         dtype = resolve_dtype(self.model.fields.get("dtype"))
         loaded = Pretrained.load(reference.name, dtype=jnp.bfloat16 if dtype is None else dtype,
                                  param_dtype=self.pretrained_param_dtype,
-                                 attention_impl=str(self.model.fields.get("attention_impl", "auto")),
+                                 attention_impl=self.source_attention(),
                                  max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
                                  **self.source_keywords(frozen=self.lora is not None))

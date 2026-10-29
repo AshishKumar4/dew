@@ -54,7 +54,7 @@ from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import NATURAL, capped, kernel_dot, prescaled
+from .templates.attention import capped, kernel_dot, prescaled
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -124,20 +124,19 @@ over an `AttentionCase`): a GPU Dew's Triton kernels run on, at most `QUERIES` p
 power-of-two width from 16 to 256, a capacity of whole blocks and one of its dtypes on both sides."""
 
 
-def _spec(scale: float, power: float, softcap: float | None, natural: bool, dtype, sinks: bool
+def _spec(scale: float, power: float, softcap: float | None, natural: bool | None, dtype, sinks: bool
           ) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
-    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and in
-    either form whether a row's sums of `dtype` values need a guard (`algebra.headroom`) and keep their
-    additions' rounding (`algebra.compensates`). fp32 keeps natural logits even in the default form:
-    rounding an edge logit's base-2 conversion before exp2 moves its normal weight by several ppm,
-    which a large value carries into the output (ledger 2151). Lower-precision operands keep their
-    existing form. A decode
+    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`; None:
+    natural for fp32 operands, whose edge logit's base-2 conversion rounded before exp2 moves its normal
+    weight by several ppm, which a large value carries into the output, ledger 2151), and in either form
+    whether a row's sums of `dtype` values need a guard (`algebra.headroom`) and keep their additions'
+    rounding (`algebra.compensates`). A decode
     block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(capped, softcap),
-                           natural=natural or jnp.dtype(dtype) == jnp.float32,
+                           natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
                            headroom=algebra.headroom(dtype), initial=sinks,
                            compensated=algebra.compensates(dtype), prescale=power)
 
@@ -336,7 +335,7 @@ class DecodeAttention(tuning.KernelOp):
 
     def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, spans: jax.Array,
              sinks: jax.Array | None = None, *, interpret: bool, softcap: float | None = None,
-             natural: bool = NATURAL, config: Split, return_residuals: bool = False):
+             natural: bool | None = None, config: Split, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         batch, _, heads, width = query.shape
@@ -403,7 +402,7 @@ class PagedDecodeAttention(tuning.KernelOp):
 
     def _fwd(self, query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
              spans: jax.Array, sinks: jax.Array | None = None, *, interpret: bool,
-             softcap: float | None = None, natural: bool = NATURAL, config: Split,
+             softcap: float | None = None, natural: bool | None = None, config: Split,
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
@@ -491,7 +490,7 @@ def grouped_query(attend, query, key, value):
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array, starts=None, *,
-           softcap: float | None = None, sinks: jax.Array | None = None, natural: bool = NATURAL,
+           softcap: float | None = None, sinks: jax.Array | None = None, natural: bool | None = None,
            interpret: bool = False) -> jax.Array:
     """Attention of `query` `[B, T, N, D]` over the keys from `starts` `[B]`
     (0 where None) to `lengths` `[B]` of `key` and `value` `[B, S, K, D]`, a
@@ -502,7 +501,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
     the call's positions times its group are at most `QUERIES`. A `softcap`
     bounds the scaled logits (`softcap · tanh(logit / softcap)`, Gemma 2's);
     `sinks` `[N]` put one value-free logit a head in each row's softmax;
-    `natural` keeps the logits natural (`algebra.Forward.base2`). Its
+    `natural` keeps the logits natural (`algebra.Forward.base2`; None: for fp32 operands alone, `_spec`). Its
     Pallas call has no derivative: `dew.nn.attention` differentiates it as the
     attention it stands in for. A cache of no keys gives the empty result
     (`_empty`), no launch."""
@@ -552,7 +551,7 @@ selector's GPU kernel declares (`dew.nn.kv_cache.TRITON_PAGED_SUPPORTS`)."""
 
 def attend_paged(query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
                  lengths: jax.Array, starts=None, *, softcap: float | None = None,
-                 sinks: jax.Array | None = None, natural: bool = NATURAL,
+                 sinks: jax.Array | None = None, natural: bool | None = None,
                  interpret: bool = False) -> jax.Array:
     """Attention of one query a row `[rows, heads, D]` over the keys from
     `starts` `[rows]` (0 where None) to `lengths` `[rows]` of that row's pages,

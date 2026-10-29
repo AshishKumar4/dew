@@ -248,6 +248,23 @@ def packed_row():
     return jnp.asarray(ids), jnp.asarray(segments), jnp.asarray(positions)
 
 
+def test_the_depths_read_a_packed_rows_coordinates_as_its_fields():
+    """The prediction depths' logits (`mtp_logits`) take the rows' layout as `Coordinates` as they take
+    it as flat fields, the same logits bit for bit: the call converts its fields once
+    (`token_coordinates`) and the depths read the coordinates alone (ledger 1122)."""
+    model = tiny(num_nextn_predict_layers=2)
+    ids, segments, positions = packed_row()
+    variables = model.init(jax.random.key(0), ids)
+    hidden = jax.random.normal(jax.random.key(1), (*ids.shape, model.emb_features))
+    laid = coordinates(segments=segments, positions=positions)
+    by_fields = model.apply(variables, hidden, ids, segment_ids=segments, positions=positions,
+                            method=CausalTransformer.mtp_logits)
+    by_coordinates = model.apply(variables, hidden, ids, coordinates=laid,
+                                 method=CausalTransformer.mtp_logits)
+    for ours, reference in zip(by_coordinates, by_fields, strict=True):
+        np.testing.assert_array_equal(ours, reference)
+
+
 @pytest.mark.parametrize("depths", [1, 2])
 def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     """Coordinates may ride the `ModelInputs` instead of beside the batch's

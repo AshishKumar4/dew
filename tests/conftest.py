@@ -36,6 +36,13 @@ else:
         if os.environ.get("PYTEST_XDIST_WORKER") and os.environ.get("DEW_XLA_CACHE_URL"):
             _cache = os.path.join(_cache, os.environ["PYTEST_XDIST_WORKER"])
         enable_compilation_cache(_cache)
+        # The processes its tests start (a checker run as a script, a CLI) compile into the same cache under
+        # the same settings, so their programs reach the shared bundles below and their next run is warm
+        # (2026-10-29, row 2323: tools/check_native_diffusion.py compiled cold each run, 139.6 s
+        # against 43.3 s warm), as JAX's own switch reaches them under DEW_TEST_NO_CACHE.
+        for _name in ("jax_compilation_cache_dir", "jax_persistent_cache_min_compile_time_secs",
+                      "jax_persistent_cache_min_entry_size_bytes", "jax_persistent_cache_enable_xla_caches"):
+            os.environ[_name.upper()] = str(getattr(jax.config, _name))
         # On armada, where each task's container starts cold, a cache the tasks share.
         _remote = remote_cache.install_from_environment()
 

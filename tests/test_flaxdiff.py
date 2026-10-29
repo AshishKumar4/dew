@@ -192,10 +192,12 @@ def test_a_flaxdiff_run_dew_does_not_read_is_refused_before_its_weights(run, tmp
 
 
 def test_a_2024_aggregate_checkpoint_is_refused(tmp_path):
-    """FlaxDiff's 2024 aggregate checkpoint, one default/checkpoint file, is refused by its layout rather
-    than read as a later step."""
+    """FlaxDiff's 2024 aggregate checkpoint, one default/checkpoint file, given to the loader a user calls
+    with a run Dew reads, is refused by its layout rather than read as a later step."""
+    from dew.inference import TextToImage
+
     step = tmp_path / "1" / "default"
     step.mkdir(parents=True)
     (step / "checkpoint").write_bytes(b"\x80")
     with pytest.raises(ValueError):
-        read_checkpoint(tmp_path / "1")
+        TextToImage.from_flaxdiff(tmp_path / "1", flaxdiff_run(), jax_version="0.5.3")

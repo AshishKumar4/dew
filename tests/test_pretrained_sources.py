@@ -88,8 +88,8 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
     record = hf_decoders.translate_config(released)
     expected, attention_factor = ROPE_INIT_FUNCTIONS["yarn"](Qwen3Config.from_dict(released), None)
 
-    scaling = YarnScaling(**record["yarn"])
-    assert record["yarn"]["factor"] == 4.0 and record["yarn"]["original_max_position_embeddings"] == 32768
+    scaling = YarnScaling(**record["rope_scaling"])
+    assert scaling.factor == 4.0 and scaling.original_max_position_embeddings == 32768
     assert (
         np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy()))
         < 1e-7
@@ -123,7 +123,7 @@ task = dew.pipeline(sys.argv[1], dtype="bfloat16", param_dtype="auto")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from dew.nn.attention import RMSNorm
+from dew.nn.norms import RMSNorm
 a = jax.random.normal(jax.random.key(0), (512, 64), jnp.bfloat16)
 b = (jax.random.normal(jax.random.key(1), (512, 64)) * 0.37).astype(jnp.bfloat16)
 norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
@@ -172,7 +172,7 @@ else:
             return jnp.sum(variables["params"]["w"] ** 2), Aux({})
     trainer = Trainer(Probe(), optax.sgd(0.1), key=0)
     trainer.initial_state()
-from dew.nn.attention import RMSNorm
+from dew.nn.norms import RMSNorm
 a = jax.random.normal(jax.random.key(0), (512,64), jnp.bfloat16)
 b = (jax.random.normal(jax.random.key(1), (512,64)) * 0.37).astype(jnp.bfloat16)
 norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)

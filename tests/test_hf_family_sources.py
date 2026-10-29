@@ -20,7 +20,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import assert_pads_as, clearing_selections, token_draw, token_table, torch_logits
+from interop_support import (
+    assert_pads_as,
+    clearing_selections,
+    respelled,
+    token_draw,
+    token_table,
+    torch_logits,
+)
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
@@ -175,11 +182,14 @@ def test_a_yarn_record_extends_every_family_whose_source_builds_it(name, tmp_pat
     """The family's reader takes a YaRN record onto its rotated layers, and its logits over drawn ids
     past the original context hold check 1 against the source's."""
 
+    from dew.nn.rope import YarnScaling
+
     config = _fixture_config(name)
     directory = _source(name, tmp_path / name, **_yarned(config))
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     model = loaded.model
-    assert model.yarn is not None or any(kind.yarn is not None for kind in (model.kinds or {}).values())
+    assert any(isinstance(scaling, YarnScaling) for scaling in
+               (model.rope_scaling, *(kind.rope_scaling for kind in (model.kinds or {}).values())))
     reference, wide = _reference(directory)
     forward = jax.jit(model.apply)
 
@@ -360,11 +370,9 @@ def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path)
 
     from tools.torch_precision import float64_twin
 
-    directory = shutil.copytree(FIXTURES / WRAPPER, tmp_path / WRAPPER)
-    config = json.loads((directory / "config.json").read_text())
-    text = config["text_config"]
-    text.update(rope_parameters={**text["rope_parameters"], **YARN}, max_position_embeddings=CONTEXT)
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURES / WRAPPER, tmp_path / WRAPPER, lambda config: {
+        **config, "text_config": {**config["text_config"], "max_position_embeddings": CONTEXT,
+                                  "rope_parameters": {**config["text_config"]["rope_parameters"], **YARN}}})
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     assert loaded.processor is not None
 
@@ -379,6 +387,7 @@ def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path)
     pixels = np.load(directory / "pixel_values.npy").shape
     valid = held["attention_mask"].astype(bool)
     # The text a prompt holds, below the image and vision marker ids.
+    config = json.loads((directory / "config.json").read_text())
     words = valid & (held["input_ids"] < config["image_token_id"])
 
     def draw(seed):
