@@ -280,7 +280,7 @@ SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'voc
          'column orders': 32, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
          'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
          'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 256, 'bf16 cotangent': 256,
-         'whole logits': 512}
+         'whole logits': 512, 'projected head': 32, 'projected fused head': 32}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on each platform the site
 runs on, the most any of its cases took: on armada, and paired (Dew's arm as `dew_fn`) on an A100 under
 JAX 0.12 for 'bf16 cotangent', 256 at the first tile, and for 'gemma', which runs on a GPU alone, 256 at
@@ -1601,3 +1601,64 @@ def test_a_vocabulary_split_heads_unconfident_target_gradient_is_on_par_with_aut
     with jax.default_matmul_precision("highest"):
         seeds = seeds_for(reference, draw, label, dew_fn=split)
         assert_as_exact(split, reference, draw, label, seeds=seeds)
+
+
+PROJECTED = CausalTransformer(vocab_size=97, emb_features=32, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=8, embedding_features=16, qk_norm=False, attention_impl='reference')
+"""A decoder whose embedding has a width of its own (OPT-350m's `word_embed_proj_dim`): its final states
+reach the vocabulary matrix through `project_out` (`OutputTable.projection`)."""
+
+
+@pytest.mark.parametrize('fused', [False, True], ids=['tiled', 'fused'])
+def test_a_projected_head_is_scored_as_one_matrix_as_its_exact_head_scores(fused):
+    """A projected head is read as one matrix (`output_table`), its states projected once by the read
+    (`OutputTable.states`), and scored in tiles (`head_cross_entropy`) or fused (`fused_head_loss`): the
+    per-token cross entropies, or their sum, and its gradient in the model's parameters (`project_out`'s
+    and the table's) and in the final states are on par with the exact head's whole logits
+    (`logits_from_hidden`), check 1 with that head in float64 the truth."""
+    ids = jnp.asarray([[2, 7, 3, 5], [11, 4, 9, 1]], jnp.int32)
+    variables = PROJECTED.init(jax.random.key(0), ids)
+    shape = PROJECTED.apply(variables, ids, method='hidden_states').shape
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(8), seed))
+        return (variables['params'], jax.random.normal(keys[0], shape),
+                jax.random.randint(keys[1], ids.shape, 0, 97))
+
+    def scored(loss, model=PROJECTED):
+        def run(params, states, targets):
+            def total(params, states):
+                return jnp.sum(loss(model, {**variables, 'params': params}, states, targets))
+            value = loss(model, {**variables, 'params': params}, states, targets)
+            return value, jax.grad(total, argnums=(0, 1))(params, states)
+        return run
+
+    def tiled(model, variables, states, targets):
+        if fused:
+            table = chunked.head_table(model, variables)
+            weights = jnp.ones(targets.shape, states.dtype)
+            return fused_head_loss(states, table, targets, weights, tile=(3, 11))[0]
+        return chunked.head_cross_entropy(model, variables, states, targets, 4, tile=(3, 11))[0]
+
+    def exact(model, variables, states, targets):
+        logits = model.apply(variables, states, method='logits_from_hidden')
+        losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+        return jnp.sum(losses) if fused else losses
+
+    @as_given
+    def truth(params, states, targets):
+        with jax.enable_x64(new_val=True):
+            wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), (params, states))
+            return jax.device_get(scored(exact, PROJECTED.clone(dtype=jnp.float64))(*wide, targets))
+
+    def highest(run):
+        def held(*inputs):
+            with jax.default_matmul_precision('highest'):
+                return run(*inputs)
+        return held
+
+    assert chunked.head_table(PROJECTED, variables).projection is not None
+    label = 'projected fused head' if fused else 'projected head'
+    assert_as_exact(jax.jit(highest(scored(tiled))), jax.jit(highest(scored(exact))), draw, label,
+                    seeds=SEEDS[label], truth_fn=truth)
+

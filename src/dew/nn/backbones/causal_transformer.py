@@ -97,7 +97,7 @@ from ..precision import (
     scaled,
     scaled_logits,
 )
-from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
+from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
 from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
 from .decoder_block import (
@@ -1316,8 +1316,7 @@ class CausalTransformer(nn.Module):
         # The head's own inputs: `lm_head`'s, and `project_out`'s before it past an embedding's own width.
         heads = [*([] if self.tie_embeddings else [self.lm_head]), *([] if self.embedding_features is None
                                                                   else [self.project_out])]
-        quantized = (isinstance(self, QuantizesInputs)
-                     and any(self.input_quantizer(head) is not None for head in heads))
+        quantized = any(self._quantizer(head) is not None for head in heads)
         return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
                 and not quantized)
 
@@ -2136,14 +2135,16 @@ class CausalTransformer(nn.Module):
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
         the parameter itself, with `_logits`'s scale, bias, softcap and precision, the compute dtype
-        its product follows and a checkpoint's quantizer of its input.
-        None where no matrix alone is the head: past a `head_transform`, a continuum level or an
-        embedding's own width (`project_out`), or where `lm_head`'s parameters are not its kernel
-        alone: `dew.lora`'s factors beside it, which its interceptor adds, or no kernel at all, a
-        frozen FP8 head's, whose codes its FP8 product reads instead."""
-        head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
+        its product follows and a checkpoint's quantizer of its input, and past an embedding's own
+        width `project_out` as the states' `Projection`.
+        None where no matrix alone is the head: past a `head_transform` or a continuum level, or where
+        `lm_head`'s or `project_out`'s parameters are not its kernel alone: `dew.lora`'s factors
+        beside it, which its interceptor adds, or no kernel at all, a frozen FP8 layer's, whose codes
+        its FP8 product reads instead."""
+        layers = [*([] if self.tie_embeddings else [self.lm_head]),
+                  *([] if self.embedding_features is None else [self.project_out])]
         if (self.head_transform is not None or self.continuum is not None
-                or self.embedding_features is not None or (head is not None and set(head) != {"kernel"})):
+                or any(set(layer.variables.get("params", {})) != {"kernel"} for layer in layers)):
             return None
         return self._head_table()
 
@@ -2156,16 +2157,23 @@ class CausalTransformer(nn.Module):
             return rows
         return rows @ self.applied_kernel("project_out").T.astype(rows.dtype)
 
+    def _quantizer(self, layer: nn.Module):
+        """A checkpoint's quantizer of `layer`'s input, None where the model computes under none."""
+        return self.input_quantizer(layer) if isinstance(self, QuantizesInputs) else None
+
     def _head_table(self) -> OutputTable:
         """The head's matrix, as `lm_head`'s call multiplies by it (`applied_kernel`) or the tied
         embeddings, with `_logits`'s scale, bias, softcap and precision, the compute dtype its
-        product follows and a checkpoint's quantizer of its input."""
+        product follows and a checkpoint's quantizer of its input, past an embedding's own width
+        reached through `project_out` as its call multiplies (`Projection`)."""
         matrix = self.embed_tokens.embedding if self.tie_embeddings else self.applied_kernel("lm_head")
-        quantizer = (self.input_quantizer(self.lm_head)
-                     if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
+        projection = None if self.embedding_features is None else Projection(
+            self.applied_kernel("project_out"), self.precision, compute=self.dtype,
+            input_quantizer=self._quantizer(self.project_out))
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
                            self.final_logit_softcap, self.precision, compute=self.dtype,
-                           input_quantizer=quantizer, scale=self._token_gains())
+                           input_quantizer=None if self.tie_embeddings else self._quantizer(self.lm_head),
+                           scale=self._token_gains(), projection=projection)
 
     def applied_kernel(self, name: str) -> jax.Array:
         """The kernel the submodule `name` multiplies its input by on this call: its own. A method
