@@ -47,8 +47,10 @@ built and run in float64 on the CPU under tools/torch_precision.py's
 call boundaries by fla's own torch references (tools/fla_float64.py), which
 tests/test_kimi_k3.py measures Dew and the reference from: the logits, the
 loss, the logits after one SGD step at the stored learning rate, and the
-greedy decode's step logits teacher-forced. `symmetric DRAWN` checks that
-tools/rounding_orders.py's residual orders are a symmetry of that truth.
+greedy decode's step logits teacher-forced. It runs on a CPU, in the same
+environment with torch 2.8.0's CPU build and triton 3.4.0 (fla imports it).
+`symmetric DRAWN` checks that tools/rounding_orders.py's residual orders are
+a symmetry of that truth.
 """
 
 import copy
