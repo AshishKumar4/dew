@@ -595,23 +595,33 @@ def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
 
 
 def test_a_judges_draws_ahead_keep_every_pending_draw_and_only_the_window():
-    """A judge's draws ahead are held in the order they were last asked for: a second layout restarting
-    its draws at 0 finds the first layout's pairs still held, so nothing it submitted is dropped and
-    drawn again, and past twice `AHEAD` finished pairs only are let go (ledgers 2166, 2167)."""
+    """A judge's draws ahead are held in the order they were last asked for and let go only once
+    finished: while every draw is still pending, asking past twice `AHEAD` drops none, so each later
+    read waits on the draw already submitted rather than drawing it again, and a later layout restarting
+    at draw 0 finds it held (ledgers 2166, 2167)."""
+    import threading
+
     tool = load("layout_parity")
     _, reference = tool.model_case("jepa", "float32", {}, {})
     with jax.enable_x64(new_val=True):
         judge = tool.Judge(reference, tool.References(), "jepa")
-        drawn = []
-        judge._drawn_reference = (lambda draw: lambda seed: drawn.append(seed) or draw(seed))(
-            judge._drawn_reference)
-        for _ in range(2):  # two layouts, each from draw 0
-            for seed in range(judge.AHEAD):
-                judge.ahead(seed)
-                judge.reference(seed)
-        # The second layout's reads find the first layout's draws: none is drawn twice.
-        assert len(drawn) == len(set(drawn)) and set(range(judge.AHEAD)) <= set(drawn), sorted(drawn)
-        assert len(judge._ahead) <= 3 * judge.AHEAD + 1
+        released, drawn = threading.Event(), []
+
+        def held(seed, draw=judge._drawn_reference):
+            drawn.append(seed)
+            released.wait()
+            return draw(seed)
+
+        judge._drawn_reference = held
+        for seed in range(0, 3 * judge.AHEAD, judge.AHEAD):
+            judge.ahead(seed)  # every draw submitted is still pending
+        submitted = dict(judge._ahead)
+        judge.ahead(0)  # a later layout restarting at draw 0
+        assert all(judge._ahead.get(at) is pair for at, pair in submitted.items()), sorted(judge._ahead)
+        released.set()
+        for seed in range(3 * judge.AHEAD):
+            judge.reference(seed)
+        assert len(drawn) == len(set(drawn)), sorted(drawn)
 
 
 def test_layout_parity_fails_a_run_with_an_inconclusive_row():
