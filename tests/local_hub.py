@@ -1,9 +1,10 @@
 """A Hugging Face Hub on the loopback, for tests at the Hub's boundary without the network: it serves
-repos of local files, each at one commit, over the HTTP routes `huggingface_hub` calls (a listing of its
-models, a repo's info, its tree, a file's metadata and its bytes, a range of them as a safetensors header
-read asks), and keeps every request it answers, a missing repo's or file's too (`LocalHub.served`), so a
-test counts what a load fetched. A process reaches it through `HF_ENDPOINT` (`LocalHub.endpoint`), which
-`huggingface_hub` reads when it is imported."""
+repos of local files, each at one commit, and their open pull requests, each its own files at its own
+commit on the repo's, over the HTTP routes `huggingface_hub` calls (a listing of its models, a repo's info
+at a revision, its tree, a file's metadata and its bytes, a range of them as a safetensors header read
+asks, a repo's discussions and a revision's commits), and keeps every request it answers, a missing repo's
+or file's too (`LocalHub.served`), so a test counts what a load fetched. A process reaches it through
+`HF_ENDPOINT` (`LocalHub.endpoint`), which `huggingface_hub` reads when it is imported."""
 
 import hashlib
 import json
@@ -29,12 +30,25 @@ class Served:
     sent: int
 
 
+@dataclass(frozen=True)
+class Pull:
+    """An open pull request on a repo: its title, its author's name and its files, which the Hub serves at
+    its ref `refs/pr/<num>` and its own commit, whose parent is the repo's commit."""
+
+    title: str
+    author: str
+    files: Mapping[str, Path]
+
+
 class LocalHub:
     """`repos` (a repo id to its files, by repo-relative name) served on the loopback while the hub is
-    entered, each repo at the commit its files hash to (`commit`)."""
+    entered, each repo at the commit its files hash to (`commit`), and `pulls` (a repo id to its open pull
+    requests by number), each at its own commit (`pull_commit`)."""
 
-    def __init__(self, repos: Mapping[str, Mapping[str, Path]]):
+    def __init__(self, repos: Mapping[str, Mapping[str, Path]],
+                 pulls: Mapping[str, Mapping[int, Pull]] | None = None):
         self.repos = {repo: dict(files) for repo, files in repos.items()}
+        self.pulls = {repo: dict(held) for repo, held in (pulls or {}).items()}
         self.served: list[Served] = []
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(self))
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -55,10 +69,19 @@ class LocalHub:
 
     def commit(self, repo: str) -> str:
         """`repo`'s commit: a hash of its files' names and bytes."""
-        digest = hashlib.sha1()
-        for name, path in sorted(self.repos[repo].items()):
-            digest.update(name.encode() + b"\0" + path.read_bytes())
-        return digest.hexdigest()
+        return _hashed(self.repos[repo])
+
+    def pull_commit(self, repo: str, num: int) -> str:
+        """Pull request `num`'s commit on `repo`: a hash of its files and of the commit it sits on."""
+        return _hashed(self.pulls[repo][num].files, self.commit(repo))
+
+    def at(self, repo: str, revision: str | None) -> tuple[Mapping[str, Path], str]:
+        """`repo`'s files and commit at `revision`: a pull request's at its ref or its commit, else the
+        repo's own, whatever else the revision names."""
+        for num in self.pulls.get(repo, {}):
+            if revision in (f"refs/pr/{num}", self.pull_commit(repo, num)):
+                return self.pulls[repo][num].files, self.pull_commit(repo, num)
+        return self.repos[repo], self.commit(repo)
 
     def sent(self, repo: str, file: str) -> list[Served]:
         """The requests that sent bytes of `repo`'s `file` (a repo-relative name)."""
@@ -70,7 +93,19 @@ _LISTING = "/api/models"
 _API = re.compile(r"/api/models/(?P<repo>[^/]+/[^/]+)(?:/revision/(?P<revision>[^/]+)"
                   r"|/tree/(?P<tree>[^/]+)(?:/(?P<folder>.+))?)?")
 _FILE = re.compile(r"/(?P<repo>[^/]+/[^/]+)/resolve/(?P<revision>[^/]+)/(?P<file>.+)")
+_DISCUSSIONS = re.compile(r"/api/models/(?P<repo>[^/]+/[^/]+)/discussions")
+_COMMITS = re.compile(r"/api/models/(?P<repo>[^/]+/[^/]+)/commits/(?P<revision>[^/]+)")
 _RANGE = re.compile(r"bytes=(\d+)-(\d*)")
+_DATE = "2024-01-01T00:00:00.000Z"
+"""The date every discussion and commit states."""
+
+
+def _hashed(files: Mapping[str, Path], parent: str = "") -> str:
+    """A commit's hash: its files' names and bytes, after its parent's."""
+    digest = hashlib.sha1(parent.encode())
+    for name, path in sorted(files.items()):
+        digest.update(name.encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()
 
 
 def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
@@ -90,6 +125,10 @@ def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
         def _answer(self, *, head: bool) -> None:
             address = urlsplit(self.path)
             path = unquote(address.path)
+            # A revision names a pull request's ref with its slashes quoted: the routes match the path as
+            # sent, and each part is read unquoted.
+            if self._pulls(address.path, head=head):
+                return
             if path == _LISTING:
                 # Every repo, whatever the listing filters, each with the fields `expand` asks, as the Hub
                 # states a commit and downloads only where asked.
@@ -100,18 +139,19 @@ def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
                              **({"downloads": 0} if "downloads" in expand else {})} for repo in hub.repos],
                            head=head)
                 return
-            api, file = _API.fullmatch(path), _FILE.fullmatch(path)
+            api, file = _API.fullmatch(address.path), _FILE.fullmatch(address.path)
             match = api or file
             if match is None or match["repo"] not in hub.repos:
                 hub.served.append(Served(self.command, None if match is None else match["repo"],
-                                         None if file is None else file["file"], None, 0))
+                                         None if file is None else unquote(file["file"]), None, 0))
                 self._missing("RepoNotFound", head=head)
                 return
             repo = match["repo"]
-            files, commit = hub.repos[repo], hub.commit(repo)
+            revision = (api["tree"] if api is not None and api["tree"] is not None else match["revision"])
+            files, commit = hub.at(repo, None if revision is None else unquote(revision))
             if api is not None:
                 hub.served.append(Served(self.command, repo, None, None, 0))
-                folder = (api["folder"] or "").rstrip("/")
+                folder = unquote(api["folder"] or "").rstrip("/")
                 if api["tree"] is None:
                     self._json({"id": repo, "modelId": repo, "sha": commit, "private": False,
                                 "siblings": [{"rfilename": name} for name in sorted(files)]}, head=head)
@@ -123,7 +163,7 @@ def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
                                 for name in sorted(files) if name.startswith(f"{folder}/" if folder else "")],
                                head=head)
                 return
-            name = file["file"]
+            name = unquote(file["file"])
             if name not in files:
                 hub.served.append(Served(self.command, repo, name, None, 0))
                 self._missing("EntryNotFound", head=head, commit=commit)
@@ -144,6 +184,31 @@ def _handler(hub: LocalHub) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             if not head:
                 self.wfile.write(sent)
+
+        def _pulls(self, sent: str, *, head: bool) -> bool:
+            """Answer a repo's discussions (its open pull requests) or a revision's commits, the revision's
+            and the one a pull request sits on; False for any other route."""
+            discussions, commits = _DISCUSSIONS.fullmatch(sent), _COMMITS.fullmatch(sent)
+            match = discussions or commits
+            if match is None or match["repo"] not in hub.repos:
+                return False
+            repo = match["repo"]
+            hub.served.append(Served(self.command, repo, None, None, 0))
+            pulls = hub.pulls.get(repo, {})
+            if discussions is not None:
+                # Filtered by author where the request names one, as the Hub filters them.
+                author = parse_qs(urlsplit(self.path).query).get("author")
+                listed = [{"num": num, "title": pull.title, "status": "open", "author": {"name": pull.author},
+                           "createdAt": _DATE, "repo": {"name": repo, "type": "model"}, "isPullRequest": True}
+                          for num, pull in sorted(pulls.items()) if author is None or pull.author in author]
+                self._json({"discussions": listed, "count": len(listed), "start": 0, "numItems": len(listed)},
+                           head=head)
+                return True
+            _, commit = hub.at(repo, unquote(commits["revision"]))
+            history = [commit] + ([hub.commit(repo)] if commit != hub.commit(repo) else [])
+            self._json([{"id": sha, "title": "", "message": "", "authors": [], "date": _DATE}
+                        for sha in history], head=head)
+            return True
 
         def _json(self, value, *, head: bool) -> None:
             body = json.dumps(value).encode()
