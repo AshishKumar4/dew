@@ -220,6 +220,29 @@ def test_a_held_prefetcher_places_no_batch_until_its_hold_ends():
     assert seen == [0.0, 1.0, 2.0]
 
 
+def test_a_prefetcher_closed_while_held_stops_its_worker():
+    """Closing a prefetcher inside a hold stops its worker, which waits out the hold with a batch it read
+    and would otherwise place: the close returns, and the source is finalized."""
+    import threading
+
+    released, closed = threading.Event(), threading.Event()
+
+    def source():
+        try:
+            yield {"x": np.zeros((jax.device_count(), 2), np.float32)}
+            released.wait()
+            yield {"x": np.ones((jax.device_count(), 2), np.float32)}
+        finally:
+            closed.set()
+
+    batches = DevicePrefetchIterator(source(), MeshSpec().build(), depth=4)
+    next(batches)
+    with batches.held():
+        released.set()
+        batches.close()
+    assert closed.is_set()
+
+
 def test_prefetch_iterator_tracks_checkpointable_source_state():
     """The position handed out must be the consumed batch's, not the thread's."""
     import grain.python as pygrain
@@ -570,16 +593,17 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
 
 
 class Releasing(PeakToPeak):
-    """`PeakToPeak`, whose first call lets the training stream read on (`released`) and checks that the
-    stream places nothing before the pass it runs in ends: the stream asks for the batch after the one
-    released (`asked`) only once it has placed that one."""
+    """`PeakToPeak`, whose first call in the run's first validation pass after its warming one
+    (`WARM_BATCHES` calls) lets the training stream read on (`released`) and checks that the stream
+    places nothing before that pass ends: the stream asks for the batch after the one released
+    (`asked`) only once it has placed that one."""
 
     def __init__(self, released, asked):
         super().__init__([])
         self.released, self.asked = released, asked
 
     def __call__(self, artifact, batch):
-        if not self.released.is_set():
+        if len(self.seen) == WARM_BATCHES:
             self.released.set()
             assert not self.asked.wait(timeout=1), "the training stream placed a batch during the pass"
         return super().__call__(artifact, batch)
@@ -596,7 +620,9 @@ def test_a_run_places_no_training_batch_while_it_evaluates():
     released, asked = threading.Event(), threading.Event()
 
     def stream():
+        # The first step's batch and the one the pass after it reads ahead, then the rest once released.
         source = batches()
+        yield next(source)
         yield next(source)
         released.wait()
         yield next(source)
