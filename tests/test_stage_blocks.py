@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 from reference_error import as_given, assert_as_exact, widened, without_ynn
+from whole_suite import timed
 
 from dew.diffusion.process import DenoisingCondition
 from dew.mesh import batch_axes
@@ -72,10 +73,19 @@ CELLS = [("dit", "fsdp2_stage2"), ("dit", "stage2_sequence2"), ("hybrid_dit", "f
          ("jepa", "stage2_sequence2"), ("jepa_video", "fsdp2_stage2"), ("unet", "fsdp2_stage2"),
          ("unet", "stage2_sequence2")]
 
+PAST_TARGET = {"stack": {("unet", "stage2_sequence2"): 153}}
+"""The cells past a group's 120 s (`timed`), each its seconds in train 284's CI (812c5b2db, ledger 2200):
+the UNet beside the sequence axis; every train stacks the UNet's stages over fsdp2_stage2 and the DiT's
+and the JEPA encoder's beside the sequence axis."""
+
 SEEDS = {"dit": 32, "hybrid_dit": 32, "jepa": 32, "jepa_video": 32, "unet": 128, "patch_conv": 8}
-"""Each model's check-1 seeds, the most any of its layouts took, sized paired by `seeds_for` (`dew_fn`, the
-layout's arm) on armada, at 9efb77a3e and the UNet's with the confirming block at 8ce8072b5 (64 over
-fsdp2_stage2, 128 beside the sequence axis): the arms share their inputs and variables."""
+"""Each model's check-1 seeds, the most any of its layouts took (`LAYOUT_SEEDS` where a layout took
+fewer), sized paired by `seeds_for` (`dew_fn`, the layout's arm) on armada, at 9efb77a3e and the UNet's
+with the confirming block at 8ce8072b5: the arms share their inputs and variables."""
+
+LAYOUT_SEEDS = {("unet", "fsdp2_stage2"): 64}
+"""A cell whose layout took fewer seeds than its model's most, by the same sizing: the UNet's 64 over
+fsdp2_stage2 (128 beside the sequence axis)."""
 
 
 def drawn(kind: str):
@@ -166,12 +176,8 @@ def runs_a_pipeline(spec: MeshSpec, model, variables, call, inputs, microbatches
 
 
 @pytest.mark.mesh(devices=8)
-# The UNet over fsdp2_stage2 runs in the whole suite alone (162 s, ledger 2135); every train still
-# stacks the UNet's stages over stage2_sequence2.
-@pytest.mark.parametrize(("case", "layout"), [
-    pytest.param(case, layout, id=f"{case}-{layout}",
-                 marks=pytest.mark.whole_suite if (case, layout) == ("unet", "fsdp2_stage2") else ())
-    for case, layout in CELLS])
+@pytest.mark.parametrize(("case", "layout"), timed(PAST_TARGET, "stack", CELLS),
+                         ids=[f"{case}-{layout}" for case, layout in CELLS])
 def test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes(case, layout):
     """The model runs its blocks as a pipeline over the stage axis, and its output and gradients are
     on par with one device's, both measured from float64 (check 1). Before, every model but a
@@ -185,7 +191,8 @@ def test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes(ca
     assert runs_a_pipeline(spec, model, variables, call, inputs, microbatches)
     assert_as_exact(on_mesh(spec, 8, model, variables, call, microbatches),
                     on_mesh(MeshSpec(), 1, model, variables, call), draw, f"{case} over {layout}",
-                    seeds=SEEDS[case], truth_fn=float64_pulled(model, variables, call))
+                    seeds=LAYOUT_SEEDS.get((case, layout), SEEDS[case]),
+                    truth_fn=float64_pulled(model, variables, call))
 
 
 @pytest.mark.mesh(devices=8)

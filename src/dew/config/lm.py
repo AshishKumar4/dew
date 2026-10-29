@@ -90,7 +90,7 @@ class LMRunConfig(DecoderRunConfig):
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")
 
-    def prepare(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The objective this run names over its token files.
 
         The files decide the vocabulary; training and sampling decide the
@@ -104,9 +104,6 @@ class LMRunConfig(DecoderRunConfig):
         or a fresh draw from the run's key, so the objective trains its factors
         alone. Each validation pass scores `val_metrics`, perplexity by default.
         """
-        if (pinned := self.pinned_adapter()) is not self:
-            # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
-            return pinned.prepare()
         tokens = self.tokens()
         if objectives.label(self.objective.name) == "block_diffusion" and tokens.packed:
             raise ValueError("block_diffusion trains on spans of the stream, not packed documents")
@@ -217,12 +214,9 @@ class LMRunConfig(DecoderRunConfig):
                              "is a number of tokens")
         reference = SourceReference.parse(self.pretrained)
         dtype = resolve_dtype(self.model.fields.get("dtype"))
-        from dew.nn.attention import attention_implementation
-
         loaded = Pretrained.load(reference.name, dtype=jnp.bfloat16 if dtype is None else dtype,
                                  param_dtype=self.pretrained_param_dtype,
-                                 attention_impl=attention_implementation(
-                                     str(self.model.fields.get("attention_impl", "auto"))),
+                                 attention_impl=self.source_attention(),
                                  max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
                                  **self.source_keywords(frozen=self.lora is not None))

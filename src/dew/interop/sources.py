@@ -92,6 +92,17 @@ class SourceReference:
     def metadata(self) -> Path:
         return snapshot(self.name, self.revision, weights=False) / (self.subfolder or "")
 
+    def pinned(self) -> SourceReference:
+        """This source at the commit its revision resolves to now, as a run records it: the snapshot's
+        own, which offline is the one the cache holds. A local directory is as it is."""
+        if os.path.isdir(self.name):
+            return self
+        return replace(self, revision=snapshot(self.name, self.revision, weights=False).name)
+
+    def spelled(self) -> str:
+        """The `repo@revision` spelling `parse` reads back, or the name alone."""
+        return self.name if self.revision is None else f"{self.name}@{self.revision}"
+
     def directory(self, root: Path) -> Path:
         return root / (self.subfolder or "")
 

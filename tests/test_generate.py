@@ -88,6 +88,13 @@ def test_drawn_tokens_continue_the_prompts_positions_as_its_response_does(rng):
         "attention_mask": jnp.asarray([[1, 1, 1, 1, 1], [1, 1, 1, 1, 1], [0, 1, 1, 1, 1], [1, 1, 1, 1, 1]],
                                       bool)}
     params = model.init(rng, jnp.zeros((4, 5), jnp.int32))
+    wide = tiny(dtype=jnp.float64)
+
+    def compiled(model):
+        """`model`'s full forward compiled, as a user runs it, a program each request length."""
+        return jax.jit(lambda params, tokens, fields: model.apply(params, tokens, **fields))
+
+    forward, wide_forward = compiled(model), compiled(wide)
 
     def draw(seed):
         return (np.asarray(jax.random.randint(jax.random.key(seed), (4, 5), 0, VOCAB)),)
@@ -96,17 +103,16 @@ def test_drawn_tokens_continue_the_prompts_positions_as_its_response_does(rng):
         """The request extended token by token by a full forward's greedy choice."""
         walked = ModelInputs(jnp.asarray(tokens), metadata)
         for _ in range(8):
-            logits = model.apply(params, walked.tokens, **walked.kwargs())[:, -1]
+            logits = forward(params, walked.tokens, walked.kwargs())[:, -1]
             walked = walked.extended(jnp.argmax(logits, axis=-1)[:, None].astype(jnp.int32))
         return walked
 
-    def scored(model, params):
+    @as_given
+    def scored(tokens):
         """Each drawn token's log probability under a full forward over the float32 walk."""
-        def run(tokens):
-            walked = walk(np.asarray(tokens))
-            log_probs = jax.nn.log_softmax(model.apply(params, walked.tokens, **walked.kwargs())[:, 4:-1])
-            return np.asarray(jnp.take_along_axis(log_probs, walked.tokens[:, 5:, None], axis=-1)[..., 0])
-        return as_given(run)
+        walked = walk(np.asarray(tokens))
+        log_probs = jax.nn.log_softmax(forward(params, walked.tokens, walked.kwargs())[:, 4:-1])
+        return np.asarray(jnp.take_along_axis(log_probs, walked.tokens[:, 5:, None], axis=-1)[..., 0])
 
     @as_given
     def drawn(tokens):
@@ -119,11 +125,10 @@ def test_drawn_tokens_continue_the_prompts_positions_as_its_response_does(rng):
         # The float32 walk's tokens, then the float64 forward's log probabilities of them.
         with jax.enable_x64(new_val=False):
             walked = walk(np.asarray(tokens))
-        wide, held = tiny(dtype=jnp.float64), widened(params)
-        log_probs = jax.nn.log_softmax(wide.apply(held, walked.tokens, **walked.kwargs())[:, 4:-1])
+        log_probs = jax.nn.log_softmax(wide_forward(widened(params), walked.tokens, walked.kwargs())[:, 4:-1])
         return np.asarray(jnp.take_along_axis(log_probs, walked.tokens[:, 5:, None], axis=-1)[..., 0])
 
-    assert_as_exact(drawn, scored(model, params), draw, "drawn log probabilities", seeds=DRAWN_SEEDS,
+    assert_as_exact(drawn, scored, draw, "drawn log probabilities", seeds=DRAWN_SEEDS,
                     truth_fn=as_given(truth))
 
 
