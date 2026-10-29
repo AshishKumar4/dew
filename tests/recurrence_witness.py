@@ -443,7 +443,8 @@ class Run:
                     point(self.carries[n, head]) if carry is None else carry)
 
 
-def recorded(q, k, v, g, beta, h0, *, starts=None, carried: bool = True) -> Run:
+def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
+             carried: bool = True) -> Run:
     """The records of the gated delta rule's call on the template, forced (`generation.chosen`) at JAX's own
     default precision as a model runs it: `mainloop.kept_forward` at the tiles the route takes
     (`tuning.seen`), its output and final memory bit for bit the route's own (the certify build is the
@@ -461,14 +462,14 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, carried: bool = True) -> Run:
     dtype = jnp.result_type(q, k, v)
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with tuning.seen() as launches:
-            o, final = jax.jit(lambda *x: recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts))(
-                *operands)
+            o, final = jax.jit(lambda *x: recurrence_chunk.chunk_gated_delta_rule(
+                *x, starts=starts, max_segments=max_segments))(*operands)
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
 
         def kept(*x, starts=starts):
             return jax.jit(lambda *x: mainloop.kept_forward(
-                *x, tiles=tiles, starts=starts, scale=k.shape[-1] ** -0.5,
+                *x, tiles=tiles, starts=starts, max_segments=max_segments, scale=k.shape[-1] ** -0.5,
                 family=mainloop.family_of(dtype) or mainloop.INTERPRETED,
                 interpret=generation.backend() != "gpu"))(*x)
 
@@ -507,31 +508,72 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, carried: bool = True) -> Run:
                np.stack(carries), seams)
 
 
-def witness(run: Run, lane: Lane) -> dict:
-    """Whether each record of `run` lies inside its step's enclosure (`enclosures`), by record `[N, H, ...]`:
-    `a`, `w`, `c`, `o`, the stored memory each chunk enters `h` (the first's its initial memory stored), and
-    `leaving`, the fp32 memory each chunk leaves (`Run.carries`), each step from the fp32 memory it enters;
-    and each enclosure's width in units of the last place of its record's grid, at the record (`ulps`) and
-    at its row's largest (`spans`)."""
+def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
+    """Each record's enclosure `[N, H, ...]` (`enclosures`), each chunk's step from the fp32 memory it enters:
+    `a`, `w`, `c`, `o`; `h`, the memory each chunk enters as stored; and `leaving`, the fp32 memory it
+    leaves."""
     scale = run.k.shape[-1] ** -0.5
-    names = ("a", "w", "c", "o", "h", "leaving")
-    held: dict[str, list] = {name: [] for name in names}
-    widths: dict[str, list] = {name: [] for name in names}
-    spans: dict[str, list] = {name: [] for name in names}
+    found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
-            step = run.step(n, head)
-            found = enclosures(step, scale, lane)
-            found["leaving"] = found["h"]
-            found["h"] = stored_memory(point(run.carries[n, head]), lane)
-            records = {"a": step.a, "w": step.w, "c": step.c, "o": run.o[n, head], "h": step.h,
-                       "leaving": run.carries[n + 1, head]}
-            for name, record in records.items():
-                held[name].append(within(record, found[name]))
-                grid = FLOAT32 if name == "leaving" else lane.held or FLOAT32
-                widths[name].append(ulps(found[name], record, grid))
-                spans[name].append(ulps(found[name], np.max(np.abs(record), -1, keepdims=True), grid))
-    shaped = {name: np.stack(values).reshape(run.chunks, run.heads, *values[0].shape)
-              for name, values in held.items()}
-    return {**shaped, "ulps": {name: np.stack(values) for name, values in widths.items()},
-            "spans": {name: np.stack(values) for name, values in spans.items()}}
+            step = enclosures(run.step(n, head), scale, lane)
+            step["leaving"], step["h"] = step["h"], stored_memory(point(run.carries[n, head]), lane)
+            for name, iv in step.items():
+                found.setdefault(name, []).append(iv)
+    return {name: Iv(*(np.stack([getattr(iv, end) for iv in ivs]).reshape(run.chunks, run.heads,
+                                                                           *ivs[0].lo.shape)
+                       for end in ("lo", "hi"))) for name, ivs in found.items()}
+
+
+def records(run: Run) -> dict[str, np.ndarray]:
+    """Each record `[N, H, ...]`, as `enclosed` names them."""
+    return {"a": run.a, "w": run.w, "c": run.c, "o": run.o, "h": run.h, "leaving": run.carries[1:]}
+
+
+def witness(run: Run, lane: Lane) -> dict:
+    """Whether each record of `run` lies inside its step's enclosure (`enclosed`), by record `[N, H, ...]`,
+    and each enclosure's width in units of the last place of its record's grid, at the record (`ulps`) and
+    at its row's largest (`spans`)."""
+    found, recorded_ = enclosed(run, lane), records(run)
+    held = {name: within(recorded_[name], found[name]) for name in found}
+
+    def grid(name):
+        return FLOAT32 if name == "leaving" else lane.held or FLOAT32
+
+    largest = {name: np.max(np.abs(record), -1, keepdims=True) for name, record in recorded_.items()}
+    return {**held, "ulps": {name: ulps(found[name], recorded_[name], grid(name)) for name in found},
+            "spans": {name: ulps(found[name], largest[name], grid(name)) for name in found}}
+
+
+def refusals(faulty: Run, claimed: Run, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """A fault's refusals, by record: `faulty`'s records held to the enclosures `claimed` gives them (the
+    call's own operands and memories, about `faulty`'s records), and where those are separated from the
+    enclosures on what the faulty kernel was given (`faulty`'s own, `certified.separated`)."""
+    from certified import separated
+
+    truth, fault, found = enclosed(claimed, lane), enclosed(faulty, lane), records(faulty)
+    return {name: (within(found[name], truth[name]), separated(truth[name], fault[name])) for name in truth}
+
+
+def rounded_cumsums(g) -> np.ndarray:
+    """Log decays `[1, T, H]` whose exact prefix within each chunk is `g`'s cumulative sum in fp32, token by
+    token (row 2066's defect, the decay from a difference of rounded cumulative sums): each token's the
+    difference of two neighbouring rounded sums, rounded to fp32, so the kernel's compensated prefix carries
+    their rounding."""
+    shape = np.shape(g)
+    chunked = np.asarray(g, np.float32).reshape(shape[0], -1, CHUNK, shape[-1])
+    sums = np.cumsum(chunked, axis=2, dtype=np.float32)
+    before = np.concatenate([np.zeros_like(sums[:, :, :1]), sums[:, :, :-1]], axis=2)
+    return (sums - before).astype(np.float32).reshape(shape)
+
+
+def shifted(operands: tuple) -> tuple:
+    """A call's operands `(q, k, v, g, beta, h0)` with each token one later: a neutral token first (no key,
+    value, decay or write), the last dropped, so each chunk's boundary falls one token early."""
+    import jax.numpy as jnp
+
+    def later(x):
+        return jnp.concatenate([jnp.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+
+    *tokens, h0 = operands
+    return (*map(later, tokens), h0)
