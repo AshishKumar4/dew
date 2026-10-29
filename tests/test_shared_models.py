@@ -18,21 +18,10 @@ def service():
 
 def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_path):
     import numpy as np
-    from test_inference import make_run
 
-    from dew.inference import TextToImage
     from dew.sampling import CFG, Heun
 
-    progress = load("progress", "site/live/container")
-    client = load("model_client", "site/live/container")
-    client.TERMS = load("contract", "site/live/container").written()
-    make_run(tmp_path)
-    pipe = TextToImage.from_run(str(tmp_path))
-    native = service.NativeModels.__new__(service.NativeModels)
-    native.np, native.progress, native.cfg = np, progress, CFG
-    native.repo, native.revision = "model", "pinned"
-    native.pipe = progress.Reporting(pipe)
-    native.solvers = {"Heun": Heun}
+    client, pipe, native = live_kernel(service, tmp_path)
     request = {"repo": "model", "revision": "pinned", "prompt": "a lake", "negative": "",
                "prepare_key": 3, "prepare_steps": 4, "key": 5, "steps": 4,
                "solver": {"name": "Heun", "args": {}},
@@ -72,21 +61,11 @@ def test_the_live_sampler_cell_runs_whole_through_the_stand_ins_as_dew_runs_it(s
     calling what the stand-ins bind otherwise than Dew, fails every unedited Run (ledger 1159, 2339). A
     tiny run stands in for the pinned model, under the pinned name, at 4 steps where the page takes 15."""
     import numpy as np
-    from test_inference import make_run
 
-    from dew.inference import TextToImage
 
-    progress = load("progress", "site/live/container")
-    client = load("model_client", "site/live/container")
-    client.TERMS = load("contract", "site/live/container").written()
-    make_run(tmp_path)
-    pipe = TextToImage.from_run(str(tmp_path))
-    native = service.NativeModels.__new__(service.NativeModels)
-    native.np, native.progress = np, progress
-    native.cfg, native.solvers = service_records()
+    client, pipe, native = live_kernel(service, tmp_path)
     pinned = (SITE / "live" / "container" / "text-to-image").read_text()
     native.repo, native.revision = pinned.strip().split("@")
-    native.pipe = progress.Reporting(pipe)
     asked = []
 
     def shared(payload):
@@ -139,12 +118,28 @@ def as_service(held):
         sys.meta_path[:] = finders
 
 
-def service_records():
-    """The service's guidance record and solvers, as NativeModels takes them from Dew."""
-    from dew import sampling
-    from dew.sampling import CFG
+def live_kernel(service, tmp_path):
+    """The live page's two sides over a tiny run: the guest's client (its contract read from Dew), the tiny run's
+    pipeline, and the shared process's native models serving it, behind the progress reporter, as "model" at
+    "pinned", with the guidance record and solvers it takes from Dew."""
+    import numpy as np
+    from test_inference import make_run
 
-    return CFG, {name: getattr(sampling, name) for name in ("DPMSolverMultistep", "EulerAncestral", "Heun")}
+    from dew import sampling
+    from dew.inference import TextToImage
+
+    progress = load("progress", "site/live/container")
+    client = load("model_client", "site/live/container")
+    client.TERMS = load("contract", "site/live/container").written()
+    make_run(tmp_path)
+    pipe = TextToImage.from_run(str(tmp_path))
+    native = service.NativeModels.__new__(service.NativeModels)
+    native.np, native.progress, native.pipe = np, progress, progress.Reporting(pipe)
+    native.cfg = sampling.CFG
+    native.solvers = {name: getattr(sampling, name)
+                      for name in ("DPMSolverMultistep", "EulerAncestral", "Heun")}
+    native.repo, native.revision = "model", "pinned"
+    return client, pipe, native
 
 
 def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_does_not_serve(
@@ -157,21 +152,10 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
     is a solver of the cell's own named as one the service runs; and the service refuses a solver outside the
     contract's (ledger 1159)."""
     import numpy as np
-    from test_inference import make_run
 
-    from dew.inference import TextToImage
     from dew.sampling import CFG as CFGOfDew, DPMSolverMultistep as DPMOfDew, Heun as HeunOfDew
 
-    progress = load("progress", "site/live/container")
-    client = load("model_client", "site/live/container")
-    client.TERMS = load("contract", "site/live/container").written()
-    make_run(tmp_path)
-    pipe = TextToImage.from_run(str(tmp_path))
-    native = service.NativeModels.__new__(service.NativeModels)
-    native.np, native.progress = np, progress
-    native.cfg, native.solvers = service_records()
-    native.repo, native.revision = "model", "pinned"
-    native.pipe = progress.Reporting(pipe)
+    client, pipe, native = live_kernel(service, tmp_path)
     monkeypatch.setattr(client, "request",
                         lambda payload: native.sample(service.validate(payload), lambda _: None))
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
