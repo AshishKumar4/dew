@@ -941,6 +941,7 @@ def slot_request(seed):
                                                    "criteria": dict.fromkeys(options)}}}
 
 
+@pytest.mark.whole_suite
 def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers_states(tmp_path):
     """A slot release whose backbone no registered family computes loads it as tier 3 and decides
     over it: each option's score is the release's law (`SlotReadout`: `<slot_i, h> + <q h, k m_i> /
