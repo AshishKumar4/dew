@@ -276,9 +276,13 @@ def contents(name: str) -> bytes:
     it is downloaded here or not, so a planner that never fetches it keys it as a task does. An execution
     limit a run read (followed.py's `LIMITS`: "limit:cpu", "limit:memory") is the one binding this process
     (host.py's `limit`): a row green on 4 vCPUs is not reused on 8, nor on a planner, which reads its own (row
-    1998, Main 2026-10-28)."""
+    1998, Main 2026-10-28). A path a run probed (followed.py's `PROBED`: "probe:" and the path) is its kind
+    where it is a directory, whose probe never reads its entries, and as read otherwise."""
     if name.startswith("limit:"):
         return hashlib.sha256(host().limit(name).encode()).digest()
+    if name.startswith("probe:"):
+        probed = name.removeprefix("probe:")
+        return b"directory" if Path(probed).is_dir() else contents(probed)
     path = Path(name)
     manifest = path.parent / (path.name + FETCHED)
     if path.name and manifest.is_file():
