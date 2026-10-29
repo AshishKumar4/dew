@@ -38,7 +38,6 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
-from jax.interpreters.ad import JVPTracer
 from jax.sharding import PartitionSpec as P
 
 from dew.batch import Coordinates, prefix_sum, valid_order
@@ -46,7 +45,6 @@ from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
 
-from .attention import FORWARD_MODE
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
@@ -135,10 +133,8 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
         out = _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, rows)
     else:
         pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
-        case = short_conv.ConvCase(placed=triton_runs(),
-                                   reverse=not FORWARD_MODE.get() and not isinstance(x, JVPTracer),
-                                   whole=seen_whole(x), shape=x.shape, dtype=jnp.dtype(x.dtype), out=dtype,
-                                   taps=kernel.shape[-1], parts=pieces)
+        case = short_conv.ConvCase(placed=triton_runs(), whole=seen_whole(x), shape=x.shape,
+                                   dtype=jnp.dtype(x.dtype), out=dtype, taps=kernel.shape[-1], parts=pieces)
         if select(short_conv.CONV, case).kernel == 'pallas':
             out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),
                                   None if segments is None else jnp.asarray(segments, jnp.int32),
@@ -552,21 +548,21 @@ def stepped_per_shard(hooks: recurrence.Hooks, state: jax.Array, query: jax.Arra
         query, key, value, log_decay, beta, state, active)
 
 
-def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, tangent: bool, fuses: bool) -> str:
+def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, fuses: bool) -> str:
     """The kernel a decode token over `state` `[B, Hv, Dk, Dv]` runs on the target, as the decode selector
     reports it (`DELTA_DECODE`): a caller that has a conv, gates and a gated norm for the fused step to
-    take (`fuses`), and a token traced for `jax.jvp` (`tangent`)."""
-    return select(DELTA_DECODE, DecodeCase(recurrence.refusal(state, tangent=tangent), fuses)).kernel
+    take (`fuses`)."""
+    return select(DELTA_DECODE, DecodeCase(recurrence.refusal(state), fuses)).kernel
 
 
 def decode_step(hooks: recurrence.Hooks, state: jax.Array, query: jax.Array, key: jax.Array,
-                value: jax.Array, log_decay: jax.Array, beta: jax.Array, active: jax.Array | None, *,
-                tangent: bool) -> tuple[jax.Array, jax.Array]:
+                value: jax.Array, log_decay: jax.Array, beta: jax.Array,
+                active: jax.Array | None) -> tuple[jax.Array, jax.Array]:
     """A decode token's `(output, state')` through the shared recurrence, its operands as
     `stepped_per_shard` takes them: the step kernel per shard where `decode_kernel` picks it, else the
     portable step (`recurrence.step_reference`) in the operands' own precision, which the compiler
     partitions."""
-    if decode_kernel(state, tangent=tangent, fuses=False) == 'step':
+    if decode_kernel(state, fuses=False) == 'step':
         return stepped_per_shard(hooks, state, query, key, value, log_decay, beta, active)
     out, _, final = recurrence.step_reference(hooks, recurrence.Step(
         state, query=query, key=key, value=value, log_decay=log_decay, beta=beta, active=active))
@@ -596,7 +592,7 @@ def _launches(code: str, row: str) -> Requirement[DecodeCase]:
 
 
 _LAUNCH = tuple(_launches(code, row) for code, row in (
-    ('forward_mode', INHERENT), ('capability', INHERENT), ('precision', INHERENT),
+    ('capability', INHERENT), ('precision', INHERENT),
     ('widths', 'roadmap: recurrence step widths')))
 
 
@@ -615,7 +611,7 @@ or the portable recurrence where a caller names the rule's math (`generation.cho
 decodes unfused;
 the fused step (`recurrence.step` with the layer's conv, gates and norm) where a call names it; else the
 portable recurrence ('xla'), a kernel the token does not take handing it to the next. Both kernels update
-the state in place, which JAX's Pallas gives no tangent."""
+the state in place and take their derivatives from the portable step (`recurrence.step`)."""
 
 
 def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
@@ -806,7 +802,7 @@ class GatedDeltaNet(nn.Module):
         the portable recurrence ('xla')."""
         state = jax.ShapeDtypeStruct((x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim),
                                      self._stored(operand)[0])
-        return decode_kernel(state, tangent=FORWARD_MODE.get() or isinstance(x, JVPTracer), fuses=True)
+        return decode_kernel(state, fuses=True)
 
     def _fused_hooks(self) -> recurrence.Hooks:
         """The decode token whole in the recurrence's step: the conv and its silu, the queries' and

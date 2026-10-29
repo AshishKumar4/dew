@@ -939,11 +939,12 @@ def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, hel
                                      np.asarray(exact_after["cache"]["recurrent_state"]), "fused state")
 
 
-def test_a_cached_layer_traced_for_a_jvp_decodes_its_token():
-    """A cached gated delta net on an A100, whose row's step kernel decodes its tokens, traces for
-    `jax.jvp` (`forward_mode_attention`, as MeanFlow and consistency training trace it): its token
-    decodes with a tangent, which the in-place kernels do not give."""
-    from dew.nn.attention import forward_mode_attention
+@pytest.mark.parametrize("staged", ["plain", "remat"])
+def test_a_cached_layer_traced_for_a_jvp_decodes_its_token(staged):
+    """A cached gated delta net on an A100, whose row's step kernel decodes its tokens, traced for
+    `jax.jvp` as MeanFlow and consistency training trace it, plainly or under a remat that hides the
+    tangent from the layer: its token decodes with the portable step's tangent (`recurrence.step`'s
+    `generation.linear_tangent`), which the in-place launch does not give (row 2395)."""
     from dew.nn.kernels.generation import assumed
 
     layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
@@ -951,12 +952,10 @@ def test_a_cached_layer_traced_for_a_jvp_decodes_its_token():
     def step(token):
         return layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True), mutable=["cache"])[0]
 
-    def traced():
-        tangent = jax.random.normal(jax.random.key(9), token.shape)
-        jax.make_jaxpr(lambda token, tangent: jax.jvp(step, (token,), (tangent,)))(token, tangent)
-
-    with assumed("sm80"), forward_mode_attention():
-        traced()
+    staged_step = jax.checkpoint(step) if staged == "remat" else step
+    tangent = jax.random.normal(jax.random.key(9), token.shape)
+    with assumed("sm80"):
+        jax.make_jaxpr(lambda token, tangent: jax.jvp(staged_step, (token,), (tangent,)))(token, tangent)
 
 
 def test_the_fused_decode_step_leaves_an_idle_row_alone():
