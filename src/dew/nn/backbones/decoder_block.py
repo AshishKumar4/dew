@@ -22,7 +22,7 @@ from dew.nn.dropout import Dropout
 
 from ..activations import GatedActivation, gated_product
 from ..attention_residuals import DepthAttention, ResidualSite, sources
-from ..cross_attention import NAME as CROSS_ATTENTION
+from ..cross_attention import NAME as CROSS_ATTENTION, AttendsContext, LayerReads
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
@@ -879,7 +879,15 @@ class DecoderBlock(nn.Module):
         """The state after the cross-attention block joins it: the plain stream (AltUp's active
         copy among them, nGPT's unit one), mHC's streams through their mean, or the depth
         state's partial block through the mixture the attention reads."""
-        cross = functools.partial(self.cross_attention, decode=decode, train=train)
+        # A block that reads through the layer's own attention is handed it, with the layer's attention
+        # input from the states a sublayer reads (`LayerReads`).
+        layer = {}
+        if self.cross_attention.reads_layer:
+            if not isinstance(self.self_attn, AttendsContext):
+                raise ValueError(f"this layer's mixer ({type(self.self_attn).__name__}) has no attention of "
+                                 "its own for its cross-attention block to read a context through")
+            layer = {"layer": LayerReads(self._attention_input, self.self_attn)}
+        cross = functools.partial(self.cross_attention, decode=decode, train=train, **layer)
         if isinstance(state, _Plain):
             return state._replace(x=constrain(cross(state.x, context), RESIDUAL))
         if isinstance(state, _Streams):
@@ -891,6 +899,11 @@ class DecoderBlock(nn.Module):
                 return partial
             return self.attention_res(sources(state.blocks, state.finished, partial))
         return state._replace(partial=cross(state.partial, context, read=mixture))
+
+    def _attention_input(self, read: jax.Array) -> jax.Array:
+        """The states a sublayer reads, `read`, as the layer's attention reads them: through its
+        input norm where it pre-norms its attention, else as they are."""
+        return self.input_layernorm(read) if self.wiring.pre_norms and self.attention_norm else read
 
     def _joined(self, state: _BlockState) -> tuple[SeamNorm, _Plain] | None:
         """The MLP's pre-norm and the plain stream, where that norm adds the
