@@ -234,10 +234,10 @@ class OuterProgram:
 
 
 def _signature(leaf) -> Hashable:
-    """What jit keys an argument on: an array's abstract value (shape, dtype, weak type) and
-    placement, another value's type, shape and dtype."""
+    """What jit keys an argument on: an array's abstract value (shape, dtype, weak type), placement
+    and layout (its `format`, which holds its sharding), another value's type, shape and dtype."""
     if isinstance(leaf, jax.Array):
-        return leaf.aval, leaf.sharding, leaf.committed
+        return leaf.aval, leaf.format, leaf.committed
     return type(leaf), np.shape(leaf), np.result_type(leaf)
 
 
