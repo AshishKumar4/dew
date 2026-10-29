@@ -942,7 +942,7 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     its memory: `w`, the gated queries and keys, the memory each chunk enters and the corrected
     values, which fla recomputes in its backward ('delta_memory', as `fla_gdn._rule_fwd` keeps it)."""
     return fla_gdn.prefixed_fwd(cumulated_fwd, q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret,
-                                keep, wide, compensated=True)
+                                keep, wide)
 
 
 def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: int, interpret: bool,
