@@ -54,6 +54,7 @@ from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
     from dew.training._lowering import KernelReport
+    from dew.training.ahead import AheadOfTime
     from dew.training.rollout import Rollout
     from dew.training.trainer import StepFn
 
@@ -210,6 +211,8 @@ class Probe:
     headroom: int | None
     temp: int | None
     argument: int | None
+    ahead: bool = False
+    """Whether the executable is the step compiled ahead (`FitSearch.ahead`), not the search's own."""
 
     @classmethod
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
@@ -222,7 +225,7 @@ class Probe:
 
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
-                "headroom": self.headroom, "temp": self.temp, "argument": self.argument}
+                "headroom": self.headroom, "temp": self.temp, "argument": self.argument, "ahead": self.ahead}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
@@ -525,6 +528,9 @@ class FitSearch[LossT, EffectsT]:
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
     dropped: str | None = None
     """The rung (`rung`) the narrow copies were dropped at."""
+    ahead: AheadOfTime | None = None
+    """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
+    is that program (`AheadOfTime.taken`)."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
@@ -587,11 +593,17 @@ class FitSearch[LossT, EffectsT]:
     def measured(self, split: int, candidate: Candidate
                  ) -> tuple[jax.stages.CompilerOptions | None, jax.stages.Compiled | None, Probe]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
-        where it fits the devices, and the measure of its fit (`Probe`), the search's state untouched."""
+        where it fits the devices, or for the search's first compile the step compiled ahead
+        (`ahead`), and the measure of its fit (`Probe`), the search's state else untouched."""
         options = self.required if self.xla_defaults else self.options(candidate)
-        executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
+        taken = self.ahead is not None
+        if self.ahead is not None:
+            executable, self.ahead = self.ahead.taken(candidate.lowered), None
+        else:
+            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
         fit, headroom = step_fits(executable, self.mesh, candidate.held)
-        return options, executable, Probe.read(split, candidate, self.current(), fit, headroom, executable)
+        probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
+        return options, executable, dataclasses.replace(probe, ahead=taken)
 
     def fits_here(self, split: int) -> bool:
         key = (split, self.rung())
