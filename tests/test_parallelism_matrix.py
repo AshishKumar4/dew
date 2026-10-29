@@ -1,11 +1,12 @@
 """Every model family on every objective class it takes, split by the layouts
 that split it differently, against one device on the eight-device CPU mesh.
 
-Each cell is two tests, edm2's cells the first alone (`RUN_ONCE`). One runs its layout once
+Each cell is one test. edm2's cells (`RUN_ONCE`) run their layout once
 (tools/layout_parity.py's `run` with no draws): the layout compiles and takes its first step, its
 sample the one-device reference's, its loss and gradient finite where the
 reference's are, and its FLOPs an even split, or it is refused as REFUSED
-states. The other judges that first step's loss and gradient against one device by the floor judge
+states. Every other cell's test judges that first step's loss and gradient against one device by the
+floor judge, which states it works or is refused as well, so no second test runs it again
 (`layout_parity.floored`): each leaf within
 FLOOR_FACTOR of the reference's own deviation under reassociating its sums
 (its rows reordered and pooled, and the step's distance from float64), and
@@ -103,13 +104,14 @@ def references(tmp_path_factory):
     return tool, tool.References(tmp_path_factory.mktemp("layout-draws"), prepare=True, reserve=4 << 30)
 
 
-def cells(*, judged: bool = False) -> list:
-    """Every cell as a test's parameters, its layouts on every device but CELLS_ON_FOUR's, on four:
-    for the accuracy test (`judged`), without the run-once cells (`RUN_ONCE`)."""
+def cells(*, judged: bool) -> list:
+    """The cells as a test's parameters, their layouts on every device but CELLS_ON_FOUR's, on four:
+    for the accuracy test (`judged`) every cell but the run-once ones (`RUN_ONCE`), and for the
+    run-once test those alone."""
     return [pytest.param(model, layout, devices, id=f"{model}-{layout}" + ("-on-four" if devices else ""))
             for table, devices in ((CELLS, None), (CELLS_ON_FOUR, 4))
             for model, layouts in sorted(table.items()) for layout in layouts
-            if not (judged and (model, layout) in RUN_ONCE)]
+            if judged != ((model, layout) in RUN_ONCE)]
 
 
 def statuses(rows):
@@ -121,11 +123,11 @@ def statuses(rows):
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells())
+@pytest.mark.parametrize(("model", "layout", "devices"), cells(judged=False))
 def test_each_layout_of_a_model_runs_or_is_refused_as_stated(model, layout, devices, references):
-    """Each layout compiles and takes its first step, its sample the one-device reference's and its FLOPs
-    an even split, or is refused for the reason REFUSED gives: a refused cell that runs fails, as does a
-    supported one that raises."""
+    """Each run-once layout (`RUN_ONCE`) compiles and takes its first step, its sample the one-device
+    reference's and its FLOPs an even split, or is refused for the reason REFUSED gives: a refused cell
+    that runs fails, as does a supported one that raises."""
     tool, draws = references
     with jax.enable_x64(new_val=True):
         rows = tool.run([model], (layout,), dtype="float32", seeds=0, mixture={}, objective={},
