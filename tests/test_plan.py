@@ -946,34 +946,19 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
 
 
-def test_a_run_that_sets_its_remat_keeps_it_and_is_told_of_the_cheapest_rung_below_that_fits(
-        monkeypatch, caplog, tmp_path):
-    """A run that sets remat 'full', with room for its step and for the step at 'minimal', trains at
-    'full', as it asked, and its plan record and its log name the cheapest rung below that fits too,
-    with its headroom: no recomputation where its step fits, else 'minimal' (row 2026); a later run of
-    the same step reads the advice from the plan it recorded. A run that sets no remat has no rung
-    below to be told of. Before, a run's own remat was the plan's whole story."""
-    def needed(remat):
-        return needs(monkeypatch, lm(split=1, remat=None if remat is None else REMAT_POLICIES[remat]))
-
-    none, minimal, full = needed(None), needed("minimal"), needed("full")
-    room = max(minimal, full)
-    free(monkeypatch, room)
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "set"))
+def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, caplog, tmp_path):
+    """A run that sets remat 'full', with room for its step at every cheaper rung too, compiles its
+    training step once, at its own rung, and trains there: its plan holds that one compile and no
+    other rung's (row 2102). Each compile is the whole step's, which on a 4B's first step took most of
+    30 minutes where a run compiled the rungs below its own to advise it of them. JAX states each
+    compile it makes (`jax._src.dispatch`, "Finished XLA compilation of jit(step)")."""
+    free(monkeypatch, LIMIT)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     trainer = lm(split=1, remat=REMAT_POLICIES["full"])
-    with caplog.at_level(logging.WARNING, logger="dew.training.planning"):
+    with caplog.at_level(logging.DEBUG, logger="jax._src.dispatch"):
         trained(trainer, steps=0)
+    steps = [record for record in caplog.records
+             if record.getMessage().startswith("Finished XLA compilation of jit(step)")]
+    assert len(steps) == 1
+    assert [probe["remat"] for probe in trainer.plan["probes"]] == ["full"]
     assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]
-    cheaper = trainer.plan.get("cheaper")
-    assert cheaper is not None
-    assert (cheaper["remat"], cheaper["fits"]) == (None if none <= room else "minimal", True)
-    assert cheaper["headroom"] >= 0
-    assert any("set remat to it" in record.getMessage() for record in caplog.records)
-    # A later run of the same step takes the plan its record holds, and the advice with it.
-    again = lm(split=1, remat=REMAT_POLICIES["full"])
-    trained(again, steps=0)
-    assert again.plan.get("cheaper") == cheaper
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "none"))
-    unset = lm(split=1)
-    trained(unset, steps=0)
-    assert unset.plan.get("cheaper") is None

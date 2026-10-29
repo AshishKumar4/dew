@@ -223,12 +223,14 @@ PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "inp
 HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "fp16 normed biased forward",
                 "normed biased input gradient", "normed kernel gradient", "exact normed kernel gradient",
                 "cast forward", "residual forward", "two bf16 outputs forward", "scaled forward",
-                "row scaled forward", "gated forward", "gated kernel gradient")
+                "row scaled forward", "gated forward", "gated kernel gradient", "paired swiglu forward",
+                "paired forward")
 """The hooked and exactly summed forms, which a family's launches emit where its register model counts what
 they hold (`Family.counts_hooks`): the fuser's prologues over side vectors (a norm's scaling, a cast) and
 tiles (a SwiGLU gate's side), and epilogues (a bias, a residual add
 after an activation, two outputs, column and row scales), each as the `Hooks` the fuser builds
-(`templates.gemm.fused`)."""
+(`templates.gemm.fused`); and a paired product's (`templates.gemm.template.gemm`'s `paired`: a gate's and
+an up projection's two accumulators, their SwiGLU or both products)."""
 
 
 FUSED_FORMS = ("fused normed residual forward",)
@@ -267,7 +269,17 @@ def _fused_case(rows: int, depth: int, width: int, groups: int):
 def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
     """Each GEMM Mosaic launch form (`PLAIN_FORMS`, `HOOKED_FORMS`) at a projection's extents: its name,
     launch, abstract operands and options."""
-    from test_gemm_template import biased, casted, doubled, gated, normed, scaled, scaled_rows, silu_residual
+    from test_gemm_template import (
+        biased,
+        casted,
+        doubled,
+        gated,
+        normed,
+        scaled,
+        scaled_rows,
+        silu_residual,
+        swiglu,
+    )
 
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     vector = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
@@ -320,6 +332,10 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
           "hooks": hooks(epilogue=scaled, epilogue_axes=(("columns",),), out_dtypes=("float32",))}),
         ("row scaled forward", gmm, (x, w, sizes, (), (vector((rows,)),)),
          {**forward, "hooks": hooks(epilogue=scaled_rows, epilogue_axes=(("rows",),))}),
+        ("paired swiglu forward", gmm, (x, w, sizes, (), (), w),
+         {**forward, "hooks": hooks(epilogue=swiglu, paired=True)}),
+        ("paired forward", gmm, (x, w, sizes, (), (), w),
+         {**forward, "hooks": hooks(out_dtypes=("bfloat16", "bfloat16"), paired=True)}),
     ]
 
 
@@ -368,12 +384,17 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
 
 
 def _model(launch, ba, config) -> dict:
-    """What a launch's register model decides at `config` for the call `ba`, as the gate holds it to ptxas's
-    need (`kernel_compile.decisions`): its registers a consumer thread, its budget, its consumers, the most
-    programs its family runs a multiprocessor, and its producer's registers where it has one."""
+    """What a launch's model decides at `config` for the call `ba`, as the gate holds it to the compiled
+    kernel: its registers a consumer thread, its budget, its consumers, the most programs its family runs a
+    multiprocessor and its producer's registers where it has one, against ptxas's need
+    (`kernel_compile.decisions`); and the scratch the planner sized it by (`resources.scratch_bytes` of
+    `launch_of`'s allocations, its barriers apart), against the kernel's own."""
     bundle = mosaic_gpu.family_of(config, jnp.bfloat16)
     producer = bundle.warpgroups(config.warpgroups) > config.warpgroups
+    shared = resources.scratch_bytes(mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype),
+                                    launch.launch_of(ba, config).scope(config.stages))
     return {"registers": launch.registers(ba, config), "budget": launch.register_budget(config),
+            "shared": shared,
             "consumers": config.warpgroups, "most": bundle.programs(config.warpgroups),
             "register_step": bundle.register_step,
             "producer": resources.PRODUCER_REGISTERS if producer else 0}

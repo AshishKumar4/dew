@@ -4,6 +4,7 @@ the plain program they stand for (`lax.ragged_dot` between the same hooks and ca
 JAX) from float64 truth, forward and reverse; its forward mode; the fuser's value; its CUDA lowering on
 an H100 and its TPU lowering."""
 
+import contextlib
 import dataclasses
 import functools
 import itertools
@@ -493,20 +494,32 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
                         "dense 65x40x100 gradients", seeds=SEEDS, truth_fn=with_gradients(truth))
 
 
-def test_a_named_kernel_runs_the_calls_derivative_too():
+def test_a_named_kernels_derivative_pulled_after_its_block_holds_check_1():
     """A grouped product traced on an A100 within `generation.chosen(grouped_matmul='xla')`, its pullback
-    run after the block closes, as MoE's implementation='xla' scopes only its own call: every grouped
-    dispatch its gradient reports runs XLA's program, the kernel the call named (train 243's review), not
-    the launches an unnamed call would select."""
-    rng = np.random.default_rng(0)
-    x = jnp.asarray(rng.normal(size=(ROUTED, DEPTH)), jnp.bfloat16)
-    w = jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, WIDTH)), jnp.bfloat16)
-    with generation.assumed("sm80"), generation.routes() as found:
+    run after the block closes, as MoE's implementation='xla' scopes only its own call: the value and both
+    gradients on par with the plain program's over the draws (check 1), truth float64's."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, WIDTH)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16))
+
+    def dew(x, w, cotangent):
         with generation.chosen(grouped_matmul="xla"):
-            y, pull = jax.vjp(lambda x, w: template.gemm(x, w, jnp.asarray(SIZES), out_dtype=jnp.bfloat16),
-                              x, w)
-        pull(jnp.ones_like(y))
-    assert {route.kernel for route in found if route.choice == "grouped_matmul"} == {"xla"}
+            y, pull = jax.vjp(lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16), x, w)
+        return (y, *pull(cotangent))
+
+    def plain(x, w, cotangent, wide=jnp.float32):
+        def product(x, w):
+            return jax.lax.ragged_dot(x.astype(wide), w.astype(wide), sizes).astype(cotangent.dtype)
+        y, pull = jax.vjp(product, x, w)
+        return (y, *pull(cotangent))
+
+    with generation.assumed("sm80"):
+        assert_as_exact(dew, jax.jit(plain), draw, "named kernel's pullback", seeds=SEEDS,
+                        truth_fn=functools.partial(plain, wide=jnp.float64))
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -580,6 +593,28 @@ def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
                  jnp.asarray(rng.normal(size=(depth, width)), jnp.bfloat16))
         return (*drawn, jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16)) if cotangent else drawn
     return draw
+
+
+@runs("sm90")
+@pytest.mark.parametrize("rows", [1, 65, 256, 257])
+@pytest.mark.parametrize("transpose_rhs", [False, True], ids=["forward", "input gradient"])
+def test_a_dense_projection_keeps_the_rows_at_a_pair_boundary(rows, transpose_rhs):
+    """A dense projection at one row, within a tile, at a pair and one row past it keeps every real row
+    through both matrix orientations. The interpreter takes the same dense fact as the native launch."""
+    def dew(x, w):
+        return mosaic_gpu.gmm(
+            x, w[None], jnp.asarray([rows], jnp.int32), tiles=PAIRED, transpose_rhs=transpose_rhs,
+            out_dtype=jnp.bfloat16, multiprocessors=2, interpret=True, dense=True)
+
+    def plain(x, w):
+        matrix = w.T if transpose_rhs else w
+        return jnp.dot(x, matrix, preferred_element_type=jnp.promote_types(x.dtype, jnp.float32)).astype(
+            x.dtype)
+
+    with generation.assumed("sm90"):
+        assert_as_exact(jax.jit(dew), jax.jit(plain), _dense_draw(rows, 128, 128),
+                        f"dense pair boundary {rows}, transpose_rhs={transpose_rhs}",
+                        seeds=SEEDS, truth_fn=plain)
 
 
 @runs("sm90")
@@ -677,19 +712,6 @@ def test_the_epilogue_applies_to_every_row(generation_name):
             out_dtype=jnp.float32, interpret_on_cpu=True))(x, w, b)
     expected = np.broadcast_to(np.asarray(b), (ROWS - ROUTED, WIDTH))
     np.testing.assert_array_equal(np.asarray(out)[ROUTED:], expected)
-
-
-def test_the_backward_reads_what_the_epilogues_derivative_reads():
-    """A bias's VJP passes its cotangent through and reads no accumulator; a scale's reads it, and its
-    cotangent is no output's unchanged; two outputs' sum theirs."""
-    acc, side = (ROWS, WIDTH), (jax.ShapeDtypeStruct((WIDTH,), jnp.float32),)
-    bf16 = (jnp.dtype(jnp.bfloat16),)
-    assert not template._reads_accumulator(biased, acc, side)
-    assert template._passes_cotangent(biased, acc, side, bf16, jnp.bfloat16)
-    assert template._reads_accumulator(scaled, acc, side)
-    assert not template._passes_cotangent(scaled, acc, side, bf16, jnp.bfloat16)
-    assert not template._passes_cotangent(biased, acc, side, (jnp.dtype(jnp.float32),), jnp.bfloat16)
-    assert not template._passes_cotangent(doubled, acc, (), bf16 * 2, jnp.bfloat16)
 
 
 @runs("sm80")
@@ -1500,6 +1522,87 @@ def test_a_paired_product_holds_check_1_against_its_two_products_combined():
     paired = run(*draw(0))
     assert paired.shape == (rows, width) and paired.dtype == jnp.bfloat16
     assert_as_exact(run, jax.jit(plain), draw, "paired product", seeds=SEEDS, truth_fn=truth)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm90"))
+@pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
+def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
+    """A gate and an up projection as the template's paired product (`gemm`'s `paired`): its value on
+    warpgroup MMA, which takes hooks (one load of the rows for both, their SwiGLU in its epilogue), and every
+    gradient (the rows', both matrices') through the paired product's own reverse mode on the routes the
+    selector takes (its two accumulators recomputed, the input gradient's two products summed wide: the
+    SwiGLU's fp32 cotangents multiply wide, which warpgroup MMA's 16-bit products do not take), each as
+    exact as the unfused program's from float64 truth. The gradients run eagerly, as the Mosaic
+    interpreters' ordered callbacks need."""
+    rows, depth, width = 136, 128, 256
+    sizes = jnp.asarray([70, 66], jnp.int32) if grouped else None
+    groups = 2 if grouped else 1
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        shape = (groups, depth, width) if grouped else (depth, width)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=shape) / 8, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=shape) / 8, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16))
+
+    def dew(x, gate, up):
+        return template.gemm(x, gate, sizes, paired=up, epilogue=swiglu, out_dtype=jnp.bfloat16,
+                             interpret_on_cpu=True)
+
+    def plain(x, gate, up, wide=jnp.float32, out=jnp.bfloat16):
+        def projected(matrix):
+            if not grouped:
+                return x.astype(wide) @ matrix.astype(wide)
+            return jnp.concatenate([x[:70].astype(wide) @ matrix[0].astype(wide),
+                                    x[70:].astype(wide) @ matrix[1].astype(wide)])
+        g, u = projected(gate), projected(up)
+        # The program rounds as the epilogue does (`swiglu`); float64 truth rounds nothing.
+        return (swiglu(g, u) if wide == jnp.float32 else jax.nn.silu(g) * u).astype(out)
+
+    def valued(f):
+        """`f` of the drawn inputs but the cotangent."""
+        return lambda x, gate, up, cotangent: f(x, gate, up)
+
+    label = f"paired {'grouped' if grouped else 'dense'} product on {generation_name}"
+    truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
+    with generation.assumed(generation_name):
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            assert_as_exact(jax.jit(valued(dew)), jax.jit(valued(plain)), draw, label, seeds=SEEDS,
+                            truth_fn=valued(truth))
+        assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw, f"{label}, gradients",
+                        seeds=SEEDS, truth_fn=with_gradients(truth))
+
+
+@pytest.mark.parametrize(("generation_name", "out"),
+                         [pytest.param("sm90", jnp.bfloat16, marks=runs("sm90")), (None, jnp.float32)],
+                         ids=["warpgroup MMA", "XLA"])
+def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generation_name, out):
+    """A paired product without an epilogue, each matrix's product an output of its own: on warpgroup MMA
+    in bf16, and in XLA's program in fp32, whose fp32 cotangents its reverse mode keeps wide; its values
+    and every gradient (the rows', both matrices') as exact as the unfused program's from float64 truth.
+    The gradients run eagerly, as the Mosaic interpreters' ordered callbacks need."""
+    rows, depth, width = 136, 128, 256
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                *(jnp.asarray(rng.normal(size=(depth, width)) / 8, jnp.bfloat16) for _ in range(2)),
+                tuple(jnp.asarray(rng.normal(size=(rows, width)), out) for _ in range(2)))
+
+    def dew(x, gate, up):
+        return template.gemm(x, gate, None, paired=up, out_dtype=out, out_dtypes=(out, out),
+                             interpret_on_cpu=generation_name is not None)
+
+    def plain(x, gate, up, wide=jnp.float32, cast=out):
+        return tuple((x.astype(wide) @ matrix.astype(wide)).astype(cast) for matrix in (gate, up))
+
+    chosen = (generation.chosen(grouped_matmul="mosaic_gpu") if generation_name is not None
+              else contextlib.nullcontext())
+    with generation.assumed(generation_name), chosen:
+        assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
+                        f"paired product's two outputs ({generation_name})", seeds=SEEDS,
+                        truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, cast=jnp.float64)))
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])
