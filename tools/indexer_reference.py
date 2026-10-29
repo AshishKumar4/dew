@@ -162,8 +162,8 @@ def published_loss(methods: dict, dtype, raw, attention_mask, query, key, sparse
                                                  row_mask[None, None], row_indexer_mask[None, None],
                                                  sparse_loss=sparse, scaling_factor=1.0)
 
-    per_query = jax.vmap(jax.vmap(alone, in_axes=(0, 0, None, 0, 0)))(indexer_score, query, key, attention_mask,
-                                                                         indexer_mask)
+    per_query = jax.vmap(jax.vmap(alone, in_axes=(0, 0, None, 0, 0)))(indexer_score, query, key,
+                                                                         attention_mask, indexer_mask)
     return value, (indexer_mask, per_query)
 
 
