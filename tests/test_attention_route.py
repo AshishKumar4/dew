@@ -629,4 +629,28 @@ def test_an_accurate_call_on_the_default_route_runs_the_template_or_the_referenc
             accurate = select(ATTENTION, attention_case(query, query, causal=True)).kernel
         fast = select(ATTENTION, attention_case(query, query, causal=True)).kernel
     assert accurate in ("template", "reference"), accurate
-    assert accurate != fast or fast in ("template", "reference")
+    # On a GPU a 16-bit call's fast form takes an old route, which the accurate one refuses.
+    if target is not None and dtype == jnp.bfloat16:
+        assert fast not in ("template", "reference"), fast
+    else:
+        assert fast == accurate
+
+
+def test_an_accurate_call_the_template_refuses_runs_the_reference_path_on_ieee_products():
+    """An accurate call the template does not take on a GPU, a dropping one, runs the reference path,
+    whose fp32 products the accurate form holds to IEEE fp32 (`Precision.HIGHEST`), never TF32, so a
+    run recorded accurate computes in its form (row 2350's review, Attention)."""
+    import re
+
+    from dew.nn.kernels.generation import assumed, chosen
+
+    query = jnp.ones((1, 64, 4, 32), jnp.float32)
+
+    def attend(query):
+        return attention.scaled_dot_product_attention(query, query, query, causal=True, dropout_rate=0.1,
+                                                      dropout_rng=jax.random.key(3), deterministic=False)
+
+    with assumed("sm90"), chosen(attention_form="accurate"):
+        lowered = jax.jit(jax.grad(lambda query: attend(query).sum())).lower(query).as_text()
+    dots = [line for line in lowered.splitlines() if "dot_general" in line and "f32" in line]
+    assert dots and all(re.search(r"precision = \[HIGHEST, HIGHEST\]", line) for line in dots), dots
