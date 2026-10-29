@@ -623,8 +623,8 @@ def _blockwise(denoise: DiscreteDenoiser, tokens: jax.Array, blocks: jax.Array, 
     draws come from each row's key folded with the block's number. Returns the tokens, each row's useful
     refinements (the steps a block of it still held a mask at), and the slots left changeable (those of
     a stopped row's blocks after its end are not)."""
-    from dew.sampling.walks import sample
     from dew.sampling.solvers import RowKeys
+    from dew.sampling.walks import sample
 
     batch, length = tokens.shape
     slots = jnp.arange(length)
