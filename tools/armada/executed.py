@@ -66,6 +66,10 @@ collected: dict[str, int] = {}
 is 0."""
 deselected: dict[str, int] = {}
 """Each test file's tests the selection set aside, as pytest reports it (`pytest_deselected`)."""
+released: dict[str, dict[str, list[str]]] = {}
+"""Each test file's release checks, by the requirement each runs under, as pytest resolves a node's
+release_env mark, recorded before any selection: its row names them, and a whole suite's run plans their
+tasks from it (`ci.py release-plan`)."""
 whole_suite: dict[str, list[str]] = {}
 """Each test file's tests marked whole_suite, by their node ids, as pytest resolves a node's marks (its own,
 its class's, its module's, a parameter set's, a conftest's), which `ci.py slow` reads in the file's row."""
@@ -189,6 +193,11 @@ def tally(counts: dict[str, int], items) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
     tally(collected, items)
+    # Before any selection sets them aside, as every run but a release check's does (`ci.py selected`).
+    for item in items:
+        if (mark := item.get_closest_marker("release_env")) is not None and mark.args:
+            checks = released.setdefault(item.nodeid.split("::")[0], {})
+            checks.setdefault(str(mark.args[0]), []).append(item.nodeid)
 
 
 def pytest_deselected(items):
@@ -240,7 +249,8 @@ def pytest_sessionfinish(session):
     if counted := os.environ.get("DEW_COLLECTED"):
         Path(counted).write_text(json.dumps({
             name: {"collected": count, "deselected": deselected.get(name, 0),
-                   **({"whole_suite": whole_suite[name]} if name in whole_suite else {})}
+                   **({"whole_suite": whole_suite[name]} if name in whole_suite else {}),
+                   **({"release_env": released[name]} if name in released else {})}
             for name, count in collected.items()}))
 
 

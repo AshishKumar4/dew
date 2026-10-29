@@ -320,6 +320,20 @@ jobs:
         fi
         failed=0
         if [ -n "${suite:-}" ]; then wait "$suite" || failed=1; fi
+        # The whole suite's second job: its release checks, which its own tasks set aside, a task each requirement
+        # (ci.py release-plan, from the rows naming them as pytest resolved their marks), each pytest under uv's
+        # overlay of the requirement on the suite's environment, on the suite's CPU (2173).
+        if [ -n "$DEW_WHOLE_SUITE" ]; then
+          $armada verdict ${{ github.sha }} --json > "$RUNNER_TEMP/verdict.json" || true
+          checks=$(python3 tools/armada/ci.py release-plan "$RUNNER_TEMP/verdict.json") || checks=
+          if [ -n "$checks" ] && [ "$checks" != "[]" ]; then
+            echo "$checks" | $armada map --commit=${{ github.sha }} --items=- --size=medium \
+              --pool="$(echo "$checks" | jq length)" --deadline=1800 $priority --label="${{ github.ref_name }}" \
+              --cpu="$(jq -r '.task.cpu | "\(.vendor)/\(.family)/\(.model)"' .armada.json)" \
+              -- python3 tools/armada/ci.py release --python={python} --tests={tests} --requirement={release} \
+              --out=/tmp/dew-release.json || failed=1
+          fi
+        fi
         if [ -n "${gangs:-}" ]; then
           wait "$gangs" || failed=1
           echo "--- the multi-host gangs"

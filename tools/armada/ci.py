@@ -686,39 +686,34 @@ def plan(target: float, timings: dict) -> list[dict]:
                         "tests": " ".join(names), "split": COLLECT,
                         "rows": [row(PYTHONS[-1], name, COLLECT) for name in names], "weight": target,
                         "cache": cache, "whole": cells})
-    # The whole suite's run alone runs the release checks, a task each requirement (`released`).
-    checks = released(every) if cells == "1" else {}
-    for index, (requirement, names) in enumerate(sorted(checks.items()), start=1):
-        entries.append({"name": f"{PYTHONS[0]}-release-{index}", "python": PYTHONS[0],
-                        "tests": " ".join(names), "split": "",
-                        "rows": [row(PYTHONS[0], name, f"{RELEASE}{requirement}") for name in names],
-                        "weight": target, "cache": cache, "whole": cells, "release": requirement})
-    return [{"release": "", **entry} for entry in entries]
+    return entries
 
 
 RELEASE = "release:"
 """A release check's row, beside its file's own: `row`'s group, its requirement after it."""
 
 
-def released(files: list[str]) -> dict[str, list[str]]:
-    """The test files of `files` with release checks, by the requirement each check runs under: its
-    release_env(<requirement>) mark's argument, as the file's source writes it (2173: a release's own code
-    checked under a package pinned apart from the suite's, transformers>=5.18.0 for LFM3's)."""
-    checks: dict[str, list[str]] = {}
-    for name in files:
-        source = Path(name).read_text()
-        if "release_env" not in source:
-            continue
-        for node in ast.walk(ast.parse(source)):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "release_env" and node.args):
-                continue
-            requirement = node.args[0]
-            if (isinstance(requirement, ast.Constant) and isinstance(requirement.value, str)
-                    and name not in checks.get(requirement.value, [])):
-                checks.setdefault(requirement.value, []).append(name)
-    return checks
+def release_plan(verdict: dict) -> list[dict]:
+    """The release checks of a whole suite's `verdict` (`armada verdict <sha> --json`), a task each
+    requirement: the files whose rows name checks under it (`release_env`, as pytest resolved each test's
+    mark before any selection: executed.py), which the run's own tasks set aside, as the suite's environment
+    lacks it (`selected`). Its run's second job runs them (.github/workflows/ci.yml, `release`)."""
+    checks: dict[str, set[str]] = {}
+    for found in verdict["rows"]:
+        for requirement in found.get("release_env", {}):
+            checks.setdefault(requirement, set()).add(parsed_row(found["name"])[1])
+    return [{"release": requirement, "python": PYTHONS[0], "tests": " ".join(sorted(names))}
+            for requirement, names in sorted(checks.items())]
 
+
+def release(python: str, tests: list[str], requirement: str, out: Path) -> int:
+    """`requirement`'s release checks in `tests` (`release_plan`), as a whole suite's second job runs each:
+    its rows in `out`, each red one named, exit 1 on any."""
+    task(python, tests, "", out, session.DEADLINE, "off", release=requirement)
+    red = [found["name"] for found in json.loads(out.read_text())["rows"] if found["exitCode"]]
+    for name in red:
+        print(f"RED {name}")
+    return 1 if red else 0
 
 def node_of(case: ET.Element) -> str:
     """A JUnit case's pytest node id, as tests/test_durations.json keys it."""
@@ -923,7 +918,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
-                     **{key: cells for key, cells in counts.get(name, {}).items() if key == "whole_suite"},
+                     **{key: cells for key, cells in counts.get(name, {}).items()
+                        if key in ("whole_suite", "release_env")},
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:
@@ -1059,7 +1055,7 @@ def selected(command: list[str], network: bool, whole: bool = False, release: bo
     the cache's policy: a policy-off train runs every file, never a whole-suite cell (Main, 2026-10-28:
     train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks
     run in their own tasks alone (`release`), under a requirement the suite's environment lacks
-    (`released`)."""
+    (`release_plan`)."""
     at = command.index(session.SELECTION[1])
     checks = " and release_env" if release else " and not release_env"
     cells = checks + ("" if whole else " and not whole_suite")
@@ -1427,12 +1423,27 @@ def task_arguments(running: argparse.ArgumentParser) -> None:
         help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
     running.add_argument("--whole", choices=("0", "1"), default="0",
                          help="the plan's DEW_WHOLE_SUITE: 1 on the whole suite's run, which runs its cells")
-    running.add_argument("--release", default="",
-                         help="a release check's requirement (`released`): its marked tests alone, under it")
     running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
                          help="run the files under coverage.py, its data file in this directory")
+
+
+def release_arguments(planning: argparse.ArgumentParser, checking: argparse.ArgumentParser) -> None:
+    """The `release-plan` and `release` operations' arguments: a whole suite's second job (`release_plan`)."""
+    planning.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
+    checking.add_argument("--python", choices=PYTHONS, required=True)
+    checking.add_argument("--tests", required=True)
+    checking.add_argument("--requirement", required=True)
+    checking.add_argument("--out", type=Path, required=True)
+
+
+def releasing(args: argparse.Namespace) -> int:
+    """`release-plan`'s tasks printed, or `release`'s checks run (`release_plan`, `release`)."""
+    if args.operation == "release-plan":
+        print(json.dumps(release_plan(json.loads(args.verdict.read_text()))))
+        return 0
+    return release(args.python, args.tests.split(), args.requirement, args.out)
 
 
 def main() -> int:
@@ -1480,6 +1491,9 @@ def main() -> int:
     flagging.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
     flagging.add_argument("--new", type=Path, default=None,
                           help="the durations record the change is measured against: only the tests it lacks")
+    release_arguments(
+        operations.add_parser("release-plan", help="a whole suite verdict's release checks, a task each"),
+        operations.add_parser("release", help="one requirement's release checks; exit 1 on a red row"))
     recording = operations.add_parser("durations")
     recording.add_argument("verdict", type=Path, help="main's CI verdict: armada verdict <sha> --json")
     args = parser.parse_args()
@@ -1490,6 +1504,8 @@ def main() -> int:
         return 0
     if args.operation == "slow":
         return flagged(args.verdict, args.new)
+    if args.operation in ("release-plan", "release"):
+        return releasing(args)
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
         before = durations_record()
@@ -1540,7 +1556,7 @@ def main() -> int:
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage, whole=args.whole == "1", release=args.release)
+                coverage=args.coverage, whole=args.whole == "1")
 
 
 if __name__ == "__main__":

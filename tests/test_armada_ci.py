@@ -2007,27 +2007,38 @@ def a_wheel(root: Path, name: str, version: str) -> Path:
     return wheel
 
 
-def test_a_release_check_runs_on_the_whole_suite_alone_under_its_own_requirement(ci, tmp_path, monkeypatch):
+def test_a_release_check_runs_in_the_whole_suites_second_job_under_its_requirement(ci, tmp_path, monkeypatch,
+                                                                                   capsys):
     """A test marked release_env(<requirement>) checks a release's own code under a package pinned apart from
-    the suite's (2173: LFM3's needs transformers>=5.18.0, MiMo-V2's <=5.1.0): it runs on the whole suite's run
-    alone, in a task of its own whose pytest runs with the requirement over the suite's environment (uv's
-    overlay, torch and jax the suite's), under a row of its own beside its file's other tests; every other
-    run sets it aside, as the suite's environment lacks its requirement."""
+    the suite's (2173: LFM3's needs transformers>=5.18.0, MiMo-V2's <=5.1.0): every suite task sets it aside,
+    as the suite's environment lacks its requirement, and its file's row names it as pytest resolved its mark;
+    from a whole suite's rows, its second job plans a task each requirement, whose pytest runs with the
+    requirement over the suite's environment (uv's overlay, torch and jax the suite's), under a row of its
+    own beside its file's, and exits 1 on a red one."""
     interpreter(tmp_path, "3.12")
     pinned = a_wheel(tmp_path, "pinned", "2.0")
     written(tmp_path, {"test_release.py": "import pytest\n"
-                       f"@pytest.mark.release_env({str(pinned)!r})\n"
+                       "@pytest.mark.release_env(" + repr(str(pinned)) + ")\n"
                        "def test_under_the_release():\n    import pinned\n"
                        "    assert pinned.VERSION == '2.0'\n"
                        "def test_plain():\n    pass\n"})
     monkeypatch.setenv("UV_OFFLINE", "1")
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
-    (tmp_path / ".verdict").mkdir()
-    out = tmp_path / ".verdict/verdict.json"
-    monkeypatch.delenv("DEW_WHOLE_SUITE", raising=False)
-    rows = {found["name"]: found["exitCode"] for found in armada_task(ci, monkeypatch, out, "off")}
-    assert rows == {"3.12:tests/test_release.py": 0}, rows
     monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
-    rows = {found["name"]: found["exitCode"] for found in armada_task(ci, monkeypatch, out, "off")}
-    released = f"3.12:tests/test_release.py#release:{pinned}"
-    assert rows == {"3.12:tests/test_release.py": 0, released: 0}, rows
+    (tmp_path / ".verdict").mkdir()
+    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
+    assert [(found["name"], found["exitCode"], found.get("release_env")) for found in rows] == [
+        ("3.12:tests/test_release.py", 0, {str(pinned): ["tests/test_release.py::test_under_the_release"]})]
+    verdict = tmp_path / "verdict.json"
+    verdict.write_text(json.dumps({"rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "release-plan", str(verdict)])
+    assert ci.main() == 0
+    [item] = json.loads(capsys.readouterr().out)
+    assert item == {"release": str(pinned), "python": "3.12", "tests": "tests/test_release.py"}
+    out = tmp_path / ".verdict/release.json"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "release", f"--python={item['python']}",
+                                      f"--tests={item['tests']}", f"--requirement={item['release']}",
+                                      f"--out={out}"])
+    assert ci.main() == 0
+    assert [(found["name"], found["exitCode"]) for found in json.loads(out.read_text())["rows"]] == [
+        (f"3.12:tests/test_release.py#release:{pinned}", 0)]
