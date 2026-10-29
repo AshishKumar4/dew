@@ -136,13 +136,13 @@ FED_STEPS = 5
 FED_ROWS, FED_WIDTH = 64, 128
 
 
-def _fed_products(p, x, *, interpret, consumers: int = 2):
+def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0):
     """`p @ x` and `2 * p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on
     warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
     first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
     contraction, its blocks staged at `mosaic.swizzle_for`'s 64 bytes), and their sums meet before one
     store each, twice in one scope reused (`mosaic.summed_across`), in a scope after the rings'
-    (`Family.scoped` returns)."""
+    (`Family.scoped` returns); the walk's steps counted from `lo`, its ring counters from 0 (`first`)."""
     from dew.nn.kernels.templates import mosaic_sm90
     family, share = mosaic_sm90.FED, FED_ROWS // consumers
     swizzle = mosaic.swizzle_for(jnp.bfloat16, share)
@@ -154,8 +154,10 @@ def _fed_products(p, x, *, interpret, consumers: int = 2):
         wg = jax.lax.axis_index("wg")
 
         def walked(*, streams):
-            views = {'p': (p_gmem, lambda j: (0, j)), 'x': (x_gmem, lambda j: (j, 0))}
-            feed = family.fed(family.opened(streams), views, jnp.int32(0), jnp.int32(FED_STEPS), wg)
+            first = jnp.int32(lo)
+            # A plain walk's views take its own step indices, as a producer's stream gives them.
+            views = {'p': (p_gmem, lambda j: (0, j - first)), 'x': (x_gmem, lambda j: (j - first, 0))}
+            feed = family.fed(family.opened(streams), views, first, first + FED_STEPS, wg, first=first)
 
             def step(at, slots, carry, accumulators):
                 del at
@@ -165,7 +167,8 @@ def _fed_products(p, x, *, interpret, consumers: int = 2):
                                           rows.at[pl.ds(wg * share, share)], interpret)
                 return carry, (product,)
 
-            return family.walk(feed, ((step, 0, FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),), interpret)[1][0]
+            return family.walk(feed, ((step, first, first + FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),),
+                               interpret, first=first)[1][0]
 
         summed = family.scoped(walked, streams=allocated)
 
@@ -195,13 +198,14 @@ def _fed_expected(p, x):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("consumers", [1, 2])
-def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(consumers):
+@pytest.mark.parametrize(("consumers", "lo"), [(1, 0), (2, 0), (2, 3)])
+def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(consumers, lo):
     """Interpreted: consumers with no producer walk every step of one ring through slot reuse (five steps
     over two slots), each its share of a step's rows, and store their sum once, twice through one scratch:
-    exactly the product and its double."""
+    exactly the product and its double; a walk whose steps start past 0 (a later key block's), its ring
+    counters from its own first (`first`), alike."""
     p, x = _fed_operands()
-    got = _fed_products(p, x, interpret=INTERPRETED, consumers=consumers)
+    got = _fed_products(p, x, interpret=INTERPRETED, consumers=consumers, lo=lo)
     for value, expected in zip(got, _fed_expected(p, x), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
@@ -219,11 +223,11 @@ def test_the_fed_walk_lowers_for_an_h100(consumers):
 
 @ON_HOPPER
 @pytest.mark.gpu(reason="runs the toolkit's kernels compiled, on an H100")
-@pytest.mark.parametrize("consumers", [1, 2])
-def test_consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers):
+@pytest.mark.parametrize(("consumers", "lo"), [(1, 0), (2, 0), (2, 3)])
+def test_consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
     """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real."""
     p, x = _fed_operands()
-    got = jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers))(p, x)
+    got = jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, lo=lo))(p, x)
     for value, expected in zip(got, _fed_expected(p, x), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
