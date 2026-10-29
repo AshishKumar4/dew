@@ -27,7 +27,8 @@ from dew.data.text import Tokenizer
 from dew.decision.layout import DecisionInputs, Encoded, Labels
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
-from dew.nn.attention import NormalAttention, l2_normalized
+from dew.nn.attention import AttentionImpl
+from dew.nn.attention_blocks import NormalAttention
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, decoder_norm
 from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
@@ -36,6 +37,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
+from dew.nn.norms import l2_normalized
 from dew.nn.precision import accumulated, at_least_fp32, capped_logits, divided, scaled_logits, span_means
 from dew.nn.scatter import DROPPED, gather_positions
 from dew.registry import Record, component, from_record, import_path, record_fields
@@ -135,7 +137,7 @@ class DecisionHead(Head):
     dropout_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def decision_flops(self, lengths, questions, options) -> float:
@@ -219,7 +221,7 @@ class _RoutingLayer(nn.Module):
     feedforward: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"
+    attention_impl: AttentionImpl = "auto"
 
     @nn.compact
     def __call__(self, queries: jax.Array, memory: jax.Array, read: _Reading) -> jax.Array:
@@ -244,7 +246,7 @@ class _FieldLayer(nn.Module):
     feedforward: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"
+    attention_impl: AttentionImpl = "auto"
 
     @nn.compact
     def __call__(self, fields: jax.Array, memory: jax.Array, read: _Reading) -> jax.Array:
@@ -328,7 +330,7 @@ class JointSchemaHead(Head):
     feedforward: int = 4096
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"
+    attention_impl: AttentionImpl = "auto"
     reads_table: ClassVar[bool] = True
     pools_spans: ClassVar[bool] = True
     width_field: ClassVar[str] = "hidden_size"

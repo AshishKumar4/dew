@@ -460,7 +460,8 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     whole = taped([(0, 1, batch)])
     pooled = taped([(slot, 1, half) for slot, half in enumerate(halves)])
     split = taped([(part, 2, rows) for part, rows in enumerate(microbatches)])
-    assert set(whole) == {"condition dropout", "times", "noise", "noised input", "target", "loss weights"}
+    assert set(whole) == {"condition dropout", "unconditioned", "times", "noise", "noised input", "target",
+                          "model times", "loss weights"}
     for name in whole:
         for layout in (pooled, split):
             np.testing.assert_array_equal(np.asarray(layout[name]), np.asarray(whole[name]), err_msg=name)

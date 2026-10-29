@@ -73,6 +73,7 @@ from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
 from dew.mesh import batch_axes
+from dew.nn.attention import AttentionImpl
 from dew.nn.cross_attention import ContextEncoder
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import program
@@ -221,7 +222,7 @@ class Decide(SavedRunTask):
     @classmethod
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
-                        attention_impl: str = "auto") -> Self:
+                        attention_impl: AttentionImpl = "auto") -> Self:
         """Load a released Laya or joint-head checkpoint through `Pretrained.load` as a task.
 
         A Laya task uses the temperatures that Laya's agent reads from

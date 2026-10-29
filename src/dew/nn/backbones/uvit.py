@@ -14,7 +14,6 @@ from flax import linen as nn
 
 from dew.nn.dense import Dense, DenseGeneral
 
-from ..attention import LayerNorm
 from ..blocks import sinusoidal_time
 from ..conv import Conv
 from ..dit import (
@@ -29,6 +28,7 @@ from ..dit import (
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from ..mlp import GatedMLP
+from ..norms import LayerNorm
 from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
 from ..scan_orders import unscanned
