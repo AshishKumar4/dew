@@ -14,6 +14,7 @@ import numpy as np
 import optax
 import pytest
 from generation_support import lowers
+from jax.experimental.layout import Format, Layout
 from process_support import fresh
 
 from dew.inputs import Field, InputSpec
@@ -214,3 +215,9 @@ def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_d
     np.testing.assert_array_equal(keyed(x, flag), x * 2)
     np.testing.assert_array_equal(keyed(x, 1), x * 3)
     np.testing.assert_array_equal(named(x, 2.0), x * 3)
+    # An array in another layout is another program's argument, as jit keys it.
+    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    rows, columns = (jax.device_put(jnp.arange(6.0).reshape(2, 3), Format(Layout(order), sharding))
+                     for order in ((0, 1), (1, 0)))
+    doubled = program(lambda x: x * 2)
+    np.testing.assert_array_equal(doubled(rows), doubled(columns))
