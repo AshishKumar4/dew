@@ -176,6 +176,15 @@ class DecisionRunConfig(DecoderRunConfig):
     """How a context becomes the states its cross-attention reads
     (`DecisionModel.context_encoder`): the backbone's token table, or the
     backbone's own pass over it. With `context_layers` alone."""
+    def pinned(self) -> DecisionRunConfig:
+        """This run with its Hub sources at their commits (`RunConfig.pinned`), its backbone's `revision`
+        among them (`SourceReference.pinned`), so its record names the commit it read."""
+        from dew.interop.sources import SourceReference
+
+        run = super().pinned()
+        revision = SourceReference(self.pretrained, self.revision, self.subfolder).pinned().revision
+        return run if revision == self.revision else dataclasses.replace(run, revision=revision)
+
     def build_run(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the

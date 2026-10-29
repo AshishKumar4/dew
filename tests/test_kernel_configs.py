@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from generation_support import COMPILES_FOR_TPU, generations, lowers
+from jax.sharding import PartitionSpec
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
@@ -203,6 +204,51 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
                                     case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+class _Uncounted(grouped_matmul.MosaicGmm):
+    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
+    registers do not hold: a launch whose model misses."""
+
+    def registers(self, ba, config):
+        return 0
+
+
+@lowers("sm90")
+def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once():
+    """A compile that finds a template launch's kernel spilling (`report.compiled`, owner 10-29) refuses that
+    launch's config and lowers once more, where the derivation takes its next tile by its own rule; a
+    kernel spilling again is recorded and not stepped again. A paired SwiGLU forward whose model counts no
+    registers, compiled for a compile-only H100 on this CPU through ptxas."""
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_only_gpus
+
+    launch = _Uncounted()
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    placed = jax.sharding.NamedSharding(devices, PartitionSpec())
+    shapes = [jax.ShapeDtypeStruct(shape, dtype, sharding=placed)
+              for shape, dtype in (((4096, 2048), jnp.bfloat16), ((8, 2048, 4096), jnp.bfloat16),
+                                   ((8, 2048, 4096), jnp.bfloat16), ((8,), jnp.int32))]
+    traced = []
+
+    def lowered():
+        def forward(x, gate, up, sizes):
+            return launch(x, gate, sizes, paired=up, hooks=grouped_matmul.Hooks(
+                epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16", trans_rhs=False,
+                          interpret=False)
+        with tuning.seen() as seen:
+            program = jax.jit(forward).trace(*shapes).lower()
+        traced.append(seen.taken[0][0])
+        return program
+
+    with (report.refusals(), generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        report.compiled(lowered(), relower=lowered)
+        misses = report.misses()
+    first, stepped = traced
+    assert stepped != first
+    assert [(miss.config, miss.stepped) for miss in misses][:1] == [(first, True)]
+    assert all(miss.config == stepped and not miss.stepped for miss in misses[1:])
 
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),

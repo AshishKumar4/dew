@@ -219,6 +219,9 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], bus
                 continue
             layout, planned = found
             tile = dataclasses.replace(shaped(layout, block_m, block_n, step), stages=planned[0].stages)
+            if not candidate(tile):
+                # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
+                continue
             if tile.stages >= busy:
                 return tile, True
             fallback = fallback or tile

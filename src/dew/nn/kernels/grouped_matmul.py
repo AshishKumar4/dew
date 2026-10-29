@@ -47,7 +47,7 @@ from jax.extend import core as jax_core
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic, resources, tail as tail_of
+from .templates import base, bundles, cost, mosaic, report, resources, tail as tail_of
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import Product
 
@@ -731,9 +731,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         stages at least (a walk keeping one step's products in flight holds its slot while the next step's
         loads fill another), its blocks dividing the call's extents, its cluster at most the family's
         (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
-        copy's extent along its axis (`mosaic.Family.copy_extent`)."""
+        copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
+        spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
-        if family is None or config.cluster > family.cluster or not self._divides(ba, config):
+        if (family is None or config.cluster > family.cluster or not self._divides(ba, config)
+                or report.refused(self, ba, config)):
             return False
         dtype = ba.arguments['tokens'].dtype
         if (config.warpgroups > family.consumers or config.programs > family.programs(config.warpgroups)
@@ -889,7 +891,9 @@ class MosaicTgmm(_Mosaic):
         sliced = super().derived(partials, target)
         if sliced is None or (splits := self._splits(partials, sliced, target)) == 1:
             return tile
-        return dataclasses.replace(sliced, splits=splits)
+        split = dataclasses.replace(sliced, splits=splits)
+        # A split a compile of this process found spilling (`report.refused`) gives way to the call's own.
+        return tile if report.refused(self, ba, split) else split
 
     def _balances(self, ba, tile: mosaic_gpu.Tiles, target) -> bool:
         """Whether the call's last wave runs balanced over the programs (`tail.balanced`), which it
