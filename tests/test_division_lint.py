@@ -5,10 +5,8 @@ array: a call of jax.numpy, jax.lax, jax.nn, jax.random or jax.scipy, a method o
 arithmetic with one, or a parameter annotated as one. A Python number, or a name it cannot prove, is no
 finding."""
 
-import textwrap
-
 import pytest
-from tool_support import load
+from tool_support import lint_codes, load
 
 
 @pytest.fixture(scope="module")
@@ -41,21 +39,13 @@ DIVISIONS = {
 }
 
 
-def _codes(lint, tmp_path, parts, body):
-    path = tmp_path.joinpath(*parts)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(textwrap.dedent(body))
-    [module] = lint.collect(["/".join(parts)], tmp_path, "dew")
-    return [finding.code for finding in lint.check(module)]
-
-
 @pytest.mark.parametrize("case", list(DIVISIONS))
 def test_a_jax_array_divided_by_a_literal_no_power_of_two_is_reported_in_the_library(lint, case, tmp_path):
     body, count = DIVISIONS[case]
-    assert _codes(lint, tmp_path, ("src", "dew", "case.py"), body).count("SLOP024") == count
+    assert lint_codes(lint, tmp_path, ("src", "dew", "case.py"), body).count("SLOP024") == count
 
 
 def test_the_rule_reads_the_library_alone(lint, tmp_path):
     body = "import jax.numpy as jnp\ndef f(x):\n    return jnp.mean(x) / 3.0"
-    assert "SLOP024" not in _codes(lint, tmp_path, ("tests", "test_case.py"), body)
-    assert "SLOP024" not in _codes(lint, tmp_path, ("tools", "case.py"), body)
+    assert "SLOP024" not in lint_codes(lint, tmp_path, ("tests", "test_case.py"), body)
+    assert "SLOP024" not in lint_codes(lint, tmp_path, ("tools", "case.py"), body)
