@@ -94,8 +94,8 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     if config.staged_logits:
         # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
         # and the two turns that order its writes against their products' reads (`_staged_logits`).
-        scoped += [mosaic.staged((block_q, width), dtype, swizzle), plgpu.Barrier(num_arrivals=consumers),
-                   plgpu.Barrier(num_arrivals=consumers)]
+        scoped += [mosaic.staged((block_q, width), dtype, swizzle), family.schedule(consumers),
+                   family.schedule(consumers)]
     else:
         blocks["logits"] = ((block_q, width), dtype)
     swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
@@ -421,7 +421,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     s = family.product(k_smem, logits_slot.transpose((1, 0)), shape)
     if logits_stage is not None:
         # Its share of the staged queries read (the product waited): the next step's stage may be written.
-        plgpu.barrier_arrive(logits_stage[2])
+        walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
@@ -468,26 +468,25 @@ def _staged_logits(walk: _Backward, stage: tuple, q_slot, part: tuple):
     step's (`read`, which each arrives at past its product and once before its walk, and waits for once
     past it), and every consumer waits for it (`written`); the consumer's share of it, `part`'s rows."""
     ref, written, read, index = stage
-    family = walk.program.family
-    plgpu.barrier_wait(read)
+    family, consumers = walk.program.family, walk.consumers
+    family.turn(read, consumers, arrive=False)
 
     @pl.when(index == 0)
     def _():
         family.staged(by_power(family.tile_of(q_slot), walk.spec.prescale), ref)
 
-    plgpu.barrier_arrive(written)
-    plgpu.barrier_wait(written)
+    family.turn(written, consumers)
     first, count = part
     return ref if count == ref.shape[0] else ref.at[pl.ds(first, count)]
 
 
-def _logits_stage(allocated: list, index) -> tuple | None:
+def _logits_stage(family: mosaic.Family, consumers: int, allocated: list, index) -> tuple | None:
     """Consumer `index`'s staged logits' queries (`_staged_logits`' `stage`) from their `allocated` ref and
-    turns, its read turn's first arrival made (no step's stage is written before it); None where its
-    launch streams them."""
+    turns (`Family.schedule`), its read turn's first arrival made (no step's stage is written before it);
+    None where its launch streams them."""
     if not allocated:
         return None
-    plgpu.barrier_arrive(allocated[2])
+    family.turn(allocated[2], consumers, wait=False)
     return (*allocated, index)
 
 
@@ -847,7 +846,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             resident = k_smem.at[holder], v_smem.at[holder]
             adds = None if not walk.fused else (fused_stages[0].at[index], functools.partial(
                 _dq_added, walk, dq_ref, fused_stages[1], (row, head), index))
-            stage = _logits_stage(logits_stages, index)
+            stage = _logits_stage(family, consumers, logits_stages, index)
             step = functools.partial(_dkv_step, walk, resident, rows_of, coords_of, params_of, store_tiles,
                                      shares, part, stage, adds)
             # Its consumers' own loads of its query stream where they feed it (`Family.fed`).
@@ -859,7 +858,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                              first=lo if split else streamed[0])
             if stage is not None:
                 # The read turn's last phase, past the walk's last product, observed.
-                plgpu.barrier_wait(stage[2])
+                family.turn(stage[2], consumers, arrive=False)
             if not split:
                 # The tiles past this block's last reader its partner reads.
                 family.passed(streams, hi, streamed[1], first=streamed[0])
