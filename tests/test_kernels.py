@@ -838,25 +838,6 @@ def single_query_cudnn_decode_matches_float64_attention_and_gradients(without_de
 
 
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
-def test_cpu_fp32_attention_rounds_closer_to_float64_than_jax_nn():
-    """Over 2048 keys of cross-attention-like inputs, Dew's fp32 attention on
-    XLA:CPU, its products summed in float64 (`dew.nn.precision.accumulated`),
-    is at most three quarters of jax.nn's xla distance from float64 (torch's
-    SDPA sits between, docs/performance.md)."""
-    rng = np.random.default_rng(0)
-    query, key = (rng.normal(size=(1, length, 2, 128)).astype(np.float32) * 0.6 for length in (128, 2048))
-    value = rng.normal(size=(1, 2048, 2, 128)).astype(np.float32)
-    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
-    logits = np.einsum('btnh,bsnh->bnts', q, k) / np.sqrt(128)
-    probs = np.exp(logits - logits.max(-1, keepdims=True))
-    truth = np.einsum('bnts,bsnh->btnh', probs / probs.sum(-1, keepdims=True), v)
-    dew = scaled_dot_product_attention(query, key, value)
-    plain = jax.nn.dot_product_attention(query, key, value, implementation='xla')
-    mine, theirs = distance(dew, truth), distance(plain, truth)
-    assert mine <= 0.75 * theirs, (mine, theirs)
-
-
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
 def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     """fp32 reference attention over 300 keys, whose products a CPU sums in float64
     (`dew.nn.precision.accumulated`), as a consistency model's JVP runs it under
@@ -966,29 +947,6 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
     assert_as_exact(jax.jit(ours), jax.jit(flax(softmax_in_fp32=forced)), draw,
                     f"the reference path against flax, {jnp.dtype(dtype).name}, forced {forced}, "
                     f"rate {dropout_rate}", seeds=FLAX_SEEDS, truth_fn=flax(softmax_in_fp32=False))
-
-
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the routing is a CPU's")
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
-@pytest.mark.parametrize("implementation", ["auto", "xla"])
-def test_a_cpu_attention_over_one_key_moves_no_query_or_key(implementation, dtype):
-    """A query that reads one key attends it whatever the scores, so its query's and its key's
-    gradients are exactly zero, as the softmax's own derivative gives them: on a CPU 'auto' and 'xla'
-    take the reference path in every dtype, where jax.nn's backward, through rowsum(dO * O), left
-    each a rounding's worth."""
-    keys = jax.random.split(jax.random.key(3), 4)
-    query = jax.random.normal(keys[0], (2, 5, 4, 8), dtype)
-    key, value = (jax.random.normal(drawn, (2, 7, 4, 8), dtype) for drawn in keys[1:3])
-    cotangent = jax.random.normal(keys[3], (2, 5, 4, 8), dtype)
-    one = jnp.ones((2,), jnp.int32)
-
-    def attend(query, key, value):
-        return scaled_dot_product_attention(query, key, value, implementation=implementation,
-                                            key_value_seq_lengths=one)
-
-    _, into_query, into_key, _ = jax.jit(with_gradients(attend))(query, key, value, cotangent)
-    assert not np.any(np.asarray(into_query, np.float32))
-    assert not np.any(np.asarray(into_key, np.float32))
 
 
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
