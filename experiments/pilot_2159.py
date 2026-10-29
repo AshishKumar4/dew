@@ -12,16 +12,16 @@ import numpy as np  # noqa: E402
 import test_flow_matching as flow  # noqa: E402
 from learning_gate import units_for  # noqa: E402
 
-steps = int(sys.argv[1])
+steps, offset = int(sys.argv[1]), int(sys.argv[2]) if len(sys.argv) > 2 else 0
 source = open("tests/test_flow_matching.py").read()
 assert "jax.lax.fori_loop(0, 1500," in source
 flow_code = compile(source.replace("jax.lax.fori_loop(0, 1500,", f"jax.lax.fori_loop(0, {steps},"),
                     "tests/test_flow_matching.py", "exec")
 exec(flow_code, flow.__dict__)
 began = time.perf_counter()
-contrasts = flow.mixture_contrasts(np.arange(192))
+contrasts = flow.mixture_contrasts(np.arange(offset, offset + 192))
 seconds = time.perf_counter() - began
-print("RESULT", json.dumps({"steps": steps, "units": units_for(contrasts, "two-mode mixture"),
+print("RESULT", json.dumps({"steps": steps, "offset": offset, "units": units_for(contrasts, "two-mode mixture"),
                             "seconds_192": seconds,
                             "weakest": min((float(np.mean(v) / np.std(v, ddof=1)), k)
                                            for k, v in contrasts.items())}), flush=True)
