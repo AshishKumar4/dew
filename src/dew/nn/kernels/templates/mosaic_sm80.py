@@ -307,9 +307,12 @@ class Mma(mosaic.Family):
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         del streams, lo, hi, first, between
 
-    def loaded(self, copies) -> None:
+    def loaded(self, copies, *, issued: jax.Array | bool = True) -> None:
         # Through registers (no TMA before Hopper), in a layout of the tile's rank: a side vector's the
-        # accumulator's column vector layout, a tile's the left operand's.
+        # accumulator's column vector layout, a tile's the left operand's. Each caller its own: a shared
+        # `ref` loaded by one role would need a barrier past its stores that no caller here waits on.
+        if issued is not True:
+            raise NotImplementedError(f"{self.name} loads no shared copy for its roles")
         for view, ref, _ in copies:
             layout = self.lhs if len(ref.shape) > 1 else self.column
             ref[...] = plgpu.load(view, layout=layout, optimized=False)

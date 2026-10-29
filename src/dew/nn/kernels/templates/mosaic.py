@@ -160,11 +160,19 @@ def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) ->
             between()
 
 
-def loaded(copies) -> None:
+def loaded(copies, issued: jax.Array | bool = True) -> None:
     """Each `(view, ref, barrier)` copied whole into shared memory, every copy issued before any is
-    awaited."""
-    for view, ref, barrier in copies:
-        plgpu.copy_gmem_to_smem(view, ref, barrier)
+    awaited: issued where `issued` (a role loading `ref` for every role that shares it), awaited by every
+    caller."""
+    def issue():
+        for view, ref, barrier in copies:
+            plgpu.copy_gmem_to_smem(view, ref, barrier)
+
+    if isinstance(issued, bool):
+        if issued:
+            issue()
+    else:
+        pl.when(issued)(issue)
     for _, _, barrier in copies:
         plgpu.barrier_wait(barrier)
 
@@ -676,8 +684,29 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         consumer's (counted from `first`); `between()` after each step."""
 
     @abc.abstractmethod
-    def loaded(self, copies) -> None:
-        """Each `(view, ref, barrier)` copied whole into its shared-memory `ref`."""
+    def loaded(self, copies, *, issued: jax.Array | bool = True) -> None:
+        """Each `(view, ref, barrier)` copied whole into its shared-memory `ref` (its barrier one of
+        `load_barriers`'): where `issued` is a role's own (a traced predicate), that role loads `ref` for
+        every role that shares it and each caller awaits it; by default each caller loads its own."""
+
+    def load_barriers(self, count: int):
+        """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
+        allocations hold beside its streams (`scoped`, `resources.Scope`)."""
+        return plgpu.Barrier(num_barriers=count)
+
+    def schedule(self, consumers: int):
+        """The scoped allocation of `consumers`' turns on the tensor cores (`turn`): one barrier each of
+        them arrives at."""
+        return plgpu.Barrier(num_arrivals=consumers)
+
+    def turn(self, schedule, consumers: int, *, arrive: bool = True, wait: bool = True) -> None:
+        """A consumer's turn on the tensor cores through `schedule` (`schedule`'s allocation), where a
+        program has more than one: its arrival unless not `arrive`, then its wait for its partner's unless
+        not `wait` (FlashAttention-3's ping-pong of products and softmax)."""
+        if consumers > 1 and arrive:
+            plgpu.barrier_arrive(schedule)
+        if consumers > 1 and wait:
+            plgpu.barrier_wait(schedule)
 
     def output_staging(self, outputs: tuple, consumers: int) -> list:
         """The shared memory `persist` stages each of `outputs` (`(shape, dtype)`, a tile's) in, which a
@@ -1064,8 +1093,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         passed(tuple(streams.values()), lo, hi, first=first, between=between)
 
-    def loaded(self, copies) -> None:
-        loaded(copies)
+    def loaded(self, copies, *, issued: jax.Array | bool = True) -> None:
+        loaded(copies, issued)
 
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
         # An add still reading `smem` (`added`) done first, unless the caller defers and so waits itself

@@ -54,7 +54,7 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
               plgpu.SMEM((consumers, block_q, value_width), dtype),
               plgpu.SMEM((consumers, block_q, width // config.columns), jnp.float32),
               plgpu.SMEM((consumers, block_q), jnp.float32),
-              plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
+              family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
     return scoped, family.streams(blocks, stages, consumers)
 
@@ -84,7 +84,7 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         plgpu.SMEM((holders, block_k), jnp.float32)]
     scoped = [mosaic.staged((holders, block_k, width), dtype, swizzle),
               mosaic.staged((holders, block_k, value_width), dtype, swizzle), *outputs,
-              plgpu.Barrier(num_barriers=holders), plgpu.Barrier(num_barriers=holders)]
+              family.load_barriers(holders), family.load_barriers(holders)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, value_width), dtype)}
     if config.fused:
         # A fused launch's (`_dkv_step`'s `add_dq`): each consumer's score cotangents staged for dQ's
@@ -113,7 +113,7 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     scoped = [plgpu.SMEM((consumers, block_k, width), dtype), plgpu.SMEM((consumers, block_k, width), dtype),
               plgpu.SMEM((consumers, 2, block_q, block_k), dtype),
               plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
-              plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
+              family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
     return scoped, family.streams(blocks, stages, consumers)
 
@@ -652,22 +652,6 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
     walk.program.family.added(dq, view, walk.interpret, smem=out_smem.at[index, pl.ds(0, rows)])
 
 
-def _resident_loaded(family: mosaic.Family, copies, index, *, shared: bool) -> None:
-    """A dK/dV consumer's resident keys and values (`(view, ref, barrier)` each) loaded: `shared` between the
-    consumers (`split_queries`), the first loading them and each waiting; else its own."""
-    if not shared:
-        family.loaded(copies)
-        return
-
-    @pl.when(index == 0)
-    def _():
-        for view, ref, barrier in copies:
-            plgpu.copy_gmem_to_smem(view, ref, barrier)
-
-    for _, _, barrier in copies:
-        plgpu.barrier_wait(barrier)
-
-
 def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, index) -> None:
     """A dK/dV consumer's dK and dV (and its key gradients' sums) of its own keys to their `views`, through
     its `stages` (dK's output stage, dV's, the key gradients')."""
@@ -842,7 +826,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             keys_view = (row, pl.ds(k_first, block_k), lax.div(head, heads // kv_heads))
             copies = ((k_ref.at[keys_view], k_smem.at[holder], k_loaded.at[holder]),
                       (v_ref.at[keys_view], v_smem.at[holder], v_loaded.at[holder]))
-            _resident_loaded(family, copies, index, shared=split)
+            # Shared between the consumers (`split_queries`): the first loads them, each waits.
+            family.loaded(copies, issued=index == 0 if split else True)
             lo, hi, _ = program.readers(k_first, q_steps, spans_of, row)
             part = (index * count, count) if split else (0, block_q)
 
@@ -1003,7 +988,7 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
     scoped = [plgpu.SMEM((consumers, block_q, width), query.dtype),
               plgpu.SMEM((consumers, block_q, dout.shape[-1]), dout.dtype),
               plgpu.SMEM((consumers, block_q), jnp.float32),
-              plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
+              family.load_barriers(consumers), family.load_barriers(consumers)]
     rings = family.streams({"keys": ((block_k, width), key.dtype), "values": ((block_k, value.shape[-1]),
                                                                               value.dtype)},
                            program.stages, consumers)
