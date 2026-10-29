@@ -436,11 +436,13 @@ RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kd
 key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
 
 
-def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down():
-    """A compile that refused the 27B gated delta net's joined tiles on an H100 (`report.refused`: a kernel
-    spilled), the training call's and the forward's apart (`Tiles.forward`): the derivation gives the call
-    narrower tiles, which it takes (`fits`), where a refusal of the joined tiles matched none of the rules'
-    candidates and the call found none (`Unfitted`)."""
+@pytest.mark.parametrize('kernel', ['recurrence_states', 'recurrence_reverse'], ids=['forward', 'backward'])
+def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
+    """A compile that refused the 27B gated delta net's joined tiles on an H100 (`report.spilled`: a kernel
+    spilled), the training call's and the forward's apart (`Tiles.forward`): the derivation gives the call a
+    narrower training block, which it takes (`fits`), and the forward's too where a forward launch spilled,
+    which runs at both; a refusal of the joined tiles once matched none of the rules' candidates, and the
+    call found none (`Unfitted`)."""
     key_heads, value_heads, key_width, value_width, _ = RESOURCE_SHAPES['qwen3.5-27b-gdn']
     rows, length = 1, 4096
     keys = jax.ShapeDtypeStruct((rows, length, key_heads, key_width), jnp.bfloat16)
@@ -452,11 +454,13 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down():
     with report.refusals(), generation.assumed('sm90'):
         target = template.Mosaic.launched()
         first = template.MOSAIC.derived(bound, target)
-        report.refuse([(report._identity(template.MOSAIC, bound), first)])
+        report.refuse([(report._identity(template.MOSAIC, bound), first, {kernel})])
         stepped = template.MOSAIC.derived(bound, target)
         taken = template.MOSAIC.fits(bound, target)
-    assert first.forward is not None
-    assert stepped is not None and stepped.block_v < first.block_v and taken == (stepped,)
+    assert first.forward is not None and stepped is not None and taken == (stepped,)
+    assert stepped.block_v < first.block_v
+    narrower = (stepped.forward or stepped).block_v < first.forward.block_v
+    assert narrower == (kernel == 'recurrence_states')
 
 
 def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.RegisterModel:

@@ -176,10 +176,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
           where fla's port took 0.440 (JS-fwdtiles2-h100-a7ec9a134).
         None where no block is legal: the launch refuses the call.
 
-        A compile that refused the joined tiles (`report.refused`: a kernel of the launch spilled) steps the
-        tiles the spilling kernel ran at down to their next narrower value block: the training call's where
-        it is a backward launch's alone (`_spilled_backward`), else both, a forward launch running at the
-        training call's tiles and, where they differ, at the forward's (`Tiles.forward`)."""
+        A compile that refused the joined tiles (`report.spilled`: kernels of the launch spilled) steps the
+        tiles the spilling kernels ran at down to their next narrower value block: the training call's where
+        they are the fast backward's alone, else both, a forward launch running at the training call's tiles
+        and, where they differ, at the forward's (`Tiles.forward`)."""
         refused: dict[bool, set[int]] = {True: set(), False: set()}
         while True:
             trained = self._derive(ba, target, training=True, refused=refused[True])
@@ -187,20 +187,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 return None
             alone = self._derive(ba, target, training=False, refused=refused[False])
             joined = trained if alone in (None, trained) else dataclasses.replace(trained, forward=alone)
-            if not report.refused(self, ba, joined):
+            spilled = report.spilled(self, ba, joined)
+            if not spilled:
                 return joined
             refused[True].add(trained.block_v)
-            if alone is not None and not self._spilled_backward(ba, joined, target):
+            forward = {launch.name for launch in self._launches(ba, joined, target, backward=False)}
+            if alone is not None and any(kernel.startswith(name) for kernel in spilled for name in forward):
                 refused[False].add(alone.block_v)
-
-    def _spilled_backward(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles,
-                          target: generation.GpuTarget) -> bool:
-        """Whether every kernel a compile found spilling at `joined` (`report.misses`) is a launch of the
-        fast backward's alone, none of the forward's: False where no miss names one."""
-        forward = {launch.name for launch in self._launches(ba, joined, target, backward=False)}
-        spilled = [miss.kernel for miss in report.misses()
-                   if miss.op == type(self).__name__ and miss.config == joined]
-        return bool(spilled) and not any(kernel.startswith(name) for kernel in spilled for name in forward)
 
     def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, *, training: bool,
                 refused: Set[int] = frozenset()) -> mainloop.Tiles | None:
