@@ -38,11 +38,14 @@ which transformers parses the tokenizer.
 
 `consume` fetches and builds llama.cpp under ~/.cache/dew/upstream (cmake,
 ninja and a C++ compiler) and writes tests/fixtures/llama_cpp/reference.npz:
-the ids, llama.cpp's float32 logits, transformers' float64 ones, the
-SHA-256 of the export's config, generation config and weights (the weights
-by contents, as tools/lora_export_reference.py's `digest` hashes them), and
-the vocabulary the GGUF carries (its pieces by id, and its unknown,
-beginning and end ids), read back with the pinned gguf-py.
+the SHA-256 of the export's config, generation config and weights (the
+weights by contents, as tools/lora_export_reference.py's `digest` hashes
+them), and the vocabulary the GGUF carries (its pieces by id, and its
+unknown, beginning and end ids), read back with the pinned gguf-py; and
+recorded_logits.npz: llama.cpp's float32 logits over check 1's seeds of ids
+(`drawn_ids`), with transformers' float64 ones as their truth, its evidence
+alone kept with the truth's sketch (`record_case`'s summary), sized paired
+with Dew's logits.
 """
 
 from __future__ import annotations
@@ -64,6 +67,13 @@ FIELDS = {"vocab_size": 384, "emb_features": 64, "num_layers": 2, "num_heads": 4
           "mlp_features": 128, "max_seq_len": 64, "qk_norm": False, "tie_embeddings": False}
 SEED = 61
 IDS = (np.arange(3, 3 + 24 * 7, 7) % FIELDS["vocab_size"]).astype(np.int32)
+"""The length of a row llama.cpp computes the logits of every position of."""
+
+
+def drawn_ids(seed: int) -> dict[str, np.ndarray]:
+    """Check 1's draw: one row of IDS's length over the vocabulary, the same on every run."""
+    rng = np.random.default_rng([0x11A, seed])
+    return {"input_ids": rng.integers(0, FIELDS["vocab_size"], (1, IDS.size)).astype(np.int32)}
 DIGESTED = ("config.json", "generation_config.json", "model.safetensors")
 """The files Dew writes itself. The tokenizer files are transformers' own
 serialization, which the tokenizers release decides, so what the GGUF
@@ -253,6 +263,7 @@ def consume(directory: Path, converter_python: str) -> None:
     import transformers
     from transformers import AutoModelForCausalLM
 
+    from tools.recorded_references import provenance, record_case, save
     from tools.reference_source import saved_fixture
     from tools.torch_precision import float64
 
@@ -261,15 +272,24 @@ def consume(directory: Path, converter_python: str) -> None:
     export_dir, gguf = directory / "export", directory / "model-f32.gguf"
     subprocess.run([converter_python, str(source / "convert_hf_to_gguf.py"), str(export_dir),
                     "--outtype", "f32", "--outfile", str(gguf)], check=True)
-    (directory / "ids.bin").write_bytes(IDS.tobytes())
-    subprocess.run([str(program), str(gguf), str(directory / "ids.bin"), str(directory / "logits.bin")],
-                   check=True, capture_output=True)
-    theirs = np.fromfile(directory / "logits.bin", np.float32).reshape(1, IDS.size, FIELDS["vocab_size"])
     with float64():
         model = AutoModelForCausalLM.from_pretrained(export_dir, dtype=torch.float64,
                                                      attn_implementation="eager").eval()
-        with torch.no_grad():
-            truth = model(torch.from_numpy(IDS[None]).long()).logits.numpy()
+
+    def evaluate(inputs):
+        ids = inputs["input_ids"]
+        (directory / "ids.bin").write_bytes(ids[0].tobytes())
+        subprocess.run([str(program), str(gguf), str(directory / "ids.bin"), str(directory / "logits.bin")],
+                       check=True, capture_output=True)
+        theirs = np.fromfile(directory / "logits.bin", np.float32).reshape(1, ids.shape[1],
+                                                                            FIELDS["vocab_size"])
+        with float64(), torch.no_grad():
+            truth = model(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
+        return {"logits": theirs}, {"logits": truth}
+
+    ours, variables = export(directory / "dew")
+    recording = record_case("logits", drawn_ids, evaluate, store_inputs=False, summary=True,
+                            dew=lambda inputs: {"logits": ours.apply(variables, inputs["input_ids"])})
     converter = subprocess.run([converter_python, "-c", "import torch, transformers; "
                                 "print(torch.__version__, transformers.__version__)"],
                                check=True, capture_output=True, text=True).stdout.split()
@@ -277,11 +297,12 @@ def consume(directory: Path, converter_python: str) -> None:
             "converter transformers": converter[1], "truth transformers": transformers.__version__,
             "truth torch": torch.__version__}
     pieces, special = gguf_vocabulary(source, gguf)
-    arrays = {"ids": IDS[None], "llama_cpp.fp32": theirs, "transformers.fp64": truth, "gguf.pieces": pieces,
-              "gguf.special": special}
-    saved_fixture(FIXTURE / "reference.npz", arrays, meta)
-    gap = float(np.sqrt(np.mean((theirs - truth) ** 2)))
-    print(f"{FIXTURE / 'reference.npz'}: llama.cpp off float64 by {gap:.3g} (rms)")
+    saved_fixture(FIXTURE / "reference.npz", {"gguf.pieces": pieces, "gguf.special": special}, meta)
+    made = provenance("ggml-org/llama.cpp", COMMIT, "cpu",
+                      "PYTHONPATH=src python tools/llama_cpp_reference.py consume DIR CONVERTER_PYTHON",
+                      truth=f"transformers {transformers.__version__}")
+    print(save(FIXTURE / "recorded_logits.npz", {**recording, "logits.provenance": made},
+               reference="ggml-org/llama.cpp", license="MIT"))
 
 
 def main() -> None:

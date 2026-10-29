@@ -24,7 +24,7 @@ import numpy as np
 import optax
 import pytest
 from flax.traverse_util import unflatten_dict
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import TEXT_KEY
 from dew.data.dataset import DataPartition, Loader, replayed
@@ -243,12 +243,6 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
     assert_as_exact(dew, pulled, drawn_parameters(params), f"{kind} student gradient",
                     seeds=DISTILLATION_SEEDS["gradient"],
                     truth_fn=as_given(lambda params: pulled(params, "float64")))
-    # The fixture's own draw: the student's logits as near its float64 forward as the fixture's,
-    # which the reference generator wrote from the same forward.
-    outputs = student_forward(wide=False)(params["params"], ids)
-    with jax.enable_x64(new_val=True):
-        wide_logits = np.asarray(student_forward(wide=True)(widened(params["params"]), ids)[0])
-    assert_as_exact_as_the_reference(np.asarray(outputs[0]), arrays["student_logits"], wide_logits, "logits")
     truth = pulled(params)
     assert jax.tree.structure(dew(params)) == jax.tree.structure(truth)
     assert all(float(np.abs(leaf).max()) > 0 for leaf in jax.tree.leaves(truth))

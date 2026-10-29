@@ -12,10 +12,9 @@ The tool runs the function's own body, extracted from the pinned file with
 its `torch.compile` decorator dropped, on the CPU: vLLM's fused CUDA kernel
 is off (`VLLM_USE_FUSED_MOE_GROUPED_TOPK` false, no CUDA platform) and the
 top-k is sorted (`VLLM_BATCH_INVARIANT`), so it takes the torch path. For
-each case it records gate logits, the bias, the chosen experts and their
-weights: once in float32 and once in float64
-(`torch_precision.widened`, which widens the function's float32
-return cast), the truth tests/reference_error.py measures both from. Every
+each case it records gate logits, the bias and the chosen experts, which
+float32 and float64 (`torch_precision.widened`, which widens the function's
+float32 return cast) choose alike. Every
 token's k-th and (k+1)-th selection scores, and its groups' scores where it
 chooses among groups, are at least MARGIN apart in float64, so float32
 rounding cannot change a choice.
@@ -30,9 +29,15 @@ Cases (Kimi Linear's published router, then the other paths):
 - `unbiased`: 32 experts in 4 groups, 2 per token by their best score, 4
   chosen, softmax, renormalized, no bias.
 
+`--record` records instead each case's weights in float32 and float64 over
+check 1's seeds of gate logits and biases drawn so (`drawn`), sized paired
+with Dew's `Router` (tests/test_router_source.py `routed`), as
+tests/fixtures/router/recorded_vllm.npz.
+
 Run with the Dew test environment's torch, on CPU:
 
     python tools/vllm_router_reference.py OUTPUT.npz
+    PYTHONPATH=src:tools python tools/vllm_router_reference.py --record
 """
 
 import contextlib
@@ -95,9 +100,70 @@ def margins(logits: np.ndarray, bias: np.ndarray, config: dict) -> np.ndarray:
     return np.min(gaps, 0)
 
 
-def main():
+RECORDING = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "router" / "recorded_vllm.npz"
+
+
+def drawn(case: str, seed: int) -> dict[str, np.ndarray]:
+    """Check 1's draw of `case`: its balancing bias (zeros where it has none) and TOKENS rows of gate
+    logits, each kept only where its float64 selection margins are at least MARGIN (`margins`), so
+    float32 rounding cannot change a choice; the same on every run."""
+    config = CASES[case]
+    rng = np.random.default_rng([SEED, list(CASES).index(case), seed])
+    experts = config["experts"]
+    bias = (rng.standard_normal(experts) * 0.05 if config["bias"] else np.zeros(experts)).astype(np.float32)
+    rows = []
+    while len(rows) < TOKENS:
+        row = (rng.standard_normal((1, experts)) * 2).astype(np.float32)
+        if margins(row, bias, config)[0] >= MARGIN:
+            rows.append(row[0])
+    return {"logits": np.stack(rows), "bias": bias}
+
+
+def routed(route, case: str, inputs: dict[str, np.ndarray], dtype) -> tuple[np.ndarray, np.ndarray]:
+    """`grouped_topk`'s weights and chosen experts for `case` over `inputs` at `dtype`, its float32
+    return cast widened in float64 (`torch_precision.widened`)."""
     from torch_precision import widened
 
+    config = CASES[case]
+    arguments = {key: config[key] for key in ("topk", "renormalize", "num_expert_group", "topk_group",
+                                              "scoring_func", "routed_scaling_factor")}
+    gate = torch.from_numpy(inputs["logits"]).to(dtype)
+    correction = torch.from_numpy(inputs["bias"]).to(dtype) if config["bias"] else None
+    with widened() if dtype == torch.float64 else contextlib.nullcontext():
+        weights, ids = route(gate, gate, **arguments, e_score_correction_bias=correction)
+    return weights.numpy(), ids.numpy()
+
+
+def record() -> None:
+    """Each case's weights over check 1's seeds (`record_case`), sized paired with Dew's router."""
+    from recorded_references import provenance, record_case, save
+    from test_router_source import routed as ours
+
+    route = grouped_topk()
+    arrays = {}
+    for case in CASES:
+        dewed = ours(case)
+
+        def evaluate(inputs, case=case):
+            return ({"weights": routed(route, case, inputs, torch.float32)[0]},
+                    {"weights": routed(route, case, inputs, torch.float64)[0]})
+
+        def dew(inputs, dewed=dewed):
+            return {"weights": dewed(inputs)["weights"]}
+
+        arrays.update(record_case(case, lambda seed, case=case: drawn(case, seed), evaluate,
+                                  store_inputs=False, dew=dew))
+    made = provenance(f"{REPO} grouped_topk", COMMIT, "cpu",
+                      "PYTHONPATH=src:tools python tools/vllm_router_reference.py --record",
+                      torch=torch.__version__)
+    print(save(RECORDING, {**arrays, "provenance": made}, reference=f"{REPO} grouped_topk",
+               license="Apache-2.0"))
+
+
+def main():
+    if sys.argv[1:] == ["--record"]:
+        record()
+        return
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
     route = grouped_topk()
@@ -115,22 +181,18 @@ def main():
         logits = np.stack(rows)
         arguments = {key: config[key] for key in ("topk", "renormalize", "num_expert_group", "topk_group",
                                                   "scoring_func", "routed_scaling_factor")}
-        record = {"logits": logits, "bias": bias}
-        for precision, dtype in (("fp32", torch.float32), ("fp64", torch.float64)):
-            gate = torch.from_numpy(logits).to(dtype)
-            correction = torch.from_numpy(bias).to(dtype) if config["bias"] else None
-            with widened() if dtype == torch.float64 else contextlib.nullcontext():
-                weights, ids = route(gate, gate, **arguments, e_score_correction_bias=correction)
-            record[f"{precision}.weights"], record[f"{precision}.ids"] = weights.numpy(), ids.numpy()
-        if not np.array_equal(record["fp32.ids"], record["fp64.ids"]):
+        stored = {"logits": logits, "bias": bias}
+        chosen = {precision: routed(route, case, stored, dtype)[1]
+                  for precision, dtype in (("fp32", torch.float32), ("fp64", torch.float64))}
+        if not np.array_equal(chosen["fp32"], chosen["fp64"]):
             raise SystemExit(f"{case}: float32 and float64 choose differently")
+        stored["fp32.ids"] = chosen["fp32"]
         if config["bias"]:
             unbiased = dict(arguments, e_score_correction_bias=None)
             _, plain = route(torch.from_numpy(logits), torch.from_numpy(logits), **unbiased)
-            changed = int((np.sort(plain.numpy(), -1) != np.sort(record["fp32.ids"], -1)).any(-1).sum())
+            changed = int((np.sort(plain.numpy(), -1) != np.sort(stored["fp32.ids"], -1)).any(-1).sum())
             print(f"{case}: the bias changes the choice of {changed} of {TOKENS} tokens")
-        assert record["fp64.weights"].dtype == np.float64, case
-        arrays.update({f"{case}/{key}": value for key, value in record.items()})
+        arrays.update({f"{case}/{key}": value for key, value in stored.items()})
     meta = {"repo": REPO, "commit": COMMIT, "path": PATH, "sha256": DIGEST, "cases": CASES,
             "margin": MARGIN, "torch": torch.__version__}
     saved_fixture(Path(sys.argv[1]), arrays, meta)

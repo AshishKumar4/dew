@@ -218,7 +218,7 @@ def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_
         Pretrained.load(directory, dtype="float32")
 
 
-BIASED_SEEDS = 0
+BIASED_SEEDS = 8
 """The biased MLPs' declared draws of ids against the reference's logits (check 1), sized by `seeds_for`
 paired with Dew's logits on the CPU."""
 
@@ -716,7 +716,7 @@ def test_the_llama3_ramp_matches_the_reference_frequencies(head_dim, theta, ramp
     assert np.sum(scaled != plain) >= head_dim // 4
 
 
-FP32_SEEDS = 0
+FP32_SEEDS = 8
 """The hybrid and classic families' declared draws of ids against transformers' logits (check 1), sized by
 `seeds_for` paired with Dew's logits on the CPU."""
 
@@ -762,7 +762,7 @@ def causal_logits(model, ids):
     return model(ids, use_cache=False).logits
 
 
-HYBRID_SEEDS = 0
+HYBRID_SEEDS = 8
 """The Nemotron-H exports' declared draws of ids against transformers' logits over the fixture (check 1),
 sized by `seeds_for` paired with the export's logits on the CPU."""
 
@@ -1473,7 +1473,7 @@ def nemotron_step_source(directory, *, seed: int = 7):
     return logits
 
 
-STEP_SEEDS = 0
+STEP_SEEDS = 8
 """The prediction step's declared draws of ids against the composed reference's logits (check 1), sized
 by `seeds_for` paired with Dew's step on the CPU."""
 

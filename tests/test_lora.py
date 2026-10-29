@@ -1103,7 +1103,7 @@ def _moved_b(tuned, seed: int):
                             if path[-1].key == "lora_B" else leaf), tuned.variables)
 
 
-PIPELINE_SEEDS = {"flux": 0, "sd3": 0, "sd": 0}
+PIPELINE_SEEDS = 8
 """Each pipeline's declared draws of sampling keys against the source's sample (check 1), sized by
 `seeds_for` paired with the adapted sample on the CPU."""
 
@@ -1145,7 +1145,7 @@ def test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source(family, p
 
     wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64),
                                variables=widened(source.variables))
-    assert_as_exact(sampled(tuned), sampled(source), draw, family, seeds=PIPELINE_SEEDS[family],
+    assert_as_exact(sampled(tuned), sampled(source), draw, family, seeds=PIPELINE_SEEDS,
                     truth_fn=as_given(lambda inputs: np.asarray(sampled(wide)(inputs))))
     with pytest.raises(ValueError):
         source.adapt(LoRA(rank=2, modules=("q_proj",)), key=0)
@@ -1248,7 +1248,7 @@ def _written_as_read(name: str, source, variables, directory: Path) -> Adapter:
     return LoRA.load(source.model, source.variables, EXPORTS / name, layouts=source.layouts)
 
 
-EXPORT_SEEDS = 0
+EXPORT_SEEDS = {"llama": 16, "llama-rslora": 64, "llama-patterns": 16}
 """Each written adapter's declared draws of ids against PEFT's adapted and merged logits (check 1), sized
 by `seeds_for` paired with Dew's logits on the CPU."""
 
@@ -1292,7 +1292,7 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
     variables = adapter.variables
     assert_as_exact(lambda ids: {"adapted": adapter.model.apply(variables, ids),
                                  "merged": decoder.model.apply(adapter.merge(variables), ids)},
-                    theirs, draw, f"{name} logits", seeds=EXPORT_SEEDS, truth_fn=truth)
+                    theirs, draw, f"{name} logits", seeds=EXPORT_SEEDS[name], truth_fn=truth)
     (ids,) = draw(0)
     with peft.disable_adapter(), torch.no_grad():
         plain = peft(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
