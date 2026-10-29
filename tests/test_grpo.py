@@ -266,7 +266,7 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
     rollout = PromptRollout(reward=f"{rl_support.__name__}:completion_length", groups=2, max_new_tokens=4)
     model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
                                                "dtype": "float32"})
-    default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=4),
+    default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),
                           tokenizer=tokenizer, objective=ObjectiveConfig("grpo"), rollout=rollout,
                           model=model, max_new_tokens=0)
     config = LMRunConfig.cli(["--trainer.steps", "1", "--trainer.name", "grpo", "--trainer.checkpoint-dir",
