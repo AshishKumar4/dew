@@ -4,6 +4,8 @@ While `Trainer.fit` runs, evaluation scores a separate validation split. The obj
 
 Evaluation runs only when the dataset has a validation split and `fit` has `eval_every` set. Each pass records the objective's validation loss (`val/loss`) where the objective defines one, so a cadence alone is enough for an LM, a diffusion or a JEPA objective. `metrics` that read the objective's artifacts, and `preview=True` with a tracker, add to it. `fit` refuses a cadence only when nothing would read the pass: an objective with no validation loss (Flow-GRPO's), no metrics, no preview a tracker receives, no checkpointer, and no `restore_best=True` keeping the step of lowest validation loss. Asking for a validation loss an objective does not define is refused on its own. Passing `metrics` alone does not turn evaluation on.
 
+A split scored as an `EvalSuite` keeps its own cadence (`every`), so a cheap split can score often and a costly one rarely. A recorded run names each split's cadence in `val_every`, `--val-every '{"test": "25%"}'`, and every split it does not name scores at `--trainer.eval-every`.
+
 ## Example
 
 The example trains a tiny next-token decoder on synthetic token rows and measures perplexity on a different row. It needs no tokenizer, downloaded weights or accelerator.
