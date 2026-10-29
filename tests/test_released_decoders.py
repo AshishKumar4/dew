@@ -68,4 +68,5 @@ def test_diffucoder_reads_through_the_dream_reader_as_dream():
     whose logits Dream's own code qualifies (tests/test_hf_decoders.py, dream-tiny)."""
     diffucoder = json.loads((FIXTURES / "diffucoder-7b" / "config.json").read_text())
     dream = json.loads((FIXTURES / "dream-7b" / "config.json").read_text())
-    assert translate_config(diffucoder) == translate_config({**dream, "torch_dtype": diffucoder["torch_dtype"]})
+    stored = {**dream, "torch_dtype": diffucoder["torch_dtype"]}
+    assert translate_config(diffucoder) == translate_config(stored)
