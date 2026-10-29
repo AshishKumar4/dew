@@ -56,7 +56,7 @@ def stood_in(client):
     held = {name: module for name, module in sys.modules.items() if name.split(".")[0] == "dew"}
     try:
         client.install()
-        yield
+        yield held
     finally:
         for name in [name for name in sys.modules if name.split(".")[0] == "dew"]:
             del sys.modules[name]
@@ -91,22 +91,41 @@ def test_the_live_sampler_cell_runs_whole_through_the_stand_ins_as_dew_runs_it(s
 
     def shared(payload):
         asked.append(payload["op"])
-        request = service.validate(payload)
-        if payload["op"] == "describe":
-            return native.describe(request)
-        return native.sample(request, lambda _: None)
+        with as_service(real):
+            request = service.validate(payload)
+            if payload["op"] == "describe":
+                return native.describe(request)
+            return native.sample(request, lambda _: None)
 
     monkeypatch.setattr(client, "request", shared)
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
     cell = (SITE / "src" / "data" / "sampler.py").read_text()
     namespace = {}
-    with stood_in(client):
+    with stood_in(client) as real:
         exec(compile(cell, "sampler.py", "exec"), namespace)
     assert asked == ["describe", "sample"]
     assert (namespace["pipe"].repo, namespace["pipe"].revision) == (native.repo, native.revision)
     native_namespace = {"dew": SimpleNamespace(pipeline=lambda *args, **kwargs: pipe)}
     exec(compile(cell, "sampler.py", "exec"), native_namespace)
     np.testing.assert_array_equal(namespace["result"].host().images, native_namespace["result"].host().images)
+
+
+@contextlib.contextmanager
+def as_service(held):
+    """Dew's own modules (`held`, those `stood_in` put aside) for the block, as the shared model process holds
+    them, under a cell's stand-ins, which take theirs back after it: the service runs in a process of its
+    own."""
+    stood = {name: module for name, module in sys.modules.items() if name.split(".")[0] == "dew"}
+    finders = list(sys.meta_path)
+    sys.modules.update(held)
+    sys.meta_path[:] = [finder for finder in finders if type(finder).__name__ != "Elsewhere"]
+    try:
+        yield
+    finally:
+        for name in [name for name in sys.modules if name.split(".")[0] == "dew"]:
+            del sys.modules[name]
+        sys.modules.update(stood)
+        sys.meta_path[:] = finders
 
 
 def service_records():
