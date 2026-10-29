@@ -4,9 +4,9 @@
     python tools/benchmark_augmentation.py --output augmentation.json
     python tools/benchmark_augmentation.py --policies none flip --seeds 0 --steps 50 --output smoke.json
 
-Oxford Flowers 102 (the Hub's copy at a pinned commit, its standard splits): a small residual network trains on
-the 1,020 training images at 64 pixels from fresh weights, under each policy in turn, and is scored on the 6,149
-test images, resized and never augmented. The policies are the device augmentation `presets.images` runs
+Oxford Flowers 102 (the Hub's copy at a pinned commit, its standard splits): a small residual network trains
+on the 1,020 training images at 64 pixels from fresh weights, under each policy in turn, and is scored on the
+6,149 test images, resized and never augmented. The policies are the device augmentation `presets.images` runs
 (`images.DeviceAugment`): none, a horizontal flip, the flip with a random crop of 35-100% of the image's area
 (staged at 80 pixels), and those with colour jitter (`augment=True`'s three). Each policy trains under every
 seed, which draws the weights and the order and augmentation of the data alike, so the spread across seeds is
@@ -80,7 +80,8 @@ def split(name: str) -> Hub:
 
 
 def trained(policy: str, seed: int, steps: int) -> tuple[float, float]:
-    """Test top-1 accuracy of the classifier trained `steps` under `policy` and `seed`, and the run's seconds."""
+    """Test top-1 accuracy of the classifier trained `steps` under `policy` and `seed`, and its training's
+    seconds."""
     augment = POLICIES[policy]
     train = split("train").shuffle(seed=seed).repeat().pipe(
         presets.images, SIZE, batch=BATCH, augment=augment or False,
@@ -98,7 +99,8 @@ def trained(policy: str, seed: int, steps: int) -> tuple[float, float]:
     predict = jax.jit(lambda variables, image: jnp.argmax(model.apply(variables, image), axis=-1))
     right = total = 0
     for batch in test:
-        right += int(np.sum(np.asarray(predict(state.variables, batch["image"])) == np.asarray(batch["label"])))
+        predicted = np.asarray(predict(state.variables, batch["image"]))
+        right += int(np.sum(predicted == np.asarray(batch["label"])))
         total += len(batch["label"])
     return right / total, seconds
 
@@ -129,7 +131,8 @@ def main(args: Args) -> None:
               "jax": version("jax"), "python": platform.python_version(), "runs": runs, "summary": summary}
     args.output.write_text(json.dumps(record, indent=1) + "\n")
     for policy, found in summary.items():
-        print(f"{policy}: {found['mean']:.4f}" + (f" ± {found['std']:.4f}" if found["std"] is not None else ""))
+        spread = f" ± {found['std']:.4f}" if found["std"] is not None else ""
+        print(f"{policy}: {found['mean']:.4f}{spread}")
 
 
 if __name__ == "__main__":
