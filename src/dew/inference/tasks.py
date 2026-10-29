@@ -476,7 +476,7 @@ def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
     return {**record, "model": current(record["model"])}
 
 
-def _declared_decoders(name: str, fields: dict[str, object]) -> dict[str, object]:
+def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, object]:
     """The fields of the component class `name` with each decoder its fields declare
     (`dew.registry.declared_type`) and record as their fields alone translated (`_decoder_fields`)."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -490,7 +490,7 @@ def _declared_decoders(name: str, fields: dict[str, object]) -> dict[str, object
             for field, value in fields.items()}
 
 
-def _decoder_fields(fields: Mapping[str, object]) -> dict[str, object]:
+def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
     """A decoder's fields and its layer kinds' with an earlier YaRN field read as their rope scaling
     (`_one_scaling`)."""
     kinds = fields.get("kinds")
