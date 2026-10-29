@@ -561,8 +561,9 @@ def test_a_clocked_run_whose_split_is_planned_compiles_one_step():
     optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
     Trainer(Echoed(), optim, key=0, tracker=tracker).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
                                                          log_every=1)
-    assert len(tracker.scalars) > 1
-    assert sum("train/compile_s" in scalars for _, scalars in tracker.scalars) == 1
+    # `train/compiles` counts the step's compiles over the whole fit (`Interval.compiles`).
+    logged = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
+    assert len(logged) > 1 and logged[-1]["train/compiles"] == 1
 
 
 def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():
@@ -821,7 +822,8 @@ def test_a_clocked_run_of_a_warmup_as_a_share_trains_and_records_it_as_written(s
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
     assert started.cadences["warmup_steps.learning_rate"] == "25%"
     assert started.target_steps is None and started.examples == CLOCKED_RECORDS
-    consumed = [scalars["train/examples_consumed"] for _, scalars in tracker.scalars]
+    consumed = [scalars["train/examples_consumed"] for _, scalars in tracker.scalars
+                if "train/loss" in scalars]
     assert consumed == sorted(consumed) and consumed[-1] == CLOCKED_RECORDS
 
 
