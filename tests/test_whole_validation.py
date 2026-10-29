@@ -136,11 +136,13 @@ EVALUATED = sorted(set(objectives) - ROLLOUT)
 """Every registered objective with an evaluation loss."""
 
 POOLED = (("block_diffusion", "distillation", "lm", "mean_flow", "masked_diffusion", "supervised"),
-          ("guidance_distillation",), ("ladd", "decision", "shortcut"), ("jepa", "diffusion", "rcm", "dpo"))
-"""`EVALUATED` in the parts `tests/test_multiprocess.py` runs its passes on a pool in, each about as long as
-the others, by each objective's seconds alone on one process (guidance distillation's Flux about 119,
-LADD's 47, JEPA's 40, the decision objective's 36, the rest under 30), so no part passes CI's group
-target; the first, the lightest, also scores `Perplexity`."""
+          ("guidance_distillation",), ("ladd",), ("decision", "shortcut"), ("jepa", "dpo"), ("diffusion", "rcm"))
+"""`EVALUATED` in the parts `tests/test_multiprocess.py` runs its passes on a pool in, so no part passes
+CI's group target on a pool's own seconds, which its two processes' start and compiles dominate: split
+four ways (the second part guidance distillation's Flux alone, about 119 s on one process), the parts
+took 95, 117, 127 and 124 s (verdict 10-29), and LADD's 47 s on one process, JEPA's 40 and the decision
+objective's 36 each now share a pool with one lighter objective at most. The first, the lightest, also
+scores `Perplexity`."""
 
 
 def evaluated(name: str, windows, tmp_path) -> dict:
