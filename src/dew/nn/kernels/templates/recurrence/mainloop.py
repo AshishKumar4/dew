@@ -2070,10 +2070,12 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
     steps = chunks / sequences.shape[0]
     work = Work(2 * 3 * CHUNK * width * walked_width * steps, steps)
     # The memory's gradient carried, its key slices in fp32, and the one it gives the chunk before as it is
-    # summed; a step's corrected values' two gradients and its local one beside the output's gradient, a
-    # memory slice as an operand, and the stored tiles' casts.
+    # summed; a step's two fp32 tiles at once, the corrected values' gradient beside the local one it adds
+    # or the decayed output's gradient read after it (`algebra.reverse_carried`: the local one folds into it
+    # before the read forms), beside the output's gradient, a memory slice as an operand, and the stored
+    # tiles' casts.
     held_tiles = _Held(carried=[_f32(width, bv)] * 2, phases=(
-        [_f32(CHUNK, bv)] * 3 + _held(given, CHUNK, bv)
+        [_f32(CHUNK, bv)] * 2 + _held(given, CHUNK, bv)
         + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(held, CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
     final_landing, after = _final_landing(call, bv)

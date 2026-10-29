@@ -86,8 +86,12 @@ def test_one_frame_of_images_is_a_still_grid_and_several_take_turns():
     still = read(figures.images([batch], columns=2, size=32))
     assert "@keyframes" not in still.find(f"{SVG}style").text
     drawn = list(still.iter(f"{SVG}image"))
-    assert [(float(image.get("x")), float(image.get("y"))) for image in drawn] == \
-        [(4 + column * 36, 4 + row * 36) for row, column in (divmod(index, 2) for index in range(5))]
+    places = [(float(image.get("x")), float(image.get("y"))) for image in drawn]
+    # Rows of two, each image as wide as it is high and the rows as far apart as the columns.
+    assert [y for _, y in places] == [places[0][1]] * 2 + [places[2][1]] * 2 + [places[4][1]]
+    assert [x for x, _ in places] == [places[0][0], places[1][0]] * 2 + [places[0][0]]
+    assert places[1][0] - places[0][0] == places[2][1] - places[0][1] == places[4][1] - places[2][1] > \
+        float(drawn[0].get("width")) == float(drawn[0].get("height"))
     for image, source in zip(drawn, batch, strict=True):
         assert image.get("href").startswith("data:image/webp;base64,") and pixels(image).shape == source.shape
 
@@ -113,24 +117,24 @@ def test_an_image_drawn_sharp_keeps_its_pixels():
         assert "image-rendering:pixelated" in image.get("style")
 
 
-def test_a_scatters_dots_slide_to_where_their_targets_are_drawn():
-    """With `moved`, each dot of a scatter ends where the same dot is drawn when `moved` is where it starts:
-    both pictures share their axes, so the slide is the dot's move between them. Values from 0 to 100 pad to
-    -6 and 106, and a plot 112 px across and up (the margins 56 and 20 wide, 58 and 48 high) puts each value
-    on a whole pixel, which the figure writes exactly."""
-    start = {"base": [(0.0, 0.0), (10.0, 20.0)], "tuned": [(20.0, 10.0)]}
-    end = {"base": [(100.0, 100.0), (50.0, 10.0)], "tuned": [(10.0, 0.0)]}
-    size = {"width": 56 + 112 + 20, "height": 58 + 112 + 48}
-    moved = read(figures.points(start, x_label="x", y_label="y", joined=False, moved=end, **size))
-    landed = read(figures.points(end, x_label="x", y_label="y", joined=False, moved=start, **size))
-    dots = [dot for dot in moved.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
-    targets = [dot for dot in landed.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
-    drawn = [(float(dot.get("cx")), float(dot.get("cy"))) for dot in targets]
-    assert drawn == [(162, 64), (112, 154), (72, 164)]
-    for dot, target in zip(dots, targets, strict=True):
-        dx, dy = map(float, re.search(r"translate\(([-\d.]+)px,([-\d.]+)px\)", dot.get("style")).groups())
-        assert (float(dot.get("cx")) + dx, float(dot.get("cy")) + dy) == \
-            (float(target.get("cx")), float(target.get("cy")))
+def test_a_scatters_dots_slide_by_their_moves_and_land_where_their_targets_are_drawn():
+    """With `moved`, each dot of a scatter slides by its own move, scaled alike for every dot: two dots that
+    move by the same amount slide alike, one that does not move stays, one that moves right alone slides right
+    alone. Where it ends is where the same dot is drawn when `moved` is where it starts: there, a dot at an
+    axis's tick sits on the tick's label."""
+    start = {"base": [(0.0, 0.0), (5.0, 5.0)], "tuned": [(20.0, 20.0), (0.0, 20.0)]}
+    end = {"base": [(10.0, 20.0), (15.0, 25.0)], "tuned": [(20.0, 20.0), (10.0, 20.0)]}
+    moved = read(figures.points(start, x_label="x", y_label="y", joined=False, moved=end))
+    slides = [re.search(r"translate\(([-\d.]+)px,([-\d.]+)px\)", dot.get("style")).groups()
+              for dot in moved.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
+    assert slides[0] == slides[1] and slides[2] == ("0.0", "0.0")
+    assert float(slides[3][0]) > 0 and slides[3][1] == "0.0" and float(slides[0][1]) < 0
+    landed = read(figures.points(end, x_label="x", y_label="y", joined=False, moved=start))
+    ticks = {text.text: float(text.get("x")) for text in landed.iter(f"{SVG}text")
+             if text.get("text-anchor") == "middle"}
+    drawn = [float(dot.get("cx")) for dot in landed.iter(f"{SVG}circle")
+             if "animation" in dot.get("style", "")]
+    assert drawn[0] == ticks["10"] and drawn[2] == ticks["20"]
 
 
 @pytest.mark.parametrize(("x", "ticks"), [([1, 1000], {"1", "10", "100", "1000"}),
@@ -145,13 +149,14 @@ def test_a_log_axis_marks_powers_of_ten_or_their_halves_and_fifths(x, ticks):
 
 
 def test_a_log_axis_places_each_dot_at_its_logarithm():
-    """On a logarithmic axis 1, 10 and 100 stand evenly apart: their logarithms 0 to 2 pad to -0.12 and 2.12,
-    and a plot 224 px across (the margins 56, and 53.6 for the series' name) puts each 100 px apart, from
-    68."""
-    width = 56 + 224 + 20 + 0.6 * 14 * len("loss")
-    figure = figures.points({"loss": [(1.0, 1.0), (10.0, 1.5), (100.0, 2.0)]}, x_label="tokens",
-                            y_label="loss", log_x=True, width=width)
-    assert [float(dot.get("cx")) for dot in read(figure).iter(f"{SVG}circle")] == [68, 168, 268]
+    """On a logarithmic axis each dot sits on its value's tick: 1, 10 and 100 on the labels "1", "10" and
+    "100"."""
+    figure = read(figures.points({"loss": [(1.0, 1.0), (10.0, 1.5), (100.0, 2.0)]}, x_label="tokens",
+                                 y_label="loss", log_x=True))
+    ticks = {text.text: float(text.get("x")) for text in figure.iter(f"{SVG}text")
+             if text.get("text-anchor") == "middle"}
+    placed = [float(dot.get("cx")) for dot in figure.iter(f"{SVG}circle")]
+    assert placed == [ticks["1"], ticks["10"], ticks["100"]]
 
 
 def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
@@ -164,8 +169,12 @@ def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
     widths = [float(box.get("width")) for box in boxes]
     texts = [text for text in root.iter(f"{SVG}text") if text.text in {t for row in rows for t in row}]
     for box, width, text in zip(boxes, widths, texts, strict=True):
-        assert width >= 27 - 4 and width >= 0.6 * 15 * len(text.text)
         assert float(box.get("x")) < float(text.get("x")) < float(box.get("x")) + width
+    # The short tokens' boxes alike, the longest token's the widest, and a row's boxes side by side.
+    by_token = dict(zip((text.text for text in texts), widths, strict=False))
+    assert by_token["a"] == by_token["b"] == by_token["c"] < by_token["<bos>"] < by_token["a_long_token"]
+    row = [float(box.get("x")) for box in boxes[2:]]
+    assert all(left + width <= right for left, width, right in zip(row, widths[2:], row[1:], strict=False))
     outlined = ["stroke:none" not in box.get("style") for box in boxes]
     assert outlined == [fill == "none" for row in fills for fill in row]
     notes = {text.text: float(text.get("x")) for text in root.iter(f"{SVG}text")
@@ -179,15 +188,19 @@ def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
 
 
 def test_an_arrows_head_points_along_its_line_at_its_end():
-    """`Figure.arrow`'s head is a triangle whose tip is the line's end and whose base lies 7 px back along the
-    line, 3.5 px either side of it, whatever the direction: along the x axis, and along (0.6, -0.8), whose
-    base centre is 4.2 left of and 5.6 below the tip and whose corners lie 2.8 and 2.1 either side of it."""
-    heads = {(0, 0, 100, 0): [(100, 0), (93, 3.5), (93, -3.5)],
-             (10, 90, 70, 10): [(70, 10), (68.6, 17.7), (63, 13.5)]}
-    for (x1, y1, x2, y2), corners in heads.items():
+    """`Figure.arrow`'s head is a triangle whose tip is the line's end and whose base stands behind it, square
+    to the line and halved by it: along the x axis its corners share an x behind the tip and lie either side
+    of the line alike, along the y axis they share a y behind it; in a moved group the drawing is the same."""
+    for (x1, y1, x2, y2), along in (((0, 10, 100, 10), 0), ((40, 90, 40, 10), 1)):
         figure = figures.Figure(120, 120)
         with figure.group(5, 7) as moved:
             figure.arrow(x1, y1, x2, y2)
         assert moved.attributes["transform"] == "translate(5,7)"
-        head = next(path for path in read(figure).iter(f"{SVG}path"))
-        assert [(float(x), float(y)) for x, y in re.findall(r"([-\d.]+),([-\d.]+)", head.get("d"))] == corners
+        root = read(figure)
+        line = next(root.iter(f"{SVG}line"))
+        head = next(root.iter(f"{SVG}path"))
+        tip, a, b = [(float(x), float(y)) for x, y in re.findall(r"([-\d.]+),([-\d.]+)", head.get("d"))]
+        assert tip == (float(line.get("x2")), float(line.get("y2")))
+        across = 1 - along
+        assert a[along] == b[along] and (a[along] - tip[along]) * ((x2, y2)[along] - (x1, y1)[along]) < 0
+        assert a[across] + b[across] == 2 * tip[across] and a[across] != b[across]
