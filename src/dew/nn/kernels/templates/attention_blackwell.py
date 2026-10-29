@@ -306,6 +306,8 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
         kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type,
                           rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
-        interpret=plgpu.InterpretGPUParams() if interpret else None, name="attention_forward_tcgen05",
+        interpret=plgpu.InterpretGPUParams() if interpret else None,
+        # A name a form (the default's fold and its natural rewalk compile apart).
+        name="attention_forward_tcgen05" + ("_natural" if spec.natural else ""),
     )(query, key, value)
     return out, maxima, over > 0
