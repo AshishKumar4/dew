@@ -137,8 +137,9 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool, dtyp
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(capped, softcap),
-                           natural=natural or jnp.dtype(dtype) == jnp.float32, headroom=algebra.headroom(dtype),
-                           initial=sinks, compensated=algebra.compensates(dtype), prescale=power)
+                           natural=natural or jnp.dtype(dtype) == jnp.float32,
+                           headroom=algebra.headroom(dtype), initial=sinks,
+                           compensated=algebra.compensates(dtype), prescale=power)
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
