@@ -33,16 +33,17 @@ def tokenizer():
 
 
 def sources(tok) -> dict[str, Pipeline]:
-    """Each source at its pinned commit, as token documents under "text"."""
+    """Each source at its pinned commit, read from its own shards as it streams (FineWeb-Edu's sample is 10B
+    tokens, more than a run's host need hold), as token documents under "text"."""
     web = Hub("HuggingFaceFW/fineweb-edu", name="sample-10BT", columns=("text",),
               revision="87f09149ef4734204d70ed1d046ddc9ca3f2b8f9")
     code = Hub("codeparrot/codeparrot-clean-valid", columns=("content",),
                revision="4db92d2ec0c1b4c41eeb439cfae16854511d9dcd")
     conversations = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft", columns=("messages",),
                         revision="8049631c405ae6576f93f445c6b8166f76f5505a")
-    return {"web": web.map(text.tokenize(tok, eos=True)).named("web"),
-            "code": code.map(text.tokenize(tok, field="content", eos=True)).named("code"),
-            "chat": conversations.map(chat.template(tok)).select_columns("text").named("chat")}
+    return {"web": web.read("streamed").map(text.tokenize(tok, eos=True)).named("web"),
+            "code": code.read("streamed").map(text.tokenize(tok, field="content", eos=True)).named("code"),
+            "chat": conversations.read("streamed").map(chat.template(tok)).select_columns("text").named("chat")}
 
 
 def mixed(tok) -> Pipeline:
