@@ -1409,7 +1409,8 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
+                with run.held():
+                    batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
                 device, _ = split_fields(batch)
                 inputs = self.objective.inputs
                 if not compiled and self.rollout is None and inputs is not None:
@@ -1776,20 +1777,21 @@ class Trainer(Generic[Loss, Effects]):
         assert run.notice is not None
         stopping = paused or cut or (not ending and run.notice.reached())
         if not ending:
-            with run.held():
-                self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
-                            full=stopping)
+            self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
+                        full=stopping)
         if plan.observe:
-            plan.observe.at(current, state)
+            with run.held():
+                plan.observe.at(current, state)
         if run.stopped:
             return True, state
         if stopping:
             self._take(plan, run, interval, state, unlogged=True)
             if checkpoints is not None and interval.resumable != current:
                 self._read_taken(run)
-                run.other += self._saved_checkpoint(
-                    checkpoints, current, state, position, interval,
-                    training_best=not plan.validation and not plan.best, control=run.stop_control)
+                with run.held():
+                    run.other += self._saved_checkpoint(
+                        checkpoints, current, state, position, interval,
+                        training_best=not plan.validation and not plan.best, control=run.stop_control)
             if paused:
                 run.paused = current
             else:
@@ -1847,7 +1849,9 @@ class Trainer(Generic[Loss, Effects]):
                     batch = agreed_next("cooldown read", branched.train)
                     if batch is None:
                         break
-                    batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted)
+                    with branched.held():
+                        batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked,
+                                           counted)
                     device, _ = split_fields(batch)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
@@ -1938,18 +1942,22 @@ class Trainer(Generic[Loss, Effects]):
         if (checkpoints is not None and interval.last_saved != current
                 and (run.checkpoint_due or candidate or (final and plan.checkpoint_final) or full)):
             self._read_taken(run)
-            # A save of weights alone is no step to resume from, so not the run's last (`FitRun.ends_here`).
-            run.other += self._saved_checkpoint(
-                checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
-                training_best=not plan.validation and not plan.best, control=run.stop_control,
-                weights_only=not run.checkpoint_due and not run.stopped and not full
-                and not (final and plan.checkpoint_final) and bool(winners)
-                and all(rank.weights_only for rank in winners) and not run.ends_here(interval))
+            # A save of weights alone is no step to resume from, so not the run's last (`FitRun.ends_here`),
+            # which may read the stream ahead: decided before its placements are held.
+            weights_only = (not run.checkpoint_due and not run.stopped and not full
+                            and not (final and plan.checkpoint_final) and bool(winners)
+                            and all(rank.weights_only for rank in winners) and not run.ends_here(interval))
+            with run.held():
+                run.other += self._saved_checkpoint(
+                    checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
+                    training_best=not plan.validation and not plan.best, control=run.stop_control,
+                    weights_only=weights_only)
             run.last_checkpoint = time.perf_counter()
         if run.local_due and checkpoints is not None and run.last_local_saved != current:
             self._read_taken(run)
-            run.other += self._saved_local_checkpoint(
-                checkpoints, current, state, position, interval, control=run.stop_control)
+            with run.held():
+                run.other += self._saved_local_checkpoint(
+                    checkpoints, current, state, position, interval, control=run.stop_control)
             run.last_local_saved = current
 
     def _wind_down(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
