@@ -285,6 +285,7 @@ def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_t
 
 
 @pytest.mark.gpu(reason="measures a run's kernel launches, which only a GPU runs")
+@pytest.mark.mesh(devices=1)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_measures_its_kernel_launches_as_set(kind, tmp_path):
     """A run that measures its step's launches on this GPU (`tune_kernels`) keeps what it picked
@@ -294,7 +295,8 @@ def test_a_kinds_run_measures_its_kernel_launches_as_set(kind, tmp_path):
     cache, compiling = tmp_path / "cache", jax.config.jax_compilation_cache_dir
     try:
         trained(kind, tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
-                                              "trainer.compilation_cache_dir": str(cache)})
+                                              "trainer.compilation_cache_dir": str(cache),
+                                              "trainer.mesh": {}})
     finally:
         jax.config.update("jax_compilation_cache_dir", compiling)
     (picks,) = cache.rglob("kernels/*.json")
