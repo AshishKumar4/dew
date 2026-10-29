@@ -281,6 +281,26 @@ def test_a_batch_scores_every_request_as_it_would_alone_and_keeps_the_order(adap
         [score for score, _ in reversed(together)], rel=RELATIVE)
 
 
+def test_harnesses_over_one_model_score_through_one_program(run):
+    """Two harnesses over one model, each with weights of its own (a run scored at each checkpoint, a
+    draw of weights per seed), score a request through the one program compiled for the model and the
+    request's width; the second compiles nothing, and each scores its own weights (a harness built its
+    scorer anew, a static argument of the program, so each recompiled it)."""
+    import dataclasses
+
+    import jax
+
+    from dew.telemetry.instrumentation import Compiles
+
+    first = TextGeneration.from_run(str(run))
+    second = dataclasses.replace(first, variables=jax.tree.map(lambda leaf: leaf * 2, first.variables))
+    request = [instance("the ", "quick")]
+    (score, _), = DewLM(first).loglikelihood(request)
+    with Compiles("_scored") as compiles:
+        (doubled, _), = DewLM(second).loglikelihood(request)
+    assert compiles.count == 0 and doubled != pytest.approx(score, rel=RELATIVE)
+
+
 @pytest.mark.network
 def test_a_real_task_suite_runs_against_a_run(tmp_path):
     """One tiny suite end to end, over a run whose 512-id window holds
