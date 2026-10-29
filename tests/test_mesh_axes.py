@@ -345,7 +345,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
     A one-position context saves no work even on a link fast enough for any split.
     """
     from dew.mesh import SEQUENCE_AXIS
-    from dew.nn.attention import NormalAttention
+    from dew.nn.attention_blocks import NormalAttention
     from dew.nn.sharding import measured_links
     from dew.telemetry.instrumentation import compiled_flops
 

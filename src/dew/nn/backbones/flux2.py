@@ -30,10 +30,11 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import gated_product
-from dew.nn.attention import RMSNorm, scaled_dot_product_attention
+from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import matching_lengths, patch_lengths, projection_flops, self_attention_flops
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
@@ -82,7 +83,7 @@ class Flux2SingleBlock(nn.Module):
     epsilon: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -153,7 +154,7 @@ class Flux2Transformer(TextStream, nn.Module):
     guidance_embeds: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @property
     def modulation_pieces(self) -> dict[str, int]:

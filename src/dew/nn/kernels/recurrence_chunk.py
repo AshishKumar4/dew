@@ -36,7 +36,8 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
+from dew.nn.attention import FORWARD_MODE
+from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import at_least_fp32, l2norm
 from dew.nn.sharding import grouped_heads, manual_map, rows_like

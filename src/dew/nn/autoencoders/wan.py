@@ -42,9 +42,10 @@ from dew.interop.weights import indexed_path
 from dew.nn.kernels.options import program
 
 from ..activations import silu
-from ..attention import l2_normalized, scaled_dot_product_attention
+from ..attention import scaled_dot_product_attention
 from ..blocks import Upsample
 from ..conv import Conv
+from ..norms import l2_normalized
 from ..precision import at_least_fp32
 from .api import AutoEncoder, LatentNormalization, published_source
 from .kl import posterior_latent

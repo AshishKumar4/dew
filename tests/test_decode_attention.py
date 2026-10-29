@@ -19,7 +19,8 @@ from reference_error import (
     assert_fp32_reduction_bound,
 )
 
-from dew.nn.attention import attention_case, scaled_dot_product_attention, with_key_lengths
+from dew.nn.attention import attention_case, scaled_dot_product_attention
+from dew.nn.attention_masks import with_key_lengths
 from dew.nn.decode_geometry import folded_attention
 from dew.nn.kernels import decode_attention
 from dew.nn.kernels.generation import chosen
@@ -374,7 +375,8 @@ def test_a_grouped_query_attends_as_its_heads_do_alone(implementation):
     """Grouped in the core, a lone query of 8 heads over 2 key heads with key lengths gives each head's
     attention over its key head's keys, within tests/reference_error.py's rule of the reference over
     the key heads repeated, against float64."""
-    from dew.nn.attention import reference_attention, repeat_kv_heads
+    from dew.nn.attention import reference_attention
+    from dew.nn.attention_masks import repeat_kv_heads
 
     rng = np.random.default_rng(3)
     lengths = jnp.asarray([1, 9, 32], jnp.int32)
@@ -851,7 +853,7 @@ def cache_call(window=None):
     right-padded by 1 after 3 held tokens, row 2 with a hole after 7, and row 3 all padding; the
     tokens' slots (`open_kv_cache`'s positions, -1 for padding), the slots filled after the call, and
     the cache's mask over them (`causal_attention_mask`), a window's where given."""
-    from dew.nn.attention import causal_attention_mask
+    from dew.nn.attention_masks import causal_attention_mask
 
     held = np.array([0, 3, 7, 5])
     valid = np.array([[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0], [1, 1, 0, 1, 1, 1], [0, 0, 0, 0, 0, 0]], bool)

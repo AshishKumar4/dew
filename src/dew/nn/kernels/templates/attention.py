@@ -649,9 +649,9 @@ def dropout_seed(dropout_rng) -> jax.Array:
 @dataclasses.dataclass(frozen=True)
 class DropPlaces:
     """The global places a slice of a call draws its dropout at, where a sequence exchange holds a slice of
-    its rows, heads, queries or keys (`dew.nn.attention.sequence_parallel_attention`): each local batch
-    row's `rows` `[B]`, query head's `heads` `[H]`, query's `queries` `[Q]` and key's `keys` `[K]` global
-    index, so every device drops the weights one device holding the whole call drops."""
+    its rows, heads, queries or keys (`dew.nn.attention_parallel.sequence_parallel_attention`): each local
+    batch row's `rows` `[B]`, query head's `heads` `[H]`, query's `queries` `[Q]` and key's `keys` `[K]`
+    global index, so every device drops the weights one device holding the whole call drops."""
 
     rows: jax.Array
     heads: jax.Array
@@ -681,9 +681,9 @@ class Dropout:
     and key is kept where its draw keeps it and multiplied by `1 / (1 - rate)`, while the softmax's
     denominator takes the undropped weights, so the output is the softmax over the values `z v`. `seed`
     holds the call's two uint32 words, `rows` `[B]` and `heads` `[H]` each local batch row's and query
-    head's global index (a shard's own positions are not, `_per_shard`), `queries` `[Q]` and `keys` `[K]`
-    each local query's and key's where a sequence exchange holds a slice of them (`DropPlaces`; local are
-    global where None), and `rate` is static."""
+    head's global index (a shard's own positions are not, `dew.nn.attention_parallel.per_shard`),
+    `queries` `[Q]` and `keys` `[K]` each local query's and key's where a sequence exchange holds a slice
+    of them (`DropPlaces`; local are global where None), and `rate` is static."""
 
     seed: jax.Array
     rows: jax.Array

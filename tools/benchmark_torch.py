@@ -437,7 +437,7 @@ class SimpleDiT(nn.Module):
 
 
 # ----------------------------------------------------------------------------
-# unet (src/dew/nn/backbones/unet.py, src/dew/nn/blocks.py, src/dew/nn/attention.py)
+# unet (src/dew/nn/backbones/unet.py, src/dew/nn/blocks.py, src/dew/nn/attention_blocks.py)
 # ----------------------------------------------------------------------------
 
 class Conv(nn.Module):

@@ -7,7 +7,8 @@ import pytest
 from flax import linen as nn
 
 from dew.batch import coordinates
-from dew.nn.attention import causal_attention_mask, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention_masks import causal_attention_mask
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kv_cache import cached_validity, open_kv_cache
 from dew.nn.linear import GatedDeltaNet

@@ -17,6 +17,7 @@ from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained, with_overrides
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, from_record, import_path
 
 from .calibration import Calibration
@@ -100,7 +101,7 @@ def _labels(tokenizer: HFTokenizer, count: int) -> tuple[Labels, tuple[tuple[int
 
 @dataclasses.dataclass(frozen=True)
 class SlotHeadSource(HeadComponent):
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str, *,
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         if backbone is None:
             raise ValueError("a slot readout needs its native backbone")
