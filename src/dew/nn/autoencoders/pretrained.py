@@ -22,10 +22,9 @@ from . import dc_ae, flux2, qwen_image, rae, wan
 from .api import AutoEncoder, LatentNormalization, published_source
 from .dc_ae import DCAutoencoder, load_dc_ae
 from .flux2 import Flux2Autoencoder, load_flux2_vae
-from .kl import AutoencoderKL
 from .qwen_image import QwenImageAutoencoder, load_qwen_image_vae
 from .rae import RAEAutoencoder, load_rae
-from .sd_vae import StableDiffusionVAE, published_normalization
+from .sd_vae import StableDiffusionVAE, published
 from .vae import (
     FLAX_REVISIONS,
     FLAX_WEIGHTS,
@@ -78,8 +77,7 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
         weights = TORCH_WEIGHTS
     if weights == FLAX_WEIGHTS and params is None:
         params, shapes = flax_vae(directory / FLAX_WEIGHTS)
-    model = AutoencoderKL.from_diffusers(config, compute)
-    shift, scale = published_normalization(config)
+    model, shift, scale = published(config, compute)
     image = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
     return bind_component(

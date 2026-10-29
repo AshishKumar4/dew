@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -337,10 +338,11 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     install_compiler(tmp_path / "tests/compiler")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
-    # The session fixture's files in a task of their own, where it reads for every file.
-    fixtures = ["tests/test_one.py", "tests/test_two.py"]
+    # The session fixture's files in a task of their own, where it reads for every file, and the file whose
+    # helper changes below in one of its own, as what a process ran before a file is that file's input too.
+    fixtures, alone = ["tests/test_one.py", "tests/test_two.py"], ["tests/test_plain.py"]
     ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
-    for tests in ([name for name in ran if name not in fixtures], fixtures):
+    for tests in ([name for name in ran if name not in fixtures + alone], fixtures, alone):
         ci.task("3.12", tests, "", out, 600.0)
         assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
             f"3.12:{name}": 0 for name in tests}
@@ -1268,27 +1270,50 @@ def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, m
     assert run() == [1, 2]
 
 
-def test_a_fixture_added_or_removed_reruns_every_file(ci, tmp_path, monkeypatch, cache_worker):
-    """A fixture's arrival or removal is every file's input, as a test may ask whether one exists
-    (`Path.exists`, a collection by presence) without opening it, which no record sees; its contents stay
-    its openers' alone (train 253's review: a test asserting a fixture's absence was reused green once the
-    fixture came)."""
-    (tmp_path / "tests/fixtures").mkdir(parents=True)
-    (tmp_path / "tests/fixtures/present.json").write_text("{}\n")
-    (tmp_path / "tests/test_absent.py").write_text(
-        "from pathlib import Path\n"
-        "def test_absent():\n"
-        "    with Path('runs-absent').open('a') as runs: runs.write('x')\n"
-        "    assert not Path('tests/fixtures/unexpected.json').exists()\n")
-    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
-    base = commit(tmp_path, "base")
-    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
-    assert [row["exitCode"] for row in rows] == [0]
-    (tmp_path / "tests/fixtures/unexpected.json").write_text("{}\n")
-    git(tmp_path, "add", "tests/fixtures/unexpected.json")
-    commit(tmp_path, "a fixture arrives")
-    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
-    assert [row["exitCode"] for row in rows] != [0] and len((tmp_path / "runs-absent").read_text()) == 2
+def test_a_fixture_reruns_only_the_files_that_opened_listed_or_probed_it(ci, tmp_path, monkeypatch,
+                                                                         cache_worker):
+    """A fixture's arrival reruns the files whose runs opened it, listed its directory, or asked whether it
+    exists (`Path.is_file`, `os.path.exists`: recorded as a read, in a test, at collection or in a child it
+    started), and no other: an existence probe is a read the record keeps, so a fixture's name is no other
+    file's input (Main, 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures; train 253's
+    review: a test asserting a fixture's absence must not be reused once it comes)."""
+    fixtures = tmp_path / "tests/fixtures"
+    (fixtures / "model").mkdir(parents=True)
+    (fixtures / "model/config.json").write_text("{}\n")
+    (fixtures / "other").mkdir()
+    (fixtures / "other/data.json").write_text("{}\n")
+    probe = "import os; os.path.exists('tests/fixtures/model/tokenizer.json')"
+    sources = {
+        "opens": "    Path('tests/fixtures/model/config.json').read_text()\n",
+        "probes": "    Path('tests/fixtures/model/weights.bin').is_file()\n",
+        "collects": "",
+        "child": "    import subprocess, sys\n"
+                 f"    subprocess.run([sys.executable, '-c', {probe!r}], check=True)\n",
+        "lists": "    [entry.name for entry in Path('tests/fixtures').iterdir()]\n",
+        "other": "    Path('tests/fixtures/other/data.json').read_text()\n"}
+    for name, body in sources.items():
+        found = "[name for name in ('weights.bin',) if Path('tests/fixtures/model', name).exists()]"
+        cases = f"{found} or ['none']" if name == "collects" else "['one']"
+        (tmp_path / f"tests/test_{name}.py").write_text(
+            f"import pytest\nfrom pathlib import Path\n@pytest.mark.parametrize('case', {cases})\n"
+            f"def test_{name}(case):\n    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
+            + body)
+    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, tuple(sources))
+    commit(tmp_path, "base")
+    assert run() == [1] * 6
+    assert run() == [1] * 6
+    (fixtures / "model/weights.bin").write_text("w\n")
+    (fixtures / "model/tokenizer.json").write_text("{}\n")
+    git(tmp_path, "add", "tests/fixtures")
+    commit(tmp_path, "fixtures arrive beside a model's config")
+    # Its probers rerun, at their test, their collection and their child; opener, lister and other do not.
+    assert run() == [1, 2, 2, 2, 1, 1]
+    (fixtures / "later").mkdir()
+    (fixtures / "later/config.json").write_text("{}\n")
+    git(tmp_path, "add", "tests/fixtures")
+    commit(tmp_path, "a model's fixtures arrive")
+    # A new model's directory reruns what listed the directory it arrived in, and nothing else.
+    assert run() == [1, 2, 2, 2, 2, 1]
 
 
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
@@ -1428,18 +1453,23 @@ def packed(root: Path, names: list[str]) -> None:
 
 def test_a_reader_files_share_in_one_process_is_every_such_files_input(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A data file a reader opens is the input of every test file its pytest process ran, not only the
-    one that opened it: a session fixture's lazy reader, or a process-lived cache (dew.data.text's
-    load_tokenizer), opened under one file serves the next without reopening it, so a change to the data
-    reruns both (train 239's review, row 1987)."""
+    """A data file a reader opens or probes, and code it runs, is the input of every test file its pytest
+    process ran after it, not only the one that ran it: a session fixture's lazy reader, a process-lived
+    cache (dew.data.text's load_tokenizer, which asks after a tokenizer's optional files), or a module
+    imported inside a test, run under one file serves the next without running again, so a change to the
+    data, an optional file's arrival or a change to the module reruns both (train 239's review, row 1987;
+    the CI bundle's review; row 2228: 256 test files hold ~2,300 imports inside tests)."""
     (tmp_path / "tests/fixtures").mkdir(parents=True)
     (tmp_path / "tests/fixtures/shared.json").write_text("[1]\n")
+    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 1\n")
     (tmp_path / "tests/conftest.py").write_text(
-        "import functools, pytest\nfrom pathlib import Path\n"
+        "import functools, pytest, sys\nfrom pathlib import Path\nsys.path.insert(0, 'tests')\n"
         "@pytest.fixture(scope='session')\ndef vocabulary():\n"
-        "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text())\n")
+        "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text()\n"
+        "                           + str(Path('tests/fixtures/template.jinja').exists()))\n")
     body = ("from pathlib import Path\ndef test_{0}(vocabulary):\n"
-            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n")
+            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n"
+            "    import lazy_values\n    assert lazy_values.VALUE\n")
     written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
     packed(tmp_path, ["test_a.py", "test_b.py"])
     run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("a", "b"))
@@ -1448,6 +1478,10 @@ def test_a_reader_files_share_in_one_process_is_every_such_files_input(
     assert run() == [1, 1]
     (tmp_path / "tests/fixtures/shared.json").write_text("[2]\n")
     assert run() == [2, 2]
+    (tmp_path / "tests/fixtures/template.jinja").write_text("{{ x }}\n")
+    assert run() == [3, 3]
+    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 2\n")
+    assert run() == [4, 4]
 
 
 def test_an_open_after_the_tests_ended_is_the_records_input(ci, tmp_path, monkeypatch, cache_worker):
@@ -1988,3 +2022,100 @@ def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_pat
     assert slow() == (0, {"test_new": False, "test_old": False, "test_sized[1]": False, "test_cell": True,
                           "test_named": True, "TestHeld::test_inside": True, "test_sized[big]": True})
     assert slow("--new", str(base)) == (1, {"test_new": False, "test_sized[big]": True})
+
+
+def a_wheel(root: Path, name: str, version: str) -> Path:
+    """A pure-Python wheel of `name` at `version` whose module says its version, as an index serves one."""
+    wheel = root / f"{name}-{version}-py3-none-any.whl"
+    info = f"{name}-{version}.dist-info"
+    files = {f"{name}/__init__.py": f"VERSION = {version!r}\n",
+             f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+             f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
+                              "Tag: py3-none-any\n"}
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, text in files.items():
+            archive.writestr(path, text)
+        recorded = [*files, f"{info}/RECORD"]
+        archive.writestr(f"{info}/RECORD", "".join(f"{path},,\n" for path in recorded))
+    return wheel
+
+
+def test_a_release_check_marked_whole_suite_or_network_too_runs_in_its_release_task_alone(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A release_env test marked whole_suite or network too runs in its release task, never set aside there
+    as the whole suite's or the network lane's cells, and the network lane, which lacks its requirement,
+    never runs it (the bundle's review: such a check was planned, deselected by its own task, and reported
+    green)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    pinned = a_wheel(tmp_path, "pinned", "2.0")
+    written(tmp_path, {"test_release.py": "import pytest\nfrom pathlib import Path\n" + "".join(
+        f"@pytest.mark.release_env({str(pinned)!r})\n@pytest.mark.{also}\n"
+        f"def test_{also}_too():\n    import pinned\n    Path('ran-{also}').write_text(pinned.VERSION)\n"
+        for also in ("whole_suite", "network"))})
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", ["tests/test_release.py"], out, cache="off", processes=1, deadline=600.0,
+                       network=True) == 0
+    assert not (tmp_path / "ran-network").exists(), "the network lane ran a release check"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "release", "--python=3.12", "--tests=tests/test_release.py",
+                                      f"--requirement={pinned}", f"--out={tmp_path / 'release.json'}"])
+    assert ci.main() == 0
+    assert [(tmp_path / f"ran-{also}").read_text() for also in ("whole_suite", "network")] == ["2.0", "2.0"]
+
+
+@pytest.mark.parametrize("mark", ["release_env()", "release_env(requirement='pinned==2.0')",
+                                  "release_env('pinned==2.0', 'other==1.0')", "release_env(2)"])
+def test_a_release_mark_without_one_requirement_fails_its_files_collection(ci, tmp_path, monkeypatch, mark):
+    """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string)
+    fails its file's collection, naming its test: every suite task sets a marked test aside, and no release
+    task would plan it, so it would run nowhere (Main's read of b94d89999)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_release.py": f"import pytest\n@pytest.mark.{mark}\n"
+                       "def test_under_the_release():\n    pass\n"
+                       "def test_plain():\n    pass\n"})
+    (tmp_path / ".verdict").mkdir()
+    [row] = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
+    assert row["exitCode"] != 0, row["output"]
+    assert "tests/test_release.py::test_under_the_release" in row["output"] and "release_env" in row["output"]
+
+
+def test_a_release_check_runs_in_the_whole_suites_second_job_under_its_requirement(ci, tmp_path, monkeypatch,
+                                                                                   capsys):
+    """A test marked release_env(<requirement>) checks a release's own code under a package pinned apart from
+    the suite's (2173: LFM3's needs transformers>=5.18.0, MiMo-V2's <=5.1.0): every suite task sets it aside,
+    as the suite's environment lacks its requirement, and its file's row names it as pytest resolved its mark;
+    from a whole suite's rows, its second job plans a task each requirement, whose pytest runs with the
+    requirement over the suite's environment (uv's overlay, torch and jax the suite's), under a row of its
+    own beside its file's, and exits 1 on a red one."""
+    interpreter(tmp_path, "3.12")
+    pinned = a_wheel(tmp_path, "pinned", "2.0")
+    written(tmp_path, {"test_release.py": "import pytest\n"
+                       "@pytest.mark.release_env(" + repr(str(pinned)) + ")\n"
+                       "def test_under_the_release():\n    import pinned\n"
+                       "    assert pinned.VERSION == '2.0'\n"
+                       "def test_plain():\n    pass\n"})
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
+    (tmp_path / ".verdict").mkdir()
+    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
+    assert [(found["name"], found["exitCode"], found.get("release_env")) for found in rows] == [
+        ("3.12:tests/test_release.py", 0, {str(pinned): ["tests/test_release.py::test_under_the_release"]})]
+    verdict = tmp_path / "verdict.json"
+    verdict.write_text(json.dumps({"rows": rows}))
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "argv", ["ci.py", "release-plan", str(verdict)])
+    assert ci.main() == 0
+    [item] = json.loads(capsys.readouterr().out)
+    assert item == {"release": str(pinned), "python": "3.12", "tests": "tests/test_release.py"}
+    out = tmp_path / ".verdict/release.json"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "release", f"--python={item['python']}",
+                                      f"--tests={item['tests']}", f"--requirement={item['release']}",
+                                      f"--out={out}"])
+    assert ci.main() == 0
+    assert [(found["name"], found["exitCode"]) for found in json.loads(out.read_text())["rows"]] == [
+        (f"3.12:tests/test_release.py#release:{pinned}", 0)]

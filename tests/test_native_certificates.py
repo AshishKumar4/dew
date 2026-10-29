@@ -2,17 +2,22 @@
 each native kernel's output held element by element to the exact products of its operands, on the GPU
 that compiles it, never to another implementation's error. Link 1: the grouped GEMM template's plain
 forward and input gradient, each a sum of exact 16-bit products a tensor core accumulates in fp32 by
-truncating adds and rounds once to its output (`certified.native_dot_holds`). Link 2: the rest of the
+truncating adds and rounds once to its output (`native_dot_holds`). Link 2: the rest of the
 template's native launches, Mosaic GPU's and Triton's (CUTLASS's wheel is not installed on the lanes'
 GPUs): the kernel gradient; fp32 operands at the default precision, whose products are of their TF32
-values (`certified.tf32_operand`); and the exact sums a precision above the default declares for an fp32
-output, held a depth step at a time (`certified.promoted_step_holds`), each step's output the launch's own
+values (`tf32_operand`); and the exact sums a precision above the default declares for an fp32
+output, held a depth step at a time (`promoted_step_holds`), each step's output the launch's own
 on its operands zeroed from the next step on. The rule's validation: its nulls (Gaussian and same-sign
 draws certify) and its faults, each refused where it lands: a lost block of products, a row read under the
 wrong group, a partial sum rounded to bf16 mid-depth; bf16 products where TF32 is declared and the
 reverse, and operands truncated to TF32 where the tensor cores round them; and a step's partial added by
-the tensor cores' truncating adds where IEEE sums are declared."""
+the tensor cores' truncating adds where IEEE sums are declared. Link 3: the recurrence template's gated
+delta rule with a decay a head, each record its launches store between them held inside its launch step's
+enclosure on the native records the step reads (`recurrence_witness`), its faults a dropped carry, a state
+rounded to bf16 where fp32 is held, the decay from rounded cumulative sums and an off-by-one chunk
+boundary."""
 
+import functools
 import itertools
 
 import jax
@@ -20,18 +25,30 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from certified import (
+import recurrence_witness as rw
+from generation_support import generations, runs
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
+from native_certificates import (
+    LOST_SHARE,
+    MOVED_SHARE,
+    NARROW_SHARE,
+    SUBNORMAL_CASE,
+    TF32_SHARES,
+    TRUNCATED_SHARE,
+    Terms,
     assert_refused,
+    narrow_partial_ends,
     native_dot_ends,
     native_dot_holds,
     promoted_step_ends,
     promoted_step_holds,
     separated,
+    terms,
     tf32_operand,
     truncating_step_ends,
 )
-from generation_support import generations, runs
-from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, rounded, truncated
+from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, Format, truncated
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import template
@@ -52,29 +69,6 @@ FALL = 2.0 ** -12
 partial a few thousandths of the accumulator, so the exact-sums witness of its add, whose partial's
 allowance (γ of a step's 64 products at 2^-23, of their magnitudes) falls below the accumulator's last
 place, decides the add's rounding."""
-
-
-LOST_SHARE = 0.95
-"""The least share of the elements a lost block of sixteen rows or depth columns reaches whose interval on
-the call's products is separated from that on the products the kernel was given (`assert_refused`): 99.4%
-of a forward's bf16 outputs, 99.9% of a kernel gradient's fp32 ones, and 99.98% of the exact-sums step that
-loses them, on an A100 and an H100 alike."""
-MOVED_SHARE = 0.95
-"""The same of the elements a row read under its neighbour group reaches: all of the forward's row, 99.8% of
-both groups' kernel gradients, and 99.85% of both groups' first exact-sums steps."""
-NARROW_SHARE = 0.65
-"""The same of an fp32 forward's elements where a partial sum over half the depth is rounded to bf16 before
-the rest is added, on Gaussian draws, whose partials sometimes cancel to a bf16 value's neighbourhood:
-70.5%."""
-TRUNCATED_SHARE = 0.4
-"""The same of a kernel gradient's elements past each group's first depth step, on a falling draw of one sign
-(`FALL`), where its default launch adds each step's products by truncating adds and exact sums are
-declared: 48.8% on Mosaic GPU's launch and 49.2% on Triton's, about those whose exact sum lies past the
-midpoint between two fp32 values (each was refused, and 87% to 99% of all of them were)."""
-TF32_SHARES = {True: (0.85, 0.85, 0.75), False: (0.85, 0.85, 0.95)}
-"""The same, on Gaussian draws and on draws of one sign, of an fp32 forward's elements where its operands'
-bf16 values are multiplied and TF32 is declared, its TF32 values where bf16 is, and its truncated TF32 values
-where they are rounded: 92.5%, 92.5% and 79.8%, and 89.3%, 89.3% and all."""
 
 
 def cells(*pairs) -> list:
@@ -134,26 +128,27 @@ def spans(sizes) -> list[tuple[int, int]]:
     return list(itertools.pairwise(np.cumsum((0, *sizes)).tolist()))
 
 
-def forward_products(x, w, sizes) -> np.ndarray:
-    """`[rows, width, depth]`: each output element's exact products, its row times its group's column."""
-    return x[:, None, :] * np.swapaxes(w[groups(sizes)], 1, 2)
+def forward_products(x, w, sizes, fmt: Format = BFLOAT16) -> Terms:
+    """`[rows, width, depth]`: each output element's exact products of operands of `fmt` (`terms`),
+    its row times its group's column."""
+    return terms(lambda x, w: x[:, None, :] * np.swapaxes(w[groups(sizes)], 1, 2), x, w, fmt=fmt)
 
 
-def input_gradient_products(dy, w, sizes) -> np.ndarray:
+def input_gradient_products(dy, w, sizes, fmt: Format = BFLOAT16) -> Terms:
     """`[rows, depth, width]`: each input gradient element's exact products, the row's cotangent times its
     group's matrix row."""
-    return dy[:, None, :] * w[groups(sizes)]
+    return terms(lambda dy, w: dy[:, None, :] * w[groups(sizes)], dy, w, fmt=fmt)
 
 
-def rows_products(x, dy) -> np.ndarray:
+def rows_products(x, dy, fmt: Format = BFLOAT16) -> Terms:
     """`[depth, width, rows]`: the exact products of rows of `x` and of the cotangent `dy` a kernel gradient
     sums, each element's its rows' column of `x` times theirs of `dy`."""
-    return x.T[:, None, :] * dy.T[None, :, :]
+    return terms(lambda x, dy: x.T[:, None, :] * dy.T[None, :, :], x, dy, fmt=fmt)
 
 
-def kernel_gradient_products(x, dy, sizes) -> list[np.ndarray]:
+def kernel_gradient_products(x, dy, sizes, fmt: Format = BFLOAT16) -> list[Terms]:
     """Each group's kernel gradient's exact products (`rows_products` of its rows)."""
-    return [rows_products(x[start:end], dy[start:end]) for start, end in spans(sizes)]
+    return [rows_products(x[start:end], dy[start:end], fmt) for start, end in spans(sizes)]
 
 
 def kernel_gradient_ends(products: list) -> tuple[np.ndarray, np.ndarray]:
@@ -228,21 +223,21 @@ def kernel_gradient_of(x, dy, sizes, out_dtype=jnp.bfloat16, *, dtype=jnp.bfloat
     return np.asarray(native, np.float64)
 
 
-def assert_products_certify(x, w, dy, read, outputs: tuple, label) -> None:
+def assert_products_certify(x, w, dy, read, fmt: Format, outputs: tuple, label) -> None:
     """Every element of the native forward and kernel gradient of `x`, `w` and `dy`, in each of `outputs`
     (a dtype and its format, the first the operands' own), and of the input gradient, in the operands' own,
-    is a value the exact products of the operands' values as the tensor cores read them (`read`) admit
-    (`native_dot_holds`)."""
+    is a value the exact products of the operands' values as the tensor cores read them (`read`, values of
+    `fmt`) admit (`native_dot_holds`)."""
     dtype = outputs[0][0]
     rx, rw, rdy = (read(value) for value in (x, w, dy))
-    forward, gradient = forward_products(rx, rw, SIZES), kernel_gradient_products(rx, rdy, SIZES)
+    forward, gradient = forward_products(rx, rw, SIZES, fmt), kernel_gradient_products(rx, rdy, SIZES, fmt)
     for out_dtype, out in outputs:
         assert np.all(native_dot_holds(forward_of(x, w, SIZES, out_dtype, dtype=dtype), forward, out,
                                        flushes=False)), (label, out.name)
         assert np.all(kernel_gradient_holds(kernel_gradient_of(x, dy, SIZES, out_dtype, dtype=dtype),
                                             gradient, out)), (label, out.name)
     assert np.all(native_dot_holds(input_gradient_of(x, w, dy, SIZES, dtype=dtype),
-                                   input_gradient_products(rdy, rw, SIZES), outputs[0][1],
+                                   input_gradient_products(rdy, rw, SIZES, fmt), outputs[0][1],
                                    flushes=False)), label
 
 
@@ -364,7 +359,7 @@ def test_the_grouped_gemm_templates_products_certify_natively(kernel, generation
     fp32: the null of row 2084's links 1 and 2."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         for seed in range(SEEDS):
-            assert_products_certify(*draw(seed, signed), lambda value: value,
+            assert_products_certify(*draw(seed, signed), lambda value: value, BFLOAT16,
                                     ((jnp.bfloat16, BFLOAT16), (jnp.float32, FLOAT32)), seed)
 
 
@@ -376,8 +371,8 @@ def test_fp32_operands_certify_natively_as_products_of_their_tf32_values(kernel,
     products of their TF32 values admit (`tf32_operand`, `native_dot_holds`)."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         for seed in range(SEEDS):
-            assert_products_certify(*draw(seed, signed, np.float32), tf32_operand, ((jnp.float32, FLOAT32),),
-                                    seed)
+            assert_products_certify(*draw(seed, signed, np.float32), tf32_operand, TFLOAT32,
+                                    ((jnp.float32, FLOAT32),), seed)
 
 
 @pytest.mark.parametrize("kernel, generation_name", EXACT)
@@ -517,7 +512,7 @@ def test_the_tf32_certificate_refuses_bf16_products_tf32_where_bf16_is_declared_
 
         def read(left, right):
             """The products the kernel takes of operands it is given: of their TF32 values."""
-            return forward_products(tf32_operand(left), tf32_operand(right), SIZES)
+            return forward_products(tf32_operand(left), tf32_operand(right), SIZES, TFLOAT32)
 
         tf32, wide = read(x, w), forward_products(bf16(x), bf16(w), SIZES)
         cases = (((bf16(x), bf16(w)), tf32), ((x, w), wide),
@@ -556,9 +551,135 @@ def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narro
         first, rest = (forward_of(half, w, SIZES, jnp.float32) for half in halves)
         narrow = np.asarray(np.float32(bf16(first)) + np.float32(rest), np.float64)
         held = native_dot_holds(narrow, products, FLOAT32, flushes=False)
-        # The first half's bf16 value lies between its ends' bf16 values; the IEEE add is monotone in both.
-        halved = native_dot_ends(forward_products(halves[0], w, SIZES), FLOAT32, flushes=False)
-        narrowed = promoted_step_ends(*(rounded(end, np.zeros_like(end), BFLOAT16) for end in halved),
-                                      forward_products(halves[1], w, SIZES), flushes=False)
+        narrowed = narrow_partial_ends(*(forward_products(half, w, SIZES) for half in halves), flushes=False)
         truth = native_dot_ends(products, FLOAT32, flushes=False)
         assert_refused(held, separated(truth, narrowed), NARROW_SHARE)
+
+
+SUBNORMAL_CELLS = [
+    pytest.param(dtype, kernel, name, marks=runs(name), id=f"{jnp.dtype(dtype).name}-{kernel}-{name}")
+    for dtype, kernel, name in (
+        (jnp.float16, "triton", "sm80"), (jnp.float16, "triton", "sm90"), (jnp.float16, "mosaic_gpu", "sm90"),
+        (jnp.bfloat16, "mosaic_gpu", "sm80"), (jnp.bfloat16, "mosaic_gpu", "sm90"),
+        (jnp.bfloat16, "triton", "sm80"), (jnp.bfloat16, "triton", "sm90"))]
+"""The template's launches of 16-bit products by dtype on the lanes' GPUs (Mosaic GPU's mma.sync bundle takes
+no fp16)."""
+
+
+@pytest.mark.parametrize("dtype, kernel, generation_name", SUBNORMAL_CELLS)
+def test_subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, kernel, generation_name):
+    """A subnormal 16-bit operand's products, which the tensor cores align by its exponent field
+    (`aligned`): the native forward's element summing `SUBNORMAL_CASE`'s five fp16 products, and
+    every element of a forward of rows a quarter of whose values are subnormals of `dtype` (Gaussian draws
+    beside them), holds with each such operand counted at its format's least normal."""
+    fmt = rw.FLOAT16 if dtype == jnp.float16 else BFLOAT16
+    values = np.float16 if dtype == jnp.float16 else ml_dtypes.bfloat16
+    rng = np.random.default_rng([2084, 3, 7])
+    x, w, _ = draw(0, signed=True, dtype=values)
+    least = 2.0 ** fmt.emin
+    subnormal = rng.random(x.shape) < 0.25
+    x = np.where(subnormal, np.asarray((rng.uniform(-1, 1, x.shape) * least).astype(values), np.float64), x)
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
+        assert np.all(native_dot_holds(forward_of(x, w, SIZES, jnp.float32, dtype=dtype),
+                                       forward_products(x, w, SIZES, fmt), FLOAT32, flushes=False))
+        if dtype == jnp.float16:
+            left, right, _ = SUBNORMAL_CASE
+            case = np.zeros((ROWS, DEPTH))
+            case[0, :5] = left
+            matrices = np.zeros((len(SIZES), DEPTH, WIDTH))
+            matrices[:, :5, 0] = right
+            native = forward_of(case, matrices, SIZES, jnp.float32, dtype=dtype)
+            products = forward_products(case, matrices, SIZES, fmt)
+            assert np.all(native_dot_holds(native, products, FLOAT32, flushes=False))
+
+
+PTX_EX2 = 2
+"""PTX ISA 9.4 §9.7.3.21: "The maximum ulp error is 2 ulp from correctly rounded result across the full
+range of inputs" of ex2.approx.f32, Mosaic GPU's `exp2` under `approx_math`, which the recurrence mainloop's
+launches compile with."""
+
+
+def mosaic_exp2(semantics: str):
+    """Mosaic GPU's `exp2` under `approx_math` on fp32 operands, a multiple of 128 of them, in a kernel
+    lowered with `semantics` (`plgpu.LoweringSemantics`' name: Lane, mma.sync's bundle's; Warpgroup,
+    wgmma's), beside each operand's product with 2^-100 (whether a product below the normal range
+    flushes)."""
+    def body(x_ref, out_ref, tiny_ref):
+        span = pl.ds(jax.lax.axis_index("x") * 128, 128)
+        value = x_ref[span]
+        out_ref[span] = jnp.exp2(value)
+        tiny_ref[span] = value * np.float32(2.0 ** -100)
+
+    def run(x):
+        f32 = jax.ShapeDtypeStruct(np.shape(x), jnp.float32)
+        params = plgpu.CompilerParams(approx_math=True,
+                                      lowering_semantics=getattr(plgpu.LoweringSemantics, semantics))
+        kernel = plgpu.kernel(body, out_type=(f32, f32), grid=(np.size(x) // 128,), grid_names=("x",),
+                              compiler_params=params)
+        return tuple(np.asarray(out, np.float64) for out in jax.jit(kernel)(jnp.asarray(x, jnp.float32)))
+
+    return run
+
+
+@functools.cache
+def mosaic_lane() -> rw.Lane:
+    """The arithmetic the recurrence mainloop's launches run in on this GPU, probed natively in each lowering
+    its bundles take: `exp2`'s reach (`recurrence_witness.exp2_reach`), at most PTX's (`PTX_EX2`, past it a
+    finding), and whether an fp32 product below the normal range flushes (2^-30 times 2^-100); a 16-bit
+    call's. Its fp32 adds, multiplies, contractions and casts to bf16 and fp16 round to nearest, subnormals
+    kept (row 2084's link 3 probe, both GPUs and lowerings)."""
+    reaches, flushes = [], False
+    for semantics in ("Lane", "Warpgroup"):
+        run = mosaic_exp2(semantics)
+        reaches.append(rw.exp2_reach(lambda x, run=run: run(x)[0]))
+        flushes |= bool(np.any(run(np.full(128, 2.0 ** -30, np.float32))[1] == 0))
+    assert max(reaches) <= PTX_EX2, reaches
+    return rw.Lane(max(reaches), flushes)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+@pytest.mark.parametrize("regime", rw.REGIMES)
+def test_the_recurrence_templates_records_certify_natively_a_step_at_a_time(generation_name, regime):
+    """Every record of the recurrence template's native bf16 call of three chunks and two value heads on one
+    key head, forced (`generation.chosen`, `recurrence_witness.recorded`), lies inside its launch step's
+    enclosure on the native records the step reads, each chunk's from the fp32 memory it enters, under each
+    regime of decay (`REGIMES`): its inverses, weighted keys, corrected values, outputs, and stored and fp32
+    memories; the certify build is the production program bit for bit, and each chunk's stored entering
+    memory is the fp32 memory the chunks before it leave, rounded as stored (end_j == start_{j+1})."""
+    with generation.assumed(generation_name):
+        run = rw.recorded(*rw.draw(0, regime, heads=2))
+    held = rw.witness(run, mosaic_lane())
+    assert np.all(run.seams)
+    for name in rw.RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively(
+        generation_name):
+    """The native step witness's faults, each refused where it lands (`assert_refused`), a memory
+    kept across chunks (`REGIMES`' 'slow'): a document starting at the second chunk, whose zero memory is
+    refused at more than 95% of the memory the first chunk leaves (99.99% on an A100 and an H100); and the
+    second chunk run from that memory rounded to bf16 where fp32 is held, refused at more than 60% of the fp32
+    memory it leaves (74%)."""
+    with generation.assumed(generation_name):
+        operands = rw.draw(1, "slow", chunks=2, heads=2)
+        truth = rw.recorded(*operands)
+        assert_refused(*rw.dropped_refusals(operands, truth, 1, mosaic_lane()), 0.95)
+        assert_refused(*rw.handed_refusals(operands, truth, 1, mosaic_lane()), 0.6)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_the_recurrence_step_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary_natively(
+        generation_name):
+    """The native step witness's faults, each refused where it lands (`recurrence_witness.assert_refusals`):
+    the decay from a difference of fp32 cumulative sums (row 2066's defect) in a decay alone, refused at more
+    than 50% of the fp32 memory each chunk leaves (75% on an A100 and an H100; the 16-bit records' grid hides
+    it, and a write beside the decay its rounding's share); and each chunk's boundary a token early, at more
+    than 95% of the weighted keys, corrected values and outputs (99.9%); no record held where its intervals
+    separate."""
+    with generation.assumed(generation_name):
+        rw.assert_refusals(rw.cumsum_refusals(rw.draw(1, "decay", chunks=2, heads=2), mosaic_lane()),
+                           {"leaving": 0.5})
+        rw.assert_refusals(rw.shifted_refusals(rw.draw(1, "mild", chunks=2, heads=2), mosaic_lane()),
+                           {"w": 0.95, "c": 0.95, "o": 0.95})
