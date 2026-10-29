@@ -7584,6 +7584,8 @@
 "tests/test_k2_horizon.py::test_each_release_translates_to_the_dense_block_it_ships[3.7b-2-36-2560]": 0.008,
 "tests/test_k2_horizon.py::test_each_release_translates_to_the_dense_block_it_ships[7b-4-36-4096]": 0.847,
 "tests/test_k2_horizon.py::test_the_loaded_model_norms_over_two_groups_of_the_width": 0.275,
+"tests/test_kda.py::test_default_eps_gradients_certify_element_by_element": 4.158,
+"tests/test_kda.py::test_default_eps_gradients_compute_the_transcriptions": 4.158,
 "tests/test_kda.py::test_default_eps_gradients_hold_their_prior_bound": 4.158,
 "tests/test_kda.py::test_padded_rows_preserve_the_memory_and_the_history": 3.684,
 "tests/test_kda.py::test_prefill_then_token_steps_reproduce_the_parallel_layer": 14.356,
