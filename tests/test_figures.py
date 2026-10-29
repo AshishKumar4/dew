@@ -180,8 +180,8 @@ def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
 
 def test_an_arrows_head_points_along_its_line_at_its_end():
     """`Figure.arrow`'s head is a triangle whose tip is the line's end and whose base lies 7 px back along the
-    line, 3.5 px either side of it, whatever the direction: along the x axis, and along (0.6, -0.8), whose base
-    centre is 4.2 left of and 5.6 below the tip and whose corners lie 2.8 and 2.1 either side of it."""
+    line, 3.5 px either side of it, whatever the direction: along the x axis, and along (0.6, -0.8), whose
+    base centre is 4.2 left of and 5.6 below the tip and whose corners lie 2.8 and 2.1 either side of it."""
     heads = {(0, 0, 100, 0): [(100, 0), (93, 3.5), (93, -3.5)],
              (10, 90, 70, 10): [(70, 10), (68.6, 17.7), (63, 13.5)]}
     for (x1, y1, x2, y2), corners in heads.items():
