@@ -269,7 +269,7 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
     reduced in fp32 and rounded to the input's dtype before it multiplies, as DeepSeek-V4's and GLM's
     unweighted norms round it, and its reverse rounded where XLA's is; its output and input gradient
     within the float64 gate of XLA's, random rows, a row of 1.5 under a cotangent of ones, whose two
-    gradient contributions cancel, and rows of 0.5 under cotangents of 1.5 * 2**119 (2**14 in fp16), finite
+    gradient contributions cancel, and rows of 0.5 under cotangents of 1.5 * 2**119 (2**7 in fp16), finite
     through XLA's transposes, and of a subnormal (2**-140 in fp32, 2**-130 in bf16, 2**-20 in fp16), which
     they do not halve."""
     def unweighted(x):
@@ -280,8 +280,9 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
     if kind == "aligned":
         x, seed = jnp.full(shape, 1.5, dtype), jnp.ones(shape, dtype)
     elif kind in ("large", "small"):
-        # A cotangent at each format's edge: near its largest finite (fp16's 65504) and a subnormal.
-        large, small = {jnp.dtype(jnp.float16): (14, -20), jnp.dtype(jnp.bfloat16): (119, -130)}.get(
+        # A cotangent at each format's edge: 2**8 below its largest finite (fp16's 2**16, bf16's and fp32's
+        # 2**128), which the gradient's terms grow by within it, and a subnormal.
+        large, small = {jnp.dtype(jnp.float16): (7, -20), jnp.dtype(jnp.bfloat16): (119, -130)}.get(
             jnp.dtype(dtype), (119, -140))
         cotangent = 1.5 * 2.0 ** large if kind == "large" else 2.0 ** small
         x, seed = jnp.full(shape, 0.5, dtype), jnp.full(shape, cotangent, dtype)
