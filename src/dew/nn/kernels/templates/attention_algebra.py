@@ -434,7 +434,9 @@ def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
     and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite."""
     k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH)
-    first = jax.lax.div(k.astype(jnp.int32), jnp.int32(3)).astype(jnp.float32)
+    # k's third by its product with fp32's 1/3, which truncates to the integer quotient for every integral
+    # |k| within POWER2_REACH; an integer division costs the Mosaic mainloops registers they don't have.
+    first = jnp.trunc(k * np.float32(1 / 3))
     second = jnp.trunc((k - first) / 2)
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
 
