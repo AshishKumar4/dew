@@ -11,7 +11,7 @@ import pytest
 from test_optim import assert_updates_as
 
 from dew.nn.cross_attention import CrossAttention, crossing
-from dew.optim import FRESH_LEARNING_RATE, Linear, OptimConfig, ParamGroup, param_labels
+from dew.optim import FRESH_LEARNING_RATE, Exponential, Linear, OptimConfig, ParamGroup, param_labels
 
 RATE, MULTIPLIER = 1e-5, 30.0
 FRESH = ParamGroup("fresh", fresh=True, learning_rate_multiplier=MULTIPLIER, spared=True)
@@ -56,21 +56,24 @@ def test_a_loaded_parameter_steps_as_ungrouped_and_a_fresh_one_at_its_groups_rat
         assert_updates_as(solver, reference, params, [path], f"{optimizer} at {'/'.join(path)}")
 
 
-@pytest.mark.parametrize(("rate", "fresh"), [(1e-5, FRESH_LEARNING_RATE), (1e-2, 1e-2)],
-                         ids=["fine-tuning", "above-the-fresh-rate"])
-def test_a_run_naming_no_groups_steps_its_fresh_modules_at_the_fresh_rate_on_its_schedule(rate, fresh):
+@pytest.mark.parametrize(("schedule", "peak", "fresh"), [
+    (Linear(peak_value=1e-5), 1e-5, FRESH_LEARNING_RATE), (Linear(peak_value=1e-2), 1e-2, 1e-2),
+    (Exponential(init_value=1e-5, end_value=1e-6, offset=1e-5), 2e-5, FRESH_LEARNING_RATE)],
+    ids=["fine-tuning", "above-the-fresh-rate", "offset-decay"])
+def test_a_run_naming_no_groups_steps_its_fresh_modules_at_the_fresh_rate_on_its_schedule(schedule, peak,
+                                                                                          fresh):
     """Where a run names no groups, its fresh modules' default group steps them at the fresh rate at its
-    schedule's peak, on its shape (a linear decay's first update at the peak), or at the run's own rate
-    where that is higher, and every other parameter at the run's; each on par with Optax's AdamW alone
-    at that rate (check 1)."""
+    schedule's peak (`ScheduleBase.peak`, an offset decay's offset added), on its shape: a decay's first
+    update at its peak; or at the run's own rate where that is higher. Every other parameter steps at
+    the run's; each on par with Optax's AdamW alone at that rate (check 1)."""
     params = {"layers_0": {"dense": {"kernel": jnp.zeros((3, 2))}},
               "layers_1": {"cross_attention": {"q": {"kernel": jnp.zeros((2, 2))}}}}
-    config = OptimConfig(optimizer="adamw", learning_rate=Linear(peak_value=rate), weight_decay=0.1)
+    config = OptimConfig(optimizer="adamw", learning_rate=schedule, weight_decay=0.1)
     solver = dataclasses.replace(config, param_groups=config.fresh_groups()).with_fresh(
         ("layers_1/cross_attention",)).build(4)
-    for path, peak in ((("layers_0", "dense", "kernel"), rate),
+    for path, rate in ((("layers_0", "dense", "kernel"), peak),
                        (("layers_1", "cross_attention", "q", "kernel"), fresh)):
-        assert_updates_as(solver, optax.adamw(peak, weight_decay=0.1), params, [path], f"at {'/'.join(path)}")
+        assert_updates_as(solver, optax.adamw(rate, weight_decay=0.1), params, [path], f"at {'/'.join(path)}")
 
 
 def labelled(groups: tuple[ParamGroup, ...], params) -> dict[tuple[str, ...], str]:
@@ -108,18 +111,6 @@ def test_a_decision_claims_its_sources_fresh_blocks_only_over_the_sources_weight
     assert decision(variables=declared.init(jax.random.key(0))).fresh_modules() == ()
 
 
-def ran(run, root, name: str, steps: int):
-    """`run` trained to `steps` under `name`, checkpointing every step, as `test_run_options.trained`
-    trains a kind's run: its state."""
-    from dew.config import TrainerConfig
-    from dew.distributed.placement import Layout, MeshSpec
-
-    trainer = TrainerConfig(checkpoint_dir=str(root / "runs"), steps=steps, log_every=1, eval_every=None,
-                            checkpoint_every=1, multi_host=False, mesh=MeshSpec(fsdp=2),
-                            layout=Layout(min_shard=64))
-    return dataclasses.replace(run, trainer=trainer).prepare().train(name)
-
-
 @pytest.mark.mesh(devices=8)
 def test_a_decision_run_records_its_fresh_group_and_steps_its_blocks_and_head_in_it(tmp_path):
     """A decision run whose context layers draw cross-attention blocks over its loaded backbone records
@@ -130,7 +121,7 @@ def test_a_decision_run_records_its_fresh_group_and_steps_its_blocks_and_head_in
     is refused a fresh group it names (row 2391); a run in the shared form draws each context layer's
     gate alone, a sliver of IDEFICS's blocks, and its default group claims them (row 2414)."""
     from test_decision_recipe import QWEN
-    from test_run_options import decision
+    from test_run_options import decision, trained
 
     from dew.config import RunConfig
     from dew.decision.config import Letters
@@ -142,26 +133,34 @@ def test_a_decision_run_records_its_fresh_group_and_steps_its_blocks_and_head_in
 
     run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN), context_layers=(0,),
                               context_length=16, lora=LoRA(rank=2, modules=("q_proj",)))
-    state = ran(run, tmp_path, "default", 1)
+    saving = {"checkpoint_every": 1}
+    state, _ = trained(run, tmp_path, "default", trainer=saving)
     recorded = groups("default")
     labels = labelled(recorded, state.variables["params"])
     assert {label for path, label in labels.items() if crossing(path) or path[0] == "head"} == {"fresh"}
     assert {label for path, label in labels.items() if "lora" in "/".join(path).lower()} == {"base"}
-    assert int(ran(run, tmp_path, "default", 2).step) == 2 and groups("default") == recorded
     claiming = dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(FRESH, BASE)))
-    named = ran(claiming, tmp_path, "named", 1)
+    named, _ = trained(claiming, tmp_path, "named", trainer=saving)
     assert groups("named")[1] == BASE and groups("named")[0].learning_rate_multiplier == MULTIPLIER
     assert labelled(groups("named"), named.variables["params"]) == labels
+    # Resumed from a recipe naming no groups, each run trains on in the groups its record names, the
+    # default's or its own, and a validation chain only its Python holds rebuilds nothing to read them.
+    resumed, _ = trained(run, tmp_path, "named", trainer={**saving, "steps": 2})
+    assert int(resumed.step) == 2 and groups("named")[0].learning_rate_multiplier == MULTIPLIER
+    held = dataclasses.replace(run, validation=run.validation.map(lambda batch: batch))
+    trained(held, tmp_path, "held", trainer=saving)
+    assert int(trained(held, tmp_path, "held", trainer={**saving, "steps": 2})[0].step) == 2
     # A tied readout over the fixture's tokenizer, whose letters each spell one token as "{}" variants.
     tied = dataclasses.replace(run, context_layers=None, lora=None,
                                head=Letters(labels=Labels(variants=("{}",)), count=4))
-    ran(tied, tmp_path, "tied", 1)
+    trained(tied, tmp_path, "tied")
     assert groups("tied") == ()
     with pytest.raises(ValueError):
-        ran(dataclasses.replace(tied, optim=claiming.optim), tmp_path, "tied-named", 1)
+        trained(dataclasses.replace(tied, optim=claiming.optim), tmp_path, "tied-named")
     # The shared form draws only each layer's gate: at layer 3, the fixture's one layer of full
     # attention, whose projections read the context.
-    gated = ran(dataclasses.replace(run, context_form="shared", context_layers=(3,)), tmp_path, "shared", 1)
+    shared = dataclasses.replace(run, context_form="shared", context_layers=(3,))
+    gated, _ = trained(shared, tmp_path, "shared")
     assert {label for path, label in labelled(groups("shared"), gated.variables["params"]).items()
             if crossing(path)} == {"fresh"}
     assert 0 < drawn(gated) < drawn(state) / 100
