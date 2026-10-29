@@ -265,6 +265,10 @@ CONTEXT_LOGITS = "context_max_logits"
     # like the query's; the longer suffix outranks the MLP's `gate_proj`.
     ("self_attn", "gate_proj"): ("embed", "heads"),
     ("o_proj",): ("attention", "embed"),
+    # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
+    # every device (`dew.nn.dex`).
+    ("dex_projection",): (None, None, None),
+    ("dex_lambda",): (),
 })
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
