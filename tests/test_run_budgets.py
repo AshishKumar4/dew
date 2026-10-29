@@ -19,6 +19,7 @@ from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import Pipeline
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, Linear, OneCycle, OptimConfig
+from dew.telemetry.records import FitStarted
 from dew.training import Best, Checkpoints, Pause, Trainer
 from dew.training.interval import CONSUMED_COMMITTED, CONSUMED_EXAMPLES
 
@@ -813,13 +814,15 @@ def test_asking_a_streamed_runs_steps_reads_none_of_its_data():
 def test_a_clocked_run_of_a_warmup_as_a_share_trains_and_records_it_as_written(schedule):
     """A run bounded in examples that counts no steps ahead trains under a schedule whose warmup is a share
     of the run, which it records at its start as written (`OptimConfig.warmups`), there being no updates
-    ahead to count it in."""
+    ahead to count it in; its start records its length, its bound, and each step's log the examples it
+    has consumed, ending at the bound (row 2436)."""
     state, tracker = clocked_fit(*clocked_records(0), 1, learning_rate=schedule)
     assert state is not None and int(state.consumed) == CLOCKED_RECORDS
-    from dew.telemetry.records import FitStarted
-
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
     assert started.cadences["warmup_steps.learning_rate"] == "25%"
+    assert started.target_steps is None and started.examples == CLOCKED_RECORDS
+    consumed = [scalars["train/examples_consumed"] for _, scalars in tracker.scalars]
+    assert consumed == sorted(consumed) and consumed[-1] == CLOCKED_RECORDS
 
 
 def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():

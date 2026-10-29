@@ -1681,7 +1681,7 @@ class Trainer(Generic[Loss, Effects]):
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
-            seed=self.seed, tokens=plan.tokens,
+            seed=self.seed, tokens=plan.tokens, examples=self._examples,
             cadences=plan.recorded(self._config, self.accumulation, clocked=self._examples is not None),
             groups=self._groups(state))
         self._report(started, current)
@@ -1973,7 +1973,7 @@ class Trainer(Generic[Loss, Effects]):
                                   held(learning_rate(state.opt_state),
                                        None if state.scale is None else state.scale.scale),
                                   {} if self.rollout is None else dict(_rollout_metrics(self.rollout)),
-                                  plan.dataset.statistics())
+                                  {**plan.dataset.statistics(), **interval.consumption(self._examples)})
 
     def _saves(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState, position,
                scores: Mapping[str, float], *, evaluation_due: bool, final: bool = False,
