@@ -105,7 +105,8 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         `solver` or `steps` and an omitted `block` take a loaded source's own
         walk where its family declares one (`masked_recipe`, LLaDA2.0's
         blocks), else `Unmask` over MDLM's steps and the whole response.
-        `samples` is how many rows the preview draws. `decode` turns a row of ids into the text the artifact shows;
+        `samples` is how many rows the preview draws. `decode` turns a row of ids into the text the artifact
+        shows;
         with None, the artifact shows the ids alone.
 
         `model` may be a loaded source, such as a released LLaDA or Dream
