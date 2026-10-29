@@ -30,7 +30,7 @@ from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _rows, option_width, packing
 from dew.decision.scoring import LogLoss, ScoringRule
-from dew.decision.task import Decide, DecideSettings, Weights, laid_out
+from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out
 from dew.inference.loading import RunProcessor
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
@@ -500,11 +500,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
         A `Decide` encodes with the objective's own tokenizer and layout, so it
         takes no processor; it reads images with the backbone's own processor,
-        which a task the objective fine-tunes brings.
+        which a task the objective fine-tunes brings. Its passes pad to the
+        run's widths (`bind_widths`), as the task loaded from its run does.
         """
         if processor is not OMITTED:
             raise TypeError("a Decide task encodes with the objective's tokenizer and takes no processor")
         averaged = not (ema is False or (ema is None and state.ema is None))
+        questions, options = self.widths or (None, None)
         return Decide(
             self.model,
             self._pipeline_weights(state, ema),
@@ -513,4 +515,5 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             self.specials,
             weights=Weights(int(state.step), averaged),
             processor=self.image_processor,
+            budget=Budget(questions=questions, options=options),
         )

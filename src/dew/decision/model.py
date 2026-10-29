@@ -138,18 +138,23 @@ class DecisionModel(HeadedModel):
         head = thaw(part(variables, "head"))
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
         # them. A head that pools none reads a question in its context through the cross-attention alone.
-        pooled = {"spanned": spanned} if spanned is not None and self.head.pools_spans else {}
+        spans = spanned if self.head.pools_spans else None
         if self.head.reads_labels:
             # A readout of labels reads its answer cue in the row.
             labels = self.head.tied_labels()
             tied = None if labels is None else self.readout_logits(variables, states, inputs, labels)
             # A head drawn from the vocabulary rows reads no table after its draw.
             table = None if self.head.draws_from_rows else self.output_table(variables)
-            logits = _array(self.head.apply(head, states, inputs, table, train=train, tied=tied, rngs=rngs,
-                                            **pooled))
+            logits = _array(
+                self.head.apply(head, states, inputs, table, tied=tied, train=train, rngs=rngs)
+                if spans is None else
+                self.head.apply(head, states, inputs, table, tied=tied, spanned=spans, train=train,
+                                rngs=rngs))
         else:
             table = self.table(variables) if self.head.reads_table else None
-            logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs, **pooled))
+            logits = _array(
+                self.head.apply(head, states, inputs, table, train=train, rngs=rngs) if spans is None
+                else self.head.apply(head, states, inputs, table, spanned=spans, train=train, rngs=rngs))
         return jnp.where(inputs.options, logits, -jnp.inf)
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
