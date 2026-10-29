@@ -33,8 +33,7 @@ def draw(seed):
     segments = np.zeros((rows, WIDTH), np.int32)
     mask = np.zeros((rows, WIDTH), np.float32)
     advantage = np.zeros((rows, WIDTH), np.float32)
-    # A session's weight exactly one over its count, in float64, as the float64 run reads it.
-    weights = np.zeros((rows, WIDTH), np.float64)
+    weights = np.zeros((rows, WIDTH), np.float32)
     for row, lengths in enumerate(LENGTHS):
         start = 0
         for session, length in enumerate(lengths, start=1):
