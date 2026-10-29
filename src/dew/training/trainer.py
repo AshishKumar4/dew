@@ -106,7 +106,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import clips_qk, held_rates, learning_rate, scaled_rates, settable_rates, with_rates
+from dew.optim import clips_qk, held_rates, learning_rate, reclocked, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
@@ -1566,11 +1566,15 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume))
         if initial is not None:
             # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
-            # accumulation's mirrors of the parameters with them. Its run reads its data afresh, so a
-            # clock of examples starts at none consumed, and a run on another clock keeps none.
+            # accumulation's mirrors of the parameters with them. Its run reads its data afresh: a clock
+            # of examples starts at none consumed, a run on another clock keeps none, and its schedules
+            # take the run's own form (`reclocked`).
             initial = owned_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
+            with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
+                made = jax.eval_shape(self.optimizer.init, initial.variables["params"])
             initial = dataclasses.replace(
-                initial, consumed=None if self._examples is None else jnp.zeros((), jnp.int32))
+                initial, consumed=None if self._examples is None else jnp.zeros((), jnp.int32),
+                opt_state=reclocked(initial.opt_state, made))
             shardings, _ = self._validated(initial)
             supplied = jax.device_put(initial, shardings)
             return int(supplied.step), None, lambda: (supplied, shardings), None

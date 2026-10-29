@@ -487,7 +487,8 @@ def test_a_clocked_run_a_take_ends_first_consumes_only_what_it_dispatched():
 def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_clock_keeps_none(tmp_path):
     """A state supplied to a fit opens its data afresh: a clocked fit from a finished clocked run's state
     consumes its whole bound again from none, ending at it; a run of steps from that state keeps no clock,
-    in its state or its checkpoints."""
+    in its state or its checkpoints, its schedules counted in updates; and a clocked fit from that run's
+    state reads its progress again (`reclocked`)."""
     (x,) = clocked_records(0)
     # A fit donates the state it is given, so each one's counts are read before the next fit takes it.
     first = thin_fit(x, examples=CLOCKED_RECORDS)
@@ -500,6 +501,8 @@ def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_
     checkpoints.wait()
     assert stepped.consumed is None
     assert not {CONSUMED_EXAMPLES, CONSUMED_COMMITTED} & checkpoints.control(int(stepped.step)).keys()
+    # Back on the examples clock, its schedule reads the run's progress from none consumed again.
+    assert int(thin_fit(x, examples=CLOCKED_RECORDS, state=stepped).consumed) == CLOCKED_RECORDS
 
 
 class Placed(Pulled):

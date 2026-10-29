@@ -1187,6 +1187,26 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     return rates[0] if len(rates) == 1 else None
 
 
+def reclocked(opt_state: optax.OptState, made: optax.OptState) -> optax.OptState:
+    """`opt_state`, a state supplied to a run, with each schedule's state in the form the run's own
+    optimizer makes (`made`, its init's shapes): a schedule over a run's progress (`ProgressState`) that
+    the run counts in updates keeps its updates and rates alone (`RateState`), and one the run reads
+    over its progress starts its marks at none, as the run's clock starts afresh (`Trainer.fit`'s
+    `state`). A schedule in its own form is kept as it is."""
+    def converted(own, held):
+        if not isinstance(own, (RateState, ProgressState)) or type(own) is type(held):
+            return held
+        if isinstance(own, RateState):
+            return RateState(held.updates, held.rates)
+        marks = {name: jnp.zeros([], jnp.float32) for name in own.marks}
+        return ProgressState(held.updates, held.rates, marks, jnp.zeros([], jnp.float32))
+
+    def scheduled(node) -> bool:
+        return isinstance(node, (RateState, ProgressState))
+
+    return jax.tree.map(converted, made, opt_state, is_leaf=scheduled)
+
+
 def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str, float]]) -> optax.OptState:
     """`opt_state` with each `scheduled_solver`'s rate set to `rates`' for its param group, by name, or
     under None for a solver of no group (`rates_of`): a schedule's rate-valued fields in its
