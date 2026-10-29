@@ -11,7 +11,7 @@ import time
 from collections.abc import Iterator, Mapping
 from typing import Protocol
 
-from dew.data.compile import fitted
+from dew.data.compile import Handed, fitted
 from dew.data.dataset import Loader, Reader
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.telemetry.instrumentation import count_compilation_cache
@@ -64,7 +64,7 @@ class DataObjective(Protocol):
     def data(self) -> ObjectiveData: ...
 
 
-def run_data(objective: DataObjective, dataset: Dataset | Loader,
+def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
              validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None, *,
              steps: int | None, epochs: int | None, tokens: int | None, examples: int | None,
              accumulation: int, startup: Startup,
