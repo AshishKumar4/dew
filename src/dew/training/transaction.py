@@ -119,17 +119,19 @@ def _only_when(due, taken, kept, operand):
 
 
 def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: jax.Array | None,
-            batch: Batch, stepped: jax.typing.ArrayLike) -> tuple:
+            batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array) -> tuple:
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
-    `batch`, wherever it ran: the advanced state, its step counting `stepped`, the loss, the metrics
-    with the batch's counts, and whether the loss is finite, the microbatch accepted and the window
-    committed."""
+    `batch`, wherever it ran: the advanced state, its step counting `stepped` and its clock the source
+    examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
+    metrics with the batch's counts, and whether the loss is finite, the microbatch accepted and the
+    window committed."""
     metrics = {**aux.metrics, **step_counts(batch)}
     if aux.record is not None:
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
-    return (dataclasses.replace(advanced, step=current.step + stepped), loss, metrics, jnp.isfinite(loss),
-            advanced.microstep > current.microstep, committed)
+    clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
+    return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
+            jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
 
 
 def evaluation_of(aux: Aux) -> Evaluated | None:
@@ -330,7 +332,7 @@ class Transaction:
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
                  record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None,
-                 inspection: Inspection | None = None):
+                 inspection: Inspection | None = None, examples: int | None = None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -348,12 +350,16 @@ class Transaction:
         through both: a plain Adam step's peak rose from 2.483 GB to 3.020 GB with its state in host
         memory, and fetched past the gradient it is 2.483 GB again (node receipt TL-a100-offload-1338-c,
         hostmem.json). XLA:GPU still holds the whole state for the update, so keeping it on the host
-        frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way.
+        frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way. `examples`
+        is a run's bound in source examples, where it counts no updates ahead: each update hands its
+        optimizer the run's progress, the share of them its state has consumed (`TrainState.consumed`),
+        which a schedule over the run reads (`dew.optim.ScheduleBase.progressed`).
         """
         self.fetch = fetch
         self.record = record
         # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
         self.inspection = inspection
+        self.bound = examples
         self.objective = objective
         self.optimizer = optimizer
         self.copies = copies or {}
@@ -400,14 +406,17 @@ class Transaction:
         loss, back = jax.vjp(lambda s: self.objective.reduce_loss(s)[0], stats)
         return loss, back(jnp.asarray(factor, loss.dtype))[0]
 
-    def prepare_attempt(self, state, stats, aux, loss, gradient):
+    def prepare_attempt(self, state, stats, aux, loss, gradient, closing=None):
         """Pool this microbatch into the window and weigh up the commit.
 
         Returns a `PendingAttempt`: the pooled statistics and gradient,
         whether this attempt closes the window, and whether the pooled loss
         needs a replay. A shared mean pools its gradient by mass here and
         never replays. A general statistics tree reduces only once pooled, so
-        its gradient has to be recomputed under the pooled cotangent.
+        its gradient has to be recomputed under the pooled cotangent. A
+        `closing` attempt, the last of a run whose stream ends inside the
+        window (`dew.batch.CLOSES_WINDOW`), closes it with the microbatches it
+        holds, its mean theirs.
         """
         if aux.qk_stats is None and clips_qk(state.opt_state):
             raise ValueError(
@@ -417,6 +426,8 @@ class Transaction:
         previous = state.accumulation
         fill = state.microstep % self.size
         due = (fill + 1) == self.size
+        if closing is not None:
+            due = due | closing
         local_finite = _all_finite((loss, stats, gradient, aux.variables, aux.effects))
         local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
         qk = compact_qk(aux.qk_stats)
@@ -526,6 +537,14 @@ class Transaction:
         """Add one replayed microbatch's unscaled gradient into the running sum."""
         return jax.tree.map(lambda a, b: a + _unscale(b, factor), accumulated, contribution)
 
+    def progress(self, current: TrainState) -> jax.Array:
+        """The share of the run's bound in examples `current` has consumed, float32: what its dispatched
+        batches consumed before this update (`TrainState.consumed`)."""
+        if self.bound is None or current.consumed is None:
+            raise ValueError("a schedule over the run's progress reads the examples it consumed, which only "
+                             "a run bounded in examples that no plan counts ahead keeps")
+        return jnp.asarray(current.consumed, jnp.float32) / self.bound
+
     def commit(self, current, gradient, effects, qk):
         """Apply the pooled native gradient and return its finiteness and global norm.
 
@@ -545,7 +564,9 @@ class Transaction:
             # (`Objective.projected`), and the step stores them projected again.
             stored = self.objective.projected(current.variables["params"], updated=False)
             if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
-                update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk)
+                clocked = {} if self.bound is None else {"progress": self.progress(current)}
+                update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk,
+                                                          **clocked)
             else:
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored)
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
@@ -559,9 +580,10 @@ class Transaction:
             if self.objective.ema is not None:
                 if averaged is None:
                     raise ValueError("the objective declares EMA but the state carries none")
+                # A decay over the run's progress reads it where the run keeps one (`EMASpec.progressed`).
+                at = self.progress(current) if self.objective.ema.progressed else current.updates
                 averaged = _chosen(self.objective.averages(current.updates),
-                                   ema_update(averaged, params, self.objective.ema.decay(current.updates)),
-                                   averaged)
+                                   ema_update(averaged, params, self.objective.ema.decay(at)), averaged)
             inspected = {} if self.inspection is None else summaries(
                 self.inspection, stored, native, update, params["params"])
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
@@ -705,7 +727,7 @@ class Transaction:
         unscale = compile_phase(self.unscaled)
         add = compile_phase(self.add_contribution)
 
-        def run(state, batch, part, tokens):
+        def run(state, batch, part, tokens, closes=None):
             # The `part`th microbatch of the step's batch is attempt step *
             # split + part, with a draw of its own; the objective's schedules
             # count steps, however many microbatches each is read in. `tokens`
@@ -728,7 +750,9 @@ class Transaction:
             # and a copied parameter's gradient stays bf16 until the update
             # widens it as it reads it. A window of several microbatches
             # widens it as it pools it, so the window sums in fp32.
-            pending = prepare(state, realized.stats, realized.aux, loss, gradient)
+            # A run whose stream ends inside the window closes it at the step's last part (`closes`).
+            closing = None if closes is None else jnp.logical_and(closes, part == self.split - 1)
+            pending = prepare(state, realized.stats, realized.aux, loss, gradient, closing)
 
             # The record of each of the window's other microbatches the commit replays, in its slot.
             own = evaluation_of(realized.aux)
@@ -750,12 +774,14 @@ class Transaction:
                         kept = [jax.tree.map(lambda held, new, slot=slot: jnp.where(slot == index, new, held),
                                              held, evaluated) for slot, held in enumerate(kept)]
                     return add(accumulated, realized.pullback(cot), factor), kept
+                # The window's other microbatches stand in its slots before this one's: all of them
+                # where the window is whole, those it holds where a closing attempt ends it early.
                 if host:
                     carried = (combined, unreplayed)
-                    for index in range(self.size - 1):
+                    for index in range(int(pending.fill)):
                         carried = one(index, carried)
                     return carried
-                return jax.lax.fori_loop(0, self.size - 1, one, (combined, unreplayed))
+                return jax.lax.fori_loop(0, pending.fill, one, (combined, unreplayed))
 
             replayed = jnp.zeros((), bool)
             if state.accumulation is not None and not self.shared:
@@ -770,7 +796,8 @@ class Transaction:
             if own is not None:
                 replays = replays or []
                 evaluations = [(own, self._places(state.microstep % self.size, own, part)), *replays]
-                ran = jnp.concatenate([jnp.ones((1,), bool), jnp.full((len(replays),), replayed)])
+                held = jnp.arange(len(replays)) < pending.fill
+                ran = jnp.concatenate([jnp.ones((1,), bool), jnp.logical_and(held, replayed)])
                 realized = dataclasses.replace(realized, aux=dataclasses.replace(
                     realized.aux, record=recorded(evaluations, ran)))
             if not host:

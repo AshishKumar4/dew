@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A decoder's cross-attention is any configuration that builds a block per layer (`CrossBlocks`), which
+  `with_cross_attention` takes. `SharedCrossAttention` is a new one: each named layer reads the
+  conditioning sequence through its own attention's projections and norms, and the read joins the
+  residual through one tanh gate per layer, zero at the start, the only weight it adds.
+  `CrossAttention`, IDEFICS's gated block, is the other.
 - A request names its key: `TextGeneration`, `BlockGeneration` and `MaskedGeneration` calls and
   `Server.submit` and `Server.__call__` take `key=` as a required keyword, as every native sampler does,
   where a call without one raised `ValueError` at run time; it now raises `TypeError` at the call.

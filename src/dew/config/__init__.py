@@ -1583,7 +1583,9 @@ class RunConfig:
             with generation.chosen(attention_form=trainer.attention_form):
                 state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
                                    profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
+                    # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
                     dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
+                    examples=trainer.examples if steps is None else None,
                     eval_every=trainer.eval_interval(dataset),
                     checkpoint_every=trainer.checkpoint_interval(dataset),
                     checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,

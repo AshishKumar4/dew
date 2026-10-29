@@ -11,7 +11,7 @@ from jax import lax
 
 from dew.nn.precision import divided, scaled
 
-from .common import _check_endpoint_domain, _push
+from .common import _check_endpoint_domain, _push, _unit_noise
 
 
 def transition_variance(rates_t, rates_s):
@@ -72,7 +72,7 @@ class DDPM:
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         alpha_t, sigma_t = process.rates(t, like=x)
         alpha_s, sigma_s = process.rates(t_next, like=x)
-        noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+        noise = _unit_noise(key, x)
         eps_coeff = (sigma_s ** 2 * alpha_t) / (sigma_t * alpha_s)
         if self.variance == "large":
             gamma = jnp.sqrt(transition_variance((alpha_t, sigma_t), (alpha_s, sigma_s)))
@@ -108,7 +108,7 @@ class DDIM:
             # from the DDPM posterior on any process. The direction term shrinks to keep the
             # marginal variance right.
             sigma_tilde = self.eta * posterior_std((alpha_t, sigma_t), (alpha_s, sigma_s))
-            noise = jax.random.normal(key, x.shape)
+            noise = _unit_noise(key, x)
             direction = jnp.sqrt(jnp.maximum(sigma_s ** 2 - sigma_tilde ** 2, 0.0))
             return alpha_s * denoised + direction * eps + sigma_tilde * noise, state
         return alpha_s * denoised + sigma_s * eps, state
@@ -224,7 +224,7 @@ class Consistency:
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         alpha_s, sigma_s = process.rates(t_next, like=x)
         count, steps = state
-        noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+        noise = _unit_noise(key, x)
         stepped = jnp.where(count == steps - 1, denoised, alpha_s * denoised + sigma_s * noise)
         return stepped, (count + 1, steps)
 
@@ -259,7 +259,7 @@ class TCD:
         if self.eta == 0:
             return noised, state
         ratio = alpha_s / alpha_mid
-        noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+        noise = _unit_noise(key, x)
         # The forward process's q(x_s | x_mid) (`transition_variance`). The reference's 1 - ratio^2
         # is its variance on a variance-preserving table only: with alpha 1 it adds no noise, and a
         # variance-exploding walk collapsed to zero.

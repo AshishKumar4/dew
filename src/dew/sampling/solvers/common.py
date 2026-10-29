@@ -134,6 +134,12 @@ def _sigma_integrator(name: str, process: Process) -> GeneralizedNoiseScheduler:
             f"so it needs a GeneralizedNoiseScheduler and not {type(schedule).__name__}")
     return schedule
 
+def _unit_noise(key, x):
+    """The unit normal a stochastic step draws from its key at `x`'s shape: in float32 whatever the
+    run's precision, so a float64 walk draws a float32 walk's innovations widened, and is its truth."""
+    return jax.random.normal(key, x.shape, dtype=jnp.float32)
+
+
 def _push(buffer, value):
     """`buffer` with its oldest entry dropped and `value` appended, so the
     most recent entry is last."""
@@ -164,10 +170,14 @@ class Multistep(NamedTuple):
         return self._replace(taken=self.taken + 1)
 
 
-def _multistep(x, times, depth: int) -> Multistep:
-    rates = jnp.ones((depth, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
-    return Multistep(jnp.zeros((depth, *x.shape), x.dtype), rates, rates,
-                     jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32))
+def _multistep(x, times, depth: int, process) -> Multistep:
+    # The rates' history in the dtypes the rates take at the run's times, as each step pushes them, so
+    # a float64 walk scans in float64 (ledger 2063).
+    alpha, sigma = process.rates(times[0], like=x)
+    shape = (depth, x.shape[0]) + (1,) * (x.ndim - 1)
+    return Multistep(jnp.zeros((depth, *x.shape), x.dtype), jnp.ones(shape, alpha.dtype),
+                     jnp.ones(shape, sigma.dtype), jnp.zeros((), jnp.int32),
+                     jnp.asarray(times.shape[0] - 1, jnp.int32))
 
 
 def _half_log_snr(alpha, sigma):

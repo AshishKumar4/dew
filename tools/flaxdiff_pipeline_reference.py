@@ -141,12 +141,12 @@ def draws(step: Path, config: dict) -> tuple[np.ndarray, list[np.ndarray], np.nd
     """Dew's own call on the run: its initial state, each ancestral step's
     unit noise in order, and its images. The call runs the task's own solver,
     `EulerAncestral`, through one that records, step by step, the noise it
-    draws from the key the walk hands it (`_ancestral_noise`)."""
+    draws from the key the walk hands it (`_unit_noise`)."""
     from flax import struct
 
     from dew.inference import TextToImage
     from dew.sampling.solvers import Solver
-    from dew.sampling.solvers.sigma import _ancestral_noise
+    from dew.sampling.solvers.common import _unit_noise
 
     task = TextToImage.from_flaxdiff(step, config, jax_version=jax.__version__)
     noise: list[np.ndarray] = []
@@ -159,7 +159,7 @@ def draws(step: Path, config: dict) -> tuple[np.ndarray, list[np.ndarray], np.nd
             return self.solver.init(x, times, process, key=key)
 
         def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-            drawn = _ancestral_noise(key, x)
+            drawn = _unit_noise(key, x)
             jax.debug.callback(lambda value: noise.append(np.asarray(value)), drawn, ordered=True)
             return self.solver.step(x, t, t_next, denoised, eps, state, key, process, denoise)
 

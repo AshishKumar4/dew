@@ -91,6 +91,7 @@ from dew.data.pipeline import (
     Batched,
     BatchStage,
     Configured,
+    Consumed,
     Costly,
     Dataset,
     DeviceStep,
@@ -391,6 +392,26 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
 
 
+def _native_after_bound(pipeline: Pipeline) -> bool:
+    """Whether `pipeline` counts the examples its rows consume (`Consumed`) and runs a native Grain step
+    after the bound that marks them."""
+    stages = pipeline.stages
+    at = next((index for index, stage in enumerate(stages)
+               if isinstance(stage, Map) and isinstance(stage.step, Consumed)), None)
+    return at is not None and any(isinstance(stage, Native) for stage in stages[at:])
+
+
+def _shuffles_windows(pipeline: Pipeline) -> bool:
+    """Whether `pipeline` counts the examples its rows consume (`Consumed`, a run bounded in examples) and
+    shuffles in a window after a stage that packs or windows its rows."""
+    stages = pipeline.stages
+    if not any(isinstance(stage, Map) and isinstance(stage.step, Consumed) for stage in stages):
+        return False
+    packed = next((index for index, stage in enumerate(stages) if isinstance(stage, (Pack, Windows))), None)
+    return packed is not None and any(isinstance(stage, Shuffle) and bool(stage.window)
+                                      for stage in stages[packed:])
+
+
 def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     """`pipeline`'s training read bounded to its first `examples` source examples: the records as they
     reach the first of the objective's steps that makes several rows of one (`FlatMap.examples`, which
@@ -419,7 +440,8 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
             isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
         raise ValueError(f"{_name(pipeline)} repeats with a count, or after the records it packs or batches, "
                          f"which a bound of {examples} examples would cut or repeat; leave the repeat out")
-    bound = (Limit(examples),) if repeats else (Repeat(None), Limit(examples))
+    # Each example the bound reads is consumed by the last row a step makes of it (`Consumed`).
+    bound = (*(() if repeats else (Repeat(None),)), Limit(examples), Map(Consumed()))
     batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
                                                  batch, *pipeline.stages[batched + 1:]))
@@ -696,7 +718,17 @@ def compile(
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured)
     loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
-    return loader if examples is None else dataclasses.replace(loader, examples=examples)
+    if examples is None:
+        return loader
+    return dataclasses.replace(loader, examples=examples, bound_ends=_bound_ends(staged.original))
+
+
+def _bound_ends(pipeline: Pipeline) -> bool:
+    """Whether `pipeline`'s read, bounded in examples (`_bounded`), ends where its bound does: no limit or
+    slice after the bound ends it first (`Loader.bound_ends`)."""
+    at = next((index for index, stage in enumerate(pipeline.stages)
+               if isinstance(stage, Map) and isinstance(stage.step, Consumed)), len(pipeline.stages))
+    return not any(isinstance(stage, (Limit, Slice)) for stage in pipeline.stages[at + 1:])
 
 
 def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective: ObjectiveData | None,
@@ -852,6 +884,19 @@ def _compiled(
     records = _epoch_records(train, build)
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
+    order_records = _order_records(train, build)
+    if order_records is None and _native_after_bound(train):
+        # A native Grain step rebuilds or reorders rows as it likes, so the examples each row consumes
+        # (`CONSUMED`), which a run no plan counts ahead reads its progress off, are kept by no contract.
+        raise ValueError(f"{_name(train)} runs a native Grain step (`grain`) after its examples bound, which "
+                         "keeps no count of the examples its rows consume: run it before the bound, as a "
+                         "step Dew names, or read the data in a global order")
+    if order_records is None and _shuffles_windows(train):
+        # A run no plan counts ahead reads its progress off the windows that end its examples
+        # (`CONSUMED`), which a later shuffle could draw before the windows holding the rest of them.
+        raise ValueError(f"{_name(train)} shuffles the windows it packs, which a run bounded in examples "
+                         "and read in its own order reads in the order they end their examples; shuffle "
+                         "the records before the pack, or read it in a global order")
     held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
     return Loader(
         training,
@@ -866,7 +911,7 @@ def _compiled(
         batch_tokens=staged.batch_tokens,
         device=device,
         tail=_tail(train, build),
-        order_records=_order_records(train, build),
+        order_records=order_records,
     )
 
 

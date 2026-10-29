@@ -9,8 +9,10 @@ from .common import GeneralizedNoiseScheduler, times
 def rho_ramp(low_inv, high_inv, ramp, rho):
     """(high_inv + ramp (low_inv - high_inv))^rho: the rho spacing at `ramp` between sigma extremes
     given as their 1/rho powers, on a number or an array of either library, the one interpolation
-    the scheduler and the published Karras grids take."""
-    return (high_inv + ramp * (low_inv - high_inv)) ** rho
+    the scheduler and the published Karras grids take. `rho` is raised as a float, so an equal rho
+    given as an int (a config read back, `7`) walks the grid its float does: an int exponent lowers to
+    repeated multiplication, a float to pow, about an ulp apart (ledger 2061)."""
+    return (high_inv + ramp * (low_inv - high_inv)) ** float(rho)
 
 
 class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):

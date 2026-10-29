@@ -90,6 +90,31 @@ CROSS_VALUE = "cross_value"
 """The cache variable of a cached call's context values, shaped as its keys."""
 
 
+def kept_context(module: nn.Module, rows: int, length: int, shapes: tuple[tuple[int, ...], tuple[int, ...]],
+                 dtype, context: jax.Array | None,
+                 project: Callable[[jax.Array], tuple[jax.Array, jax.Array]]) -> tuple[jax.Array, jax.Array]:
+    """The keys and values a cached call of `module` over a context reads, `[rows, tokens, *shape]`
+    each, `shapes` a key's and a value's trailing axes. A call that carries a context `[rows, tokens,
+    features]` projects them from it (`project`) and, once the cache is allocated, keeps them in
+    `CROSS_KEY` and `CROSS_VALUE`, padded to the `length` tokens the cache holds; a call without one
+    reads what the cache keeps. As with a decoder's own cache, the first cached call allocates the
+    cache and writes nothing. The call reads them as the cache keeps them, in `dtype`."""
+    allocated = module.has_variable("cache", CROSS_KEY)
+    keys = module.variable("cache", CROSS_KEY, jnp.zeros, (rows, length, *shapes[0]), dtype)
+    values = module.variable("cache", CROSS_VALUE, jnp.zeros, (rows, length, *shapes[1]), dtype)
+    if context is None:
+        return keys.value, values.value
+    width = context.shape[1]
+    if width > length:
+        raise ValueError(f"a cached call keeps at most {length} context tokens a row "
+                         f"(CrossAttention.context_length), got {width}")
+    key, value = (projected.astype(dtype) for projected in project(context))
+    if allocated:
+        keys.value = jnp.pad(key, ((0, 0), (0, length - width)) + ((0, 0),) * len(shapes[0]))
+        values.value = jnp.pad(value, ((0, 0), (0, length - width)) + ((0, 0),) * len(shapes[1]))
+    return key, value
+
+
 @logical_axes({
     ("to_q",): ("embed", "heads", "head_dim"),
     ("to_k",): ("embed", "heads", "head_dim"),
@@ -198,22 +223,8 @@ class NormalAttention(nn.Module):
         if self.cache_length is None:
             raise ValueError("a cached call keeps a context's keys and values, which this attention has "
                              "no cache_length for")
-        allocated = self.has_variable("cache", CROSS_KEY)
-        shape = (rows, self.cache_length, self.key_heads, self.dim_head)
-        keys = self.variable("cache", CROSS_KEY, jnp.zeros, shape, dtype)
-        values = self.variable("cache", CROSS_VALUE, jnp.zeros, shape, dtype)
-        if context is None:
-            return keys.value, values.value
-        width = context.shape[1]
-        if width > self.cache_length:
-            raise ValueError(f"a cached call keeps at most {self.cache_length} context tokens a row "
-                             f"(CrossAttention.context_length), got {width}")
-        key, value = (projected.astype(dtype) for projected in self._keys_values(context))
-        if allocated:
-            padding = ((0, 0), (0, self.cache_length - width), (0, 0), (0, 0))
-            keys.value = jnp.pad(key, padding)
-            values.value = jnp.pad(value, padding)
-        return key, value
+        shape = (self.key_heads, self.dim_head)
+        return kept_context(self, rows, self.cache_length, (shape, shape), dtype, context, self._keys_values)
 
     @nn.compact
     def __call__(self, x, context=None, freqs_cis=None, mask=None, key_value_seq_lengths=None,

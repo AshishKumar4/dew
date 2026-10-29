@@ -108,9 +108,7 @@ def vp_process():
 
 
 def karras_process():
-    # rho a float, as FlaxDiff's KarrasVENoiseScheduler and Dew's default hold it: an int lowers the
-    # power to repeated products, an ulp off its grid (row 2061).
-    schedule = KarrasVENoiseScheduler(sigma_max=80, rho=7.0, sigma_data=0.5)
+    schedule = KarrasVENoiseScheduler(sigma_max=80, rho=7, sigma_data=0.5)
     return Process(schedule, KarrasPredictionTransform(sigma_data=0.5)), KarrasOracle()
 
 
@@ -221,6 +219,9 @@ model, the sample shape, and the check a walk's samples pass."""
 GAUSSIAN = ("vp", "karras")
 """The cases a solver that integrates any Gaussian process samples."""
 
+FLOATING = ("vp", "linear", "endpoint", "karras", "ve_endpoint", "flow")
+"""The cases whose state is continuous, a float array a run holds in its precision."""
+
 FAMILIES = ("vp", "karras", "flow")
 """One case of each continuous process family: variance preserving,
 variance exploding, rectified flow."""
@@ -300,6 +301,33 @@ def test_every_registered_solver_samples_its_processes_and_refuses_the_rest(name
             generate(*build(), solver, shape=shape)
 
 
+@pytest.mark.parametrize("name, case", [
+    (name, case) for name in sorted(solvers) if name not in CONFIDENCE
+    for case in INTEGRATES.get(name, CONVERGES_ON.get(name, GAUSSIAN)) if case in FLOATING])
+def test_every_registered_solver_walks_a_float64_run_in_float64(name, case):
+    """Each solver `dew.registry.solvers` names walks a float64 state over float64 times through
+    `sample`'s scan in float64 on every continuous case it samples, a multistep history included
+    (ledger 2063: their histories were float32 and the scan refused them), so its float64 walk is check
+    1's truth for its float32 one: from the same prior draw and key, each step's innovations the float32
+    walk's widened (`_unit_noise`), not the float32 walk widened."""
+    build, shape, _ = PROCESS_CASES[case]
+    process, model = build()
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *shape)), jnp.ones((1,)))
+    x_T = np.asarray(process.noise(jax.random.PRNGKey(0), (4, *shape)))
+
+    denoise = process.denoiser(model, params, {})
+
+    def walked(dtype):
+        return sample(denoise, jnp.asarray(x_T, dtype), solver=solvers.build(name), key=jax.random.PRNGKey(1),
+                      times=np.asarray(process.times(8), dtype))
+
+    narrow = walked(np.float32)
+    with jax.enable_x64(new_val=True):
+        wide = walked(np.float64)
+    assert (narrow.dtype, wide.dtype) == (jnp.float32, jnp.float64)
+    assert np.all(np.isfinite(wide)) and not np.array_equal(np.asarray(wide), np.asarray(narrow, np.float64))
+
+
 @pytest.mark.parametrize("case, solver, steps", [
     ("vp", DDPM(), 1000),
     ("vp", DDIM(eta=0.5), 100),
@@ -357,7 +385,9 @@ def flaxdiff_start(solver, x_T):
     states start no different on."""
     process, _ = karras_process()
     with jax.ensure_compile_time_eval():
-        return solver.init(x_T, np.asarray(process.times(12)), process, key=jax.random.key(0))
+        # The grid in the walk's precision, as `flaxdiff_walk` and `flaxdiff_closed` cast it, so the state
+        # starts in the dtype the walk carries it in.
+        return solver.init(x_T, np.asarray(process.times(12), x_T.dtype), process, key=jax.random.key(0))
 
 
 def flaxdiff_walk(solver, x_T, times):
@@ -437,20 +467,10 @@ def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     is held as it is and through the clip to [-1, 1] that FlaxDiff's
     `post_process` applies as the pipeline's output step: the stand-in's
     clean predictions reach |x| = 3, so the clip moves most entries and the
-    unclipped comparison is the one that reads the walk. The truth is Dew's
-    walk in float64 interval by interval (`flaxdiff_walk`), closed with the
-    clean prediction at the last time: `sample`'s own float64 scan refuses
-    MultiStepDPM's float32 history (row 2063)."""
-    process, _ = karras_process()
+    unclipped comparison is the one that reads the walk. The truth is the
+    same `sample` in float64, MultiStepDPM's history included (ledger 2063)."""
     closing = flaxdiff_closed(solver)
-
-    def walked_and_closed(inputs):
-        x_T = jnp.asarray(inputs["x_T"])
-        times = jnp.asarray(inputs["times"], x_T.dtype)
-        last = flaxdiff_walk(solver, x_T, times)[-1]
-        return flaxdiff_outputs(StandIn(process)(last, jnp.full((x_T.shape[0],), times[-1]))[0])
-
-    assert_on_par_with_flaxdiff(f"{name} closed", closing, walked_and_closed)
+    assert_on_par_with_flaxdiff(f"{name} closed", closing)
     assert float(jnp.abs(closing(writer("flaxdiff_solver_reference").draw(0))["closed"]).max()) > 2
 
 

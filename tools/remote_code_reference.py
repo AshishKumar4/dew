@@ -114,15 +114,41 @@ widens the pins its code carries (MiMo's router casts its logits with
 rotary `inv_freq`) in float64."""
 
 
+def release_file(name: str, file: str) -> Path:
+    """One of `name`'s release files at its pinned commit (its code, its `config.json`): the copy
+    vendored into the fetched store (`--vendor`, tests/fixtures/hf/<name>/release/<file>), read offline
+    and checked by its sha256, where it is pinned; else the Hub's."""
+    from fetched_fixtures import PINNED, local
+
+    vendored = FIXTURES / name / "release" / file
+    if vendored.with_name(vendored.name + PINNED).is_file():
+        return local(vendored)
+    repo, revision = RELEASES[name][:2]
+    return Path(hf_hub_download(repo, file, revision=revision))
+
+
+def vendor(name: str) -> None:
+    """`name`'s release files, its code and its `config.json`, pinned into the fetched store from the Hub
+    at the release's commit, with its license (`fetched_fixtures.pin_release`), so a check that opens the
+    release reads them offline (`release_file`)."""
+    from fetched_fixtures import pin_release
+
+    repo, revision, files, _ = RELEASES[name]
+    for file in (*files, "config.json"):
+        data = Path(hf_hub_download(repo, file, revision=revision)).read_bytes()
+        print(pin_release(FIXTURES / name / "release" / file, data, reference=f"{repo}@{revision}/{file}",
+                          license=LICENSES[name]), flush=True)
+
+
 def released_classes(name: str, workspace: Path):
     """The release's own config of a dict (its code's files at its commit, beside the dict with the
     release's `auto_map`, in `workspace`) and its model class over such a config."""
-    repo, revision, files, auto = RELEASES[name]
+    _, _, files, auto = RELEASES[name]
     directory = workspace / name
     directory.mkdir(parents=True)
     for file in files:
-        shutil.copy(hf_hub_download(repo, file, revision=revision), directory / file)
-    released = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
+        shutil.copy(release_file(name, file), directory / file)
+    released = json.loads(release_file(name, "config.json").read_text())
 
     def configured(config: dict):
         (directory / "config.json").write_text(json.dumps({**config, "auto_map": released["auto_map"]}))
@@ -192,7 +218,7 @@ print(json.dumps({"class": name == other, "every weight matched": matched,
 """A fresh interpreter's offline opens of two directories through their own code (`opens`), compared."""
 
 
-def opens(name: str, export: Path, scratch: Path) -> None:
+def opens(name: str, export: Path, scratch: Path) -> dict[str, bool]:
     """Whether `export`, a Dew save of `name`'s fixture (`PretrainedDecoder.from_model(...).save`), opens
     offline through the release's own transformers loader as the release does: one fresh interpreter, the
     hub offline and its module cache empty, opens the export, which reads its own code alone, and the
@@ -203,31 +229,27 @@ def opens(name: str, export: Path, scratch: Path) -> None:
       python -c 'from dew.interop import Pretrained, PretrainedDecoder; loaded = Pretrained.load(
           "tests/fixtures/hf/lfm3-tiny"); PretrainedDecoder.from_model(loaded.model, loaded.variables).save(
           "/tmp/lfm3-export")'
-      <the release's Python> tools/remote_code_reference.py lfm3-tiny --opens /tmp/lfm3-export"""
+      <the release's Python> tools/remote_code_reference.py lfm3-tiny --opens /tmp/lfm3-export
+    The release's files are its vendored copies where they are pinned (`release_file`). Returns each
+    check by name; tests/test_remote_code_releases.py runs it under the release's transformers
+    (`release_env`)."""
     import os
-    import subprocess
-    import sys
 
-    from huggingface_hub import hf_hub_download
-
-    repo, revision, files, auto = RELEASES[name]
+    _, _, files, auto = RELEASES[name]
     release = scratch / "release"
     release.mkdir()
-    released = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
+    released = json.loads(release_file(name, "config.json").read_text())
     config = json.loads((FIXTURES / name / "config.json").read_text())
     (release / "config.json").write_text(json.dumps({**config, "auto_map": released["auto_map"]}))
     shutil.copy(FIXTURES / name / "model.safetensors", release / "model.safetensors")
     for file in files:
-        shutil.copy(hf_hub_download(repo, file, revision=revision), release / file)
+        shutil.copy(release_file(name, file), release / file)
     # The release's own loader, the auto class its config registers it under.
     run = subprocess.run([sys.executable, "-c", OPENED, auto, str(FIXTURES / name / "input_ids.npy"),
                           str(export), str(release)], check=True, capture_output=True, text=True,
                          env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                               "HF_MODULES_CACHE": str(scratch / "modules")})
-    checks = json.loads(run.stdout.strip().splitlines()[-1])
-    print(name, "opens as the release does" if all(checks.values()) else f"differs: {checks}")
-    if not all(checks.values()):
-        raise SystemExit(1)
+    return json.loads(run.stdout.strip().splitlines()[-1])
 
 
 def send(stream, arrays: dict) -> None:
@@ -361,12 +383,18 @@ def main() -> None:
     parser.add_argument("--opens", type=Path,
                         help="check that a Dew export of the fixture opens as the release does")
     parser.add_argument("--record", action="store_true", help="record the release over seeds at its sites")
+    parser.add_argument("--vendor", action="store_true",
+                        help="pin the release's files into the fetched store, for checks run offline")
     parser.add_argument("--serve", action="store_true", help="the release's side of --record's pipe")
     parser.add_argument("--release-python", default=sys.executable,
                         help="the Python whose transformers runs the release's code, for --record")
     arguments = parser.parse_args()
     if arguments.serve:
         serve(arguments.names[0])
+        return
+    if arguments.vendor:
+        for name in arguments.names:
+            vendor(name)
         return
     if arguments.record:
         for name in arguments.names:
@@ -377,7 +405,11 @@ def main() -> None:
             # One export is one fixture's save: it opens beside that fixture's release alone.
             if len(arguments.names) != 1:
                 parser.error(f"--opens checks one fixture's export, and {len(arguments.names)} are named")
-            opens(arguments.names[0], arguments.opens, Path(scratch))
+            checks = opens(arguments.names[0], arguments.opens, Path(scratch))
+            print(arguments.names[0], "opens as the release does" if all(checks.values())
+                  else f"differs: {checks}")
+            if not all(checks.values()):
+                raise SystemExit(1)
             return
         if arguments.padding:
             for name in arguments.names:

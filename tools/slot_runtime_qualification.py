@@ -273,6 +273,9 @@ class ObservedScoring:
     def fits(self, rows):
         return self.task.fits(rows)
 
+    def compile(self, variables):
+        return self.task.compile(variables)
+
     def forward(self, variables, rows):
         self.batch_rows.append(len(rows))
         return self.task.forward(variables, rows)
@@ -301,7 +304,13 @@ def native(args, pool):
 
     # Each leaf at the dtype the release stores it in, as the verdict reads the release's headers.
     bundle = Pretrained.load(args.source, dtype=args.dtype, param_dtype="auto", attention_impl="xla")
-    task = replace(Decide.of(bundle), budget=Budget(tokens=4096, rows=4))
+    decide = Decide.of(bundle)
+    # Four rows a pass at the layout's shortest pass length (`Decide.pass_shapes`, its window's halvings),
+    # so the server's passes batch: a slot release's 32768-token window pads every pass to 4096 or more.
+    # No widths are declared, so each pass compiles as it comes: compiled up front, every shape of the
+    # window would run a pass, to 32768 tokens, which the pool never asks (`Decide.compile_scoring`).
+    shortest = min(shape.length for shape in decide.pass_shapes)
+    task = replace(decide, budget=Budget(tokens=4 * shortest, rows=4))
     scoring, variables = task.scoring()
     observed = ObservedScoring(scoring)
     server = ScoringServer.from_task(observed, variables)
