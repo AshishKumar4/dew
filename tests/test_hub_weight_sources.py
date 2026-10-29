@@ -110,7 +110,8 @@ from dew.data.sources.tokens import TokenFiles
 
 tokens, root = sys.argv[1:3]
 chain = TokenFiles(tokens).pipe(presets.lm, None, seq_len=8, batch=8, pack=None).loading(Loading(workers=0))
-LMRunConfig.cli(["--pretrained", "local/llama", "--trainer.name", "run", "--trainer.checkpoint-dir", root,
+LMRunConfig.cli(["--pretrained", "local/llama", "--tokenizer", "local/llama", "--trainer.name", "run",
+                 "--trainer.checkpoint-dir", root,
                  "--trainer.steps", "1", "--trainer.compilation-cache-dir", "None", "--trainer.multi-host",
                  "False", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "1",
                  "--max-new-tokens", "0"], default=LMRunConfig(data=chain)).run()
