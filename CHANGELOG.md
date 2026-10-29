@@ -5,6 +5,15 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A decoder whose family runs remote code (`LFM3`) saves with its release's code beside its config: the
+  modules its `auto_map` names and every module they import, at the release's pinned revision, so the
+  export opens through transformers' `trust_remote_code` as the release does.
+- Muse Glimmer's processor reads videos (`pixel_values_videos`, `video_grid_thw`) as Qwen 3.5's does,
+  each frame pair a temporal patch the tower attends within.
+- LLaDA2.0 generates as its release does: `text_generation()`, `dew.pipeline` and an objective over the
+  source walk its response 32 places at a time with `Confident`'s reveal (LLaDA2.1 alike, without its
+  release's editing), and `MaskedSettings`, `MaskedGeneration` and `MaskedDiffusionObjective` take
+  `Confident` and `block` for any masked model.
 - Masked diffusion walks a block at a time, as LLaDA2's releases generate: `DiscreteProcess.generate(...,
   block=)` unmasks each block of counted places over its own steps, each position reading its document
   through its own block, and `dew.diffusion.discrete.Confident` reveals as LLaDA2 does (the draws past a

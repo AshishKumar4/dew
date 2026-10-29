@@ -388,4 +388,5 @@ DEEPSEEK_V41 = DecoderFamily(
     constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,
     # The image span's learned vectors sit at the top level, beside the
     # aligner (model.py:1201-1222).
-    wrapper_projector_names=('image_start', 'image_newline', 'image_end'))
+    wrapper_projector_names=('image_start', 'image_newline', 'image_end'),
+    wrapper_media_suffixes=('.gate.bias_vl',))

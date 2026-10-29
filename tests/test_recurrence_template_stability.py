@@ -178,6 +178,7 @@ def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(r
     assert fast_backward(restarting(lambda given: given, regime)(bf16(operands, HOOKS)))
 
 
+@pytest.mark.whole_suite  # 130 s interpreted, past a group's two minutes (ledger 2145).
 def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
     """The fast backward's log decay gradient, interpreted, as near float64 as the port's under decays near
     zero on a draw: a chunk's ranges sum each token's terms before it (`mainloop.gradients`), never a token's

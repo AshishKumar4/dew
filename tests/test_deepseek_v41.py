@@ -520,6 +520,61 @@ def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeyp
     assert wrapper_route("embed.weight", record) == ("language_model", "embed.weight")
 
 
+def test_a_bundle_loaded_text_only_is_its_text_checkpoint(tmp_path):
+    """The bundle with its ViT, loaded `text_only`, reads as the family's text checkpoint: the model the
+    text-only checkpoint builds, its variables leaf for leaf that checkpoint's, so neither the tower, the
+    aligner nor the routers' image-span bias is read, and its logits bit for bit."""
+    text = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference",
+                           text_only=True)
+    plain = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
+    assert text.model == plain.model
+    assert jax.tree.structure(text.variables) == jax.tree.structure(plain.variables)
+    jax.tree.map(np.testing.assert_array_equal, text.variables, plain.variables)
+    ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
+    np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)),
+                                  np.asarray(plain.model.apply(plain.variables, ids)))
+
+
+def quantized_as_released(directory: Path) -> Path:
+    """The checkpoint at `directory` stored as the release stores its decoder: its quantization_config's
+    `.scale` format (FP8 blocks of 32 under E8M0 scales, routed experts as FP4 pairs), over every
+    projection the blocks cover, the rest as they are."""
+    from safetensors.numpy import load_file
+
+    from dew.interop.codecs import deepseek_v4
+    from dew.interop.safetensors_io import write_file
+
+    released = json.loads((RELEASED / "config.json").read_text())["quantization_config"]
+    codec = deepseek_v4(32, fp4_experts=True)
+    stored = {}
+    for name, tensor in load_file(directory / "model.safetensors").items():
+        covered = (name.endswith(".weight") and tensor.ndim == 2
+                   and not name.startswith(("embed", "head", "vision"))
+                   and tensor.shape[0] % 32 == 0 and tensor.shape[1] % 32 == 0)
+        stored.update(codec.encode(name, tensor) if covered else {name: tensor})
+    write_file(stored, directory / "model.safetensors", {"format": "pt"})
+    config = json.loads((directory / "config.json").read_text())
+    (directory / "config.json").write_text(json.dumps({**config, "quantization_config": released}))
+    return directory
+
+
+def test_a_quantized_bundle_loaded_text_only_is_its_quantized_text_checkpoint(tmp_path):
+    """A bundle stored as the release stores its decoder (FP8 and FP4 under its quantization_config),
+    loaded `text_only`, is the quantized text-only checkpoint loaded: its codec reads the decoder's names
+    unchanged, so its variables are that checkpoint's leaf for leaf."""
+    import shutil
+
+    (tmp_path / "bundle").mkdir()
+    bundle = quantized_as_released(vision_bundle(tmp_path / "bundle"))
+    text = tmp_path / "text"
+    shutil.copytree(TINY, text, ignore=shutil.ignore_patterns("vision*"))
+    quantized_as_released(text)
+    taken = Pretrained.load(bundle, dtype="float32", attention_impl="reference", text_only=True)
+    plain = Pretrained.load(text, dtype="float32", attention_impl="reference")
+    assert taken.model == plain.model
+    jax.tree.map(np.testing.assert_array_equal, taken.variables, plain.variables)
+
+
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):
     """Routing the image span by the text bias moves the prefill's logits
     further from the float64 truth than rounding can, and the image
