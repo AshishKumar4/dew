@@ -10,7 +10,7 @@ import jax
 import numpy as np
 import pytest
 from decision_support import decision_rows
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, dew_programs
 from steady_state import steady_state
 
 from dew.artifacts import Decisions
@@ -217,13 +217,20 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
         return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
                              decide.variables),)
 
+    def real(scored: list[np.ndarray]) -> np.ndarray:
+        """Each row's questions' logits over their own options, the padding slots left out."""
+        return np.concatenate([logits[slot, :len(laid.options)]
+                               for row, logits in zip(rows, scored, strict=True)
+                               for slot, laid in enumerate(row.questions)])
+
+    @dew_programs
     def packed(variables) -> np.ndarray:
-        return np.concatenate([logits.ravel() for logits in task.scored(rows, variables)])
+        return real(task.scored(rows, variables))
 
     def alone(task: Decide):
-        return lambda variables: np.concatenate([task.scored([row], variables)[0].ravel() for row in rows])
+        return lambda variables: real([task.scored([row], variables)[0] for row in rows])
 
-    assert_as_exact(as_given(packed), as_given(alone(task)), draw, "packed pass", seeds=PACKED_SEEDS,
+    assert_as_exact(packed, dew_programs(alone(task)), draw, "packed pass", seeds=PACKED_SEEDS,
                     truth_fn=alone(wide))
 
 

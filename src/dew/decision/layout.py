@@ -446,15 +446,16 @@ class Layout:
     def shortest_row(self, encoder: Tokenizer, specials: Specials) -> int:
         """The tokens of the shortest row this layout lays out, one one-option question about an empty
         state, laid out with room to spare: `bounds`' unit, which no window shorter holds."""
-        return self._laid_size(encoder, specials, 1)[0]
+        return self._laid_size(encoder, specials, 1, empty=self.state(encoder, specials, ""))[0]
 
-    def _laid_size(self, encoder: Tokenizer, specials: Specials, *options: int) -> tuple[int, int]:
+    def _laid_size(self, encoder: Tokenizer, specials: Specials, *options: int,
+                   empty: Sequence[int]) -> tuple[int, int]:
         """A row's tokens and its context's, of a question of each of `options` one-option questions about
-        an empty state, laid out with room to spare (`bounds`)."""
+        an empty state, its tokens `empty`, laid out with room to spare (`bounds`)."""
         roomy = dataclasses.replace(self, max_len=1 << 30)
         asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
                  for index, count in enumerate(options)}
-        laid = roomy.rows(encoder, specials, "", asked, tokens=self.state(encoder, specials, ""))
+        laid = roomy.rows(encoder, specials, "", asked, tokens=empty)
         return sum(len(row.tokens) for row in laid), sum(len(row.context or ()) for row in laid)
 
     def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None,
@@ -482,7 +483,7 @@ class Layout:
                              "context's length; give its context_length")
 
         def size(*options: int) -> tuple[int, int]:
-            return self._laid_size(encoder, specials, *options)
+            return self._laid_size(encoder, specials, *options, empty=empty)
 
         row, held = size(1)
         if row > self.max_len:

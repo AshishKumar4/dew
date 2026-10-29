@@ -339,6 +339,7 @@ class Decide(SavedRunTask):
         average = averaged_pinned(pinned, ema=ema)
         task = cls._recorded(runs[0], recorded[0], average.model.build(), average.variables,
                              Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
+        task = replace(task, variables=_served(task.model, task.variables))
         return task if calibrate_on is None else task.calibrated(calibrate_on)
 
     def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
@@ -504,20 +505,36 @@ class Decide(SavedRunTask):
         return tuple(shapes)
 
     def _shape(self, rows: Sequence[Encoded]) -> PassShape:
-        """The shape of the pass over `rows` (`pass_shapes`): of the shortest length that holds the
-        longest row, the fewest windows that hold them all, or the most there are, which `fits` refuses
-        past."""
+        """The shape of the pass over `rows` (`pass_shapes`): of the shortest length whose windows hold
+        them all, the fewest such windows declared; else the most windows of the longest length, which
+        `fits` refuses. First-fit opens a window only where those before it have no room, so the
+        windows it uses at a length are the same however many it may: one placement over the most a
+        length declares gives the fewest that hold them."""
         longest = max(len(row.tokens) for row in rows)
         # The layout refuses a row past its window (`_encoded`), which the last length is.
-        length = next(shape.length for shape in self.pass_shapes if shape.length >= longest)
-        sized = [shape for shape in self.pass_shapes if shape.length == length]
-        return next((shape for shape in sized if self._placed(rows, shape) is not None), sized[-1])
+        lengths = sorted({shape.length for shape in self.pass_shapes if shape.length >= longest})
+        for length in lengths:
+            sized = [shape for shape in self.pass_shapes if shape.length == length]
+            placed = self._placed(rows, sized[-1])
+            if placed is not None:
+                used = max(placed) + 1
+                return next(shape for shape in sized if shape.rows >= used)
+        return [shape for shape in self.pass_shapes if shape.length == lengths[-1]][-1]
 
-    def packing(self, shape: PassShape) -> Pack:
+    def packing(self, shape: PassShape, questions: int | None = None) -> Pack:
         """How a pass of `shape` packs its rows: first-fit into its windows, each holding whole rows within
         a run's bounds (`DecisionObjective.bounds`), as a run packs its rows (`dew.decision.rows.packing`),
-        their gold left out."""
-        return self._packs[shape.length, shape.rows]
+        their gold left out; with `questions` past the shape's slots, a window's questions widened to
+        that many, for a row the bounds' probes undercount (a program of its own)."""
+        if questions is None or questions <= (shape.questions or 0):
+            return self._packs[shape.length, shape.rows]
+        from dew.decision.rows import packing
+
+        held = self.context_length
+        widened = replace(self._bounds[shape.length], questions=questions)
+        return replace(packing(replace(self.layout, max_len=shape.length), widened,
+                               None if held is None else max(shape.length, held), trained=False),
+                       bins=shape.rows)
 
     @functools.cached_property
     def _bounds(self) -> dict[int, Bounds]:
@@ -547,7 +564,7 @@ class Decide(SavedRunTask):
         from dew.data.packing import window_fields
         from dew.data.tokens import FirstFit
 
-        pack = self.packing(shape)
+        pack = self.packing(shape, max(len(row.questions) for row in rows))
         lengths, paired = window_fields(pack)
         placement = FirstFit([lengths[name] for name in paired], shape.rows, pack.segments)
         placed = []
@@ -690,7 +707,7 @@ class Decide(SavedRunTask):
         offered = max(len(laid.options) for row in rows for laid in row.questions)
         # A declared width holds a pass unless a row asks more, which widens it (a program of its own).
         options = shape_bucket(offered, 1) if shape.options is None else max(shape.options, offered)
-        pack = self.packing(shape)
+        pack = self.packing(shape, max(len(row.questions) for row in rows))
         windows = first_fit_windows([model_row(row, options, self.context_length) for row in rows], pack)
         if len(windows) > shape.rows:
             raise ValueError(f"{len(rows)} rows pack into {len(windows)} windows of {shape.length} "
@@ -1052,14 +1069,15 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
 
 
 def _served(model: DecisionModel, variables: Variables) -> Variables:
-    """A loaded task's weights, its own to give up (`dew.inference.projections.packed_owned`), with the
-    backbone's projections packed as a served decoder's are: the one layout a task holds whatever a
-    source stored, a run's packed or an export's apart, so its loads compute one program (ledger 2299).
-    A task over a bundle's borrowed weights (`Decide.of`) reads them as the bundle holds them."""
+    """A loaded task's weights as the model's own tree, each projection group a source or a run held
+    packed split back into its members (`dew.inference.projections.unpacked`): the one layout a task
+    holds whatever its source stored, a run's packed or an export's apart, so its loads compute one
+    program (ledger 2299), and the tree an adapter binds and an export writes. A task over a bundle's
+    borrowed weights (`Decide.of`) reads them as the bundle holds them."""
     from dew.batch import part
-    from dew.inference.projections import packed_owned
+    from dew.inference.projections import unpacked
 
-    return joined({"backbone": packed_owned(model.backbone, part(variables, "backbone")),
+    return joined({"backbone": unpacked(model.backbone, part(variables, "backbone")),
                    "head": part(variables, "head")})
 
 
