@@ -569,11 +569,12 @@ def capped(softcap: float, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array
     return softcap * jnp.tanh(logits / softcap)
 
 
-def key_biased(score_mod: Callable | None, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array,
-               bias: jax.Array) -> jax.Array:
-    """`score_mod`'s logits (the scaled logits where None) plus a bias one term a key, `bias` the tile's
-    keys' `[1, k]` (a `Kind.KEY` parameter): ALiBi's slope times each key's place, added after a softcap as
-    `reference_attention` adds its bias. It is a score hook as `functools.partial(key_biased, score_mod)`."""
+def biased(score_mod: Callable | None, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array,
+           bias: jax.Array) -> jax.Array:
+    """`score_mod`'s logits (the scaled logits where None) plus a bias, `bias` the tile's keys' `[1, k]` (a
+    `Kind.KEY` parameter: ALiBi's slope times each key's place) or its entries' `[q, k]` (a `Kind.TILE`
+    one: a dense bias), added after a softcap as `reference_attention` adds its bias. It is a score hook as
+    `functools.partial(biased, score_mod)`."""
     capped = logits if score_mod is None else score_mod(logits, q_pos, k_pos)
     return capped + bias
 
