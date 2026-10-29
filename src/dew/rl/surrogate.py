@@ -105,6 +105,34 @@ def segment_mean(values: jax.Array, mask: jax.Array, segments: jax.Array | None 
     return total / jnp.clip(count, min=1.0)
 
 
+def _first_kept(keep: jax.Array, segments: jax.Array | None) -> jax.Array:
+    """Where each sequence's first kept position is, `[B, T]` (`segment_mean`'s sequences): a
+    sequence's count of kept positions before it is the least of its positions' (`segment_min`)."""
+    keep = keep.astype(jnp.int32)
+    keys = jnp.ones(keep.shape, jnp.int32) if segments is None else jnp.asarray(segments, jnp.int32)
+    seen = jnp.cumsum(keep, axis=1)
+    per_row = jax.vmap(lambda row, ids: jax.ops.segment_min(row, ids, num_segments=keep.shape[1] + 1))
+    before = jnp.take_along_axis(per_row(seen - keep, keys), keys, axis=1)
+    return (keep != 0) & (seen - before == 1)
+
+
+def sequence_sum(per_token: jax.Array, weights: jax.Array, segments: jax.Array | None = None) -> jax.Array:
+    """`sum(weights * per_token)` over the tokens of nonzero weight, for terms that each sequence's
+    tokens share (GSPO's and GMPO's, a sequence `segment_mean`'s): each sequence's first kept term
+    times its weights' total, once a sequence, plus each token's departure from that term at its
+    weight. The sum is the same in exact arithmetic whatever the terms, but a sequence of one term
+    rounds once, as its per-sequence form does, not once a token; the gradient is each token's own
+    term's, the shared term carrying none."""
+    weights = jnp.asarray(weights)
+    keep = weights != 0
+    held = jnp.where(keep, per_token, 0)
+    first = _first_kept(keep, segments)
+    shared, _ = _segment_totals(jax.lax.stop_gradient(jnp.where(first, held, 0)), first, segments)
+    total, _ = _segment_totals(weights, keep, segments)
+    return (jnp.sum(jnp.where(first, shared * total, 0))
+            + jnp.sum(jnp.where(keep, held - shared, 0) * weights))
+
+
 def sequence_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array,
                        mask: jax.Array, segments: jax.Array | None = None) -> jax.Array:
     """Return GSPO's sequence-level log ratio, with a per-token gradient.

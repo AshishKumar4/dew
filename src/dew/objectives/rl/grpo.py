@@ -39,6 +39,7 @@ from dew.rl.surrogate import (
     mismatch_metrics,
     reinforce_terms,
     sequence_rejection_mask,
+    sequence_sum,
 )
 
 from ..lm.objective import Scores, TokenScorer, _unpadded
@@ -399,7 +400,12 @@ class GRPOObjective(TokenScorer):
             # Each session's sum over the constant, averaged over the sessions (their session weights sum
             # to their count): a kept token weighs one over the constant.
             weights = effective.astype(weights.dtype) / self.aggregation_tokens
-        return Ratio(jnp.sum(jnp.where(weights != 0, per_token, 0) * weights), mass), weights, mass, aux
+        if self.policy_loss in ("gspo", "gmpo"):
+            # A sequence's tokens share its term: summed once a sequence, as its paper's form sums it.
+            total = sequence_sum(per_token, weights, terms.segments)
+        else:
+            total = jnp.sum(jnp.where(weights != 0, per_token, 0) * weights)
+        return Ratio(total, mass), weights, mass, aux
 
     def _policy_terms(self, terms: _Terms, mask: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         """The chosen surrogate's per-token terms and verl's three actor metrics."""

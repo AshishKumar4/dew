@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import as_given, assert_as_exact
+from reference_error import assert_as_exact
 from rl_support import TinyHead
 
 from dew.objectives.rl import RolloutScheduler, Synchronous
@@ -36,7 +36,7 @@ from dew.training.transaction import with_ema
 LENGTHS = ((3, 5), (4, 2))
 """Each row's two sessions' trained token counts."""
 WIDTH = 12
-SEEDS = 16
+SEEDS = dict.fromkeys(("grpo", "dapo", "dr_grpo", "gspo", "cispo", "gmpo", "reinforce_pp", "rloo"), 16)
 
 
 def draw(seed):
@@ -62,10 +62,9 @@ def draw(seed):
     return policy, old, reference, advantage, mask, segments, weights
 
 
-def sessions_of(mask, segments):
-    """Each session's token positions, `(row, columns)`."""
-    return [(row, np.flatnonzero((segments[row] == session) & (mask[row] > 0)))
-            for row in range(mask.shape[0]) for session in np.unique(segments[row]) if session]
+SPANS = [(row, np.arange(start, start + length)) for row, lengths in enumerate(LENGTHS)
+         for start, length in zip(np.cumsum((0, *lengths[:-1])), lengths, strict=True)]
+"""Each session's token positions, `(row, columns)`, the same in every draw."""
 
 
 def dew_term(name, **settings):
@@ -91,22 +90,16 @@ def dew_term(name, **settings):
     return term
 
 
-def paper(objective, dtype):
-    """A paper's objective `objective(per-session arrays) -> loss` and its gradient in `dtype`, by
-    autodiff of the formula written over each session's tokens alone: in float32 the reference, in
-    float64 the truth. It reads each draw's sessions off its mask on the host, so the gate runs it as
-    given."""
+def paper(objective):
+    """A paper's objective `objective(per-session arrays) -> loss` and its gradient, by autodiff of the
+    formula written over each session's tokens alone (`SPANS`), in its inputs' precision: float32 the
+    reference, float64 the truth."""
     def term(policy, old, reference, advantage, mask, segments, weights):
-        spans = sessions_of(np.asarray(mask), np.asarray(segments))
-        with jax.enable_x64(new_val=True):
-            def value(current):
-                return objective([(current[row, columns], jnp.asarray(old, dtype)[row, columns],
-                                   jnp.asarray(reference, dtype)[row, columns],
-                                   jnp.asarray(np.asarray(advantage)[row, columns[0]], dtype))
-                                  for row, columns in spans])
-            current = jnp.asarray(policy, dtype)
-            return jax.device_get((value(current), jax.grad(value)(current)))
-    return as_given(term)
+        def value(current):
+            return objective([(current[row, columns], old[row, columns], reference[row, columns],
+                               advantage[row, columns[0]]) for row, columns in SPANS])
+        return value(policy), jax.grad(value)(policy)
+    return term
 
 
 def clipped(ratio, advantage, low, high):
@@ -151,7 +144,7 @@ def gmpo(sessions):
     def one(p, o, _, a):
         ratio = jnp.exp(p - o)
         kept = jnp.minimum(ratio * a, jnp.clip(ratio, np.exp(-0.4), np.exp(0.4)) * a)
-        return jnp.exp(jnp.mean(jnp.log(jnp.abs(kept)))) * np.sign(a)
+        return jnp.exp(jnp.mean(jnp.log(jnp.abs(kept)))) * jnp.sign(a)
     return -sum(one(*session) for session in sessions) / len(sessions)
 
 
@@ -177,8 +170,7 @@ def rloo(sessions):
 def test_each_method_is_its_papers_objective(name, formula, settings):
     """The method's loss term, its reference penalty in the loss included, and its gradient in each
     token's log-probability are its paper's objective's (check 1, the paper's form in float64 the truth)."""
-    assert_as_exact(dew_term(name, **settings), paper(formula, jnp.float32), draw, name, seeds=SEEDS,
-                    truth_fn=paper(formula, jnp.float64))
+    assert_as_exact(dew_term(name, **settings), paper(formula), draw, name, seeds=SEEDS[name])
 
 
 def test_a_method_fixes_its_composition_and_refuses_what_it_lacks():
