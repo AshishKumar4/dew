@@ -206,9 +206,9 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
 
 
 def _shapes(layouts: tuple, consumers: int, columns: list[int], role: int, most_rows: int) -> list[tuple]:
-    """`derived`'s tile shapes at `consumers`, in its order (its Shape): the derived one, then each narrower
-    or shorter one a tile that stages too shallow gives way to, its registers the most generous of
-    `layouts`' (a layout holding fewer gives way at placement, `resources.placed`)."""
+    """`derived`'s tile shapes at `consumers`, in its order (its Shape): by their operand reads a FLOP, a
+    tile that stages too shallow giving way to the next, its registers the most generous of `layouts`' (a
+    layout holding fewer gives way at placement, `resources.placed`)."""
     if not columns:
         return []
     area = max(resources.held_area(layout, consumers) for layout in layouts)
@@ -218,9 +218,15 @@ def _shapes(layouts: tuple, consumers: int, columns: list[int], role: int, most_
     def held(block_n: int) -> int:
         return min(most_rows, max(resources.held_rows(layout, consumers, block_n) for layout in layouts))
 
-    first = [(held(widest), widest)] if held(widest) >= role else []
-    return [*first, *((block_m, block_n) for block_n in columns if block_n <= widest
-                      for block_m in range(held(block_n), 0, -role) if (block_m, block_n) not in first)]
+    # Every shape at each column width up to the widest and each height its registers hold there, in the
+    # order of the fewest operand reads a FLOP (1/rows + 1/columns), the wider on a tie: a shape that
+    # does not plan (its registers, its stages) gives way to the next by that measure, never first to a
+    # shorter one of its width. mma.sync's one consumer at Qwen3-8B's gate/up so takes 128 x 128 where
+    # 128 x 192 does not hold, not 64 x 192 (0.016 against 0.021 reads a FLOP; 64 x 192 ran 1.21-1.30x
+    # XLA's time against 128 x 128's 1.10-1.14, FSA100POST32).
+    return sorted(((block_m, block_n) for block_n in columns if block_n <= widest
+                   for block_m in range(held(block_n), 0, -role)),
+                  key=lambda shape: (1 / shape[0] + 1 / shape[1], -shape[1]))
 
 
 def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, programs: int, rows: int,
