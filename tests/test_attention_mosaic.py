@@ -61,18 +61,22 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_backward.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "accurate")
-"""The backward's forms (`_backward_form`): the fast and the accurate."""
+BACKWARD_FORMS = ("default", "fused", "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one, and the accurate."""
+HOOKED_FORMS = ("default", "accurate")
+"""The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
 
-def _backward_form(form: str, width: int) -> tuple[bool, attention_mosaic.BackwardTiles]:
-    """The backward form `form` names over heads `width` wide, `(accurate, config)`: its dQ launch one
-    consumer's beside a producer and its dK/dV launch two consumers sharing a key block (`FED`), the accurate
-    form's sums past 64 wide in two column halves, as the derivation takes them (one whole at 128 wide holds
-    262 registers a thread)."""
-    accurate = form == "accurate"
-    columns = 2 if accurate and width > 64 else 1
-    return accurate, attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, **FED)
+def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
+    """The backward form `form` names, `(accurate, config)`: two launches, the dQ launch one consumer's
+    beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
+    accurate form's sums in two column halves where it is `accurate-halves` (a width split's,
+    `BackwardTiles.columns`); or the fast form's one launch (`fused`), queries first on the dQ launch's
+    layout."""
+    if form == "fused":
+        return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
+    columns = 2 if form == "accurate-halves" else 1
+    return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, **FED)
 
 
 FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2)
@@ -178,7 +182,7 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                                                for value, kind in zip(params, kinds, strict=True)), initial,
                               output.output_mod, output.output_params)
 
-    accurate, config = _backward_form(form, width)
+    accurate, config = _backward_form(form)
 
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
@@ -279,7 +283,7 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call]) if spans is None else spans
     hooks = _dropping(shape) if drop else None
     draw = _drawn(shape, jnp.bfloat16, width, keys=keys, value_width=value_width)
-    accurate, config = (False, config) if form is None else _backward_form(form, width)
+    accurate, config = (False, config) if form is None else _backward_form(form)
     trained = attention_mosaic.forward if residuals_from is None else residuals_from
 
     def ours(query, key, value, dout):
@@ -382,7 +386,7 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("form", BACKWARD_FORMS)
+@pytest.mark.parametrize("form", HOOKED_FORMS)
 def test_the_backward_is_on_par_dropping_interpreted(form):
     """The backward in each form under probability dropout over a causal call, its D the dropped products'
     own pass (`attention_mosaic_backward._centre_launch`), under the interpreter."""
@@ -416,7 +420,7 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
     spans = template.spans(queries, queries, 1)
     query, key, value = (jnp.zeros((1, queries, 1, 64), jnp.bfloat16) for _ in range(3))
     dout = jnp.ones((1, queries, 1, 64), jnp.bfloat16)
-    accurate, config = _backward_form(form, 64)
+    accurate, config = _backward_form(form)
 
     def score_mod(s, q_pos, k_pos, temperature, bias):
         del q_pos, k_pos
@@ -779,10 +783,10 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 @INTERPRETS
 @pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
 def test_a_width_split_backward_writes_its_score_parameters_gradients_once_interpreted(hooks):
-    """The accurate backward 128 wide, its dK/dV sums in two column halves (`BackwardTiles.columns`), under a
-    hook whose gradient the dK/dV programs write (a key's parameter, a tile's): the first half's program
-    writes it, and every gradient is the reference's, under the interpreter."""
-    _check_hooked_backward(hooks, form="accurate", interpret=True, width=128)
+    """The accurate backward 128 wide, its sums in two column halves (`BackwardTiles.columns`), under a hook
+    whose gradient the dK/dV programs write (a key's parameter, a tile's): the first half's program writes
+    it, and every gradient is the reference's, under the interpreter."""
+    _check_hooked_backward(hooks, form="accurate-halves", interpret=True, width=128)
 
 
 @lowers("sm90")
@@ -1184,8 +1188,12 @@ def _residuals(shape) -> tuple:
 
 def _backward_models(op, ba, config) -> dict:
     """Each backward launch's register model by its kernel's name (`attention_dq`, `attention_dkv`, a width
-    share's `_columnsN`), at its own layout and consumers (`BackwardTiles.dkv`)."""
+    share's `_columnsN`, the one launch's `attention_dkv_fused`), at its own layout and consumers
+    (`BackwardTiles.dkv`)."""
     dq, dkv = op._launch_registers(ba, config)
+    if config.fused:
+        family = attention_mosaic_program.bundle_of(config, jnp.bfloat16)
+        return {"attention_dkv_fused": resources.register_model(family, config.consumers, dkv)}
     models = {}
     for kind, tiles, registers in (("dq", config, dq), ("dkv", config.dkv, dkv)):
         family = attention_mosaic_program.bundle_of(tiles, jnp.bfloat16)

@@ -36,6 +36,7 @@ from dew.nn.kernels.templates.attention import (
 from dew.nn.kernels.templates.attention_mosaic_backward import (
     _dkv_allocations,
     _dq_allocations,
+    _fused_allocations,
     _launch_backward,
     split_queries,
 )
@@ -51,7 +52,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     Tiles,
     _block,
     _padded,
-    _parts,
     _width,
     bundle,
     bundle_of,
@@ -360,38 +360,44 @@ def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) 
 
 DQ_ROWS = 7
 """The per-query rows a dQ step holds across its walk (`_backward_registers`)."""
-KEYS_FIRST_STATISTICS = 5
-"""The per-query statistics a keys-first dK/dV step holds as column vectors (`_backward_registers`)."""
+DKV_STATISTICS = 5
+"""The per-query statistics a dK/dV step holds, the maximum, the denominator, the anchor, D and the anchor
+key (`attention_mosaic_backward._scores`): column vectors keys first, row vectors in a fused launch's queries
+first (`_backward_registers`)."""
 
 
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                         accurate: bool, dq: bool) -> int:
     """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
     consumer's dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums) and its per-query rows,
-    beside a step's logits and output cotangents' products fp32, then its score cotangents fp32 and their
-    parts in the operands' dtype; a dK/dV consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside
-    a step's two products, a fused launch's dQ tile `[bq, D]` fp32 and its per-query statistics; every sum its
-    share of the `columns`."""
+    beside a step's logits and output cotangents' products fp32, then its score cotangents fp32 and one part
+    of them in the operands' dtype at a time (`algebra.formed_parts`; ptxas held the accurate form's three at
+    width 128 in 255 registers, unspilled, where all three would be 262); a dK/dV consumer's dK and dV sums
+    `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products (a fused launch's queries first, its dQ
+    tile `[bq, D]` fp32 too) and its per-query statistics; every sum its share of the `columns`."""
     block_q, block_k = config.block_q, config.block_k
     products = [(block_q, block_k, jnp.float32)] * 2
     if dq:
         carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
-        cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
+        cotangents = [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]
         # Its per-query rows in the accumulator's row layout (`Family.row_registers`), live across the walk:
         # the maximum, the prior total, the anchor, D, the anchor key and the residual and mass sums
         # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
         rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
         return resources.live_registers(family, carried, products, cotangents) + rows
+    carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
+                                                                 jnp.float32)]
+    if config.fused:
+        # Queries first (`attention_mosaic_backward._fused_launch`): its statistics row vectors.
+        statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
+        dq_tile = [(block_q, width, jnp.float32)]
+        return resources.live_registers(family, carried, products, dq_tile) + statistics
     # A consumer's share of a slot's queries where the consumers share its keys (`split_queries`).
     queries = block_q // config.consumers if split_queries(family) else block_q
     step = [(queries, block_k, jnp.float32)] * 2
-    carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
-                                                                 jnp.float32)]
-    fused = [(queries, width, jnp.float32)] if config.fused else []
-    # The keys-first step's per-query statistics in its tiles' column layout (`Family.column_registers`): the
-    # maximum, the denominator, the anchor, D and the anchor key (`attention_mosaic_backward._scores`).
-    statistics = KEYS_FIRST_STATISTICS * family.column_registers(queries, jnp.float32)
-    return resources.live_registers(family, carried, step, fused) + statistics
+    # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`).
+    statistics = DKV_STATISTICS * family.column_registers(queries, jnp.float32)
+    return resources.live_registers(family, carried, step) + statistics
 
 
 @dataclasses.dataclass(frozen=True)
@@ -433,8 +439,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                          block=_block(config), scale=self.scale, rounded=self.rounded), None
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
-        # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless call's.
-        hooked = self.score_mod is not None or ba.arguments["initial"] is not None
+        # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless and
+        # undropped call's of equal head widths, its dK/dV program queries first on the dQ launch's layout.
+        hooked = (self.score_mod is not None or ba.arguments["initial"] is not None
+                  or ba.arguments["drop"] is not None)
+        if config.fused and (config.dkv != dataclasses.replace(config, dkv_family=None, dkv_consumers=None)
+                             or ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1]):
+            return False
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         dkv_family = found.get(config.dkv.family)
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
@@ -453,36 +464,42 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
         launches walk the largest their registers and the block hold, two stages, one consumer, whose step
         issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
-        at 64 x 64 with two consumers and one). The fast form of a hookless call takes one launch, the dK/dV
-        program adding each tile's dQ atomically (FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and
-        128 over 1k to 8k tokens; check 1 on drawn inputs and finite over every stability family it takes,
-        FUSEDSTAB-h100; 384 MB of temporaries against 258 at llama-d128 2 x 4096, its dQ fp32); the accurate
-        form, a hooked call and deterministic mode (`deterministic_ops_requested`) two launches, the dQ launch
-        then the dK/dV one, in a fixed order."""
+        at 64 x 64 with two consumers and one). The fast form of a hookless call takes one launch where one
+        holds the whole width, its dK/dV program queries first adding each tile's dQ atomically
+        (FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and 128 over 1k to 8k tokens; ET-A05AB3-h100:
+        5.20 against 6.19 ms the two keys-first launches at Qwen3-8B causal, 1.19 against 1.53 at width 64;
+        check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
+        temporaries against 258 at llama-d128 2 x 4096, its dQ fp32); otherwise (the accurate form, a hooked
+        or dropping call, deterministic mode, `deterministic_ops_requested`, a width no fused launch holds)
+        two launches, the dQ launch then the keys-first dK/dV one, in a fixed order."""
         family = self._family(ba, target)
         if family is None:
             return None
         query, key = ba.arguments["query"], ba.arguments["key"]
 
-        hooked = self.score_mod is not None or ba.arguments["initial"] is not None
-        fused = not (self.accurate or hooked or deterministic_ops_requested())
+        def fits(config: BackwardTiles) -> bool:
+            return self.legal(ba, config, target)
 
+        if not deterministic_ops_requested():
+            def fused(rows: int, walked: int, consumers: int) -> BackwardTiles:
+                return BackwardTiles(walked, rows, 2, consumers, fused=True, family=family.name)
+
+            # Legal where the form, the hooks, the widths and the registers allow (`legal`).
+            if config := _derived(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
+                                  overlapped=False):
+                return config
         # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
         # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
-        # Its fused form's dQ tiles, a consumer's share of a slot's queries, take no wgmma (M is 64): two
-        # launches there.
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
         dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
-        fused = fused and not fed
         for columns in (1, 2, 4):
             def tiles(rows: int, walked: int, consumers: int, columns=columns) -> BackwardTiles:
-                return BackwardTiles(walked, rows, 2, consumers, fused=fused and columns == 1,
-                                     family=family.name, columns=columns, **dkv)
+                return BackwardTiles(walked, rows, 2, consumers, family=family.name, columns=columns, **dkv)
 
-            if config := _derived(family, query.dtype, key.shape[1], query.shape[1], tiles,
-                                  lambda config: self.legal(ba, config, target), overlapped=False):
+            if config := _derived(family, query.dtype, key.shape[1], query.shape[1], tiles, fits,
+                                  overlapped=False):
                 return config
         return None
 
@@ -497,9 +514,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
         # Each launch on its own layout (`BackwardTiles.dkv`).
         dkv_family = bundle_of(config.dkv, dtype)
-        launches = [(dkv_family, config.dkv, _dkv_allocations(
-            dkv_family, config.dkv, width, value_width, dtype, parts=_parts(self.accurate, dtype),
-            stages=min(config.stages, padded_q // config.block_q), columns=config.columns))]
+        q_stages = min(config.stages, padded_q // config.block_q)
+        if config.fused:
+            launches = [(family, config, _fused_allocations(family, config, width, dtype, q_stages))]
+        else:
+            launches = [(dkv_family, config.dkv, _dkv_allocations(dkv_family, config.dkv, width, value_width,
+                                                                  dtype, stages=q_stages,
+                                                                  columns=config.columns))]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k))))
@@ -507,11 +528,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             layout, tiles.consumers, self.score_mod))) for layout, tiles, allocations in launches)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
-        return max(self._launch_registers(ba, config))
+        dq, dkv = self._launch_registers(ba, config)
+        return dkv if config.fused else max(dq, dkv)
 
     def _launch_registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> tuple[int, int]:
-        """Each launch's registers a consumer holds (`_backward_registers`): the dQ launch's at `config`, the
-        dK/dV launch's at its own tiles (`BackwardTiles.dkv`)."""
+        """Each launch's registers a consumer holds (`_backward_registers`): the dQ launch's at `config` (none
+        runs where `fused`), the dK/dV launch's at its own tiles (`BackwardTiles.dkv`)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         counts = []
         for tiles, dq in ((config, True), (config.dkv, False)):
@@ -524,7 +546,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
         # Each launch's registers within its own layout's budget (`Family.registers`).
         dq, dkv = self._launch_registers(ba, config)
-        return dq <= self.register_budget(config) and dkv <= self.register_budget(config.dkv)
+        held = dkv <= self.register_budget(config.dkv)
+        return held and (config.fused or dq <= self.register_budget(config))
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
