@@ -211,7 +211,7 @@ class LMRunConfig(DecoderRunConfig):
             fields = {**self.model.fields, "max_seq_len": context, "vocab_size": table}
             model = self.model.build(max_seq_len=context, vocab_size=table)
         else:
-            source, run = self.pretrained_source(written, vocab_size, context)
+            source = self.pretrained_source(written, vocab_size, context)
             source = self.looped(source)
             model, fields = source.model, dict(source.model_config)
         if source is None:
@@ -298,16 +298,16 @@ class LMRunConfig(DecoderRunConfig):
     def pinned(self) -> LMRunConfig:
         """This run with its Hub sources at their commits (`RunConfig.pinned`), `pretrained` among them
         (`SourceReference.pinned`)."""
-        from dew.interop.sources import SourceReference
+        from dew.interop.sources import pinned_source
 
         run = super().pinned()
         if self.pretrained is None:
             return run
-        pretrained = SourceReference.parse(self.pretrained).pinned().spelled()
+        pretrained = pinned_source(self.pretrained)
         return run if pretrained == self.pretrained else dataclasses.replace(run, pretrained=pretrained)
 
     def pretrained_source(self, written: str, vocab_size: int, context: int):
-        """The bundle `pretrained` names, at the commit the run pinned it to (`pinned`), and this run.
+        """The bundle `pretrained` names, at the commit the run pinned it to (`pinned`).
 
         The checkpoint decides every architecture field, so the model flags
         may say only how far the KV cache reaches, the compute dtype and the
@@ -347,7 +347,7 @@ class LMRunConfig(DecoderRunConfig):
         if loaded.model.vocab_size < vocab_size:
             raise ValueError(f"{self.pretrained} has room for {loaded.model.vocab_size} ids and the token "
                              f"files use {vocab_size}")
-        return loaded, self
+        return loaded
 
     def masked_objective(self, model, fields, variables, source=None):
         """MDLM over a bidirectional model, its mask id from the model's fields.
