@@ -490,16 +490,18 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
          if walk.scaled else family.product(q_slot, keys, shape))
     dp = family.product(do_slot, v_smem.transpose((1, 0)), shape)
 
-    def scores(*, masked: bool):
-        # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
+    def operands(*, masked: bool):
+        # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice). Each branch
+        # gives the products' 16-bit operands alone, dV's weights and dK's cotangents narrowed, so the
+        # choice joins two half tiles, not three fp32 ones (its fp32 weights, exponentials and cotangents
+        # held at the join spilled 60 bytes at 128 x 64 and width 64).
         exponentials, weights, cotangents, _, _ = _scores(walk, coords_of(q_first), (), s, dp, *rows,
                                                           masked=masked)
-        return exponentials, weights, cotangents
+        ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
+        return algebra.value_weights(exponentials, weights, do_slot.dtype), part
 
-    exponentials, weights, cotangents = lax.cond(whole(index), functools.partial(scores, masked=False),
-                                                 functools.partial(scores, masked=True))
-    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
-    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
+    narrowed, part = lax.cond(whole(index), functools.partial(operands, masked=False),
+                              functools.partial(operands, masked=True))
     dv_acc = family.products(dv_acc, family.staged(narrowed, staged.at[0]).transpose((1, 0)), do_slot,
                              walk.interpret)
     cotangents_staged = family.staged(part, staged.at[1])
