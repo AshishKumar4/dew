@@ -44,10 +44,6 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
 TOKENIZER = FIXTURES / "tokenizers" / "tiny-tools"
 
-# The shared qualification starts three training processes per model. Splitting its checks across
-# the 120-second gate groups repeats that setup; the full suite keeps every recovery and export check.
-pytestmark = pytest.mark.whole_suite
-
 
 def spawn(directory: Path, mode: str) -> subprocess.Popen:
     """One run of the worker in its own session, so a kill takes its children
