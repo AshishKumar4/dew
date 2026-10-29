@@ -1049,13 +1049,10 @@ class Trainer(Generic[Loss, Effects]):
             self.objective, mesh, self._xla_defaults, self._narrow,
             None if self._base_rung is None else self._base_rung[1], resumed, ahead=self._ahead,
             capacity=capacity)
-        plans, probes = search.plans(
-            candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
-            # Live runs compile the admitted plan alone. Speed comparisons belong to offline planning.
-            frontier=False)
+        planned, probes = search.admitted(
+            candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
         self._ahead = search.ahead
-        planned = plans[0]
         if runs := pgle_runs():
             trials = Trials(state, batch, owned=False) if trials is None else trials
             planned = planned.guided(trials.profiled(self._runner(planned, mesh), planned, mesh, runs), runs,
@@ -1070,7 +1067,7 @@ class Trainer(Generic[Loss, Effects]):
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
-        self.plan = settled(planned, plans, (), probes)
+        self.plan = settled(planned, probes)
         search.told(planned)
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", self.plan)
