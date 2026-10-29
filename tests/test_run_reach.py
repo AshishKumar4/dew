@@ -13,8 +13,9 @@ import jax
 import numpy as np
 import optax
 import pytest
+from test_block_sft import assert_tree_equal
 from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_files
-from test_run_options import lm, scalars, trained
+from test_run_options import decision, lm, scalars, trained
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
@@ -22,7 +23,6 @@ from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources.tokens import TokenFiles
 from dew.optim import OneCycle, OptimConfig, ParamGroup
-from dew.registry import ModelConfig
 
 pytestmark = pytest.mark.mesh
 
@@ -44,14 +44,6 @@ def descending(tokens, *flags: str, pretrained=None) -> LMRunConfig:
                                        model_config="{}" if pretrained else TINY), default=default)
 
 
-def assert_same_leaves(found, expected):
-    """Every leaf of `found` is `expected`'s at its place, bit for bit."""
-    flat = jax.tree_util.tree_flatten_with_path(found)[0]
-    for (path, mine), theirs in zip(flat, jax.tree.leaves(expected), strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
-                                      err_msg=jax.tree_util.keystr(path))
-
-
 def test_a_run_stops_on_its_plateau_and_ends_on_its_best_model(tmp_path):
     """`trainer.stop:plateau` stops a run once the metric it names, as `--trainer.best` names one, has
     not improved past `min_delta` for `evals` evaluations, and `--trainer.restore-best` ends the run on
@@ -67,7 +59,7 @@ def test_a_run_stops_on_its_plateau_and_ends_on_its_best_model(tmp_path):
     checkpoints = Checkpoints(str(tmp_path / "runs" / "plateau"))
     assert checkpoints.latest == 2
     assert int(state.step) == 1
-    assert_same_leaves(state.variables["params"], checkpoints.variables(step=1)["params"])
+    assert_tree_equal(state.variables["params"], checkpoints.variables(step=1)["params"])
 
 
 def test_a_saved_run_scores_a_split_at_its_own_cadence_and_writes_its_local_tier(tmp_path):
@@ -115,12 +107,7 @@ def test_dew_export_reads_the_step_a_ranking_chose(tmp_path):
     checkpoints, best = Checkpoints(str(run)), 1
     assert checkpoints.latest == 3
     loaded = Pretrained.load(str(exported), dtype="float32", attention_impl="reference").variables["params"]
-    trained_params = checkpoints.variables(step=best)["params"]
-    for path, leaf in jax.tree_util.tree_flatten_with_path(loaded)[0]:
-        held = trained_params
-        for entry in path:
-            held = held[entry.key]
-        np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf), err_msg=jax.tree_util.keystr(path))
+    assert_tree_equal(loaded, checkpoints.variables(step=best)["params"])
 
 
 def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run(tmp_path):
@@ -137,7 +124,7 @@ def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run
             update, state = solver.update(gradient, state, params)
             found.append(update)
         return found
-    assert_same_leaves(updates(config.build(10)), updates(optax.sgd(0.05, momentum=0.9)))
+    assert_tree_equal(updates(config.build(10)), updates(optax.sgd(0.05, momentum=0.9)))
 
     # A group's momentum schedule needs a factory that takes b1, which Optax's adamw names.
     grouped = OptimConfig(optimizer="optax:adamw", param_groups=(ParamGroup("all", ("*",), b1=OneCycle(
@@ -157,14 +144,12 @@ def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run
 
 @pytest.mark.mesh(devices=8)
 def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
-    """`trainer.attention_form` is the form every attention of the run trains in (row 2245), passed to
-    the template's own choice (`generation.chosen`, whose arithmetic tests/test_attention_route.py holds
-    to each form): a step of the same run recorded "accurate" and recorded with none ends on other
-    weights, and `dew train` of each run's own record, under a new name, ends on that run's weights,
-    bit for bit."""
+    """`trainer.attention_form` is the form every attention of the run trains in (row 2245), on the
+    default route ('auto'), which runs an accurate call on the template or the reference path
+    (tests/test_attention_route.py, row 2350): a step of the same run recorded "accurate" and recorded
+    with none ends on other weights, and `dew train` of each run's own record, under a new name, ends
+    on that run's weights, bit for bit."""
     run = lm(tmp_path, drawn=False)
-    run = dataclasses.replace(run, model=ModelConfig("causal_transformer", {
-        **run.model.fields, "attention_impl": "template"}))
     states = {name: trained(run, tmp_path, name, trainer=fields)[0]
               for name, fields in (("accurate", {"attention_form": "accurate"}), ("default", {}))}
     assert any(not np.array_equal(np.asarray(mine), np.asarray(theirs)) for mine, theirs in zip(
@@ -174,7 +159,43 @@ def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
         assert main(["train", str(recorded), "--set", f"trainer.name={name}-again",
                      "--set", "trainer.checkpoint_final=True"]) == 0
         again = Checkpoints(str(tmp_path / "runs" / f"{name}-again")).variables(step=1)
-        assert_same_leaves(again["params"], state.variables["params"])
+        assert_tree_equal(again["params"], state.variables["params"])
+
+
+def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_called(tmp_path):
+    """A run record's optimizer names an import path, which must be declared to return an Optax gradient
+    transformation before it is called (row 2349: `os:spawnv` ran a command before its result was
+    checked): `os:mkdir` is refused, its directory never made, and Optax's LARS, which takes a decay
+    and no decay mask, builds with one (row 2351)."""
+    made = tmp_path / "made"
+    with pytest.raises(ValueError):
+        OptimConfig(optimizer="os:mkdir", optimizer_opts={"path": str(made)}).build(4)
+    assert not made.exists()
+    params = {"w": np.ones((2, 3), np.float32)}
+    solver = OptimConfig(optimizer="optax:lars", learning_rate=0.1, weight_decay=1e-4).build(4)
+    update, _ = solver.update({"w": np.full((2, 3), 0.5, np.float32)}, solver.init(params), params)
+    assert np.all(np.asarray(update["w"]) < 0)
+
+
+def test_a_decision_run_that_ends_on_its_best_loads_at_its_calibrated_step(tmp_path):
+    """A decision run that ends on its best step (`--trainer.restore-best`) calibrates that step, and its
+    saved task loads there by default, through `Decide.from_run` and `dew.pipeline` alike, where the
+    run's latest checkpoint is its last step (row 2352: the load refused the calibration's step)."""
+    import dew
+    from dew.decision.task import Decide
+    from dew.training.selection import Best
+
+    runs = tmp_path / "runs"
+    run = decision(tmp_path, drawn=False)
+    trainer = dataclasses.replace(run.trainer, name="ended", checkpoint_dir=str(runs), steps=3, eval_every=1,
+                                  checkpoint_every=1, keep=3, restore_best=True, multi_host=False,
+                                  compilation_cache_dir=None, best=Best("val/accuracy", mode="min"))
+    dataclasses.replace(run, trainer=trainer).prepare().train("ended")
+    checkpoints = Checkpoints(str(runs / "ended"))
+    best = checkpoints.resolve("best")
+    assert best != checkpoints.latest, "the last step ranked best: the default step is the latest"
+    for loaded in (Decide.from_run(str(runs / "ended")), dew.pipeline(str(runs / "ended"))):
+        assert loaded.weights.step == best
 
 
 def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):

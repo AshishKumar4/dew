@@ -599,3 +599,27 @@ def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
         traced = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(query, query, query)
         traced.lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.parametrize("target", [None, "sm80", "sm90"], ids=["cpu", "a100", "h100"])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_an_accurate_call_on_the_default_route_runs_the_template_or_the_reference_path(target, dtype):
+    """Under `generation.chosen(attention_form='accurate')`, the default route ('auto') runs a call on the
+    template or the reference path, which compute the form, never on an old route, whose arithmetic is
+    its own (row 2350: FlashAttention, cuDNN, xla and splash ran an accurate run's calls fast); the fast
+    form keeps its kernels as before."""
+    import contextlib
+
+    from dew.nn.attention import attention_case
+    from dew.nn.attention_kernels import ATTENTION
+    from dew.nn.kernels.generation import assumed, chosen
+    from dew.nn.kernels.selection import select
+
+    query = jnp.zeros((2, 64, 4, 32), dtype)
+    placed = contextlib.nullcontext() if target is None else assumed(target)
+    with placed:
+        with chosen(attention_form="accurate"):
+            accurate = select(ATTENTION, attention_case(query, query, causal=True)).kernel
+        fast = select(ATTENTION, attention_case(query, query, causal=True)).kernel
+    assert accurate in ("template", "reference"), accurate
+    assert accurate != fast or fast in ("template", "reference")
