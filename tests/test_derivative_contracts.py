@@ -201,5 +201,6 @@ def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
     cotangent = jnp.ones((3,), jnp.float32)
     assert_contract(jnp.abs, x, direction, cotangent, "the plain formula", plain_fn=jnp.abs)
     with pytest.raises(AssertionError, match="not finite where float64"):
-        assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a squared root", plain_fn=jnp.abs)
+        assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a squared root",
+                        plain_fn=jnp.abs)
 
