@@ -76,7 +76,7 @@ GENERATOR = load("mla_reference")
 """tools/mla_reference.py, whose configs and transformers classes build the reference blocks."""
 
 SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 8, "value columns": 8,
-         "yarn": 16, "visibility": 16, "mla_v3 int8 latent decode": 8, "mla_v32 int8 latent decode": 16}
+         "yarn": 16, "visibility": 16, "mla_v3 int8 latent decode": 8, "mla_v32 int8 latent decode": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
 
