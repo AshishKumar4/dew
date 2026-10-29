@@ -31,6 +31,9 @@ class Plain(LimitedMappingKernelManager):
         return "kernel_gateway.services.kernels.manager.KernelGatewayIOLoopKernelManager"
 '''
 """The gateway's mapping manager with the isolation left out: a guest's needs root, its uids and mounts."""
+OBSERVED = 2.0
+"""Seconds a kernel's removal may take to be seen after its shutdown: the kernel's cleanup and removal from
+the manager, a poll's 0.1 s and the HTTP call that reads it."""
 
 
 def kernel(port: int, identifier: str) -> dict | None:
@@ -100,9 +103,10 @@ def test_a_kernel_no_connection_holds_is_culled_once_idle_for_the_live_contracts
             return gone - last
 
         # Culled on the culler's first look past the idle time, which comes every tenth of it, and gone from
-        # the gateway once jupyter-client's shutdown of it returns, within its own wait.
+        # the gateway once jupyter-client's shutdown of it returns, within its own wait; then its cleanup, the
+        # manager's removal and this poll's own reading of it (`OBSERVED`).
         shutdown = KernelManager.shutdown_wait_time.default_value
-        assert idle <= asyncio.run(scenario()) <= idle + max(1, idle // 10) + shutdown
+        assert idle <= asyncio.run(scenario()) <= idle + max(1, idle // 10) + shutdown + OBSERVED
     finally:
         gateway.terminate()
         gateway.wait(30)
