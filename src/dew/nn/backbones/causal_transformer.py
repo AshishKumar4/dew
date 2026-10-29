@@ -1278,13 +1278,15 @@ class CausalTransformer(nn.Module):
                  attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
                  right_padded: bool = False, coordinates: Coordinates | None = None,
                  conditioning: Mapping[str, jax.Array] | None = None):
+        # The call's token layout, converted once (`token_coordinates`): the trunk and the
+        # prediction depths read its coordinates alone.
+        coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
+                                        valid=attention_mask, positions=positions, right_padded=right_padded)
         x, prediction = self.hidden_and_mtp_inputs(
-            tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
+            tokens, train=train, decode=decode, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
             attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
-            attention_key_runs=attention_key_runs, right_padded=right_padded,
-            coordinates=coordinates, conditioning=conditioning)
+            attention_key_runs=attention_key_runs, coordinates=coordinates, conditioning=conditioning)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1292,9 +1294,7 @@ class CausalTransformer(nn.Module):
             # main forward never enters the prediction depths. Reaching them
             # here, during init only, makes the model's tree the model's
             # business: a plain init holds every depth.
-            self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
-                                   segment_ids=segment_ids, input_embeddings=input_embeddings,
-                                   attention_mask=attention_mask,
+            self.mtp_hidden_states(prediction, tokens, train=train, input_embeddings=input_embeddings,
                                    image_groups=image_groups, block_groups=block_groups,
                                    rotary_positions=rotary_positions, coordinates=coordinates)
         return self._logits(x)
@@ -1403,24 +1403,22 @@ class CausalTransformer(nn.Module):
             raise ValueError("prediction depths need a sequence longer than their depth count")
         coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
                                         positions=positions)
-        if coordinates is not None:
-            segment_ids, positions, attention_mask = (coordinates.segments, coordinates.positions,
-                                                     coordinates.valid)
+        documents, given, given_valid = ((None, None, None) if coordinates is None else
+                                         (coordinates.segments, coordinates.positions, coordinates.valid))
         embeds = self._prepared(self.token_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
         # and no validity says that: an all-true array would make the depth
         # build a mask and drop off the fused kernel.
         valid = None
-        if segment_ids is not None or attention_mask is not None:
-            valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
+        if documents is not None or given_valid is not None:
+            valid = jnp.ones(tokens.shape, bool) if given_valid is None else given_valid
         states = []
         for depth, block in enumerate(self.mtp, start=1):
             if valid is not None:
-                documents = None if segment_ids is None else segment_ids[:, depth - 1:]
-                valid = shifted_span(valid.shape, 1, valid=valid, segments=documents)
-            segments, places = (None if field is None else field[:, depth:]
-                                for field in (segment_ids, positions))
+                valid = shifted_span(valid.shape, 1, valid=valid,
+                                     segments=None if documents is None else documents[:, depth - 1:])
+            segments, places = (None if field is None else field[:, depth:] for field in (documents, given))
             metadata = AttentionMetadata(
                 # Cross-document pairs leave holes even when the token rows were right-padded.
                 coordinates=None if coordinates is None else build_coordinates(
@@ -1436,13 +1434,15 @@ class CausalTransformer(nn.Module):
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
                    segment_ids=None, input_embeddings=None,
                    attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
+                   coordinates: Coordinates | None = None,
                    conditioning: Mapping[str, jax.Array] | None = None):
         """Return the shared language head's logits for each prediction depth's hidden states; a
         call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
-            block_groups=block_groups, rotary_positions=rotary_positions, conditioning=conditioning)]
+            block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates,
+            conditioning=conditioning)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
@@ -1671,11 +1671,11 @@ class CausalTransformer(nn.Module):
           A cached call that carries it keeps its keys and values for the
           calls after it. A model without cross-attention takes none.
         """
+        coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
+                                        valid=attention_mask, positions=positions, right_padded=right_padded)
         attention_metadata = self._attention_metadata(
-            tokens, decode, positions, segment_ids, attention_mask, image_groups, block_groups,
-            rotary_positions, attention_pairwise_mask, attention_key_positions, attention_key_runs,
-            media_mask, admitted,
-            right_padded, coordinates, conditioning)
+            tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
+            attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1733,17 +1733,16 @@ class CausalTransformer(nn.Module):
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction
 
-    def _attention_metadata(self, tokens, decode: bool, positions, segment_ids, attention_mask, image_groups,
-                            block_groups, rotary_positions, pairwise_mask, key_positions, key_runs,
-                            media_mask, admitted=None,
-                            right_padded: bool = False,
+    def _attention_metadata(self, tokens, decode: bool, image_groups, block_groups, rotary_positions,
+                            pairwise_mask, key_positions, key_runs, media_mask, admitted=None,
                             coordinates: Coordinates | None = None,
                             conditioning: Mapping[str, jax.Array] | None = None) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
-        carries none of it: the masks and positions `hidden_and_mtp_inputs`
-        takes, the token ids a hash router selects by, the engram layers'
-        bucket ids, the media mask, which only a model with engram or a
-        router with a media bias reads, and the cross-attention's context."""
+        carries none of it: the tokens' layout `hidden_and_mtp_inputs`
+        converted (`coordinates`), the token ids a hash router selects by,
+        the engram layers' bucket ids, the media mask, which only a model
+        with engram or a router with a media bias reads, and the
+        cross-attention's context."""
         if conditioning and self.cross_attention is None:
             raise TypeError(f"this decoder has no cross-attention to read the conditioning "
                             f"{sorted(conditioning)}")
@@ -1764,8 +1763,6 @@ class CausalTransformer(nn.Module):
                              "visibility; pass one")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
-        coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
-                                        valid=attention_mask, positions=positions, right_padded=right_padded)
         if decode and coordinates is not None and coordinates.max_segments > 1:
             raise ValueError(
                 "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
