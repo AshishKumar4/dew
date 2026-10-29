@@ -735,28 +735,32 @@ def _rounded_divisor(node: ast.expr) -> float | None:
 
 
 def divisions(module: Module) -> Iterator[Finding]:
-    """SLOP023: a JAX array (`_array`) divided by a literal no power of two (`_rounded_divisor`)."""
+    """SLOP023: a JAX array (`_array`) divided by a literal no power of two (`_rounded_divisor`), a
+    parameter annotated as an array read as one within its function."""
     bound = _modules_bound(module.tree)
+    scope: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(module.tree):
+        for child in ast.iter_child_nodes(node):
+            scope[child] = node if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else \
+                scope.get(node, module.tree)
+    arrays: dict[ast.AST, set[str]] = {module.tree: set()}
     for function in ast.walk(module.tree):
-        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            parameters = function.args.posonlyargs + function.args.args + function.args.kwonlyargs
+            arrays[function] = {parameter.arg for parameter in parameters if parameter.annotation is not None
+                                and _resolved(parameter.annotation, bound) in ARRAY_TYPES}
+    for node in ast.walk(module.tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            numerator, divisor = node.left, node.right
+        elif isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Div):
+            numerator, divisor = node.target, node.value
+        else:
             continue
-        parameters = function.args.posonlyargs + function.args.args + function.args.kwonlyargs \
-            if not isinstance(function, ast.Module) else []
-        arrays = {parameter.arg for parameter in parameters if parameter.annotation is not None
-                  and _resolved(parameter.annotation, bound) in ARRAY_TYPES}
-        body = function.body if isinstance(function, ast.Module) else [function]
-        for node in (inner for statement in body for inner in ast.walk(statement)):
-            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-                numerator, divisor = node.left, node.right
-            elif isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Div):
-                numerator, divisor = node.target, node.value
-            else:
-                continue
-            value = _rounded_divisor(divisor)
-            if value is not None and _array(numerator, bound, arrays):
-                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP023",
-                              f"divides a JAX array by {value!r}, which XLA computes as a product with its "
-                              "rounded reciprocal, not correctly rounded; divide with precision.divided")
+        value = _rounded_divisor(divisor)
+        if value is not None and _array(numerator, bound, arrays[scope.get(node, module.tree)]):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP023",
+                          f"divides a JAX array by {value!r}, which XLA computes as a product with its "
+                          "rounded reciprocal, not correctly rounded; divide with precision.divided")
 
 
 def size(module: Module) -> Iterator[Finding]:
