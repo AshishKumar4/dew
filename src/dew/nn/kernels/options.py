@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unp
 import jax
 import numpy as np
 from jax._src import api_util, config as jax_config, core as jax_core
+from jax._src.array import ArrayImpl
 from jax.sharding import Sharding
 
 from dew.devices import xla_flag
@@ -241,9 +242,11 @@ def _signature(leaf) -> Hashable:
     """What jit keys an argument on: an array's abstract value (shape, dtype, weak type), placement
     and layout (its `format`, which holds its sharding; a key array's sharding), another value's type,
     shape and dtype."""
+    if isinstance(leaf, ArrayImpl):
+        return leaf.aval, leaf.format, leaf.committed
     if isinstance(leaf, jax.Array):
         # A typed key array states no format: its placement is its sharding.
-        return leaf.aval, getattr(leaf, "format", None) or leaf.sharding, leaf.committed
+        return leaf.aval, leaf.sharding, leaf.committed
     return type(leaf), np.shape(leaf), np.result_type(leaf)
 
 
