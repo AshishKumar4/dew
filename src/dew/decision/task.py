@@ -44,7 +44,6 @@ from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
     OPTION_TILE,
     QUESTION_FIELDS,
-    Bounds,
     DecisionInputs,
     Encoded,
     JointLayout,
@@ -130,7 +129,7 @@ class Weights:
 class PassShape:
     """The shape of one scoring pass (`Decide.pass_shapes`): `rows` windows of `length` tokens, each
     holding whole rows packed first-fit as a run's windows hold them (`Decide.packing`), its questions in
-    `questions` slots (the most a window of that length holds, `Layout.bounds`) of `options` options
+    `questions` slots (a run's window's, `DecisionObjective.bounds`) of `options` options
     each (the budget's, None where it declares none: each pass's own, rounded up to a power of two)."""
 
     length: int
@@ -491,15 +490,15 @@ class Decide(SavedRunTask):
         """The shapes a text pass packs its rows into, declared once: windows of the layout's length
         and its halvings (`dew.inference.tasks.length_ladder`), each at a few window counts, one (a lone
         request's pass), the powers of 8 below the most the budget's tokens and rows allow, and that
-        most; each window's question slots the most a window of its length holds (`Layout.bounds`), its
-        options the budget's (`Budget`). Where the budget declares its options, each shape is one
+        most; each window's question slots a run's window's (`DecisionObjective.bounds`), its options
+        the budget's (`Budget`). Where the budget declares its options, each shape is one
         program, which `compile_scoring` compiles."""
         shapes = []
         for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens)):
             most = max(1, min(self.budget.rows, self.budget.tokens // length))
             counts = sorted({*(8 ** power for power in range(math.floor(math.log(most, 8)) + 1)), most})
-            questions = self._window_bounds(length).questions
-            shapes.extend(PassShape(length, count, questions, self.budget.options) for count in counts)
+            shapes.extend(PassShape(length, count, self._scoring.bounds.questions, self.budget.options)
+                          for count in counts)
         return tuple(shapes)
 
     def _shape(self, rows: Sequence[Encoded]) -> PassShape:
@@ -512,22 +511,10 @@ class Decide(SavedRunTask):
         sized = [shape for shape in self.pass_shapes if shape.length == length]
         return next((shape for shape in sized if self._placed(rows, shape) is not None), sized[-1])
 
-    def _window_bounds(self, length: int) -> Bounds:
-        """The most rows, questions and options a window of `length` tokens packs (`Layout.bounds`)."""
-        return self._bounds[length]
-
-    @functools.cached_property
-    def _bounds(self) -> dict[int, Bounds]:
-        """Each pass length's window bounds (`Layout.bounds`), its rows' contexts at most a window's
-        length or one row's, as a run's (`DecisionObjective`)."""
-        held = self.context_length
-        return {length: replace(self.layout, max_len=length).bounds(
-            self.tokenizer, self.specials, held, context_window=None if held is None else max(length, held))
-            for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens))}
-
     def packing(self, shape: PassShape) -> Pack:
         """How a pass of `shape` packs its rows: first-fit into its windows, each holding whole rows within
-        its bounds, as a run packs its rows (`dew.decision.rows.packing`)."""
+        a run's bounds (`DecisionObjective.bounds`), as a run packs its rows (`dew.decision.rows.packing`),
+        their gold left out."""
         return self._packs[shape.length, shape.rows]
 
     @functools.cached_property
@@ -535,11 +522,9 @@ class Decide(SavedRunTask):
         """Each pass shape's packing (`packing`), by its length and windows."""
         from dew.decision.rows import packing
 
-        held = self.context_length
-        return {(shape.length, shape.rows): replace(
-            packing(replace(self.layout, max_len=shape.length), self._window_bounds(shape.length),
-                    None if held is None else max(shape.length, held)), bins=shape.rows)
-            for shape in self.pass_shapes}
+        held = packing(self.layout, self._scoring.bounds, self._scoring.context_window, trained=False)
+        return {(shape.length, shape.rows): replace(held, seq_len=shape.length, bins=shape.rows)
+                for shape in self.pass_shapes}
 
     def _placed(self, rows: Sequence[Encoded], shape: PassShape) -> list[int] | None:
         """The window of `shape` each of `rows` goes to, in order (`dew.data.tokens.FirstFit`), or None
@@ -696,7 +681,7 @@ class Decide(SavedRunTask):
             raise ValueError(f"{len(rows)} rows pack into {len(windows)} windows of {shape.length} "
                              f"tokens, more than the {shape.rows} the pass holds; `fits` says which rows "
                              "a pass holds")
-        bounds = self._window_bounds(shape.length)
+        bounds = self._scoring.bounds
         in_context = isinstance(self.layout, JointLayout) and self.layout.schema_in_context
         # A joint layout's windows hold their real options in as many slots as its bounds allow, as a
         # run's (`DecisionObjective.data`).
@@ -705,7 +690,7 @@ class Decide(SavedRunTask):
         read = PackedRows(shape.length, compact, in_context)
         laid = [read.map(window) for window, _ in windows]
         batch = {name: np.stack([window[name] for window in laid]) for name in laid[0]}
-        inputs = laid_out(batch, pack.segments or bounds.segments, spans_in_context=in_context)
+        inputs = laid_out(batch, bounds.segments, spans_in_context=in_context)
         padded = RowPlan(None, len(windows), shape.rows, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
         plan = RowPlan.over(mesh_of(held), shape.rows)

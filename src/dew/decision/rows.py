@@ -621,12 +621,13 @@ questions stand in consistency groups (`Example.groups`, `GroupedExamples`), eac
 option slot's `canonical` option, -1 for none, and its row in its unit of rows (`question_row`, `_unit`)."""
 
 
-def _along(layout: Layout, grouped: bool = False) -> tuple[str, ...]:
-    """The fields along the questions of `layout`'s training rows (`QUESTION_FIELDS`,
-    `TRAINING_FIELDS`): its readout's where its options stand under labels, and their consistency
-    groups' where they carry them (`grouped`)."""
+def _along(layout: Layout, grouped: bool = False, trained: bool = True) -> tuple[str, ...]:
+    """The fields along the questions of `layout`'s rows (`QUESTION_FIELDS`), with a training row's gold
+    (`TRAINING_FIELDS`) where they are `trained`: its readout's where its options stand under labels,
+    and their consistency groups' where they carry them (`grouped`)."""
     labelled = isinstance(layout, QuestionLayout) and layout.labels is not None
-    carried = ("always", "trained", *(("labelled",) if labelled else ()), *(("grouped",) if grouped else ()))
+    carried = ("always", *(("trained",) if trained else ()), *(("labelled",) if labelled else ()),
+               *(("grouped",) if grouped else ()))
     declared = (*QUESTION_FIELDS, *TRAINING_FIELDS)
     # The model's and training's fields, then the labelled readout, then the groups, as rows carry them.
     return tuple(field.name for when in carried for field in declared if field.when == when)
@@ -639,15 +640,18 @@ def _along_fields(element: Batch, when: tuple[str, ...] = ("always", "trained"))
                  if field.name in element and field.when in when)
 
 
-def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, grouped: bool = False) -> Pack:
+def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, grouped: bool = False,
+            trained: bool = True) -> Pack:
     """Rows of `layout` packed first-fit into windows of its `max_len`, each
     window's rows, questions and options within `bounds` (`Layout.bounds`),
     and with a `context_window` each row's context along an axis of its own of
     that many tokens, end to end in the order their rows stand (`PackedRows`'
-    `context_segments`): a window holds rows while both its streams do."""
+    `context_segments`): a window holds rows while both its streams do. A
+    `trained` row carries its gold along its questions; a scored one
+    (`model_row`) carries the model's fields alone."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
-    along = tuple((name, bounds.questions) for name in _along(layout, grouped))
+    along = tuple((name, bounds.questions) for name in _along(layout, grouped, trained))
     if context_window is not None:
         along = (*along, ("context", context_window))
         if grouped:
