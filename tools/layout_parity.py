@@ -1894,8 +1894,9 @@ def summary(rows: Sequence[Mapping[str, Any]]) -> list[str]:
 def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] = ("dense",),
          layouts: Annotated[tuple[str, ...], tyro.conf.arg(help="LAYOUTS names")] = tuple(LAYOUTS),
          dtype: str = "float32",
-         seeds: Annotated[int, tyro.conf.arg(
-             help="the draws check 1 judges each model over; 0 runs each layout once")] = 8,
+         seeds: Annotated[int | None, tyro.conf.arg(
+             help="the draws check 1 judges each model over; 0 runs each layout once; unset, each "
+                  "layout is judged by the floor judge CI runs (`floored`)")] = None,
          window: Annotated[int, tyro.conf.arg(
              help="consecutive draws each of check 1's draws holds")] = 1,
          rounding_orders: Annotated[bool, tyro.conf.arg(
@@ -1936,6 +1937,16 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
                           objective=json.loads(objective), out=out,
                           speak=lambda line: print(line, flush=True))
         print('\n'.join(summary(rows)), flush=True)
+        raise SystemExit(verdict(rows))
+    if seeds is None:
+        # The floor judge, which CI's matrix and its multi-host gangs run until check 1's draws shard
+        # across tasks (`floored`): a layout at a time, through agreed phases on a pool.
+        if prepare or references is not None:
+            raise SystemExit("--prepare and --references are check 1's draws; give --seeds")
+        rows = [floored(model, layout, dtype=dtype, devices=devices)
+                for model in models for layout in layouts]
+        if speaker:
+            print("\n".join(summary(rows)), flush=True)
         raise SystemExit(verdict(rows))
     store = References(references, prepare)
     if prepare:
