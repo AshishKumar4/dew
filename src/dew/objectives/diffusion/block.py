@@ -399,18 +399,18 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         return noisy, step.boundary("canvas", selected), step.boundary("self conditioning", use_sc)
 
     def _encoder_targets(self, batch: Batch, tokens: jax.Array, validity, full_valid: jax.Array,
-                         text_slots) -> tuple[jax.Array, jax.Array]:
+                         text_slots, dtype) -> tuple[jax.Array, jax.Array]:
         """Shift the row by one and weight the targets the encoder scores.
 
         A default target needs its neighbour valid too, which is Google's
         SequenceTargetShift; a supplied mask is taken as given, except that
-        media placeholders never become labels.
+        media placeholders never become labels. The weights are `dtype`'s.
         """
         shifted = jnp.concatenate(
             [tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1
         )
         adjacent = jnp.pad(shifted_span(tokens.shape, 1, valid=full_valid), ((0, 0), (0, 1)))
-        encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), jnp.float32)
+        encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), dtype)
         if encoder_target_mask.shape != tokens.shape:
             raise ValueError("encoder_target_mask must align with the full sequence")
         if validity is not None:
@@ -481,7 +481,9 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         if text_slots is not None:
             target_mask &= text_slots[:, self.prompt_length:]
         canvas_losses, predicted, _ = self.head_terms(model, params, states, response, predict=not train)
-        shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots)
+        # The targets' weights at the precision the encoder's states compute at, at least fp32.
+        shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots,
+                                                             at_least_fp32(encoder_states.dtype))
         encoder_losses, _, _ = self.head_terms(model, params, encoder_states, shifted, predict=False)
         correct = None if predicted is None else predicted == response
         return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, qk
