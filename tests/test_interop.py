@@ -376,11 +376,16 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
 # ---------------------------------------------------------------------------------
 
 
+RUN_EXPORT_SEEDS = 8
+"""A run's export's declared draws of ids against transformers' fp32 read of it (check 1), sized by
+`seeds_for` paired with the run's logits on the CPU."""
+
+
 def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None):
     """transformers' own class for the export's model_type loads its files
-    with a clean report (`decoder_export_reference.reference_model`) and,
-    over the same ids, holds the run's own logits to tests/reference_error.py's
-    rule: in fp32 the reference, in float64 the truth. An `ordered_export`
+    with a clean report (`decoder_export_reference.reference_model`) and holds
+    the run's own logits on par with its fp32 forward from its float64 one over
+    drawn ids of the shape of `ids` (check 1). An `ordered_export`
     holds the trained run over 52 residual orders when one draw can flake,
     each order of the run's canonical tree exported and, packed as the run's
     task holds it, run by Dew; every reference order in float64 must compute
@@ -388,7 +393,8 @@ def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None)
     """
     from reference_error import (
         ORDERS,
-        assert_as_exact_as_the_reference,
+        as_given,
+        assert_as_exact,
         assert_as_exact_over_orders,
         assert_computes_the_oracle,
         distance,
@@ -400,12 +406,19 @@ def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None)
     from tools.decoder_export_reference import Case, reference_logits
 
     case = Case("run export", str(export))
-    truth = reference_logits(case, export, ids, wide=True)
     if ordered_export is None:
-        ours = np.asarray(task.model.apply(task.variables, jnp.asarray(ids, jnp.int32)))
-        assert_as_exact_as_the_reference(ours, reference_logits(case, export, ids), truth,
-                                         "run export logits")
+        vocabulary = json.loads((Path(export) / "config.json").read_text())["vocab_size"]
+
+        def draw(seed):
+            return (np.random.default_rng(seed).integers(0, vocabulary, np.shape(ids)).astype(np.int32),)
+
+        def read(wide):
+            return as_given(lambda drawn: reference_logits(case, export, np.asarray(drawn), wide=wide))
+
+        assert_as_exact(lambda drawn: task.model.apply(task.variables, drawn), read(wide=False), draw,
+                        "run export logits", seeds=RUN_EXPORT_SEEDS, truth_fn=read(wide=True))
         return
+    truth = reference_logits(case, export, ids, wide=True)
     source = Pretrained.load(export, dtype="float32", attention_impl="reference")
     forward = jax.jit(lambda variables: task.model.apply(variables, jnp.asarray(ids, jnp.int32)))
     mine, theirs = [], []
