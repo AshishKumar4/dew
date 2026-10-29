@@ -26,8 +26,8 @@ from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import at_least_fp32, divided
 
 from .guidance import Guidance, Walk
-from .sample import sample
 from .solvers.common import _check_endpoint_domain
+from .walks import sample
 
 
 @struct.dataclass

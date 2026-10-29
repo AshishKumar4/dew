@@ -17,7 +17,7 @@ from dew.diffusion.schedules import expand
 from dew.inputs import unit_range
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import Aux, EMASpec, Objective
-from dew.sampling.sample import sample
+from dew.sampling.walks import sample
 
 
 class SourceOracle(nn.Module):

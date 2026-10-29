@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.batch import valid_order
+from dew.batch import prefix_sum, valid_order
 from dew.mesh import SEQUENCE_AXIS, logical_spec
 
 from .attention import (
@@ -237,8 +237,8 @@ def compacted(attend, query, key, value, places, segment_ids, valid):
     real = _whole_sequence(jnp.asarray(valid, bool))
     order, count = valid_order(real)
     # Each slot's column in that order: a real token's rank among the real, a padding slot's after them.
-    column = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1,
-                       count[:, None] + jnp.cumsum(~real, axis=1, dtype=jnp.int32) - 1)
+    column = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1,
+                       count[:, None] + prefix_sum(~real, dtype=jnp.int32) - 1)
 
     def moved(x, to):
         x = jnp.asarray(x)

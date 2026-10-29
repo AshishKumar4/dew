@@ -78,6 +78,25 @@ def test_finite_token_budget_keeps_its_geometry_and_every_real_row(entry, read):
         reader.close()
 
 
+def test_an_unbatched_validation_beside_a_token_budget_reads_in_its_training_batch():
+    """Training batched by a token budget states its rows only as it compiles, so a validation set that
+    states no batch is measured before it (`fitted`) and batched as it is read: in training's rows, every
+    record once and the short last batch filled and marked, not one row a batch (row 2085)."""
+    rows = [{"id": np.int32(index + 1), "length": np.int32(4)} for index in range(6)]
+    train = Memory(rows).map(Tokens()).batch(tokens=64).read("memory")
+    held = Memory([{"id": np.int32(index + 1), "length": np.int32(3)} for index in range(6)]).map(Tokens())
+    data, readers = fitted(train, held, objective=ObjectiveData())
+    assert data.batch == 4
+    reader = readers["val"](DataPartition())
+    try:
+        batches = list(reader)
+        assert [batch["id"].shape for batch in batches] == [(4,), (4,)]
+        assert sorted(int(value) for batch in batches
+                      for value in batch["id"][batch.get(VALID_ROWS, np.ones(4, bool))]) == list(range(1, 7))
+    finally:
+        reader.close()
+
+
 def held_rows():
     return iter([{"id": np.int32(index)} for index in range(5)])
 

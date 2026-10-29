@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 
-from dew.batch import Variables, part, thaw
+from dew.batch import Variables, part, prefix_sum, thaw
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
@@ -104,8 +104,11 @@ class DecisionModel(HeadedModel):
             if inputs.slots is not None:
                 raise ValueError("a row of option positions holds no images")
             def read_media(module, rows, given):
-                # The images' own conditioning beside the context's, one mapping the backbone reads.
-                kwargs = dict(given.kwargs())
+                # The images' own conditioning beside the context's, one mapping the backbone reads;
+                # the rows' layout is the decision's coordinates alone, the processor's flat fields
+                # left out (`token_coordinates`).
+                kwargs = {name: value for name, value in given.kwargs().items()
+                          if name not in ("positions", "attention_mask", "segment_ids")}
                 if conditioning is not None:
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)
@@ -177,7 +180,7 @@ def key_runs(slots: jax.Array, segments: jax.Array, options: int, *, causal: boo
     index = jnp.arange(length, dtype=jnp.int32)
     first, last = block_starts(segments), block_ends(segments)
     # Each document's number in its row, which the per-document reductions key by.
-    documents = jnp.cumsum(index[None, :] == first, axis=1) - 1
+    documents = prefix_sum(index[None, :] == first, dtype=jnp.int32) - 1
 
     def spans(slot_row, document_row):
         # Each option's span in each token's document, `[options, L]` twice, empty past the keys.
