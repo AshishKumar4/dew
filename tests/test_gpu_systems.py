@@ -9,19 +9,18 @@ own:
   (test_profile).
 - A fused attention counts the pairs its mask computes, with and without a window; a run prepared on a GPU
   keeps its autotuner's picks where the policy puts them (test_instrumentation).
-- A compilation counts the memory kept alive outside its state, in a fresh 2 GiB allocator (test_remat).
+- A compilation counts the memory kept alive outside its state, in a fresh 2 GiB allocator; two checkouts
+  share one compiled kernel (tests/systems_cells.py).
 - A case's measured peak holds at least the bytes XLA planned (test_benchmark_step).
-- Two checkouts share one compiled kernel (test_cache_checkouts).
 """
 
 import functools
 
 import pytest
+import systems_cells
 import test_benchmark_step as benchmark_step
-import test_cache_checkouts as cache_checkouts
 import test_instrumentation as instrumentation
 import test_profile as profile
-import test_remat as remat
 import test_tuning as tuning
 from gpu_flow import Cell, run_cells
 
@@ -53,9 +52,9 @@ def test_a_runs_systems_read_this_gpu(tmp_path_factory):
              in_own(instrumentation.a_run_prepared_on_a_gpu_keeps_its_picks_where_the_policy_puts_them,
                     "picks")),
         Cell("a compilation counts memory kept alive outside its state",
-             in_own(remat.compilation_counts_memory_kept_alive_outside_its_state, "remat")),
+             in_own(systems_cells.compilation_counts_memory_kept_alive_outside_its_state, "remat")),
         Cell("a case's measured peak holds at least the bytes XLA planned",
              in_own(benchmark_step.a_cases_measured_peak_holds_at_least_the_bytes_xla_planned, "peak")),
         Cell("two checkouts share one compiled kernel",
-             in_own(cache_checkouts.two_checkouts_share_one_compiled_kernel, "checkouts")),
+             in_own(systems_cells.two_checkouts_share_one_compiled_kernel, "checkouts")),
     ])
