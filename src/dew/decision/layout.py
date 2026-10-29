@@ -1757,6 +1757,9 @@ class DecisionInputs:
     spans_in_context: bool = struct.field(pytree_node=False, default=False)
     """Whether the questions' spans are positions in `context`, which holds the schema
     (`Schema.stream`), rather than in `tokens`."""
+    whole_blocks: bool = struct.field(pytree_node=False, default=False)
+    """Whether each row's one block is the whole row (`QuestionLayout.split` 'whole'), which a backbone
+    reads as non-causal attention by rows (`AttentionMetadata.whole_blocks`)."""
 
     @property
     def valid(self) -> jnp.ndarray:
