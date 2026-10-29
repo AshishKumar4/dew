@@ -318,7 +318,14 @@ class SharedCrossAttention:
     it adds are the gates; the context's tokens are the decoder's width, which the layer's key and
     value projections read. `context_length` is the most tokens a row's context holds, which a
     decode cache keeps the keys and values of. A layer of no attention, or a KV-sharing one, projects
-    no keys of its own and is refused."""
+    no keys of its own and is refused.
+
+    Its only new weights are the gates, so what it reads is what the layer's own projections, trained
+    for its own sequence, make of the context: over a frozen trunk it learns no read those projections
+    do not already make, and a context the trunk must learn to read needs the trunk's adapters (LoRA)
+    training beside it. A toy whose answer is the context's first token (row 2320's diagnosis, armada
+    IGGATE2) stays at the no-context loss under it whatever the rate, where IDEFICS's block
+    (`CrossAttention`), fresh weights of its own, learns the read once they train at their own rate."""
 
     layer_ids: tuple[int, ...]
     context_length: int
