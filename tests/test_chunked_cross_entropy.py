@@ -280,7 +280,7 @@ SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'voc
          'column orders': 32, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
          'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
          'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 256, 'bf16 cotangent': 256,
-         'whole logits': 512, 'projected head': 32, 'projected fused head': 32}
+         'whole logits': 512, 'projected head': 64, 'projected fused head': 256}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on each platform the site
 runs on, the most any of its cases took: on armada, and paired (Dew's arm as `dew_fn`) on an A100 under
 JAX 0.12 for 'bf16 cotangent', 256 at the first tile, and for 'gemma', which runs on a GPU alone, 256 at
