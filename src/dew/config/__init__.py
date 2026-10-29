@@ -1253,9 +1253,14 @@ class RunConfig:
         return run_class.from_dict(named[1])
 
     def prepare(self) -> Prepared:
+        """Build what this run trains, as `_prepared` builds it from the run with its Hub sources pinned
+        (`pinned`), so the record names what it started from and is what it loads."""
+        return self.pinned()._prepared()
+
+    def _prepared(self) -> Prepared:
         """Build what this run trains: the objective its record names around
         its model, on its data. A kind of run with settings of its own builds
-        from them in its own `prepare`."""
+        from them in its own `_prepared`."""
         if self.objective is None or self.lora is not None:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
@@ -1328,10 +1333,10 @@ class RunConfig:
                                 f"{_chain_label(prepared.run.data)}/date-{run_timestamp()}")
         return prepared.train(name)
 
-    def pinned_adapter(self) -> Self:
-        """This run with its imported adapter's Hub source named at its commit (`LoRA.resolved`), so the
-        record names the factors the run started from: every kind's `prepare` prepares this run, which
-        loads the factors it records. Itself where nothing is left to pin."""
+    def pinned(self) -> Self:
+        """This run with its Hub sources named at the commits they resolve to now, as its record names
+        them and `prepare` loads them: here an imported adapter's (`LoRA.resolved`); a kind of run pins
+        its own sources beside it. Itself where nothing is left to pin."""
         lora = None if self.lora is None else self.lora.resolved()
         return self if lora == self.lora else dataclasses.replace(self, lora=lora)
 
