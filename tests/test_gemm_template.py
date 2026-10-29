@@ -1614,7 +1614,7 @@ def test_a_paired_product_holds_check_1_against_its_two_products_combined():
     assert_as_exact(run, jax.jit(plain), draw, "paired product", seeds=SEEDS, truth_fn=truth)
 
 
-@pytest.mark.parametrize("generation_name", generations("sm90"))
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 @pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
 def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     """A gate and an up projection as the template's paired product (`gemm`'s `paired`): its value on
@@ -1622,8 +1622,10 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     gradient (the rows', both matrices') through the paired product's own reverse mode on the routes the
     selector takes (its two accumulators recomputed, the input gradient's two products summed wide: the
     SwiGLU's fp32 cotangents multiply wide, which warpgroup MMA's 16-bit products do not take), each as
-    exact as the unfused program's from float64 truth. The gradients run eagerly, as the Mosaic
-    interpreters' ordered callbacks need."""
+    exact as the unfused program's from float64 truth. On mma.sync, which takes no paired call, its two
+    products run apart (`grouped_matmul.APART`, a structural handoff a named kernel keeps), each through
+    its own launch, the named one, the SwiGLU in XLA on their fp32 accumulators (`template._apart`). The
+    gradients run eagerly, as the Mosaic interpreters' ordered callbacks need."""
     rows, depth, width = 136, 128, 256
     sizes = jnp.asarray([70, 66], jnp.int32) if grouped else None
     groups = 2 if grouped else 1
@@ -1657,11 +1659,83 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     label = f"paired {'grouped' if grouped else 'dense'} product on {generation_name}"
     truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
     with generation.assumed(generation_name):
+        # Named: on mma.sync, which takes no pair, the call hands its two products on apart, each Mosaic's.
         with generation.chosen(grouped_matmul="mosaic_gpu"):
             assert_as_exact(jax.jit(valued(dew)), jax.jit(valued(plain)), draw, label, seeds=SEEDS,
                             truth_fn=valued(truth))
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw, f"{label}, gradients",
                         seeds=SEEDS, truth_fn=with_gradients(truth))
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_paired_products_epilogue_reads_its_fp32_accumulators_in_every_mode(generation_name):
+    """A paired product's epilogue (a product of its two accumulators, fp32 out) at a named compute dtype,
+    whole on warpgroup MMA or apart on mma.sync: its value, every reverse gradient and its forward-mode
+    tangent read the two fp32 accumulators, as the composed program's (two portable projections summed
+    wide, their product), so its derivatives are of one function: each on par with that program's from
+    float64 truth (check 1)."""
+    rows, depth, width = 136, 128, 256
+    sizes = jnp.asarray([70, 66], jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.float32),
+                *(jnp.asarray(rng.normal(size=(2, depth, width)) / 8, jnp.float32) for _ in range(2)),
+                jnp.asarray(rng.normal(size=(rows, width)), jnp.float32))
+
+    def dew(x, gate, up):
+        return template.gemm(x, gate, sizes, paired=up, epilogue=lambda g, u: g * u, compute=jnp.bfloat16,
+                             out_dtype=jnp.float32, precision="default", interpret_on_cpu=True)
+
+    def plain(x, gate, up, dtype=jnp.bfloat16):
+        g, u = (grouped_matmul.portable_projection(x, matrix, sizes, dtype, "default",
+                                                   out_dtype=jnp.promote_types(dtype, jnp.float32))
+                for matrix in (gate, up))
+        return g * u
+
+    def tangent(f):
+        """`f`'s forward-mode tangent along the drawn direction (the cotangent's draw, the rows')."""
+        return lambda x, gate, up, direction: jax.jvp(f, (x, gate, up),
+                                                      (direction[:, :depth], gate, up))[1]
+
+    truth = functools.partial(plain, dtype=jnp.float64)
+    with generation.assumed(generation_name):
+        assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
+                        f"paired epilogue's gradients ({generation_name})", seeds=SEEDS,
+                        truth_fn=with_gradients(truth))
+        assert_as_exact(tangent(dew), jax.jit(tangent(plain)), draw,
+                        f"paired epilogue's tangent ({generation_name})", seeds=SEEDS,
+                        truth_fn=tangent(truth))
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_paired_product_at_a_named_compute_dtype_holds_check_1(generation_name):
+    """A gate and an up projection of fp32 rows and masters multiplied in bf16 (`gemm`'s `compute`, the MoE
+    projection's law: the operands rounded, the products summed wide and rounded once, each tangent
+    through the rounded operands) as one paired product without an epilogue: its two outputs and every
+    gradient (the rows' in fp32, both masters' in fp32) as exact as the two unfused projections'
+    (`grouped_matmul.portable_projection`) from float64 truth."""
+    rows, depth, width = 136, 128, 256
+    sizes = jnp.asarray([70, 66], jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.float32),
+                *(jnp.asarray(rng.normal(size=(2, depth, width)) / 8, jnp.float32) for _ in range(2)),
+                tuple(jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16) for _ in range(2)))
+
+    def dew(x, gate, up):
+        return template.gemm(x, gate, sizes, paired=up, compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
+                             out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True)
+
+    def plain(x, gate, up, dtype=jnp.bfloat16):
+        return tuple(grouped_matmul.portable_projection(x, matrix, sizes, dtype, None)
+                     for matrix in (gate, up))
+
+    with generation.assumed(generation_name):
+        assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
+                        f"paired product at a named compute dtype ({generation_name})", seeds=SEEDS,
+                        truth_fn=with_gradients(functools.partial(plain, dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize(("generation_name", "out"), [pytest.param("sm90", jnp.bfloat16, marks=runs("sm90")),
@@ -1686,7 +1760,12 @@ def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generati
                              interpret_on_cpu=generation_name is not None)
 
     def plain(x, gate, up, wide=jnp.float32, cast=out):
-        return tuple((x.astype(wide) @ matrix.astype(wide)).astype(cast) for matrix in (gate, up))
+        # The unfused program's products, its operands' own dtype summed wide (XLA's tensor-core product
+        # on a GPU, as the template's); float64 truth rounds nothing.
+        if wide == jnp.float64:
+            return tuple((x.astype(wide) @ matrix.astype(wide)).astype(cast) for matrix in (gate, up))
+        return tuple(jax.lax.dot(x, matrix, preferred_element_type=wide).astype(cast)
+                     for matrix in (gate, up))
 
     with generation.assumed(generation_name):
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
