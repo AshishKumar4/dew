@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import dataclasses
 import hashlib
+import json
 import logging
 import os
 import re
@@ -60,21 +61,83 @@ _LAUNCHES: dict[str, Launch] = {}
 """Each launch this process traced, by its digest."""
 @dataclasses.dataclass
 class _Registry:
-    """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), and each miss."""
-    refused: set[tuple[str, Hashable]] = dataclasses.field(default_factory=set)
+    """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), by the names of its
+    kernels that spilled, and each miss."""
+    refused: dict[tuple[str, Hashable], frozenset[str]] = dataclasses.field(default_factory=dict)
     missed: list["Miss"] = dataclasses.field(default_factory=list)
 
 
 _PROCESS = _Registry()
-"""The process's registry, every thread's."""
+"""The process's registry, every thread's, seeded from and kept in `records()` where it is set."""
+_SEEDED: list[Path] = []
+"""The records file the process's registry was seeded from (`_registry`), once."""
 _SCOPE: contextvars.ContextVar[_Registry | None] = contextvars.ContextVar("refusals_scope", default=None)
 """A `refusals` scope's own registry, in its context alone."""
-_GUARD = threading.Lock()
-"""Serializes the registries' reads and updates between threads."""
+_GUARD = threading.RLock()
+"""Serializes the registries' reads and updates between threads (a read may seed the process's)."""
+
+
+def records() -> Path | None:
+    """Where a process keeps its refusals beside the persistent compilation cache, so every process sharing
+    the cache shares them and derives the configs it holds (a training pool's, an eval's, a server's):
+    DEW_REFUSAL_RECORDS when set, else `dew-refusals.jsonl` in JAX's compilation cache directory, or nowhere
+    when the process keeps no cache."""
+    if path := os.environ.get("DEW_REFUSAL_RECORDS"):
+        return Path(path)
+    cache = jax.config.jax_compilation_cache_dir
+    return None if not cache else Path(cache) / "dew-refusals.jsonl"
 
 
 def _registry() -> _Registry:
-    return _SCOPE.get() or _PROCESS
+    scoped = _SCOPE.get()
+    if scoped is not None:
+        return scoped
+    path = records()
+    if path is not None and path not in _SEEDED:
+        with _GUARD:
+            if path not in _SEEDED:
+                _SEEDED.append(path)
+                for identity, config, kernels in _read(path):
+                    _PROCESS.refused[(identity, config)] = (
+                        _PROCESS.refused.get((identity, config), frozenset()) | kernels)
+    return _PROCESS
+
+
+def _read(path: Path) -> list[tuple[str, Hashable, frozenset[str]]]:
+    """The refusals `path` keeps, a JSON line each; a line this checkout cannot rebuild (another checkout's
+    config) is skipped."""
+    from dew.nn.kernels import tuning  # tuning traces launches under this module's names
+    if not path.exists():
+        return []
+    found = []
+    for line in path.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+            found.append((entry["identity"], tuning.decoded(entry["config"]), frozenset(entry["kernels"])))
+        except (ValueError, KeyError, TypeError, tuning.Unreadable):
+            _log.warning("a refusal in %s this checkout cannot read: %.120s", path, line)
+    return found
+
+
+def _kept(identity: str, config: Hashable, kernels: frozenset[str]) -> None:
+    """A process refusal appended to `records()`, one line written at once (O_APPEND), so processes sharing
+    the file append whole lines."""
+    from dew.nn.kernels import tuning  # tuning traces launches under this module's names
+    path = records()
+    if path is None:
+        return
+    line = json.dumps({"identity": identity, "config": tuning.encoded(config), "kernels": sorted(kernels)})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(descriptor, (line + "\n").encode())
+    finally:
+        os.close(descriptor)
+
+
+class Exhausted(ValueError):
+    """A derivation that finds no config left for a launch (`base.Unfitted`): a relowering after a spill
+    that ends so keeps the first program (`compiled`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,11 +155,16 @@ class Miss:
 
 def _identity(op, arguments: tokamax.BoundArguments) -> str:
     """A launch's identity apart from its config, the same in every process: its op as its picks name it
-    and its arguments as its picks key them, its arrays by their shapes and dtypes and its hooks by what
-    they compute (`tuning.KernelOp.keyed`, `traced`)."""
-    keyed = op.keyed(arguments)
-    return repr((keyed.op, tuple((name, op.traced(name, value) if name in op.HOOKS else value)
-                                 for name, value in sorted(keyed.arguments.items()))))
+    (`tuning.KernelOp.keyed`) and its arguments exactly, its arrays by their own shapes and dtypes (no
+    key's bucket: two launches a key shares compile two kernels) and its hooks by what they compute
+    (`traced`)."""
+    def described(name, value):
+        if name in op.HOOKS:
+            return op.traced(name, value)
+        return jax.tree.map(lambda leaf: (tuple(leaf.shape), str(leaf.dtype)) if hasattr(leaf, "dtype")
+                            and hasattr(leaf, "shape") else leaf, value)
+    return repr((op.keyed(arguments).op, tuple((name, described(name, value))
+                                               for name, value in sorted(arguments.arguments.items()))))
 
 
 def _digest(text: str) -> str:
@@ -133,12 +201,35 @@ def traced(digest: str) -> Launch | None:
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     """Whether a compile of this process refused `op`'s launch of `arguments` at `config`: its kernel
     spilled (`compiled`). A template's legality reads it, so its derivation takes the next config."""
+    return bool(spilled(op, arguments, config))
+
+
+def spilled(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozenset[str]:
+    """The names of `op`'s kernels a compile of this process found spilling at `config` for `arguments`
+    (`refused` where any): a launch of several kernels (a recurrence's forward and backward walks) steps
+    the one that spilled."""
     registry = _registry()
     if not registry.refused:
-        return False
+        return frozenset()
     identity = (_identity(op, arguments), config)
     with _GUARD:
-        return identity in registry.refused
+        return registry.refused.get(identity, frozenset())
+
+
+def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
+    """Every (launch identity, config, spilled kernel names) refused in this context (a `refusals` scope's or
+    the process's), ordered: a run records them with its plan, so every process loading it seeds them
+    (`refuse`) and derives the stepped-down configs alike, and the compilation cache only holds those."""
+    with _GUARD:
+        return tuple(sorted(((identity, config, kernels)
+                             for (identity, config), kernels in _registry().refused.items()), key=repr))
+
+
+def refuse(entries) -> None:
+    """Each `(identity, config, kernels)` of `entries` (`refused_launches`') refused in this context, as a
+    compile's spill refuses it: a run seeding a plan's refusals before it lowers."""
+    for identity, config, kernels in entries:
+        _record((identity, config), None, frozenset(kernels))
 
 
 def misses() -> tuple[Miss, ...]:
@@ -160,12 +251,17 @@ def refusals() -> Iterator[None]:
         _SCOPE.reset(token)
 
 
-def _record(refusal: tuple[str, Hashable] | None, miss: "Miss") -> None:
+def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
+            kernels: frozenset[str] = frozenset()) -> None:
     registry = _registry()
     with _GUARD:
         if refusal is not None:
-            registry.refused.add(refusal)
-        registry.missed.append(miss)
+            known = registry.refused.get(refusal, frozenset())
+            registry.refused[refusal] = known | kernels
+            if registry is _PROCESS and not kernels <= known:
+                _kept(*refusal, kernels)
+        if miss is not None:
+            registry.missed.append(miss)
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
@@ -174,35 +270,54 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     spills, that launch's config is refused (`refused`), the miss recorded (`misses`, logged), and the
     program `relower`ed once and compiled; `relower` traces afresh, so each refused launch's derivation
     takes the next config by its own rule. A kernel spilling again is refused and recorded, not stepped
-    again; a relowering whose derivation finds no config left (`base.Unfitted`) keeps the first program. A
-    program loaded from the persistent compilation cache runs no ptxas and reports nothing."""
+    again; a relowering whose derivations find no config left (`Exhausted`) keeps the first program, its
+    misses recorded as not stepped. A program loaded from the persistent compilation cache runs no ptxas
+    and reports nothing."""
     executable, spilling = _compiled_reported(lowered, options)
-    if not _refused_all(spilling, stepped=True):
+    found = _misses_of(spilling)
+    refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
+    for refusal, kernel in refusals:
+        _record(refusal, None, frozenset({kernel}))
+    if not refusals:
+        _recorded(found, stepped=False)
         return executable
     try:
         relowered = relower()
-    except ValueError as failed:  # `base.Unfitted`: the derivations refuse every config left
+    except Exhausted as failed:
         _log.warning("relowering after a spill found no config: %s; the first program runs", failed)
+        _recorded(found, stepped=False)
         return executable
+    _recorded(found, stepped=True)
     executable, spilling = _compiled_reported(relowered, options)
-    _refused_all(spilling, stepped=False)
+    again = _misses_of(spilling)
+    for refusal, report, _ in again:
+        if refusal is not None:
+            _record(refusal, None, frozenset({report.kernel}))
+    _recorded(again, stepped=False)
     return executable
 
 
-def _refused_all(spilling: list["Report"], *, stepped: bool) -> bool:
-    """Each spilling kernel's launch refused and its miss recorded; whether any was a launch's."""
-    any_launch = False
-    for found in spilling:
-        launch = None if found.launch is None else traced(found.launch)
-        any_launch |= launch is not None
-        miss = Miss(found.kernel, None if launch is None else launch.op,
-                    None if launch is None else launch.config, found.registers, found.spilled,
+def _misses_of(spilling: list["Report"]) -> list[tuple[tuple[str, Hashable] | None, "Report", Launch | None]]:
+    """Each spilling kernel's refusal (its launch's identity and config, None for a kernel no launch of
+    this process traced), its report and its launch."""
+    found = []
+    for report in spilling:
+        launch = None if report.launch is None else traced(report.launch)
+        found.append((None if launch is None else (launch.identity, launch.config), report, launch))
+    return found
+
+
+def _recorded(found: list, *, stepped: bool) -> None:
+    """Each of `found`'s misses recorded and logged, stepped down where `stepped` and its kernel a
+    launch's."""
+    for _, report, launch in found:
+        miss = Miss(report.kernel, None if launch is None else launch.op,
+                    None if launch is None else launch.config, report.registers, report.spilled,
                     stepped and launch is not None)
-        _record(None if launch is None else (launch.identity, launch.config), miss)
+        _record(None, miss)
         _log.warning("kernel %s spilled %s bytes at %s registers (%s at %s); %s", miss.kernel, miss.spilled,
                      miss.registers, miss.op, miss.config,
                      "its launch steps down" if miss.stepped else "no step-down")
-    return any_launch
 
 
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
