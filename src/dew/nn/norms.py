@@ -15,7 +15,7 @@ from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype
 
 from .kernels import norm_swiglu
-from .precision import at_least_fp32, rms_statistics, rounded_to
+from .precision import at_least_fp32, rms_statistics, rms_weighted, rounded_to
 
 
 def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
@@ -125,10 +125,10 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
     """
     def portable(x, gate, scale):
         wide = at_least_fp32(x.dtype)
-        y = unweighted_rmsnorm(x.astype(wide), epsilon, implementation='xla')
-        y = y if scale is None else y * scale.astype(wide)
-        gate = gate.astype(wide)
-        return (y * (jax.nn.silu(gate) if activation == 'silu' else jax.nn.sigmoid(gate))).astype(dtype)
+        x = x.astype(wide)
+        weight = None if scale is None else scale.astype(wide)
+        return rms_weighted(x, rms_statistics(x, epsilon)[1], weight=weight, gate=gate.astype(wide),
+                            activation=activation).astype(dtype)
 
     chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
     if chosen == 'pallas':

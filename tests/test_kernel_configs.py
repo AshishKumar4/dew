@@ -84,7 +84,7 @@ def test_a_launch_clips_its_blocks_to_the_operands():
     h = jax.ShapeDtypeStruct((1, 1, 64, 32), jnp.bfloat16)
     g = jax.ShapeDtypeStruct((1, 64, 1), jnp.float32)
     spans = chunked_launch.sequences(1, 64)
-    ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, *spans, scale=1.0, chunk=64, interpret=True)
+    ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, None, *spans, scale=1.0, chunk=64, interpret=True)
     with generation.assumed("sm80"):
         tiles = fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba)
     assert tiles.bk <= q.shape[-1] and tiles.bv <= v.shape[-1], tiles
@@ -416,15 +416,20 @@ def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
 
 
+def _kernel_of(name: str) -> str:
+    """A case's kernel: its form at its tile, its band (`Tiles.grid_block_n`, the order its tiles are
+    walked) apart, its shared memory and registers the tile's; a count the form's name carries (` x2`, the
+    family contract's) apart too, the tile's consumers stating it."""
+    form, _, tile = name.partition(" Tiles(")
+    return f"{re.sub(r' x\d+$', '', form)} Tiles({re.sub(r'grid_block_n=\d+, ', '', tile)}"
+
+
 def _gate_cases(generation_name: str) -> list:
-    """Every projection's cases (`_gemm_mainloop_cases`), each distinct kernel once: a form at a tile is
-    one kernel at every projection that derives it, its band (`Tiles.grid_block_n`, the order its tiles
-    are walked) apart, its shared memory and registers the tile's."""
+    """Every projection's cases (`_gemm_mainloop_cases`), each distinct kernel once (`_kernel_of`)."""
     found = {}
     for shape in GEMM_SHAPES:
         for case in _gemm_mainloop_cases(generation_name, shape):
-            kernel = re.sub(r"grid_block_n=\d+, ", "", case.name)
-            found.setdefault(kernel, case)
+            found.setdefault(_kernel_of(case.name), case)
     return list(found.values())
 
 
@@ -457,8 +462,10 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, part)
     adopts a Family head: every launch form it emits (`_emitted_forms`: plain and transposed right
     operands, 16-bit and fp32 stores, fixed and streamed side vectors and tiles, several outputs, the
     running sum) at one consumer and at the family's most (`_gemm_mainloop_cases(every_consumer_count=
-    True)`). Every form and count must be present, and each lower, within the block, spilling nothing, in
-    `FAMILY_PARTS` parts. No version guard skips it: a JAX that breaks the contract fails here."""
+    True)`). Every form and count must be present, and each the compile gate does not hold
+    (`test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources`) lower, within the block,
+    spilling nothing, in `FAMILY_PARTS` parts. No version guard skips it: a JAX that breaks the contract
+    fails here."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     family = bundles.of(generation_name, jnp.bfloat16)
@@ -468,7 +475,9 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, part)
     expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
-    cases = cases[part::FAMILY_PARTS]
+    # A kernel the compile gate already holds (`_gate_cases`) is compiled there, not again.
+    held = {_kernel_of(case.name) for case in _gate_cases(generation_name)}
+    cases = [case for case in cases if _kernel_of(case.name) not in held][part::FAMILY_PARTS]
     found = compile_mosaic_kernels(cases, generation_name)
     failed = mosaic_failures(found)
     assert len(found) == len(cases) and not failed, "\n".join(failed)
