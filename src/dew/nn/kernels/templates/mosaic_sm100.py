@@ -81,21 +81,13 @@ class Tcgen05:
     def roles(load: Callable[[], None], products: Callable[[], None], read: Callable[[], None]) -> None:
         """The issuing warpgroup's load warp runs `load`, its product warp `products`; the other warpgroup
         runs `read`."""
-        wg = lax.axis_index("wg")
-
-        @pl.when(wg == ISSUE)
-        def _():
-            @plgpu.warp_map
-            def _(warp):
-                pl.when(warp == LOAD_WARP)(load)
-                pl.when(warp == MMA_WARP)(products)
-
-        pl.when(wg == READ)(read)
+        Tcgen05.issued(load, products)
+        pl.when(lax.axis_index("wg") == READ)(read)
 
     @staticmethod
     def issued(load: Callable[[], None], products: Callable[[], None]) -> None:
-        """The issuing warpgroup's warps alone (a program's end, `drain`'s): its load warp runs `load`, its
-        product warp `products`."""
+        """The issuing warpgroup's warps alone (a program's end, `drain`'s, and each tile's in `roles`): its
+        load warp runs `load`, its product warp `products`."""
         @pl.when(lax.axis_index("wg") == ISSUE)
         def _():
             @plgpu.warp_map
