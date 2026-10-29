@@ -184,6 +184,10 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if hooks.drop is not None and (hooks.drop.queries is not None or hooks.drop.keys is not None):
         return DROPPING
+    if hooks.drop is not None and jnp.dtype(dtype) == jnp.dtype(jnp.float16):
+        # fp16's dropped weights take scaled parts (`algebra.weights_parts`), which the mainloop's register
+        # products do not take back (`mosaic.unscaled_part`).
+        return "the Mosaic mainloop's dropping walk takes bf16 operands, not float16"
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
         return f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}"
     if jnp.dtype(dtype) not in sixteen:
@@ -265,9 +269,10 @@ def _score_jaxprs(score_mod, params: tuple, tile: tuple[int, int], *,
     return traced
 
 
-TILE_SIDES = (64, 128, 192, 256)
+TILE_SIDES = (32, 64, 128, 192, 256)
 """The sides a program's score tile may take, at every shape of which a hook's legality traces it
-(`transposable`)."""
+(`transposable`): a consumer's share of a slot's queries (32 of a 64-row slot, `split_queries`) among
+them."""
 
 
 def transposable(hooks: Hooks) -> bool:

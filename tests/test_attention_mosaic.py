@@ -1132,10 +1132,33 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-BACKWARD_GATE = [(generation_name, width, accurate) for generation_name in ("sm90", "sm80")
+BACKWARD_GATE = [(generation_name, width, accurate) for generation_name in ("sm90",)
                  for width in (64, 128, 256) for accurate in (False, True)]
-"""The backward resource gate's cases: each qualified family's GPU (an H100, an A100), a causal call's head
-widths, each form."""
+"""The backward resource gate's cases: each GPU whose family the mainloop qualifies (an H100's; mma.sync's
+is not, `test_an_a100_derives_no_mosaic_backward`), a causal call's head widths, each form."""
+
+
+def _gated_backward(generation_name: str, width: int, accurate: bool):
+    """The resource gate's backward op, bound arguments and derived config: a causal call of 512 queries,
+    four query heads over two key heads `width` wide, bf16, in the form `accurate` names, for
+    `generation_name`."""
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    query = jnp.zeros((1, queries, 4, width), jnp.bfloat16)
+    key = jnp.zeros((1, queries, 2, width), jnp.bfloat16)
+    with generation.assumed(generation_name):
+        op, args = attention_mosaic._backward_call(query, key, key, spans, None, query,
+                                                   _residuals(query.shape), accurate=accurate, scale=None,
+                                                   natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, interpret=False)
+        return op, ba, op.derived(ba, generation.gpu_target())
+
+
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_an_a100_derives_no_mosaic_backward(accurate):
+    """The mma.sync family is not one this mainloop qualifies (`attention_mosaic_program.QUALIFIED`, row
+    2078): an A100's backward derives no config, so the route takes another mainloop there."""
+    assert _gated_backward("sm80", 128, accurate)[2] is None
 
 
 @pytest.mark.parametrize(("generation_name", "width", "accurate"), BACKWARD_GATE)
@@ -1159,16 +1182,9 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
                                           accurate=accurate)
         return grads.query, grads.key, grads.value
 
+    op, ba, config = _gated_backward(generation_name, width, accurate)
+    assert config is not None, f"the Mosaic backward derives no config {width} wide on {generation_name}"
     with generation.assumed(generation_name):
-        op, args = attention_mosaic._backward_call(*(jnp.zeros(array.shape, array.dtype)
-                                                     for array in (query, key, key)), spans, None,
-                                                   jnp.zeros(query.shape, query.dtype), residuals,
-                                                   accurate=accurate, scale=None,
-                                                   natural=attention_mosaic.NATURAL)
-        ba = op.bind(*args, interpret=False)
-        config = op.derived(ba, generation.gpu_target())
-        if config is None:
-            pytest.skip(f"the Mosaic backward takes no call {width} wide on {generation_name}")
         models = _backward_models(op, ba, config)
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
         found = compile_mosaic_kernels(

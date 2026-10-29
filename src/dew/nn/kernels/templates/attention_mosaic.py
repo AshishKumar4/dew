@@ -143,8 +143,10 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         family = found.get(config.family)
-        return (family is not None and whole_tiles(family, config) and self.refusal(ba, family) is None
-                and super().legal(ba, config, target))
+        # A forward's and a dQ launch's layout streams through a producer (`Family.stream`); a layout whose
+        # consumers feed their own rings (`split_queries`) runs the keys-first dK/dV launch alone.
+        return (family is not None and not split_queries(family) and whole_tiles(family, config)
+                and self.refusal(ba, family) is None and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
