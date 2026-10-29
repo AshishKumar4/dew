@@ -38,16 +38,21 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
+from quantized_basis import dequantized_in_own_basis
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
 from dew.batch import coordinates
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import families, translate_config, translate_wrapper_config
+from dew.nn.deepseek_v4 import DRAFT_CONTEXT, DeepseekV4Attention, DSparkAttention
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import MixerCall, ModelInputs
 from dew.nn.kv_cache import KVCache
-from dew.nn.rope import LongRopeScaling, RopeScaling
+from dew.nn.precision import at_least_fp32
+from dew.nn.rope import LongRopeScaling, RopeScaling, rotary_freqs
+from dew.nn.sharding import down_projection
+from dew.nn.visibility import visible
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run
@@ -447,6 +452,147 @@ def test_a_paged_drafting_cache_drafts_what_the_compact_cache_drafts(source, qua
 
     np.testing.assert_array_equal(drafted(KVCache(quantized=quantized, page_size=4)),
                                   drafted(KVCache(quantized=quantized)))
+
+
+def window_decode_loop(module, variables, hidden):
+    """One-token decode steps of a V4 attention layer over `hidden`, from an empty cache."""
+    state = module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True))
+    state = {**state, "params": variables["params"]}
+    outputs = []
+    for step in range(hidden.shape[1]):
+        out, mutated = module.apply(state, hidden[:, step:step + 1], MixerCall(decode=True),
+                                    mutable=["cache"])
+        state = {**state, "cache": mutated["cache"]}
+        outputs.append(out)
+    return jnp.concatenate(outputs, axis=1)
+
+
+def uncached_window_steps(module, variables, hidden, quantized: str):
+    """A sliding V4 layer's per-step outputs over `hidden` with no cache: every position's
+    projections computed once, the shared window head dequantized in its own basis as the keys
+    and, where a rotated layout keeps it twice, unrotated as the values (a float8 layout stores
+    it once, its values its keys), and each step's query attending its window of the slots up
+    to its own in a cache-shaped row, so a cached decode is held to a computation that never
+    enters the stored basis."""
+    def steps(m, x):
+        batch, length, _ = x.shape
+        capacity = m.max_seq_len
+        positions = jnp.broadcast_to(jnp.arange(length)[None], (batch, length))
+        cos, sin = rotary_freqs(positions, m.rope_dim, m.rope_theta, rope_scaling=m.rope_scaling,
+                                dtype=at_least_fp32(x.dtype))
+        place = down_projection(x, m.q_lora_rank + m.head_dim)
+        query, _ = m._queries(x, cos, sin, place)
+        head = m._window_keys(x, cos, sin, place)
+        keys = dequantized_in_own_basis(head, quantized, keys=True)
+        values = keys if quantized != "int8" else dequantized_in_own_basis(head, quantized, keys=False)
+        slots = jnp.arange(capacity)
+
+        def slotted(values):
+            """`values` [B, length, D] in `capacity` slots, zero past them, as an unwritten
+            cache slot reads."""
+            return jnp.pad(values, ((0, 0), (0, capacity - length), (0, 0)))
+
+        keys, values = slotted(keys), slotted(values)
+        outputs = []
+        for step in range(length):
+            written = (slots <= step)[None, :, None]
+            allowed = jnp.broadcast_to(
+                ((slots <= step) & (step - slots < m.sliding_window))[None, None], (batch, 1, capacity))
+            outputs.append(m._attend(query[:, step:step + 1], jnp.where(written, keys, 0),
+                                     jnp.where(written, values, 0), allowed,
+                                     cos[:, step:step + 1], sin[:, step:step + 1]))
+        return jnp.concatenate(outputs, axis=1)
+
+    return module.apply(variables, hidden, method=lambda m, x: steps(m, x))
+
+
+@pytest.mark.parametrize("quantized", ["int8", "float8_e4m3fn"])
+def test_a_quantized_window_cache_decodes_what_dequantizing_in_the_own_basis_computes(quantized):
+    """A sliding V4 layer's quantized window cache, its shared head stored as keys and values
+    and its keys read back plain, held to no cache at all: each step as the layer computes it
+    over the head dequantized in its own basis (`dequantized_in_own_basis`, plain jnp from the
+    layout's rule), bit for bit. Dropping the plain read-back leaves the int8 keys in their
+    rotated basis and moves every step off this computation, where a paged-against-compact
+    comparison at one format reads them back plain on both arms."""
+    module = DeepseekV4Attention(emb_features=32, num_heads=2, head_dim=16, q_lora_rank=8, o_groups=1,
+                                 o_lora_rank=8, rope_dim=8, sliding_window=3, max_seq_len=16,
+                                 kv_cache=KVCache(quantized=quantized))
+    hidden = jax.random.normal(jax.random.key(7), (2, 6, 32))
+    variables = {"params": module.init(jax.random.key(3), hidden[:, :1],
+                                       MixerCall(decode=True))["params"]}
+    decoded = np.asarray(jax.jit(lambda variables, hidden: window_decode_loop(module, variables, hidden))(
+        variables, hidden))
+    own = np.asarray(jax.jit(
+        lambda variables, hidden: uncached_window_steps(module, variables, hidden, quantized))(
+        variables, hidden))
+    np.testing.assert_array_equal(decoded, own)
+
+
+DRAFTING = DSparkAttention(emb_features=32, num_heads=2, head_dim=16, q_lora_rank=8, o_groups=1,
+                           o_lora_rank=8, rope_dim=8, sliding_window=4, max_seq_len=16)
+"""A small DSpark stage's attention, its window shorter than the context it drafts after."""
+
+
+def cached_draft(module, variables, context, block):
+    """A DSpark stage's draft of `block` after `context`, cached: the context written by an empty block,
+    then the block drafted after it with none."""
+    writing = MixerCall(decode=True, kv_store={DRAFT_CONTEXT: context})
+    # The call that allocates the cache writes nothing (`cache_positions`), as a decoder's first does.
+    state = {**module.init(jax.random.key(0), block, writing), "params": variables["params"]}
+    _, written = module.apply(state, block[:, :0], writing, mutable=["cache"])
+    return module.apply({**state, "cache": written["cache"]}, block, MixerCall(decode=True))
+
+
+def uncached_own_basis_draft(module, variables, context, block, quantized: str):
+    """The draft as the cached stage computes it, its context's shared head never entering the stored
+    basis: the head projected at the context's slots and dequantized in its own basis as the keys and,
+    where a rotated layout keeps it twice, unrotated as the values (`dequantized_in_own_basis`), in a
+    cache-shaped row, and the block attending its window of them and all of itself."""
+    def drafted(m, context, x):
+        batch, written = context.shape[:2]
+        slots = jnp.broadcast_to(jnp.arange(written)[None], (batch, written))
+        freqs = rotary_freqs(slots, m.rope_dim, m.rope_theta, rope_scaling=m.rope_scaling,
+                             dtype=at_least_fp32(context.dtype))
+        head = m._window_keys(context, *freqs, down_projection(context, m.head_dim))
+        keys = dequantized_in_own_basis(head, quantized, keys=True)
+        values = keys if quantized != "int8" else dequantized_in_own_basis(head, quantized, keys=False)
+        padding = ((0, 0), (0, m.max_seq_len - written), (0, 0))
+        keys, values = jnp.pad(keys, padding), jnp.pad(values, padding)
+        last = jnp.full((batch,), written - 1)
+        places = jnp.arange(m.max_seq_len)[None]
+        length = x.shape[1]
+        positions = last[:, None] + 1 + jnp.arange(length)
+        cos, sin = rotary_freqs(positions, m.rope_dim, m.rope_theta, rope_scaling=m.rope_scaling,
+                                dtype=at_least_fp32(x.dtype))
+        place = down_projection(x, m.q_lora_rank + m.head_dim)
+        query, _ = m._queries(x, cos, sin, place)
+        window = visible(last[:, None], places, causal=True, window=m.sliding_window)
+        allowed = jnp.concatenate([jnp.broadcast_to(window[:, None], (batch, length, m.max_seq_len)),
+                                   jnp.ones((batch, length, length), bool)], axis=-1)
+        own = m._window_keys(x, cos, sin, place)
+        return m._attend(query, jnp.concatenate([keys, own], axis=1),
+                         jnp.concatenate([values, own], axis=1), allowed, cos, sin)
+
+    return module.apply(variables, context, block, method=drafted)
+
+
+@pytest.mark.parametrize("quantized", ["int8", "float8_e4m3fn"])
+def test_a_quantized_drafting_cache_drafts_what_dequantizing_in_the_own_basis_computes(quantized):
+    """A DSpark stage's quantized window cache, the target's context stored as its shared head and its
+    keys read back plain (`held.plain`), held to no cache at all: the block drafted over the context's
+    head dequantized in its own basis (`uncached_own_basis_draft`), bit for bit. Dropping the plain
+    read-back leaves the int8 keys in their rotated basis and moves the draft off this computation, where
+    a paged-against-compact comparison at one format reads them back plain on both arms."""
+    module = DRAFTING.clone(kv_cache=KVCache(quantized=quantized))
+    context = jax.random.normal(jax.random.key(7), (2, 6, 32))
+    block = jax.random.normal(jax.random.key(8), (2, 3, 32))
+    variables = {"params": module.init(jax.random.key(3), block,
+                                       MixerCall(decode=True, kv_store={DRAFT_CONTEXT: context}))["params"]}
+    decoded = jax.jit(lambda variables, context, block: cached_draft(module, variables, context, block))
+    own = jax.jit(lambda variables, context, block: uncached_own_basis_draft(
+        module, variables, context, block, quantized))
+    np.testing.assert_array_equal(np.asarray(decoded(variables, context, block)),
+                                  np.asarray(own(variables, context, block)))
 
 
 def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():

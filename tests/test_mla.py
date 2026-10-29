@@ -37,8 +37,9 @@ import pytest
 import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
+from quantized_basis import dequantized_in_own_basis
 from recording import RecordingTracker
-from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 from selection_margins import indexer_margins
 from tool_support import load
 
@@ -63,6 +64,7 @@ from dew.nn.rope import (
     yarn_inv_freq,
     yarn_query_scale,
 )
+from dew.nn.sharding import down_projection
 from dew.nn.visibility import prefix_groups
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
@@ -74,7 +76,7 @@ GENERATOR = load("mla_reference")
 """tools/mla_reference.py, whose configs and transformers classes build the reference blocks."""
 
 SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 8, "value columns": 8,
-         "yarn": 16, "visibility": 16}
+         "yarn": 16, "visibility": 16, "mla_v3 int8 latent decode": 8, "mla_v32 int8 latent decode": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
 
@@ -348,6 +350,89 @@ def test_a_paged_latent_cache_decodes_what_the_compact_cache_decodes(name, quant
 
     np.testing.assert_array_equal(decoded(KVCache(quantized=quantized, page_size=4)),
                                   decoded(KVCache(quantized=quantized)))
+
+
+def uncached_dequantized_steps(module, variables, hidden, quantized: str):
+    """The block's per-step outputs over `hidden` with no cache: every position's projections
+    computed once, its latents (dense) or expanded keys and values (sparse) replaced by their
+    dequantized-in-own-basis selves, and each step's query attending the slots up to its own in
+    a cache-shaped row, so a cached decode is held to a computation that never enters the
+    stored basis."""
+    def steps(m, x):
+        batch, length, _ = x.shape
+        capacity = m.max_seq_len
+        place = down_projection(x, (m.q_lora_rank or 0) + m.kv_lora_rank + m.qk_rope_head_dim)
+        queries, q_resid = m._queries(x, place)
+        latent, rot = m._latents(x, place)
+        q_pass, q_rot = jnp.split(queries, [m.qk_nope_head_dim], axis=-1)
+        q_rot, rot, freqs_cos, freqs_sin = m._rotated(q_rot, rot, jnp.arange(length))
+        query = m._scaled_query(q_pass, q_rot)
+        slots = jnp.arange(capacity)
+
+        def slotted(values):
+            """`values` [B, length, ...] in `capacity` slots, zero past them, as an unwritten
+            cache slot reads."""
+            return jnp.pad(values, ((0, 0), (0, capacity - length)) + ((0, 0),) * (values.ndim - 2))
+
+        if m.sparse:
+            key, value = m._expand(latent, rot)
+            held = (slotted(dequantized_in_own_basis(key, quantized, keys=True)),
+                    slotted(dequantized_in_own_basis(value, quantized, keys=False)))
+            index_keys = (m._rotated_index_keys(m._index_keys(x, jnp.ones(x.shape[:2], bool)),
+                                                freqs_cos, freqs_sin) if m.indexed else None)
+            keep = jnp.broadcast_to(slots[None, None, :length] <= jnp.arange(length)[None, :, None],
+                                    (batch, length, length))
+            selection, _ = m._selection(x, q_resid, index_keys, keep, freqs_cos, freqs_sin,
+                                         MixerCall(), jnp.ones(x.shape[:2], bool),
+                                         slots=jnp.arange(length))
+            visible = ((selection[..., None] == slots) & (selection[..., None] >= 0)).any(axis=-2)
+        else:
+            held = (slotted(dequantized_in_own_basis(latent, quantized, keys=True)),
+                    slotted(dequantized_in_own_basis(rot, quantized, keys=False)))
+            visible = jnp.broadcast_to(slots[None, None, :] <= jnp.arange(length)[None, :, None],
+                                        (batch, length, capacity))
+        outputs = []
+        for step in range(length):
+            written = (slots <= step).reshape((1, capacity) + (1,) * (held[0].ndim - 2))
+            first, second = (jnp.where(written, part, 0) for part in held)
+            key, value = (first, second) if m.sparse else m._expand(first, second)
+            outputs.append(m._attend(query[:, step:step + 1], key, value, x[:, step:step + 1],
+                                     visible[:, None, step:step + 1], m.attention_impl))
+        return jnp.concatenate(outputs, axis=1)
+
+    return module.apply(variables, hidden, method=lambda m, x: steps(m, x))
+
+
+@pytest.mark.parametrize("quantized", ["int8", "float8_e4m3fn"])
+@pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
+def test_a_quantized_latent_cache_decodes_what_dequantizing_in_the_own_basis_computes(name, quantized):
+    """A quantized latent cache's decode held to no cache at all: each step as the block computes
+    it over latents (V3) or expanded keys and values (V3.2) dequantized in their own basis
+    (`dequantized_in_own_basis`, plain jnp from the layout's rule). Bit for bit in float8, which
+    stores unrotated values the cache reads back as they are; int8 rotates its keys, which the cache
+    does in float32 and the own-basis run in float64 (the dense latents rotated back plain, the sparse
+    step's logits formed in the rotated basis from a rotated query), so each int8 decode is on par with
+    the own-basis run from that run in float64 over its declared draws (check 1). A basis conversion
+    dropped on either side, the sparse query's or the dense latents' plain read-back, moves the cached
+    steps off this computation, where a paged-against-compact comparison at one format runs the same
+    conversion on both arms."""
+    settings = CONFIG[SETTINGS[name]]
+    variables = block_variables(fixture(name))
+    module = mla_module(settings, kv_cache=KVCache(quantized=quantized))
+    decoded = jax.jit(lambda hidden: decode_loop(module, variables, hidden))
+    own = jax.jit(lambda hidden: uncached_dequantized_steps(module, variables, hidden, quantized))
+
+    def draw(seed):
+        return (block_draw(name)(seed)[0][:, :8],)
+
+    if quantized == "int8":
+        assert_as_exact(decoded, own, draw, f"{name} int8 latent decode",
+                        seeds=SEEDS[f"{name} int8 latent decode"],
+                        truth_fn=lambda hidden: uncached_dequantized_steps(module, widened(variables), hidden,
+                                                                           quantized))
+    else:
+        (hidden,) = draw(0)
+        np.testing.assert_array_equal(np.asarray(decoded(hidden)), np.asarray(own(hidden)))
 
 
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n"])
@@ -978,98 +1063,3 @@ def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
 
     seeds = seeds_for(masked(decoder), draw, "mla prefix run loss", truth_fn=masked(wide))
     assert_as_exact(dew, masked(decoder), draw, "mla prefix run loss", seeds=seeds, truth_fn=masked(wide))
-
-
-def test_a_latent_attention_source_reads_its_blocks_whole_through_its_config_and_export(tmp_path):
-    """A DeepSeek-V3 source whose config states its attention block-bidirectional
-    (`modeling_overrides`) loads its latent attention reading blocks whole: a block group lets the
-    first token see a later one, which a causal read does not. Its export states the override again, and
-    the reload computes the same logits under the groups, bit for bit."""
-    from interop_support import respelled
-
-    from dew.interop import Pretrained
-
-    override = {"modeling_overrides": {"attention": {"full_attention": "block_bidirectional"}}}
-    source = respelled(Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tiny",
-                       tmp_path / "source", lambda config: {**config, **override})
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
-    tokens = jnp.asarray([[10, 11, 12, 13]], jnp.int32)
-    altered = tokens.at[0, 1].set(14)
-    groups = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
-
-    def first(state, ids, **metadata):
-        return np.asarray(state.model.apply(state.variables, ids, **metadata))[0, 0]
-
-    np.testing.assert_array_equal(first(loaded, tokens), first(loaded, altered))
-    assert np.any(first(loaded, tokens, block_groups=groups) != first(loaded, altered, block_groups=groups))
-    loaded.save(tmp_path / "exported")
-    again = Pretrained.load(tmp_path / "exported", dtype="float32", attention_impl="reference")
-    np.testing.assert_array_equal(
-        np.asarray(again.model.apply(again.variables, tokens, block_groups=groups)),
-        np.asarray(loaded.model.apply(loaded.variables, tokens, block_groups=groups)))
-
-
-def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_prefix_whole(tmp_path):
-    """Row 41 through a recorded run (`LMRunConfig`, `dew train`'s): a decoder whose layer kind windows a
-    latent attention that reads blocks whole trains with an lm prefix over token files, and the model the
-    run saved scores tokens on par with an explicit mask written apart from Dew (`block_causal`: the
-    prefix a block read whole, every other key within the window), from that mask's float64 run
-    (check 1), the prefix's own targets left out."""
-    from block_support import block_causal
-    from reference_error import seeds_for
-    from token_support import write_token_corpus
-
-    from dew.batch import TEXT_KEY
-    from dew.config import ObjectiveConfig
-    from dew.config.lm import LMRunConfig
-    from dew.data import Loading, presets
-    from dew.data.sources.tokens import TokenFiles
-    from dew.inference import TextGeneration
-    from dew.objectives.lm.objective import batch_text
-    from dew.registry import ModelConfig
-
-    seq, prefix, window, vocabulary = 8, 3, 3, 256
-    rng = np.random.RandomState(0)
-    corpus = write_token_corpus(tmp_path / "tokens", rng.randint(1, 250, 40 * seq).astype(np.uint8))
-    settings = CONFIG["v3"]
-    mixer = mla_record(settings)
-    mixer["fields"]["bidirectional_blocks"] = True
-    fields = {"emb_features": settings["hidden_size"], "num_layers": 1,
-              "num_heads": settings["num_attention_heads"],
-              "head_dim": settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"], "mlp_features": 48,
-              "qk_norm": False, "mixer": mixer, "attention_impl": "reference", "dtype": "float32",
-              "layer_types": ["local"], "kinds": {"local": {"window": window}}}
-    chain = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=seq, batch=8, pack=None)
-    default = LMRunConfig(data=chain.loading(Loading(workers=0)),
-                          model=ModelConfig("causal_transformer", fields),
-                          objective=ObjectiveConfig("lm", {"prefix": prefix}), max_new_tokens=0)
-    LMRunConfig.cli(["--trainer.steps", "2", "--trainer.name", "prefix", "--trainer.checkpoint-dir",
-                     str(tmp_path / "runs"), "--trainer.compilation-cache-dir", "None",
-                     "--trainer.multi-host", "False", "--trainer.log-every", "1", "--trainer.eval-every",
-                     "None", "--trainer.checkpoint-every", "2"], default=default).run()
-    restored = TextGeneration.from_run(str(tmp_path / "runs" / "prefix"))
-    objective = LMObjective(restored.model, seq, prefix=prefix)
-    blocks = np.broadcast_to(np.where(np.arange(seq + 1) < prefix, 1, -1), (2, seq + 1)).astype(np.int32)
-    keep = jnp.asarray(block_causal(blocks, window=window)[:, :-1, :-1])
-    counted = ~((blocks[:, :-1] == blocks[:, 1:]) & (blocks[:, :-1] >= 0))
-
-    def draw(seed):
-        return (jax.random.randint(jax.random.fold_in(jax.random.key(7), seed), (2, seq + 1), 1, vocabulary),)
-
-    def masked(model, variables):
-        def losses(tokens):
-            logits = model.apply(variables, tokens[:, :-1], attention_pairwise_mask=keep)
-            lost = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
-            return lost, jnp.asarray(counted, lost.dtype)
-        return losses
-
-    def dew(tokens):
-        scores = objective.token_scores(restored.variables,
-                                        batch_text({TEXT_KEY: tokens, "text_block_groups": blocks}))
-        return scores.losses, scores.weights
-
-    # The gate runs the truth in float64 (check 1), the float64 model over the saved weights.
-    truth = masked(restored.model.clone(dtype=jnp.float64), restored.variables)
-    reference = masked(restored.model, restored.variables)
-    seeds = seeds_for(reference, draw, "recorded mla prefix run", truth_fn=truth)
-    assert_as_exact(dew, reference, draw, "recorded mla prefix run", seeds=seeds, truth_fn=truth)

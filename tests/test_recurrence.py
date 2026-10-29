@@ -183,19 +183,22 @@ def summed(hooks: recurrence.Hooks):
     return run
 
 
-def test_a_decode_launch_is_described_by_its_operands_names():
-    """A decode token's launch as tokamax describes a lowering's launches (`tuning.launches`, which
-    serializes each launch's arguments by its signature): one launch, its arguments every `Step` field the
-    launch takes by name (`recurrence.OPERANDS`) beside `active`, those the hooks read (`_names`) given and
-    the rest None."""
+def test_a_decode_step_is_tuned_as_its_launch_is_described():
+    """A decode token's launch, keyed as tokamax describes it in a lowering made to read it
+    (`tuning.launches`), is the launch its own lowering records for tuning (`tuning.seen`): a decode
+    step's picks are found and stored by what it was called with."""
     hooks = HOOKS[0]
+
+    def keyed(op, ba):
+        return type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items()))
+
     with tuning.launches():
         found = tokamax.autotuning.get_bound_args(jax.jit(functools.partial(recurrence.step, hooks)),
                                                   operands(hooks))
-    (launch,) = [ba for ba in found if isinstance(ba.op, recurrence.StepLaunch)]
-    read = set(recurrence._names(hooks))
-    assert set(launch.arguments) >= {'active', *recurrence.OPERANDS}
-    assert all((launch.arguments[name] is not None) == (name in read) for name in recurrence.OPERANDS)
+    described = sorted(keyed(ba.op, ba) for ba in found)
+    with tuning.seen() as seen:
+        jax.jit(functools.partial(recurrence.step, hooks)).lower(operands(hooks))
+    assert described and sorted(keyed(op, ba) for op, ba in seen) == described
 
 
 @pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
