@@ -128,17 +128,6 @@ def per_key_refusal(dtype, floor: float | None) -> str | None:
     return None
 
 
-def inverse_refusal(dtype, delta: bool, bound: float | None) -> str | None:
-    """Why the mainloop refuses a call's delta-rule solve, None where it takes it: a 16-bit call's merges
-    stage the chunk's inverse in fp16 (`_merges`), whose range holds it where the call's form proves its
-    entries at most two (`bound`, `recurrence.Hooks.inverse_bound`), as a layer declares of its keys and
-    write gates. An fp32 call's three bf16 parts hold fp32's range."""
-    if not delta or jnp.dtype(dtype) == jnp.float32 or bound is not None:
-        return None
-    return ("a 16-bit delta rule's solve stages its chunk inverse in fp16, which holds it where the layer "
-            "declares keys of unit norm and write gates at most two (recurrence.Hooks.inverse_bound)")
-
-
 def _parts(dtype) -> int:
     """The parts a product takes an operand of `dtype` as: three for fp32, one for 16 bits."""
     return PARTS if jnp.dtype(dtype) == jnp.float32 else 1
@@ -412,14 +401,12 @@ def _merges(call: _Call) -> tuple:
     bits as the TF32 fla merges its blocks in, where the inverse is rounded to the call's 8 after. fla inverts
     its 16-row diagonal blocks by fp32 forward substitution and merges in TF32; every doubling level here
     rounds to fp16, about 2^-12 absolute on the inverse under aligned keys, a sixth of the bf16 rounding
-    both arms share. fp16's range holds the inverse, and each merge's product of it, where the call's form
-    proves its entries at most two (`recurrence.Hooks.inverse_bound`: keys of unit norm and write gates at
-    most two, a negative-eigenvalue delta rule's twice a sigmoid among them, each transition then no
-    expansion), the call's contract (`inverse_refusal`). Unnormalized keys with `beta |k|^2` past two grow it
-    geometrically, past fp16's largest in about 16 tokens, its NaN where the portable math gave 5.7e29 (row
-    2381): fp32's range in bf16 parts spilled the solve's registers on an A100 and an H100, one bf16 part
-    put a normalized call's inverse 2.1 to 2.7 times as far from float64 after its rounding, and Mosaic's
-    mma.sync takes no TF32, so those calls take the port's TF32 merges or the portable math's fp32."""
+    both arms share. fp16's range holds the inverse and each merge's product of it where the call's form
+    proves its entries at most two (`recurrence.Hooks.inverse_bound`: unit keys, write gates at most two),
+    the call's contract (`template.inverse_refusal`). Unnormalized keys with `beta |k|^2` past two grow it
+    geometrically, past fp16's largest in about 16 tokens (row 2381): fp32's range in bf16 parts spilled the
+    solve on an A100 and an H100, one bf16 part put a normalized call's inverse 2.1 to 2.7 times as far from
+    float64, and Mosaic's mma.sync takes no TF32, so those calls take the port's or the portable math."""
     dtype, parts = (jnp.bfloat16, PARTS) if call.held.parts > 1 else (jnp.float16, 1)
     tile = (CHUNK, CHUNK)
     return tuple(tuple(plgpu.SMEM(tile, dtype) for _ in range(parts)) for _ in range(3))

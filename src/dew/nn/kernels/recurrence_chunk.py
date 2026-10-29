@@ -488,7 +488,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     which needs none. `floor` is the least log decay a token the layer declares (`recurrence.Hooks.floor`:
     Kimi delta attention's lower bound), which the recurrence template's factored form of a decay a key
     dimension reads; `write_bound` the largest write gate it declares of keys it l2-normalized
-    (`recurrence.Hooks.write_bound`), which the template's 16-bit solve needs (`mainloop.inverse_refusal`).
+    (`recurrence.Hooks.write_bound`), which the template's 16-bit solve needs (`template.inverse_refusal`).
     """
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
                              floor=floor, write_bound=write_bound)
@@ -733,10 +733,10 @@ widths, a decay a key dimension's floor, a bundle for the device's family, a con
 a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no other, row 1926)."""
 
 def _inverse_range(case: PortCase) -> bool:
-    """Whether the template's solve holds the call's chunk inverse (`mainloop.inverse_refusal`)."""
-    from .templates.recurrence import mainloop
+    """Whether the template's solve holds the call's chunk inverse (`template.inverse_refusal`)."""
+    from .templates.recurrence import template
 
-    return mainloop.inverse_refusal(case.dtype, case.delta, case.bound) is None
+    return template.inverse_refusal(case.dtype, case.delta, case.bound) is None
 
 
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
@@ -748,7 +748,7 @@ MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
                 "largest, which the port's TF32 merges and the portable math hold", row='ledger 2381'),
     *TEMPLATE_SUPPORTS)
 """What the recurrence template needs of a delta rule's call: the port's trace and placement (its custom VJP,
-a Pallas call's results), a 16-bit solve's range (`mainloop.inverse_refusal`) and `TEMPLATE_SUPPORTS`, in
+a Pallas call's results), a 16-bit solve's range (`template.inverse_refusal`) and `TEMPLATE_SUPPORTS`, in
 every form its mainloop implements, the delta rule with a decay or without one and the forms without the
 delta rule alike (row 1963: the port's 'gated' form was the template's too). A declared port cell runs the
 port first where the port takes the call (`PORT_CELLS`, `GATED_DELTA`'s declared cells)."""
@@ -987,11 +987,11 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     it issues by, interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's
     declared `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit
     delta rule the chunk inverse's `bound` its form proves, which its solve's range needs
-    (`mainloop.inverse_refusal`)."""
+    (`template.inverse_refusal`)."""
     from .templates.recurrence import mainloop, template
 
     dtype = jnp.result_type(query, key, value)
-    if refused := mainloop.inverse_refusal(dtype, delta, bound):
+    if refused := template.inverse_refusal(dtype, delta, bound):
         raise NotImplementedError(refused)
     query, key, value = (x.astype(dtype) for x in (query, key, value))
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the

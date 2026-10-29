@@ -387,7 +387,7 @@ def diverging(width: int = 64) -> Chunk:
 def test_a_16bit_delta_rule_whose_form_proves_no_range_takes_another_kernel():
     """The diverging rule (`diverging`) in a 16-bit call whose form proves no bound on its chunk's inverse
     (unnormalized keys, no declared write gate): the template's solve, whose fp16 merges gave NaN there
-    where the portable math gave 5.7e29 (row 2381), refuses it (`mainloop.inverse_refusal`), the mainloop's
+    where the portable math gave 5.7e29 (row 2381), refuses it (`template.inverse_refusal`), the mainloop's
     rule named for it too, and the delta rule's selector on an H100 gives it the port, which the same call
     declaring its bound would not take from the template."""
     from dew.nn.kernels.recurrence_chunk import port_kernel
@@ -407,8 +407,9 @@ def test_the_solve_holds_a_negative_eigenvalue_rules_inverse():
     """Unit keys within 1e-3 of one direction under write gates near two (twice a sigmoid's, the
     negative-eigenvalue delta rule's), declared (`write_bound`): each transition's eigenvalue near -1, the
     chunk's inverse alternating in sign at entries up to two, within fp16's range (`recurrence.Hooks.
-    inverse_bound`). The template's 16-bit solve on par with the portable math from float64 on the draw
-    (the gate's one-draw rule)."""
+    inverse_bound`). The template's 16-bit call on par from float64 with the port's, whose roundings it
+    takes (`recurrence_chunk.fla_rule`), on the draw (the gate's one-draw rule): no transition damps them,
+    and the fp32 portable math stays 14 times nearer."""
     tokens, width = 64, 64
     keys = jax.random.split(jax.random.key(53), 4)
     base = jax.random.normal(keys[0], (1, 1, 1, width))
@@ -425,7 +426,7 @@ def test_the_solve_holds_a_negative_eigenvalue_rules_inverse():
         return np.asarray(found[0] if isinstance(found, tuple) else found, np.float64)
 
     mine = output(functools.partial(chunk, hooks, mainloop='mosaic'), drawn)
-    theirs = output(functools.partial(chunk_on, 'xla', hooks), drawn)
+    theirs = output(functools.partial(chunk_on, 'fla', hooks), drawn)
     with jax.enable_x64(new_val=True):
         exact = output(functools.partial(token_by_token, hooks), jax.tree.map(
             lambda x: np.asarray(x, np.float64), drawn))

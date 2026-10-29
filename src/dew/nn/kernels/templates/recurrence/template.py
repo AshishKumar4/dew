@@ -71,6 +71,17 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
 
 
 @dataclasses.dataclass(frozen=True)
+def inverse_refusal(dtype, delta: bool, bound: float | None) -> str | None:
+    """Why the mainloop refuses a call's delta-rule solve, None where it takes it: a 16-bit call's merges
+    stage the chunk's inverse in fp16 (`mainloop._merges`), whose range holds it where the call's form
+    proves its entries at most two (`bound`, `recurrence.Hooks.inverse_bound`), as a layer declares of its
+    keys and write gates. An fp32 call's three bf16 parts hold fp32's range."""
+    if not delta or jnp.dtype(dtype) == jnp.float32 or bound is not None:
+        return None
+    return ("a 16-bit delta rule's solve stages its chunk inverse in fp16, which holds it where the layer "
+            "declares keys of unit norm and write gates at most two (recurrence.Hooks.inverse_bound)")
+
+
 class Mosaic(base.Template[mainloop.Tiles]):
     """The chunked rule on the recurrence template's mainloop (`recurrence_chunk.mosaic_rule`), its config
     the forward's tiles. Its operands are the rule's: queries and keys `[B, T, H, Dk]`, values
@@ -346,7 +357,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the mainloop runs the call on `target`: 16-bit or fp32 operands, a decay a key dimension's
         in a 16-bit call under a declared floor its sub-chunks factor under (`mainloop.per_key_refusal`), a
-        16-bit delta rule's solve under the inverse's bound its form proves (`mainloop.inverse_refusal`), a
+        16-bit delta rule's solve under the inverse's bound its form proves (`inverse_refusal`), a
         bundle for the target's
         family, the tensor rate its cost model reads, and a config whose launches the device holds at the
         call's widths (`fits`: their shared memory and registers). Off a GPU (a CPU's), where the rule runs
@@ -358,7 +369,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         if dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):
             return False
         factored = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype, arguments.get("floor")) is None
-        ranged = mainloop.inverse_refusal(dtype, arguments.get("delta", True), arguments.get("bound")) is None
+        ranged = inverse_refusal(dtype, arguments.get("delta", True), arguments.get("bound")) is None
         if not (factored and ranged and bundle(target, dtype) is not None
                 and target.tensor_rate("16bit") is not None):
             return False
