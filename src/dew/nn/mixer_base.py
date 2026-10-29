@@ -22,6 +22,7 @@ from typing import ClassVar
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.attention import AttentionImpl
 from dew.nn.kv_cache import KVCache
 from dew.nn.ngpt import NGPT
 from dew.nn.rope import Scaling
@@ -127,7 +128,7 @@ class MixerContext:
     (csrc/pos_encoding_kernels.cu, `apply_token_rotary_embedding`)."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
     kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
     """The decode cache's storage layout (`dew.nn.kv_cache`)."""

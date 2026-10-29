@@ -92,9 +92,10 @@ from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
 from dew.quantization import decoded_frozen_fp8, decoded_stored, moving_weights, quantized_products
 
-from .attention import FORWARD_MODE, LayerNorm
+from .attention import FORWARD_MODE
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks
 from .mlp import GatedMLP
+from .norms import LayerNorm
 from .precision import at_least_fp32, l2norm
 
 CARRY = MEMORY_RESIDUALS[0]

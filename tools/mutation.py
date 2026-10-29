@@ -49,6 +49,18 @@ TARGETS = {
     "attention": Target("src/dew/nn/attention.py", (
         "tests/test_causal_transformer.py", "tests/test_local_attention.py",
         "tests/test_sequence_parallel.py", "tests/test_attention_sinks.py")),
+    # The modules attention.py's seams became (ledger 2018), each under the tests that held it there.
+    "attention_masks": Target("src/dew/nn/attention_masks.py", (
+        "tests/test_causal_transformer.py", "tests/test_local_attention.py", "tests/test_mixers.py",
+        "tests/test_decode_attention.py")),
+    "norms": Target("src/dew/nn/norms.py", (
+        "tests/test_causal_transformer.py", "tests/test_norm_swiglu.py")),
+    "attention_parallel": Target("src/dew/nn/attention_parallel.py", (
+        "tests/test_sequence_parallel.py", "tests/test_causal_transformer.py")),
+    "attention_tpu": Target("src/dew/nn/attention_tpu.py", (
+        "tests/test_causal_transformer.py", "tests/test_local_attention.py")),
+    "attention_blocks": Target("src/dew/nn/attention_blocks.py", (
+        "tests/test_geglu_feed_forward.py", "tests/test_sequence_parallel.py", "tests/test_kernels.py")),
     "sources": Target("src/dew/data/sources", (
         "tests/test_hf_options_contract.py", "tests/test_hf_data.py", "tests/test_online_loader.py",
         "tests/test_text_data.py", "tests/test_tfds_read.py", "tests/test_data_av.py")),

@@ -46,13 +46,13 @@ from dew.batch import (
     token_coordinates,
 )
 from dew.mesh import LayoutRefused
+from dew.nn.attention import AttentionImpl
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.registry import from_record, read_arguments
 
 from ..activations import GatedActivation, Situ, ungated_activation
-from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossAttention, GatedCrossAttention
@@ -86,6 +86,7 @@ from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain
+from ..norms import RMSNorm
 from ..precision import (
     at_least_fp32,
     capped_logits,
@@ -338,7 +339,7 @@ class CausalTransformer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     kv_cache: KVCache = KVCache()
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""
