@@ -7,12 +7,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 from rl_support import TinyHead
 
 from dew.objectives.rl.grpo import _Terms
 from dew.objectives.rl.methods import METHODS, method
-from dew.objectives.rl.sessions import Session, Status, advantages, overlong_penalty
+from dew.objectives.rl.sessions import Call, Session, Status, advantages, overlong_penalty
 
 LENGTHS = ((3, 5), (4, 2))
 """Each row's two sessions' trained token counts."""
@@ -78,7 +78,7 @@ def paper(objective, dtype):
                                   for row, columns in spans])
             current = jnp.asarray(policy, dtype)
             return jax.device_get((value(current), jax.grad(value)(current)))
-    return term
+    return as_given(term)
 
 
 def clipped(ratio, advantage, low, high):
@@ -158,7 +158,8 @@ def test_the_global_estimator_centres_each_group_then_whitens_the_batch():
     """REINFORCE++ with a baseline (arXiv:2501.03262 equations 6-7): each member's reward less its group's
     mean, the batch of those whitened, with the paper's epsilon."""
     rewards = {("a", "g"): [1.0, 0.0, 0.5], ("b", "g"): [2.0, 2.0, -1.0]}
-    sessions = [Session(task, group, sample, 0, (), Status.COMPLETED, reward)
+    call = Call((1, 2), (3,), (-0.1,), "stop", 0)
+    sessions = [Session(task, group, sample, 0, (call,), Status.COMPLETED, reward)
                 for (task, group), values in rewards.items() for sample, reward in enumerate(values)]
     found = np.asarray([values[0] for values in advantages(sessions, "global")])
     centred = np.concatenate([np.asarray(values) - np.mean(values) for values in rewards.values()])
