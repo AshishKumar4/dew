@@ -201,10 +201,12 @@ def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(
 
 def trained(run: RunConfig, root: Path, name: str, **fields):
     """`run` trained one step from Python (`prepare().train`) over a mesh of four data shards by two
-    fsdp shards, its trainer the fields given: its state, and its step's scalars."""
-    trainer = TrainerConfig(checkpoint_dir=str(root / "runs"), steps=1, log_every=1, eval_every=None,
-                            checkpoint_every=None, checkpoint_final=False, multi_host=False,
-                            mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=64), **fields.pop("trainer", {}))
+    fsdp shards, its trainer the fields given, over its defaults here: its state, and its step's
+    scalars."""
+    trainer = TrainerConfig(**{"checkpoint_dir": str(root / "runs"), "steps": 1, "log_every": 1,
+                               "eval_every": None, "checkpoint_every": None, "checkpoint_final": False,
+                               "multi_host": False, "mesh": MeshSpec(fsdp=2), "layout": Layout(min_shard=64),
+                               **fields.pop("trainer", {})})
     state = dataclasses.replace(run, trainer=trainer, **fields).prepare().train(name)
     return state, scalars(root / "runs" / name)[1]
 
