@@ -40,7 +40,8 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
                     truth_fn=truth)
 
 
-OPENED = {"lfm3-tiny": "transformers==5.18.0", "lfm3-biased-tiny": "transformers==5.18.0"}
+OPENED = {"lfm3-tiny": "transformers==5.18.0", "lfm3-biased-tiny": "transformers==5.18.0",
+          "mimo-v2-tiny": "transformers==5.1.0"}
 """Each fixture whose Dew export carries its release's code (`DecoderFamily.release_code`), by the
 transformers its release's code runs under, which the whole suite's run overlays on the suite's own for
 its check alone (`release_env`)."""
