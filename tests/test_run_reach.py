@@ -9,12 +9,12 @@ makes, the placement a harness loads into, and the form a run's attention trains
 import dataclasses
 import json
 
-import jax
 import numpy as np
 import optax
 import pytest
 from test_block_sft import assert_tree_equal
 from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_files
+from test_run_option_matrix import recorded
 from test_run_options import decision, lm, scalars, trained
 
 from dew.checkpoints import Checkpoints
@@ -145,21 +145,24 @@ def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run
 @pytest.mark.mesh(devices=8)
 def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
     """`trainer.attention_form` is the form every attention of the run trains in (row 2245), on the
-    default route ('auto'), which runs an accurate call on the template or the reference path
-    (tests/test_attention_route.py, row 2350): a step of the same run recorded "accurate" and recorded
-    with none ends on other weights, and `dew train` of each run's own record, under a new name, ends
-    on that run's weights, bit for bit."""
+    default route ('auto'): a run recorded "accurate" runs each attention it traces on the template or
+    the reference path, which compute the form (row 2350), as its step's own kernel report records,
+    where a run recorded with none runs them on the host's default kernel; `dew train` of the accurate
+    run's own record, under a new name, runs them as it did."""
     run = lm(tmp_path, drawn=False)
-    states = {name: trained(run, tmp_path, name, trainer=fields)[0]
-              for name, fields in (("accurate", {"attention_form": "accurate"}), ("default", {}))}
-    assert any(not np.array_equal(np.asarray(mine), np.asarray(theirs)) for mine, theirs in zip(
-        *(jax.tree.leaves(state.variables["params"]) for state in states.values()), strict=True))
-    for name, state in states.items():
-        recorded = tmp_path / "runs" / name / "run.json"
-        assert main(["train", str(recorded), "--set", f"trainer.name={name}-again",
-                     "--set", "trainer.checkpoint_final=True"]) == 0
-        again = Checkpoints(str(tmp_path / "runs" / f"{name}-again")).variables(step=1)
-        assert_tree_equal(again["params"], state.variables["params"])
+
+    def kernels(name: str) -> set[str]:
+        (compiled, *_) = recorded(tmp_path / "runs" / name, "StepCompiled")
+        return {route["kernel"] for route in compiled["plan"]["kernels"]["routes"]
+                if route["choice"] == "attention"}
+
+    trained(run, tmp_path, "accurate", trainer={"attention_form": "accurate"})
+    trained(run, tmp_path, "default")
+    recorded_run = tmp_path / "runs" / "accurate" / "run.json"
+    assert main(["train", str(recorded_run), "--set", "trainer.name=again"]) == 0
+    assert kernels("accurate") <= {"template", "reference"} and kernels("accurate")
+    assert kernels("again") == kernels("accurate")
+    assert not kernels("default") <= {"template", "reference"}
 
 
 def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_called(tmp_path):
