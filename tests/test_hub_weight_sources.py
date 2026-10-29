@@ -67,8 +67,9 @@ def assert_the_fixture(found: dict[str, np.ndarray]) -> None:
 def environment(hub: LocalHub | None, root: Path, *, offline: bool = False) -> dict:
     """A load's environment: the hub's endpoint, the Hub cache, the recorded Hub answers and Dew's pickle
     conversions under `root`, offline where asked."""
+    # The Hub client reads either offline switch.
     kept = {name: value for name, value in os.environ.items()
-            if name not in ("HF_HUB_OFFLINE", "HF_ENDPOINT")}
+            if name not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_ENDPOINT")}
     return {**kept, **({} if hub is None else {"HF_ENDPOINT": hub.endpoint}),
             **({"HF_HUB_OFFLINE": "1"} if offline else {}),
             "HF_HUB_CACHE": str(root / "hub"), "DEW_HUB_ANSWERS": str(root / "answers"),
