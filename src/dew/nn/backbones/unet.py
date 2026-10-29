@@ -9,10 +9,13 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from ..attention import GroupNorm, RMSNorm, Stage, stage_attention
+from dew.nn.attention import AttentionImpl
+
+from ..attention_blocks import Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..conv import Conv
 from ..flops import MissingFlopsCount, patch_lengths
+from ..norms import GroupNorm, RMSNorm
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 
@@ -116,7 +119,7 @@ class Unet(nn.Module):
     norm_groups:int=8
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def _convolution(self, features: int, **scope):

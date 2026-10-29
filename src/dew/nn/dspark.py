@@ -33,10 +33,10 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.dense import Dense
 
-from .attention import RMSNorm
 from .deepseek_v4 import DRAFT_CONTEXT, DRAFT_VALID
 from .hyper_connections import Carried, HyperConnections, HyperHead, collapse_by, expand_streams, first_stream
 from .inputs import MixerCall
+from .norms import RMSNorm
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .protocols import ProjectionGroup
 from .sharding import logical_axes

@@ -19,12 +19,14 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.attention import AttentionImpl
 from dew.nn.dropout import Dropout
 
 from .activations import gelu_tanh
-from .attention import RMSNorm, scaled_dot_product_attention
+from .attention import scaled_dot_product_attention
 from .blocks import torch_nearest_resize
 from .conv import Conv
+from .norms import RMSNorm
 from .sharding import logical_axes
 
 
@@ -253,7 +255,7 @@ class MobileMultiQueryAttention(nn.Module):
     padding: str = "same"
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.compact
     def __call__(self, x):
@@ -285,7 +287,7 @@ class MobileAttention(nn.Module):
     drop_path: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.compact
     def __call__(self, x, train: bool = False):
@@ -312,7 +314,7 @@ class MobileStage(nn.Module):
     drop_path_rate: float
     dtype: Dtype | None
     precision: PrecisionLike
-    attention_impl: str
+    attention_impl: AttentionImpl
 
     @nn.compact
     def __call__(self, x, train: bool = False):
@@ -400,7 +402,7 @@ class MobileNetV5Encoder(nn.Module):
     construction: MobileNetV5 = MobileNetV5()
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     def setup(self):
         args = self.construction

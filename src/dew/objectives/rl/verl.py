@@ -150,6 +150,7 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
                     "status": session.status.value,
                     "components": dict(session.components),
                     "detail": session.detail,
+                    "source": session.source,
                 },
                 "chain": number,
                 "chains": len(built),
@@ -333,7 +334,8 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
                               integer(record["sample"], "sample"), integer(record["attempt"], "attempt"),
                               calls, Status(text(record["status"], "status")),
                               None if reward is None else finite(reward, "reward_score"),
-                              MappingProxyType(components), text(record["detail"], "detail"))
+                              MappingProxyType(components), text(record["detail"], "detail"),
+                              text(record.get("source", ""), "source"))
             if dew.get("stamped", False):
                 for key in ("min_global_steps", "max_global_steps"):
                     extra.pop(key, None)

@@ -31,8 +31,8 @@ from dew.interop.weights import indexed_path
 from dew.nn.dense import Dense
 
 from ..activations import gated_product, silu
-from ..attention import rms_normalized
 from ..conv import Conv
+from ..norms import rms_normalized
 from ..precision import at_least_fp32, float32_dot_general, float32_einsum
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import LatentNormalization, ModuleAutoEncoder, published_source
