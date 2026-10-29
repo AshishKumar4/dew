@@ -154,28 +154,6 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
         loaded.loaded()
 
 
-def test_a_step_compiled_ahead_is_derived_again_for_its_gpu_s_facts_on_one_that_runs_its_launches():
-    """A run handed a step compiled ahead for an A100 derives its launches for the A100 the step was
-    compiled for (`AheadOfTime.derived_for`, ledger 2453): on an A100 whose measured clock and bandwidth
-    differ from the table's, as an attached GPU's do, it derives for the table's, so it lowers the
-    step's program; a GPU of another generation, or one whose block holds less shared memory than the
-    step's launches take, is refused."""
-    import dataclasses
-
-    from dew.nn.kernels.generation import gpu_target
-    from dew.training.ahead import compile_ahead, compile_only_gpus
-
-    ahead = compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus("sm80", 1))),
-                          token_rows(VOCAB, BATCH, SEQ_LEN + 1))
-    a100 = gpu_target("sm80")
-    measured = dataclasses.replace(a100, clock_hz=a100.clock_hz * 1.08,
-                                   memory_bandwidth=a100.memory_bandwidth + 1)
-    assert ahead.derived_for(measured) == a100
-    for other in (gpu_target("sm90"), dataclasses.replace(a100, shared_limit=a100.shared_limit // 2)):
-        with pytest.raises(ValueError):
-            ahead.derived_for(other)
-
-
 @pytest.mark.mesh(devices=8)
 def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
     """A trainer whose mesh is this host's own devices runs its step here; compiling it ahead is

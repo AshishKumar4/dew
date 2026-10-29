@@ -158,10 +158,9 @@ def test_a_run_steps_its_spilling_launch_down_and_trains(tmp_path, nonce):
 @lowers("sm90")
 def test_a_run_handed_a_step_compiled_ahead_with_a_spilling_launch_takes_it(tmp_path, nonce):
     """A run in a fresh process handed a step compiled ahead for a compile-only H100, whose launch's
-    first tile spilled, refuses that tile before it lowers (`FitSearch`) and derives its launches for
-    the H100 the step was compiled for, not for this one's measured clock (`AheadOfTime.derived_for`,
-    ledger 2453), so it lowers the saved program and trains from it, its plan's first compile the step
-    compiled ahead."""
+    first tile spilled, refuses that tile before it lowers (`FitSearch`) and derives its launches from
+    the facts the step's were derived from, its clock and bandwidth the table's (ledger 2453), so it
+    lowers the saved program and trains from it, its plan's first compile the step compiled ahead."""
     step = str(tmp_path / "step.dew-aot")
     spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
     handed = spilled(tmp_path, PRELUDE + HANDED, str(nonce), step)
