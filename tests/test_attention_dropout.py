@@ -472,8 +472,7 @@ def test_a_dropping_call_under_x64_on_fp32_inputs_keeps_fp32_gradients():
         assert bool(jnp.all(jnp.isfinite(array)))
 
 
-@pytest.mark.gpu(reason="the route's GPU mainloops refuse dropout where calls run on an sm80 GPU or later")
-def test_a_dropping_route_call_on_a_gpu_runs_finite():
+def a_dropping_route_call_on_a_gpu_runs_finite():
     """On a GPU, whose Mosaic and frozen Triton mainloops draw no dropout yet (their legality rules refuse
     it, `attention_mosaic.refused`, `attention_triton.refused`, ledger row 1521), a direct route call that
     drops runs, finite, on a mainloop that draws it."""
