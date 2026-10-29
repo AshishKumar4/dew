@@ -31,7 +31,6 @@ def run_check(*arguments, failing: bool = False) -> str:
         cwd=ROOT,
         capture_output=True,
         text=True,
-        timeout=240,
         env={
             **os.environ,
             "JAX_PLATFORMS": "cpu",
@@ -45,16 +44,20 @@ def run_check(*arguments, failing: bool = False) -> str:
     return result.stdout
 
 
+TASKS = ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety")
+"""The saved flows, each loaded whole."""
+
 STREAMED = ("sd", "xl", "safety")
-"""The flows that also load their pipeline streamed onto a mesh a leaf at a time
-(tests/test_pipeline_streaming.py) and hold it to the source beside the whole load."""
+"""The flows also loaded streamed onto a mesh a leaf at a time (tests/test_pipeline_streaming.py) and
+held to the source as the whole load is, each load a case of its own: the two together took 230-245 s
+on armada's Zen 3 hosts (AuthenticAMD 25/1) in queue train 298, each alone about half."""
 
 
-@pytest.mark.parametrize(
-    "task", ["sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"]
-)
-def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task):
-    run_check(saved_pipelines / task, *(["--streamed"] if task in STREAMED else []))
+@pytest.mark.parametrize(("task", "streamed"), [(task, False) for task in TASKS]
+                         + [(task, True) for task in STREAMED],
+                         ids=[*TASKS, *(f"{task}-streamed" for task in STREAMED)])
+def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task, streamed):
+    run_check(saved_pipelines / task, *(["--streamed"] if streamed else []))
 
 
 SCHEDULER_GRIDS = ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz"
