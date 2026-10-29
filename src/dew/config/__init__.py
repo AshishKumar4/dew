@@ -933,7 +933,8 @@ _RANDOM_SEARCH = RandomSearch()
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     """A whole run's configuration. A kind of run subclasses it with its own
-    settings and builds what it trains from them (`prepare`); `run` trains it.
+    settings and builds what it trains from them (`_prepared`, which `prepare` calls
+    on the run with its Hub sources pinned); `run` trains it.
     """
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
