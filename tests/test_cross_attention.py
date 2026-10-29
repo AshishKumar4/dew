@@ -189,11 +189,14 @@ def model_draw(model: CausalTransformer, *, gated: bool = True):
     `gated`, and its tokens, a context and each row's context tokens, a row of none among them."""
     init = jax.jit(model.init)
 
+    cross = model.cross_attention
+    assert cross is not None
+
     def draw(seed):
         rng = np.random.default_rng(seed)
         ids = rng.integers(0, VOCAB, (B, SEQ)).astype(np.int32)
-        context = rng.standard_normal((B, CROSS.context_length, CROSS.context_features)).astype(np.float32)
-        lengths = rng.integers(0, CROSS.context_length + 1, B).astype(np.int32)
+        context = rng.standard_normal((B, cross.context_length, model.context_width)).astype(np.float32)
+        lengths = rng.integers(0, cross.context_length + 1, B).astype(np.int32)
         lengths[0] = 0
         variables = init(jax.random.key(seed), ids)
         if gated:
@@ -217,9 +220,10 @@ def float64(model):
     return model.clone(dtype=jnp.float64, attention_impl="reference")
 
 
-def fresh_against_base(model: CausalTransformer, label: str):
+def fresh_against_base(model: CausalTransformer, label: str, seeds: int | None = None):
     """Check 1: `model` drawn at zero gates, reading a context, on par with the decoder without its
-    blocks from that decoder's float64: the same function in two programs."""
+    blocks from that decoder's float64: the same function in two programs, over `seeds` (this file's
+    `SEEDS[label]` unless given)."""
     base = dataclasses.replace(model, cross_attention=None)
 
     def base_logits(model):
@@ -227,7 +231,7 @@ def fresh_against_base(model: CausalTransformer, label: str):
         return lambda variables, ids, context, lengths: run(_without_blocks(variables), ids)
 
     assert_as_exact(logits(model), base_logits(base), model_draw(model, gated=False), label,
-                    seeds=SEEDS[label], truth_fn=base_logits(float64(base)))
+                    seeds=SEEDS[label] if seeds is None else seeds, truth_fn=base_logits(float64(base)))
 
 
 def test_a_fresh_block_computes_the_decoder_it_was_attached_to():
@@ -265,39 +269,49 @@ def _without_blocks(variables):
     return kept(dict(variables))
 
 
-@jax.jit
-def _decoded(variables, ids, context, lengths):
-    """The prompt prefilled with its context into a fresh cache, then each later token a step with
-    none: the logits from the prompt's last position on."""
-    _, made = MODEL.apply(variables, ids.shape[0], method=CausalTransformer.init_cache, mutable=["cache"])
-    out, held = MODEL.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
-                            conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
-    steps = [out[:, -1]]
-    for position in range(PROMPT, SEQ):
-        out, held = MODEL.apply({**variables, **held}, ids[:, position:position + 1], decode=True,
-                                mutable=["cache"])
-        steps.append(out[:, -1])
-    return jnp.stack(steps, axis=1)
+def decoded(model: CausalTransformer):
+    """`model`'s prompt prefilled with its context into a fresh cache, then each later token a step
+    with none: the logits from the prompt's last position on, compiled."""
+    @jax.jit
+    def run(variables, ids, context, lengths):
+        _, made = model.apply(variables, ids.shape[0], method=CausalTransformer.init_cache, mutable=["cache"])
+        out, held = model.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
+                                conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
+        steps = [out[:, -1]]
+        for position in range(PROMPT, SEQ):
+            out, held = model.apply({**variables, **held}, ids[:, position:position + 1], decode=True,
+                                    mutable=["cache"])
+            steps.append(out[:, -1])
+        return jnp.stack(steps, axis=1)
+    return run
+
+
+def assert_a_cached_context_decodes_as_the_full_forward(model: CausalTransformer, label: str,
+                                                        seeds: int | None = None):
+    """The context a prefill carries stays in `model`'s cache, its count a row with it, and each later
+    step attends over it without it: the steps' logits on par with the full forward's from the float64
+    forward (check 1), over `seeds` (this file's `SEEDS["decode"]` unless given)."""
+    def full(model):
+        run = logits(model)
+        return lambda variables, ids, context, lengths: run(variables, ids, context, lengths)[:, PROMPT - 1:]
+
+    draw = model_draw(model)
+    assert_as_exact(decoded(model), full(model), draw, label,
+                    seeds=SEEDS["decode"] if seeds is None else seeds, truth_fn=full(float64(model)))
+    variables, ids, context, lengths = draw(0)
+    _, made = model.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
+    _, held = model.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
+                          conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
+    kept = [leaf for path, leaf in flat_tree(held["cache"]).items() if path.endswith(CROSS_LENGTHS)]
+    assert model.cross_attention is not None and len(kept) == len(model.cross_attention.layer_ids)
+    for leaf in kept:
+        np.testing.assert_array_equal(np.asarray(leaf), lengths)
 
 
 def test_a_cached_context_decodes_as_the_full_forward():
     """The context a prefill carries stays in the cache, and each later step attends over it without
     it: the steps' logits on par with the full forward's from the float64 forward (check 1)."""
-    def full(model):
-        run = logits(model)
-        return lambda variables, ids, context, lengths: run(variables, ids, context, lengths)[:, PROMPT - 1:]
-
-    draw = model_draw(MODEL)
-    assert_as_exact(_decoded, full(MODEL), draw, "cached context", seeds=SEEDS["decode"],
-                    truth_fn=full(float64(MODEL)))
-    variables, ids, context, lengths = draw(0)
-    _, made = MODEL.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
-    _, held = MODEL.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
-                          conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
-    kept = [leaf for path, leaf in flat_tree(held["cache"]).items() if path.endswith(CROSS_LENGTHS)]
-    assert len(kept) == len(CROSS.layer_ids)
-    for leaf in kept:
-        np.testing.assert_array_equal(np.asarray(leaf), lengths)
+    assert_a_cached_context_decodes_as_the_full_forward(MODEL, "cached context")
 
 
 def test_a_scanned_stack_runs_its_blocks_as_the_plain_one():

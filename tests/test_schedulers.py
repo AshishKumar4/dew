@@ -524,6 +524,16 @@ def test_a_sigma_schedule_keeps_a_float64_runs_times_in_float64(schedule):
         assert not np.array_equal(np.asarray(sigma), np.asarray(narrow, np.float64))
 
 
+def test_an_equal_rho_walks_one_karras_grid_whatever_its_type():
+    """A Karras schedule given rho 7 (a config read back, YAML's `7`) computes the grid it computes at
+    7.0, the default and FlaxDiff's, bit for bit: an int power lowered to repeated products, about an
+    ulp off at most points (ledger 2061: 1 to 2 ulps over a 12-point grid, three times FlaxDiff's
+    float32 error at MultiStepDPM's first step)."""
+    t = jnp.linspace(0.0, 1.0, 12)
+    grids = [KarrasVENoiseScheduler(sigma_max=80, rho=rho, sigma_data=0.5).sigmas(t) for rho in (7, 7.0)]
+    np.testing.assert_array_equal(*grids)
+
+
 T_OF_SIGMA_SEEDS = 8
 """Check 1's declared seeds for the EDM schedule's time of a sigma, sized by `seeds_for`."""
 
