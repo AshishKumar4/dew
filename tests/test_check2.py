@@ -591,8 +591,9 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
         narrowed = nc.narrow_partial_ends(products[..., :64], products[..., 64:], flushes=False)
         truth = nc.native_dot_ends(products, oc.FLOAT32, flushes=False)
         fault_lost = nc.native_dot_ends(lost, oc.FLOAT32, flushes=False)
-        for faulty, fault, share in ((_truncating_sums(lost.exact, rng), fault_lost, 0.95),
-                                     (narrow, narrowed, 0.65 if signed else 0.9)):
+        # One sign's partials never cancel to a bf16 value's neighbourhood: the emulation's claim there is 0.9.
+        for faulty, fault, share in ((_truncating_sums(lost.exact, rng), fault_lost, nc.LOST_SHARE),
+                                     (narrow, narrowed, nc.NARROW_SHARE if signed else 0.9)):
             held = nc.native_dot_holds(np.asarray(faulty, np.float64), products, oc.FLOAT32, flushes=False)
             nc.assert_refused(held, nc.separated(truth, fault), share)
 
@@ -637,9 +638,9 @@ def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf
             (lambda value: oc.truncated(value, oc.TFLOAT32), oc.TFLOAT32)))
         native = _truncating_sums(tf32.exact, rng)
         assert np.all(nc.native_dot_holds(native, tf32, oc.FLOAT32, flushes=False)), signed
-        cut = 0.75 if signed else 0.95
-        for faulty, declared, given, share in ((_truncating_sums(wide.exact, rng), tf32, wide, 0.85),
-                                               (native, wide, tf32, 0.85),
+        swapped, other, cut = nc.TF32_SHARES[signed]
+        for faulty, declared, given, share in ((_truncating_sums(wide.exact, rng), tf32, wide, swapped),
+                                               (native, wide, tf32, other),
                                                (_truncating_sums(truncated.exact, rng), tf32, truncated,
                                                 cut)):
             held = nc.native_dot_holds(faulty, declared, oc.FLOAT32, flushes=False)
@@ -672,7 +673,7 @@ def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_a
         held = _steps_held(states, products, width)
         apart = _steps_apart(states, products, width, lambda before, step, lost=lost: nc.promoted_step_ends(
             before, before, lost[..., step], flushes=False))
-        nc.assert_refused(held[2], apart[2], 0.95)
+        nc.assert_refused(held[2], apart[2], nc.LOST_SHARE)
         assert all(np.all(held[j]) for j in (0, 1, 3)), signed
         if not signed:
             # A truncation's bound toward zero holds where the accumulator and every product share a sign.
@@ -681,7 +682,7 @@ def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_a
             apart = _steps_apart(states, products, width, lambda before, step, terms=products: (
                 nc.truncating_step_ends(before, terms[..., step], flushes=False)))
             assert not np.any(np.stack(held) & np.stack(apart))
-            nc.assert_refused(np.stack(held[1:]), np.stack(apart[1:]), 0.4)
+            nc.assert_refused(np.stack(held[1:]), np.stack(apart[1:]), nc.TRUNCATED_SHARE)
 
 
 @INTERPRETS

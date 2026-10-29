@@ -30,7 +30,12 @@ from generation_support import generations, runs
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from native_certificates import (
+    LOST_SHARE,
+    MOVED_SHARE,
+    NARROW_SHARE,
     SUBNORMAL_CASE,
+    TF32_SHARES,
+    TRUNCATED_SHARE,
     Terms,
     assert_refused,
     narrow_partial_ends,
@@ -64,29 +69,6 @@ FALL = 2.0 ** -12
 partial a few thousandths of the accumulator, so the exact-sums witness of its add, whose partial's
 allowance (γ of a step's 64 products at 2^-23, of their magnitudes) falls below the accumulator's last
 place, decides the add's rounding."""
-
-
-LOST_SHARE = 0.95
-"""The least share of the elements a lost block of sixteen rows or depth columns reaches whose interval on
-the call's products is separated from that on the products the kernel was given (`assert_refused`): 99.4%
-of a forward's bf16 outputs, 99.9% of a kernel gradient's fp32 ones, and 99.98% of the exact-sums step that
-loses them, on an A100 and an H100 alike."""
-MOVED_SHARE = 0.95
-"""The same of the elements a row read under its neighbour group reaches: all of the forward's row, 99.8% of
-both groups' kernel gradients, and 99.85% of both groups' first exact-sums steps."""
-NARROW_SHARE = 0.65
-"""The same of an fp32 forward's elements where a partial sum over half the depth is rounded to bf16 before
-the rest is added, on Gaussian draws, whose partials sometimes cancel to a bf16 value's neighbourhood:
-70.5%."""
-TRUNCATED_SHARE = 0.4
-"""The same of a kernel gradient's elements past each group's first depth step, on a falling draw of one sign
-(`FALL`), where its default launch adds each step's products by truncating adds and exact sums are
-declared: 48.8% on Mosaic GPU's launch and 49.2% on Triton's, about those whose exact sum lies past the
-midpoint between two fp32 values (each was refused, and 87% to 99% of all of them were)."""
-TF32_SHARES = {True: (0.85, 0.85, 0.75), False: (0.85, 0.85, 0.95)}
-"""The same, on Gaussian draws and on draws of one sign, of an fp32 forward's elements where its operands'
-bf16 values are multiplied and TF32 is declared, its TF32 values where bf16 is, and its truncated TF32 values
-where they are rounded: 92.5%, 92.5% and 79.8%, and 89.3%, 89.3% and all."""
 
 
 def cells(*pairs) -> list:
