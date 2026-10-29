@@ -83,7 +83,7 @@ def test_a_launch_clips_its_blocks_to_the_operands():
     h = jax.ShapeDtypeStruct((1, 1, 64, 32), jnp.bfloat16)
     g = jax.ShapeDtypeStruct((1, 64, 1), jnp.float32)
     spans = chunked_launch.sequences(1, 64)
-    ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, *spans, scale=1.0, chunk=64, interpret=True)
+    ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, None, *spans, scale=1.0, chunk=64, interpret=True)
     with generation.assumed("sm80"):
         tiles = fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba)
     assert tiles.bk <= q.shape[-1] and tiles.bv <= v.shape[-1], tiles

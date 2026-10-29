@@ -32,9 +32,12 @@ class KernelCase(NamedTuple):
     (`kernel_compile.mosaic_failures`)."""
 
 
-def _pinned(launch, tiles, *args, **kwargs):
+def _pinned(launch, tiles, *args, compensated: bool = False, **kwargs):
     """`launch`'s kernel on `args`, pinned to `tiles` (`tuning.pinned`): the function its module
-    names as the launch (`NAME`)."""
+    names as the launch (`NAME`); where `compensated`, the last of `args` the decay prefix's remainder
+    (`g_lo`)."""
+    if compensated:
+        *args, kwargs["g_lo"] = args
     with tuning.pinned({type(launch): tiles}):
         return getattr(importlib.import_module(type(launch).__module__), launch.NAME)(*args, **kwargs)
 
@@ -69,7 +72,10 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
         kwargs.update(scale=fla_gdn.RCP_LN2, reverse=reverse)
     elif kernel in ("chunk_fwd_o", "chunk_bwd_dv_local", "chunk_bwd_dhu", "chunk_bwd_dqkwg"):
         kwargs["scale"] = width ** -0.5
-    return functools.partial(_pinned, launch, tiles, **kwargs), operands[kernel]
+    # Each launch as the rule calls it, the decay's prefix compensated: its remainder the last operand.
+    compensated = kernel != "cumulated"
+    return (functools.partial(_pinned, launch, tiles, compensated=compensated, **kwargs),
+            operands[kernel] + ((gated,) if compensated else ()))
 
 
 def kernel_cases(target: str, dtypes: tuple[str, ...] = ("bfloat16", "float32")) -> Iterator[KernelCase]:
