@@ -225,8 +225,7 @@ def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
             lambda variables, inputs: objective.model.logits(variables, inputs)))
         logits = {}
         for batch in batches:
-            inputs = laid_out(batch, objective.bounds.segments, spans_in_context=objective.schema_in_context,
-                              attention=objective.layout.attention)
+            inputs = laid_out(batch, objective.bounds.segments, spans_in_context=objective.schema_in_context)
             held = np.asarray(forward(variables, inputs))
             options, owners = np.asarray(batch["options"]), np.asarray(batch["question_rows"])
             # Rows that carry no context read none.
