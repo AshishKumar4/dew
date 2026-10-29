@@ -327,8 +327,11 @@ def allowance(magnitude, count: int, fmt: Format, underflow: float):
     """How far any order's sum of `count` terms of total magnitude `magnitude` lies from their exact sum in
     `fmt`: γ_n of it (Higham, §3.1), with 2^-52 for the exact sum's own float64 rounding (`exact_sum`), and
     `underflow` lost at each rounding below the normal range. Check 2's sums (`_terms_hold`) and a native
-    GEMM's (`native_certificates.native_dot_ends`) are held within it."""
-    return (gamma(count, fmt) + 2.0 ** -52) * magnitude + count * underflow
+    GEMM's (`native_certificates.native_dot_ends`) are held within it; `count` an int or each element's
+    count, an array (an add of an exact zero rounding nothing)."""
+    gammas = (np.vectorize(lambda n: gamma(int(n), fmt), otypes=[np.float64])(count) if np.ndim(count)
+              else gamma(count, fmt))
+    return (gammas + 2.0 ** -52) * magnitude + count * underflow
 
 
 def _floats(operands, flushes: bool):

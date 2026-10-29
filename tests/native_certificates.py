@@ -71,6 +71,13 @@ def terms(build, *operands, fmt: Format) -> Terms:
                  np.asarray(build(*(aligned(operand, fmt) for operand in operands)), np.float64))
 
 
+def truncating_underflow(flushes: bool) -> float:
+    """What an fp32 truncating add loses below the normal range: the least normal where results flush, else a
+    whole subnormal unit (truncation's, twice round to nearest's half)."""
+    accumulator = FORMATS["float32"]
+    return 2.0 ** accumulator.emin if flushes else 2.0 ** (accumulator.emin - accumulator.precision + 1)
+
+
 def _terms_of(products) -> Terms:
     """`products` as the native-dot contract takes them: `Terms`, each exact product beside its magnitude as
     the tensor cores align it (`terms`), so a subnormal operand can never take the tight bound unseen."""
@@ -89,10 +96,10 @@ def native_dot_ends(products, out: Format, flushes: bool) -> tuple[np.ndarray, n
     if count == 0:
         return np.zeros(products.shape[:-1]), np.zeros(products.shape[:-1])
     exact = exact_sum(products.exact, -1)
-    accumulator = FORMATS["float32"]
-    # A truncating add below the normal range loses up to a whole subnormal unit, not half of one.
-    underflow = 2.0 ** accumulator.emin if flushes else 2.0 ** (accumulator.emin - accumulator.precision + 1)
-    slack = allowance(magnitude_sum(products.magnitudes, -1), count, TRUNCATING["float32"], underflow)
+    # Each nonzero term's add may round; an add of an exact zero rounds nothing.
+    live = (products.exact != 0).sum(-1)
+    slack = allowance(magnitude_sum(products.magnitudes, -1), live, TRUNCATING["float32"],
+                      truncating_underflow(flushes))
     zero = np.zeros_like(exact)
     return (rounded(np.nextafter(exact - slack, -np.inf), zero, out),
             rounded(np.nextafter(exact + slack, np.inf), zero, out))

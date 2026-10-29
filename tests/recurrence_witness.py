@@ -32,6 +32,8 @@ from typing import NamedTuple
 
 import ml_dtypes
 import numpy as np
+from certified import allowance
+from native_certificates import TRUNCATING, truncating_underflow
 from op_certificates import BFLOAT16, FLOAT32, Format, rounded
 
 from dew.nn.kernels import recurrence_algebra
@@ -200,11 +202,10 @@ def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1)
     magnitude = (aligned(a, fmt)[:, None, :] * aligned(b, fmt).T[None, :, :]).sum(-1) * (1 + 2.0 ** -50)
-    unit = 2.0 ** -(FLOAT32.precision - 1)  # a truncating add's
-    gammas = np.nextafter(live * unit / (1 - live * unit), np.inf)
-    underflow = 2.0 ** FLOAT32.emin if lane.flushes else 2.0 ** (FLOAT32.emin - FLOAT32.precision + 1)
-    allowance = (gammas + (live + 2) * 2.0 ** -52) * magnitude + live * underflow
-    return onto(_outward(terms.lo.sum(-1) - allowance, terms.hi.sum(-1) + allowance), FLOAT32)
+    # The native-dot contract's allowance, and the float64 interval sums' own roundings beside it.
+    slack = (allowance(magnitude, live, TRUNCATING["float32"], truncating_underflow(lane.flushes))
+             + (live + 1) * 2.0 ** -52 * magnitude)
+    return onto(_outward(terms.lo.sum(-1) - slack, terms.hi.sum(-1) + slack), FLOAT32)
 
 
 def blocked(a: Iv, b: Iv, lane: Lane) -> Iv:
