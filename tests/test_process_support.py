@@ -1,6 +1,7 @@
 """Worker reports and cleanup survive failed starts, failed exits and timeouts."""
 
 import os
+import select
 import subprocess
 import sys
 from pathlib import Path
@@ -109,3 +110,59 @@ def test_timed_out_pool_reports_every_rank_and_reaps_them(tmp_path):
         run_pool("timeout", tmp_path, 2, start=start, timeout=.05)
     assert all(f"--- process {rank}, exit " in str(caught.value) for rank in range(2))
     assert all(process.poll() is not None for process in running)
+
+
+def test_a_worker_ends_with_its_owner_however_the_owner_dies(tmp_path):
+    """A worker in a session of its own, and what it started, end when the harness that owns them dies, by
+    SIGKILL from outside as by any signal that unwinds nothing: their ownership outlives no owner (Main,
+    2026-10-28: a worker outlived its killed owner 43 hours at 195% CPU on the VM; armada job
+    20261028061537-7e66486a)."""
+    owner = (
+        "import sys, time\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+        "from process_support import start_process\n"
+        "code = ('import os, time\\npid = os.fork()\\n'\n"
+        "        'if pid:\\n    print(os.getpid(), pid, flush=True)\\ntime.sleep(600)\\n')\n"
+        "worker = start_process([sys.executable, '-c', code], devices=1)\n"
+        "print(worker.stdout.readline().strip(), flush=True)\n"
+        "time.sleep(600)\n"
+    )
+    for signal_number in (9, 15):
+        harness = subprocess.Popen([sys.executable, "-c", owner], stdout=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        assert harness.stdout is not None
+        workers = [int(pid) for pid in harness.stdout.readline().split()]
+        assert len(workers) == 2
+        os.kill(harness.pid, signal_number)
+        harness.wait(timeout=30)
+        for worker in workers:
+            assert gone_within(worker, 30), (signal_number, worker)
+
+
+def test_a_worker_that_ends_by_itself_leaves_its_owner_nothing_running(tmp_path):
+    """A worker that ends on its own, its owner reading its output and never stopping it (a rank that
+    finishes), leaves no process of its ownership running beside the owner: its lifeline ends with it and
+    kills nothing, as the group's id is then free for another process."""
+    before = children()
+    process = start_process([sys.executable, "-c", "print('done')"], devices=1)
+    assert process.communicate(timeout=60)[0].strip() == "done"
+    assert all(gone_within(pid, 30) for pid in children() - before), children() - before
+
+
+def children() -> set[int]:
+    """This process's live children, every thread's (/proc's children lists)."""
+    return {int(pid) for task in Path("/proc/self/task").iterdir()
+            for pid in (task / "children").read_text().split()}
+
+
+def gone_within(pid: int, seconds: float) -> bool:
+    """Whether process `pid` has ended (gone, or a zombie no one reaps yet) within `seconds`: its pidfd is
+    readable once it ends."""
+    try:
+        ended = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    try:
+        return bool(select.select([ended], [], [], seconds)[0])
+    finally:
+        os.close(ended)
