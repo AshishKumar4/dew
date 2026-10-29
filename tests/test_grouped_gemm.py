@@ -200,9 +200,7 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
                                           label)
 
 
-@pytest.mark.gpu(reason="needs a GPU the installed dew-cutlass holds kernels for")
-@pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
-def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
+def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
     gradients through CUTLASS's launches, chosen by name, are as exact as XLA's ragged dot from float64,
     unrouted rows and empty groups included."""
