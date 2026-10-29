@@ -941,59 +941,34 @@ class RecordedLeaf:
         return self.worst_log if self.worst_log is not None else float(_log_over(self.worst, 1.0))
 
 
-@dataclasses.dataclass(frozen=True)
-class _TruthRows:
-    """What `leaf_summary` reads of a truth leaf alone, where a caller reads it once for both arms
-    (`_LaidTruths` reads a draw's at once): each row's own RMS (`_scaled_rms`), its size (the RMS where
-    it is past RESOLUTION of the leaf, else zero: `row_errors`'s), and whether every value is finite."""
-
-    own: np.ndarray
-    sizes: np.ndarray
-    finite: bool
-
-    @staticmethod
-    def of(truth: np.ndarray) -> "_TruthRows":
-        own, sizes = _row_sizes(truth) if truth.ndim >= 2 else (np.zeros(0), np.zeros(0))
-        return _TruthRows(own, sizes, bool(np.isfinite(truth).all()))
-
-
-def leaf_summary(reference, truth, rows_of: _TruthRows | None = None) -> RecordedLeaf:
+def leaf_summary(reference, truth) -> RecordedLeaf:
     """`RecordedLeaf` of a leaf against its float64 truth: check 1's evidence of the reference's leaf, or
-    of Dew's (`_drawn` reads both so, a recorded reference's as recorded). An empty leaf is exact.
-    `rows_of` is the truth's own rows (`_TruthRows.of`), where a caller has read them already."""
-    dtype = str(jnp.dtype(getattr(reference, "dtype", np.asarray(reference).dtype)))
-    reference, truth = np.asarray(reference, np.float64), np.asarray(truth, np.float64)
-    if not reference.size:
-        assert truth.shape == reference.shape, (f"an empty leaf {reference.shape} against a truth "
-                                                f"{truth.shape}")
-        return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True, dtype=dtype)
-    held = rows_of or _TruthRows.of(truth)
-    # Each row's own size by the arithmetic its errors take (`_scaled_rms`), so an arm exactly zero on a
-    # row is exactly its size from it: `row_errors`' sizes and errors, the truth's read once.
-    sizes, own = held.sizes, held.own
-    rows = _rows_rms(reference - truth, truth.shape[-1]) if truth.ndim >= 2 else np.zeros(0)
-    sized = sizes > 0
-    logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
-    return RecordedLeaf(float(np.mean(np.square(reference - truth))),
-                        float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
-                        np.flatnonzero(~sized), rows[~sized],
-                        finite=bool(np.isfinite(reference).all()) and held.finite, dtype=dtype,
-                        zero_sizes=own[~sized], worst_log=logged)
+    of Dew's (`_drawn` reads both so, a recorded reference's as recorded), read as `_evidence` reads a
+    draw's (`leaf_summaries`). An empty leaf is exact."""
+    return leaf_summaries([reference], [truth])[0]
+
+
+def leaf_summaries(references, truths) -> list[RecordedLeaf]:
+    """Each reference leaf's `leaf_summary` against its truth, read at once (`_summaries`), each held to
+    its truth's shape first: a recording's record (tools/recorded_references.py)."""
+    for reference, truth in zip(references, truths, strict=True):
+        if np.shape(reference) != np.shape(truth):
+            raise AssertionError(f"a leaf {np.shape(reference)} against a truth {np.shape(truth)}")
+    return _summaries(references, _LaidTruths.of(truths))
 
 
 @dataclasses.dataclass(frozen=True)
 class _LaidTruths:
-    """A draw's truth leaves read at once for both arms (`_summaries`), each as `_TruthRows` reads one.
-    Every leaf that is not empty and is C-contiguous in float64 lies end to end with the others, by row
-    width (its last axis's, 0 for a leaf of rank under two) and then size: each run of one width and size
-    is one (leaves, size) matrix, its rows one (rows, width) matrix. Each reduction `leaf_summary` takes
-    over a row or a leaf is then the same reduction of the same values, NumPy's pairwise sum of that row
-    or leaf alone wherever it lies, and each log and exponential the same elementwise, so a draw takes a
-    few passes where it took a pipeline a leaf (ledger 1848: 190 µs a leaf at the gemma3n gradient's
-    tiny leaves). A leaf in another layout is read alone: NumPy sums an F-ordered row in another order.
-    `truths` is every leaf in float64, `laid` the leaves laid in order, `runs` each run's (leaves, size,
-    width), `values` the laid leaves, `own` and `sizes` their rows' own RMS and size, and `finite` each
-    laid leaf's."""
+    """A draw's truth leaves read at once for both arms (`_summaries`). Every leaf that is not empty lies
+    end to end with the others in C order, by row width (its last axis's, 0 for a leaf of rank under two)
+    and then size: each run of one width and size is one (leaves, size) matrix, and each width's rows one
+    (rows, width) matrix, so a draw takes a few passes where it took a pipeline a leaf (ledger 1848:
+    190 µs a leaf at the gemma3n gradient's tiny leaves). A leaf in another layout is read as its
+    C-ordered copy. Each row has its own RMS (`_scaled_rms`) and its size, the RMS where it is past
+    RESOLUTION of its leaf, else zero (`row_errors`'). `truths` is every leaf in float64 in C order,
+    `laid` the leaves laid in order, `runs` each run's (leaves, size, width), `values` the laid leaves,
+    `own` and `sizes` their rows' own RMS and size, and `finite` whether each laid leaf's every value
+    is."""
 
     truths: list
     laid: list[int]
@@ -1005,9 +980,9 @@ class _LaidTruths:
 
     @staticmethod
     def of(truths) -> "_LaidTruths":
-        truths = [np.asarray(truth, np.float64) for truth in truths]
+        truths = [np.asarray(truth, np.float64, order="C") for truth in truths]
         keys = sorted((truth.shape[-1] if truth.ndim >= 2 else 0, truth.size, at)
-                      for at, truth in enumerate(truths) if truth.size and truth.flags.c_contiguous)
+                      for at, truth in enumerate(truths) if truth.size)
         runs = [(len(list(run)), size, width)
                 for (width, size), run in itertools.groupby(keys, lambda key: key[:2])]
         values = np.concatenate([np.zeros(0), *(truths[at].reshape(-1) for *_, at in keys)])
@@ -1043,59 +1018,62 @@ def _rows(values: np.ndarray, runs) -> list[np.ndarray]:
 
 
 def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
-    """Each leaf's `leaf_summary` against its truth in `held` (`_LaidTruths.of`), None for a reference of
-    None. Every leaf `held` lays whose reference is C-contiguous in float64 too is read in a few passes
-    over all of them, bit for bit the summary `leaf_summary` reads of it alone; every other leaf is read
-    alone (`leaf_summary`), the order its arithmetic sums in following its layout."""
-    summaries = [None] * len(references)
-    arms = [None if references[at] is None else np.asarray(references[at], np.float64) for at in held.laid]
-    for arm, at in zip(arms, held.laid, strict=True):
-        if arm is not None and arm.shape != held.truths[at].shape:
-            raise AssertionError(f"a leaf {arm.shape} against a truth {held.truths[at].shape}")
-    read = [arm is not None and arm.flags.c_contiguous for arm in arms]
-    if any(read):
-        # An arm read alone or not at all lies as its truth, a zero error never read.
-        values = np.concatenate([np.zeros(0), *((arm if ok else held.truths[at]).reshape(-1)
-                                                for arm, ok, at in zip(arms, read, held.laid, strict=True))])
-        finite = np.concatenate([np.isfinite(block).all(axis=1) for block in _blocks(values, held.runs)])
-        errors = values - held.values
-        mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
-        rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
-        # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
-        counts = np.repeat([size // width if width else 0 for _, size, width in held.runs],
-                           [leaves for leaves, _, _ in held.runs])
-        starts = np.cumsum(counts) - counts
-        sized = held.sizes > 0
-        before = np.concatenate([[0], np.cumsum(sized)])
-        taken = before[starts + counts] - before[starts]
-        logs, over = _log_over(rows[sized], held.sizes[sized]), _over(rows[sized], held.sizes[sized])
-        # The worst sized row of each leaf that has one: the largest of its run of the sized rows.
-        some = taken > 0
-        worst_log, worst = np.full(len(counts), LOG_ZERO), np.zeros(len(counts))
-        if some.any():
-            firsts = (np.cumsum(taken) - taken)[some]
-            worst_log[some] = np.maximum.reduceat(logs, firsts)
-            worst[some] = np.maximum.reduceat(over, firsts)
-        # The rows of float64 zero, each leaf's its span of them.
-        unsized = np.flatnonzero(~sized)
-        zero_rows = unsized - np.repeat(starts, counts - taken)
-        zero_errors, zero_sizes = rows[unsized], held.own[unsized]
-        ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
-        mse, worst, worst_log, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), (
-            finite & held.finite).tolist()
-        names = {}
-        for index, at in enumerate(held.laid):
-            if read[index]:
-                reference, span = references[at], slice(ends[index], ends[index + 1])
-                dtype = reference.dtype if hasattr(reference, "dtype") else np.asarray(reference).dtype
-                if dtype not in names:
-                    names[dtype] = str(jnp.dtype(dtype))
-                summaries[at] = RecordedLeaf(mse[index], worst[index], zero_rows[span], zero_errors[span],
-                                             finite=finite[index], dtype=names[dtype],
-                                             zero_sizes=zero_sizes[span], worst_log=worst_log[index])
+    """Each reference leaf's evidence against its truth in `held` (`_LaidTruths.of`) as check 1 reads it
+    (`RecordedLeaf`), every leaf read in C order with the others in a few passes; None for a reference of
+    None. The caller holds each reference to its truth's shape (`leaf_summaries`, `_evidence`)."""
+    names = {}
+
+    def dtype(reference) -> str:
+        kind = reference.dtype if hasattr(reference, "dtype") else np.asarray(reference).dtype
+        if kind not in names:
+            names[kind] = str(jnp.dtype(kind))
+        return names[kind]
+
+    # An empty leaf is exact; `held` lays every other.
+    summaries, laid = [None] * len(references), set(held.laid)
     for at, reference in enumerate(references):
-        if reference is not None and summaries[at] is None:
-            summaries[at] = leaf_summary(reference, held.truths[at])
+        if reference is not None and at not in laid:
+            summaries[at] = RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True,
+                                         dtype=dtype(reference))
+    read = [references[at] is not None for at in held.laid]
+    if not any(read):
+        return summaries
+    # A leaf of no reference lies as its truth, a zero error never read.
+    values = np.concatenate([np.zeros(0), *(
+        np.asarray(references[at], np.float64, order="C").reshape(-1) if ok else held.truths[at].reshape(-1)
+        for ok, at in zip(read, held.laid, strict=True))])
+    finite = np.concatenate([np.isfinite(block).all(axis=1) for block in _blocks(values, held.runs)])
+    errors = values - held.values
+    mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
+    rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
+    # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
+    counts = np.repeat([size // width if width else 0 for _, size, width in held.runs],
+                       [leaves for leaves, _, _ in held.runs])
+    starts = np.cumsum(counts) - counts
+    sized = held.sizes > 0
+    before = np.concatenate([[0], np.cumsum(sized)])
+    taken = before[starts + counts] - before[starts]
+    logs, over = _log_over(rows[sized], held.sizes[sized]), _over(rows[sized], held.sizes[sized])
+    # The worst sized row of each leaf that has one: the largest of its run of the sized rows.
+    some = taken > 0
+    worst_log, worst = np.full(len(counts), LOG_ZERO), np.zeros(len(counts))
+    if some.any():
+        firsts = (np.cumsum(taken) - taken)[some]
+        worst_log[some] = np.maximum.reduceat(logs, firsts)
+        worst[some] = np.maximum.reduceat(over, firsts)
+    # The rows of float64 zero, each leaf's its span of them.
+    unsized = np.flatnonzero(~sized)
+    zero_rows = unsized - np.repeat(starts, counts - taken)
+    zero_errors, zero_sizes = rows[unsized], held.own[unsized]
+    ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
+    mse, worst, worst_log, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), (
+        finite & held.finite).tolist()
+    for index, at in enumerate(held.laid):
+        if read[index]:
+            span = slice(ends[index], ends[index + 1])
+            summaries[at] = RecordedLeaf(mse[index], worst[index], zero_rows[span], zero_errors[span],
+                                         finite=finite[index], dtype=dtype(references[at]),
+                                         zero_sizes=zero_sizes[span], worst_log=worst_log[index])
     return summaries
 
 
@@ -1174,7 +1152,7 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
     both truths the same leaves at the same paths, and each leaf the shape of its truth, so no leaf is
     paired with another's truth or compared through broadcasting. Every leaf's summary is read at once
     (`_summaries`)."""
-    # Every leaf on the host in one transfer a tree, not one a leaf (`leaf_summary` reads them on the host);
+    # Every leaf on the host in one transfer a tree, not one a leaf (`_summaries` reads them on the host);
     # one truth stays one tree, as the draw gave it.
     shared = their_truth is truth
     dew, reference, truth = jax.device_get((dew, reference, truth))
