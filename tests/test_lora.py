@@ -1434,3 +1434,28 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
     rebuilt = Adapter.from_run(tmp_path / "run")
     rebuilt.save(rebuilt.variables, tmp_path / "from-run")
     _same_files(tmp_path / "from-run", tmp_path / "in-process")
+
+
+def test_an_imported_adapter_binds_to_its_bundle_as_a_fresh_one_does(decoder, loaded, tmp_path):
+    """`source.adapt(LoRA(..., source=<PEFT directory>))` binds the imported adapter to the bundle as a
+    fresh spec's does: its factors are the file's (the adapted model computes what `LoRA.load` binds,
+    bit for bit), the adapter saves under the source's names, and the bundle saves the merged weights
+    a plain load computes. A spec stating another rank, alpha, target, rslora or dropout than the file
+    holds is refused."""
+    stated = LoRA(rank=4, modules=("q_proj", "v_proj", "down_proj"), alpha=8, dropout=0.1,
+                  source=str(ADAPTER))
+    bundled = decoder.adapt(stated, key=0)
+    ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6) % decoder.model.vocab_size
+    np.testing.assert_array_equal(np.asarray(bundled.model.apply(bundled.variables, ids)),
+                                  np.asarray(loaded.model.apply(loaded.variables, ids)))
+    bundled.adapter.save(bundled.variables, tmp_path / "adapter")
+    again = LoRA.load(decoder.model, decoder.variables, tmp_path / "adapter", layouts=decoder.layouts)
+    jax.tree.map(np.testing.assert_array_equal, thaw(again.variables), thaw(loaded.variables))
+    bundled.save(tmp_path / "merged")
+    merged = Pretrained.load(tmp_path / "merged", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(merged.model.apply(merged.variables, ids)),
+                                  np.asarray(decoder.model.apply(loaded.merge(loaded.variables), ids)))
+    for other in ({"rank": 2}, {"alpha": 4}, {"modules": ("q_proj", "v_proj")}, {"rslora": True},
+                  {"dropout": 0.0}):
+        with pytest.raises(ValueError):
+            decoder.adapt(dataclasses.replace(stated, **other), key=0)
