@@ -102,8 +102,8 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
     contract.py): a prepare without its key fails as Dew's does; a call naming no steps, solver or guidance
     takes the pipeline's own, the image the service returns the one Dew's call makes; `CFG` holds Dew's
     defaults, and `Sampling` Dew's, so a greedy policy named in full is the greedy policy; an argument the
-    service does not serve, or one of another type than Dew's default (decode=1), is refused by name, and so is a
-    solver of the cell's own named as one the service runs; and the service refuses a solver outside the
+    service does not serve, or one of another type than Dew's default (decode=1), is refused by name, and so
+    is a solver of the cell's own named as one the service runs; and the service refuses a solver outside the
     contract's (ledger 1159)."""
     import numpy as np
     from test_inference import make_run
