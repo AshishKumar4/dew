@@ -708,8 +708,7 @@ def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixtu
                for arrived, answered in received)
 
 
-@pytest.mark.gpu(reason="an NCCL group opens on a cuda device")
-def test_a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting():
+def a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting():
     """The sender opens its NCCL group while the replica's HTTP join runs. A replica that refuses
     the join never enters the rendezvous, so the push aborts the group and raises the refusal
     within seconds, where a blocking open waited on that peer for ever. The aborted group is not

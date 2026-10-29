@@ -192,6 +192,15 @@ def test_backbone_composes_layers_loop_passes_and_a_separate_lm_head():
     assert model.clone(tie_embeddings=False).logits_flops(LENGTHS) == model.logits_flops(LENGTHS)
 
 
+def test_an_embedding_of_its_own_width_counts_both_projections_and_its_narrower_head():
+    """An embedding four wide under an eight-wide stream (`embedding_features`) adds `project_in`'s
+    product to the trunk once, and the head counts `project_out`'s product and the tied table at the
+    embedding's width."""
+    model, projected = decoder(), decoder(embedding_features=4)
+    assert projected.model_flops(LENGTHS) == model.model_flops(LENGTHS) + 2 * 4 * 8 * 7
+    assert projected.logits_flops(LENGTHS) == 2 * 8 * 4 * 7 + 2 * 4 * 64 * 7
+
+
 def test_hybrid_backbone_reuses_its_mixer_factory_geometry():
     mixer = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2,
                                linear_key_head_dim=4, linear_value_head_dim=4)

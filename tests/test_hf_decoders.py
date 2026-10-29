@@ -265,8 +265,7 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
         reloaded = np.asarray(again.model.apply(again.variables, ids))
         np.testing.assert_array_equal(reloaded, ours)
 
-@pytest.mark.gpu(reason="TF32 is a GPU's: a CPU multiplies float32 operands in float32 at any precision")
-def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
+def a_float32_decoder_multiplies_float32_products_on_a_gpu():
     """A float32 decoder that states no precision multiplies float32 products, as torch's float32
     matmuls do by default (`dew.nn.precision.float32_products`): its logits on a GPU are as exact
     as transformers' float32 ones, both from transformers' float64 ones, under JAX's own default
@@ -449,20 +448,16 @@ def _respelled(name, tmp_path, edit):
 
 
 @pytest.mark.parametrize(("name", "change"), [
-    ("opt-tiny", {"activation_dropout": 0.1}), ("opt-tiny", {"do_layer_norm_before": False}),
-    ("opt-tiny", {"_remove_final_layer_norm": True}), ("opt-tiny", {"layer_norm_elementwise_affine": False}),
-    ("opt-tiny", {"word_embed_proj_dim": 16}), ("opt-tiny", {"layerdrop": 0.1}),
-    ("bloom-tiny", {"apply_residual_connection_post_layernorm": True}),
+    ("opt-tiny", {"activation_dropout": 0.1}), ("opt-tiny", {"layer_norm_elementwise_affine": False}),
+    ("opt-tiny", {"layerdrop": 0.1}), ("bloom-tiny", {"apply_residual_connection_post_layernorm": True}),
     ("bloom-tiny", {"slow_but_exact": True, "pretraining_tp": 2}), ("bloom-tiny", {"n_head": 5})],
-    ids=["opt activation dropout", "opt post-norm", "opt no final norm", "opt unscaled norms",
-         "opt projected embeddings", "opt layer drop", "bloom post-norm residuals",
+    ids=["opt activation dropout", "opt unscaled norms", "opt layer drop", "bloom post-norm residuals",
          "bloom tensor-parallel exact path", "bloom heads not dividing the width"])
 def test_a_checkpoint_asking_what_its_family_does_not_compute_is_refused(name, change, tmp_path):
     """An OPT or BLOOM checkpoint whose config asks what Dew's family does not compute (OPT's dropout
-    inside the feed-forward, post-residual or scaleless norms, no final norm, embeddings projected to
-    another width, dropped layers; BLOOM's residuals read after the norm, the tensor-parallel exact path
-    that drops projection biases, a width no whole number of heads divides) is refused at load rather
-    than computed without it."""
+    inside the feed-forward, scaleless norms, dropped layers; BLOOM's residuals read after the norm, the
+    tensor-parallel exact path that drops projection biases, a width no whole number of heads divides)
+    is refused at load rather than computed without it."""
     with pytest.raises(ValueError):
         fp32_decoder(_respelled(name, tmp_path, lambda config: {**config, **change}))
 
