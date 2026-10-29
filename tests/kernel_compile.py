@@ -358,7 +358,7 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     found = {}
     for path in Path(directory).glob("*.ptx"):
         registers, spilled, _ = _ptxas(path.read_text(), generation, cap=None)
-        found[report.KERNEL_COUNTER.sub("", path.name.removesuffix(".ptx"))] = {
+        found[report.kernel_name(path.name.removesuffix(".ptx"))] = {
             "registers": registers, "spilled": spilled, "ptxas": "the GPU's compile of its PTX"}
     return found
 
@@ -366,10 +366,10 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
 def _needs(directory: str, generation: str,
            models: dict[str, resources.RegisterModel] | None = None) -> dict[str, int | dict | None]:
     """Each kernel's register need (`register_need`) from the PTX Mosaic dumped into `directory`, by the
-    kernel's name less Mosaic's counter (`report.KERNEL_COUNTER`)."""
+    kernel's name less Mosaic's counter and its launch (`report.kernel_name`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
-        name = report.KERNEL_COUNTER.sub("", path.name.removesuffix(".ptx"))
+        name = report.kernel_name(path.name.removesuffix(".ptx"))
         model = (models or {}).get(name)
         found[name] = (register_decisions(path.read_text(), generation, model) if model is not None
                        else register_need(path.read_text(), generation))
