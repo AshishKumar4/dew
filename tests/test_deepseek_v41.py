@@ -535,6 +535,20 @@ def test_a_bundle_loaded_text_only_is_its_text_checkpoint(tmp_path):
                                   np.asarray(plain.model.apply(plain.variables, ids)))
 
 
+def test_the_released_quantized_bundle_takes_text_only_as_its_text_checkpoint(tmp_path):
+    """The released bundle, its weights FP8 and FP4 under its quantization_config, loaded `text_only`
+    builds the model its text checkpoint (the same config without its vision_config) builds: its codec
+    reads the decoder's names unchanged, so the quantized bundle is taken as the unquantized one is."""
+    from dew.interop.hf_decoders import bundle_text_config
+
+    config = json.loads((RELEASED / "config.json").read_text())
+    assert config.get("vision_config") is not None and config.get("quantization_config") is not None
+    (tmp_path / "config.json").write_text(json.dumps(bundle_text_config(config)))
+    text = Pretrained.load(RELEASED, weights=False, text_only=True, dtype="bfloat16")
+    plain = Pretrained.load(tmp_path, weights=False, dtype="bfloat16")
+    assert text.model == plain.model
+
+
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):
     """Routing the image span by the text bias moves the prefill's logits
     further from the float64 truth than rounding can, and the image

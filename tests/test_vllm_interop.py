@@ -282,13 +282,14 @@ def test_the_server_refuses_impossible_controls_but_ignores_unknown_ones(client)
     """
     with pytest.raises(openai.BadRequestError):
         client(PROMPTS[0], DRAWN, sampling=Sampling(temperature=1.0, top_p=0.0))
+    # More new tokens than the served export's whole context: refused, or drawn no further than it.
+    context = json.loads((Path(client.model) / "config.json").read_text())["max_position_embeddings"]
     try:
-        past = client(PROMPTS[0], 200, sampling=GREEDY, extra_body={"return_token_ids": True})
+        past = client(PROMPTS[0], context + 1, sampling=GREEDY, extra_body={"return_token_ids": True})
     except openai.BadRequestError:
         pass
     else:
         choice = past.responses[0].choices[0]
-        context = json.loads((Path(client.model) / "config.json").read_text())["max_position_embeddings"]
         assert len(choice.prompt_token_ids) + len(choice.token_ids) <= context, past.finish_reasons
     with pytest.raises(openai.BadRequestError):
         client(PROMPTS[0], DRAWN, sampling=GREEDY, logprobs=1000)

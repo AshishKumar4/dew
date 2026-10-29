@@ -1800,13 +1800,16 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
-        if source_quantization(config) is not None:
+        # A bundle its own family reads whole states its text checkpoint without its vision_config, its
+        # decoder's names and their codec unchanged; another wrapper's language model is its text family's
+        # checkpoint, under names its quantization's module selection does not follow.
+        if decoders.bundles(config):
+            config = decoders.bundle_text_config(config)
+        elif source_quantization(config) is not None:
             raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
                              "names the wrapper's modules, which its text checkpoint renames")
-        # A bundle its own family reads whole states its text checkpoint without its vision_config; another
-        # wrapper's language model is its text family's checkpoint.
-        config = (decoders.bundle_text_config(config) if decoders.bundles(config)
-                  else decoders.language_model_config(config))
+        else:
+            config = decoders.language_model_config(config)
         route = source_route(config, remote=remote, pinned=pinned)
     elif isinstance(route, WrapperRoute):
         # Before any weight downloads, as the routing of the wrapper's names would (`_wrapper_sources`).

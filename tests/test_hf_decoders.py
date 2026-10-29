@@ -112,6 +112,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import respelled
 from model_support import flat_tree, llada_draw, llada_fields
 from reference_error import (
     as_given,
@@ -460,12 +461,28 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
 
 def _respelled(name, tmp_path, edit):
     """The fixture's checkpoint under the config `edit` returns from its own."""
-    from shutil import copytree
+    return respelled(FIXTURES / name, tmp_path / name, edit)
 
-    directory = copytree(FIXTURES / name, tmp_path / name)
-    config = edit(fixture_config(name))
-    (directory / "config.json").write_text(json.dumps(config))
-    return directory
+
+@pytest.mark.parametrize(("name", "embedding"), [("opt-tiny", "model.decoder.embed_tokens.weight"),
+                                                 ("bloom-tiny", "transformer.word_embeddings.weight")])
+def test_a_tied_checkpoint_keeping_its_embedding_under_the_head_name_alone_loads_the_same_model(
+        name, embedding, tmp_path):
+    """A tied checkpoint whose safetensors keep lm_head.weight and drop the embedding the config ties it
+    to, as SFconvertbot's conversion of OPT-125m does: the head is the embedding's one copy and fills it,
+    so the model loads leaf for leaf as the checkpoint storing the embedding does."""
+    from dew.interop.safetensors_io import save_hf_layout
+    from dew.interop.sources import load_shards
+
+    tensors = load_shards(FIXTURES / name)
+    tensors["lm_head.weight"] = tensors.pop(embedding)
+    save_hf_layout(tensors, fixture_config(name), tmp_path)
+    head_only = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    stored = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    assert jax.tree.structure(head_only.variables) == jax.tree.structure(stored.variables)
+    for ours, theirs in zip(jax.tree.leaves(head_only.variables), jax.tree.leaves(stored.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
 def _reference_logits(name, directory):
