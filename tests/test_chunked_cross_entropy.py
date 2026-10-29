@@ -276,7 +276,8 @@ def columns(vocab: int, seed: int = 0):
             jax.random.normal(bias, (vocab,), jnp.float32) / 17)
 
 
-SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'vocabulary split': 512,
+SEEDS = {'projected head': 32,
+         'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'vocabulary split': 512,
          'column orders': 32, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
          'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
          'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 256, 'bf16 cotangent': 256,
@@ -1601,3 +1602,54 @@ def test_a_vocabulary_split_heads_unconfident_target_gradient_is_on_par_with_aut
     with jax.default_matmul_precision("highest"):
         seeds = seeds_for(reference, draw, label, dew_fn=split)
         assert_as_exact(split, reference, draw, label, seeds=seeds)
+
+
+def test_a_projected_head_is_scored_in_tiles_as_its_whole_logits_are():
+    """A decoder whose embedding has a width of its own (`embedding_features`, OPT-350m's) is scored in
+    tiles, its final states projected once (`head_input`) and met by the vocabulary matrix
+    (`projected_output_table`): its per-token cross entropy and the gradient of their sum in the head's
+    parameters are on par with the whole logits' (check 1, both products in float64 the truth)."""
+    model = CausalTransformer(vocab_size=97, emb_features=32, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=8, embedding_features=16, qk_norm=False, attention_impl='reference')
+    ids = jnp.asarray([[2, 7, 3, 5], [11, 4, 9, 1]], jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    states = model.apply(variables, ids, method='hidden_states')
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(8), seed))
+        return (variables['params'], jax.random.normal(keys[0], states.shape),
+                jax.random.randint(keys[1], ids.shape, 0, 97))
+
+    def scored(loss):
+        def run(params, states, targets):
+            def total(params):
+                return jnp.sum(loss({**variables, 'params': params}, states, targets))
+            return loss({**variables, 'params': params}, states, targets), jax.grad(total)(params)
+        return run
+
+    def tiled(variables, states, targets):
+        with jax.default_matmul_precision('highest'):
+            return chunked.head_cross_entropy(model, variables, states, targets, 4, tile=(3, 11))[0]
+
+    def whole(variables, states, targets):
+        with jax.default_matmul_precision('highest'):
+            return optax.softmax_cross_entropy_with_integer_labels(
+                chunked.model_logits(model, variables, states), targets)
+
+    wide = model.clone(dtype=jnp.float64)
+
+    @as_given
+    def truth(params, states, targets):
+        with jax.enable_x64(new_val=True):
+            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), {**variables, 'params': params})
+
+            def total(params):
+                read = jnp.asarray(states, jnp.float64)
+                logits = chunked.model_logits(wide, {**held, 'params': params}, read)
+                return optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+            return jax.device_get((total(held['params']),
+                                   jax.grad(lambda p: jnp.sum(total(p)))(held['params'])))
+
+    assert chunked.head_table(model, variables) is None
+    assert_as_exact(jax.jit(scored(tiled)), jax.jit(scored(whole)), draw, 'projected head',
+                    seeds=SEEDS['projected head'], truth_fn=truth)

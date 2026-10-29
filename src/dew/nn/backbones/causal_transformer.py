@@ -2202,6 +2202,21 @@ class CausalTransformer(nn.Module):
             return None
         return self._head_table()
 
+    def projected_output_table(self) -> OutputTable | None:
+        """The vocabulary matrix past an embedding's own width (`embedding_features`), which the final
+        states meet through `head_input` (`project_out`), where nothing else stands between them; None
+        for any other decoder, whose `output_table` gives its head. A loss scores the projected states
+        against it in tiles, the two products and their gradients kept."""
+        head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
+        if self.embedding_features is None or (head is not None and set(head) != {"kernel"}):
+            return None
+        return self._head_table()
+
+    def head_input(self, hidden):
+        """The final states as the vocabulary matrix reads them: through `project_out` past an
+        embedding's own width, else as they are."""
+        return hidden if self.embedding_features is None else self.project_out(hidden)
+
     def vocabulary_rows(self) -> jax.Array:
         """Each vocabulary token's `[features]` row of the head (`OutputTable.rows`) where no exact
         table is: past a `head_transform` the matrix's, which the transformed states meet, with an

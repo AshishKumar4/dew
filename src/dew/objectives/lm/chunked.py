@@ -994,6 +994,11 @@ def head_cross_entropy(model, variables, read, targets, chunks: int, *, tile: tu
     token, which the tiled head never does.
     """
     table = head_table(model, variables) if reads_states(model) else None
+    if table is None and reads_states(model) and hasattr(model, "projected_output_table"):
+        # Past an embedding's own width the states are projected once, then scored in tiles.
+        table = model.apply(variables, method="projected_output_table")
+        if table is not None:
+            read = model.apply(variables, read, method="head_input")
     if table is not None:
         return chunked_cross_entropy(read, table, targets, chunks, tile=tile, predict=predict,
                                      temperature=temperature, excluded=excluded)
