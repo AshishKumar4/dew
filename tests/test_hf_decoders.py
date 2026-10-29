@@ -112,6 +112,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import respelled
 from model_support import flat_tree, llada_draw, llada_fields
 from reference_error import (
     as_given,
@@ -173,14 +174,9 @@ def recorded_logit_difference(model, variables, directory) -> float:
 
 
 def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path):
-    from shutil import copytree
-
     original = FIXTURES / "llama-tiny"
-    directory = tmp_path / "checkpoint"
-    copytree(original, directory)
-    config = fixture_config("llama-tiny")
-    config.update(is_llama_config=True, rope_interleaved=False)
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(original, tmp_path / "checkpoint",
+                          lambda config: {**config, "is_llama_config": True, "rope_interleaved": False})
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     ids = np.load(original / "input_ids.npy")
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
@@ -194,7 +190,6 @@ def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_
     state its embedding and residual dropout, which LlamaModel never applies: the release loads as
     the model its own fields state, the same model and variables bit for bit, and a repeat that
     states another value than its field is refused by name (ledger 1883)."""
-    from shutil import copytree
 
     original = FIXTURES / "llama-tiny"
     plain = Pretrained.load(original, dtype="float32")
@@ -204,10 +199,8 @@ def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_
     repeats = {"ffn_hidden_size": config["intermediate_size"],
                "num_query_groups": config["num_key_value_heads"], "rotary_base": theta,
                "kv_channels": head_dim, "seq_length": config["max_position_embeddings"]}
-    directory = tmp_path / "checkpoint"
-    copytree(original, directory)
     stated = {**config, "head_dim": head_dim, **repeats, "embd_pdrop": 0.0, "resid_pdrop": 0.0}
-    (directory / "config.json").write_text(json.dumps(stated))
+    directory = respelled(original, tmp_path / "checkpoint", lambda _: stated)
     loaded = Pretrained.load(directory, dtype="float32")
     assert loaded.model == plain.model
     for got, want in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(plain.variables), strict=True):
@@ -319,15 +312,12 @@ def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds
     disagree with the ones the reference reads: its logits under them are the bits it computes
     without them, the same program on the same values, which the fixture's parity test holds to the
     reference's."""
-    from shutil import copytree
 
     import torch
     import transformers
 
-    directory = tmp_path / "checkpoint"
-    copytree(FIXTURES / name, directory)
     config = {**fixture_config(name), **stale}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURES / name, tmp_path / "checkpoint", lambda _: config)
     ids = np.load(FIXTURES / name / "input_ids.npy")
 
     def theirs(source):
@@ -384,18 +374,15 @@ def test_an_olmo3_model_with_a_llama3_ramp_on_one_kind_writes_back_what_transfor
     """OLMo3 rotates each layer kind through its own rope_parameters entry, so a Llama-3 ramp on
     the full layers beside plain sliding ones loads, writes back in that spelling, and
     transformers' Olmo3 reads the export to the logits Dew computes."""
-    from shutil import copytree
 
     import torch
     from transformers import Olmo3ForCausalLM
 
-    source = tmp_path / "source"
-    copytree(FIXTURES / "olmo3-tiny", source)
     config = fixture_config("olmo3-tiny")
     config["rope_parameters"]["full_attention"] = {
         "rope_type": "llama3", "rope_theta": 500000.0, "factor": 8.0, "low_freq_factor": 1.0,
         "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
-    (source / "config.json").write_text(json.dumps(config))
+    source = respelled(FIXTURES / "olmo3-tiny", tmp_path / "source", lambda _: config)
     ids = np.load(FIXTURES / "olmo3-tiny" / "input_ids.npy")
     from dew.interop import PretrainedDecoder
 
@@ -433,7 +420,7 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
 
     expected, attention_factor = ROPE_INIT_FUNCTIONS['yarn'](
         reference, None, layer_type='full_attention')
-    record = translate_config(released)['kinds']['full_attention']['yarn']
+    record = translate_config(released)['kinds']['full_attention']['rope_scaling']
     scaling = YarnScaling(**record)
     scaled = yarn_inv_freq(128, 5e5, scaling, dtype=np.float32)
     plain = 1.0 / (5e5 ** (np.arange(0, 128, 2, dtype=np.float32) / 128))
@@ -460,12 +447,47 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
 
 def _respelled(name, tmp_path, edit):
     """The fixture's checkpoint under the config `edit` returns from its own."""
-    from shutil import copytree
+    return respelled(FIXTURES / name, tmp_path / name, edit)
 
-    directory = copytree(FIXTURES / name, tmp_path / name)
-    config = edit(fixture_config(name))
-    (directory / "config.json").write_text(json.dumps(config))
-    return directory
+
+@pytest.mark.parametrize(("name", "change"), [
+    ("opt-tiny", {"activation_dropout": 0.1}), ("opt-tiny", {"do_layer_norm_before": False}),
+    ("opt-tiny", {"_remove_final_layer_norm": True}), ("opt-tiny", {"layer_norm_elementwise_affine": False}),
+    ("opt-tiny", {"word_embed_proj_dim": 16}), ("opt-tiny", {"layerdrop": 0.1}),
+    ("bloom-tiny", {"apply_residual_connection_post_layernorm": True}),
+    ("bloom-tiny", {"slow_but_exact": True, "pretraining_tp": 2}), ("bloom-tiny", {"n_head": 5})],
+    ids=["opt activation dropout", "opt post-norm", "opt no final norm", "opt unscaled norms",
+         "opt projected embeddings", "opt layer drop", "bloom post-norm residuals",
+         "bloom tensor-parallel exact path", "bloom heads not dividing the width"])
+def test_a_checkpoint_asking_what_its_family_does_not_compute_is_refused(name, change, tmp_path):
+    """An OPT or BLOOM checkpoint whose config asks what Dew's family does not compute (OPT's dropout
+    inside the feed-forward, post-residual or scaleless norms, no final norm, embeddings projected to
+    another width, dropped layers; BLOOM's residuals read after the norm, the tensor-parallel exact path
+    that drops projection biases, a width no whole number of heads divides) is refused at load rather
+    than computed without it."""
+    with pytest.raises(ValueError):
+        fp32_decoder(_respelled(name, tmp_path, lambda config: {**config, **change}))
+
+
+@pytest.mark.parametrize(("name", "embedding"), [("opt-tiny", "model.decoder.embed_tokens.weight"),
+                                                 ("bloom-tiny", "transformer.word_embeddings.weight")])
+def test_a_tied_checkpoint_keeping_its_embedding_under_the_head_name_alone_loads_the_same_model(
+        name, embedding, tmp_path):
+    """A tied checkpoint whose safetensors keep lm_head.weight and drop the embedding the config ties it
+    to, as SFconvertbot's conversion of OPT-125m does: the head is the embedding's one copy and fills it,
+    so the model loads leaf for leaf as the checkpoint storing the embedding does."""
+    from dew.interop.safetensors_io import save_hf_layout
+    from dew.interop.sources import load_shards
+
+    tensors = load_shards(FIXTURES / name)
+    tensors["lm_head.weight"] = tensors.pop(embedding)
+    save_hf_layout(tensors, fixture_config(name), tmp_path)
+    head_only = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    stored = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    assert jax.tree.structure(head_only.variables) == jax.tree.structure(stored.variables)
+    for ours, theirs in zip(jax.tree.leaves(head_only.variables), jax.tree.leaves(stored.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
 def _reference_logits(name, directory):
@@ -824,7 +846,6 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
 
 
 @pytest.mark.parametrize("name", [name for name in TINY if name not in (
-    'bloom-tiny',
     'falcon-mha-tiny',
     'falcon-tiny',
     'gpt-bigcode-tiny',
@@ -832,7 +853,6 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
     'gpt-neox-tiny',
     'gpt2-tiny',
     'gptj-tiny',
-    'opt-tiny',
     'phi-tiny',
     'phi3-tiny',
     'starcoder2-tiny',
@@ -1560,12 +1580,7 @@ def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, t
     """transformers saves the trunk alone whatever depth the config names:
     such a checkpoint, the dense one too, whose default step names a routed
     kind its trunk lacks, loads the trunk it holds and computes its logits."""
-    from shutil import copytree
-
-    directory = tmp_path / name
-    copytree(FIXTURES / name, directory)
-    stated = {**fixture_config(name), "num_nextn_predict_layers": 1}
-    (directory / "config.json").write_text(json.dumps(stated))
+    directory = _respelled(name, tmp_path, lambda config: {**config, "num_nextn_predict_layers": 1})
     model, variables = fp32_decoder(directory)
     assert model.num_nextn_predict_layers == 0 and "mtp_0" not in variables["params"]
     ids = jnp.asarray(np.load(FIXTURES / name / "input_ids.npy"), jnp.int32)

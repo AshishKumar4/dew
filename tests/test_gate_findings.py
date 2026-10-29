@@ -185,6 +185,27 @@ def test_a_test_the_gate_fails_reports_its_findings_as_a_junit_property(tmp_path
     assert found["test_call"][0]["measure"] == raised.value.findings[0].measure
 
 
+def test_a_skip_or_a_failure_outside_the_gate_loads_no_gate(tmp_path):
+    """The report hook reads a test's GateFailure only where the gate is loaded: a skipped or failed test
+    that never imported it loads none, so the files whose tests skip are not keyed on the gate's every
+    change in the test cache (30 of main's 2,204 rows were, 10-29)."""
+    site = tmp_path / "test_site.py"
+    site.write_text("import sys\nimport pytest\n\n\n"
+                    "def test_skipped():\n    pytest.skip('not here')\n\n\n"
+                    "def test_failed():\n    assert False\n\n\n"
+                    "def test_after():\n    assert 'reference_error' not in sys.modules\n")
+    report = tmp_path / "report.xml"
+    tests = Path(__file__).resolve().parent
+    path = os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")])
+    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider",
+                           f"--junitxml={report}", str(site)], cwd=tmp_path,
+                          env={**os.environ, "PYTHONPATH": path})
+    ended = {case.get("name"): [child.tag for child in case]
+             for case in ElementTree.parse(report).iter("testcase")}
+    assert done.returncode == 1 and ended == {"test_skipped": ["skipped"], "test_failed": ["failure"],
+                                              "test_after": []}, ended
+
+
 def test_a_measure_is_finite_where_the_evidence_is_finite_even_past_float64s_largest_quotient():
     """Row 1628: a sized row's error over its size and the zero rows' pooled squares overflowed from
     finite evidence (an error of 1e154 over a row of 1e-160), and the promotion matcher refuses a

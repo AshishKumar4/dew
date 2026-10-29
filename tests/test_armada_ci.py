@@ -338,10 +338,11 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     install_compiler(tmp_path / "tests/compiler")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
-    # The session fixture's files in a task of their own, where it reads for every file.
-    fixtures = ["tests/test_one.py", "tests/test_two.py"]
+    # The session fixture's files in a task of their own, where it reads for every file, and the file whose
+    # helper changes below in one of its own, as what a process ran before a file is that file's input too.
+    fixtures, alone = ["tests/test_one.py", "tests/test_two.py"], ["tests/test_plain.py"]
     ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
-    for tests in ([name for name in ran if name not in fixtures], fixtures):
+    for tests in ([name for name in ran if name not in fixtures + alone], fixtures, alone):
         ci.task("3.12", tests, "", out, 600.0)
         assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
             f"3.12:{name}": 0 for name in tests}
@@ -1452,20 +1453,23 @@ def packed(root: Path, names: list[str]) -> None:
 
 def test_a_reader_files_share_in_one_process_is_every_such_files_input(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A data file a reader opens or probes is the input of every test file its pytest process ran, not
-    only the one that opened or probed it: a session fixture's lazy reader, or a process-lived cache
-    (dew.data.text's load_tokenizer, which asks after a tokenizer's optional files), read under one file
-    serves the next without reading again, so a change to the data, or an optional file's arrival, reruns
-    both (train 239's review, row 1987; the CI bundle's review)."""
+    """A data file a reader opens or probes, and code it runs, is the input of every test file its pytest
+    process ran after it, not only the one that ran it: a session fixture's lazy reader, a process-lived
+    cache (dew.data.text's load_tokenizer, which asks after a tokenizer's optional files), or a module
+    imported inside a test, run under one file serves the next without running again, so a change to the
+    data, an optional file's arrival or a change to the module reruns both (train 239's review, row 1987;
+    the CI bundle's review; row 2228: 256 test files hold ~2,300 imports inside tests)."""
     (tmp_path / "tests/fixtures").mkdir(parents=True)
     (tmp_path / "tests/fixtures/shared.json").write_text("[1]\n")
+    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 1\n")
     (tmp_path / "tests/conftest.py").write_text(
-        "import functools, pytest\nfrom pathlib import Path\n"
+        "import functools, pytest, sys\nfrom pathlib import Path\nsys.path.insert(0, 'tests')\n"
         "@pytest.fixture(scope='session')\ndef vocabulary():\n"
         "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text()\n"
         "                           + str(Path('tests/fixtures/template.jinja').exists()))\n")
     body = ("from pathlib import Path\ndef test_{0}(vocabulary):\n"
-            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n")
+            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n"
+            "    import lazy_values\n    assert lazy_values.VALUE\n")
     written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
     packed(tmp_path, ["test_a.py", "test_b.py"])
     run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("a", "b"))
@@ -1476,6 +1480,8 @@ def test_a_reader_files_share_in_one_process_is_every_such_files_input(
     assert run() == [2, 2]
     (tmp_path / "tests/fixtures/template.jinja").write_text("{{ x }}\n")
     assert run() == [3, 3]
+    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 2\n")
+    assert run() == [4, 4]
 
 
 def test_an_open_after_the_tests_ended_is_the_records_input(ci, tmp_path, monkeypatch, cache_worker):
