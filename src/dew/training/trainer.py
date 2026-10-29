@@ -1548,8 +1548,9 @@ class Trainer(Generic[Loss, Effects]):
             assert profiler is not None
             stop_trace = functools.partial(self._stop_trace, run, profile, profiler)
         error = primary
-        # A failed run's peers may be gone: its logs are written only where no write waits on them.
-        unread = None if primary is None else functools.partial(self._read_taken, run, agree=False)
+        # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
+        # its peers may never finish (`LogWriter.raise_failure`).
+        unread = functools.partial(self._read_taken, run, agree=False)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
                     ("Profiler", stop_trace),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
