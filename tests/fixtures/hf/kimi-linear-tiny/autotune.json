@@ -1,0 +1,594 @@
+{
+ "fla.modules.convolution.causal_conv1d_bwd_kernel": [
+  [
+   [
+    32,
+    4,
+    1,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {
+     "BD": 32
+    },
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 8
+   }
+  ]
+ ],
+ "fla.modules.convolution.causal_conv1d_fwd_kernel": [
+  [
+   [
+    32,
+    4,
+    1,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {
+     "BD": 32
+    },
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  ]
+ ],
+ "fla.modules.fused_norm_gate.layer_norm_gated_bwd_kernel": [
+  [
+   [
+    16,
+    1,
+    true,
+    false,
+    true,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32"
+   ],
+   {
+    "kwargs": {
+     "BT": 16
+    },
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  ]
+ ],
+ "fla.modules.fused_norm_gate.layer_norm_gated_fwd_kernel": [
+  [
+   [
+    16,
+    1,
+    true,
+    false,
+    false,
+    true,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32"
+   ],
+   {
+    "kwargs": {
+     "BT": 16
+    },
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 8
+   }
+  ]
+ ],
+ "fla.modules.l2norm.l2norm_bwd_kernel": [
+  [
+   [
+    16,
+    1,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32"
+   ],
+   {
+    "kwargs": {
+     "BT": 8
+    },
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 1
+   }
+  ]
+ ],
+ "fla.modules.l2norm.l2norm_fwd_kernel": [
+  [
+   [
+    16,
+    1,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32"
+   ],
+   {
+    "kwargs": {
+     "BT": 8
+    },
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 2
+   }
+  ]
+ ],
+ "fla.ops.common.chunk_delta_h.chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64": [
+  [
+   [
+    2,
+    16,
+    16,
+    64,
+    false,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int64"
+   ],
+   {
+    "kwargs": {
+     "BV": 32
+    },
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  ]
+ ],
+ "fla.ops.common.chunk_delta_h.chunk_gated_delta_rule_fwd_kernel_h_blockdim64": [
+  [
+   [
+    2,
+    16,
+    16,
+    64,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int64"
+   ],
+   {
+    "kwargs": {
+     "BV": 32
+    },
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  ],
+  [
+   [
+    2,
+    16,
+    16,
+    64,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int64"
+   ],
+   {
+    "kwargs": {
+     "BV": 32
+    },
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  ]
+ ],
+ "fla.ops.common.chunk_o.chunk_bwd_kernel_dv_local": [
+  [
+   [
+    2,
+    16,
+    16,
+    64,
+    16,
+    16,
+    false,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {},
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  ]
+ ],
+ "fla.ops.gla.chunk.chunk_gla_bwd_kernel_dA": [
+  [
+   [
+    16,
+    64,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {},
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  ]
+ ],
+ "fla.ops.gla.chunk.chunk_gla_fwd_kernel_o": [
+  [
+   [
+    64,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {
+     "BK": 32,
+     "BV": 64
+    },
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 8
+   }
+  ]
+ ],
+ "fla.ops.kda.chunk_inter.chunk_kda_bwd_kernel_inter": [
+  [
+   [
+    64,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {
+     "BK": 32,
+     "BV": 64
+    },
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 8
+   }
+  ]
+ ],
+ "fla.ops.kda.chunk_intra.chunk_kda_bwd_kernel_intra": [
+  [
+   [
+    16,
+    4,
+    64,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {},
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 8
+   }
+  ]
+ ],
+ "fla.ops.kda.chunk_intra.chunk_kda_fwd_kernel_intra_sub_inter": [
+  [
+   [
+    16,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {
+     "BK": 32
+    },
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 2
+   }
+  ]
+ ],
+ "fla.ops.kda.chunk_intra.chunk_kda_fwd_kernel_intra_sub_intra": [
+  [
+   [
+    16,
+    64,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {},
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 1
+   }
+  ]
+ ],
+ "fla.ops.kda.gate.kda_gate_bwd_kernel": [
+  [
+   [
+    2,
+    16,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32"
+   ],
+   {
+    "kwargs": {},
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  ]
+ ],
+ "fla.ops.kda.gate.kda_gate_fwd_kernel": [
+  [
+   [
+    2,
+    16,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32"
+   ],
+   {
+    "kwargs": {
+     "BT": 32
+    },
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  ]
+ ],
+ "fla.ops.kda.wy_fast.prepare_wy_repr_bwd_kernel": [
+  [
+   [
+    2,
+    16,
+    16,
+    64,
+    16,
+    16,
+    true,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {},
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 4
+   }
+  ]
+ ],
+ "fla.ops.kda.wy_fast.recompute_w_u_fwd_kernel": [
+  [
+   [
+    2,
+    16,
+    16,
+    64,
+    64,
+    64,
+    true,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {
+     "DOT_PRECISION": "ieee"
+    },
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 8
+   }
+  ],
+  [
+   [
+    2,
+    16,
+    16,
+    64,
+    64,
+    64,
+    true,
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {
+     "DOT_PRECISION": "ieee"
+    },
+    "num_ctas": 1,
+    "num_stages": 2,
+    "num_warps": 8
+   }
+  ]
+ ],
+ "fla.ops.utils.cumsum.chunk_local_cumsum_vector_kernel": [
+  [
+   [
+    1,
+    2,
+    16,
+    64,
+    true,
+    false,
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {
+     "BS": 32
+    },
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 4
+   }
+  ],
+  [
+   [
+    1,
+    2,
+    16,
+    64,
+    true,
+    true,
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {
+     "BS": 32
+    },
+    "num_ctas": 1,
+    "num_stages": 3,
+    "num_warps": 8
+   }
+  ]
+ ],
+ "fla.ops.utils.solve_tril.merge_16x16_to_64x64_inverse_kernel": [
+  [
+   [
+    2,
+    64,
+    true,
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   {
+    "kwargs": {},
+    "num_ctas": 1,
+    "num_stages": 5,
+    "num_warps": 4
+   }
+  ]
+ ]
+}
