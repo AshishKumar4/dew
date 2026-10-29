@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+import contract
 from guests import GUEST_UIDS
 
 MAX_REQUEST = 32_768
@@ -38,9 +39,50 @@ def text(value, length=4096):
         raise ValueError(f"text must contain at most {length} characters")
 
 
-def fields(value, names):
-    if not isinstance(value, dict) or set(value) != set(names.split()):
+def fields(value, names, optional=""):
+    named = set(names.split())
+    if not isinstance(value, dict) or not named <= set(value) <= named | set(optional.split()):
         raise ValueError("unsupported model request fields")
+
+
+TERMS: dict | None = None
+"""The contract (contract.py's `written`, read from `contract.PATH` at first use), or the one a test sets."""
+
+
+def terms() -> dict:
+    global TERMS
+    if TERMS is None:
+        TERMS = contract.read()
+    return TERMS
+
+
+def guidance_record(value):
+    """A CFG record a cell sent, as Dew's CFG takes it (the contract's fields: each required one given, no
+    other), each field the service bounds within its bounds and any other at Dew's default."""
+    record = {entry["name"]: entry for entry in terms()["CFG"]}
+    if not isinstance(value, dict) or not {name for name, entry in record.items() if "default" not in entry
+                                           and not entry.get("omitted")} <= set(value) <= set(record):
+        raise ValueError("unsupported guidance fields")
+    bounds = {"scale": lambda scale: number(scale, 0, 20), "rescale": lambda rescale: number(rescale, 0, 1),
+              "interval": interval}
+    for name, given in value.items():
+        if name in bounds:
+            bounds[name](given)
+        elif given != record[name].get("default"):
+            raise ValueError(f"the live sampler takes CFG's {name} at its default")
+
+
+def interval(value):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("guidance interval needs two bounds")
+    number(value[0], 0, 1)
+    number(value[1], value[0], 1)
+
+
+def nullable(check, value, *bounds):
+    """`check` of `value`, or None, where Dew takes a task's own default (contract.py)."""
+    if value is not None:
+        check(value, *bounds)
 
 
 def validate(request):
@@ -53,36 +95,34 @@ def validate(request):
         fields(request, "op model prompt tokens key")
         text(request["model"], 256)
         text(request["prompt"])
-        integer(request["tokens"], 1, 64)
+        integer(request["tokens"], 1, contract.TOKENS)
         integer(request["key"], 0, 2**32 - 1)
         return request
     elif op == "sample":
-        fields(request, "op repo revision prompt negative prepare_key prepare_steps "
-                        "key steps solver guidance")
+        # A step count, a solver and guidance left out take the pipeline's own, as Dew's call does (`guidance`
+        # absent, where None is the plain conditional prediction).
+        fields(request, "op repo revision prompt negative prepare_key prepare_steps key steps solver",
+               "guidance")
         text(request["prompt"])
-        text(request["negative"])
+        nullable(text, request["negative"])
         integer(request["key"], 0, 2**32 - 1)
-        integer(request["steps"], 2, 40)
+        nullable(integer, request["steps"], 2, 40)
         integer(request["prepare_key"], 0, 2**32 - 1)
-        integer(request["prepare_steps"], 2, 40)
+        nullable(integer, request["prepare_steps"], 2, 40)
         solver = request["solver"]
-        fields(solver, "name args")
-        if solver["name"] not in ("DPMSolverMultistep", "Heun", "EulerAncestral") or solver["args"]:
-            raise ValueError("the live sampler supports the displayed solvers with their default settings")
-        guidance = request["guidance"]
-        if guidance is None:
+        if solver is not None:
+            fields(solver, "name args")
+            if solver["name"] not in terms()["solvers"] or solver["args"]:
+                raise ValueError("the live sampler supports the displayed solvers with their default "
+                                 "settings")
+        guidance = request.get("guidance")
+        if guidance is None or type(guidance) in (int, float):
+            nullable(number, guidance, 0, 20)
             text(request["repo"], 256)
             if request["revision"] is not None:
                 text(request["revision"], 64)
             return request
-        fields(guidance, "scale interval rescale")
-        number(guidance["scale"], 0, 20)
-        number(guidance["rescale"], 0, 1)
-        interval = guidance["interval"]
-        if not isinstance(interval, (list, tuple)) or len(interval) != 2:
-            raise ValueError("guidance interval needs two bounds")
-        number(interval[0], 0, 1)
-        number(interval[1], interval[0], 1)
+        guidance_record(guidance)
     else:
         raise ValueError("unsupported model operation")
     text(request["repo"], 256)
@@ -98,22 +138,24 @@ class NativeModels:
         import progress
 
         import dew
+        from dew import sampling
         from dew.inference import Server
         from dew.interop import PretrainedDecoder
-        from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling
+        from dew.sampling import CFG, Sampling
 
         print("MODEL_PHASE", time.time(), "pipeline load", flush=True)
         self.np, self.progress = np, progress
         self.cfg = CFG
-        self.solvers = {solver.__name__: solver for solver in (DPMSolverMultistep, EulerAncestral, Heun)}
+        self.solvers = {name: getattr(sampling, name) for name in terms()["solvers"]}
         self.repo, self.revision = (root / "text-to-image").read_text().strip().split("@")
         self.pipe = progress.Reporting(dew.pipeline(self.repo, revision=self.revision))
         self.text_servers = {}
         for line in (root / "text-models").read_text().split():
             name, _ = line.split("@")
             print("MODEL_PHASE", time.time(), "text load", name, flush=True)
-            bundle = PretrainedDecoder.load(f"/opt/models/{name}", dtype=jnp.float32, max_seq_len=256)
-            task = bundle.text_generation(sampling=Sampling(temperature=0))
+            bundle = PretrainedDecoder.load(f"/opt/models/{name}", **{
+                **contract.LOADED, "dtype": getattr(jnp, contract.LOADED["dtype"])})
+            task = bundle.text_generation(sampling=Sampling(**contract.GREEDY))
             self.text_servers[name] = Server.from_task(task, slots=CAPACITY, capacity=256)
         print("MODEL_PHASE", time.time(), "warm sample", flush=True)
         self.sample({"repo": self.repo, "revision": self.revision,
@@ -137,18 +179,19 @@ class NativeModels:
 
     def sample(self, request, emit):
         self.describe(request)
-        options = request["guidance"]
-        guidance = (None if options is None else
-                    self.cfg(options["scale"], interval=tuple(options["interval"]),
-                             rescale=options["rescale"]))
+        options = request.get("guidance")
+        guided = ({} if "guidance" not in request else
+                  {"guidance": options if options is None or type(options) in (int, float) else
+                   self.cfg(**{name: tuple(given) if isinstance(given, list) else given
+                               for name, given in options.items()})})
         inputs = self.pipe.prepare([request["prompt"]], key=request["prepare_key"],
-                                   steps=request["prepare_steps"],
-                                   unconditional=request["negative"])
+                                   steps=request["prepare_steps"], unconditional=request["negative"])
         previous = self.progress._show
         self.progress._show = lambda report, png=None: emit({"progress": report, "png": png})
         try:
-            result = self.pipe(inputs, key=request["key"], steps=request["steps"], guidance=guidance,
-                               solver=self.solvers[request["solver"]["name"]]()).host()
+            solver = request["solver"]
+            result = self.pipe(inputs, key=request["key"], steps=request["steps"], **guided,
+                               solver=None if solver is None else self.solvers[solver["name"]]()).host()
         finally:
             self.progress._show = previous
         if not self.np.isfinite(self.np.asarray(result.images)).all():

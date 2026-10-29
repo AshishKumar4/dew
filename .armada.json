@@ -8,21 +8,21 @@
             "tests/fixtures/**/*.fetched.json"],
     "smoke": ".venv-3.12/bin/python -c 'import dew' && .venv-3.14/bin/python -c 'import dew'"
   },
-  "history": "commit",
+  "history": "full",
   "env": { "JAX_PLATFORMS": "cpu", "PYTHONFAULTHANDLER": "1",
            "DEW_XLA_CACHE_URL": "https://dew-xla-cache.ashishkmr472.workers.dev" },
   "pool": 375,
   "size": "auto",
-  "target": 240,
+  "target": 120,
   "plan": { "command": ["python3", "tools/armada/ci.py", "plan", "--target={target}", "--timings={timings}"],
             "local": true },
   "task": {
     "command": ["python3", "tools/armada/ci.py", "task", "--python={python}", "--tests={tests}", "--split={split}",
-                "--out={out}", "--cache={cache}"],
+                "--out={out}", "--cache={cache}", "--whole={whole}"],
     "timeout": 1800,
     "mode": "fast",
     "speculative": true,
-    "cpu": { "vendor": "AuthenticAMD", "family": 25, "model": 17 },
+    "cpu": [{ "vendor": "AuthenticAMD", "family": 25, "model": 17 }, { "vendor": "AuthenticAMD", "family": 26, "model": 17 }],
     "secrets": ["DEW_XLA_CACHE_TOKEN"]
   }
 }

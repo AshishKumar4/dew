@@ -31,14 +31,7 @@ import torch
 import transformers
 from interop_support import token_draw
 from jax.sharding import PartitionSpec as P
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    equations,
-    torch_with_gradients,
-    with_gradients,
-)
+from reference_error import as_given, assert_as_exact, equations, torch_with_gradients, with_gradients
 
 from dew.batch import coordinates
 from dew.data.dataset import Loader
@@ -758,37 +751,60 @@ def test_a_float64_forwards_logits_are_as_wide_as_its_output_tables(tokens, tmp_
     assert direct.dtype == table.dtype == jnp.float64
 
 
+TORCHAX_SEEDS = 8
+"""The float32 torchax model's declared draws of token ids against torch's forward (check 1), sized by
+`seeds_for` paired with the model on an A100."""
+
+
 @pytest.mark.gpu(reason="TF32 is a GPU's default float32 product")
-def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tokens, tmp_path):
+def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_path):
     """On a GPU, a float32 torchax model's own logits and its output table's over the same
-    states are each as exact as torch's float32 forward, from torch's in float64, under JAX's own
-    default precision (the test lane sets 'highest' for every product that states none)."""
+    states are each on par with torch's float32 forward from torch's in float64 over drawn token
+    ids (check 1), under JAX's own default precision (the test lane sets 'highest' for every
+    product that states none)."""
     loaded = tied_float32(tmp_path)
-    ids = tokens[:, :SEQ]
     model = head_model("tied")
-    with jax.default_matmul_precision(None):
-        direct = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)), np.float64)
-        hidden = loaded.model.apply(loaded.variables, jnp.asarray(ids), method="hidden_states")
-        table = np.asarray(loaded.model.apply(loaded.variables, method="output_table").logits(hidden),
-                           np.float64)
-    reference = torch_logits(model, ids).astype(np.float64)
-    with float64(), torch.no_grad():
+    with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
-        wide.load_state_dict(model.state_dict())
-        truth = wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
-    assert_as_exact_as_the_reference(direct, reference, truth, "the forward's logits")
-    assert_as_exact_as_the_reference(table, reference, truth, "the output table's logits")
+    wide.load_state_dict(model.state_dict())
+
+    def draw(seed):
+        return (np.random.RandomState(seed).randint(0, TINY["vocab_size"], (ROWS, SEQ)).astype(np.int32),)
+
+    @as_given
+    def ours(ids):
+        # Run as the model runs, eagerly, at JAX's default precision.
+        with jax.default_matmul_precision(None):
+            direct = loaded.model.apply(loaded.variables, jnp.asarray(ids))
+            hidden = loaded.model.apply(loaded.variables, jnp.asarray(ids), method="hidden_states")
+            table = loaded.model.apply(loaded.variables, method="output_table").logits(hidden)
+        return {"forward": np.asarray(direct), "output table": np.asarray(table)}
+
+    def torch_twice(run):
+        """Torch's logits for both of Dew's leaves."""
+        def both(ids):
+            logits = run(np.asarray(ids))
+            return {"forward": logits, "output table": logits}
+        return as_given(both)
+
+    def truth(ids):
+        with float64(), torch.no_grad():
+            return wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
+
+    assert_as_exact(ours, torch_twice(lambda ids: torch_logits(model, ids).astype(np.float64)), draw,
+                    "a float32 torchax model's logits", seeds=TORCHAX_SEEDS, truth_fn=torch_twice(truth))
 
 
-STATES_SEEDS = {"cohere": 8, "cohere2": 8, "cohere2 keyed": 8}
+STATES_SEEDS = {"cohere": 8, "cohere runs": 8, "cohere2": 8, "cohere2 keyed": 8}
 """The final states' declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
 def slotted_rows(seed):
     """A drawn option-slot row as a decision readout lays it: a prompt every token sees, then options
     each seeing the prompt and itself causally and no other option, positions restarting after the
-    prompt for each option; its tokens, `[B, S, S]` visibility and `[B, S]` positions."""
+    prompt for each option; its tokens, `[B, S, S]` visibility, `[B, S]` positions and `[B, S]` option slots
+    (0 the prompt's, `DecisionInputs.slots`)."""
     rng = np.random.default_rng([0x1657, seed])
     prompt = int(rng.integers(3, 7))
     lengths = rng.integers(1, 4, 3)
@@ -801,7 +817,8 @@ def slotted_rows(seed):
     visible = (order[:, None] >= order[None, :]) & shared
     tokens = rng.integers(0, COHERE_VOCAB, (2, length)).astype(np.int32)
     rows = (2, length, length)
-    return tokens, np.broadcast_to(visible, rows).copy(), np.tile(positions, (2, 1)).astype(np.int32)
+    return (tokens, np.broadcast_to(visible, rows).copy(), np.tile(positions, (2, 1)).astype(np.int32),
+            np.tile(group, (2, 1)).astype(np.int32))
 
 
 COHERE_VOCAB = transformers.CohereConfig(**COHERE).vocab_size
@@ -809,18 +826,19 @@ COHERE_VOCAB = transformers.CohereConfig(**COHERE).vocab_size
 
 @pytest.mark.parametrize("case", sorted(STATES_SEEDS))
 def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
-    """A tier-3 model whose head is no plain product (Cohere's logits are scaled) gives the states its
-    head reads (`hidden_states`), transformers' final normed states, under a stated visibility (an
-    option-slot row's) at its tokens' positions, and its head over given states (`logits_from_hidden`),
-    transformers' logits; Cohere 2's window keeps each query to the keys within it of the stated keys'
-    positions where the call states them (`keyed`), and leaves the stated visibility whole where not,
-    as Dew's own attention reads them. Each as exact as transformers' own float32 from its float64 twin
-    (check 1), transformers given the same masks, a window's layers theirs, and position ids. A decision
-    head sizes itself to the states (`DecisionModel.head_size`), which the model's initialization
-    traces."""
-    from dew.decision.model import DecisionModel
+    """A tier-3 model whose head is no plain product (Cohere's logits are scaled) gives the states its head
+    reads (`hidden_states`), transformers' final normed states, under a stated visibility (an option-slot
+    row's) at its tokens' positions, and its head over given states (`logits_from_hidden`), transformers'
+    logits; Cohere 2's window keeps each query to the keys within it of the stated keys' positions where
+    the call states them (`keyed`), and leaves the stated visibility whole where not, as Dew's own
+    attention reads them; the visibility stated as the decision model states it, key runs (`runs`,
+    `decision.model.key_runs`), reads as its mask. Each as exact as transformers' own float32 from its
+    float64 twin (check 1), transformers given the same masks, a window's layers theirs, and position ids.
+    A decision head sizes itself to the states (`DecisionModel.head_size`), which the model's
+    initialization traces."""
+    from dew.decision.model import DecisionModel, key_runs
 
-    family, keyed = case.split(" ")[0], case.endswith("keyed")
+    family, keyed, runs = case.split(" ")[0], case.endswith("keyed"), case.endswith("runs")
     torch.manual_seed(0)
     model = PACKED_MODELS[family]().eval()
     model.save_pretrained(tmp_path)
@@ -835,15 +853,17 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
     window = getattr(model.config, "sliding_window", None)
 
     @jax.jit
-    def ours_jitted(variables, tokens, visible, positions):
+    def ours_jitted(variables, tokens, visible, positions, slots):
         keys = {"attention_key_positions": positions} if keyed else {}
-        hidden = loaded.model.apply(variables, tokens, positions=positions, attention_pairwise_mask=visible,
-                                    method="hidden_states", **keys)
+        stated = ({"attention_key_runs": key_runs(slots, jnp.ones_like(slots), 3, causal=True)} if runs
+                  else {"attention_pairwise_mask": visible})
+        hidden = loaded.model.apply(variables, tokens, positions=positions, method="hidden_states", **stated,
+                                    **keys)
         return hidden, loaded.model.apply(variables, hidden, method="logits_from_hidden")
 
     @as_given
-    def ours(tokens, visible, positions):
-        hidden, logits = ours_jitted(loaded.variables, tokens, visible, positions)
+    def ours(tokens, visible, positions, slots):
+        hidden, logits = ours_jitted(loaded.variables, tokens, visible, positions, slots)
         return {"states": np.asarray(hidden, np.float64), "logits": np.asarray(logits, np.float64)}
 
     def masks(visible, positions, dtype):
@@ -859,7 +879,8 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
         return {kind: additive(near if kind == "sliding_attention" else visible) for kind in types}
 
     def theirs(source, dtype):
-        def run(tokens, visible, positions):
+        def run(tokens, visible, positions, slots):
+            del slots
             mask = masks(visible, positions, dtype)
             with torch.no_grad():
                 out = source(input_ids=torch.from_numpy(tokens).long(),
@@ -920,6 +941,7 @@ def slot_request(seed):
                                                    "criteria": dict.fromkeys(options)}}}
 
 
+@pytest.mark.whole_suite
 def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers_states(tmp_path):
     """A slot release whose backbone no registered family computes loads it as tier 3 and decides
     over it: each option's score is the release's law (`SlotReadout`: `<slot_i, h> + <q h, k m_i> /

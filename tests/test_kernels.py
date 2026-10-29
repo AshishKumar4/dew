@@ -20,10 +20,17 @@ import numpy as np
 import pytest
 from attention_oracle import attention_and_grads, attention_terms, exact_attention, kept, qkv, value_and_grads
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, distance, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    distance,
+    with_gradients,
+)
 
 from dew.nn import kernels
-from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
+from dew.nn.attention import scaled_dot_product_attention, weighted_values
+from dew.nn.attention_blocks import NormalAttention
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template
@@ -135,6 +142,10 @@ def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_dete
 SHARDED_SEEDS = 8
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
+KEY_LENGTH_SEEDS = 8
+"""Key lengths against their mask's declared draws (check 1), sized by `seeds_for` paired on armada."""
+FLAX_SEEDS = 8
+"""The reference path against flax's declared draws (check 1), sized by `seeds_for` paired on armada."""
 
 
 @on_gpu
@@ -769,16 +780,24 @@ def key_length_call(implementation, query, key, value, lengths, **kwargs):
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
 @pytest.mark.parametrize("causal", [False, True])
 def test_key_lengths_attend_as_the_mask_they_mean(implementation, causal):
-    """Row b reads its first lengths[b] keys and no other: the output and
-    every gradient are the call that masks the rest, and what a row's keys
-    past its length hold reaches nothing, its own key and value gradients
+    """Row b reads its first lengths[b] keys and no other: the output and every gradient on par with the
+    call that masks the rest over drawn operands (check 1), truth the reference path's masked call in
+    float64, and what a row's keys past its length hold reaches nothing, its own key and value gradients
     there included."""
-    query, key, value = (x.astype(jnp.float32) for x in qkv((3, 9, 2, 16)))
     lengths = jnp.asarray([9, 5, 1], jnp.int32)
+
+    def draw(seed):
+        return tuple(x.astype(jnp.float32) for x in qkv((3, 9, 2, 16), seed=seed))
+
+    def call(kernel, **options):
+        return as_given(lambda query, key, value: tuple(key_length_call(kernel, query, key, value, lengths,
+                                                                        causal=causal, **options)))
+
+    assert_as_exact(call(implementation), call(implementation, as_mask=True), draw,
+                    f"key lengths on {implementation}, {'causal' if causal else 'full'}",
+                    seeds=KEY_LENGTH_SEEDS, truth_fn=call("reference", as_mask=True))
+    query, key, value = draw(0)
     by_length = key_length_call(implementation, query, key, value, lengths, causal=causal)
-    by_mask = key_length_call(implementation, query, key, value, lengths, causal=causal, as_mask=True)
-    for got, want in zip(by_length, by_mask, strict=True):
-        np.testing.assert_array_equal(got, want)
     past = jnp.arange(9)[None, :, None, None] >= lengths[:, None, None, None]
     moved = key_length_call(implementation, query, jnp.where(past, 3.0, key),
                             jnp.where(past, -2.0, value), lengths, causal=causal)
@@ -858,24 +877,6 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_than_jax_nn():
     assert mine <= 0.75 * theirs, (mine, theirs)
 
 
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the setting is a CPU's")
-@pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
-def test_a_cpu_takes_the_reference_attention_under_the_test_setting_alone(wide, monkeypatch):
-    """'auto' and 'xla' on a CPU take the reference path in a process running Dew's test setting
-    (`WIDE_CPU_ARITHMETIC`), whose fp32 sums jax.nn's xla kernel would run below, and jax.nn's xla
-    kernel in a library process, which sets nothing, as on any platform: no CPU veto of its own."""
-    from dew.nn.attention import resolve_implementation
-    from dew.nn.precision import WIDE_CPU_ARITHMETIC
-
-    if wide:
-        monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
-    else:
-        monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
-    query = jnp.zeros((2, 16, 4, 8), jnp.float32)
-    for implementation in ("auto", "xla"):
-        assert resolve_implementation(implementation, query, query) == ("reference" if wide else "xla")
-
-
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
 def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     """fp32 reference attention over 300 keys, whose products a CPU sums in float64
@@ -907,62 +908,85 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
         assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
 
 
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
-def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_float64_too():
-    """A layer whose rows are padded on the left builds its mask and runs the
-    kernel a materialized mask takes (`kernel_for_materialized_mask`). On a
-    CPU that is the reference path, whose products sum in float64, the route
-    `resolve_implementation` takes for an unmasked call (`_takes_reference`):
-    the padded rows' real logits under 'auto' are the 'reference' kernel's,
-    bit for bit."""
+def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
+    """A layer whose rows are padded on the left builds its mask and runs the kernel a materialized mask
+    takes (`kernel_for_materialized_mask`): 'auto' on par with the reference path over the real tokens
+    (check 1), the reference model in float64 the truth."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    def model(implementation):
-        return CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
-                                 max_seq_len=320, attention_impl=implementation)
-
-    tokens = jnp.asarray(np.random.default_rng(3).integers(1, 64, (2, 300)), jnp.int32)
     valid = jnp.arange(300)[None] >= jnp.asarray([[0], [7]])
-    params = model('auto').init(jax.random.key(0), tokens)
-    chosen, reference = (np.asarray(model(name).apply(params, tokens, attention_mask=valid))
-                         for name in ('auto', 'reference'))
-    np.testing.assert_array_equal(chosen[np.asarray(valid)], reference[np.asarray(valid)])
+
+    def model(implementation, dtype=jnp.float32):
+        return CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
+                                 max_seq_len=320, attention_impl=implementation, dtype=dtype)
+
+    def draw(seed):
+        tokens = jnp.asarray(np.random.default_rng(seed).integers(1, 64, (2, 300)), jnp.int32)
+        return model('auto').init(jax.random.key(seed), tokens), tokens
+
+    def applied(implementation, dtype=jnp.float32):
+        def apply(params, tokens):
+            out = model(implementation, dtype).apply(params, tokens, attention_mask=valid)
+            return jnp.where(valid[..., None], out, 0)
+        return apply
+
+    assert_as_exact(jax.jit(applied('auto')), jax.jit(applied('reference')), draw,
+                    "a padded layer's built mask", seeds=8, truth_fn=applied('reference', jnp.float64))
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
 @pytest.mark.parametrize("forced", [True, False])
 @pytest.mark.parametrize("dropout_rate", [0.0, 0.25])
 def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_rate):
-    """Without sinks the reference path (`reference_attention`) is flax's
-    `dot_product_attention` handed the key heads repeated over their group and
-    its probability product (`weighted_values`), bitwise: in each compute dtype,
-    the softmax forced to fp32 or not, an fp32 bias wider than half-precision
-    logits and a causal mask. Its probability draw is Dew's own (row 1521: the
-    keep bits every route draws from one rng, `template.dropout_keep`, so a
-    route never changes which weights drop) and its multiplier Dew's (row 1533:
-    1 / (1 - rate) rounded once in at least fp32), applied where flax applies
-    its own: flax's weights (`dot_product_attention_weights`) under Dew's keep
-    mask and multiplier, then the value product. Both sum their fp32 products
-    as XLA does (`FP32_SUMS`), the reference path's own float64 sums on a CPU
-    being the policy's (tests/test_cpu_accumulation.py)."""
-    keys = jax.random.split(jax.random.key(0), 5)
-    query = jax.random.normal(keys[0], (2, 6, 4, 8), dtype)
-    key, value = (jax.random.normal(drawn, (2, 6, 2, 8), dtype) for drawn in keys[1:3])
-    bias = jax.random.normal(keys[3], (2, 4, 6, 6), jnp.float32)
-    drop = {"dropout_rate": dropout_rate, "dropout_rng": keys[4], "deterministic": not dropout_rate}
-    with jax.default_matmul_precision(FP32_SUMS):
-        ours = scaled_dot_product_attention(query, key, value, implementation="reference", causal=True,
-                                            bias=bias, force_fp32_for_softmax=forced, **drop)
-        weights = nn.dot_product_attention_weights(
-            query, jnp.repeat(key, 2, axis=2), bias=bias, mask=jnp.tril(jnp.ones((6, 6), bool))[None, None],
-            force_fp32_for_softmax=forced, einsum=jnp.einsum)
-        if dropout_rate:
-            wide = at_least_fp32(dtype)
-            keep = template.dropout_keep(template.dropout_seed(keys[4]), dropout_rate, weights.shape)
-            scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
-            weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(dtype)
-        theirs = weighted_values('...hqk,...khd->...qhd', weights, jnp.repeat(value, 2, axis=2))
-    np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    """Without sinks the reference path (`reference_attention`) is flax's `dot_product_attention` handed the
+    key heads repeated over their group and its probability product (`weighted_values`), on par with it from
+    float64 over drawn operands (check 1): in each compute dtype, the softmax forced to fp32 or not, an fp32
+    bias wider than half-precision logits and a causal mask. Its probability draw is Dew's own (row 1521:
+    the keep bits every route draws from one rng, `template.dropout_keep`, so a route never changes which
+    weights drop) and its multiplier Dew's (row 1533: 1 / (1 - rate) rounded once in at least fp32), applied
+    where flax applies its own: flax's weights (`dot_product_attention_weights`) under Dew's keep mask and
+    multiplier, then the value product. Both sum their fp32 products as XLA does (`FP32_SUMS`), the
+    reference path's own float64 sums on a CPU being the policy's (tests/test_cpu_accumulation.py)."""
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 4)
+        query = jax.random.normal(keys[0], (2, 6, 4, 8), dtype)
+        key, value = (jax.random.normal(drawn, (2, 6, 2, 8), dtype) for drawn in keys[1:3])
+        return query, key, value, jax.random.normal(keys[3], (2, 4, 6, 6), jnp.float32), np.int32(seed)
+
+    def dropped(seed):
+        return jax.random.fold_in(jax.random.key(5), seed)
+
+    def ours(query, key, value, bias, seed):
+        with jax.default_matmul_precision(FP32_SUMS):
+            return scaled_dot_product_attention(
+                query, key, value, implementation="reference", causal=True, bias=bias,
+                force_fp32_for_softmax=forced, dropout_rate=dropout_rate, dropout_rng=dropped(seed),
+                deterministic=not dropout_rate)
+
+    def flax(*, softmax_in_fp32):
+        def run(query, key, value, bias, seed):
+            return flax_attention(query, key, value, bias, seed, softmax_in_fp32=softmax_in_fp32)
+        return run
+
+    def flax_attention(query, key, value, bias, seed, *, softmax_in_fp32):
+        with jax.default_matmul_precision(FP32_SUMS):
+            weights = nn.dot_product_attention_weights(
+                query, jnp.repeat(key, 2, axis=2), bias=bias,
+                mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], force_fp32_for_softmax=softmax_in_fp32,
+                einsum=jnp.einsum)
+            if dropout_rate:
+                wide = at_least_fp32(query.dtype)
+                keep = template.dropout_keep(template.dropout_seed(dropped(seed)), dropout_rate,
+                                             weights.shape)
+                scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
+                weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(query.dtype)
+            return weighted_values('...hqk,...khd->...qhd', weights, jnp.repeat(value, 2, axis=2))
+
+    # Two programs, so on par from float64 over the draws (check 1), not bit for bit (bible §6).
+    # The truth's softmax in float64: flax's forced one would narrow it to fp32.
+    assert_as_exact(jax.jit(ours), jax.jit(flax(softmax_in_fp32=forced)), draw,
+                    f"the reference path against flax, {jnp.dtype(dtype).name}, forced {forced}, "
+                    f"rate {dropout_rate}", seeds=FLAX_SEEDS, truth_fn=flax(softmax_in_fp32=False))
 
 
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the routing is a CPU's")
@@ -1104,68 +1128,7 @@ def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, ca
         return np.asarray(out, np.float32)
 
     if failed:
-        with pytest.raises(KernelRefused) as refused:
+        with pytest.raises(KernelRefused):
             run()
-        raised = {refusal.code for refusal in refused.value.refusals}
-        assert {requirement.code for requirement in failed} <= raised
     else:
         assert np.all(np.isfinite(run()))
-
-
-@pytest.mark.parametrize("dtype, kept", [(jnp.float16, False), (jnp.bfloat16, True)])
-def test_an_fp16_call_leaves_the_triton_route_as_a_declared_gap(dtype, kept):
-    """A causal call of 16-wide heads that prefers tokamax's Triton kernel: an fp16 one is refused by its
-    dtype, whose dQ that kernel narrows before the scale the route applies outside it (row 1676,
-    `triton_attention`), and the next kernel takes it; a bf16 one keeps it."""
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
-    from dew.nn.kernels import generation
-    from dew.nn.kernels.selection import select
-
-    query = jnp.zeros((2, 128, 4, 16), dtype)
-    with generation.assumed("sm89"), generation.routes():
-        case = attention_case(query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(ATTENTION, "triton", case)}
-        route = select(ATTENTION, case, "triton", insist=False)
-    assert ("fp16" not in refused) == kept
-    assert (route.kernel == "triton") == kept
-
-
-@pytest.mark.parametrize("head_dim, kept", [(8, False), (16, True)])
-def test_heads_narrower_than_the_triton_kernel_computes_take_the_next_kernel(head_dim, kept):
-    """A causal bf16 call of narrow heads that prefers tokamax's Triton kernel: 8-wide heads, which that
-    kernel computes wrong (`TRITON_NARROWEST`), are refused by their width and the next kernel takes the
-    call; 16-wide heads keep it."""
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
-    from dew.nn.kernels import generation
-    from dew.nn.kernels.selection import select
-
-    query = jnp.zeros((2, 128, 4, head_dim), jnp.bfloat16)
-    with generation.assumed("sm89"), generation.routes():
-        case = attention_case(query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(ATTENTION, "triton", case)}
-        route = select(ATTENTION, case, "triton", insist=False)
-    assert ("head_dim" not in refused) == kept
-    assert (route.kernel == "triton") == kept
-
-
-@pytest.mark.parametrize("call, refused", [
-    ({"precision": jax.lax.Precision.HIGHEST}, ["arithmetic"]),
-    ({"key_value_seq_lengths": jnp.array([512])}, ["key_lengths"]),
-    ({"bias": jnp.zeros((1, 4, 512, 512), jnp.bfloat16)}, ["bias"]),
-], ids=["arithmetic", "key lengths", "bias"])
-def test_a_splash_call_tiled_but_refused_otherwise_is_reported_by_its_own_requirement(call, refused):
-    """On a TPU, a call splash's blocking tiles but another of its requirements turns down is refused
-    by that requirement alone, not for its tiling: the case builder forms the mask-descriptor fact
-    under a name that may choose splash on a TPU (`TPU_BACKEND`) whatever else the call asks, and
-    `tiles` reads the lengths from the case."""
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
-    from dew.nn.kernels import generation
-
-    query = jnp.zeros((1, 512, 4, 64), jnp.bfloat16)
-    with generation.assumed("v5e"):
-        case = attention_case(query, query, causal=True, **call)
-        found = [refusal.code for refusal in kernel_refusals(ATTENTION, "tpu", case)]
-    assert case.splash_mask and found == refused

@@ -13,7 +13,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew._model_types import GEMMA4_TYPES
-from dew.batch import Coordinates, coordinates as build_coordinates
+from dew.batch import Coordinates, coordinates as build_coordinates, prefix_sum, token_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
@@ -371,11 +371,12 @@ class MultimodalTransformer(DecoderWrapper):
         token fields as the main decoder (`hidden_states`)."""
         _, media = CrossContext.parted(conditioning)
         fused = self._fused(tokens, image_indices, audio_indices, media, train=train)
+        # The tokens' layout converted once (`token_coordinates`); the language model reads it alone.
+        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
+                                        positions=positions)
         return self.language_model.mtp_hidden_states(
-            hidden, fused.tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=fused.embeddings, attention_mask=attention_mask,
-            image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
-            coordinates=coordinates)
+            hidden, fused.tokens, train=train, input_embeddings=fused.embeddings, image_groups=image_groups,
+            block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates)
 
     def mtp_logits(self, hidden, tokens, **kwargs):
         """Return the shared language head's logits for each media-aware prediction depth."""
@@ -423,10 +424,8 @@ class MultimodalTransformer(DecoderWrapper):
         """
         # The tokens as the decoder reads them (`Coordinates`), whichever fields the caller gave
         # them in, so the cursor counts the places the layers do.
-        if coordinates is None and (segment_ids is not None or attention_mask is not None
-                                    or positions is not None or right_padded):
-            coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
-                                            positions=positions, right_padded=right_padded)
+        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
+                                        positions=positions, right_padded=right_padded)
         if decode:
             allocated = self.has_variable("cache", POSITION)
             cursor = self.variable("cache", POSITION, jnp.zeros, (tokens.shape[0],), jnp.int32)
@@ -434,7 +433,7 @@ class MultimodalTransformer(DecoderWrapper):
                      else coordinates.valid)
             positions = None if coordinates is None else coordinates.positions
             if rotary_positions is None and positions is None:
-                positions = cursor.value[:, None] + jnp.cumsum(valid, axis=1) - 1
+                positions = cursor.value[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
                 coordinates = (build_coordinates(tokens.shape, positions=positions) if coordinates is None
                                else dataclasses.replace(coordinates, positions=positions))
             # The response's rule (`next_position`): past the last real token's position, or past
@@ -464,21 +463,20 @@ class MultimodalTransformer(DecoderWrapper):
                  conditioning: Mapping[str, jax.Array] | None = None,
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                  audio_indices=None, coordinates: Coordinates | None = None):
-        hidden = self.hidden_states(tokens, train=train, decode=decode, positions=positions,
-                                    segment_ids=segment_ids, image_indices=image_indices,
-                                    conditioning=conditioning, attention_mask=attention_mask,
-                                    image_groups=image_groups, block_groups=block_groups,
-                                    rotary_positions=rotary_positions, audio_indices=audio_indices,
-                                    coordinates=coordinates)
+        # The call's token layout converted once (`token_coordinates`), read alone from here on.
+        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
+                                        positions=positions)
+        hidden = self.hidden_states(tokens, train=train, decode=decode, image_indices=image_indices,
+                                    conditioning=conditioning, image_groups=image_groups,
+                                    block_groups=block_groups, rotary_positions=rotary_positions,
+                                    audio_indices=audio_indices, coordinates=coordinates)
         if self.is_initializing() and self.language_model.dspark is not None:
             self.language_model.reach_drafter(tokens, hidden.dtype)
         if self.is_initializing() and self.num_nextn_predict_layers:
-            self.mtp_hidden_states(hidden, tokens, train=train, positions=positions,
-                                   segment_ids=segment_ids, image_indices=image_indices,
-                                   conditioning=conditioning, attention_mask=attention_mask,
-                                   image_groups=image_groups, block_groups=block_groups,
-                                   rotary_positions=rotary_positions, audio_indices=audio_indices,
-                                   coordinates=coordinates)
+            self.mtp_hidden_states(hidden, tokens, train=train, image_indices=image_indices,
+                                   conditioning=conditioning, image_groups=image_groups,
+                                   block_groups=block_groups, rotary_positions=rotary_positions,
+                                   audio_indices=audio_indices, coordinates=coordinates)
         return self.language_model.logits_from_hidden(hidden)
 
     def logits(self, tokens, *, train: bool = False, **fields):

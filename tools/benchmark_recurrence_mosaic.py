@@ -34,13 +34,13 @@ from benchmark_recurrence import SHAPES, operands
 from jax.experimental.mosaic.gpu import profiler
 
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk, recomputing
 
 DELTA = ('qwen3.5-27b-gdn', 'qwen3-next-gdn', 'kimi-linear-kda')
 """The delta-rule shapes the template's forward takes: a decay a head (Qwen3.5-27B's and Qwen3-Next's
 gated delta nets) and a key dimension's (Kimi Linear's)."""
 
-ROUTES = {'mosaic': {'mainloop': 'mosaic'}, 'port': {}, 'xla': {}}
+ROUTES = {'mosaic': {'mainloop': 'mosaic'}, 'mosaic-recompute': {'mainloop': 'mosaic'}, 'port': {}, 'xla': {}}
 """Each arm's route through the chunked op; the port's and the portable math's under
 `generation.chosen(gated_delta_rule=...)` (`NAMED`)."""
 
@@ -91,8 +91,10 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
     def trained(*args):
         # The forward's results returned with the gradients, as a training step reads both: a pass
         # returning the gradients alone leaves XLA to drop every forward launch the backward does not
-        # read (each arm's output launch).
-        out, pull = jax.vjp(forward, *args)
+        # read (each arm's output launch). The recomputing arm keeps no memories for its backward, as the
+        # remat rung 'delta_memory' asks (`recurrence_chunk.recomputing`).
+        with recomputing(('delta_memory',) if arm.endswith('-recompute') else ()):
+            out, pull = jax.vjp(forward, *args)
         return out, pull(jax.tree.map(jnp.ones_like, out))
 
     timed = trained if training else forward

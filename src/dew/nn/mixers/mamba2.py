@@ -57,52 +57,26 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
-from jax.sharding import PartitionSpec as P
 
-from dew.mesh import SEQUENCE_AXIS, LayoutRefused, logical_spec
-from dew.nn.attention import repeat_kv_heads, unweighted_rmsnorm
+from dew.mesh import SEQUENCE_AXIS, LayoutRefused
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
-from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_conv1d, held_scan, real_tail
+from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, sequence_conv
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
+from dew.nn.norms import unweighted_rmsnorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
-from dew.nn.sharding import logical_axes, manual_map, sequence_shards
+from dew.nn.sharding import logical_axes, sequence_shards
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
 chunked and the recurrent form agree at any size."""
-
-def _entering_state(decay, write, axis: str):
-    """The state entering this shard of a sequence the mesh axis `axis`
-    splits, inside a `shard_map` that holds it manual.
-
-    Shard r's span is affine in its entering state: it leaves `exp(A_r) h +
-    B_r`, with `decay` `A_r` `[B, H]` and `write` `B_r` `[B, H, P, N]`. Spans
-    compose as `(A_1 + A_2, exp(A_2) B_1 + B_2)`, associative with identity
-    `(0, 0)`, what `ppermute` hands a shard with no source. So the prefix is a
-    Kogge-Stone scan, shifts 1, 2, 4, ... for `ceil(log2 n)` rounds and one more
-    to make it exclusive (zero on the first shard), one pair per shard per
-    round where lm-engine's `_SerialPrefixScan` gathers all n. Autodiff
-    transposes each `ppermute`."""
-    shards = jax.lax.axis_size(axis)
-
-    def shifted(value, shift: int):
-        return jax.lax.ppermute(value, axis, [(r, r + shift) for r in range(shards - shift)])
-
-    shift = 1
-    while shift < shards:
-        earlier_decay, earlier_write = shifted(decay, shift), shifted(write, shift)
-        write = jnp.exp(decay)[..., None, None] * earlier_write + write
-        decay = earlier_decay + decay
-        shift *= 2
-    return shifted(write, 1)
-
 
 def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, starts=None):
     """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357), as the recurrence
@@ -134,30 +108,33 @@ SSD = Hooks(decay='scalar', rated=True, delta=False, skip=True)
 
 def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     """One token at a time, `mamba2_selective_state_update`
-    (modeling_mamba2.py:192-251) as a scan over time, in fp32 (the input's
-    own dtype where it is wider). Operands and results as `chunk_ssd`'s; a
-    token `starts` marks sees a zero state."""
+    (modeling_mamba2.py:192-251) as a scan over time, each token the shared
+    recurrence's decode step (`recurrence.step_reference` under `SSD`), in fp32
+    (the input's own dtype where it is wider). Operands and results as
+    `chunk_ssd`'s; a token `starts` marks sees a zero state."""
     work = at_least_fp32(jnp.result_type(x, B, C))
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, heads, head_dim = x.shape
-    # The `H // G` heads of one group read the same B and C, the reference's `repeat_interleave`.
-    B, C = repeat_kv_heads(B, heads), repeat_kv_heads(C, heads)
     if state is None:
         state = jnp.zeros((batch, heads, head_dim, B.shape[-1]), work)
     if starts is None:
         starts = jnp.zeros((batch, length), jnp.bool_)
 
     def one_token(s, step):
-        x_t, dt_t, B_t, C_t, start = step                   # [B, H, P], [B, H], [B, H, N], [B]
-        decay = jnp.where(start[:, None], 0.0, jnp.exp(dt_t * A))
-        s = s * decay[..., None, None] + (dt_t[..., None] * x_t)[..., None] * B_t[..., None, :]
-        read = float32_einsum('bhps,bhs->bhp', s, C_t)
-        return s, read + x_t * D[None, :, None]
+        x_t, dt_t, B_t, C_t, start = step                   # [B, H, P], [B, H], [B, G, N], [B]
+        # `C` the query, `B` the key (a group's heads reading it, the template's prologue), `x` the
+        # value, `dt` the write and `A dt` the log decay (`Hooks.rated`), `D` the skip; a document's
+        # first token enters a zero memory.
+        s = jnp.where(start[:, None, None, None], jnp.zeros((), s.dtype), s)
+        out, _, s = recurrence.step_reference(SSD, recurrence.Step(
+            state=s, query=C_t, key=B_t, value=x_t, beta=dt_t, rate=A, skip=D), dtype=work)
+        return s, out
 
+    # The SSD's memory is `[P, N]`, values by keys: the step's `[N, P]` transposed.
     final, out = jax.lax.scan(
-        one_token, jnp.asarray(state, work),
+        one_token, jnp.swapaxes(jnp.asarray(state, work), -1, -2),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
-    return jnp.moveaxis(out, 0, 1), final
+    return jnp.moveaxis(out, 0, 1), jnp.swapaxes(final, -1, -2)
 
 
 class MambaRMSNormGated(nn.Module):
@@ -203,7 +180,7 @@ class Mamba2(nn.Module):
     Under a mesh sequence axis above one, training and scoring run the conv and
     scan in a `shard_map` (`_sequence_mix`): the conv reads the previous shard's
     last `K-1` tokens by `ppermute` and the scan adds the earlier shards' state
-    (`_entering_state`); decoding and padded rows are refused there.
+    (`recurrence_algebra.entering`); decoding and padded rows are refused there.
     """
 
     reads: ClassVar[frozenset[str]] = frozenset()
@@ -311,9 +288,9 @@ class Mamba2(nn.Module):
                     f"mamba2 under a sequence axis of {shards} runs whole training sequences; a decode "
                     "step holds one state per row. Decode on a mesh with sequence=1.")
             # Wide across the shards, so a halo's gradient and its shard's own add before rounding.
-            out = _over_sequence(functools.partial(_sequence_mix, scan=scan, dtype=compute),
-                                 shards, mixed.astype(wide), dt, tokens.segments, tokens.starts, valid,
-                                 (taps, bias, *heads))
+            out = over_sequence(functools.partial(_sequence_mix, scan=scan, dtype=compute), shards,
+                                (mixed.astype(wide), dt, tokens.segments, tokens.starts, valid),
+                                ((taps, bias, *heads),))
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
             return self.out_proj(self.norm(out, gate))
@@ -341,8 +318,11 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
 
     Under `axis` the scan runs from zero and the output gains `C_t . exp(acs_t)
     h` for the state `h` the earlier shards leave, `acs_t` the inclusive sum of
-    this shard's `A dt` (a `RESET_DECAY` in it zeroes the term). The zero-start
-    final state is the shard's write `B_r` (`_entering_state`)."""
+    this shard's `A dt` (a `RESET_DECAY` in it zeroes the term). The shard's span
+    is affine in the state entering it, `exp(A_r) h + B_r` (`recurrence_algebra.Span`):
+    `A_r` its summed log decay `[B, H]`, a decay never expanded to a matrix, and
+    `B_r` its zero-start final state, whose exclusive prefix over the shards
+    (`recurrence_algebra.entering`) is the state each enters."""
     dt_bias, A, D = heads
     batch, length, _ = convolved.shape
     intermediate = num_heads * head_dim
@@ -362,7 +342,8 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
         log_decay = A * step                                # [B, S, H]
         if starts is not None:
             log_decay = jnp.where(starts[..., None], RESET_DECAY, log_decay)
-        entering = _entering_state(jnp.sum(log_decay, axis=1), final, axis)
+        span = recurrence_algebra.Span(jnp.sum(log_decay, axis=1), final)
+        entering = recurrence_algebra.entering(span, axis)
         entering = entering.reshape(batch, n_groups, num_heads // n_groups, head_dim, state_size)
         decayed = jnp.exp(jnp.cumsum(log_decay, axis=1)).reshape(
             batch, length, n_groups, num_heads // n_groups)
@@ -373,91 +354,22 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
 
 def _sequence_mix(mixed, dt, segments, starts, valid, weights, *, scan, dtype):
     """The conv and the scan over this shard's slice of whole training
-    sequences, inside a `shard_map` that holds the sequence axis manual; a
-    single shard runs `held_scan` instead.
+    sequences, inside a `shard_map` that holds the sequence axis manual
+    (`over_sequence`); a single shard runs `held_scan` instead.
 
     `mixed` `[B, S, conv_dim]` the projection, convolved in at least fp32
     and handed to the scan in `dtype`, the model's compute dtype, `dt`
     `[B, S, H]` in fp32, `segments` `[B, S]` and their documents' `starts` or None, `valid` `[B, S]`
     the real tokens or None, `weights` the conv's taps and bias and the heads' `dt_bias`, `A` and
-    `D`. The conv reads the previous shard's last `K-1` tokens and segments by one `ppermute` (zeros
-    on the first) and the scan is corrected for the earlier shards' state (`_ssd`). A segment change
-    resets both wherever it falls. With `valid`, as `held_scan` runs a row with padding, a padded slot
-    neither reads nor advances the conv or the state: each real token's conv reads the `K-1` real
-    tokens before it in its document, wherever they lie (`_halo`), and a padded slot's step is
-    zero."""
+    `D`. The conv reads the real tokens before each shard's first from the earlier shards
+    (`sequence_conv`) and the scan is corrected for the earlier shards' state (`_ssd`). A segment change
+    resets both wherever it falls; a padded slot's step is zero."""
     taps, bias, dt_bias, A, D = weights
-    width = taps.shape[1] - 1
-    length = mixed.shape[1]
-    if length < width:
-        raise LayoutRefused(
-            f"each sequence shard holds {length} tokens, fewer than the {width} the "
-            f"conv reads behind its first; use fewer sequence shards or longer sequences")
-    if valid is not None:
-        halo = _halo(mixed, valid, segments, width)
-        convolved, _ = held_conv1d(mixed, taps, valid, halo, bias=bias, segments=segments, dtype=dtype)
-        out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, valid=valid, axis=SEQUENCE_AXIS)
-    else:
-        forward = [(shard, shard + 1) for shard in range(jax.lax.axis_size(SEQUENCE_AXIS) - 1)]
-        history = jax.lax.ppermute(mixed[:, length - width:], SEQUENCE_AXIS, forward)
-        owners = None
-        if segments is not None:
-            before = jax.lax.ppermute(segments[:, length - width:], SEQUENCE_AXIS, forward)
-            owners = jnp.concatenate([before, segments], axis=1)
-        stream = jnp.concatenate([history, mixed], axis=1)
-        convolved = causal_conv1d(stream, taps, bias=bias, segments=owners, dtype=dtype)[:, width:]
-        out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=SEQUENCE_AXIS)
+    convolved = sequence_conv(mixed, taps, bias, segments, valid, dtype=dtype)
+    out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, valid=valid, axis=SEQUENCE_AXIS)
     # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'
     # (a remat policy's `RESIDUALS`).
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
-
-
-def _halo(mixed, valid, segments, width: int):
-    """The `width` real tokens before this shard's first, `[B, width, conv_dim]`, from every earlier
-    shard of the sequence axis: each shard's last real tokens (`real_tail`) gathered, then taken in
-    order, so a shard holding fewer than `width` real tokens passes on the ones before it too. Rows of
-    another document than this shard's first real token's are zeros, where its conv starts afresh."""
-    tail, documents, count = real_tail(mixed, valid, segments, width)
-    tails, all_documents, counts = (jax.lax.all_gather(value, SEQUENCE_AXIS)
-                                    for value in (tail, documents, count))
-    here = jax.lax.axis_index(SEQUENCE_AXIS)
-    halo = jnp.zeros_like(tail)
-    halo_documents = jnp.full_like(documents, -1)
-    slots = jnp.arange(width)[None, :]
-    for shard in range(tails.shape[0]):
-        # A shard's tail holds its last `kept` real tokens at its end, zeros before them; behind them
-        # come the halo's last `width - kept`.
-        kept = jnp.minimum(counts[shard], width)[:, None]
-        behind = slots < width - kept
-        rows = jnp.minimum(kept + slots, width - 1)
-        joined = jnp.where(behind[:, :, None], jnp.take_along_axis(halo, rows[:, :, None], axis=1),
-                           tails[shard])
-        joined_documents = jnp.where(behind, jnp.take_along_axis(halo_documents, rows, axis=1),
-                                     all_documents[shard])
-        earlier = shard < here
-        halo = jnp.where(earlier, joined, halo)
-        halo_documents = jnp.where(earlier, joined_documents, halo_documents)
-    if segments is None:
-        return halo
-    first_real = jnp.argmax(jnp.asarray(valid, bool), axis=1)[:, None]
-    first = jnp.take_along_axis(jnp.asarray(segments, jnp.int32), first_real, axis=1)
-    return jnp.where((halo_documents == first)[:, :, None], halo, 0)
-
-
-def _over_sequence(mix, shards: int, mixed, dt, segments, starts, valid, weights):
-    """Run `mix` (`_sequence_mix` under the sequence axis) in a `manual_map`
-    that splits the rows and the sequence as the rule table places a
-    `[batch, length, ...]` activation, with the weights whole on every
-    shard. The layer's projections and its gated norm act token by token
-    and stay with GSPMD outside it."""
-    length = mixed.shape[1]
-    if length % shards:
-        raise LayoutRefused(
-            f"mamba2 splits the sequence of {length} tokens {shards} ways over the "
-            "mesh's sequence axis, and it does not divide")
-    tokens = logical_spec(("activation_batch", "activation_length"), mixed.shape[:2])
-    split = manual_map(mix, (tokens, tokens, tokens, tokens, tokens, P()), tokens)
-    return split(mixed, dt, segments, starts, valid, weights)
 
 
 def _log_head_index(key, shape):

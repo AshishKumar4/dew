@@ -23,6 +23,7 @@ routed experts together, on the simulated mesh.
 
 import contextlib
 import functools
+import itertools
 import json
 import math
 from pathlib import Path
@@ -37,23 +38,18 @@ import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    float64_forward,
-    torch_with_gradients,
-    with_gradients,
-)
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from selection_margins import indexer_margins
 from tool_support import load
 
+from dew.batch import coordinates
 from dew.data.dataset import Loader
 from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import MixerCall
+from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache
 from dew.nn.mla import MultiHeadLatentAttention
@@ -67,6 +63,7 @@ from dew.nn.rope import (
     yarn_inv_freq,
     yarn_query_scale,
 )
+from dew.nn.visibility import prefix_groups
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, MeshSpec, Trainer
@@ -77,7 +74,7 @@ GENERATOR = load("mla_reference")
 """tools/mla_reference.py, whose configs and transformers classes build the reference blocks."""
 
 SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 8, "value columns": 8,
-         "yarn": 16}
+         "yarn": 16, "visibility": 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
 
@@ -471,8 +468,8 @@ def mla_model(settings: dict, **overrides) -> CausalTransformer:
         "num_heads": settings["num_attention_heads"],
         "head_dim": settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"],
         "mlp_features": 48, "max_seq_len": 64, "rope_theta": float(settings["rope_theta"]),
-        "yarn": yarn_record(settings["rope_scaling"], "rope_scaling",
-                            int(settings["max_position_embeddings"])),
+        "rope_scaling": yarn_record(settings["rope_scaling"], "rope_scaling",
+                                    int(settings["max_position_embeddings"])),
         "norm_eps": float(settings["rms_norm_eps"]), "qk_norm": False,
         "attention_bias": bool(settings["attention_bias"]),
         "mixer": mla_record(settings), "attention_impl": "reference"}
@@ -514,14 +511,14 @@ def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
                     original_max_position_embeddings=4)], ids=["llama3", "longrope"])
 def test_the_mla_kind_rotates_by_the_models_rope_scaling(scaling):
     """A model's Llama 3.1 or LongRoPE scaling reaches its latent attention as
-    it reaches its ordinary attention (`MixerContext.rotary_scaling`): the
+    it reaches its ordinary attention (`MixerContext.rope_scaling`): the
     kind's layer computes, bit for bit, what the standalone block given that
     scaling computes, where a kind that forwarded YaRN alone rotated at the
     plain frequencies (audit NN-04). The seven positions pass LongRoPE's four,
     so it reads its long factors."""
     settings = CONFIG["v3"]
     tensors = fixture("mla_v3")
-    model = mla_model(settings, yarn=None, rope_scaling=scaling)
+    model = mla_model(settings, rope_scaling=scaling)
     variables = model.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32))
     layer = variables["params"]["layers_0"]
     variables = {**variables, "params": {
@@ -532,11 +529,16 @@ def test_the_mla_kind_rotates_by_the_models_rope_scaling(scaling):
     np.testing.assert_array_equal(inside, standalone)
 
 
+LLAMA3_SCALED_SEEDS = 8
+"""The llama3-scaled DeepSeek V3's declared draws of ids against transformers' eager forward (check 1),
+sized by `seeds_for` paired with Dew's logits on the CPU."""
+
+
 def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by_it(tmp_path):
     """A DeepSeek V3 checkpoint whose config scales its rope by Llama 3.1's ramp loads through the
-    shared rope codec, and its latent attention rotates by the ramp: Dew's logits as exact as
-    transformers' DeepseekV3 under the same config (`assert_as_exact_as_the_reference`, the truth its
-    float64 twin), where the family read YaRN alone and refused the checkpoint (audit NN-04)."""
+    shared rope codec, and its latent attention rotates by the ramp: Dew's logits on par with
+    transformers' DeepseekV3 under the same config from its float64 twin over drawn ids (check 1),
+    where the family read YaRN alone and refused the checkpoint (audit NN-04)."""
     import shutil
 
     from transformers import AutoModelForCausalLM
@@ -555,15 +557,22 @@ def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by
     # The eager experts, which run in float64 too: the grouped kernel takes float32 or narrower.
     reference = AutoModelForCausalLM.from_pretrained(
         tmp_path, dtype=torch.float32, attn_implementation="eager", experts_implementation="eager").eval()
-    ids = np.load(source / "input_ids.npy")
-    given = torch.from_numpy(ids.astype(np.int64))
-    with torch.no_grad():
-        theirs = reference(input_ids=given).logits.numpy()
-        with float64():
-            wide = float64_twin(reference)(input_ids=given).logits.numpy()
-    _, terms = float64_forward(loaded.model, loaded.variables, ids)
-    assert_as_exact_as_the_reference(np.asarray(loaded.model.apply(loaded.variables, ids)), theirs, wide,
-                                     "a llama3-scaled DeepSeek V3's logits", terms=terms)
+    shape = np.load(source / "input_ids.npy").shape
+    wide = float64_twin(reference)
+
+    def draw(seed):
+        return (np.random.default_rng(seed).integers(0, config["vocab_size"], shape).astype(np.int32),)
+
+    def logits_of(model, precision):
+        def run(ids):
+            with torch.no_grad(), precision():
+                return model(input_ids=torch.from_numpy(np.asarray(ids, np.int64))).logits.double().numpy()
+        return as_given(run)
+
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids),
+                    logits_of(reference, contextlib.nullcontext), draw,
+                    "a llama3-scaled DeepSeek V3's logits", seeds=LLAMA3_SCALED_SEEDS,
+                    truth_fn=logits_of(wide, float64))
 
 
 # --------------------------------------------------------------------------
@@ -634,3 +643,338 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
         model.init, jax.random.key(0), jnp.ones((1, 16), jnp.int32))
     shardings = trainer.layout.shardings(trainer.device_mesh, abstract)
     trainer.layout.check(abstract["params"], shardings["params"], trainer.device_mesh)
+
+
+# --------------------------------------------------------------------------
+# Dense MLA reads the shared attention core's visibility descriptors
+# --------------------------------------------------------------------------
+
+VIS_LENGTH = 12
+VIS_SLOTS = np.arange(VIS_LENGTH)
+VIS_CAUSAL = VIS_SLOTS[None, :] <= VIS_SLOTS[:, None]
+"""The keys causality keeps at `VIS_LENGTH`, written out here apart from Dew."""
+
+
+def visibility_module(**fields) -> MultiHeadLatentAttention:
+    """The V3 fixture's dense block, with `fields`, for the descriptor scenarios."""
+    return mla_module(CONFIG["v3"]).clone(**fields)
+
+
+def visibility_variables() -> dict:
+    """The V3 fixture's weights, which every descriptor scenario shares."""
+    return block_variables(fixture("mla_v3"))
+
+
+def visibility_draw(variables):
+    """Check 1's draw for the descriptor scenarios: the shared weights and a seed's hidden states."""
+    def draw(seed):
+        hidden = np.random.default_rng(seed).standard_normal(
+            (2, VIS_LENGTH, CONFIG["v3"]["hidden_size"])).astype(np.float32)
+        return variables, jnp.asarray(hidden)
+    return draw
+
+
+def masked_reference(rule: np.ndarray, positions: np.ndarray | None = None):
+    """transformers' V3 block over the fixture's weights under an explicit mask of `rule`'s keys
+    `[B, Q, K]`, its queries and keys rotated at `positions` (their indices by default): the reference
+    in float32 and its truth in float64, each a function of `visibility_draw`'s draw, apart from Dew's
+    metadata."""
+    from tools.torch_precision import float64
+
+    places = torch.as_tensor(np.broadcast_to(np.arange(VIS_LENGTH) if positions is None else positions,
+                                             (2, VIS_LENGTH)).copy())
+
+    def run(wide: bool):
+        block, rotary = reference_block("mla_v3", wide)
+
+        def forward(variables, hidden):
+            states = torch.as_tensor(np.asarray(hidden, np.float64 if wide else np.float32))
+            mask = torch.zeros(rule.shape, dtype=states.dtype).masked_fill(
+                ~torch.as_tensor(np.asarray(rule, bool)), float("-inf"))[:, None]
+            with float64() if wide else contextlib.nullcontext(), torch.no_grad():
+                output, _ = block(states, rotary(states, places), mask, position_ids=places)
+            return output.numpy()
+        return as_given(forward)
+    return run(wide=False), run(wide=True)
+
+
+def assert_masks_as_the_reference(dew, rule, label: str, positions: np.ndarray | None = None) -> None:
+    """Check 1 of `dew`, a function of `visibility_draw`'s draw, against transformers' block under an
+    explicit mask of `rule` (`masked_reference`)."""
+    reference, truth = masked_reference(rule, positions)
+    assert_as_exact(jax.jit(dew), reference, visibility_draw(visibility_variables()), label,
+                    seeds=SEEDS["visibility"], truth_fn=truth)
+
+
+def test_dense_mla_reads_a_pairwise_mask_as_the_reference_masks():
+    """A call's pairwise mask, both halves of the row read whole, replaces the layer's causality:
+    on par with transformers' block under the same mask from it in float64 (check 1)."""
+    rule = np.broadcast_to((VIS_SLOTS[:, None] // 6) == (VIS_SLOTS[None, :] // 6),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    call = MixerCall(metadata=AttentionMetadata(pairwise_mask=jnp.asarray(rule)))
+    module = visibility_module()
+    assert_masks_as_the_reference(lambda v, h: module.apply(v, h, call), rule, "mla pairwise mask")
+
+
+def test_a_call_s_own_mask_replaces_its_rows_validity():
+    """A call's own mask replaces its rows' validity as it replaces their causality, as the shared core
+    reads it: a real query may read a key the rows mark padding where the mask keeps it, on par with
+    transformers' block under that mask alone (check 1), each token rotated at its place among the real
+    tokens (`Coordinates.places`)."""
+    rule = np.broadcast_to((VIS_SLOTS[:, None] // 4) == (VIS_SLOTS[None, :] // 4),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    valid = np.ones((2, VIS_LENGTH), bool)
+    valid[:, [1, 6]] = False
+    call = MixerCall(metadata=AttentionMetadata(
+        pairwise_mask=jnp.asarray(rule), coordinates=coordinates(valid=jnp.asarray(valid))))
+    module = visibility_module()
+    places = np.maximum(np.cumsum(valid, axis=1) - 1, 0)
+    assert_masks_as_the_reference(lambda v, h: module.apply(v, h, call), rule, "mla own mask over padding",
+                                  positions=places)
+
+
+def test_dense_mla_reads_its_window_as_the_reference_masks():
+    """A windowed layer computes what transformers' block computes under an explicit mask of the
+    window's keys written out by hand: on par with it from it in float64 (check 1)."""
+    rule = np.broadcast_to(VIS_CAUSAL & (VIS_SLOTS[:, None] - VIS_SLOTS[None, :] < 3),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    windowed = visibility_module(sliding_window=3)
+    assert_masks_as_the_reference(lambda v, h: windowed.apply(v, h), rule, "mla window")
+
+
+def test_dense_mla_windows_its_tokens_by_their_count_not_their_rotary_places():
+    """Places with gaps (0, 10, 20, ...) rotate the tokens, and the window counts the tokens: a window
+    of two keeps each query and the token before it, on par with transformers' block rotating at the
+    same places under that mask (check 1)."""
+    places = 10 * VIS_SLOTS
+    rule = np.broadcast_to(VIS_CAUSAL & (VIS_SLOTS[:, None] - VIS_SLOTS[None, :] < 2),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    windowed = visibility_module(sliding_window=2)
+    placed = MixerCall(metadata=AttentionMetadata(coordinates=coordinates(
+        positions=jnp.broadcast_to(jnp.asarray(places), (2, VIS_LENGTH)))))
+    assert_masks_as_the_reference(lambda v, h: windowed.apply(v, h, placed), rule, "mla window over places",
+                                  positions=places)
+
+
+@pytest.mark.parametrize("both_sides", [False, True], ids=["whole row", "two-sided window"])
+def test_a_bidirectional_dense_mla_windows_only_where_its_kind_keeps_both_sides(both_sides):
+    """A non-causal windowed layer reads its whole row, unless its kind keeps the window on both sides
+    of a query (`bidirectional_window`), where it reads the keys within two places of it: on par with
+    transformers' block under that mask (check 1)."""
+    near = (VIS_SLOTS[:, None] < VIS_SLOTS[None, :] + 3) & (VIS_SLOTS[None, :] < VIS_SLOTS[:, None] + 3)
+    rule = np.broadcast_to(near if both_sides else np.ones_like(near), (2, VIS_LENGTH, VIS_LENGTH))
+    module = visibility_module(causal=False, sliding_window=3, bidirectional_window=both_sides)
+    assert_masks_as_the_reference(lambda v, h: module.apply(v, h), rule, "mla bidirectional window")
+
+
+def test_dense_mla_reads_its_chunk_as_the_reference_masks():
+    """A chunked layer computes what transformers' block computes under an explicit mask of the
+    chunk rule, on par with it from it in float64 (check 1)."""
+    rule = np.broadcast_to(VIS_CAUSAL & ((VIS_SLOTS[:, None] // 4) == (VIS_SLOTS[None, :] // 4)),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    chunked = visibility_module(attention_chunk=4)
+    assert_masks_as_the_reference(lambda v, h: chunked.apply(v, h), rule, "mla chunk")
+
+
+@pytest.mark.parametrize("kind", [LayerKind(window=3), LayerKind(chunk=4)], ids=["window", "chunk"])
+def test_the_mla_kind_takes_its_layers_window_and_chunk(kind):
+    """A decoder's mla layer of a windowed or chunked kind computes what the block with that window or
+    chunk computes on the same weights, bit for bit: the kind hands its layer's window and chunk on."""
+    model = mla_model(CONFIG["v3"], layer_types=("local",), kinds={"local": kind})
+    variables = model.init(jax.random.key(0), jnp.zeros((2, VIS_LENGTH), jnp.int32))
+    variables = {**variables, "params": {**variables["params"], "layers_0": {
+        **variables["params"]["layers_0"], "self_attn": visibility_variables()["params"]}}}
+    hidden = visibility_draw(visibility_variables())(0)[1]
+    inside = model.apply(variables, hidden, method=lambda m, x: m.layers[0].self_attn(x))
+    alone = visibility_module(sliding_window=kind.window, attention_chunk=kind.chunk).apply(
+        visibility_variables(), hidden)
+    np.testing.assert_array_equal(np.asarray(inside), np.asarray(alone))
+
+
+VIS_BLOCKS = np.asarray([[-1, 0, 0, 0, -1, 1, 1, 1, -1, 2, 2, -1],
+                         [3, 3, 3, -1, -1, 4, 4, -1, 5, 5, 5, 5]], np.int32)
+VIS_IMAGES = np.asarray([[6, 6, 6, 6, -1, -1, 7, 7, 7, -1, -1, -1],
+                         [-1, 8, 8, -1, 9, 9, 9, 9, -1, -1, 10, 10]], np.int32)
+
+
+def whole_group_rule(groups: np.ndarray) -> np.ndarray:
+    """The keys a block read whole keeps beside causality, written out apart from Dew."""
+    same = (groups[:, :, None] == groups[:, None, :]) & (groups[:, :, None] >= 0)
+    return VIS_CAUSAL[None] | same
+
+
+@pytest.mark.parametrize("field,groups", [
+    ("bidirectional_blocks", VIS_BLOCKS),
+    ("bidirectional_images", VIS_IMAGES),
+    ("bidirectional_blocks", np.asarray(prefix_groups(
+        jnp.ones((2, VIS_LENGTH), jnp.int32), jnp.ones((2, VIS_LENGTH), bool), 5))),
+], ids=["blocks", "images", "prefix"])
+def test_dense_mla_reads_its_groups_whole_as_the_reference_masks(field, groups):
+    """A causal block that reads its block, image or prefix groups whole computes what transformers'
+    block computes under an explicit mask of the whole-group rule, on par with it (check 1). The rule
+    keeps keys a causal mask does not, so the groups are read."""
+    rule = whole_group_rule(np.asarray(groups))
+    assert (rule & ~VIS_CAUSAL[None]).any()
+    named = field.removeprefix("bidirectional_")[:-1] + "_groups"
+    metadata = AttentionMetadata(**{named: jnp.asarray(groups)})
+    module = visibility_module(**{field: True})
+    assert_masks_as_the_reference(lambda v, h: module.apply(v, h, MixerCall(metadata=metadata)), rule,
+                                  f"mla {field}")
+
+
+def test_dense_mla_reads_key_runs_as_the_reference_masks():
+    """A call's key runs, two keys either side of each query, compute what transformers' block
+    computes under an explicit mask of their union, on par with it (check 1)."""
+    lo, hi = np.clip(VIS_SLOTS - 2, 0, None), np.clip(VIS_SLOTS + 2, None, VIS_LENGTH)
+    runs = np.broadcast_to(np.stack([lo, hi], -1)[:, None], (2, VIS_LENGTH, 1, 2)).astype(np.int32)
+    rule = np.broadcast_to((VIS_SLOTS[None, :] >= lo[:, None]) & (VIS_SLOTS[None, :] < hi[:, None]),
+                           (2, VIS_LENGTH, VIS_LENGTH))
+    call = MixerCall(metadata=AttentionMetadata(key_runs=jnp.asarray(runs)))
+    module = visibility_module()
+    assert_masks_as_the_reference(lambda v, h: module.apply(v, h, call), rule, "mla key runs")
+
+
+def test_dense_mla_windows_its_key_runs_over_their_positions():
+    """Key runs over the whole row, windowed by a windowed layer over the keys' given positions, its
+    queries read at them too (runs of three places, then a gap), compute what transformers' block
+    computes under an explicit mask over those positions, on par with it (check 1)."""
+    places = np.asarray([0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14], np.int32)
+    runs = np.broadcast_to(np.asarray([[[0, VIS_LENGTH]]]), (2, VIS_LENGTH, 1, 2)).astype(np.int32)
+    within = (places[:, None] <= places[None, :] + 1) & (places[None, :] <= places[:, None] + 1)
+    rule = np.broadcast_to(within, (2, VIS_LENGTH, VIS_LENGTH))
+    metadata = AttentionMetadata(key_runs=jnp.asarray(runs),
+                                 key_positions=jnp.broadcast_to(places, (2, VIS_LENGTH)))
+    module = visibility_module(sliding_window=2)
+    assert_masks_as_the_reference(lambda v, h: module.apply(v, h, MixerCall(metadata=metadata)), rule,
+                                  "mla windowed key runs")
+
+
+def test_dense_mla_reads_a_position_bias_as_the_reference_masks():
+    """A position bias that forbids the odd keys but a query's own computes what transformers' block
+    computes under an explicit mask of the same keys, on par with it (check 1): the bias's -inf is the
+    mask's."""
+    rule = VIS_CAUSAL & ((VIS_SLOTS[None, :] % 2 == 0) | (VIS_SLOTS[:, None] == VIS_SLOTS[None, :]))
+    bias = np.where(rule, 0.0, -np.inf).astype(np.float32)[None, None]
+    call = MixerCall(metadata=AttentionMetadata(position_bias=jnp.asarray(bias)))
+    module = visibility_module()
+    rule = np.broadcast_to(rule, (2, VIS_LENGTH, VIS_LENGTH))
+    assert_masks_as_the_reference(lambda v, h: module.apply(v, h, call), rule, "mla position bias")
+
+
+def test_dense_mla_reads_packed_documents_under_a_window_as_the_split_calls_do():
+    """Packed documents under the layer's window compute what the same windowed block computes
+    over each document as its own call, on par with the split calls from them in float64
+    (check 1): no key crosses a document, and the window counts within it."""
+    segments = np.asarray([[1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3],
+                           [1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3]], np.int32)
+    windowed = visibility_module(sliding_window=3)
+    packed = MixerCall(metadata=AttentionMetadata(
+        coordinates=coordinates(segments=jnp.asarray(segments))))
+
+    def split(variables, hidden):
+        rows = []
+        for row in range(segments.shape[0]):
+            cuts = [0, *(int(i) for i in np.flatnonzero(np.diff(segments[row])) + 1), VIS_LENGTH]
+            rows.append(jnp.concatenate(
+                [windowed.apply(variables, hidden[row:row + 1, lo:hi])
+                 for lo, hi in itertools.pairwise(cuts)], axis=1))
+        return jnp.concatenate(rows, axis=0)
+
+    variables = visibility_variables()
+    ours = jax.jit(lambda v, h: windowed.apply(v, h, packed))
+    assert_as_exact(ours, jax.jit(split), visibility_draw(variables),
+                    "mla documents under a window", seeds=SEEDS["visibility"])
+
+
+def test_dense_mla_reads_a_padded_row_under_a_window_as_its_unpadded_twin():
+    """A row with padding among its tokens, under the layer's window, computes at its real
+    tokens what the same windowed block computes over those tokens alone, on par with the twin
+    from it in float64 (check 1): the window counts real tokens, so a key two real tokens back
+    across a padding slot stays in it."""
+    kept = np.asarray([[0, 1, 3, 4, 5, 7, 8, 9, 11], [0, 2, 3, 4, 6, 7, 8, 10, 11]])
+    valid = np.zeros((2, VIS_LENGTH), bool)
+    np.put_along_axis(valid, kept, values=True, axis=1)
+    windowed = visibility_module(sliding_window=3)
+    padded = MixerCall(metadata=AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(valid))))
+    slots = jnp.asarray(kept)
+
+    def ours(variables, hidden):
+        out = windowed.apply(variables, hidden, padded)
+        return jnp.take_along_axis(out, slots[:, :, None], axis=1)
+
+    def twin(variables, hidden):
+        return windowed.apply(variables, jnp.take_along_axis(hidden, slots[:, :, None], axis=1))
+
+    variables = visibility_variables()
+    assert_as_exact(jax.jit(ours), jax.jit(twin), visibility_draw(variables),
+                    "mla padded row under a window", seeds=SEEDS["visibility"])
+
+
+def test_a_windowed_dense_mla_decodes_as_it_prefills():
+    """A windowed block's one-token decode steps compute what its whole-sequence pass computes,
+    on par with that pass from it in float64 (check 1): the decode mask keeps the window's keys
+    by their cache slots."""
+    windowed = visibility_module(sliding_window=3)
+    variables = visibility_variables()
+    decoded = jax.jit(lambda v, h: decode_loop(windowed, v, h))
+    full = jax.jit(lambda v, h: windowed.apply(v, h))
+    assert_as_exact(decoded, full, visibility_draw(variables), "mla windowed decode",
+                    seeds=SEEDS["visibility"])
+
+
+def test_a_mla_model_reads_key_runs_as_their_pairwise_mask():
+    """Through a decoder, whose block refuses a call field its mixer does not read, an mla model's
+    logits under key runs are its logits under a pairwise mask of their union, bit for bit."""
+    model = mla_model(CONFIG["v3"])
+    length = 9
+    ids = jax.random.randint(jax.random.key(2), (2, length), 0, 37)
+    params = model.init(jax.random.key(3), ids)
+    slots = np.arange(length)
+    lo, hi = np.clip(slots - 1, 0, None), np.clip(slots + 1, None, length)
+    runs = np.broadcast_to(np.stack([lo, hi], -1)[:, None], (2, length, 1, 2)).astype(np.int32)
+    rule = np.broadcast_to((slots[None, :] >= lo[:, None]) & (slots[None, :] < hi[:, None]),
+                           (2, length, length))
+    by_runs = model.apply(params, ids, attention_key_runs=jnp.asarray(runs))
+    by_mask = model.apply(params, ids, attention_pairwise_mask=jnp.asarray(rule))
+    np.testing.assert_array_equal(np.asarray(by_runs), np.asarray(by_mask))
+
+
+def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
+    """A prefix run needs a layer that reads its blocks whole (`MixerBase.reads_blocks`): a decoder on
+    the mla kind that reads them takes one, and its trained per-token losses are on par with its losses
+    under an explicit block-causal mask written apart from Dew (`block_causal`), from that mask's float64
+    run (check 1), its in-block targets left out."""
+    from block_support import block_causal
+    from reference_error import seeds_for
+
+    from dew.batch import TEXT_KEY
+    from dew.objectives.lm.objective import batch_text
+
+    record = mla_record(CONFIG["v3"])
+    record["fields"]["bidirectional_blocks"] = True
+    decoder = mla_model(CONFIG["v3"], mixer=record)
+    seq, prefix = 8, 3
+    blocks = np.broadcast_to(np.where(np.arange(seq + 1) < prefix, 1, -1), (2, seq + 1)).astype(np.int32)
+    objective = LMObjective(decoder, seq, prefix=prefix)
+    wide = decoder.clone(dtype=jnp.float64)
+    keep = jnp.asarray(block_causal(blocks)[:, :-1, :-1])
+    counted = ~((blocks[:, :-1] == blocks[:, 1:]) & (blocks[:, :-1] >= 0))
+    init = jax.jit(decoder.init)
+
+    def draw(seed):
+        tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), (2, seq + 1), 0, 37)
+        return init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1]), tokens
+
+    def masked(model):
+        def losses(params, tokens):
+            logits = model.apply(params, tokens[:, :-1], attention_pairwise_mask=keep)
+            lost = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
+            return lost, jnp.asarray(counted, lost.dtype)
+        return losses
+
+    def dew(params, tokens):
+        scores = objective.token_scores(params, batch_text({TEXT_KEY: tokens, "text_block_groups": blocks}))
+        return scores.losses, scores.weights
+
+    seeds = seeds_for(masked(decoder), draw, "mla prefix run loss", truth_fn=masked(wide))
+    assert_as_exact(dew, masked(decoder), draw, "mla prefix run loss", seeds=seeds, truth_fn=masked(wide))

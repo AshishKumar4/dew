@@ -4,6 +4,7 @@ training stream (`waited_read`)."""
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import math
@@ -11,6 +12,7 @@ import time
 import types
 from collections.abc import Iterator, Mapping, Sequence
 
+import grain.python as pygrain
 import jax
 from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
@@ -20,6 +22,7 @@ from dew._coordination import agreed_next
 from dew._records import JSON
 from dew.batch import Batch
 from dew.checkpoints import Checkpoints
+from dew.data.compile import Handed, native
 from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
@@ -97,6 +100,8 @@ class FitPlan:
     local_every: Cadence
     metrics: Sequence[Metric]
     preview: bool
+    scored_to: str | None = None
+    """Where each evaluation writes every validation batch's scoring artifacts (`Evaluation.run`)."""
     best: tuple[Best, ...] = ()
     stop: Plateau | None = None
     pause: tuple[int | None, int | None] = (None, None)
@@ -334,6 +339,11 @@ class FitRun:
             self.ahead = (waited_read(self, interval, agree=True),)
         return self.ahead[0] is None
 
+    def held(self) -> contextlib.AbstractContextManager[None]:
+        """The training stream's placements held for a block of device work beside the steps
+        (`DevicePrefetchIterator.held`), none to hold once the stream is closed."""
+        return contextlib.nullcontext() if self.train is None else self.train.held()
+
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
         a caller's alias would keep the closed stream reachable from a failed
@@ -409,13 +419,17 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
     if len(labels) != len(set(labels)):
         raise ValueError("select each metric once; one Best.top already keeps all its winners")
     if plateau is not None:
-        metric = owned(plateau.metric)
-        if not isinstance(metric, (Metric, TrainingScalar, Summary)):
+        # A name binds as a Best of it does, to the metric fit scores under it, its split and direction.
+        metric = plateau.metric if isinstance(plateau.metric, str) else owned(plateau.metric)
+        if not isinstance(metric, (str, Metric, TrainingScalar, Summary)):
             raise TypeError(
                 "Plateau selects a declared metric object or summary, not a Best policy or score function"
             )
-        stopping = Best(metric, mode=plateau.mode, split=plateau.split).resolved(scored)
-        plateau = dataclasses.replace(plateau, metric=metric, mode=stopping.mode, split=stopping.split)
+        chosen = owned(Best(metric, mode=plateau.mode, split=plateau.split))
+        stopping = (chosen if isinstance(chosen, Best) else Best(chosen, mode=plateau.mode,
+                                                                 split=plateau.split)).resolved(scored)
+        plateau = dataclasses.replace(plateau, metric=stopping._source, mode=stopping.mode,
+                                      split=stopping.split)
     return selection, plateau, pause
 
 
@@ -434,8 +448,33 @@ def first_batch(loader: Loader, mesh: Mesh) -> Batch:
     return batch
 
 
-def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bool, seeded: bool,
-                     mesh: MeshSpec | Mesh | None, given: Mapping[str, object]) -> list[str]:
+type HandedSplits = (Dataset | pygrain.MapDataset | pygrain.IterDataset
+                     | Mapping[str, Dataset | Handed | Reader | EvalSuite])
+"""`fit`'s validation: a chain or a Grain dataset, the split `val`, or splits by name, each a chain, a
+Grain dataset, NumPy arrays, a reader or an evaluation suite."""
+
+
+def handed_splits(
+        validation: HandedSplits | None) -> Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None:
+    """`fit`'s validation with what was handed as it is read as handed (`dew.data.compile.native`): a
+    Grain dataset as the split `val`, and a named split's Grain dataset or NumPy arrays as that split.
+    Arrays are a split by name alone, as a mapping of splits is one by its names."""
+    if isinstance(validation, pygrain.MapDataset | pygrain.IterDataset):
+        return {"val": native(validation, training=False)}
+    if validation is None or isinstance(validation, Dataset):
+        return validation
+    return {name: _handed_split(entry) for name, entry in validation.items()}
+
+
+def _handed_split(entry: Dataset | Handed | Reader | EvalSuite) -> Dataset | Reader | EvalSuite:
+    """One split of `handed_splits`: read as handed where it is a Grain dataset or arrays."""
+    if isinstance(entry, Mapping | pygrain.MapDataset | pygrain.IterDataset):
+        return native(entry, training=False)
+    return entry
+
+
+def unrecorded_parts(objective: str, dataset: Dataset | Loader | Handed, *, optimized: bool,
+                     seeded: bool, mesh: MeshSpec | Mesh | None, given: Mapping[str, object]) -> list[str]:
     """Why a run's record cannot rebuild a trainer's run on `dataset`, each a part a
     `dew.config.RunConfig` states otherwise, read from the trainer's own fields
     (`Checkpoints.python_run`): an objective, of the class `objective` names, built in Python, an optax
@@ -452,6 +491,9 @@ def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bo
         reasons.append("the mesh is a jax.sharding.Mesh; a run's record states a MeshSpec")
     if isinstance(dataset, Loader):
         reasons.append("the data is a compiled Loader; a run's record states its chain")
+    elif not isinstance(dataset, Dataset):
+        reasons.append("the data was handed as it is, a Grain dataset or arrays; a run's record states "
+                       "a chain")
     reasons += [f"{name} is given to the trainer, which a run's record does not state"
                 for name, part in given.items() if part is not None]
     return reasons

@@ -5,10 +5,11 @@ layout facts alone (`Family`: mosaic_sm90's wgmma; mma.sync's and tcgen05's to c
 its own mainloop, product dependencies and launch DAG; only these primitives are shared.
 
 A launch takes each warpgroup's role (`roles`: a producer issuing the loads beside consumers computing where
-the family's roles split the register file, `Family.consumers`), persistent over the multiprocessors. The
+the family's roles split the register file, `Family.consumers`), persistent over the multiprocessors, a pair
+of them a cluster where they share one operand's blocks (multicast: `ring`'s, `Family.streams`'). The
 consumers meet (`meet`) where one consumer's writes to shared memory are the other's operand, and a tile's
 rows reach global memory through `store_rows`, whose stores have static extents however many rows a tile
-holds. The derivation's shared steps are here too (`held_rows`, `deepest`, `band`, `program_shared`).
+holds. What a program asks of a multiprocessor, and the derivation's shared steps, are `resources`'.
 
 A mainloop that drives its own loads (the GEMM's kernel gradient, its stages streaming across tiles)
 streams each operand through a `Ring` whose counter runs across tiles, and takes each warpgroup's role
@@ -17,6 +18,7 @@ streams each operand through a `Ring` whose counter runs across tiles, and takes
 
 import abc
 import dataclasses
+import functools
 import math
 from collections.abc import Callable
 
@@ -27,22 +29,33 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import cost
+from dew.nn.kernels.templates import product, resources
+from dew.nn.sharding import per_shard
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
 Operand = Ref | jax.Array
 """A product's operand: a tile in shared memory (a ref) or in registers (an array)."""
 
 
-def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:
+def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0) -> plgpu.CompilerParams:
     """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
     and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
-    exp2 and FlashAttention's are). No shared memory is reserved for reductions across warps: a block's
-    warpgroups reduce at once, so each takes its own scratch, the consumers' from the kernel's allocations
-    (`Family.column_sums`), and a reduction that would take Mosaic GPU's implicit scratch fails to lower
-    rather than share it."""
+    exp2 and FlashAttention's are). A block's warpgroups reduce at once, so each takes its own scratch: a
+    consumer's planned reductions its share of the kernel's allocations (`Family.column_sums`), the
+    implicit ones its arithmetic forms (a unit row a hook slices) an equal share of `reduction_scratch`
+    bytes, which Mosaic GPU splits between the block's warpgroups; with none, such a reduction fails to
+    lower rather than share one."""
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
-                                reduction_scratch_bytes=0)
+                                reduction_scratch_bytes=reduction_scratch)
+
+
+CLUSTER = "cluster"
+"""The axis a launch's cluster of programs runs along (`Family.kernel`'s `cluster`)."""
+
+
+def cluster_index(cluster: int) -> jax.Array | int:
+    """This program's index among its cluster's `cluster` programs (`CLUSTER`): 0 alone."""
+    return lax.axis_index(CLUSTER) if cluster > 1 else 0
 
 
 def meet(halves) -> None:
@@ -172,13 +185,25 @@ def stored(parts, views, *, smem, wait: bool = True) -> None:
             plgpu.wait_smem_to_gmem(0)
 
 
-def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
-               copy: Callable = plgpu.copy_smem_to_gmem) -> None:
+def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, least: int = 1,
+               copy: Callable = plgpu.copy_smem_to_gmem, widest: int | None = None) -> None:
     """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a
     power-of-two ladder of static-size `copy`s (a TMA store's descriptor has static extents; `copied`
-    moves the rows through registers where a GPU has no TMA), the largest `most` rows'."""
+    moves the rows through registers where a GPU has no TMA), the largest `most` rows', the smallest
+    `least` (`stored` a multiple of it: a rung below it is never taken, and none is emitted); with
+    `widest`, in copies of at most `widest` rows, whole ones first (a copy through registers holds its
+    rows: `resources.copied_rows`)."""
     start, size = first, most
-    while size:
+    if widest is not None and widest < most:
+        for whole in range(most // widest):
+            @pl.when(stored // widest > whole)
+            def _(whole=whole):
+                copy(o_smem.at[pl.ds(first + whole * widest, widest)],
+                     o_gmem.at[pl.ds(row_start + first + whole * widest, widest),
+                               pl.ds(column, o_smem.shape[1])])
+
+        start, size = first + stored // widest * widest, widest - 1
+    while size >= least:
         rung = 1 << int(math.log2(size))
         size //= 2
 
@@ -207,7 +232,13 @@ class Ring:
     (`release`). The counter runs across a persistent kernel's tiles, so a tile's first loads reuse the
     slots the last tile left, and each tile may take its own number of steps (a causal tile's trip range):
     a slot is free for its first fill and, after, once every consumer released it; the producer drains the
-    ring after its last load (`drain`). Allocated with `ring`, its slot count the allocation's own."""
+    ring after its last load (`drain`). Allocated with `ring`, its slot count the allocation's own.
+
+    A ring a cluster's programs share (`ring`'s `multicast`) takes each step's block once between them:
+    every program's producer loads the same view, its share of the block multicast into each program's slot,
+    and each program's load barrier awaits the whole block. A release arrives at each program's barrier, so
+    a slot is free once every consumer of every program has released it (CUTLASS's PipelineTmaAsync), and
+    the producer's drain holds its program until the others' last releases have reached it."""
     smem: Ref
     full: state_types.AbstractRef
     consumed: state_types.AbstractRef
@@ -217,6 +248,13 @@ class Ring:
         """The ring's slots: its allocation's leading dimension."""
         return int(self.smem.shape[0])
 
+    @property
+    def multicast(self) -> tuple | None:
+        """The cluster axes the ring's loads are multicast along: its release barrier's, a cluster's (`ring`);
+        None where the ring is its program's own."""
+        dtype = self.consumed.dtype
+        return dtype.collective_axes if isinstance(dtype, plgpu_core.ClusterBarrierType) else None
+
     def slot(self, counter):
         """The slot step `counter` (traced, or a Python int) uses."""
         return counter % self.stages
@@ -225,7 +263,7 @@ class Ring:
         """The producer's load of step `counter` from `view`, once its slot is free."""
         slot = self.slot(counter)
         pl.when(counter >= self.stages)(lambda: plgpu.barrier_wait(self.consumed.at[slot]))
-        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot])
+        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot], collective_axes=self.multicast)
 
     def acquire(self, counter):
         """A consumer's wait for step `counter`'s load: its slot. Each load is waited for once (a wait takes
@@ -252,31 +290,17 @@ class Ring:
             pl.when(step >= 0)(lambda step=step: plgpu.barrier_wait(self.consumed.at[self.slot(step)]))
 
 
-def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
-    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, a load barrier
-    each, and a release barrier each that `consumers` arrive at. `Ring(**allocated)` once scoped."""
-    return {'smem': plgpu.SMEM((stages, *block), dtype),
-            'full': plgpu.Barrier(num_barriers=stages),
-            'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False,
+         swizzle: int | None = None) -> dict:
+    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (their rows staged
+    at `swizzle`, `staged`), a load barrier each, and a release barrier each that `consumers` arrive at,
+    with `multicast` the `consumers` of each program of the cluster (`CLUSTER`), whose programs share the
+    ring's blocks. `Ring(**allocated)` once scoped."""
+    consumed = (plgpu.ClusterBarrier(collective_axes=(CLUSTER,), num_arrivals=consumers, num_barriers=stages)
+                if multicast else plgpu.Barrier(num_arrivals=consumers, num_barriers=stages))
+    return {'smem': staged((stages, *block), dtype, swizzle), 'full': plgpu.Barrier(num_barriers=stages),
+            'consumed': consumed}
 
-
-PRODUCER_REGISTERS = 40
-"""The registers a thread of a cooperative block's producer warpgroup holds: it only issues loads."""
-
-THREADS = 128
-"""The threads of a role: a warpgroup's, each family's compute and producer roles alike."""
-
-SMEM_ALIGNMENT = 1024
-"""The bytes each shared-memory allocation of a Mosaic GPU kernel starts at a multiple of (its lowering's
-`SMEM_ALIGNMENT`)."""
-
-BARRIER_BYTES = 8
-"""A barrier's shared memory."""
-
-
-def allocated(*sizes: int) -> int:
-    """The shared memory allocations of `sizes` bytes take, each rounded up to `SMEM_ALIGNMENT`."""
-    return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
 
 SWIZZLE_BYTES = 128
 """The widest swizzle a shared-memory block's rows are staged at, which an MMA reads conflict-free."""
@@ -285,106 +309,54 @@ NARROWEST_SWIZZLE_BYTES = 32
 """The narrowest swizzle Mosaic GPU stages a block's rows at (`plgpu.find_swizzle`'s least)."""
 
 
-def live_registers(family: "Family", carried, *phases) -> int:
-    """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
-    walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
-    of its `phases`' tiles held at once (a step's operand fragments, a rewrite's operands), each tile's
-    32-bit words spread over a role's threads, and what it holds beside them (`Family.held_registers`).
-    The one register estimate every Mosaic template's launches state (`base.Template.registers`), which
-    a legal config holds within a thread's budget (`base.Template.legal`)."""
-    def words(tiles) -> float:
-        return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
-
-    phase = max((words(tiles) for tiles in phases), default=0.0)
-    return int(-(-(words(carried) + phase) // THREADS)) + family.held_registers
-
-
-def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype, *,
-                   transposed: bool = False) -> int:
-    """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
-    of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
-    fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
-    each of its replicating warps: `lhs_copies`, `rhs_copies`), the right one's a sub-step deep where
-    it loads it so (`Family.fragment_depth`), but a `transposed` one, which it loads a step deep and
-    slices a sub-step at a time, both live at once (sm86 and sm89 spilled 8 bytes at an input gradient's
-    128 x 128 x 32 a step's count held, FAMBASE-4)."""
-    rows, columns, depth = block
-    sub = family.fragment_depth(depth)
-    share, sub = rows // consumers, depth + sub if transposed and sub < depth else sub
-    fragments = ([(share * family.lhs_copies, depth, dtype), (sub, columns * family.rhs_copies, dtype)]
-                 if family.operands_in_registers else [])
-    return live_registers(family, [(share, columns, jnp.float32)], fragments)
+def swizzle_for(dtype, *contractions: int) -> int:
+    """The widest swizzle, in bytes, a shared-memory block of `dtype` takes whose group of elements (the
+    swizzle over the itemsize: Mosaic's wgmma issues a product's contraction in groups of it, one swizzle
+    for both its shared operands, wgmma.py's `k_group_elems`) divides each of `contractions`, the elements
+    the products it takes part in contract over a step. A product contracting over 32 rows of 16-bit
+    operands so stages them at 64 bytes, at which its partner block must stage too (K32SWZ3: S = K Qᵀ
+    over a 128-wide head lowers with both at 64 and both at 128, not mixed; dV += P dO over 32 rows lowers
+    at 64, not 128)."""
+    size = jnp.dtype(dtype).itemsize
+    return next((swizzle for swizzle in (SWIZZLE_BYTES, SWIZZLE_BYTES // 2, NARROWEST_SWIZZLE_BYTES)
+                 if all(contraction % (swizzle // size) == 0 for contraction in contractions)),
+                NARROWEST_SWIZZLE_BYTES)
 
 
-def program_shared(block: int, programs: int) -> int:
-    """The shared memory each of `programs` programs a multiprocessor runs at once may stage, on a GPU whose
-    block holds `block` bytes: the multiprocessor's (the block's and one reservation,
-    `cost.RESERVED_SHARED`) split between them, less each one's own reservation."""
-    return (block + cost.RESERVED_SHARED) // programs - cost.RESERVED_SHARED
+TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
+SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
+"""Mosaic GPU's tile transforms, which it declares as protocol classes (a type checker takes them for
+uninstantiable)."""
 
 
-def held_area(family: "Family", consumers: int) -> int:
-    """The fp32 accumulator elements `consumers` consumers of `family` hold beside what they hold besides
-    (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns)."""
-    return (family.registers(consumers) - family.held_registers) * THREADS * consumers
+def swizzle_transforms(dtype, swizzle: int) -> tuple:
+    """A shared-memory tile's transforms at `swizzle` bytes: 8-row tiles a swizzle's row wide, swizzled."""
+    return TILING((8, swizzle // jnp.dtype(dtype).itemsize)), SWIZZLE(swizzle)
 
 
-def held_rows(family: "Family", consumers: int, columns: int) -> int:
-    """The most rows, in whole roles of `consumers` consumers of `family` (`Family.role_rows` each), whose
-    fp32 accumulator of `columns` columns their threads hold beside what they hold besides
-    (`Family.held_registers`): the rows a derived tile's registers bound (docs/design/kernel-templates.md
-    §7). A family whose products read registers holds a step's fragments too (`tile_registers`), which
-    its derivation checks at each step."""
-    share = (family.registers(consumers) - family.held_registers) * THREADS // columns
-    return share // family.role_rows * family.role_rows * consumers
-
-
-def deepest[C](make: Callable[[int], C], holds: Callable[[C], bool], most: int) -> C | None:
-    """`make(stages)` at the most stages, from `most` down to two (one loading beside one consumed), that
-    `holds` (a launch's legality: its ring within a block's shared memory); None where none does. A
-    derived ring is the deepest a block holds (CUTLASS's StageCountAutoCarveout's rule: the block's shared
-    memory less what else it stages, over a stage's bytes)."""
-    return next((made for made in map(make, range(most, 1, -1)) if holds(made)), None)
-
-
-def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
-         group_row_tiles: int | None = None) -> int:
-    """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
-    blocks in the L2 (`grid_block_n`): the power of two, at most `column_tiles`, nearest below the band
-    that reads each operand fewest times from the device. The rows' and the columns' blocks balanced
-    (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)) or,
-    where the rows split into groups of `group_row_tiles` row tiles each, wider while a wave still spans
-    each group's row tiles whole (programs over a group's row tiles), whose columns' blocks it then
-    reads once a group."""
-    balanced = math.sqrt(multiprocessors * block_m / block_n)
-    spanning = multiprocessors / group_row_tiles if group_row_tiles else 0.0
-    return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
-
-
-def consumer_registers(consumers: int) -> int:
-    """The registers a thread of each of `consumers` consumer warpgroups holds: the multiprocessor's 64K less
-    the producer's, shared among them in setmaxnreg's steps of 8 and at most its 256 (two consumers' 232,
-    JAX's warp-specialized pipeline's `_compute_registers(40, 2)`)."""
-    share = (64 * 1024 // 128 - PRODUCER_REGISTERS) // consumers
-    return min(256, share // 8 * 8)
-
-
-CONSUMER_REGISTERS = consumer_registers(2)
-"""Two consumer warpgroups' registers a thread (`consumer_registers`)."""
+def staged(shape: tuple, dtype, swizzle: int | None = None):
+    """A shared-memory block of `shape` whose rows are staged at `swizzle` bytes: as layout inference stages
+    them where unstated (the widest that fits); otherwise in 8-row tiles of the swizzle's row, explicitly,
+    which inference does not take for a block whose products contract over fewer elements than the widest
+    swizzle's row (K32SWZ5: a register operand at a 32-row contraction lowered only so)."""
+    if swizzle is None:
+        return plgpu.SMEM(shape, dtype)
+    return plgpu.SMEM(shape, dtype, transforms=swizzle_transforms(dtype, swizzle))
 
 
 def roles(wg, consumers: int, consumer, producer) -> None:
     """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
-    register budget raised to their share (`consumer_registers`), the last runs `producer()` with its
-    lowered to `PRODUCER_REGISTERS`."""
+    register budget raised to their share (`resources.raised_registers`), the last runs `producer()`
+    with its lowered to `resources.PRODUCER_REGISTERS`, where the GPU's compile honors them
+    (`resources.RAISES_HONORED`)."""
     @pl.when(wg < consumers)
     def _():
-        plgpu.set_max_registers(consumer_registers(consumers), action="increase")
+        plgpu.set_max_registers(resources.raised_registers(consumers), action="increase")
         consumer(wg)
 
     @pl.when(wg == consumers)
     def _():
-        plgpu.set_max_registers(PRODUCER_REGISTERS, action="decrease")
+        plgpu.set_max_registers(resources.PRODUCER_REGISTERS, action="decrease")
         producer()
 
 
@@ -452,12 +424,33 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     role_rows: int
     """The rows a consumer role's products cover at least: one warpgroup's (wgmma's one MMA of 64 rows,
     mma.sync's four warps of 16 each)."""
+
+    @property
+    def transposed_rows(self) -> int:
+        """The rows a step of an operand its products read from registers transposed (a kernel gradient's
+        `[rows, depth]` stage) takes at least: a role's (`role_rows`)."""
+        return self.role_rows
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
+    register_step: int = 8
+    """The allocator's registers per thread in one step (setmaxnreg's eight-register granularity).
+    A compile gate tests admits at their actual cap, refusals one such step below it."""
     operands_in_registers: bool
     """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
     warpgroup MMA reads both from shared memory."""
+    products_overlap: bool
+    """Whether a warpgroup's products run asynchronously, an issued product's accumulator held while the
+    program goes on (warpgroup MMA's), where each mma.sync product completes before the next: a launch's
+    products issued in turn hold their accumulators at once on the one, one at a time on the other."""
+    fixes_up: bool = False
+    """Whether a tile's steps may be walked by several programs in turn (`tail.Tail`), each but the first
+    leaving its fp32 partial in global memory behind a GPU-scope semaphore the first waits on (`fixed_up`,
+    `partials_ready`)."""
+    stores_through_registers: bool
+    """Whether a program copies its stored output tiles out through its registers (no TMA store before
+    Hopper: `mosaic_sm80.Mma.persist`), so its epilogue holds its share of the stored tile beside the
+    accumulator (`resources.tile_registers`)."""
     @property
     def lhs_copies(self) -> int:
         """The warps of a role each holding the left operand's fragment for the same rows (mma.sync's warps
@@ -479,7 +472,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     widest_product: int | None = None
     """The most columns one product spans (warpgroup MMA's 256, wgmma's widest N), which a tile's columns
     are at most; None where a tile's columns are many products' (mma.sync's 8 each), held by its
-    registers alone (`tile_registers`)."""
+    registers alone (`resources.tile_registers`)."""
     copy_extent: int | None = None
     """The most elements one asynchronous copy moves along a dimension of its box after the copy's tiling
     (TMA's, 256): an operand block tiled in 8 rows by a swizzled row stays far below it at any tile its
@@ -501,12 +494,20 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
     the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
     launches keep."""
+    cluster: int = 1
+    """The programs a cluster of the family's launch takes where they read a block in common (`kernel`'s
+    `cluster`), each loading its share of the block multicast into every one's shared memory (`streams`'
+    `multicast`): TMA multicast's pair; 1 where a load reaches its own program's shared memory alone
+    (cp.async's)."""
+    walks_scoped: bool = False
+    """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
+    scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
     def programs(self, consumers: int) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
         consumer roles: one where the family's roles split the register file between them (warpgroup
-        MMA's consumers beside its producer, `consumer_registers`). Each stages its share of the
-        multiprocessor's shared memory (`program_shared`), which may hold no tile at that many."""
+        MMA's consumers beside its producer, `resources.consumer_registers`). Each stages its share of the
+        multiprocessor's shared memory (`resources.program_shared`), which may hold no tile at that many."""
         del consumers
         return 1
 
@@ -519,10 +520,30 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """The columns a tile's width steps by for operands of `dtype`: the swizzle a block's rows are
         staged in, or the row its stores lay over a role's threads."""
 
+    def stores_columns(self, columns: int, rows: int) -> bool:
+        """Whether its stores take an output tile `columns` wide (a multiple of `column_unit`) whose stored
+        rows come in multiples of `rows` (a grouped call's, ragged to a row: 1; a dense call's, whole
+        `TMA_ROWS`): any, unless its stores reload rows through registers laid over a role's threads
+        (`Mma`)."""
+        del columns, rows
+        return True
+
     @abc.abstractmethod
     def depths(self, dtype) -> tuple[int, ...]:
         """The depths a step may take for operands of `dtype`, widest first: the swizzles its products
         read a block's rows at."""
+
+    def column_registers(self, columns: int, dtype) -> int:
+        """The registers a consumer thread holds for a vector of `columns` entries of `dtype` in the
+        accumulator's column layout (`column`), broadcast over its rows: a family whose register model
+        prices such a vector (a hook's, a template's per-row statistics) states it."""
+        raise NotImplementedError(f"{self.name}'s register model takes no column vector")
+
+    def row_registers(self, rows: int, dtype) -> int:
+        """The registers a consumer thread holds for a vector of `rows` entries of `dtype` in the
+        accumulator's row layout (`row`), broadcast over its columns: a family whose register model prices
+        such a vector (a template's per-row statistics) states it."""
+        raise NotImplementedError(f"{self.name}'s register model takes no row vector")
 
     def narrowest_columns(self, dtype) -> int:
         """The fewest columns a staged operand block of `dtype` takes: a row of the narrowest swizzle
@@ -570,15 +591,21 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | None = None,
+               reducing_warpgroups: int = 0) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own, with
         `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
-        `name` where given (Mosaic names its kernel and its compile reports by it)."""
+        `name` where given (Mosaic names its kernel and its compile reports by it); each of `grid`'s
+        programs a cluster of `cluster` along `CLUSTER` (at most the family's `cluster`); its `cost`, the
+        work it states to XLA and to Dew's FLOP count (the custom call's `cost_estimate_json`); its
+        `reducing_warpgroups` (the block's, where its arithmetic may reduce across warps implicitly) each
+        reserving its share of reduction scratch (`warpgroup_reduction_scratch`)."""
 
     @abc.abstractmethod
-    def scoped(self, body, *allocations, streams) -> None:
+    def scoped(self, body, *allocations, streams):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
-        (`streams`)."""
+        (`streams`), and what it returns."""
 
     @abc.abstractmethod
     def roles(self, consumers: int, consumer, producer) -> None:
@@ -586,9 +613,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         family streams from a role of its own."""
 
     @abc.abstractmethod
-    def streams(self, blocks: dict, stages: int, consumers: int) -> Allocated:
+    def streams(self, blocks: dict, stages: int, consumers: int,
+                multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None) -> Allocated:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
-        by `consumers` (`opened` once scoped)."""
+        by `consumers` (`opened` once scoped), each stream `multicast` names one the programs of a cluster
+        share, loaded once between them (`kernel`'s `cluster`), each `swizzles` names staged at its swizzle
+        (`swizzle_for`; inference's own otherwise)."""
 
     @abc.abstractmethod
     def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
@@ -611,8 +641,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         as `walk` does, a step's index the tile's own (where not active it takes none, its accumulators as
         they start), and `store(output, value, ref, place)` stores a consumer's `value` of output `output`
         (`outputs`' `(shape, dtype)`) to `ref` at `place`, `store_rows`' `(row_start, first, stored,
-        column, most)`. The family owns the loads, the step counter across tiles, the streams' drain, the
-        outputs' staging and the stores' completion."""
+        column, most)` and, where the stored rows come in whole multiples, `least`. The family owns the
+        loads, the step counter across tiles, the streams' drain, the outputs' staging and the stores'
+        completion. A cluster's programs run the same tiles: where a stream is multicast (`streams`),
+        `schedule` gives each of them the same `active`, `steps` and view of it."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -634,11 +666,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def loaded(self, copies) -> None:
         """Each `(view, ref, barrier)` copied whole into its shared-memory `ref`."""
 
-    def output_columns(self, columns: int, dtypes) -> int:
-        """The columns of a `columns`-wide output tile a consumer stages in shared memory at once
-        (`persist`'s stores): the whole tile's, where a family stages it whole."""
-        del dtypes
-        return columns
+    def output_staging(self, outputs: tuple, consumers: int) -> list:
+        """The shared memory `persist` stages each of `outputs` (`(shape, dtype)`, a tile's) in, which a
+        template's allocations count as its own (`resources.Scope`): the whole tile, where a family stages
+        it whole."""
+        del consumers
+        return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
 
     def published(self) -> None:
         """A consumer's writes to shared memory made visible to the readers that read it asynchronously
@@ -685,6 +718,25 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def products(self, acc: Accumulator, lhs, rhs, interpret: bool) -> Accumulator:
         """`acc` with `lhs @ rhs` issued into it in place, both operands in shared memory (a GEMM's step)."""
 
+    def issued(self, acc: Accumulator, left: tuple, right: tuple, interpret: bool) -> Accumulator:
+        """`acc` with the products of `left`'s and `right`'s parts (`product.formed`, each a part's
+        shared-memory tile) issued into it in place, the pairs `product.terms` gives, smallest first
+        (`products`)."""
+        for i, j in product.terms(len(left), len(right)):
+            acc = self.products(acc, left[i], right[j], interpret)
+        return acc
+
+    def apart(self, shape: tuple[int, int], left: tuple, right: tuple, interpret: bool) -> jax.Array:
+        """The products of `left`'s and `right`'s parts (`issued`'s), each into its own fresh fp32
+        accumulator of `shape` (`summed`), added left to right in `product.terms`' order, so the smallest
+        meet first: a tensor core's accumulation truncates (mma.sync's), so a part accumulated onto a larger
+        one loses its last bit where a sum rounds it."""
+        def issue(i: int, j: int, acc: Accumulator) -> Accumulator:
+            return self.products(acc, left[i], right[j], interpret)
+
+        return functools.reduce(jnp.add, (self.summed(shape, functools.partial(issue, i, j), interpret)
+                                          for i, j in product.terms(len(left), len(right))))
+
     @abc.abstractmethod
     def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
         """`acc` with `parts`' products with `rhs` issued into it in place, each part's left operand in
@@ -700,6 +752,18 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     @abc.abstractmethod
     def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
         """`acc` taken by `scale(value)` in place, then `register_products` of `parts` with `rhs` into it."""
+
+    def partials_ready(self, shape: tuple[int, ...], interpret: bool):
+        """The semaphores of `shape` a tile's partials are signalled on across programs (`fixed_up`); none
+        interpreted, where the programs' order stands in for them (`tail.ordered`)."""
+        raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
+
+    def fixed_up(self, summed, partials, ready, program, start, gathered, store) -> None:
+        """A balanced tail's consumer's share of a tile (`tail.Tail`), `summed` from its program's steps:
+        left in `partials` (each program's, this consumer's) behind `ready` (`partials_ready`) where its
+        range starts inside the tile; otherwise added to every partial the programs after it up to
+        `gathered` left, each awaited, and stored (`store`)."""
+        raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
 
     @abc.abstractmethod
     def settled(self, pending: int = 0) -> None:
@@ -740,8 +804,13 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     reduction_scratch: int = 0
     """The bytes of shared memory the family's kernels reserve for Mosaic GPU's implicit reductions across
-    warps (its compiler parameters' `reduction_scratch_bytes`): none where a reduction takes the consumer's
-    own (`column_sums`)."""
+    warps (its compiler parameters' `reduction_scratch_bytes`) where they reduce (`resources.Scope.reduces`):
+    none where a reduction takes the consumer's own (`column_sums`)."""
+
+    warpgroup_reduction_scratch: int = 0
+    """The bytes of Mosaic GPU's reduction scratch a warpgroup of a kernel whose arithmetic reduces across
+    warps implicitly takes as its share (`kernel`'s `reducing_warpgroups`, `resources.Scope`'s): a family
+    whose kernels reserve no scratch by default (`reduction_scratch`)."""
 
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         """The sums of `value`'s columns `[columns]` in a column's layout, `value` `[rows, columns]` in the
@@ -774,10 +843,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     operands from the rings, a block's rows staged at the widest swizzle, 128 bytes."""
     bounded_loads = True
     operands_in_registers = False
+    products_overlap = True
+    fixes_up = True
+    # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).
+    warpgroup_reduction_scratch = 2048
+    stores_through_registers = False
     copy_extent = 256
 
     def registers(self, consumers: int) -> int:
-        return consumer_registers(consumers)
+        return resources.consumer_registers(consumers)
 
     def column_unit(self, dtype) -> int:
         return SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
@@ -789,26 +863,46 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return consumers + 1
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | None = None,
+               reducing_warpgroups: int = 0) -> Callable:
+        if cluster > self.cluster:
+            raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
+        per_shard(name or self.name)
+        clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
-                            num_threads=consumers + 1, thread_name="wg",
-                            compiler_params=compiler_params(approx_math=approx_math),
-                            interpret=interpreted(interpret), kernel_name=name)
+                            num_threads=self.warpgroups(consumers), thread_name="wg",
+                            compiler_params=compiler_params(
+                                approx_math=approx_math,
+                                reduction_scratch=self.warpgroup_reduction_scratch * reducing_warpgroups),
+                            interpret=interpreted(interpret), kernel_name=name, cost_estimate=cost,
+                            **clustered)
 
-    def scoped(self, body, *allocations, streams) -> None:
-        pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
-                      collective_axes="wg")
+    def scoped(self, body, *allocations, streams):
+        return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
+                             collective_axes="wg")
 
     def roles(self, consumers: int, consumer, producer) -> None:
         roles(lax.axis_index("wg"), consumers, consumer, producer)
 
-    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
-        return {name: ring(shape, dtype, stages, consumers=consumers)
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
+                swizzles: dict[str, int] | None = None) -> dict:
+        return {name: ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
+                           swizzle=(swizzles or {}).get(name))
                 for name, (shape, dtype) in blocks.items()}
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:
         del views
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
+
+    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
+            refills: bool = True) -> "dict[str, Ring] | Feed":
+        """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`), the walk's `first` its
+        `lo`: on a layout with a producer, the rings, which its producer loads from `views` (`stream`);
+        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`. Its rings fresh, one walk's a scope:
+        a second walk on them counts its steps from its own first against barriers already past them."""
+        del views, lo, hi, wg, refills
+        return streams
 
     def stream(self, streams, views: dict, lo, hi) -> None:
         rings = tuple(streams.values())
@@ -819,20 +913,18 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         streamed(rings, tiles, lo, hi)
 
-    def output_columns(self, columns: int, dtypes) -> int:
-        # Two chunk buffers, not the whole tile (`output_staging`).
-        return math.prod(output_staging(columns, dtypes))
+    def output_staging(self, outputs: tuple, consumers: int) -> list:
+        # Each consumer's share of each output in two chunk buffers, not the whole tile (`output_staging`).
+        return [plgpu.SMEM((consumers, output_staging(shape[1], (dtype,))[1], shape[0],
+                            output_staging(shape[1], (dtype,))[0]), dtype)
+                for shape, dtype in outputs]
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
-        # a tile's first loads go out while the consumers store the last one; each consumer stages its
-        # share of each output in chunks (`output_staging`: two buffers of `staged_columns`) and stores each
-        # by TMA, waiting only for a buffer's last store to read it before it writes it again.
+        # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
-        staging = [plgpu.SMEM((consumers, output_staging(shape[1], (dtype,))[1], shape[0],
-                               output_staging(shape[1], (dtype,))[0]), dtype)
-                   for shape, dtype in outputs]
+        staging = self.output_staging(outputs, consumers)
 
         def producer():
             @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
@@ -852,48 +944,93 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 ring.drain(loaded)
 
         def consumed(smems):
-            def run(index):
-                def store(output, value, ref, place):
-                    smem = smems[output].at[index]
-                    buffers, width = smem.shape[0], smem.shape[-1]
-                    row_start, first, stored, column, most = place
-                    for chunk in range(value.shape[1] // width):
-                        if chunk == 0 or chunk >= buffers:
-                            # The buffer's last store (the last tile's, at its first chunk) has read it.
-                            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                        buffer = smem.at[chunk % buffers]
-                        buffer[...] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
-                        plgpu.commit_smem()
-                        store_rows(buffer, ref, row_start, first, stored, column + chunk * width, most)
-
-                @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
-                def _(loop: plgpu.NDLoopInfo, carry):
-                    counter = carry  # the step every ring is at
-                    active, steps, _, tile = schedule(loop.index)
-
-                    def walk(step, start, shapes, *, initial=None):
-                        def stepped(at, slots, carry, accumulators):
-                            return step(at - counter, slots, carry, accumulators)
-
-                        return self.walk(rings, ((stepped, counter, counter + steps),), start, shapes,
-                                         interpret, in_flight=in_flight, initial=initial)
-
-                    pl.when(active)(lambda: consumer(index, tile, walk, store, active=True))
-                    pl.when(~active)(lambda: consumer(index, tile, unwalked(self), store, active=False))
-                    return counter + jnp.where(active, steps, 0)
-
-                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-            return run
+            return self._tiled(rings, tiles, schedule, consumer, smems, axis=axis, interpret=interpret,
+                               in_flight=in_flight)
 
         pl.run_scoped(lambda *smems: self.roles(consumers, consumed(smems), producer), *staging,
                       collective_axes="wg")
 
+    def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, consumer: Callable,
+               smems, *, axis: str, interpret: bool, in_flight: int) -> Callable:
+        """`persist`'s consumers: each walks its tiles' steps at a counter running across the tiles
+        (`_tile_walk`), stages its share of each output in chunks (`output_staging`: two buffers of
+        `staged_columns`) and stores each by TMA, waiting only for a buffer's last store to read it before
+        it writes it again; the rings are left as `_ended` leaves them."""
+        def run(index):
+            def store(output, value, ref, place):
+                smem = smems[output].at[index]
+                buffers, width = smem.shape[0], smem.shape[-1]
+                row_start, first, stored, column, *ladder = place
+                for chunk in range(value.shape[1] // width):
+                    if chunk == 0 or chunk >= buffers:
+                        # The buffer's last store (the last tile's, at its first chunk) has read it.
+                        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                    buffer = smem.at[chunk % buffers]
+                    buffer[...] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
+                    plgpu.commit_smem()
+                    store_rows(buffer, ref, row_start, first, stored, column + chunk * width, *ladder)
+
+            @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
+            def ended(loop: plgpu.NDLoopInfo, carry):
+                counter = carry  # the step every ring is at
+                active, steps, views, tile = schedule(loop.index)
+                walk = self._tile_walk(rings, counter, jnp.where(active, steps, 0), views, index,
+                                       interpret=interpret, in_flight=in_flight)
+                pl.when(active)(lambda: consumer(index, tile, walk, store, active=True))
+                pl.when(~active)(lambda: consumer(index, tile, unwalked(self), store, active=False))
+                return counter + jnp.where(active, steps, 0)
+
+            self._ended(rings, ended, index)
+            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+        return run
+
+    def _tile_walk(self, rings: dict[str, Ring], counter, steps, views: dict, wg, *, interpret: bool,
+                   in_flight: int) -> Callable:
+        """`persist`'s walk of one tile's `steps` for consumer `wg` (its consumer's `walk(step, start,
+        shapes, initial=)`), the rings at `counter`, each step's index counted from the tile's first, over
+        the streams the layout gives the tile (`_tile_streams`)."""
+        streams = self._tile_streams(rings, counter, steps, views, wg)
+
+        def walk(step, start, shapes, *, initial=None):
+            def stepped(at, slots, carry, accumulators):
+                return step(at - counter, slots, carry, accumulators)
+
+            return self.walk(streams, ((stepped, counter, counter + steps),), start, shapes, interpret,
+                             in_flight=in_flight, initial=initial)
+
+        return walk
+
+    def _tile_streams(self, rings: dict[str, Ring], counter, steps, views: dict,
+                      wg) -> "dict[str, Ring] | Feed":
+        """The streams a tile's walk reads (`_tile_walk`): the rings, which the producer loads from
+        `views`."""
+        del counter, steps, views, wg
+        return rings
+
+    def _ended(self, rings: dict[str, Ring], end, wg) -> None:
+        """Consumer `wg`'s rings after `persist`'s last tile, at counter `end`: the producer drains them."""
+        del rings, end, wg
+
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
                 ) -> tuple[C, tuple[jax.Array, ...]]:
+        return self._walked(streams, segments, start, shapes, interpret, first=first, in_flight=in_flight,
+                            initial=initial)
+
+    def _walked[C](self, streams: dict[str, Ring], segments, start: C, shapes: tuple, interpret: bool, *,
+                   first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
+                   freed: Callable | None = None) -> tuple[C, tuple[jax.Array, ...]]:
+        """`walk`, `freed(counter)` run after each step's slots are given back (step `counter`'s)."""
         if in_flight not in (0, 1):
             raise ValueError(f"a walk keeps no step's products or one step's in flight, not {in_flight}")
+
+        def given(counter, *, release: bool = False) -> None:
+            # Step `counter`'s slots given back (`release`: here, a step its products ran past), then `freed`.
+            if release:
+                released(streams, counter)
+            if freed is not None:
+                freed(counter)
 
         def slotted(step, lo):
             def run(index, carry, accumulators):
@@ -903,12 +1040,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                     # The step's products done before its slots are given back.
                     self.settled()
                     slots.done()
+                    given(index - first)
                     return carry, accumulators
                 # The step's products run on while the next step's operands are waited for: the previous
                 # step's, done now, give back its slots.
                 slots.held()
                 self.settled(in_flight)
-                pl.when(index > lo)(lambda: released(streams, index - 1 - first))
+                pl.when(index > lo)(lambda: given(index - 1 - first, release=True))
                 return carry, accumulators
 
             return run
@@ -918,7 +1056,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         if in_flight:
             # Each segment's last step, its products done by the walk's end.
             for _, lo, hi in segments:
-                pl.when(hi > lo)(lambda hi=hi: released(streams, hi - 1 - first))
+                pl.when(hi > lo)(lambda hi=hi: given(hi - 1 - first, release=True))
         return walked
 
     @abc.abstractmethod
@@ -954,8 +1092,193 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(smem, view, reduction_op="add")
 
+    def partials_ready(self, shape: tuple[int, ...], interpret: bool):
+        return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
+
+    def fixed_up(self, summed, partials, ready, program, start, gathered, store) -> None:
+        # GPU-scope signals and waits, proven to lower and run on an H100 at the pinned JAX: TGHYBRID1-h100's
+        # SASS releases each partial with MEMBAR.GPU and a strong global add, and acquires it with a strong
+        # CAS. Interpreted, the partials are left before they are read (`tail.ordered`).
+        @pl.when(start > 0)
+        def _():
+            partials[program] = summed
+            if ready is not None:
+                plgpu.semaphore_signal(ready.at[program], memory_scope="gpu")
+
+        @pl.when(start == 0)
+        def _():
+            def added(other, running):
+                if ready is not None:
+                    plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
+                return running + partials[other]
+
+            store(lax.fori_loop(program + 1, gathered, added, summed))
+
     def held(self, ref: Ref) -> Operand:
         return ref
+
+
+@dataclasses.dataclass(frozen=True)
+class Feed:
+    """A walk's steps `lo` to `hi` (its indices, `walk`'s segment bounds) as a consumer-fed walk reads them
+    (`ConsumerFed`), step `index` in the rings' slot of counter `index - first` (`walk`'s `first`, as
+    `Slots` takes it): the loading consumer (`loads`, one warpgroup's traced flag) loads each step into
+    each of `rings` from its view of `views` at `index - origin` (a plain walk's views take its own
+    indices, as a producer's `stream` gives them: `origin` 0; `persist`'s a tile's steps counted from its
+    first), the first steps before the walk (`primed`) and each later one once the slot it reuses is given
+    back
+    (`refilled`, at the given step's counter): by the walk after each step's release, or where `refills`
+    is False by the template, at a point of its own (a walk whose turns order its consumers refills past
+    the turn that lets the other finish); the loading consumer waits at the walk's end for every slot's
+    last release where it `drains` (a plain walk's; `persist` drains after a program's last tile)."""
+    rings: dict[str, Ring]
+    views: dict
+    lo: jax.Array
+    hi: jax.Array
+    loads: jax.Array
+    first: jax.Array | int = 0
+    origin: jax.Array | int = 0
+    refills: bool = True
+    drains: bool = False
+
+    @property
+    def stages(self) -> int:
+        return min(ring.stages for ring in self.rings.values())
+
+    def load(self, index) -> None:
+        for name, ring in self.rings.items():
+            ring.load(index - self.first, viewed(self.views[name], ring.smem.shape[1:], index - self.origin))
+
+    def primed(self) -> None:
+        """The walk's first steps, a slot each, loaded."""
+        for ahead in range(self.stages):
+            pl.when(self.loads & (self.lo + ahead < self.hi))(lambda ahead=ahead: self.load(self.lo + ahead))
+
+    def refilled(self, counter) -> None:
+        """The step at ring counter `counter`, its slots given back, has them take the walk's step a ring
+        ahead where it has one: its load waits until every consumer has given them back (`Ring.load`)."""
+        ahead = counter + self.first + self.stages
+        pl.when(self.loads & (ahead < self.hi))(lambda: self.load(ahead))
+
+    def drained(self) -> None:
+        """The loading consumer's wait for the release of each slot the walk filled last (`Ring.drain`), so
+        no slot is reused or freed while another consumer reads it."""
+        @pl.when(self.loads)
+        def _():
+            for ring in self.rings.values():
+                ring.drain(self.hi - self.first)
+
+
+class ConsumerFed[Accumulator](RingFamily[Accumulator]):
+    """A ring family's layout without a producer (`RingFamily`'s otherwise), an instruction family's bundle
+    taking it first among its bases (`mosaic_sm90.WgmmaFed`): its
+    consumers alone run, the first issuing every ring's loads between its own steps (`Feed`; Mosaic GPU
+    elects one of its threads to issue each copy), so each holds its program's entry registers, which no
+    raise moves (`resources.entry_registers`: two consumers' 255, where a producer's third warpgroup leaves
+    them 168 while the GPU's compile ignores setmaxnreg, `resources.RAISES_HONORED`). SETMAXNREG-FFI3-h100:
+    attention's dK/dV at two consumers so, 0.732 ms, against 1.588 ms with a producer at 168 registers,
+    spilling. Its streams run through `persist`, or a plain walk over a `Feed` (`fed`) every consumer walks
+    whole (no `passed`: a consumer's steps are every consumer's); it takes no cluster (a multicast ring's
+    loads are each program's producer's)."""
+    cluster = 1
+    loader = 0
+    """The consumer that issues the loads."""
+
+    def registers(self, consumers: int) -> int:
+        return resources.entry_registers(consumers)
+
+    def warpgroups(self, consumers: int) -> int:
+        return consumers
+
+    def roles(self, consumers: int, consumer, producer) -> None:
+        del consumers, producer
+        consumer(lax.axis_index("wg"))
+
+    def stream(self, streams, views: dict, lo, hi) -> None:
+        raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
+
+    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+        raise NotImplementedError(f"{self.name}'s consumers each walk every step of their rings (`fed`)")
+
+    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
+            refills: bool = True) -> "dict[str, Ring] | Feed":
+        """`RingFamily.fed`: a `Feed` of steps `lo` to `hi` from `views`, its ring counters from `lo` (the
+        walk's `first`), its first steps primed by the loading consumer, drained at its walk's end."""
+        feed = Feed(streams, views, lo, hi, wg == self.loader, first=lo, refills=refills, drains=True)
+        feed.primed()
+        return feed
+
+    def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
+                ) -> tuple[C, tuple[jax.Array, ...]]:
+        if not isinstance(streams, Feed):
+            raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
+        # The walk reads each step at the ring counter its feed loads it at, both from the feed's `lo`.
+        first = streams.first
+        if in_flight and len(segments) > 1:
+            # A segment's last step's release waits for the walk's end, which the feed's next segment, its
+            # loads behind that release, would never reach.
+            raise NotImplementedError(f"{self.name}'s fed walk keeps no products in flight across segments")
+        walked = self._walked(streams.rings, segments, start, shapes, interpret, first=first,
+                              in_flight=in_flight, initial=initial,
+                              freed=streams.refilled if streams.refills else None)
+        if streams.drains:
+            streams.drained()
+        return walked
+
+    def _tile_streams(self, rings: dict[str, Ring], counter, steps, views: dict,
+                      wg) -> "dict[str, Ring] | Feed":
+        # The tile's steps as its loading consumer feeds them, the first ones primed.
+        feed = Feed(rings, views, counter, counter + steps, wg == self.loader, origin=counter)
+        feed.primed()
+        return feed
+
+    def _ended(self, rings: dict[str, Ring], end, wg) -> None:
+        # The loading consumer has seen every release but the last ring's worth: it waits for those too, so
+        # no slot is reused or freed while another consumer reads it, and every release is seen.
+        @pl.when(wg == self.loader)
+        def _():
+            for ring in rings.values():
+                ring.drain(end)
+
+
+def summing(shape: tuple[int, ...], consumers: int) -> dict:
+    """`summed_across`' allocations for `pl.run_scoped` (collective across the consumers, in a scope after
+    the walk's, whose shared memory it reuses): every consumer's fp32 part but the first's, the barrier they
+    arrive at once theirs is written, and the one the first arrives at once it has read them; none for one
+    consumer, whose part is the sum."""
+    if consumers == 1:
+        return {}
+    return {'parts': plgpu.SMEM((consumers - 1, *shape), jnp.float32),
+            'ready': plgpu.Barrier(num_arrivals=consumers - 1, num_barriers=1),
+            'read': plgpu.Barrier(num_arrivals=1, num_barriers=1)}
+
+
+def summed_across(value, scratch: dict, wg, consumers: int, store: Callable) -> None:
+    """The consumers' fp32 parts of one tile (each consumer's `value`) added and stored once: every consumer
+    but the first leaves its part in `scratch` (`summing`'s, scoped) and arrives at its `ready`, then waits
+    until the first has read every part (`read`), so the scratch serves the next sum; the first waits, adds
+    them in the consumers' order (one sum, the same each run), arrives at `read` and stores the total
+    (`store(total)`). One consumer stores its own."""
+    if consumers == 1:
+        store(value)
+        return
+    parts, ready, read = scratch['parts'], scratch['ready'], scratch['read']
+
+    @pl.when(wg > 0)
+    def _():
+        parts[wg - 1] = value
+        plgpu.barrier_arrive(ready.at[0])
+        plgpu.barrier_wait(read.at[0])
+
+    @pl.when(wg == 0)
+    def _():
+        plgpu.barrier_wait(ready.at[0])
+        total = value
+        for other in range(consumers - 1):
+            total = total + parts[other]
+        plgpu.barrier_arrive(read.at[0])
+        store(total)
 
 
 def unscaled(parts) -> None:

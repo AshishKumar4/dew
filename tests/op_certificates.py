@@ -59,6 +59,9 @@ class Format:
 FLOAT32 = Format("float32", 24, -126, 127)
 BFLOAT16 = Format("bfloat16", 8, -126, 127)
 FORMATS = {"float32": FLOAT32, "bfloat16": BFLOAT16}
+TFLOAT32 = Format("tfloat32", 11, -126, 127)
+"""TF32: fp32's range at 11 bits, the operands a GPU's tensor cores multiply fp32 products in at the default
+precision (src/dew/nn/kernels/templates/product.py); no array holds it, so it is no dtype's (FORMATS)."""
 
 
 def two_sum(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -98,6 +101,28 @@ def rounded(hi: np.ndarray, lo: np.ndarray, fmt: Format) -> np.ndarray:
     inward = (lo != 0) & ((lo > 0) != (hi > 0))
     beyond = (np.abs(hi) > edge) | ((np.abs(hi) == edge) & ~inward)
     return np.where(~finite, hi, np.where(beyond, np.copysign(np.inf, hi), result))
+
+
+def _quantized(value, fmt: Format, offset: float) -> np.ndarray:
+    """Each exact value's magnitude in units of `fmt`'s spacing at it, plus `offset`, floored, as a value of
+    `fmt` of the value's sign (as float64); infinite past `fmt`'s range. For values no wider than half of
+    float64's precision every step is exact: the scaling by a power of two, the offset's add and the floor."""
+    value = np.asarray(value, np.float64)
+    finite = np.isfinite(value)
+    quantum = _quantum(np.where(finite, value, 0.0), fmt)
+    result = np.copysign(np.floor(np.abs(np.where(finite, value, 0.0)) / quantum + offset) * quantum, value)
+    overflows = np.abs(result) > fmt.largest
+    return np.where(~finite, value, np.where(overflows, np.copysign(np.inf, value), result))
+
+
+def rounded_away(value, fmt: Format) -> np.ndarray:
+    """Round to nearest in `fmt`, a tie away from zero (PTX's `.rna`), of exact values, as float64."""
+    return _quantized(value, fmt, 0.5)
+
+
+def truncated(value, fmt: Format) -> np.ndarray:
+    """Exact values rounded toward zero in `fmt`, as float64."""
+    return _quantized(value, fmt, 0.0)
 
 
 def exact_add(a, b, fmt: Format) -> np.ndarray:

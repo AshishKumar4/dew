@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
 import sys
 import time
 import types
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import jax
@@ -23,14 +25,22 @@ from dew._coordination import (
     collective_host,
     from_every_process,
 )
-from dew.artifacts import Artifact, Artifacts
+from dew.artifacts import Artifact, Artifacts, FixedRows
 from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
 from dew.data.pipeline import Dataset
-from dew.distributed.batches import row_origins, shard_batch, shared_host_fields, split_fields, with_host
+from dew.distributed.batches import (
+    batch_signature,
+    row_origins,
+    shard_batch,
+    shared_host_fields,
+    split_fields,
+    with_host,
+)
 from dew.distributed.placement import MeshSpec
 from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
 from dew.training.cadence import Tokens
+from dew.training.tracker import write_artifact
 
 
 @dataclass(frozen=True)
@@ -147,7 +157,8 @@ class Evaluation:
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None, warm: bool = False,
-            updates: int | jax.Array | None = None) -> Evaluation:
+            updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None
+            ) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
         Every process calls this with the same objective, metrics and numerical
@@ -181,6 +192,12 @@ class Evaluation:
         before its first step (`Trainer.fit`), and no score of a part of the
         split is checked or read.
 
+        `scored_to`, a directory, takes every batch's scoring artifacts, process 0 writing each batch's
+        real rows (a decision run's `Decisions`) as `<scored_to>/<split>-<batch>.npz`
+        (`dew.training.tracker.write_artifact`), so a pass's metrics pool exactly offline, across
+        batches and splits; a warming pass writes none. Process 0's `scored_to` is the pool's: every
+        process scores the batches it writes, whatever it was given.
+
         The scores are broadcast to every process. Previews stay on process 0, and
         there is at most one objective preview, however long the validation split
         is. Reporting the result is up to the caller. In a process pool, the callers
@@ -204,11 +221,16 @@ class Evaluation:
         scores: dict[str, float] = {}
         previews: tuple[Artifact, ...] = ()
         scored = records = 0
-        if batches is not None and (metrics or preview_enabled or loss):
+        written = None if scored_to is None or warm else Path(scored_to) / split
+        # Root writes what it is asked to keep, and every process scores the batches it writes, so each
+        # runs the same collectives: root's ask is the pool's.
+        kept = bool(broadcast_from_process_zero(root and written is not None))
+        if batches is not None and (metrics or preview_enabled or loss or kept):
             scores, previews, scored, records = _score_split(
                 objective, variables, batches, context, mesh, metrics=metrics, split=split,
                 root=root, preview_enabled=preview_enabled, score_key=score_key,
-                preview_key=preview_key, loss=loss, warm=warm)
+                preview_key=preview_key, loss=loss, warm=warm, written=written if root else None,
+                kept=kept)
         scores.update(training_scores)
         elapsed = time.perf_counter() - started
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
@@ -354,7 +376,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                  context: Step, mesh: Mesh | None, *, metrics: Sequence[Metric],
                  split: str, root: bool, preview_enabled: bool,
                  score_key: jax.Array, preview_key: jax.Array, loss: bool = False,
-                 warm: bool = False) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
+                 warm: bool = False, written: Path | None = None, kept: bool = False
+                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
     """Score every record of a validation split, or its first `WARM_BATCHES`
     batches unfinalized where `warm`.
 
@@ -364,7 +387,9 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     Every rank walks these phases in the same order. The pass ends when no
     rank has a batch left; until then a rank that has drained scores a copy
     of its last batch whose rows are all repeats (`_covered`), so it meets
-    its peers at every collective.
+    its peers at every collective. Where the pool keeps the pass's decisions
+    (`kept`, root's ask), every rank scores each batch and root writes it
+    to `written`.
     """
     summaries = _Accumulators()
     loss_sums = _LossSums()
@@ -373,6 +398,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     source = iterator = None
     last = None
     scored = records = 0
+    seen: set = set()
     try:
         def open_source() -> None:
             # Each name is bound as it is built, so a failure part way
@@ -384,16 +410,19 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
 
         agreed("iterator construction", open_source)
         assert iterator is not None and mesh is not None
+        # A pass that writes its scoring artifacts evaluates its batches, whatever metrics it scores.
+        evaluating = bool(metrics) or kept
         while True:
             held, available = _next_batch(iterator, scored)
             if not available:
                 break
             held, last, batch = _covered(mesh, held, last, scored)
+            _admitted(objective, batch, seen)
             # This rank's own real rows, counted on the host; the pool's count
             # is summed once after the split.
             records += int(np.sum(held[VALID_ROWS]))
             produced = None
-            if metrics or loss:
+            if evaluating or loss:
                 # The objective scores under the mesh, as the step trains
                 # under it: the model's placements and its sequence and stage
                 # splits read it. A preview decodes, which neither split does.
@@ -402,17 +431,18 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                         f"scoring batch {scored}",
                         lambda batch=batch, scored=scored: _dispatched(
                             objective, variables, batch, context, scored,
-                            loss=loss, evaluate=bool(metrics), score_key=score_key))
+                            loss=loss, evaluate=evaluating, score_key=score_key))
                     loss_sums.add(statistics)
-                    if metrics:
+                    if evaluating:
                         produced = _merged(produced, batch, held, scored, mesh=mesh, metrics=metrics,
+                                           written=written,
                                            summaries=summaries, root=root)
             if scored == 0 and preview_enabled:
                 previews = _previewed(objective, variables, batch, context,
                                       preview_key=preview_key, scored=produced, root=root)
             produced = batch = None
             scored += 1
-            if (not metrics and not loss) or (warm and scored == WARM_BATCHES):
+            if (not metrics and not loss and not kept) or (warm and scored == WARM_BATCHES):
                 break
         # Processes on one data share (a replicated stage or sequence axis)
         # read the same rows, so the pool counts each share once.
@@ -429,6 +459,44 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     finally:
         _close_source(iterator if iterator is not None else source)
     return scores, previews, scored, records
+
+
+def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> None:
+    """Check a batch of a shape the split has not shown (`seen`) against what the objective declares
+    (`InputSpec.check`), as a training step checks its own (`Trainer.fit`)."""
+    inputs = objective.inputs
+    device, _ = split_fields(batch)
+    signature = batch_signature(device)
+    if inputs is None or signature in seen:
+        return
+    seen.add(signature)
+    # A split may carry fewer fields than training, as an objective that scores from prompts reads.
+    agreed("validation input declaration", lambda: inputs.check(device, whole=False))
+
+
+def admit_split(objective: Objective[Loss, Effects], batches: Reader, mesh: Mesh, split: str) -> None:
+    """Read a validation split's first batch and check it against what the objective declares
+    (`_admitted`), before a run that scores the split only past its first step trains on: a split of
+    undeclared inputs is refused before an update, not after training. Its later batches are checked
+    as they are scored."""
+    if objective.inputs is None:
+        return
+    source = iterator = None
+    try:
+        def open_source() -> None:
+            nonlocal source, iterator
+            source = batches(DataPartition.of(mesh))
+            iterator = iter(source)
+
+        agreed(f"{split} iterator construction", open_source)
+        assert iterator is not None
+        # The phases `_score_split` walks for its first batch, so every rank meets its peers.
+        held, available = _next_batch(iterator, 0)
+        if available:
+            _, _, batch = _covered(mesh, held, None, 0)
+            _admitted(objective, batch, set())
+    finally:
+        _close_source(iterator if iterator is not None else source)
 
 
 WARM_BATCHES = 2
@@ -494,7 +562,12 @@ def _cut(leaf, keep: np.ndarray):
 
 
 def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:
-    """`artifact` with every per-row field cut to the real rows."""
+    """`artifact` with every per-row field cut to the real rows; one whose metrics read their rows through
+    a mask of its own (`FixedRows`) keeps its batch's fixed shape with that mask cleared on its padding
+    rows, so a metric reads every batch of a split, a short tail among
+    them, in one shape."""
+    if isinstance(artifact, FixedRows):
+        return artifact.unscored(~keep)
     return dataclasses.replace(artifact, **{field.name: _cut(getattr(artifact, field.name), keep)
                                             for field in dataclasses.fields(artifact)})
 
@@ -525,7 +598,7 @@ def _as_placed(leaf) -> np.ndarray:
 
 
 def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metrics: Sequence[Metric],
-            summaries: _Accumulators, root: bool):
+            summaries: _Accumulators, root: bool, written: Path | None = None):
     """Merge one batch into every metric's accumulator on root, returning what
     the objective produced, hosted.
 
@@ -534,7 +607,8 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
     it, so nothing copies back; a batch spread over processes comes home
     with the artifacts, its host fields from every share (`_shares_host`).
     One agreement covers every metric, so a failure on root stops its peers
-    there.
+    there. Where `written` names a place, root writes each of the batch's scoring artifacts there,
+    `<written>-<batch>`, its real rows alone (`write_artifact`).
     """
     if all(leaf.is_fully_addressable for leaf in jax.tree.leaves(batch) if isinstance(leaf, jax.Array)):
         produced = collective_host(produced, phase=f"scoring batch {index}")
@@ -560,6 +634,12 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
         real = _real_batch(home, keep)
         for metric in metrics:
             summaries.add(metric, metric(_pick(artifacts, metric.reads), real))
+        if written is not None:
+            # Every batch's scoring artifacts, its real rows alone, for pooling a pass offline.
+            written.parent.mkdir(parents=True, exist_ok=True)
+            for at, artifact in enumerate(artifacts):
+                suffix = f"-{at}" if len(artifacts) > 1 else ""
+                write_artifact(artifact, written.with_name(f"{written.name}-{index:05d}{suffix}"))
 
     agreed(f"metrics batch {index}", merge)
     return produced

@@ -18,13 +18,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike, VariableDict
 
+from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.interop.unread import Stored
 from dew.interop.weights import Tree, translate_parameters
-from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS
 from dew.nn.mlp import GatedMLP
 from dew.nn.multimodal import VisionConditioner
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.protocols import OutputTable
 from dew.nn.wrapping import DecoderWrapper

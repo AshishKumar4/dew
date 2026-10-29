@@ -4,7 +4,8 @@
 shapes, initializers, promotion and product hooks alike, so checkpoints,
 LoRA and Qwix see the layers they did, but for a batched `DenseGeneral`'s
 kernel, which draws each batch member alone (`_members`). Their call is their own: the same
-product, rounded to its dtype as flax's is, then the bias added by `biased`,
+product (the GEMM template's dense product where a launch takes it, `template.dot_general`, XLA's program
+otherwise), rounded to its dtype as flax's is, then the bias added by `biased`,
 which adds it in the dtype flax's addition gives them and broadcasts it at
 fp32, so its gradient sums at fp32 as torch's addmm sums it, and in float64 on a CPU under
 Dew's tests, as such a CPU sums every float32 product (`dew.nn.precision.accumulated`). The bias is
@@ -17,6 +18,7 @@ then sums, and offer no step to widen it.
 """
 
 import functools
+import importlib.util
 import inspect
 from collections.abc import Callable, Iterable
 
@@ -28,16 +30,43 @@ from flax.core import meta
 from flax.linen.module import InterceptorContext
 from flax.typing import Array
 
-from .precision import accumulated, biased
+from dew.cache import INTERCEPTED
+
+from .kernels.templates.gemm import template
+from .precision import accumulated, biased, float32_dot_general
+
+QWIX = importlib.util.find_spec("qwix") is not None
+"""Whether Qwix is installed (`dew.quantization`'s extra), whose rules a layer's product may fall under."""
+
+
+def intercepted() -> bool:
+    """Whether a wrapper owns the layer's product, which reaches it as a `jax.lax.dot_general` call: a Dew
+    interception scope (`dew.quantization`, `dew.lora`: `dew.cache.INTERCEPTED`), or a Qwix rule matching
+    the op at this module under a direct `qwix.quantize_model` call (`qwix.pallas.get_current_rule`, Qwix's
+    public query for code that runs its own kernels, which every active provider answers)."""
+    if INTERCEPTED.value:
+        return True
+    if not QWIX:
+        return False
+    from qwix import pallas as qwix_pallas
+
+    return qwix_pallas.get_current_rule("dot_general") is not None
 
 
 def _product(layer: nn.Dense | nn.DenseGeneral):
-    """The layer's product: its `dot_general_cls` or its `dot_general`, as flax picks it, else lax's at
-    its stated precision (`accumulated`: the plain product, its fp32 sum taken in float64 on a CPU under
-    Dew's tests)."""
+    """The layer's product: its `dot_general_cls` (an interceptor's: a quantized product), as flax picks
+    it, else its `dot_general`, or lax's at its stated precision (`accumulated`: the plain product, its fp32
+    sum taken in float64 on a CPU under Dew's tests). A plain product (lax's or `float32_dot_general`: its
+    operands' dtype out, at the layer's precision) goes through the GEMM template's dense product where a
+    launch takes it (`template.dot_general`; XLA's program wherever the template declares XLA faster), but
+    where a wrapper owns the products (`intercepted`: Qwix quantizes them as it intercepts `dot_general`). A
+    product with a policy of its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`)
+    is the layer's own: the template reads no policy from a callable."""
     if layer.dot_general_cls is not None:
         return layer.dot_general_cls()
-    return layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
+    product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
+    plain = layer.dot_general in (None, float32_dot_general)
+    return template.dot_general(product) if plain and not intercepted() else product
 
 
 def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None,
@@ -103,6 +132,11 @@ class _LinearEnvelope(nn.Module):
 
 class Dense(_LinearEnvelope, nn.Dense):
     """Flax's Dense, its bias added by `biased` (the module docstring)."""
+
+    def product_owned(self) -> bool:
+        """Whether a wrapper owns this layer's product (`intercepted`), asked within its own scope, so a
+        Qwix rule over its module path answers: what a parent joining it with others reads (`joined`)."""
+        return intercepted()
 
     def _linear(self, inputs: Array) -> jax.Array:
         width = jnp.shape(inputs)[-1]

@@ -3,6 +3,7 @@ held on the operands its execution gave it to its primitive's contract (CONTRACT
 oracles of tests/op_certificates.py; a primitive no contract covers fails the site
 (`assert_certified`), and the lane's arithmetic is held as it computes, measured on it (`lane`)."""
 
+import contextlib
 import dataclasses
 import fractions
 import functools
@@ -123,7 +124,7 @@ _UNBOUNDED = {name: Format(f"{name} unbounded", fmt.precision, -1022, fmt.emax)
 """Each format's precision at every exponent: what the lane's tininess is read from."""
 
 
-def _rounded_on_lane(hi, lo, fmt: Format, flushes: bool) -> np.ndarray:
+def rounded_on_lane(hi, lo, fmt: Format, flushes: bool) -> np.ndarray:
     """RN of the exact hi + lo in `fmt` as the lane's arithmetic rounds it: gradually, or where it
     `flushes` a zero of the exact value's sign wherever the value rounded with an unbounded exponent is
     below the least normal (tininess after rounding)."""
@@ -171,9 +172,9 @@ def _neighbours(low, high, fmt: Format, flushes: bool) -> tuple[np.ndarray, np.n
     (float64, outward), the least at or above it, and whether the enclosure decides them: one that
     straddles a value of the grid, its ends not two neighbours, decides nothing, and is refined by the
     caller."""
-    down = _rounded_on_lane(low, np.zeros_like(low), fmt, flushes)
+    down = rounded_on_lane(low, np.zeros_like(low), fmt, flushes)
     down = np.where(down > low, _step(down, fmt, -np.inf, flushes), down)
-    up = _rounded_on_lane(high, np.zeros_like(high), fmt, flushes)
+    up = rounded_on_lane(high, np.zeros_like(high), fmt, flushes)
     up = np.where(up < high, _step(up, fmt, np.inf, flushes), up)
     exact = (low == high) & (down == up)
     return down, up, exact | (_step(down, fmt, np.inf, flushes) == up)
@@ -252,6 +253,33 @@ def _erfinv_special(value):
     return expected, ~(np.abs(value) < 1) | (value == 0)
 
 
+def _logistic_interval(values, bits):
+    """logistic's outward enclosure, 1 / (1 + exp(-x)), at each finite value, taken at EXP_RANGE's nearer
+    end beyond it: below it every logistic is under exp(-110), between +0 and the least subnormal of a
+    format no wider than fp32, and above it within exp(-90) of one, between one and the largest value
+    below it, the verdicts of the ends'."""
+    return _interval(lambda iv, x: 1 / (1 + iv.exp(-x)))(np.clip(values, *EXP_RANGE), bits)
+
+
+def _logistic_special(value):
+    """logistic's limits at the infinities and its one exact value, logistic(±0) = 1/2, named."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.select([value == np.inf, value == -np.inf, value == 0], [1.0, 0.0, 0.5], np.nan), named
+
+
+def _rsqrt_special(value):
+    """rsqrt's pole at zero, of the zero's sign, its zero at infinity, NaN below zero, and its exact
+    values, at the powers of four (2^(2k), whose root's reciprocal 2^-k is on every grid; at no other
+    value is it), named."""
+    mantissa, exponent = np.frexp(np.where(np.isfinite(value) & (value > 0), value, 1.0))
+    four = np.isfinite(value) & (value > 0) & (mantissa == 0.5) & ((exponent - 1) % 2 == 0)
+    named = np.isnan(value) | (value <= 0) | (value == np.inf) | four
+    expected = np.select([value < 0, value == 0, value == np.inf, four],
+                         [np.nan, np.copysign(np.inf, value), 0.0, np.ldexp(1.0, -(exponent - 1) // 2)],
+                         np.nan)
+    return expected, named
+
+
 def _transcendental(enclose, special):
     """A transcendental's levels (`LEVELS`): where `special(value)` names an exact result (a limit, a
     pole, outside the domain), 0 at that result and UNREACHED elsewhere; at every other value at least
@@ -289,11 +317,18 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool) -> np.ndarray:
     count = terms.shape[-1]
     if count == 0:
         return _same(native, np.zeros_like(native))
-    magnitude = magnitude_sum(terms, -1)
     underflow = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
-    allowance = (gamma(count, fmt) + 2.0 ** -52) * magnitude + count * underflow
     error = np.abs(native - exact_sum(terms, -1))
-    return np.isfinite(error) & (error <= np.nextafter(allowance, np.inf))
+    slack = allowance(magnitude_sum(terms, -1), count, fmt, underflow)
+    return np.isfinite(error) & (error <= np.nextafter(slack, np.inf))
+
+
+def allowance(magnitude, count: int, fmt: Format, underflow: float):
+    """How far any order's sum of `count` terms of total magnitude `magnitude` lies from their exact sum in
+    `fmt`: γ_n of it (Higham, §3.1), with 2^-52 for the exact sum's own float64 rounding (`exact_sum`), and
+    `underflow` lost at each rounding below the normal range. Check 2's sums (`_terms_hold`) and a native
+    GEMM's (`native_certificates.native_dot_ends`) are held within it."""
+    return (gamma(count, fmt) + 2.0 ** -52) * magnitude + count * underflow
 
 
 def _floats(operands, flushes: bool):
@@ -312,13 +347,13 @@ def _wrapping(operator):
 
 def _arithmetic(build):
     """An IEEE operation's levels (`LEVELS`), its exact result `build(*operands)` as a double-double: 0
-    where the result is that rounded to nearest on the lane (`_rounded_on_lane`), else its place against
+    where the result is that rounded to nearest on the lane (`rounded_on_lane`), else its place against
     the exact result's two neighbours (`_past`); an exactly infinite or undefined result (an infinite
     operand, a division by zero) 0 where the lane's is the same and UNREACHED elsewhere."""
     def levels(operands, result, fmt, flushes):
         hi, lo = build(*_floats(operands, flushes))
         result = np.asarray(result, np.float64)
-        nearest = _rounded_on_lane(hi, lo, fmt, flushes)
+        nearest = rounded_on_lane(hi, lo, fmt, flushes)
         # Rounding took the exact value up, or down: the other neighbour is one step of the grid away.
         above = (nearest > hi) | ((nearest == hi) & (lo < 0))
         below = (nearest < hi) | ((nearest == hi) & (lo > 0))
@@ -399,6 +434,27 @@ def _reduced_sum(params, operands, result, fmt):
     kept = moved.shape[:moved.ndim - len(axes)]
     count = int(np.prod(moved.shape[len(kept):], dtype=np.int64))
     return _terms_hold(result, moved.reshape(*kept, count), fmt, flushes)
+
+
+def _cumulative(params, operands, result, fmt):
+    """A cumulative sum along `axis`, forward or reversed: each prefix's (or suffix's) sum of its terms
+    within its bound in any order (`_terms_hold`, every prefix taken as one of the axis's length, which
+    bounds each shorter one); for integers, each wrapped to the result's width."""
+    (terms,) = operands
+    axis, reverse = params["axis"], params["reverse"]
+    if fmt is None:
+        summed = _wrapping(lambda t: np.flip(np.cumsum(np.flip(t, axis), axis=axis, dtype=np.uint64), axis)
+                           if reverse else np.cumsum(t, axis=axis, dtype=np.uint64))
+        return _bits(result) == _bits(summed(result, terms))
+    flushes = lane().flushes
+    moved = np.moveaxis(_read(terms, flushes), axis, -1)
+    count = moved.shape[-1]
+    taken = np.arange(count)[None, :] >= np.arange(count)[:, None] if reverse else \
+        np.arange(count)[None, :] <= np.arange(count)[:, None]
+    # [..., k, j]: the j-th term where the k-th prefix (or suffix) takes it, zero elsewhere.
+    prefixes = np.where(taken, moved[..., None, :], 0.0)
+    held = _terms_hold(np.moveaxis(np.asarray(result), axis, -1), prefixes, fmt, flushes)
+    return np.moveaxis(held, -1, axis)
 
 
 def _dot(params, operands, result, fmt):
@@ -522,6 +578,89 @@ def _reshaped(params, value):
     return np.reshape(value, params["new_sizes"])
 
 
+def _padded(params, value, fill):
+    """lax.pad's result: each axis dilated by its interior padding, then given its low and high padding,
+    a negative one cropping."""
+    for axis, (low, high, interior) in enumerate(params["padding_config"]):
+        low, high, interior = int(low), int(high), int(interior)
+        if interior and value.shape[axis] > 1:
+            size = value.shape[axis] + (value.shape[axis] - 1) * interior
+            dilated = np.full((*value.shape[:axis], size, *value.shape[axis + 1:]), fill, value.dtype)
+            index = [slice(None)] * value.ndim
+            index[axis] = slice(None, None, interior + 1)
+            dilated[tuple(index)] = value
+            value = dilated
+        widths = [(0, 0)] * value.ndim
+        widths[axis] = (max(low, 0), max(high, 0))
+        value = np.pad(value, widths, constant_values=fill)
+        index = [slice(None)] * value.ndim
+        index[axis] = slice(max(-low, 0), value.shape[axis] - max(-high, 0))
+        value = value[tuple(index)]
+    return value
+
+
+def _iota(params):
+    shape, axis = tuple(params["shape"]), params["dimension"]
+    counted = np.arange(shape[axis], dtype=np.dtype(params["dtype"]))
+    return np.broadcast_to(counted.reshape([shape[axis] if dim == axis else 1 for dim in range(len(shape))]),
+                           shape)
+
+
+def _gathered(params, operand, indices):
+    """lax.gather's result, by XLA's semantics: each output index's batch coordinates pick a start vector
+    from `indices` (its last axis the index vector), placed on the operand's `start_index_map` axes and
+    its batching axes, clamped so the slice fits (the clip and promise-in-bounds modes) or the whole slice
+    the fill value where it does not (fill-or-drop), then offset by the output's offset coordinates on the
+    operand's axes a slice keeps."""
+    import jax
+
+    numbers = params["dimension_numbers"]
+    sizes, mode = tuple(params["slice_sizes"]), params["mode"]
+    fill = jax.lax.GatherScatterMode.FILL_OR_DROP
+    shape = operand.shape
+    out_rank = len(numbers.offset_dims) + indices.ndim - 1
+    offset_axes = [axis for axis in range(operand.ndim)
+                   if axis not in numbers.collapsed_slice_dims and axis not in numbers.operand_batching_dims]
+    batch_dims = [dim for dim in range(out_rank) if dim not in numbers.offset_dims]
+    kept = [size for axis, size in enumerate(sizes) if axis in offset_axes]
+    out_shape = [0] * out_rank
+    for dim, size in zip(numbers.offset_dims, kept, strict=True):
+        out_shape[dim] = size
+    for dim, size in zip(batch_dims, indices.shape[:-1], strict=True):
+        out_shape[dim] = size
+    result = np.empty(out_shape, operand.dtype)
+    filler = None
+    if mode == fill:
+        if params.get("fill_value") is not None:
+            filler = params["fill_value"]
+        elif jax.dtypes.issubdtype(operand.dtype, np.inexact):
+            filler = np.nan
+        elif operand.dtype == np.bool_:
+            filler = True
+        else:
+            filler = np.iinfo(operand.dtype).min if np.issubdtype(operand.dtype, np.signedinteger) else \
+                np.iinfo(operand.dtype).max
+    for out in np.ndindex(*out_shape):
+        batch = tuple(out[dim] for dim in batch_dims)
+        vector = indices[batch]
+        start = [0] * operand.ndim
+        for position, axis in enumerate(numbers.start_index_map):
+            start[axis] = int(vector[position])
+        for axis, batch_axis in zip(numbers.operand_batching_dims, numbers.start_indices_batching_dims,
+                                    strict=True):
+            start[axis] = batch[batch_axis]
+        if mode == fill and any(start[axis] < 0 or start[axis] + sizes[axis] > shape[axis]
+                                for axis in range(operand.ndim)):
+            result[out] = filler
+            continue
+        start = [min(max(begin, 0), shape[axis] - sizes[axis]) for axis, begin in enumerate(start)]
+        offsets = [out[dim] for dim in numbers.offset_dims]
+        for axis, offset in zip(offset_axes, offsets, strict=True):
+            start[axis] += offset
+        result[out] = operand[tuple(start)]
+    return result
+
+
 def _bitcast(params, value):
     """lax.bitcast_convert_type's shapes: a narrower type adds a trailing axis of the width ratio, a
     wider one takes the trailing axis away."""
@@ -581,6 +720,8 @@ LEVELS = {
     "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     "exp": _transcendental(_exp_interval, _exp_special),
     "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
+    "rsqrt": _transcendental(_interval(lambda iv, x: 1 / iv.sqrt(x)), _rsqrt_special),
+    "logistic": _transcendental(_logistic_interval, _logistic_special),
 }
 """Each rounding primitive's measure, `levels(operands, result, fmt, flushes) -> level`, element by
 element, on a lane that flushes or not: 0 where the result is its exact value rounded to nearest (an
@@ -601,8 +742,10 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     from about 2^-140 (subnormal on a lane that keeps subnormals) to 2^126; roots of every binade,
     subnormals included; logarithms of every binade and a quarter near one; exponentials across fp32's
     range and a quarter near zero; inverse error functions across (-1, 1) and a quarter near its poles;
-    and each transcendental at its exact value (exp(0), log(1), erf_inv(0)), which a lane must return
-    exactly. One fixed draw per primitive and format."""
+    reciprocal roots of every binade, a quarter at the powers of four where they are exact; logistics
+    across fp32's range and a quarter near zero; and each transcendental at its exact value (exp(0),
+    log(1), erf_inv(0), logistic(0)), which a lane must return exactly. One fixed draw per primitive and
+    format."""
     rng = np.random.default_rng([*name.encode(), fmt.precision])
     quarter = PROBES // 4
 
@@ -626,10 +769,14 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         value[:quarter] = 1 + rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[0] = 1.0
         drawn = [value]
-    elif name == "exp":
+    elif name in ("exp", "logistic"):
         value = rng.uniform(-104, 89, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[0] = 0.0
+        drawn = [value]
+    elif name == "rsqrt":
+        value = np.abs(scaled(-149, 127))
+        value[:quarter] = 4.0 ** rng.integers(-74, 64, quarter)
         drawn = [value]
     else:
         value = rng.uniform(-1, 1, PROBES)
@@ -666,6 +813,8 @@ def lane() -> Lane:
 
 CONTRACTS = {
     "add": _rounding("add", _wrapping(np.add)),
+    # A cotangents' sum, the add its transpose emits, lowered as `add` is: held at add's reach.
+    "add_any": _rounding("add", _wrapping(np.add)),
     "sub": _rounding("sub", _wrapping(np.subtract)),
     "mul": _rounding("mul", _wrapping(np.multiply)),
     "square": _rounding("square", _wrapping(lambda a: a * a)),
@@ -679,7 +828,10 @@ CONTRACTS = {
     "log": _rounding("log", None),
     "exp": _rounding("exp", None),
     "erf_inv": _rounding("erf_inv", None),
+    "rsqrt": _rounding("rsqrt", None),
+    "logistic": _rounding("logistic", None),
     "reduce_sum": _reduced_sum,
+    "cumsum": _cumulative,
     "dot_general": _dot,
     "eq": _compared(lambda params, a, b: np.equal(a, b)),
     "ne": _compared(lambda params, a, b: np.not_equal(a, b)),
@@ -708,6 +860,14 @@ CONTRACTS = {
     "concatenate": _moved(lambda params, *parts: np.concatenate(parts, axis=params["dimension"])),
     "copy": _moved(lambda params, a: a),
     "copy_p": _moved(lambda params, a: a),
+    "optimization_barrier": _moved(lambda params, a: a),
+    "name": _moved(lambda params, a: a),
+    "rev": _moved(lambda params, a: np.flip(a, tuple(params["dimensions"]))),
+    "split": _moved(lambda params, a: a),
+    "pad": _moved(_padded),
+    "iota": _moved(_iota),
+    "gather": _moved(_gathered),
+    "stack": _moved(lambda params, *parts: np.stack(parts, axis=params["axis"])),
     "random_bits": _random_bits,
     "random_wrap": _wrapped,
     "random_unwrap": _unwrapped,
@@ -720,6 +880,20 @@ operation wrapped to its width; or a result with no rounding at all, bit for bit
 sign operation, a comparison), every operand read as the lane reads it (`Lane.flushes`). A primitive
 missing here cannot be certified, which fails the site's coverage, as does an integer result of a
 primitive with no integer form (`div`, `sqrt`, a transcendental)."""
+def _piece(params, value, index):
+    """lax.split's `index`-th result: its operand's run of `sizes[index]` along `axis`, after the earlier
+    sizes'."""
+    start = sum(params["sizes"][:index])
+    return np.take(value, np.arange(start, start + params["sizes"][index]), axis=params["axis"])
+
+
+RESULT_OPERANDS = {
+    "optimization_barrier": lambda params, operands, index: [operands[index]],
+    "split": lambda params, operands, index: [_piece(params, operands[0], index)],
+}
+"""The primitives of several results whose each result is a move of a part of their operands of its own
+position, `parts(params, operands, index)`, which its contract reads alone (`_held`): an optimization
+barrier's i-th operand, a split's i-th piece."""
 
 
 def certified(fn, *arguments) -> tuple:
@@ -757,6 +931,8 @@ def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
             if eqn.primitive.name == "cond":
                 branch = eqn.params["branches"][int(np.asarray(operands[0]))]
                 results = _run(branch.jaxpr, branch.consts, operands[1:], findings, at + "/")
+            elif eqn.primitive.name == "scan":
+                results = _scanned(eqn.params, operands, findings, at + "/")
             elif body is not None:
                 results = _run(*body, operands, findings, at + "/")
             else:
@@ -767,10 +943,40 @@ def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
     return [read(var) for var in jaxpr.outvars]
 
 
+def _scanned(params, operands, findings, where: str) -> list:
+    """A scan run a step at a time (`reference_error.scanned_steps`, `_run` of its body), every step's
+    equations held to their contracts as the program's are, each by its step's path."""
+    from reference_error import scanned_steps
+
+    body = params["jaxpr"]
+    walked = scanned_steps(params, [(value,) for value in operands], lambda step, inputs: [
+        (value,) for value in _run(body.jaxpr, body.consts, [value for (value,) in inputs], findings,
+                                   f"{where}{step}/")], lanes=1)
+    return [value for (value,) in walked]
+
+
+_OBSERVING: list[list] = []
+
+
+@contextlib.contextmanager
+def observing():
+    """Every equation `certified` holds within, `(name, params, operands, results)` in the order held: what
+    each contract was given (`_held`), read where it is given."""
+    seen: list = []
+    _OBSERVING.append(seen)
+    try:
+        yield seen
+    finally:
+        # By identity: two observers that have seen nothing yet are equal lists.
+        del _OBSERVING[next(index for index, observer in enumerate(_OBSERVING) if observer is seen)]
+
+
 def _held(eqn, operands, results, findings, at) -> None:
     import jax
 
     name = eqn.primitive.name
+    for seen in _OBSERVING:
+        seen.append((name, eqn.params, list(operands), list(results)))
     if name not in CONTRACTS:
         findings.append(f"{at}: uncertifiable, no contract for {name}")
         return
@@ -781,10 +987,12 @@ def _held(eqn, operands, results, findings, at) -> None:
         if dtype is not None and not keyed and _inexact(dtype) and _format(dtype) is None:
             findings.append(f"{at}: uncertifiable, no format for {dtype}")
             return
-    for result in results:
+    for index, result in enumerate(results):
         fmt = _format(getattr(_host(result), "dtype", np.float32))
+        # A result of its own position reads its own part of the operands alone (a barrier's, a split's).
+        given = RESULT_OPERANDS[name](eqn.params, hosted, index) if name in RESULT_OPERANDS else hosted
         try:
-            ok = np.asarray(CONTRACTS[name](eqn.params, hosted, _host(result), fmt))
+            ok = np.asarray(CONTRACTS[name](eqn.params, given, _host(result), fmt))
         except TypeError:
             findings.append(f"{at}: uncertifiable, {name} of these operands has no contract")
             return

@@ -14,7 +14,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
-from dew.nn.kernels.templates.attention import DKV_GRADS, DQ_GRADS, Hooks, Kind, PaddedCall, Param
+from dew.nn.kernels.templates.attention import DKV_GRADS, DQ_GRADS, Hooks, Kind, PaddedCall, Param, by_power
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     _columns,
@@ -28,6 +28,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     approximate,
+    reducing,
+    stated,
 )
 
 
@@ -81,7 +83,8 @@ class _Backward:
     fused: bool
     kinds: tuple[Kind, ...]
     approx_math: bool
-    """Whether its launches take the hardware's approximate transcendentals (`approximate`)."""
+    """Whether its launches take the hardware's approximate transcendentals (`approximate`): never in the
+    accurate form."""
 
     @property
     def how(self) -> algebra.Recompute:
@@ -92,6 +95,19 @@ class _Backward:
     def scale(self) -> float:
         """The logits' scale."""
         return self.spec.scale
+
+    @property
+    def grad_scale(self) -> float:
+        """The scale the gradients' cotangents take: the call's whole scale, the logits' times the power its
+        query took before its products (`algebra.Forward.prescale`), against the call's own keys for dQ and
+        its own queries for dK, so their products stay within the call's own range."""
+        return self.spec.scale * self.spec.prescale
+
+    @property
+    def scaled(self) -> bool:
+        """Whether the dK/dV program's logits take the query by its power (`by_power`), formed in registers
+        from the call's own streamed one, which dK takes."""
+        return self.spec.prescale != 1.0
 
     @property
     def summed(self) -> tuple[bool, ...]:
@@ -149,7 +165,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         scored = _scores(walk, coords_of(k_first), masked, params, s, dp, peak, prior, anchor, delta, chosen)
         exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = algebra.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
-                                                prior, scale=walk.scale, kinds=walk.kinds,
+                                                prior, scale=walk.grad_scale, kinds=walk.kinds,
                                                 summed=walk.summed, accurate=walk.accurate)
         row_sums = (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
                     terms.keyed_shift)
@@ -263,7 +279,10 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     out = family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
-        interpret=walk.interpret, approx_math=walk.approx_math, name="attention_dq")(
+        interpret=walk.interpret, approx_math=walk.approx_math, name="attention_dq",
+        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
+        # dQ's product, the model's this launch owns (`stated`): its `S` and `dP` recomputed.
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, width, query, key, value, dout))(
             query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
     return dq, keyed, rows
@@ -286,7 +305,10 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
     peak, denominator, centre, rest, chosen = rows_of(q_first)
-    s = family.product(q_slot, k_smem.transpose((1, 0)), shape)
+    # The logits from the query taken by its power in registers (`_Backward.scaled`), dK from the call's own.
+    keys = k_smem.transpose((1, 0))
+    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), keys, walk.interpret)
+         if walk.scaled else family.product(q_slot, keys, shape))
     dp = family.product(do_slot, v_smem.transpose((1, 0)), shape)
     params = params_of(q_first, s)
 
@@ -304,7 +326,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
     exponentials, weights, logits, pieces = lax.cond(whole(index), functools.partial(scores, masked=False),
                                                      functools.partial(scores, masked=True))
     narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
-    parts = algebra.cotangent_parts(logits * walk.scale, q_slot.dtype, accurate=walk.accurate)
+    parts = algebra.cotangent_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
     # Each staged part's transpose the left operand (`algebra.cotangent_product`'s `aᵀ @ b`).
     dv_acc = family.staged_products(dv_acc, ((narrowed, None),), do_slot, buffers.at[pl.ds(0, 1)],
                                     walk.interpret, transposed=True)
@@ -443,7 +465,12 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         entry, out_type=(gradient, gradient, *(grad_shapes[kind] for kind in graded)),
         grid=(heads, keys_padded // pair, batch), grid_names=("heads", "k_tiles", "batch"),
         consumers=consumers, interpret=walk.interpret, approx_math=walk.approx_math,
-        name="attention_dkv_fused" if walk.fused else "attention_dkv")
+        name="attention_dkv_fused" if walk.fused else "attention_dkv",
+        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
+        # The model's products this launch owns (`stated`): dK's, dV's and dP's, and dQ's where it adds it;
+        # its `S` recomputed.
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
+                    (2 if walk.fused else 1) * width + 2 * value_width, query, key, value, dout))
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     if not walk.fused:
         return launch(*operands)
@@ -456,7 +483,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
-                     score_params, *, score_mod, score_kinds, score_dtypes, scale: float,
+                     score_params, *, score_mod, score_kinds, score_dtypes, scale: float, prescale: float,
                      spec: algebra.Forward, accurate: bool, tiles: BackwardTiles, family: mosaic.Family,
                      interpret: bool):
     """`gradients`' launch on this mainloop: D from the forward's split sums, each query's anchor key as the
@@ -465,17 +492,15 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     large value, bf16: dK's worst row 2.5e1 at the first pass's D, where check 1 allows 1.55e-2), the accurate
     form's always, and a score hook's and an initial state's, whose gradients need the refined D
     (`algebra.dq_step`). The fast form's one launch (`tiles.fused`, a hookless call's): the dK/dV program
-    adding each tile's dQ, under the first pass's D and the forward's denominator. Neither is the faster
-    everywhere: on an H100 at llama-d128 bf16 2 x 4096, 32 heads, the one launch takes 2.53 ms causal and 4.87
-    full, two launches 2.67 and 4.35 (the one launch's dQ reductions, each consumer's 64 keys reducing its own
-    tile into global memory, twice FlashAttention-3's traffic, cost most where every key block reads every
-    query), and the one launch holds 384 MB of temporaries against 258 (its dQ in fp32), so the derived
-    config is two launches, deterministic and of the least memory, and the one launch runs where a pin or an
-    opt-in tuning run names it (`MosaicBackward.derived`). Returns what `gradients` takes: dQ, the softmax's
+    adding each tile's dQ atomically, under the first pass's D and the forward's denominator, the derived
+    default of a hookless fast-form call outside deterministic mode (`MosaicBackward.derived`: 1.05 to 1.4
+    times as fast as two launches, FUSEDFORM-h100; 384 MB of temporaries against 258 at llama-d128 2 x 4096,
+    its dQ fp32); two launches, in a fixed order, otherwise. Returns what `gradients` takes: dQ, the softmax's
     rows, each query's anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums
     `[1, B, H, 1]`, which `gradients` sums over the batch), then dK, dV and the dK/dV parameters'
-    (`DKV_GRADS`)."""
-    del scale
+    (`DKV_GRADS`). The query arrives the call's own: its logits are those of the query taken by `prescale`
+    (`by_power`) at `scale`, the scale left (`gradients`), which `spec` takes."""
+    spec = dataclasses.replace(spec, scale=scale, prescale=prescale)
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
     cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)
@@ -488,7 +513,10 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
                        spec.queries)
     hooks = Hooks(score_mod, tuple(map(Param, score_params, score_kinds)))
-    approx_math = approximate(hooks, (tiles.block_q, tiles.block_k), value_width, differentiated=True)
+    # The accurate form's exponentials exact: the hardware's ex2.approx flushes a subnormal weight to zero,
+    # whose product with a large score cotangent the reference keeps (row 2022, ET-SUBFIX2-h100).
+    approx_math = not accurate and approximate(hooks, (tiles.block_q, tiles.block_k), value_width,
+                                               differentiated=True)
     walk = _Backward(program, spec, accurate, tiles.consumers, interpret, tiles.fused, score_kinds,
                      approx_math)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
@@ -499,8 +527,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         mass = algebra.split_mass(own, others_total, forward_total, shift)
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])
-    dq_sum, keyed, rows = _dq_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                     spans, score_params, walk=walk)
+    # The dQ program reads its queries for their logits alone.
+    dq_sum, keyed, rows = _dq_launch(by_power(query, prescale), key, value, dout, maximum, forward_total,
+                                     anchor, delta, chosen, spans, score_params, walk=walk)
     count = sum(walk.summed)
     dq_swapped = jnp.swapaxes(dq_sum, 1, 2)
     # The fast form's keyed sums are never read (`dq_finish`): a placeholder there.

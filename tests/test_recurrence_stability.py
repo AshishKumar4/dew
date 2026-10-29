@@ -19,10 +19,10 @@ apart; a memory fading over a long sequence, whose output falls far below its sc
 eighth token between mild ones, whose pairs after it are differences of large, nearly equal prefixes. Each
 runs the portable math (`recurrence_chunk.chunk`'s `chunk_delta_rule`) forward and through its gradient
 (`reference_error.with_gradients`, each seed's cotangents drawn with its operands), held to the recurrence's
-by check 1; a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. A
-GPU's kernels take their arms here when the recurrence template's GPU mainloops land; the suite runs
-compiled on a GPU as on a CPU, where a CPU's interpretation of a kernel judges its host's arithmetic, not
-the kernel's."""
+by check 1; a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. The
+template's Mosaic path, the default on a GPU, takes the same sites and regimes in
+test_recurrence_template_stability (row 1968); this suite runs compiled on a GPU as on a CPU, where a CPU's
+interpretation of a kernel judges its host's arithmetic, not the kernel's."""
 
 import dataclasses
 import functools
@@ -34,8 +34,8 @@ import pytest
 from reference_error import assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, chunk_on, draw, token_by_token
 
-from dew.nn.kernels import recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk
+from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5),
          'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5),
@@ -301,9 +301,11 @@ GRADIENT_HEADS = 16
 head each, which two heads do not resolve within 512 seeds."""
 
 RATED_HEADS = 64
-"""A rated decay's gradient arms' value heads: its rate, a head's one factor of every token's decay, did not
-resolve within 512 seeds at 16 heads under aligned keys, decays near zero, the decay bound and steep then
-mild."""
+"""A rated decay's value heads, in its gradient arms and the SSD port's: its rate, a head's one factor of
+every token's decay, did not resolve within 512 seeds at 16 heads under aligned keys, decays near zero, the
+decay bound and steep then mild, and the port's final memory, every element of a head's a sum over the
+same few steps, not at 2 heads under resets on chunk edges and spread gates (A100, receipt
+tmp/Gate/gpu/ssd-port/receipts/gate-1341-ssd-port-sizing)."""
 
 
 def restarting(fn, regime: str):
@@ -314,6 +316,23 @@ def restarting(fn, regime: str):
     return lambda operands: fn(_reset(operands))
 
 
+def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, finite_seeds: int) -> None:
+    """A scan path's claim here: every leaf of `dew` finite wherever the float64 `reference`'s is over
+    `finite_seeds` draws, and on par with `reference`'s from float64 over `seeds` (check 1). Plain
+    functions: the gate compiles both arms alike (`reference_error._arms`)."""
+    for seed in range(finite_seeds):
+        drawn = draws(seed)
+        mine = jax.jit(dew)(*drawn)
+        with jax.enable_x64(new_val=True):
+            truth = jax.jit(reference)(*widened(drawn))
+        leaves = zip(jax.tree_util.tree_leaves_with_path(mine), jax.tree.leaves(truth), strict=True)
+        for (path, ours), exact in leaves:
+            finite = np.isfinite(np.asarray(exact))
+            assert np.all(np.isfinite(np.asarray(ours))[finite]), (
+                f'{label}{jax.tree_util.keystr(path)}: not finite where float64 is, seed {seed}')
+    assert_as_exact(dew, reference, draws, label, seeds=seeds)
+
+
 CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in SITES for regime in REGIMES]
 
 
@@ -322,21 +341,11 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
     """The portable math's output and final memory finite wherever the float64 reference's are on every
     declared seed, and on par with the reference's from float64 (module docstring)."""
     hooks = SITES[name]
-    # Plain functions: the gate compiles both arms alike (`reference_error._arms`).
-    dew = functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)
-    reference = functools.partial(token_by_token, hooks)
-    draws = functools.partial(stressed, hooks, regime)
-    for seed in range(SEEDS[name, regime]):
-        operands = draws(seed)
-        mine = jax.jit(dew)(*operands)
-        with jax.enable_x64(new_val=True):
-            truth = jax.jit(reference)(*widened(operands))
-        for leaf, ours, exact in zip(('output', 'final memory'), mine, truth, strict=True):
-            finite = np.isfinite(np.asarray(exact))
-            assert np.all(np.isfinite(np.asarray(ours))[finite]), (
-                f'{leaf}: not finite where float64 is, seed {seed}')
-    assert_as_exact(dew, reference, draws, f'the portable math, {name} under {regime}',
-                    seeds=SEEDS[name, regime])
+    assert_finite_and_on_par(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK),
+                             functools.partial(token_by_token, hooks),
+                             functools.partial(stressed, hooks, regime),
+                             f'the portable math, {name} under {regime}', seeds=SEEDS[name, regime],
+                             finite_seeds=SEEDS[name, regime])
 
 
 ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-{backend}',
@@ -350,23 +359,74 @@ its kernels, whose compilers fuse and round its arithmetic as the CPU's do not (
 dimension under the regimes its chunked forms break hardest."""
 
 
-@pytest.mark.parametrize('name, regime', CASES + ACCELERATED)
+WHOLE_SUITE_GRADIENTS = {('rated', 'a fading memory'): 246}
+"""The gradient's cases whose draws take a group past its two minutes (seconds, train 270's CI on
+f58abb8a3, ledger 2125), which the whole suite runs."""
+
+
+@pytest.mark.parametrize('name, regime', [
+    pytest.param(*case.values, id=case.id, marks=(*case.marks, pytest.mark.whole_suite))
+    if tuple(case.values) in WHOLE_SUITE_GRADIENTS else case for case in CASES + ACCELERATED])
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
     token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
     hooks = SITES[name]
-    # Plain functions: the gate compiles both arms alike (`reference_error._arms`).
-    dew = with_gradients(restarting(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK), regime))
-    reference = with_gradients(restarting(functools.partial(token_by_token, hooks), regime))
-    draws = functools.partial(cotangents, hooks, regime)
-    for seed in range(2):
-        drawn = draws(seed)
-        mine = jax.jit(dew)(*drawn)
-        with jax.enable_x64(new_val=True):
-            truth = jax.jit(reference)(*widened(drawn))
-        leaves = zip(jax.tree.leaves(mine), jax.tree.leaves(truth), strict=True)
-        for index, (ours, exact) in enumerate(leaves):
-            finite = np.isfinite(np.asarray(exact))
-            assert np.all(np.isfinite(np.asarray(ours))[finite]), f'leaf {index}: not finite, seed {seed}'
-    assert_as_exact(dew, reference, draws, f"the portable math's gradient, {name} under {regime}",
-                    seeds=GRADIENT_SEEDS[name, regime])
+    assert_finite_and_on_par(
+        with_gradients(restarting(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK), regime)),
+        with_gradients(restarting(functools.partial(token_by_token, hooks), regime)),
+        functools.partial(cotangents, hooks, regime), f"the portable math's gradient, {name} under {regime}",
+        seeds=GRADIENT_SEEDS[name, regime], finite_seeds=2)
+
+
+def ssd_port(hooks, *args, **kwargs):
+    """`chunk` with its rated scan on mamba_ssm's kernels (`recurrence_chunk.SCAN`'s 'pallas', the SSD
+    port), interpreted off a GPU as the CPU suite runs a port a call names."""
+    with generation.chosen(ssd="pallas"):
+        return chunk(hooks, *args, **kwargs)
+
+
+PORT_SEEDS = {
+    'decays near one': 8, 'decays near zero': 8, 'the decay bound': 8, 'aligned keys': 8,
+    'resets on chunk edges': 8, 'saturated gates': 8, 'spread gates': 32, 'a long sequence': 8,
+    'a fading memory': 8, 'steep then mild': 8,
+}
+"""Each regime's declared seeds for the SSD port's output and final memory over RATED_HEADS value heads
+(check 1), sized by `seeds_for` paired with the port on an A100, where the port compiles (a CPU's
+interpretation of a kernel judges its host's arithmetic, not the kernel's; receipt
+tmp/Gate/gpu/ssd-port4/receipts/gate-1341-ssd-port-sizing-heads)."""
+
+PORT_GRADIENT_SEEDS = {
+    'decays near one': 16, 'decays near zero': 256, 'the decay bound': 512, 'aligned keys': 32,
+    'resets on chunk edges': 8, 'saturated gates': 16, 'spread gates': 128, 'a long sequence': 8,
+    'a fading memory': 256, 'steep then mild': 128,
+}
+"""Each regime's declared seeds for the SSD port's gradient (check 1), sized as `PORT_SEEDS` are."""
+
+PORT = pytest.mark.gpu(reason="the SSD port compiled, as a GPU runs it")
+
+
+@PORT
+@pytest.mark.parametrize('regime', REGIMES)
+def test_the_ssd_port_stays_finite_and_exact_where_chunked_forms_break(regime):
+    """The rated scan on the SSD port (row 1341: the suite held the portable math alone): its output and
+    final memory finite wherever the float64 reference's are on every declared seed, and on par with the
+    token-by-token recurrence's from float64 (check 1), as the portable math's are."""
+    hooks = SITES['rated']
+    assert_finite_and_on_par(functools.partial(ssd_port, hooks, chunk_size=CHUNK),
+                             functools.partial(token_by_token, hooks),
+                             functools.partial(stressed, hooks, regime, value_heads=RATED_HEADS),
+                             f'the SSD port under {regime}', seeds=PORT_SEEDS[regime],
+                             finite_seeds=PORT_SEEDS[regime])
+
+
+@PORT
+@pytest.mark.parametrize('regime', REGIMES)
+def test_the_ssd_ports_gradient_is_as_exact_as_the_recurrences(regime):
+    """The SSD port's gradient (its custom VJP's) finite wherever the reference's in float64 is, and on par
+    with the token-by-token recurrence's from float64 (check 1) over the regime's declared seeds."""
+    hooks = SITES['rated']
+    assert_finite_and_on_par(
+        with_gradients(restarting(functools.partial(ssd_port, hooks, chunk_size=CHUNK), regime)),
+        with_gradients(restarting(functools.partial(token_by_token, hooks), regime)),
+        functools.partial(cotangents, hooks, regime), f"the SSD port's gradient under {regime}",
+        seeds=PORT_GRADIENT_SEEDS[regime], finite_seeds=2)

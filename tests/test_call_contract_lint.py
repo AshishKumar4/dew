@@ -1,6 +1,7 @@
 """SLOP014: a layer's call reads what its block hands it, and a mixer's `reads` is what it reads."""
 
 import textwrap
+from pathlib import Path
 
 import pytest
 from tool_support import load
@@ -97,8 +98,12 @@ def test_a_call_that_drops_its_arguments_or_misdeclares_its_reads_is_reported(li
 def test_a_read_of_jaxs_private_cache_size_is_reported(lint, body, reported, tmp_path):
     """SLOP021: a jitted function's private `_cache_size` is read nowhere; its compiles are counted
     through the public compile event (`dew.telemetry.instrumentation.Compiles`)."""
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_counted.py").write_text(body)
-    [module] = lint.collect(["tests"], tmp_path, "dew")
-    assert any(finding.code == "SLOP021" for finding in lint.check(module)) is reported
+    assert reported_in_tests(lint, tmp_path, body, "SLOP021") is reported
 
+
+def reported_in_tests(lint, tmp_path: Path, body: str, code: str) -> bool:
+    """Whether lint_slop reports `code` in a test file holding `body`."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_linted.py").write_text(body)
+    [module] = lint.collect(["tests"], tmp_path, "dew")
+    return any(finding.code == code for finding in lint.check(module))

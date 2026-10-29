@@ -43,10 +43,10 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import tuning
+from dew.nn.kernels import recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
-from dew.nn.precision import float32_einsum
+from dew.nn.precision import compensated_add, compensated_difference, float32_einsum, two_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,6 +131,34 @@ def _row_block(batch: int, length: int, chunk: int, width: int, bm: int, bn: int
     return m, h, c, start, _limit(c, length, chunk), pl.ds(start + m * bm, bm)
 
 
+def _extracted(values, *, interpret: bool):
+    """`values` `[rows, n]` split into parts whose sums along a row keep every bit: `(high, low)`, `high`
+    each value rounded to a multiple of its row's unit, a power of two past `n` times its largest
+    magnitude over 2^23, so any running sum of `high` is exact, and `low` what the rounding left, whose
+    sums round only far below it (Rump's ExtractScalar). A row with a non-finite value keeps its values
+    whole as `high`. Elementwise and a row maximum: a Triton kernel's own ops, where a sequential loop over
+    a tile's columns lowered to garbage on an A100's. The rounded `unit + values` is the split itself:
+    interpreted, XLA's fusion with the values' product contracted across it unless fenced
+    (`optimization_barrier`, which Triton lowers no rule for and keeps the rounding without), and the
+    whole-chunks initial state's gradient was 3.6 times mamba_ssm's distance from float64, 0.79 fenced."""
+    largest = jnp.max(jnp.abs(values), axis=1, keepdims=True) * values.shape[1]
+    # A power of two at least twice the largest sum, exactly: its exponent's bits alone, times four (an
+    # exp2 of a log2's ceiling rounds on a CPU).
+    exponent = jax.lax.bitcast_convert_type(jnp.where(largest > 0, largest, 1.0), jnp.int32) & 0x7F800000
+    unit = jax.lax.bitcast_convert_type(exponent, jnp.float32) * 4.0
+    finite = jnp.isfinite(unit)
+    added = unit + values
+    if interpret:
+        added = jax.lax.optimization_barrier(added)
+    high = jnp.where(finite, added - unit, values)
+    return high, values - high
+
+
+def _read(prefix, index) -> tuple:
+    """The compensated prefix's `(hi, lo)` at `index` (`prefix` its two refs)."""
+    return prefix[0][index], prefix[1][index]
+
+
 def _limit(c, length: int, chunk: int):
     """The tokens chunk `c` of a row holds (mamba_ssm's `chunk_size_limit`): the constant `chunk` where
     whole chunks tile the rows, so that no load or store takes a mask."""
@@ -176,10 +204,14 @@ def _documents(batch: int, padded: int):
     return pl.BlockSpec((None, padded), lambda i, bc, h: (bc % batch, 0))
 
 
-def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int):
+def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int, interpret: bool):
     """mamba_ssm's `_chunk_cumsum_fwd_kernel` (ssd_chunk_state.py:39-86) without the step's bias,
     softplus and limit, for one chunk of `BH` heads: the step, zero past the row's end, and `A dt`
-    cumulated over the chunk, both fp32 in mamba_ssm's heads-first layout.
+    cumulated over the chunk as a pair `(hi, lo)`, the running sums of its exactly summed high parts and
+    of its low parts (`_extracted`), all fp32 in mamba_ssm's heads-first layout: every decay a kernel reads
+    is a difference of two of these sums (`precision.compensated_difference`, `algebra.apart` pairwise),
+    which the rounded sum alone gave 530 times the recurrence's distance from float64 after a steep step
+    (row 2066).
 
     With documents, each document in the chunk cumulates its own steps alone, the others' zeroed,
     where mamba_ssm's sum runs on from the chunk's first step: every decay a kernel reads is a
@@ -187,35 +219,61 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int)
     otherwise enter and leave in rounding, so that a token's output moved with another document's
     values (tests/test_mixers.py, `test_no_token_reaches_another_document`). A chunk inside one
     document takes one sum, as without them."""
-    *seq, step_ref, da_ref = refs
+    *seq, step_ref, (hi_ref, lo_ref) = refs
     c, h = pl.program_id(1), pl.program_id(2)
     heads = pl.ds(h * bh, bh)
     start = c * chunk
     steps = pl.ds(start, chunk)
     dt = read_rows(dt_ref.at[steps, heads], _limit(c, length, chunk)).astype(jnp.float32).T
     step_ref[:, steps] = dt
-    decay = dt * a_ref[heads].astype(jnp.float32)[:, None]
+    # Each step's decay split so its high parts' running sum is exact (`_extracted`): the prefix's rounded
+    # half, and its low parts' sum the compensation.
+    parts = _extracted(dt * a_ref[heads].astype(jnp.float32)[:, None], interpret=interpret)
     if not seq:
-        da_ref[:, steps] = jnp.cumsum(decay, axis=1)
+        hi_ref[:, steps], lo_ref[:, steps] = two_sum(*(jnp.cumsum(part, axis=1) for part in parts))
         return
     documents = seq[0][steps][None, :]
 
     def document(d, summed):
         mine = documents == d
-        return summed + jnp.where(mine, jnp.cumsum(jnp.where(mine, decay, 0.0), axis=1), 0.0)
+        return tuple(total + jnp.where(mine, jnp.cumsum(jnp.where(mine, part, 0.0), axis=1), 0.0)
+                     for total, part in zip(summed, parts, strict=True))
 
-    # The documents count up along a row, from the chunk's first step's to its last's.
-    da_ref[:, steps] = jax.lax.fori_loop(seq[0][start], seq[0][start + chunk - 1] + 1, document,
-                                         jnp.zeros(decay.shape, jnp.float32))
+    # The documents count up along a row, from the chunk's first step's to its last's; the pair rounded
+    # once to its sum and what that dropped (`two_sum`).
+    zero = jnp.zeros(parts[0].shape, jnp.float32)
+    hi_ref[:, steps], lo_ref[:, steps] = two_sum(*jax.lax.fori_loop(
+        seq[0][start], seq[0][start + chunk - 1] + 1, document, (zero, zero)))
+
+
+class _Cumsum(_Launch):
+    """The chunk cumsum's tiles and spans, its forward's and its backward's (`ChunkCumsum`,
+    `ChunkCumsumBwd`): one declaration for the pair, which runs over one geometry."""
+
+    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
+    SPANS = (("dt", 2), None, None)
+
+
+class _Passing(_Launch):
+    """The state passing's tiles and spans, its forward's and its backward's (`StatePassing`,
+    `StatePassingBwd`)."""
+
+    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
+    SPANS = ("state", None, None)
+
+
+class _StateGradient(_Launch):
+    """The state gradients' tiles, the keys' and the queries' (`ChunkStateBwdDb`, `ChunkScanBwdDc`, which
+    run one kernel, `_state_gradient`)."""
+
+    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkCumsum(_Launch):
+class ChunkCumsum(_Cumsum):
     """`chunk_cumsum`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum"
-    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
-    SPANS = (("dt", 2), None, None)
 
     def _fwd(self, dt: jax.Array, A: jax.Array, seq: jax.Array | None, *, chunk: int, interpret: bool,
              config: Tiles, return_residuals: bool = False):
@@ -224,13 +282,14 @@ class ChunkCumsum(_Launch):
         bh = config.bm
         out = pl.BlockSpec((None, bh, padded), lambda b, c, h: (b, h, 0))
         step, da = pl.pallas_call(
-            functools.partial(_chunk_cumsum_kernel, length=length, chunk=chunk, bh=bh),
+            functools.partial(_chunk_cumsum_kernel, length=length, chunk=chunk, bh=bh, interpret=interpret),
             grid=(batch, padded // chunk, heads // bh),
             in_specs=[pl.BlockSpec((None, length, heads), lambda b, c, h: (b, 0, 0)),
                       pl.BlockSpec((heads,), lambda b, c, h: (0,)),
                       *([] if seq is None else [pl.BlockSpec((None, padded), lambda b, c, h: (b, 0))])],
-            out_specs=[out, out],
-            out_shape=[jax.ShapeDtypeStruct((batch, heads, padded), jnp.float32)] * 2,
+            out_specs=[out, (out, out)],
+            out_shape=[jax.ShapeDtypeStruct((batch, heads, padded), jnp.float32),
+                       (jax.ShapeDtypeStruct((batch, heads, padded), jnp.float32),) * 2],
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_cumsum_fwd",
         )(dt, A, *([] if seq is None else [seq]))
@@ -238,10 +297,12 @@ class ChunkCumsum(_Launch):
 
 
 def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, *, length: int,
-                             chunk: int, bh: int):
+                             chunk: int, bh: int, interpret: bool):
     """mamba_ssm's `_chunk_cumsum_bwd_kernel` (ssd_chunk_state.py:101-174) without the step's bias,
     softplus and limit, for one chunk of `BH` heads: the step's gradient `ddA A + ddt` back in Dew's
-    `[T, H]`, and `A`'s `sum ddA dt` over the chunk for XLA to sum."""
+    `[T, H]`, and `A`'s `sum ddA dt` over the chunk for XLA to sum, its high parts summed exactly
+    (`_extracted`): summed plainly, a steep-then-mild chunk's rate gradient was 2.79 times the
+    recurrence's distance from float64, 1.20 compensated (row 2066)."""
     c, h = pl.program_id(1), pl.program_id(2)
     heads = pl.ds(h * bh, bh)
     steps = pl.ds(c * chunk, chunk)
@@ -250,16 +311,15 @@ def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, 
     ddt = dacs * a_ref[heads].astype(jnp.float32)[:, None] + ddt_ref[:, steps]
     write_rows(out_ref.at[steps, heads], limit, ddt.T)
     dt = read_rows(dt_ref.at[steps, heads], limit).astype(jnp.float32).T
-    da_ref[...] = jnp.sum(dacs * dt, axis=1)
+    high, low = _extracted(dacs * dt, interpret=interpret)
+    da_ref[...] = jnp.sum(high, axis=1) + jnp.sum(low, axis=1)
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkCumsumBwd(_Launch):
+class ChunkCumsumBwd(_Cumsum):
     """`chunk_cumsum_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum_bwd"
-    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
-    SPANS = (("dt", 2), None, None)
 
     def _fwd(self, dacs: jax.Array, ddt: jax.Array, dt: jax.Array, A: jax.Array, *, chunk: int,
              interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -269,7 +329,8 @@ class ChunkCumsumBwd(_Launch):
         first = pl.BlockSpec((None, bh, padded), lambda b, c, h: (b, h, 0))
         rows = pl.BlockSpec((None, length, heads), lambda b, c, h: (b, 0, 0))
         out, da = pl.pallas_call(
-            functools.partial(_chunk_cumsum_bwd_kernel, length=length, chunk=chunk, bh=bh),
+            functools.partial(_chunk_cumsum_bwd_kernel, length=length, chunk=chunk, bh=bh,
+                              interpret=interpret),
             grid=(batch, padded // chunk, heads // bh),
             in_specs=[first, first, rows, pl.BlockSpec((heads,), lambda b, c, h: (0,))],
             out_specs=[rows, pl.BlockSpec((None, None, bh), lambda b, c, h: (b, c, h))],
@@ -291,19 +352,29 @@ def _chunk_state_kernel(x_ref, b_ref, dt_ref, da_ref, *refs, batch: int, length:
     c = pl.program_id(1) // batch
     start = c * chunk
     limit = _limit(c, length, chunk)
-    last = da_ref[start + chunk - 1]
+    last = _read(da_ref, start + chunk - 1)
 
     def step(k, acc):
         offset = k * bk
         rows = pl.ds(start + offset, bk)
         x = read_rows(x_ref.at[rows], _from(limit, offset))
         b = read_rows(b_ref.at[rows], _from(limit, offset)).astype(jnp.float32)
-        scale = jnp.exp(jnp.minimum(last - da_ref[rows], 0.0)) * dt_ref[rows]
+        scale = jnp.exp(jnp.minimum(compensated_difference(last, _read(da_ref, rows)), 0.0)) * dt_ref[rows]
         if seq:
             scale = jnp.where(seq[0][rows] == seq[0][start + chunk - 1], scale, 0.0)
         return acc + _dot(x.T, (b * scale[:, None]).astype(x.dtype), exact=exact)
 
     states_ref[...] = jax.lax.fori_loop(0, chunk // bk, step, jnp.zeros(states_ref.shape, jnp.float32))
+
+
+def _state_blocks(rows, mat, steps, groups: int, config: Tiles) -> tuple:
+    """A state launch's geometry: `rows`' `[B, T, H, P]` batch, length, heads and width, `mat`'s state
+    width, `steps`' padded length, the heads a group serves, the config's state-block rows and columns
+    `bm` and `bn`, and the state's column blocks."""
+    batch, length, heads, width = rows.shape
+    state = mat.shape[-1]
+    return (batch, length, heads, width, state, steps.shape[-1], heads // groups, config.bm, config.bn,
+            state // config.bn)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -316,12 +387,8 @@ class ChunkState(_Launch):
 
     def _fwd(self, x: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array, seq: jax.Array | None, *,
              chunk: int, groups: int, interpret: bool, config: Tiles, return_residuals: bool = False):
-        batch, length, heads, width = x.shape
-        state = b.shape[-1]
-        padded = dt.shape[-1]
-        ratio = heads // groups
-        bm, bn = config.bm, config.bn
-        columns = state // bn
+        batch, length, heads, width, state, padded, ratio, bm, bn, columns = _state_blocks(
+            x, b, dt, groups, config)
         states = pl.pallas_call(
             functools.partial(_chunk_state_kernel, batch=batch, length=length, chunk=chunk, bk=config.bk,
                               exact=interpret),
@@ -330,7 +397,7 @@ class ChunkState(_Launch):
                                    lambda mn, bc, h: (bc % batch, 0, h, mn // columns)),
                       pl.BlockSpec((None, length, None, bn),
                                    lambda mn, bc, h: (bc % batch, 0, h // ratio, mn % columns)),
-                      _token(batch, padded), _token(batch, padded),
+                      _token(batch, padded), (_token(batch, padded),) * 2,
                       *([] if seq is None else [_documents(batch, padded)])],
             out_specs=pl.BlockSpec((None, None, None, bm, bn),
                                    lambda mn, bc, h: (bc % batch, bc // batch, h, mn // columns,
@@ -354,7 +421,7 @@ def _state_passing_kernel(states_ref, da_ref, h0_ref, *refs, chunk: int):
         state, document = carry
         out_ref[c] = state.astype(out_ref.dtype)
         end = c * chunk + chunk - 1
-        scale = jnp.exp(da_ref[end])
+        scale = jnp.exp(sum(_read(da_ref, end)))
         if seq:
             current = seq[0][end]
             scale = jnp.where(current == document, scale, 0.0)
@@ -366,24 +433,22 @@ def _state_passing_kernel(states_ref, da_ref, h0_ref, *refs, chunk: int):
 
 
 @dataclasses.dataclass(frozen=True)
-class StatePassing(_Launch):
+class StatePassing(_Passing):
     """`state_passing`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing"
-    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
-    SPANS = ("state", None, None)
 
     def _fwd(self, states: jax.Array, da: jax.Array, h0: jax.Array, seq: jax.Array | None, *, chunk: int,
              dtype: str, interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, chunks, heads, flat = states.shape
-        padded = da.shape[-1]
+        padded = da[0].shape[-1]
         size = config.bm
         rows = pl.BlockSpec((None, chunks, None, size), lambda i, b, h: (b, 0, h, i))
         final = pl.BlockSpec((None, None, size), lambda i, b, h: (b, h, i))
         out, last = pl.pallas_call(
             functools.partial(_state_passing_kernel, chunk=chunk),
             grid=(flat // size, batch, heads),
-            in_specs=[rows, pl.BlockSpec((None, None, padded), lambda i, b, h: (b, h, 0)), final,
+            in_specs=[rows, (pl.BlockSpec((None, None, padded), lambda i, b, h: (b, h, 0)),) * 2, final,
                       *([] if seq is None else [pl.BlockSpec((None, padded), lambda i, b, h: (b, 0))])],
             out_specs=[rows, final],
             out_shape=[jax.ShapeDtypeStruct(states.shape, jnp.dtype(dtype)),
@@ -458,8 +523,8 @@ def _chunk_scan_kernel(cb_ref, x_ref, dt_ref, da_ref, c_ref, states_ref, d_ref, 
     weighted in fp32 and rounded to `x`'s dtype before its product; then `D x`; stored fp32."""
     *seq, out_ref = refs
     m, h, c, start, limit, rows = _row_block(batch, length, chunk, width, bm, bn)
-    da_m = da_ref[rows]
-    scale = jnp.exp(da_m)
+    da_m = _read(da_ref, rows)
+    scale = jnp.exp(sum(da_m))
     if seq:
         scale = jnp.where(seq[0][rows] == _earlier(seq[0], start, c), scale, 0.0)
     state = c_ref.shape[-1]
@@ -476,7 +541,7 @@ def _chunk_scan_kernel(cb_ref, x_ref, dt_ref, da_ref, c_ref, states_ref, d_ref, 
         offset = k * bk
         steps = pl.ds(start + offset, bk)
         cb = cb_ref[pl.ds(m * bm, bm), pl.ds(offset, bk)]
-        cb = cb * jnp.exp(jnp.minimum(da_m[:, None] - da_ref[steps][None, :], 0.0))
+        cb = cb * jnp.exp(jnp.minimum(algebra.apart(*da_m, *_read(da_ref, steps)), 0.0))
         cb = cb * dt_ref[steps][None, :]
         cb = jnp.where(_causal(m * bm, bm, offset, bk), cb, 0.0).astype(x_ref.dtype)
         return acc + _dot(cb, read_rows(x_ref.at[steps], _from(limit, offset)), exact=exact)
@@ -511,7 +576,7 @@ class ChunkScan(_Launch):
             grid=(chunk // bm * columns, batch * (padded // chunk), heads),
             in_specs=[pl.BlockSpec((None, None, None, chunk, chunk),
                                    lambda mn, bc, h: (bc % batch, bc // batch, h // ratio, 0, 0)),
-                      headed, _token(batch, padded), _token(batch, padded),
+                      headed, _token(batch, padded), (_token(batch, padded),) * 2,
                       pl.BlockSpec((None, length, None, state),
                                    lambda mn, bc, h: (bc % batch, 0, h // ratio, 0)),
                       pl.BlockSpec((None, None, None, bn, state),
@@ -542,7 +607,7 @@ def _dstates_kernel(dout_ref, c_ref, da_ref, *refs, batch: int, length: int, chu
         offset = k * bk
         rows = pl.ds(start + offset, bk)
         dout = read_rows(dout_ref.at[rows], _from(limit, offset))
-        scale = jnp.exp(da_ref[rows])
+        scale = jnp.exp(sum(_read(da_ref, rows)))
         if seq:
             scale = jnp.where(seq[0][rows] == earlier, scale, 0.0)
         dout = (dout.astype(jnp.float32) * scale[:, None]).astype(dout.dtype)
@@ -567,7 +632,7 @@ class ChunkScanBwdDstates(_Launch):
              interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, length, heads, width = dout.shape
         groups, state = c.shape[2:]
-        padded = da.shape[-1]
+        padded = da[0].shape[-1]
         ratio = heads // groups
         bm, bn = config.bm, config.bn
         columns = state // bn
@@ -579,7 +644,7 @@ class ChunkScanBwdDstates(_Launch):
                                    lambda mn, bc, h: (bc % batch, 0, h, mn // columns)),
                       pl.BlockSpec((None, length, None, bn),
                                    lambda mn, bc, h: (bc % batch, 0, h // ratio, mn % columns)),
-                      _token(batch, padded), *([] if seq is None else [_documents(batch, padded)])],
+                      (_token(batch, padded),) * 2, *([] if seq is None else [_documents(batch, padded)])],
             out_specs=pl.BlockSpec((None, None, None, bm, bn),
                                    lambda mn, bc, h: (bc % batch, bc // batch, h, mn // columns,
                                                       mn % columns)),
@@ -607,7 +672,7 @@ def _state_passing_bwd_kernel(dout_ref, states_ref, da_ref, dfinal_ref, *refs, c
         dstates_ref[c] = dstate.astype(dstates_ref.dtype)
         entered = states_ref[c]
         converted_ref[c] = entered.astype(converted_ref.dtype)
-        scale = jnp.exp(da_ref[c * chunk + chunk - 1])
+        scale = jnp.exp(sum(_read(da_ref, c * chunk + chunk - 1)))
         if seq:
             earlier = _earlier(seq[0], c * chunk, c)
             scale = jnp.where(earlier == document, scale, 0.0)
@@ -620,25 +685,23 @@ def _state_passing_bwd_kernel(dout_ref, states_ref, da_ref, dfinal_ref, *refs, c
 
 
 @dataclasses.dataclass(frozen=True)
-class StatePassingBwd(_Launch):
+class StatePassingBwd(_Passing):
     """`state_passing_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing_bwd"
-    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
-    SPANS = ("state", None, None)
 
     def _fwd(self, dout: jax.Array, states: jax.Array, da: jax.Array, dfinal: jax.Array,
              seq: jax.Array | None, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         batch, chunks, heads, flat = states.shape
-        padded = da.shape[-1]
+        padded = da[0].shape[-1]
         size = config.bm
         rows = pl.BlockSpec((None, chunks, None, size), lambda i, b, h: (b, 0, h, i))
         whole = pl.BlockSpec((None, None, size), lambda i, b, h: (b, h, i))
         dstates, dtotal, dinit, converted = pl.pallas_call(
             functools.partial(_state_passing_bwd_kernel, chunk=chunk),
             grid=(flat // size, batch, heads),
-            in_specs=[rows, rows, pl.BlockSpec((None, None, padded), lambda i, b, h: (b, h, 0)), whole,
+            in_specs=[rows, rows, (pl.BlockSpec((None, None, padded), lambda i, b, h: (b, h, 0)),) * 2, whole,
                       *([] if seq is None else [pl.BlockSpec((None, padded), lambda i, b, h: (b, 0))])],
             out_specs=[rows, pl.BlockSpec((None, None, chunks, None), lambda i, b, h: (b, h, 0, i)), whole,
                        rows],
@@ -663,8 +726,8 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
     *seq, dx_ref, ddt_ref, dd_ref = refs
     m, h, _, start, limit, rows = _row_block(batch, length, chunk, width, bm, bn)
     taken = _from(limit, m * bm)
-    da_m = da_ref[rows]
-    scale = jnp.exp(jnp.minimum(da_ref[start + chunk - 1] - da_m, 0.0))
+    da_m = _read(da_ref, rows)
+    scale = jnp.exp(jnp.minimum(compensated_difference(_read(da_ref, start + chunk - 1), da_m), 0.0))
     if seq:
         scale = jnp.where(seq[0][rows] == seq[0][start + chunk - 1], scale, 0.0)
     state = b_ref.shape[-1]
@@ -680,7 +743,7 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
         offset = m * bm + k * bk
         steps = pl.ds(start + offset, bk)
         cb = cb_ref[pl.ds(offset, bk), pl.ds(m * bm, bm)].T
-        cb = cb * jnp.exp(jnp.minimum(da_ref[steps][None, :] - da_m[:, None], 0.0))
+        cb = cb * jnp.exp(jnp.minimum(algebra.apart(*_read(da_ref, steps), *da_m), 0.0).T)
         cb = jnp.where(_causal(offset, bk, m * bm, bm).T, cb, 0.0).astype(dout_ref.dtype)
         return acc + _dot(cb, read_rows(dout_ref.at[steps], _from(limit, offset)), exact=exact)
 
@@ -719,7 +782,7 @@ class ChunkScanChunkStateBwdDx(_Launch):
             in_specs=[headed,
                       pl.BlockSpec((None, None, None, chunk, chunk),
                                    lambda mn, bc, h: (bc % batch, bc // batch, h // ratio, 0, 0)),
-                      headed, _token(batch, padded), _token(batch, padded),
+                      headed, _token(batch, padded), (_token(batch, padded),) * 2,
                       pl.BlockSpec((heads,), lambda mn, bc, h: (0,)),
                       pl.BlockSpec((None, length, None, state),
                                    lambda mn, bc, h: (bc % batch, 0, h // ratio, 0)),
@@ -787,9 +850,10 @@ def _state_gradient_kernel(left_ref, states_ref, mat_ref, *refs, leaving: bool, 
         left = read_rows(left_ref.at[rows, h], taken)
         grad = _dot(left, states_ref[h].astype(left.dtype), exact=exact)
         if leaving:
-            decay = jnp.exp(jnp.minimum(da_ref[h, start + chunk - 1] - da_ref[h, rows], 0.0))
+            last = _read(da_ref, (h, start + chunk - 1))
+            decay = jnp.exp(jnp.minimum(compensated_difference(last, _read(da_ref, (h, rows))), 0.0))
         else:
-            decay = jnp.exp(da_ref[h, rows])
+            decay = jnp.exp(sum(_read(da_ref, (h, rows))))
         scale = jnp.where(same, decay, 0.0)
         if dt_ref is not None:
             scale = scale * dt_ref[h, rows]
@@ -804,12 +868,8 @@ def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, 
                     config: Tiles, name: str):
     """`_state_gradient_kernel`'s launch: `B`'s gradient where the step `dt` is given, else `C`'s, and
     each head's decay-exponent gradient, the head splits' and the state blocks' workspaces summed."""
-    batch, length, heads, width = left.shape
-    state = mat.shape[-1]
-    padded = da.shape[-1]
-    ratio = heads // groups
-    bm, bn = config.bm, config.bn
-    columns = state // bn
+    batch, length, heads, width, state, padded, ratio, bm, bn, columns = _state_blocks(
+        left, mat, da[0], groups, config)
     splits = -(-ratio // config.heads)
     steps = [] if dt is None else [dt]
     grad, dacs = pl.pallas_call(
@@ -822,7 +882,8 @@ def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, 
                                lambda mn, bc, sg: (bc % batch, bc // batch, 0, 0, mn % columns)),
                   pl.BlockSpec((None, length, None, bn),
                                lambda mn, bc, sg: (bc % batch, 0, sg % groups, mn % columns)),
-                  *[_token(batch, padded, heads=heads)] * (len(steps) + 1),
+                  *[_token(batch, padded, heads=heads)] * len(steps),
+                  (_token(batch, padded, heads=heads),) * 2,
                   *([] if seq is None else [_documents(batch, padded)])],
         out_specs=[pl.BlockSpec((None, length, None, None, bn),
                                 lambda mn, bc, sg: (bc % batch, 0, sg // groups, sg % groups, mn % columns)),
@@ -836,11 +897,10 @@ def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, 
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkStateBwdDb(_Launch):
+class ChunkStateBwdDb(_StateGradient):
     """`chunk_state_bwd_db`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_state_bwd_db"
-    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     SPANS = ("chunk", ("b", 3), None)
 
     def _fwd(self, x: jax.Array, dstates: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array,
@@ -851,11 +911,10 @@ class ChunkStateBwdDb(_Launch):
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkScanBwdDc(_Launch):
+class ChunkScanBwdDc(_StateGradient):
     """`chunk_scan_bwd_dc`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_scan_bwd_dc"
-    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     HEADS = "dout"
     SPANS = ("chunk", ("c", 3), None)
 
@@ -893,10 +952,14 @@ def _dcb_kernel(x_ref, dout_ref, dt_ref, da_ref, *refs, batch: int, length: int,
             dout = read_rows(dout_ref.at[rows_m, h], _from(limit, m * bm))
             x = read_rows(x_ref.at[rows_n, h], _from(limit, n * bn))
             dcb = _dot(dout, x.T, exact=exact) * dt_ref[h, rows_n][None, :]
-            decay = jnp.exp(jnp.minimum(da_ref[h, rows_m][:, None] - da_ref[h, rows_n][None, :], 0.0))
-            return acc + dcb * decay
+            pairs = algebra.apart(*_read(da_ref, (h, rows_m)), *_read(da_ref, (h, rows_n)))
+            decay = jnp.exp(jnp.minimum(pairs, 0.0))
+            return compensated_add(acc, (dcb * decay, jnp.zeros((bm, bn), jnp.float32)))
 
-        acc = jax.lax.fori_loop(0, count, head, jnp.zeros((bm, bn), jnp.float32))
+        # The group's heads summed with their roundings kept: one fp32 accumulator's serial sum over 64
+        # heads put the queries' and keys' gradients 1.5 to 2.1 times the recurrence's distance from
+        # float64 under decays near zero and aligned keys, 0.70 and 1.05 compensated (row 2066).
+        acc = sum(jax.lax.fori_loop(0, count, head, (jnp.zeros((bm, bn), jnp.float32),) * 2))
         if seq:
             acc = jnp.where(seq[0][rows_m][:, None] == seq[0][rows_n][None, :], acc, 0.0)
         dcb_ref[...] = jnp.where(_causal(m * bm, bm, n * bn, bn), acc, 0.0)
@@ -924,7 +987,8 @@ class ChunkScanBwdDcb(_Launch):
             functools.partial(_dcb_kernel, batch=batch, length=length, chunk=chunk, groups=groups,
                               ratio=ratio, heads=config.heads, bm=bm, bn=bn, exact=interpret),
             grid=(chunk // bm * columns, batch * chunks, splits * groups),
-            in_specs=[rows, rows, _token(batch, padded, heads=heads), _token(batch, padded, heads=heads),
+            in_specs=[rows, rows, _token(batch, padded, heads=heads),
+                      (_token(batch, padded, heads=heads),) * 2,
                       *([] if seq is None else [_documents(batch, padded)])],
             out_specs=pl.BlockSpec((None, None, None, None, bm, bn),
                                    lambda mn, bc, sg: (bc % batch, bc // batch, sg // groups, sg % groups,
@@ -1008,14 +1072,14 @@ def _ddacs_kernel(x_ref, dout_ref, dt_ref, da_ref, cb_ref, out_ref, *, batch: in
     limit = _limit(c, length, chunk)
     rows = pl.ds(start + m * bm, bm)
     dout = read_rows(dout_ref.at[rows], _from(limit, m * bm))
-    da_m = da_ref[rows]
+    da_m = _read(da_ref, rows)
 
     def step(k, rowsum):
         offset = k * bn
         steps = pl.ds(start + offset, bn)
         acc = _dot(dout, read_rows(x_ref.at[steps], _from(limit, offset)).T, exact=exact)
         acc = acc * dt_ref[steps][None, :] * cb_ref[pl.ds(m * bm, bm), pl.ds(offset, bn)]
-        acc = acc * jnp.exp(jnp.minimum(da_m[:, None] - da_ref[steps][None, :], 0.0))
+        acc = acc * jnp.exp(jnp.minimum(algebra.apart(*da_m, *_read(da_ref, steps)), 0.0))
         strict = _causal(m * bm, bm, offset, bn, strict=True)
         acc = jnp.where(strict, acc, 0.0)
         total = rowsum + jnp.sum(acc, axis=1)
@@ -1053,7 +1117,7 @@ class ChunkScanBwdDdacsStable(_Launch):
             functools.partial(_ddacs_kernel, batch=batch, length=length, chunk=chunk, bm=bm, bn=config.bn,
                               exact=interpret),
             grid=(chunk // bm, batch * chunks, heads),
-            in_specs=[headed, headed, _token(batch, padded), _token(batch, padded),
+            in_specs=[headed, headed, _token(batch, padded), (_token(batch, padded),) * 2,
                       pl.BlockSpec((None, None, None, chunk, chunk),
                                    lambda m, bc, h: (bc % batch, bc // batch, h // ratio, 0, 0))],
             out_specs=pl.BlockSpec((None, None, None, None, chunk),

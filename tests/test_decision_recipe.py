@@ -45,7 +45,8 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
         "--trainer.name", "tickets", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.steps", "2", "--trainer.eval-every", "2",
         "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
-        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
+        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32",
+        "--trainer.scored-to", str(tmp_path / "scored")],
         default=DecisionRunConfig(data=asked(train), validation=asked(held)))
     assert config.data.facts()["batch"] == 8
     assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
@@ -56,6 +57,9 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     answer = decide("I was billed twice", {"team": Choice("Which team?", ["billing", "technical", "sales"])})
     assert answer["team"].choice in ("billing", "technical", "sales")
     assert decide.name == "tickets" and set(decide.calibration.temperatures.types) == {"choice"}
+    # The run kept every validation batch's decisions of its evaluation, as `--trainer.scored-to` asked.
+    kept = sorted(path.name for path in (tmp_path / "scored" / "step-2").iterdir())
+    assert kept and kept == [f"val-{batch:05d}.npz" for batch in range(len(kept))]
 
 
 def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_their_summary(tmp_path):
@@ -682,6 +686,38 @@ def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():
     assert not plain.layout.blocks
     with pytest.raises(ValueError):
         dataclasses.replace(run, head=JointShape()).prepare()
+
+
+def test_a_decision_run_writes_its_rows_in_the_order_and_blocks_it_names():
+    """`--order` writes a fresh head's rows in its order and `--split` splits them where it says, the
+    whole row one block where its source reads blocks; a split of rows its source reads in order is
+    refused, a run of the rows' own segments and an order beside them too, and a framing of the
+    layout's own row, which is written unframed."""
+    from dew.config import SourceOptions
+    from dew.decision.layout import AnswerCue, Framing, Instructions, OptionLines, QuestionLayout, State
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    source = SourceOptions(text_only=True, attention={"full_attention": "block_bidirectional"})
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=source,
+                              order="re_read", split="whole")
+    objective, _ = run.prepare().train("x")
+    layout = objective.layout
+    assert isinstance(layout, QuestionLayout)
+    assert (layout.order, layout.split, layout.blocks) == ("re_read", "whole", True)
+    [row] = layout.rows(objective.tokenizer, objective.specials, "my card is lost",
+                        {"q": Choice("Which?", ["a", "b"])})
+    assert row.blocks == (0,) * len(row.tokens)
+    plain = dataclasses.replace(run, source=SourceOptions(text_only=True))
+    with pytest.raises(ValueError):
+        plain.prepare()
+    ordered, _ = dataclasses.replace(plain, split=None, order="question_first").prepare().train("x")
+    assert isinstance(ordered.layout, QuestionLayout) and ordered.layout.order == "question_first"
+    with pytest.raises(ValueError):
+        dataclasses.replace(plain, split=None, segments=(Instructions({"choice": "{}"}), OptionLines(),
+                                                         State(), AnswerCue())).prepare()
+    with pytest.raises(ValueError):
+        dataclasses.replace(plain, split=None, framing=Framing()).prepare()
 
 
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():

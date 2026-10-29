@@ -187,8 +187,8 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
         'query_norm': False, 'kv_qat': True}
     mixer = {'class': 'deepseek_v4', 'fields': fields}
     seen.update(('q_lora_rank', 'o_groups', 'o_lora_rank'))
-    compressed = native_fields(LayerKind)(window=window, rope_theta=compress_theta, yarn=None)
-    compressed['yarn'] = ramp
+    compressed = native_fields(LayerKind)(window=window, rope_theta=compress_theta, rope_scaling=None)
+    compressed['rope_scaling'] = ramp
     kinds, layer_types, shared = _v41_kinds(text, layers, ratios[:layers], modes, fields,
                                           compressed, index, seen)
     moe = record_int(text, 'moe_intermediate_size')
@@ -388,4 +388,5 @@ DEEPSEEK_V41 = DecoderFamily(
     constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,
     # The image span's learned vectors sit at the top level, beside the
     # aligner (model.py:1201-1222).
-    wrapper_projector_names=('image_start', 'image_newline', 'image_end'))
+    wrapper_projector_names=('image_start', 'image_newline', 'image_end'),
+    wrapper_media_suffixes=('.gate.bias_vl',))

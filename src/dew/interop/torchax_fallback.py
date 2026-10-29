@@ -48,7 +48,17 @@ from flax.core.scope import Variable
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
-from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, Variables, coordinates, real_slots
+from dew.batch import (
+    COORDINATES_FIELD,
+    POSITIONS_FIELD,
+    SEGMENTS_FIELD,
+    TOKEN_LAYOUT_FIELDS,
+    VALIDITY_FIELD,
+    Coordinates,
+    Variables,
+    real_slots,
+    token_coordinates,
+)
 from dew.distributed.placement import Layout
 from dew.interop import sources, verify
 from dew.interop.decoder_parts import context_lengths
@@ -57,6 +67,7 @@ from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
 from dew.mesh import LogicalAxes
+from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
@@ -277,7 +288,7 @@ class _Attending:
     token's index where None) only where the call states its keys' positions (`key_places`), as Dew's
     own attention reads a stated visibility (`AttentionMetadata.key_positions`)."""
 
-    implementation: str
+    implementation: AttentionImpl
     documents: jax.Array | None
     valid: jax.Array | None
     max_segments: int
@@ -345,7 +356,8 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     key folded by the layer, and a training call that drops with no key is refused."""
     from torchax.interop import jax_view, torch_view
 
-    from dew.nn.attention import causal_attention_mask, scaled_dot_product_attention
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.attention_masks import causal_attention_mask
     from dew.nn.kv_cache import write_cache
     from dew.nn.local_attention import compacted
     from dew.nn.visibility import windowed
@@ -771,7 +783,7 @@ class TorchGraph:
 
     module: JittableModule
     persistent: tuple[str, ...]
-    attention_impl: str | None = None
+    attention_impl: AttentionImpl | None = None
     shapes: Mapping[str, Mapping[str, jax.ShapeDtypeStruct]] = field(default_factory=dict)
     """The source's variables, `params` and `buffers`, as shapes and dtypes: what an initialization,
     which holds none of them, traces the forward over (`TorchCausalLM._run`)."""
@@ -1230,9 +1242,11 @@ class TorchCausalLM(nn.Module):
         return logits.astype(at_least_fp32(logits.dtype))
 
     def hidden_states(self, tokens, train: bool = False, *, conditioning: Mapping[str, object] | None = None,
-                      attention_pairwise_mask=None, attention_key_positions=None, **packing) -> jax.Array:
+                      attention_pairwise_mask=None, attention_key_runs=None, attention_key_positions=None,
+                      **packing) -> jax.Array:
         """The states the output head reads, `[B, S, features]`, for rows laid as `logits` lays them
-        (`_laid`). `attention_pairwise_mask` `[B, S, S]` states what each token sees, which then
+        (`_laid`). `attention_pairwise_mask` `[B, S, S]`, or `attention_key_runs` `[B, S, R, 2]` (the keys
+        each token sees as runs, `AttentionMetadata.key_runs`), states what each token sees, which then
         replaces documents and causality, and `attention_key_positions` `[B, S]` the keys' positions a
         window counts (on Dew's attention only), as Dew's own decoders read them; the tokens' rotary
         positions are the packing's (`positions`, `coordinates`).
@@ -1240,6 +1254,13 @@ class TorchCausalLM(nn.Module):
         if conditioning:
             raise TypeError("a tier-3 model has no cross-attention to read a context with")
         laid = self._laid(tokens, packing)
+        if attention_key_runs is not None:
+            from dew.nn.attention_masks import visibility_mask
+
+            # The runs as the mask they state, the stated visibility this path reads.
+            length = jnp.shape(tokens)[1]
+            attention_pairwise_mask = visibility_mask(length, length, causal=False, sliding_window=None,
+                                                      key_runs=attention_key_runs)[:, 0]
         if attention_pairwise_mask is None:
             return self._run(tokens, train, laid)[1]
         if self.graph.attention_impl is None:
@@ -1264,18 +1285,17 @@ class TorchCausalLM(nn.Module):
         if self.graph.attention_impl is None:
             _refuse_packing(packing)
             return None
-        unknown = sorted(set(packing) - {COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids", "positions"})
+        unknown = sorted(set(packing) - {COORDINATES_FIELD, *TOKEN_LAYOUT_FIELDS})
         if unknown:
             raise Lacks("packing", f"a tier-3 model reads its rows' documents, positions and validity, "
                                    f"not {unknown}")
         if not packing:
             return None
         laid = packing.get(COORDINATES_FIELD)
-        if isinstance(laid, Coordinates):
-            return laid
         batch, length = jnp.shape(tokens)[:2]
-        return coordinates((batch, length), segments=packing.get("segment_ids"),
-                           valid=packing.get(VALIDITY_FIELD), positions=packing.get("positions"))
+        return token_coordinates((batch, length), laid if isinstance(laid, Coordinates) else None,
+                                 segments=packing.get(SEGMENTS_FIELD), valid=packing.get(VALIDITY_FIELD),
+                                 positions=packing.get(POSITIONS_FIELD))
 
     def _run(self, tokens, train: bool, laid: Coordinates | None = None, *, visible=None, key_places=None,
              head_input=None) -> tuple[jax.Array, jax.Array]:
@@ -1344,7 +1364,7 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 
 def load(source: sources.SourceReference, root: Path, *, dtype: str,
-         param_dtype: str, attention_impl: str, max_seq_len: int | None,
+         param_dtype: str, attention_impl: AttentionImpl, max_seq_len: int | None,
          admission: TorchAdmission | None = None, weights: bool = True) -> PretrainedFallback:
     """Load the causal LM `source` selects through transformers and torchax.
 

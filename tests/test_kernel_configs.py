@@ -6,6 +6,7 @@ are the verdict, runs none of them: the file carries no `kernel` mark."""
 import dataclasses
 import functools
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from generation_support import COMPILES_FOR_TPU, generations, lowers
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
-from dew.nn.kernels.templates import bundles
+from dew.nn.kernels.templates import bundles, resources
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
@@ -83,7 +84,7 @@ def test_a_launch_clips_its_blocks_to_the_operands():
     h = jax.ShapeDtypeStruct((1, 1, 64, 32), jnp.bfloat16)
     g = jax.ShapeDtypeStruct((1, 64, 1), jnp.float32)
     spans = chunked_launch.sequences(1, 64)
-    ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, *spans, scale=1.0, chunk=64, interpret=True)
+    ba = fla_gdn._CHUNK_FWD_O.bind(q, q, v, h, g, None, *spans, scale=1.0, chunk=64, interpret=True)
     with generation.assumed("sm80"):
         tiles = fla_gdn._CHUNK_FWD_O._get_heuristics_config(ba)
     assert tiles.bk <= q.shape[-1] and tiles.bv <= v.shape[-1], tiles
@@ -204,51 +205,109 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
-GEMM_ROWS, GEMM_DEPTH, GEMM_WIDTH, GEMM_GROUPS = 4096, 2048, 1536, 8
-"""A grouped projection's extents for the GEMM mainloops' compile gate: a Qwen3 MoE gate-up's widths, rows
-a few tiles a group (the kernels' resources do not grow with them)."""
+GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),
+               "mixtral down": (4096, 14336, 4096, 8), "deepseek-v3 up": (4096, 7168, 2048, 256),
+               "llama up": (4096, 4096, 14336, 1), "qwen3.5-4b up": (24576, 2560, 9216, 1),
+               "qwen3.5-4b down": (24576, 9216, 2560, 1), "qwen3.5-4b key": (24576, 2560, 1024, 1),
+               "qwen3.5-4b gates": (24576, 2560, 64, 1), "narrow kernel gradient": (4096, 64, 256, 1)}
+"""Real projections' extents `(rows, depth, width, groups)` for the GEMM mainloops' compile gate, over which
+the derived tiles move: MoE expert products (Qwen3-30B-A3B's, Mixtral's and DeepSeek-V3's: rows a few tiles a
+group, or less than one, a wide and a deep product), dense ones (Llama 3 8B's up, and Qwen3.5-4B's training
+step at its 24,576 rows a device: its widest, deepest, narrow key and narrowest gate products, its HLO
+10-28), and a kernel gradient of 64 output rows, which one consumer computes."""
+
+PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "input gradient fp16",
+               "kernel gradient", "kernel gradient fp32", "kernel gradient fp16")
+"""The forms every family's GEMM launches emit: each product and output dtype they take."""
+
+HOOKED_FORMS = ("kernel gradient exact fp32", "scaled forward", "row scaled forward", "paired swiglu forward")
+"""The hooked and exactly summed forms whose register need the family's model prices (`Family.counts_hooks`,
+`grouped_matmul._priced`): epilogues over side vectors (a column or row scale), a paired product's SwiGLU
+over its two accumulators, and the running sum. A prologue, an epilogue's side tile and a second output are
+not yet priced; their calls take another launch."""
 
 
-def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = False) -> list:
-    """Each GEMM Mosaic mainloop a `generation_name` GPU runs, at the one tile its launch derives from the
-    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`), the kernel
-    gradient (`MosaicTgmm`) in bf16, and on warpgroup MMA the kernel gradient in fp32 with exact sums, the
-    forward with an RMS norm's prologue and a bias epilogue and the kernel gradient with the prologue;
-    each a family's mainloop only where it takes the call (`Template.eligible`). With
-    `every_consumer_count`, also the forward with bf16 outputs, and each form at one consumer and at the
-    family's most (`Family.consumers`) where that tile is legal, each case named with its count (`x1`,
-    `x2`)."""
-    from test_gemm_template import biased, normed
+def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
+    """Each GEMM Mosaic launch form (`PLAIN_FORMS`, `HOOKED_FORMS`) at a projection's extents: its name,
+    launch, abstract operands and options."""
+    from test_gemm_template import (
+        biased,
+        casted,
+        doubled,
+        gated,
+        normed,
+        scaled,
+        scaled_rows,
+        silu_residual,
+        swiglu,
+    )
 
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
-    sizes = jax.ShapeDtypeStruct((GEMM_GROUPS,), jnp.int32)
-    rows, depth, width, groups = GEMM_ROWS, GEMM_DEPTH, GEMM_WIDTH, GEMM_GROUPS
-    norm = grouped_matmul.Hooks(normed, (("rows",), ("depth",)))
-    norm_bias = grouped_matmul.Hooks(normed, (("rows",), ("depth",)), biased, (("columns",),))
-    plain = {"interpret": False}
-    calls = [
-        ("forward", grouped_matmul.MosaicGmm(), (bf16((rows, depth)), bf16((groups, depth, width)), sizes),
-         {**plain, "out_dtype": "float32", "trans_rhs": False}),
-        ("input gradient", grouped_matmul.MosaicGmm(),
-         (bf16((rows, width)), bf16((groups, depth, width)), sizes),
-         {**plain, "out_dtype": "float32", "trans_rhs": True}),
-        ("kernel gradient", grouped_matmul.MosaicTgmm(), (bf16((rows, depth)), bf16((rows, width)), sizes),
-         {**plain, "out_dtype": "bfloat16"}),
-        ("kernel gradient exact fp32", grouped_matmul.MosaicTgmm(),
-         (bf16((rows, depth)), bf16((rows, width)), sizes),
-         {**plain, "out_dtype": "float32", "exact_sums": True}),
-        ("normed biased forward", grouped_matmul.MosaicGmm(),
-         (bf16((rows, depth)), bf16((groups, depth, width)), sizes, (f32((rows,)), f32((depth,))),
-          (f32((width,)),)), {**plain, "out_dtype": "bfloat16", "trans_rhs": False, "hooks": norm_bias}),
-        ("normed kernel gradient", grouped_matmul.MosaicTgmm(),
-         (bf16((rows, depth)), bf16((rows, width)), sizes, (f32((rows,)), f32((depth,)))),
-         {**plain, "out_dtype": "float32", "hooks": norm}),
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    vector = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
+    x, w, dy = shaped((rows, depth)), shaped((groups, depth, width)), shaped((rows, width))
+    x16, w16, dy16 = (jax.ShapeDtypeStruct(array.shape, jnp.float16) for array in (x, w, dy))
+    gmm, tgmm, hooks = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm(), grouped_matmul.Hooks
+    norm = hooks(normed, (("rows",), ("depth",)))
+    forward = {"interpret": False, "out_dtype": "bfloat16", "trans_rhs": False}
+    backward = {"interpret": False, "out_dtype": "float32"}
+    return [
+        ("forward", gmm, (x, w, sizes), {**forward, "out_dtype": "float32"}),
+        ("forward bf16", gmm, (x, w, sizes), forward),
+        ("forward fp16", gmm, (x16, w16, sizes), {**forward, "out_dtype": "float16"}),
+        ("input gradient", gmm, (dy, w, sizes), {**backward, "trans_rhs": True}),
+        ("input gradient fp16", gmm, (dy16, w16, sizes),
+         {**forward, "out_dtype": "float16", "trans_rhs": True}),
+        ("kernel gradient", tgmm, (x, dy, sizes), {**backward, "out_dtype": "bfloat16"}),
+        ("kernel gradient fp32", tgmm, (x, dy, sizes), backward),
+        ("kernel gradient fp16", tgmm, (x16, dy16, sizes), backward),
+        ("kernel gradient exact fp32", tgmm, (x, dy, sizes), {**backward, "exact_sums": True}),
+        ("normed biased forward", gmm,
+         (x, w, sizes, (vector((rows,)), vector((depth,))), (vector((width,)),)),
+         {**forward, "hooks": hooks(normed, (("rows",), ("depth",)), biased, (("columns",),))}),
+        ("normed biased input gradient", gmm,
+         (dy, w, sizes, (vector((rows,)), vector((width,))), (vector((depth,)),)),
+         {**backward, "trans_rhs": True,
+          "hooks": hooks(normed, (("rows",), ("depth",)), biased, (("columns",),), ("float32",))}),
+        ("normed kernel gradient", tgmm, (x, dy, sizes, (vector((rows,)), vector((depth,)))),
+         {**backward, "hooks": norm}),
+        ("exact normed kernel gradient", tgmm, (x, dy, sizes, (vector((rows,)), vector((depth,)))),
+         {**backward, "exact_sums": True, "hooks": norm}),
+        ("fp16 normed biased forward", gmm,
+         (x16, w16, sizes, (vector((rows,)), vector((depth,))), (vector((width,)),)),
+         {**forward, "out_dtype": "float16",
+          "hooks": hooks(normed, (("rows",), ("depth",)), biased, (("columns",),))}),
+        ("cast forward", gmm, (x, w, sizes, (vector((depth,)),)),
+         {**forward, "hooks": hooks(casted, (("depth",),))}),
+        ("gated forward", gmm, (x, w, sizes, (shaped((rows, depth)),)),
+         {**forward, "hooks": hooks(gated, (("rows", "depth"),))}),
+        ("gated kernel gradient", tgmm, (x, dy, sizes, (shaped((rows, depth)),)),
+         {**backward, "hooks": hooks(gated, (("rows", "depth"),))}),
+        ("residual forward", gmm, (x, w, sizes, (), (vector((width,)), shaped((rows, width)))),
+         {**forward,
+          "hooks": hooks(epilogue=silu_residual, epilogue_axes=(("columns",), ("rows", "columns")))}),
+        ("two bf16 outputs forward", gmm, (x, w, sizes),
+         {**forward, "hooks": hooks(epilogue=doubled, out_dtypes=("bfloat16", "bfloat16"))}),
+        ("scaled forward", gmm, (x, w, sizes, (), (vector((width,)),)),
+         {**forward, "out_dtype": "float32",
+          "hooks": hooks(epilogue=scaled, epilogue_axes=(("columns",),), out_dtypes=("float32",))}),
+        ("row scaled forward", gmm, (x, w, sizes, (), (vector((rows,)),)),
+         {**forward, "hooks": hooks(epilogue=scaled_rows, epilogue_axes=(("rows",),))}),
+        ("paired swiglu forward", gmm, (x, w, sizes, (), (), w),
+         {**forward, "hooks": hooks(epilogue=swiglu)}),
+        ("paired forward", gmm, (x, w, sizes, (), (), w),
+         {**forward, "hooks": hooks(out_dtypes=("bfloat16", "bfloat16"))}),
     ]
-    if every_consumer_count:
-        calls.append(("forward bf16", grouped_matmul.MosaicGmm(),
-                      (bf16((rows, depth)), bf16((groups, depth, width)), sizes),
-                      {**plain, "out_dtype": "bfloat16", "trans_rhs": False}))
+
+
+def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False) -> list:
+    """Each GEMM Mosaic launch form a `generation_name` GPU runs at the projection `shape`
+    (`GEMM_SHAPES`, `_gemm_forms`), at the one tile its launch derives from the generation's facts
+    (`Template.derived`) and at each tile the derivation refused for its registers alone
+    (`_derived_and_refused`); each a family's mainloop only where it takes the call
+    (`Template.eligible`). With `every_consumer_count`, each form at one consumer and at the family's most
+    (`Family.consumers`) where that tile is legal instead, each case named with its count (`x1`, `x2`)."""
+    calls = _gemm_forms(*GEMM_SHAPES[shape])
     cases = []
     with generation.assumed(generation_name):
         target = generation.gpu_target()
@@ -256,72 +315,169 @@ def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = F
             ba = launch.bind(*args, **options)
             if not launch.eligible(ba, target):
                 continue
-            config = launch.derived(ba, target)
-            configs = {f"{name} {config}": config}
+            config, refused = _derived_and_refused(launch, ba, target)
+            configs = {f"{name} {config}": config, **{f"{name} refused {tile}": tile for tile in refused}}
             if every_consumer_count:
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
                 for consumers in sorted({1, family.consumers}):
-                    # Each consumer keeps its share of the derived tile's rows.
+                    # Each consumer keeps its share of the derived tile's rows; one consumer runs alone,
+                    # a cluster being two consumers' (`mosaic_gpu.Tiles`).
                     rows_ = config.block_m // config.warpgroups * consumers
-                    tile = dataclasses.replace(config, warpgroups=consumers, block_m=rows_)
+                    tile = dataclasses.replace(config, warpgroups=consumers, block_m=rows_,
+                                               cluster=config.cluster if consumers > 1 else 1)
                     if launch.legal(ba, tile, target):
                         configs[f"{name} x{consumers} {tile}"] = tile
+            kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
             for label, config in configs.items():
-                configured = functools.partial(launch.replace(config=config), **options)
+                configured = (functools.partial(launch.replace(config=config), **options)
+                              if launch.legal(ba, config, target) else
+                              # A tile the launch refuses runs its kernel unpinned (`KernelOp.pinnable`).
+                              lambda *arrays, config=config, options=options, launch=launch:
+                              launch._fwd(*arrays, **options, config=config)[0])
                 cases.append(support.KernelCase(label,
-                                                lambda configured=configured, args=args: (configured, args)))
+                                                lambda configured=configured, args=args: (configured, args),
+                                                {kernel: _model(launch, ba, config)}))
     return cases
 
 
+def _model(launch, ba, config) -> resources.RegisterModel:
+    """What a launch's model decides at `config` for the call `ba`, as the gate holds it to the compiled
+    kernel (`resources.register_model`, `kernel_compile.decisions`), and the scratch the planner sized it by
+    (`resources.scratch_bytes` of `launch_of`'s allocations, its barriers apart), against the kernel's
+    own."""
+    family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+    shared = resources.scratch_bytes(family, launch.launch_of(ba, config).scope(config.stages))
+    return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared)
+
+
+def _derived_and_refused(launch, ba, target) -> tuple:
+    """A launch's derived tile, and the tiles its derivation asked the planner about (`launch_of`) that
+    it refused for their registers alone (`resources.plan`: a ring its program's share holds, the registers
+    not), whose need the gate checks refuses them too: a model over the need throws tiles away
+    (`kernel_compile.decisions`). Each is the largest such of its rows, columns and layout, at the deepest
+    ring the planner holds without the registers, the one a derivation would take had they held (the
+    plans it asked, `resources.recording`)."""
+    with resources.recording() as asked:
+        config = launch.derived(ba, target)
+    refused: dict = {}
+    for each in asked:
+        (tile,) = each.tiles
+        if each.plans is not None:
+            continue
+        held = resources.plan([dataclasses.replace(launch.launch_of(ba, tile), registers=0)], each.family,
+                              target, programs=each.programs)
+        if held is not None:
+            tile = dataclasses.replace(tile, stages=held[0].stages)
+            shape = (tile.block_m, tile.block_n, tile.block_k, tile.warpgroups, tile.family)
+            refused[shape] = max(refused.get(shape, tile), tile, key=lambda each: each.stages)
+    return config, list(refused.values())
+
+
+def _emitted_forms(family, shape: str | None = None) -> set[str]:
+    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`): none without a bundle, the
+    hooked and exactly summed ones where its register model counts what they hold (`Family.counts_hooks`);
+    at a projection `shape`, each whose output's width steps by the family's column unit, whose stores take
+    it (`Family.stores_columns`: a grouped product's rows ragged to one, a kernel gradient's whole role's)
+    and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
+    if family is None:
+        return set()
+    forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ())}
+    if shape is None:
+        return forms
+    _, depth, width, _ = GEMM_SHAPES[shape]
+    unit, step = family.column_unit(jnp.bfloat16), min(family.depths(jnp.bfloat16))
+
+    def takes(form: str) -> bool:
+        # An input gradient's output is the depth wide, contracting the width; every other form's output
+        # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
+        columns, contracted = (depth, width) if "input gradient" in form else (width, depth)
+        stored = family.role_rows if "kernel gradient" in form else 1
+        return (columns % unit == 0 and family.stores_columns(columns, stored)
+                and ("kernel gradient" in form or contracted % step == 0))
+
+    return {form for form in forms if takes(form)}
+
+
+GATE_PARTS = 6
+"""The parts each generation's compile gate runs in apart (`test_each_gemm_mainloop_compiles_at_its_picks`),
+each within a CI group's time: sm90's 85 distinct kernels at about 4.7 s each (GATEPROF1, GATECOUNT1)."""
+
+
+@pytest.mark.parametrize("shape", GEMM_SHAPES)
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
-def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name):
-    """Every GEMM Mosaic GPU mainloop a generation runs (`_gemm_mainloop_cases`: warpgroup MMA's forward,
-    input and kernel gradients and hooked forms on an H100; mma.sync's forward, input and kernel gradients
-    on an A100, an A10 and an L4), at the tile its launch derives from the generation's facts, compiled by
-    Mosaic for a compile-only device of the generation on this CPU through ptxas: within the block's shared
-    memory, spilling nothing (a derived tile holds its registers: `Template.legal`). A GPU whose family has
-    no bundle (`bundles.of`: a B200's tcgen05, consumer Blackwell's TMA-fed mma.sync) runs none."""
+def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
+    """Every GEMM Mosaic GPU launch form a generation's family emits (`_emitted_forms`) derives a tile at
+    every real projection (`_gemm_mainloop_cases`): an eligibility regression fails here rather than leaving
+    the compile gate fewer cases. A GPU whose family has no bundle (`bundles.of`: a B200's tcgen05, consumer
+    Blackwell's TMA-fed mma.sync) emits none."""
+    cases = _gemm_mainloop_cases(generation_name, shape)
+    forms = _emitted_forms(bundles.of(generation_name, jnp.bfloat16), shape)
+    assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
+
+
+def _kernel_of(name: str) -> str:
+    """A case's kernel: its form at its tile, its band (`Tiles.grid_block_n`, the order its tiles are
+    walked) apart, its shared memory and registers the tile's; a count the form's name carries (` x2`, the
+    family contract's) apart too, the tile's consumers stating it."""
+    form, _, tile = name.partition(" Tiles(")
+    return f"{re.sub(r' x\d+$', '', form)} Tiles({re.sub(r'grid_block_n=\d+, ', '', tile)}"
+
+
+def _gate_cases(generation_name: str) -> list:
+    """Every projection's cases (`_gemm_mainloop_cases`), each distinct kernel once (`_kernel_of`)."""
+    found = {}
+    for shape in GEMM_SHAPES:
+        for case in _gemm_mainloop_cases(generation_name, shape):
+            found.setdefault(_kernel_of(case.name), case)
+    return list(found.values())
+
+
+@pytest.mark.parametrize("part", range(GATE_PARTS))
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
+def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, part):
+    """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), at the
+    tile its launch derives from the generation's facts and at each tile the derivation refused for its
+    registers, compiled by Mosaic for a compile-only device of the generation on this CPU through ptxas, in
+    `GATE_PARTS` parts: within the block's shared memory, spilling nothing, and its register model deciding
+    as ptxas does (`kernel_compile.mosaic_failures`)."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    cases = _gemm_mainloop_cases(generation_name)
-    # Every form the generation's family runs derives a tile at these shapes: an eligibility regression
-    # fails here rather than leaving the gate fewer cases.
-    family = bundles.of(generation_name, jnp.bfloat16)
-    forms = set() if family is None else {"forward", "input gradient", "kernel gradient"}
-    if family is not None and family.counts_hooks:
-        # Hooked and exactly summed calls run where the bundle's register model counts what they hold.
-        forms |= {"kernel gradient exact fp32", "normed biased forward", "normed kernel gradient"}
-    assert {case.name.split(" Tiles(")[0] for case in cases} == forms
+    cases = _gate_cases(generation_name)[part::GATE_PARTS]
     found = compile_mosaic_kernels(cases, generation_name)
-    # A spill is the register estimate's defect: the tile was derived to hold them.
     failed = mosaic_failures(found)
     assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
+FAMILY_PARTS = 3
+"""The parts the family contract compiles in apart, each within a CI group's time (sm90's whole, 294 s,
+train 270's CI)."""
+
+
+@pytest.mark.parametrize("part", range(FAMILY_PARTS))
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
-def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
+def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, part):
     """The whole contract a Mosaic GPU Family bundle offers its templates, compiled through ptxas for a
     compile-only GPU of the generation on this CPU with the JAX this checkout pins, before any consumer
-    adopts a Family head: plain and transposed right operands (the forward and the input gradient), fixed
-    and streamed side vectors (the normed prologue's row and depth vectors, the epilogue's column vector),
-    bf16 and fp32 stores, the running sum (exact sums), and each form at one consumer and at the family's
-    most (`_gemm_mainloop_cases(every_consumer_count=True)`); hooked and exactly summed forms on warpgroup
-    MMA alone, where the launches take them. Every form and count must be present and lower, within the
-    block, spilling nothing. No version guard skips it: a JAX that breaks the contract fails here."""
+    adopts a Family head: every launch form it emits (`_emitted_forms`: plain and transposed right
+    operands, 16-bit and fp32 stores, fixed and streamed side vectors and tiles, several outputs, the
+    running sum) at one consumer and at the family's most (`_gemm_mainloop_cases(every_consumer_count=
+    True)`). Every form and count must be present, and each the compile gate does not hold
+    (`test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources`) lower, within the block,
+    spilling nothing, in `FAMILY_PARTS` parts. No version guard skips it: a JAX that breaks the contract
+    fails here."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
-    cases = _gemm_mainloop_cases(generation_name, every_consumer_count=True)
-    forms = {"forward", "input gradient", "kernel gradient", "forward bf16"}
-    if family.counts_hooks:
-        # Hooked and exactly summed calls run where the bundle's register model counts what they hold.
-        forms |= {"kernel gradient exact fp32", "normed biased forward", "normed kernel gradient"}
+    cases = _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)), every_consumer_count=True)
     counts = sorted({1, family.consumers})
-    expected = {f"{form} x{count}" for form in forms for count in counts}
+    expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
+    # A kernel the compile gate already holds (`_gate_cases`) is compiled there, not again.
+    held = {_kernel_of(case.name) for case in _gate_cases(generation_name)}
+    cases = [case for case in cases if _kernel_of(case.name) not in held][part::FAMILY_PARTS]
     found = compile_mosaic_kernels(cases, generation_name)
     failed = mosaic_failures(found)
     assert len(found) == len(cases) and not failed, "\n".join(failed)
@@ -337,8 +493,9 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     from kernel_compile import compile_tpu_kernels
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    sizes = jax.ShapeDtypeStruct((GEMM_GROUPS,), jnp.int32)
-    rows, depth, width, groups = GEMM_ROWS, GEMM_DEPTH, GEMM_WIDTH, GEMM_GROUPS
+    # A Qwen3 MoE gate-up's widths, rows a few tiles a group.
+    rows, depth, width, groups = 4096, 2048, 1536, 8
+    sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
     calls = [("forward", grouped_matmul.MosaicTpuGmm(),
               (bf16((rows, depth)), bf16((groups, depth, width)), sizes),
               {"out_dtype": "bfloat16", "trans_rhs": False}),

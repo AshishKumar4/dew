@@ -32,7 +32,7 @@ from dew.diffusion.discrete import MDLM
 from dew.diffusion.process import DenoisingCondition
 from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
-from dew.inputs.encoders import ConditionEncoder
+from dew.inputs.condition import ConditionEncoder
 from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
@@ -317,9 +317,10 @@ def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> Model
                        {"pixel_values": pixels.astype(np.float32)})
 
 
-def global_batch(case: Case) -> Batch:
-    """The case's whole batch, drawn the same on every process."""
-    rng = np.random.default_rng(0)
+def global_batch(case: Case, seed: int = 0) -> Batch:
+    """The case's whole batch, drawn the same on every process: draw `seed` of it, seed 0 the one a
+    benchmark runs."""
+    rng = np.random.default_rng(seed)
     batch: Batch = {}
     if case.is_lm:
         vocab = case.config["vocab_size"]
@@ -425,8 +426,8 @@ class CompiledStep:
 @contextlib.contextmanager
 def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) -> Iterator[CompiledStep]:
     """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch
-    with the trials a run's compile takes (`Trials`), which time a frontier's plans and profile the
-    step where JAX's AutoPGLE asks, on a copy of the state, and yield it.
+    with the trials a run's compile takes (`Trials`), which profile only its admitted step where
+    JAX's AutoPGLE asks, on a copy of the state, and yield it.
 
     Each step reads the next placed batch, or with `fixed_batch` the first
     one again. The batches stay placed until the block ends.

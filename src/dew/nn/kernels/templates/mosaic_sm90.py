@@ -15,9 +15,10 @@ from dew.nn.kernels.templates import mosaic
 
 class Wgmma(mosaic.RingFamily):
     """wgmma's bundle: a warpgroup's 64 rows, TMA rings fed by a producer warpgroup (`mosaic.RingFamily`),
-    products from shared memory or registers into a warpgroup accumulator in the WGMMA layout, asynchronous
-    until waited for. Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a warpgroup MMA:
-    interpreted, such a product is the dot it would compute."""
+    multicast across a pair of multiprocessors where a cluster shares a ring's blocks, products from shared
+    memory or registers into a warpgroup accumulator in the WGMMA layout, asynchronous until waited for.
+    Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a warpgroup MMA: interpreted, such a
+    product is the dot it would compute."""
 
     name = "wgmma"
     takes_tf32 = True
@@ -26,6 +27,7 @@ class Wgmma(mosaic.RingFamily):
     role_rows = 64
     widest_product = 256
     most_shared = 227 * 1024  # sm90's (and sm100's) opt-in block
+    cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
 
     @property
     def layout(self):
@@ -41,6 +43,18 @@ class Wgmma(mosaic.RingFamily):
 
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
+
+    def column_registers(self, columns: int, dtype) -> int:
+        # The column layout repeats a vector over the warpgroup's four warps and eight lanes of each, so a
+        # thread holds a quarter of its columns: FS-K01-CAUSE-VECTOR, an fp32 column vector's epilogue at
+        # 128 and 256 columns needs 104 and 200 against a row vector's 96 and 160.
+        return -(-columns * jnp.dtype(dtype).itemsize // 16)
+
+    def row_registers(self, rows: int, dtype) -> int:
+        # Each warp's 16 rows of an MMA, a thread two of them, so a thread holds a 32nd of a consumer's rows:
+        # the fast attention backward's dQ consumer carries seven fp32 row vectors, 4 registers each at 128
+        # rows (DQROWPROOF64: 260 against ptxas's 255 and 512 bytes spilled; DQROWPROOF128: 184 at 64 rows).
+        return -(-rows * jnp.dtype(dtype).itemsize // 128)
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
@@ -137,5 +151,17 @@ class Wgmma(mosaic.RingFamily):
 
 WGMMA = Wgmma()
 """The wgmma family's bundle."""
+
+
+class WgmmaFed(mosaic.ConsumerFed, Wgmma):
+    """wgmma's bundle without a producer: its consumers feed their own rings (`mosaic.ConsumerFed`), each
+    at its program's entry registers, the layout a tile whose consumers need more than a producer leaves
+    them takes."""
+
+    name = "wgmma.fed"
+
+
+FED = WgmmaFed()
+"""wgmma's bundle without a producer."""
 
 

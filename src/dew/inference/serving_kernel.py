@@ -23,19 +23,29 @@ from jax.sharding import Mesh, NamedSharding
 from dew.batch import Variables
 from dew.inference.tasks import cache_sized
 from dew.mesh import logical_spec
-from dew.nn.attention import CROSS_KEY, CROSS_VALUE
+from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
 from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.tuning import tune
-from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, grouped, is_paged, leaf_name
+from dew.nn.kv_cache import (
+    POOLED,
+    ROW_CURSORS,
+    TABLE,
+    as_words,
+    from_words,
+    grouped,
+    is_paged,
+    leaf_name,
+    with_rounding_keys,
+)
 from dew.nn.protocols import Serving
 from dew.nn.scatter import DROPPED
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, row_step
-from dew.sampling.text import decode_ops, prefill_state
+from dew.sampling.text import decode_ops, prefill_state, rounding_keys
 
 
 @struct.dataclass
@@ -194,7 +204,8 @@ class Dense:
         """
         narrow = cache_sized(model, admission.prompts.tokens.shape[1])
         fresh, real = prefill_state(narrow, params, admission.prompts,
-                               decode_ops(narrow, params, pad_id, None))
+                                    decode_ops(narrow, params, pad_id, None),
+                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys)))
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
             return _placed(resident, incoming, admission.slots, self.groups)
 
@@ -227,7 +238,9 @@ class Paged:
         scattered back to the rows' slots.
         """
         rows = admission.cursors.shape[0]
-        allocated = model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"]
+        allocated = with_rounding_keys(
+            model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"],
+            rounding_keys(jax.random.wrap_key_data(admission.keys)))
         continues = admission.cursors > 0
 
         def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:

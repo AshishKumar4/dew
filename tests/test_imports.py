@@ -124,6 +124,24 @@ print(json.dumps(sorted(training)))
     assert json.loads(run.stdout.splitlines()[-1]) == []
 
 
+@pytest.mark.parametrize("module", ["dew.config", "dew.training.budget"])
+def test_a_config_or_a_package_imports_no_trainer_until_a_run_trains(module):
+    """A run's configuration reads its dataclasses' types and none of the trainer, which a run reads
+    where it trains (`RunConfig.train`), and a module of the training layer reads that module, its
+    package's names imported as they are used: each imports in a fresh interpreter without
+    `dew.training.trainer`."""
+    script = f"""
+import json
+import sys
+import {module}
+print(json.dumps("dew.training.trainer" in sys.modules))
+"""
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[-1]) is False
+
+
 def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
     """Only `dew.rl` and `dew.objectives.rl` import `dew.rl`, and `dew.rl` imports nothing of
     `dew.training` (docs/design/architecture.md). The test reads every module's imports, absolute
@@ -159,3 +177,17 @@ def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
         if within(module, "dew.rl") and any(within(name, "dew.training") for name in names):
             trained.append(module)
     assert importers == [] and trained == []
+
+
+@pytest.mark.parametrize(("package", "read"), [("dew.sampling", "text.Sampling"),
+                                               ("dew.nn.backbones", "dit.SimpleDiT")])
+def test_a_lazy_packages_modules_read_through_it_as_an_eager_packages_did(package, read):
+    """A lazily exporting package (`dew._exports`) reads each of its modules that defines an export as
+    its attribute, in a fresh interpreter that imported the package alone, as its eager imports bound
+    them: `dew.sampling.text.Sampling` after `import dew.sampling`."""
+    module, name = read.split(".")
+    script = (f"import importlib, {package}\n"
+              f"assert getattr({package}.{module}, {name!r}) is getattr(importlib.import_module("
+              f"'{package}.{module}'), {name!r})\n")
+    subprocess.run([sys.executable, "-c", script], check=True,
+                   env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})

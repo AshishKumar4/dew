@@ -129,6 +129,9 @@ class FitStarted:
     """The run's cadences and schedule warmups as it resolved them, a share of the run among them
     (`dew.training.budget.every_step`, `dew.optim.OptimConfig.warmups`): steps, committed tokens or a
     duration by name."""
+    groups: Mapping[str, str] | None = None
+    """Where the optimizer's split sent each parameter and why, by its path (`dew.optim.OptimConfig.groups`:
+    Muon's matrices beside AdamW's vectors, lookups and filters); None for an optimizer that splits none."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -148,8 +151,9 @@ class StepCompiled:
     because the step did not fit, the links of the tensor and sequence axes
     the mesh splits, by axis name, the arithmetic of the check that it
     fits this process's devices (`dew.training.memory.memory_record`), and
-    its plan: the microbatches it reads each batch in, their rows, and every
-    compile the search made (`dew.training.memory.Probe`)."""
+    its plan: the microbatches it reads each batch in, their rows, every
+    compile the search made (`dew.training.memory.Probe`), and its kernels
+    (`dew.training._lowering.KernelReport.record`)."""
     seconds: float
     remat: JSON
     links: Mapping[str, AxisLink]

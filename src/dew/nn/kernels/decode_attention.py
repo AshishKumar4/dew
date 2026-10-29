@@ -54,7 +54,7 @@ from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import NATURAL, capped, kernel_dot
+from .templates.attention import capped, kernel_dot, prescaled
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -62,12 +62,20 @@ if TYPE_CHECKING:
     from dew.nn.kv_cache import PagedCase
 
 BLOCK = 32
-"""Keys a step of the loop reads."""
+"""Keys a step of the loop reads, but a compensated walk's (`step_keys`)."""
 QUERIES = 16
 """Query positions a program holds: the fewest a tensor-core dot takes."""
 WARPS = 4
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The dtypes it attends in: its products' own precision, accumulated in fp32."""
+
+
+def step_keys(dtype) -> int:
+    """The keys a step of the loop reads over values of `dtype`: `BLOCK`, or one chain of a compensated walk's
+    (`algebra.CHUNK`, fp32's, `algebra.compensates`), whose step then sums its product whole, where a step of
+    `BLOCK` keys would split its value tile in registers, a layout change through shared memory (116736
+    bytes at 256-wide fp32 heads, past an sm120 block's 101376)."""
+    return algebra.CHUNK if algebra.compensates(dtype) else BLOCK
 
 SPLITS = (1, 2, 4, 8, 16, 32)
 """The slices a launch may cut each row's keys into (`Split`), each held to the float64 gate on the GPU."""
@@ -116,16 +124,21 @@ over an `AttentionCase`): a GPU Dew's Triton kernels run on, at most `QUERIES` p
 power-of-two width from 16 to 256, a capacity of whole blocks and one of its dtypes on both sides."""
 
 
-def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool) -> algebra.Forward:
+def _spec(scale: float, power: float, softcap: float | None, natural: bool | None, dtype, sinks: bool
+          ) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
-    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and in
-    either form whether a row's sums of `dtype` values need a guard (`algebra.headroom`). A decode
+    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`; None:
+    natural for fp32 operands, whose edge logit's base-2 conversion rounded before exp2 moves its normal
+    weight by several ppm, which a large value carries into the output, ledger 2151), and in either form
+    whether a row's sums of `dtype` values need a guard (`algebra.headroom`) and keep their additions'
+    rounding (`algebra.compensates`). A decode
     block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(capped, softcap),
-                           natural=natural, headroom=algebra.headroom(dtype),
-                           initial=sinks)
+                           natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
+                           headroom=algebra.headroom(dtype), initial=sinks,
+                           compensated=algebra.compensates(dtype), prescale=power)
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
@@ -139,12 +152,11 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
     rows = jnp.arange(QUERIES)
     spans = ((jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)),)
 
-    def body(step, state):
+    def keys_at(step):
         key, value = read(step)
         coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], spans)
         logits = algebra.modify(spec, kernel_dot(query, key.T, interpret), coords)
-        keys = algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
-        return algebra.plain_step(spec, state, keys)
+        return algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
 
     def walk(live=None) -> algebra.Partial:
         # The plain walk where `live` is None, else the guarded one, those rows shifting.
@@ -155,7 +167,7 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         elif live is not None:
             start = algebra.headroomed(start, live)
         first, last = steps
-        return jax.lax.fori_loop(first, last, body, start)
+        return algebra.plain_walk(spec, first, last, keys_at, start)
 
     if not spec.headroom:
         return walk()
@@ -213,14 +225,15 @@ def _first_slice_sink(sinks_ref) -> jax.Array | None:
 def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, spec: algebra.Forward, splits: int,
             interpret: bool, sinks: bool):
     sinks_ref, out_refs = (refs[0], refs[1:]) if sinks else (None, refs)
+    block = step_keys(value_ref.dtype)
 
     def read(step):
-        keys = pl.ds(step * BLOCK, BLOCK)
+        keys = pl.ds(step * block, block)
         return key_ref[keys, :], value_ref[keys, :]
 
     span = spans_ref[0], spans_ref[1]
-    steps = _slice(span, BLOCK, pl.program_id(2), splits)
-    _write(out_refs, spec, _attend(query_ref[...], span, read, BLOCK, spec, steps, interpret,
+    steps = _slice(span, block, pl.program_id(2), splits)
+    _write(out_refs, spec, _attend(query_ref[...], span, read, block, spec, steps, interpret,
                                    _first_slice_sink(sinks_ref)))
 
 
@@ -322,11 +335,13 @@ class DecodeAttention(tuning.KernelOp):
 
     def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, spans: jax.Array,
              sinks: jax.Array | None = None, *, interpret: bool, softcap: float | None = None,
-             natural: bool = NATURAL, config: Split, return_residuals: bool = False):
+             natural: bool | None = None, config: Split, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         batch, _, heads, width = query.shape
         splits = config.splits
+        # The query taken by its scale's power of two before its products, as the template takes it.
+        query, scale, power = prescaled(query, 1 / math.sqrt(width))
         keyed = pl.BlockSpec((None, key.shape[1], None, width), lambda row, head, split: (row, 0, head, 0))
         queried = pl.BlockSpec((None, QUERIES, None, width), lambda row, head, split: (row, 0, head, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
@@ -350,7 +365,7 @@ class DecodeAttention(tuning.KernelOp):
             )(spans, query, key, value, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=1).astype(query.dtype)
 
-        spec = _spec(1 / math.sqrt(width), softcap, natural, value.dtype, sinks is not None)
+        spec = _spec(scale, power, softcap, natural, value.dtype, sinks is not None)
         return _guarded(launch, spec), None
 
     def _get_heuristics_config(self, ba) -> Split:
@@ -364,7 +379,8 @@ class DecodeAttention(tuning.KernelOp):
         """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop, and
         the GPU's multiprocessors."""
         query = ba.arguments['query']
-        return (_rows(query) * query.shape[2], pl.cdiv(ba.arguments['key'].shape[1], BLOCK),
+        return (_rows(query) * query.shape[2],
+                pl.cdiv(ba.arguments['key'].shape[1], step_keys(ba.arguments['value'].dtype)),
                 gpu_target().multiprocessors)
 
 
@@ -386,13 +402,14 @@ class PagedDecodeAttention(tuning.KernelOp):
 
     def _fwd(self, query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
              spans: jax.Array, sinks: jax.Array | None = None, *, interpret: bool,
-             softcap: float | None = None, natural: bool = NATURAL, config: Split,
+             softcap: float | None = None, natural: bool | None = None, config: Split,
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         rows, kv_heads, _, width = query.shape
         count, page_size = key_pages.shape[1:3]
-        splits, pages = config.splits, BLOCK // page_size
+        query, scale, power = prescaled(query, 1 / math.sqrt(width))
+        splits, pages = config.splits, max(step_keys(value_pages.dtype) // page_size, 1)
         pooled = pl.BlockSpec((None, count, page_size, width), lambda row, head, split: (head, 0, 0, 0))
         queried = pl.BlockSpec((None, None, QUERIES, width), lambda row, head, split: (row, head, 0, 0))
         summed = pl.BlockSpec((None, None, None, QUERIES, width),
@@ -418,7 +435,7 @@ class PagedDecodeAttention(tuning.KernelOp):
             )(spans, table, query, key_pages, value_pages, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=2).astype(query.dtype)
 
-        spec = _spec(1 / math.sqrt(width), softcap, natural, value_pages.dtype, sinks is not None)
+        spec = _spec(scale, power, softcap, natural, value_pages.dtype, sinks is not None)
         return _guarded(launch, spec), None
 
     def _get_heuristics_config(self, ba) -> Split:
@@ -430,9 +447,9 @@ class PagedDecodeAttention(tuning.KernelOp):
     @staticmethod
     def _launch(ba) -> tuple[int, int, int | None]:
         """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop over
-        its table, `BLOCK` keys a step, and the GPU's multiprocessors."""
-        query = ba.arguments['query']
-        steps = pl.cdiv(ba.arguments['table'].shape[1], BLOCK // ba.arguments['key_pages'].shape[2])
+        its table, `step_keys` a step, and the GPU's multiprocessors."""
+        query, pages = ba.arguments['query'], ba.arguments['value_pages']
+        steps = pl.cdiv(ba.arguments['table'].shape[1], max(step_keys(pages.dtype) // pages.shape[2], 1))
         return _rows(query) * query.shape[1], steps, gpu_target().multiprocessors
 
 
@@ -473,7 +490,7 @@ def grouped_query(attend, query, key, value):
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array, starts=None, *,
-           softcap: float | None = None, sinks: jax.Array | None = None, natural: bool = NATURAL,
+           softcap: float | None = None, sinks: jax.Array | None = None, natural: bool | None = None,
            interpret: bool = False) -> jax.Array:
     """Attention of `query` `[B, T, N, D]` over the keys from `starts` `[B]`
     (0 where None) to `lengths` `[B]` of `key` and `value` `[B, S, K, D]`, a
@@ -484,7 +501,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
     the call's positions times its group are at most `QUERIES`. A `softcap`
     bounds the scaled logits (`softcap · tanh(logit / softcap)`, Gemma 2's);
     `sinks` `[N]` put one value-free logit a head in each row's softmax;
-    `natural` keeps the logits natural (`algebra.Forward.base2`). Its
+    `natural` keeps the logits natural (`algebra.Forward.base2`; None: for fp32 operands alone, `_spec`). Its
     Pallas call has no derivative: `dew.nn.attention` differentiates it as the
     attention it stands in for. A cache of no keys gives the empty result
     (`_empty`), no launch."""
@@ -534,7 +551,7 @@ selector's GPU kernel declares (`dew.nn.kv_cache.TRITON_PAGED_SUPPORTS`)."""
 
 def attend_paged(query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
                  lengths: jax.Array, starts=None, *, softcap: float | None = None,
-                 sinks: jax.Array | None = None, natural: bool = NATURAL,
+                 sinks: jax.Array | None = None, natural: bool | None = None,
                  interpret: bool = False) -> jax.Array:
     """Attention of one query a row `[rows, heads, D]` over the keys from
     `starts` `[rows]` (0 where None) to `lengths` `[rows]` of that row's pages,

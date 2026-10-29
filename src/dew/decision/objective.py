@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn, struct
+from flax import linen as nn
 
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, Batch, Variables, dicts, part
@@ -50,6 +50,7 @@ from dew.objectives.base import (
     Ratio,
     Source,
     Step,
+    Weighted,
     joined,
     model_rngs,
 )
@@ -80,17 +81,7 @@ def tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
             return None
 
 
-@struct.dataclass
-class DecisionStatistics:
-    """A decision loss's statistics where it adds a consistency term: the label loss and the groups'
-    divergence, each its own `Ratio`, their weighted sum the objective's value
-    (`DecisionObjective.reduce_loss`)."""
-
-    label: Ratio
-    consistency: Ratio
-
-
-class DecisionObjective(Objective[Ratio | DecisionStatistics]):
+class DecisionObjective(Objective[Ratio | Weighted]):
     """Trains a decision model on questions with known answers.
 
     The model is any backbone with final states (`dew.nn.protocols.HiddenStates`),
@@ -237,7 +228,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
-                 consistency: float = 0.0):
+                 consistency: float = 0.0, context_window: int | None = None):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -295,6 +286,15 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
         self.segments = segments
+        held_context = self.context_length
+        if context_window is not None and (held_context is None or context_window < held_context):
+            raise ValueError(f"context_window={context_window} holds a window's contexts, at least one row's "
+                             f"context_length ({held_context}), which rows that read a context carry")
+        # The most context tokens a packed window holds, its rows' contexts end to end (`packing`): as
+        # given, or as many as its own tokens, `max_len`, or one row's `context_length` where that is
+        # longer; none where its rows carry no context.
+        self.context_window = (None if held_context is None
+                               else context_window or max(self.layout.max_len, held_context))
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
@@ -340,13 +340,10 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
     @functools.cached_property
     def bounds(self) -> Bounds:
         """The most rows, questions and options a window packs (`Layout.bounds`),
-        at most `segments` rows; rows that carry a context pack as any do, each reading its own
-        (`DecisionInputs.context_segments`)."""
-        bounds = self.layout.bounds(self.tokenizer, self.specials, self.context_length)
-        most = self.segments
-        if most is None:
-            return bounds
-        return dataclasses.replace(bounds, segments=min(most, bounds.segments))
+        at most `segments` rows; rows that carry a context, an example's or their schema, pack as any
+        do, each reading its own (`DecisionInputs.context_segments`)."""
+        return self.layout.bounds(self.tokenizer, self.specials, self.context_length, self.segments,
+                                  self.context_window)
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
@@ -356,16 +353,16 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         return self._charged(logits, inputs, batch)
 
     def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
-                 ) -> tuple[Ratio | DecisionStatistics, Aux]:
-        """The loss and its accuracy report over the questions' option logits."""
+                 ) -> tuple[Ratio | Weighted, Aux]:
+        """The loss and its accuracy report over the questions' option logits: where it adds a consistency
+        term, the label loss and the groups' divergence, each its own `Ratio`, `consistency` weighing the
+        divergence (`Weighted`)."""
         options, scored = inputs.options, jnp.asarray(batch["scored"]).astype(jnp.float32)
         # A padding question has no options; it is scored nothing over a
         # finite, even distribution, so no NaN reaches its gradient.
         empty = ~jnp.any(options, axis=-1, keepdims=True)
         logits, options = jnp.where(empty, 0.0, logits), options | empty
-        count = jnp.sum(options, axis=-1, keepdims=True)
-        gold = jnp.asarray(batch["targets"])
-        target = jnp.where(options, (1.0 - self.label_smoothing) * gold + self.label_smoothing / count, 0.0)
+        target = categorical.smoothed(jnp.asarray(batch["targets"]), options, self.label_smoothing)
         charge = self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
@@ -377,23 +374,15 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         divergence, members = categorical.group_divergence(logits, jnp.asarray(batch["groups"]),
                                                            jnp.asarray(batch["canonical"]), options)
         term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
-        return (DecisionStatistics(loss, term),
+        return (Weighted((loss, term), (1.0, self.consistency)),
                 Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
-
-    def reduce_loss(self, stats: Ratio | DecisionStatistics) -> tuple[jax.Array, jax.Array]:
-        """The label loss, plus `consistency` times the groups' mean divergence where it adds one."""
-        if isinstance(stats, Ratio):
-            return stats.mean()
-        label, active = stats.label.mean()
-        divergence, grouped = stats.consistency.mean()
-        return label + self.consistency * divergence, active | grouped
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
-                           ) -> tuple[Ratio | DecisionStatistics, Decisions]:
+                           ) -> tuple[Ratio | Weighted, Decisions]:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         logits = self.model.logits(params, inputs)
         return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
@@ -424,6 +413,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
             targets=batch["targets"],
             ordinal=inputs.kinds == _SCORE,
             scored=batch["scored"],
+            classes=batch.get("classes"),
         )
 
     @property
@@ -443,8 +433,8 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
                                    grouped=grouped)
         evaluating = dataclasses.replace(training, train=False)
         fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
-                  self.bounds, self.none_of_the_above)
-        held = dataclasses.replace(fit, none_of_the_above=0.0)
+                  self.bounds, self.none_of_the_above, self.context_window)
+        held = dataclasses.replace(fit, none_of_the_above=0.0, scored=True)
         # Rows a record spreads into: a layout of a question a row's, or grouped examples' apart.
         expand = (QuestionRows(),)
         options = self.bounds.options if self.layout.joint else None
@@ -452,8 +442,8 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         return ObjectiveData(
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
             evaluate=(held, *expand, Configured(evaluating, needs=("slots",), scope="run")),
-            pack=packing(self.layout, self.bounds, self.context_length, grouped),
-            packed=(PackedRows(self.layout.max_len, compact),),
+            pack=packing(self.layout, self.bounds, self.context_window, grouped),
+            packed=(PackedRows(self.layout.max_len, compact, self.schema_in_context),),
         )
 
     def task_settings(self) -> DecideSettings:

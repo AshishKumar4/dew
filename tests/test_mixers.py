@@ -22,12 +22,13 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
+from whole_suite import timed
 
 from dew.batch import coordinates
 from dew.nn import linear
-from dew.nn.attention import alibi_bias
+from dew.nn.attention_masks import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
@@ -247,7 +248,7 @@ REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
-         "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64, "mlp": 64}
+         "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64, "mlp": 64, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 documents run alone compared with themselves resolve PARITY in every logit and parameter gradient (on
 armada). Mamba2's 8 heads of 32 over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a
@@ -262,7 +263,13 @@ one chunk); the scan's packed resets within a chunk stay held by tests/test_mamb
 tests/test_mamba_ssd.py at their own geometries."""
 
 
-@pytest.mark.parametrize("kind", sorted(mixers.paths))
+PAST_TARGET = {"packed": {"memory": 122}}
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2160):
+the memory mixer's packed row; every train packs every other mixer's, and test_memory_composition.py
+packs the memory decoder's."""
+
+
+@pytest.mark.parametrize("kind", timed(PAST_TARGET, "packed", sorted(mixers.paths)))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """Every mixer in the registry: a row packing documents (segment ids, positions restarting),
     one across a chunk of the chunked rules, gives each document's logits and the parameters' gradients
@@ -365,7 +372,8 @@ POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "a
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}
 """Layer fields a kind needs to build at all, beyond the test's context."""
 
-ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory"}
+ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory",
+                  "short_conv"}
 """The registry's kinds that mix tokens without attention, whose layers' attention policies are not theirs."""
 
 
@@ -484,20 +492,28 @@ def one_tap(kind):
                                      conv_kernel=1)}[kind]()
 
 
+ONE_TAP_SEEDS = {"gated_delta_net": 8, "kimi_delta_attention": 8, "mamba": 8, "mamba2": 8}
+"""Each one-tap mixer's declared draws for its decode against its whole pass (check 1), sized by
+`seeds_for` paired with the decode on the CPU."""
+
+
 @pytest.mark.parametrize("kind", ["gated_delta_net", "kimi_delta_attention", "mamba", "mamba2"])
 def test_a_recurrent_mixer_whose_conv_takes_one_tap_decodes_as_its_whole_pass(kind):
     """A one-tap causal conv is a scale per channel with no history to hold: each recurrent mixer
-    builds with one, and its decode (a 3-token prefill, then one token a step) is within
-    tests/reference_error.py's rule of its whole pass against the float64 whole pass."""
+    builds with one, and its decode (a 3-token prefill, then one token a step) is on par with its
+    whole pass from the float64 whole pass over drawn inputs (check 1)."""
     from model_support import decode_through
-    from reference_error import assert_as_exact_as_the_reference
 
     module = one_tap(kind)
-    hidden = jax.random.normal(jax.random.key(4), (2, 9, module.emb_features), jnp.float32)
-    variables = module.init(jax.random.key(5), hidden)
-    whole = np.asarray(module.apply(variables, hidden), np.float64)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-        truth = np.asarray(module.clone(dtype=jnp.float64).apply(wide, jnp.asarray(hidden, jnp.float64)))
-    decoded = np.asarray(decode_through(module, variables, hidden, prefill=3)[0], np.float64)
-    assert_as_exact_as_the_reference(decoded, whole, truth, f"{kind} decode")
+    shape = (2, 9, module.emb_features)
+    variables = module.init(jax.random.key(5), jnp.zeros(shape, jnp.float32))
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.key(seed), shape, jnp.float32),)
+
+    def truth(hidden):
+        return module.clone(dtype=jnp.float64).apply(widened(variables), hidden)
+
+    assert_as_exact(lambda hidden: decode_through(module, variables, hidden, prefill=3)[0],
+                    lambda hidden: module.apply(variables, hidden), draw, f"{kind} decode",
+                    seeds=ONE_TAP_SEEDS[kind], truth_fn=truth)

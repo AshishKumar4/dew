@@ -21,24 +21,17 @@ import optax
 import pytest
 import selection_margins
 from affine_run import dataset
+from lm_support import token_batch_of
 from recording import RecordingTracker
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    over_windows,
-    widened,
-    windows,
-)
-from token_support import token_batch_of
+from reference_error import as_given, assert_as_exact, over_windows, widened, windows
 
 from dew.artifacts import TokenScores
-from dew.batch import coordinates
+from dew.batch import TEXT_KEY, coordinates
 from dew.data.chat import ROLES_KEY, Role
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
+from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.objectives.routing import ExpertBalance
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -853,36 +846,55 @@ def test_evaluation_weights_follow_loss_role():
 # --- z-loss: PaLM's log-partition penalty ---------------------------------
 
 
+Z_TERM_SEEDS = 256
+"""Check 1's declared seeds for the z loss and its term, each a scalar of a token batch, sized by
+`seeds_for` paired with the objective on the CPU."""
+
+
 def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     """`z_loss * log(Z)^2` per counted target, masked and averaged with the
     cross entropy, as MaxText's `cross_entropy_with_logits` and
     `train.py` sum it (tools/distillation_reference.py:z_loss_reference): the
-    loss and its z term as near the oracle on the float64 forward's logits as
-    the oracle's own float32 run on the float32 logits is
-    (`assert_as_exact_as_the_reference`), and zero keeps the loss the plain
-    cross entropy to the bit."""
+    loss and its z term on par with the oracle's own float32 run on the
+    float32 logits from the oracle on the float64 forward's over drawn token
+    batches (check 1), and zero keeps the loss the plain cross entropy to the
+    bit."""
     from tools.distillation_reference import z_loss_reference
 
     pad_id, coefficient = 0, 1e-2
-    batch = token_batch()
-    tokens = np.asarray(batch[TEXT_KEY])
     plain = make_objective(pad_id=pad_id)
+    with_z = make_objective(pad_id=pad_id, z_loss=coefficient)
     params = plain.init(jax.random.key(0))
-    ids = jnp.asarray(tokens[:, :-1], jnp.int32)
-    logits = np.asarray(plain.model.apply(params, ids))
-    weights = (tokens[:, 1:] != pad_id).astype(np.float64)
-    rounded, rounded_z, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient, dtype=np.float32)
-    with jax.enable_x64(new_val=True):
-        wide_logits = np.asarray(plain.model.clone(dtype=jnp.float64).apply(widened(params), ids))
-        expected, z_term, _ = z_loss_reference(wide_logits, tokens[:, 1:], weights, coefficient)
 
-    loss, aux = make_objective(pad_id=pad_id, z_loss=coefficient).scalar_loss(params, batch, step_at())
+    def draw(seed):
+        return (np.asarray(token_batch(seed=seed)[TEXT_KEY]),)
+
+    def objective(tokens):
+        loss, aux = with_z.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
+        return {"loss": jnp.atleast_1d(loss), "z term": jnp.atleast_1d(aux.metrics["z_loss"])}
+
+    def oracle(dtype):
+        """The oracle on the model's logits in `dtype`, its float32 run on the float32 ones."""
+        def run(tokens):
+            tokens = np.asarray(tokens)
+            ids = jnp.asarray(tokens[:, :-1], jnp.int32)
+            weights = (tokens[:, 1:] != pad_id).astype(np.float64)
+            if dtype == np.float32:
+                logits = np.asarray(plain.model.apply(params, ids))
+                loss, z_term, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient,
+                                                   dtype=np.float32)
+            else:
+                logits = np.asarray(plain.model.clone(dtype=jnp.float64).apply(widened(params), ids))
+                loss, z_term, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient)
+            return {"loss": np.atleast_1d(np.float64(loss)), "z term": np.atleast_1d(np.float64(z_term))}
+        return as_given(run)
+
+    assert_as_exact(objective, oracle(np.float32), draw, "the z loss", seeds=Z_TERM_SEEDS,
+                    truth_fn=oracle(np.float64))
+    batch = token_batch()
+    loss, aux = with_z.scalar_loss(params, batch, step_at())
     without, plain_aux = plain.scalar_loss(params, batch, step_at())
 
-    for dew, reference, truth, label in ((loss, rounded, expected, "loss"),
-                                         (aux.metrics["z_loss"], rounded_z, z_term, "z term")):
-        assert_as_exact_as_the_reference(np.atleast_1d(np.float64(dew)), np.atleast_1d(reference),
-                                         np.atleast_1d(truth), label)
     # The term leaves the cross entropy the plain objective's, which is the padded targets' own
     # (`test_padded_targets_are_left_out_of_the_average`), and adds to the loss.
     np.testing.assert_array_equal(aux.metrics["ce"], plain_aux.metrics["ce"])
@@ -999,3 +1011,23 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
 
     assert_as_exact_over_instances(scored, oracle(model), draw, "router z-loss",
                                    seeds=ROUTER_SEEDS, truth_fn=oracle(model.clone(dtype=jnp.float64)))
+
+
+def test_a_decoder_whose_cache_outgrew_its_learned_positions_admits_rows_its_table_covers():
+    """A learned position table of eight places resized to a sixteen-slot cache keeps its eight rows
+    (`with_cache_capacity`), so the run admits rows of eight inputs and refuses a stage's rows of
+    twelve, which would read past the table, where it took the cache's sixteen before (row 1982)."""
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, position_embedding="learned").with_cache_capacity(16)
+    objective = LMObjective(model, 8)
+    objective.inputs.check({TEXT_KEY: np.zeros((2, 9), np.int32)})
+    with pytest.raises(ValueError):
+        objective.inputs.check({TEXT_KEY: np.zeros((2, 13), np.int32)})
+
+
+def test_the_token_batch_key_is_one_of_dew_batch_s_exports():
+    """The key a token batch packs its ids under (`TEXT_KEY`) lives in `dew.batch` beside the other
+    batch keys, and a star import of the module gives it, as its API reference lists it (row 2065)."""
+    names: dict = {}
+    exec("from dew.batch import *", names)
+    assert names.get("TEXT_KEY") == "text"

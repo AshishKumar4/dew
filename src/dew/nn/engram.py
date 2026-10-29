@@ -35,11 +35,13 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.batch import real_places, valid_order
+from dew.batch import prefix_sum, real_places, valid_order
 from dew.nn.dense import Dense
 
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
 from .sharding import logical_axes
+
+__all__ = ["Engram", "compressed_token_map"]
 
 _DEAD = -1
 """A compressed id no n-gram reaches across (engram.py:130)."""
@@ -191,7 +193,7 @@ def _lookback(compressed, valid, positions, size: int, history=None):
     order, _ = valid_order(valid)
     packed = jnp.concatenate(
         [history, jnp.take_along_axis(jnp.where(valid, compressed, _DEAD), order, axis=1)], axis=1)
-    rank = jnp.cumsum(valid, axis=1) - 1 + (size - 1)
+    rank = prefix_sum(valid, dtype=jnp.int32) - 1 + (size - 1)
     shifts = jnp.arange(size)
     at = rank[..., None] - shifts
     ids = jnp.take_along_axis(packed[:, None, :], jnp.maximum(at, 0), axis=2)

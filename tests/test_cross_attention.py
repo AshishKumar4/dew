@@ -24,6 +24,7 @@ import torch
 from model_support import TINY_DECODER, Digits, decoder, flat_tree
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
+from whole_suite import timed
 
 from dew.batch import FROZEN, coordinates, thaw
 from dew.checkpoints import Checkpoints
@@ -148,11 +149,17 @@ def idefics_block(wide: bool):
     return run
 
 
-@pytest.mark.parametrize("dtype", [np.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
-def test_the_block_computes_and_differentiates_as_idefics(dtype):
+PAST_TARGET = {"idefics": {"bfloat16": 132}}
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2158):
+the bfloat16 block; every train computes and differentiates it in float32."""
+
+
+@pytest.mark.parametrize("precision", timed(PAST_TARGET, "idefics", ["float32", "bfloat16"]))
+def test_the_block_computes_and_differentiates_as_idefics(precision):
     """Through both gated branches, the output and the gradients into the residual, the context and
     every parameter on par with IDEFICS's in float32 and in bfloat16 (check 1), over contexts of
     every length; the gates' products are at least float32."""
+    dtype = {"float32": np.float32, "bfloat16": jnp.bfloat16}[precision]
     label = f"block {np.dtype(dtype).name}"
     assert_as_exact(dew_block, idefics_block(wide=False), functools.partial(block_draw, dtype=dtype), label,
                     seeds=SEEDS[label], truth_fn=idefics_block(wide=True))
@@ -492,23 +499,23 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
     server = Server.from_task(served_task(), slots=2, capacity=128)
     wide = request(0)
     with pytest.raises(ValueError):
-        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2)
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2, key=0)
     with pytest.raises(ValueError):
-        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2)
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2, key=0)
     for length in (-1, 3):
         with pytest.raises(ValueError):
             server.submit(dataclasses.replace(wide, conditioning={
-                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2)
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2, key=0)
     model = decoder().clone(max_seq_len=128)
     plain = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
                            RunProcessor(Digits()), sampling=Sampling(temperature=0))
     with pytest.raises(ValueError):
-        Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2)
+        Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2, key=0)
     with jax.enable_x64(new_val=True):
         wrapped = np.asarray([2 ** 32 + 1], np.int64)
         with pytest.raises(ValueError):
             server.submit(dataclasses.replace(wide, conditioning={
-                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2)
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2, key=0)
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():
@@ -737,3 +744,19 @@ def test_a_served_requests_host_context_is_checked_on_the_host():
         ticket = server.submit(host, BUDGETS[0], key=0)
     server.run()
     assert_same_generation(ticket.result(), bound(given, BUDGETS[0], key=0))
+
+
+def test_a_tokens_context_is_present_where_its_document_holds_keys_whatever_their_order():
+    """A token reads the cross-attention where its document holds any of the context's keys (`holds_keys`),
+    the keys in any order and with padding (0) anywhere among them, and a padding token never does: as
+    the membership of every query among the keys says, over drawn ids (exact, booleans)."""
+    from dew.nn.documents import CrossDocuments, holds_keys
+
+    rng = np.random.default_rng(0)
+    queries = rng.integers(0, 6, (4, 32)).astype(np.int32)
+    keys = rng.integers(0, 6, (4, 48)).astype(np.int32)
+    keys[:, ::7] = 0
+    member = np.any((queries[:, :, None] == keys[:, None, :]) & (keys[:, None, :] > 0), axis=-1)
+    held = holds_keys(CrossDocuments(jnp.asarray(queries), jnp.asarray(keys)))
+    np.testing.assert_array_equal(np.asarray(held), member & (queries > 0))
+    assert member.any() and not member.all()

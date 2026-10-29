@@ -15,8 +15,10 @@ imports, so its two writes publish by a rename of their own rather than through 
 
 import atexit
 import dis
+import functools
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import sysconfig
@@ -34,7 +36,13 @@ checkout's code or hold the GPU."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
 """Audit events of a process start; a multiprocessing child's is executed.py's `CHILD_START`'s."""
+HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes")
+"""The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings), each
+the input of the files that read it alone; any other hidden entry (.git, an environment, a cache) is none."""
 READS = {"open", "os.listdir", "os.scandir"}
+LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
+"""The cgroup files that set a process's execution limits, by the input a run that read one keys: host.py's
+`LIMITS`, which this module cannot import (it runs inside every test process, before the checkout's tools)."""
 """Audit events of a read: a file opened, a directory listed."""
 IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
 """The import system's frozen modules, which list the directories it imports from."""
@@ -96,27 +104,52 @@ def read(event: str, args: tuple, root: str) -> str | None:
             return None
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
-    return placed(os.path.abspath(os.fsdecode(path if path is not None else ".")), root)
+    name = os.path.abspath(os.fsdecode(path if path is not None else "."))
+    # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
+    cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
+    if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
+        return LIMITS[os.path.basename(name)]
+    return placed(name, root)
 
 
 def placed(name: str, root: str) -> str | None:
     """Absolute path `name` relative to the checkout at `root`, its own directory as `.`, or None
-    where it is not the checkout's or is never an input (a hidden directory, compiled bytecode, the
-    environment's packages)."""
+    where it is not the checkout's or is never an input (a hidden entry but `HIDDEN_INPUTS`, compiled
+    bytecode, the environment's packages)."""
     if name == root.removesuffix(os.sep):
         return "."
     if not name.startswith(root):
         return None
     relative = name[len(root):]
-    if relative.split(os.sep)[0].startswith(".") or "__pycache__" in relative or "site-packages" in relative:
+    top = relative.split(os.sep)[0]
+    hidden = top.startswith(".") and top not in HIDDEN_INPUTS
+    if hidden or "__pycache__" in relative or "site-packages" in relative:
         return None
     return relative
+
+
+PROBES = ((os, ("stat", "lstat", "access")),
+          (os.path, ("exists", "lexists", "isfile", "isdir", "getsize")),
+          (pathlib.Path, ("exists", "is_file", "is_dir", "stat")))
+"""The existence and size probes a run's record keeps as reads (`opening`), which raise no audit event:
+`os`'s stat calls, `os.path`'s (getmtime and islink among them, through os.stat) and `pathlib.Path`'s,
+which every test, collection, conftest, loader and followed child calls. A glob's wildcard parts list the
+directories they walk (`read`), so a file arriving where a glob looks changes a listing it keyed."""
+PROBED = "probe:"
+"""What a probed path's name is recorded under: a probe's answer is whether the path is there and of
+what kind, and a file's size, so ci.py's `contents` keys a probed directory by its kind, not by the
+entries a listing of it reads."""
 
 
 def opening(recorded: Callable[[str], None], root: str) -> None:
     """`os.open` wrapped, whose audit event names a path relative to `dir_fd` without the descriptor:
     such an open, once it has opened to read, is passed to `recorded` as what the descriptor it
-    opened names (`placed`)."""
+    opened names (`placed`). Each existence or size probe (`PROBES`) is passed to `recorded` as the path it
+    asks after (`probed`), there or not, which the record then keys (ci.py's `contents`): a fixture's
+    arrival reruns its probers, and no other file (Main, 2026-10-29)."""
+    for owner, names in PROBES:
+        for name in names:
+            setattr(owner, name, probed(getattr(owner, name), recorded, root))
     plain = os.open
 
     def opened(path, flags, mode=0o777, *, dir_fd=None):
@@ -197,6 +230,32 @@ def _this_python(program) -> bool:
     path = os.fsdecode(program)
     return os.path.realpath(path if os.sep in path else os.path.join(sys.prefix, "bin", path)) == \
         os.path.realpath(sys.executable)
+
+
+def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: str) -> Callable[..., object]:
+    """`probe` (`PROBES`), which passes the path it is asked about to `recorded`, as `PROBED` and that path,
+    before it answers: but a listing tool's (`listing_tool`), whose probes, as its listings, look for what
+    it then records as it runs, and one a probe makes in answering (pathlib's `is_dir` asks `stat`), whose
+    caller's probe is already recorded."""
+
+    @functools.wraps(probe)
+    def asked(path, *arguments, **keywords):
+        if getattr(placing, "probing", False):
+            return probe(path, *arguments, **keywords)
+        # A path relative to a directory descriptor (os.stat's dir_fd) is placed in the directory it names.
+        at = keywords.get("dir_fd")
+        base = os.readlink(f"/proc/self/fd/{at}") if at is not None else ""
+        if not isinstance(path, int) and not listing_tool(sys._getframe(1).f_code.co_filename) and (
+                name := placed(os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path)))),
+                               root)) is not None:
+            recorded(PROBED + name)
+        placing.probing = True
+        try:
+            return probe(path, *arguments, **keywords)
+        finally:
+            placing.probing = False
+
+    return asked
 
 
 def installed() -> None:

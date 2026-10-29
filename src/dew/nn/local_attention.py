@@ -9,25 +9,24 @@ import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.batch import valid_order
+from dew.batch import prefix_sum, valid_order
 from dew.mesh import SEQUENCE_AXIS, logical_spec
 
 from .attention import (
-    SPLASH_LANES,
+    AttentionImpl,
     attention_kernel,
-    chunk_mask,
-    combined_attention_mask,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
-    query_split,
     resolve_implementation,
     scaled_dot_product_attention,
-    split_with_queries,
-    tensor_shards,
 )
+from .attention_kernels import SPLASH_LANES
+from .attention_masks import chunk_mask, combined_attention_mask
+from .attention_parallel import query_split, split_with_queries, tensor_shards
 from .documents import with_documents
 from .inputs import sequence_blocks
 from .kernels.selection import forced
+from .kernels.templates import attention as template
 from .sharding import HEADS, KV_HEADS, explicit_spec, manual_map, rows_like, rows_spec, sequence_shards
 from .visibility import same_chunk, visible
 
@@ -47,7 +46,7 @@ def _banded(x, before=None):
 def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
                     places=None, segment_ids=None, max_segments=None, valid=None,
                     right_padded: bool = False, dtype=None, precision=None, force_fp32_for_softmax=True,
-                    implementation='auto', sinks=None, softcap=None):
+                    implementation: AttentionImpl = 'auto', sinks=None, softcap=None):
     """Causal self-attention in which each query reads only nearby keys, in
     memory linear in the sequence.
 
@@ -120,7 +119,8 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
         # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with
         # the documents, the valid keys, the sinks and the softcap as they are, no band and no mask.
-        runs = None if chunk is None else chunk_runs(places, query.shape[0], length, chunk)
+        runs = (None if chunk is None
+                else chunk_runs(places, segment_ids, valid, query.shape[0], length, chunk))
         return whole(implementation=implementation, causal=True, sliding_window=window,
                      segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
@@ -193,17 +193,22 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     return checkpoint_name(out, 'attention_output')
 
 
-def chunk_runs(places, rows: int, length: int, chunk: int) -> jax.Array:
-    """Each query's run of keys `[lo, hi)` `[B, S, 1, 2]` int32 (`template.spans`' `runs`): its own chunk's
-    keys of `chunk` places at or before it, chunked attention's (`chunk_mask`, under causality). `places`
-    `[S]` or `[B, S]` are counted (`counted_places`), so a chunk's tokens in a document are consecutive
-    slots, and None is the row index; the documents bound a run that starts in the one before."""
-    place = jnp.arange(length) if places is None else jnp.asarray(places)
-    # The remainder in the places' own integers, then its slots: a wide place narrowed first would move it.
-    into = jnp.broadcast_to(jnp.atleast_2d(place % chunk), (rows, length)).astype(jnp.int32)
-    index = jnp.arange(length, dtype=jnp.int32)
-    first = jnp.maximum(index - into, 0)
-    return jnp.stack([first, jnp.broadcast_to(index + 1, first.shape)], axis=-1)[:, :, None, :]
+def chunk_runs(places, segment_ids, valid, rows: int, length: int, chunk: int) -> jax.Array:
+    """Each query's run of keys `[lo, hi)` `[B, S, 1, 2]` (`template.spans`' `runs`): its own chunk's keys
+    of `chunk` places at or before it within its document, chunked attention's, as the template's spans
+    take a chunk (`template.spans`' `chunk`, the one algorithm), one interval a query, which every
+    mainloop walks. `places` `[S]` or `[B, S]`, None for the row index. The keys `valid` `[B, S]` does not
+    mark are no document's (id 0, padding): a compacted row's padding sits after its tokens at places
+    that restart (`compacted`), which the search along a document's places would read as its own."""
+    positions = None
+    if places is not None:
+        place = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(places)), (rows, length))
+        positions = place, place
+    if valid is not None:
+        segment_ids = jnp.where(valid, 1 if segment_ids is None else segment_ids, 0)
+    spans = template.spans(length, length, rows, causal=True, chunk=chunk, positions=positions,
+                           segment_ids=segment_ids)
+    return jnp.stack([spans.start, spans.end], axis=-1)[:, :, None, :]
 
 
 def compacted(attend, query, key, value, places, segment_ids, valid):
@@ -230,8 +235,8 @@ def compacted(attend, query, key, value, places, segment_ids, valid):
     real = _whole_sequence(jnp.asarray(valid, bool))
     order, count = valid_order(real)
     # Each slot's column in that order: a real token's rank among the real, a padding slot's after them.
-    column = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1,
-                       count[:, None] + jnp.cumsum(~real, axis=1, dtype=jnp.int32) - 1)
+    column = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1,
+                       count[:, None] + prefix_sum(~real, dtype=jnp.int32) - 1)
 
     def moved(x, to):
         x = jnp.asarray(x)

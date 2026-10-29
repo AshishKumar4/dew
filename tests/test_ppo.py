@@ -10,22 +10,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from episode_support import (
-    GROUPS,
-    PROMPT,
-    RESPONSE,
-    SAMPLING,
-    TURNS,
-    VOCAB,
-    Harness,
-    ToolPolicy,
-    collect,
-    per_call,
-    verify,
-)
+from episode_support import SAMPLING, Harness, collect, per_call, verify
 from flax import linen as nn
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 from rl_support import clipped_surrogate, token_mean
+from tool_policy import GROUPS, PROMPT, RESPONSE, TURNS, VOCAB, ToolPolicy
 
 from dew.batch import part
 from dew.data.dataset import Loader
@@ -130,35 +119,53 @@ def episode_returns(rewards, values, gamma, lam, dtype):
     return out
 
 
+STEP_REWARD_SEEDS = 8
+"""The step rewards' returns' declared seeds for check 1, each a rollout (`assert_as_exact`), sized by
+`seeds_for` paired with PPORollout's returns on the CPU."""
+
+
 def test_each_step_reward_lands_on_the_last_action_of_the_call_it_paid_for():
     """A square tool that pays 0.5 for its tool step and 0.25 for the answer step, beside the
     verifier's reward: GAE's returns over each episode's actions are verl's with each step reward
-    on the last action id of its call and the verifier's on the episode's last, as exact against
-    float64 as the same recursion in float32."""
+    on the last action id of its call and the verifier's on the episode's last, on par with the same
+    recursion in float32 from float64 over rollouts each declared seed draws (check 1)."""
     trainer, rollout = build_ppo()
     rollout = replace(rollout, episodes=replace(rollout.episodes, environment=Harness(paid=(0.5, 0.25))))
     state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
-    episodes = collect(rollout.episodes, state)
-    mine, reference, truth = [], [], []
-    for index, episode in enumerate(episodes):
-        ids = [(turn, position) for turn, transition in enumerate(episode.transitions)
-               for position in range(len(transition.action.tokens))]
-        rows = [index * TURNS + turn for turn, _ in ids]
-        if episode.status is not EpisodeStatus.COMPLETED:
-            continue
-        rewards = np.zeros(len(ids))
-        for turn, transition in enumerate(episode.transitions):
-            last = max(at for at, (call, _) in enumerate(ids) if call == turn)
-            rewards[last] += transition.observation.reward
-        rewards[-1] += episode.reward
-        values = per_call(batch, OLD_VALUES_KEY, episodes)[rows, [position for _, position in ids]]
-        mine.append(per_call(batch, RETURNS_KEY, episodes)[rows, [position for _, position in ids]])
-        reference.append(episode_returns(rewards, values, rollout.gamma, rollout.lam, np.float32))
-        truth.append(episode_returns(rewards, values, rollout.gamma, rollout.lam, np.float64))
-    assert mine
-    assert_as_exact_as_the_reference(np.concatenate(mine), np.concatenate(reference), np.concatenate(truth),
-                                     "episode returns with step rewards")
+    task = {"task_id": np.array([31], np.int32)}
+
+    @functools.cache
+    def drawn(seed):
+        """One rollout's returns and, per completed episode, its rewards and values."""
+        batch = rollout(state, task, jax.random.key(seed))
+        episodes = collect(rollout.episodes, state, seed, tasks=task["task_id"])
+        mine, rewards_of, values_of = [], [], []
+        for index, episode in enumerate(episodes):
+            ids = [(turn, position) for turn, transition in enumerate(episode.transitions)
+                   for position in range(len(transition.action.tokens))]
+            rows = [index * TURNS + turn for turn, _ in ids]
+            if episode.status is not EpisodeStatus.COMPLETED:
+                continue
+            rewards = np.zeros(len(ids))
+            for turn, transition in enumerate(episode.transitions):
+                last = max(at for at, (call, _) in enumerate(ids) if call == turn)
+                rewards[last] += transition.observation.reward
+            rewards[-1] += episode.reward
+            positions = [position for _, position in ids]
+            rewards_of.append(rewards)
+            values_of.append(per_call(batch, OLD_VALUES_KEY, episodes)[rows, positions])
+            mine.append(per_call(batch, RETURNS_KEY, episodes)[rows, positions])
+        assert mine
+        return np.concatenate(mine), rewards_of, values_of
+
+    def recursion(dtype):
+        return as_given(lambda seed: {"returns": np.concatenate([
+            episode_returns(rewards, values, rollout.gamma, rollout.lam, dtype)
+            for rewards, values in zip(*drawn(int(seed))[1:], strict=True)])})
+
+    assert_as_exact(as_given(lambda seed: {"returns": drawn(int(seed))[0]}), recursion(np.float32),
+                    lambda seed: (np.int32(seed),), "episode returns with step rewards",
+                    seeds=STEP_REWARD_SEEDS, truth_fn=recursion(np.float64))
 
 
 def test_episode_advantages_hold_at_values_and_rewards_far_above_them():

@@ -23,7 +23,7 @@ from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead
 from dew.decision.layout import MarkerLayout, Specials
 from dew.decision.model import DecisionModel
-from dew.interop.decoder_parts import Packed, joined_packed
+from dew.interop.decoder_parts import Packed, packed_layouts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, save_sharded
 from dew.lora import FACTORS
 from dew.registry import from_record
@@ -100,8 +100,18 @@ class LayaCheckpoint:
         tokenizer under `tokenizer/`, and `rl_agent_config.json` with the head's
         depth, the layout's budgets and the temperatures. The backbone must be a
         ModernBERT encoder and the head Laya's. A backbone under LoRA is written
-        with its factors merged into their kernels (`Pretrained.bound`).
+        with its factors merged into their kernels (`Pretrained.bound`). Laya's config states a layout's
+        window, question budgets and option layout alone, so a layout that chooses more (an order, labels,
+        segments, blocks) is refused before anything is written; a run saved by `Decide.save` keeps it.
         """
+        layout = self.layout
+        # Laya's own order is the question first, however the layout names it.
+        stated = MarkerLayout(max_len=layout.max_len, head_max_len=layout.head_max_len,
+                              option_tokens=layout.option_tokens, parallel=layout.parallel,
+                              order="question_first" if layout.order == "question_first" else None)
+        if layout != stated:
+            raise ValueError(f"Laya's config states a layout's window, budgets and option layout alone, not "
+                             f"this one's other choices ({layout}); save the task into a run with `save`")
         head = from_record(DecisionHead, self.model.head)
         tensors, config = laya_tensors(self.model, self.variables)
         root = Path(directory)
@@ -159,9 +169,9 @@ def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
         return f"{module}.{torch_leaf}"
 
     variables = {"params": params}
-    layouts = native_layouts(variables, name_of, in_params(_head_path))
-    tensors = {layout.name: layout.export(variables) for layout in layouts}
-    return joined_packed(tensors, IN_PROJ)
+    layouts = packed_layouts({layout.name: layout for layout in native_layouts(
+        variables, name_of, in_params(_head_path))}, IN_PROJ)
+    return {name: layout.export(variables) for name, layout in layouts.items()}
 
 
 def _token(value: object, name: str) -> int:

@@ -18,16 +18,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from lm_support import token_batch_of
 from model_support import TINY_DECODER
 from reference_error import assert_as_exact
 from test_lm_objective import assert_as_exact_over_instances, written_cross_entropy
-from token_support import token_batch_of
 
-from dew.batch import coordinates
+from dew.batch import TEXT_KEY, coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 
 VOCAB = 37
@@ -246,6 +246,23 @@ def packed_row():
     segments = np.array([[1, 1, 1, 1, 2, 2, 2, 0, 0]], np.int32)
     positions = np.array([[0, 1, 2, 3, 0, 1, 2, 0, 0]], np.int32)
     return jnp.asarray(ids), jnp.asarray(segments), jnp.asarray(positions)
+
+
+def test_the_depths_read_a_packed_rows_coordinates_as_its_fields():
+    """The prediction depths' logits (`mtp_logits`) take the rows' layout as `Coordinates` as they take
+    it as flat fields, the same logits bit for bit: the call converts its fields once
+    (`token_coordinates`) and the depths read the coordinates alone (ledger 1122)."""
+    model = tiny(num_nextn_predict_layers=2)
+    ids, segments, positions = packed_row()
+    variables = model.init(jax.random.key(0), ids)
+    hidden = jax.random.normal(jax.random.key(1), (*ids.shape, model.emb_features))
+    laid = coordinates(segments=segments, positions=positions)
+    by_fields = model.apply(variables, hidden, ids, segment_ids=segments, positions=positions,
+                            method=CausalTransformer.mtp_logits)
+    by_coordinates = model.apply(variables, hidden, ids, coordinates=laid,
+                                 method=CausalTransformer.mtp_logits)
+    for ours, reference in zip(by_coordinates, by_fields, strict=True):
+        np.testing.assert_array_equal(ours, reference)
 
 
 @pytest.mark.parametrize("depths", [1, 2])

@@ -32,8 +32,8 @@ from flax import linen as nn
 
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
+from dew.nn.scatter import gather_positions
 
-from ..attention import LayerNorm
 from ..dit import (
     ModulatedBlock,
     _JepaStackOptions,
@@ -42,10 +42,10 @@ from ..dit import (
     scan_ordered_pos_embed,
 )
 from ..flops import MissingFlopsCount, counted_flops, patch_lengths, projection_flops, real_lengths
+from ..norms import LayerNorm
 from ..scan_orders import ScanOrder
 from ..sharding import constrain, down_projection, explicit_spec, rows_like, rows_taken
 from .decoder_stack import pipelined_blocks, pipelines
-from .dit import gather_tokens
 
 
 class TokenStack(_JepaStackOptions):
@@ -192,6 +192,8 @@ class JepaEncoder(_JepaStackOptions):
     `TokenStack` runs over one image's tokens and `FactorizedTokenStack` over a
     clip's frames.
     """
+    reads_clips: ClassVar[bool] = False
+    """Whether the encoder reads a clip's frames, (B, T, H, W, C), rather than an image."""
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -222,7 +224,7 @@ class JepaEncoder(_JepaStackOptions):
     def __call__(self, x, token_idx=None, train: bool = False):
         tokens, _ = self.embed(x)
         if token_idx is not None:
-            tokens = gather_tokens(tokens, token_idx)
+            tokens = gather_positions(tokens, token_idx)
         return self.norm(self.stack(tokens, train=train))
 
     def hidden_states(self, x, *, train: bool = False, token_idx=None):
@@ -239,6 +241,7 @@ class JepaVideoEncoder(JepaEncoder):
     """
 
     stack_type = FactorizedTokenStack
+    reads_clips = True
 
     @nn.nowrap
     def spatiotemporal_flops(self, frames, patches, input_channels: int) -> float:
@@ -253,7 +256,7 @@ class JepaVideoEncoder(JepaEncoder):
         tokens, _ = self.embed(x.reshape(B * T, H, W, C))
         if token_idx is not None:
             frames = jnp.repeat(token_idx, T, axis=0, out_sharding=explicit_spec(token_idx))
-            tokens = gather_tokens(tokens, frames)
+            tokens = gather_positions(tokens, frames)
         tokens = tokens.reshape(B, T, tokens.shape[1], self.emb_features)
         return self.norm(self.stack(tokens, train=train))
 

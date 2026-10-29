@@ -868,3 +868,151 @@ def test_a_source_with_no_deadline_of_its_own_closes_when_its_finalization_ends(
     next(stream)
     stream.close()
     assert finished.is_set()
+
+
+def test_a_mix_repeated_whole_goes_on_counting_each_corpus_on_its_second_pass():
+    """Two finite corpora mixed, each rejecting a third of its records, the mix repeated whole: the
+    second pass rewinds each corpus to its start, where the mix had not yet opened it, and its counts
+    go on from the first pass's, so each corpus counts the rows and rejections of both passes, every
+    counter its stages keep (rows 2016 and 2045)."""
+    chain = mix([from_grain(grain.MapDataset.source([{"i": np.int32(index)} for index in range(6)]), name)
+                 .filter_map(reject_thirds) for name in ("a", "b")]).repeat(2)
+    metrics = chain.stats(records=16)
+    assert (metrics["data/rows/a"], metrics["data/rows/b"]) == (8, 8)
+    # Every counter its stages keep goes on, the filter's rejections as the rows it delivered.
+    assert (metrics["data/rejected/a/third"], metrics["data/rejected/b/third"]) == (4, 4)
+
+
+def counted_source(name: str):
+    """Six records of corpus `name`, each naming it, a third of them rejected (`reject_thirds`)."""
+    records = [{"i": np.int32(index), "corpus": np.array(name)} for index in range(6)]
+    return from_grain(grain.MapDataset.source(records), name).filter_map(reject_thirds)
+
+
+def delivered_and_counted(chain) -> tuple[dict[str, int], dict[str, float]]:
+    """Each corpus's rows a whole read of `chain` delivers, read as a validation split reads it
+    (`held`), no corpus repeated but as `chain` repeats it, and the counts the read's position holds
+    of them (`state_counts`), as `Pipeline.stats` reads them."""
+    from dew.data.compile import held
+    from dew.data.dataset import DataPartition
+    from dew.data.mixing import data_metrics, state_counts
+
+    reader, delivered = held(chain, batch=1)(DataPartition()), {}
+    assert isinstance(reader, grain.DatasetIterator)
+    try:
+        for batch in reader:
+            for name in np.asarray(batch["corpus"]).reshape(-1):
+                delivered[str(name)] = delivered.get(str(name), 0) + 1
+        return delivered, data_metrics(state_counts(reader.get_state()).values())
+    finally:
+        reader.close()
+
+
+def test_a_nested_mix_repeated_whole_counts_every_corpus_it_delivered_on_both_passes():
+    """A mix whose first member is itself a mix, repeated whole and read pass by pass: every corpus,
+    at either level, counts every row the two passes delivered of it and twice the rejections of
+    one pass, the counts going on across the outer rewind that reopens the inner mix (row 2059)."""
+    def nested():
+        return mix([mix([counted_source("a"), counted_source("b")]), counted_source("c")])
+
+    once, rejected = delivered_and_counted(nested())
+    delivered, counted = delivered_and_counted(nested().repeat(2))
+    assert set(delivered) == {"a", "b", "c"}
+    for name, rows in delivered.items():
+        assert counted[f"data/rows/{name}"] == rows == 2 * once[name]
+        assert counted[f"data/rejected/{name}/third"] == 2 * rejected[f"data/rejected/{name}/third"]
+
+
+def test_a_mix_resumed_where_its_rewind_left_a_corpus_unopened_counts_as_the_read_it_resumes():
+    """A mix repeated whole and read one row past its rewind, where its second corpus has not opened
+    again and carries the first pass's counts (`_MixRead`, unopened): a read resumed from that
+    position delivers and counts every corpus as the read that went on from it (row 2059)."""
+    from dew._records import record
+    from dew.data.compile import held
+    from dew.data.dataset import DataPartition
+    from dew.data.mixing import data_metrics, state_counts
+
+    def opened():
+        stream = held(mix([counted_source("a"), counted_source("b")]).repeat(2), batch=1)(DataPartition())
+        assert isinstance(stream, grain.DatasetIterator)
+        return stream
+
+    def rest(stream) -> tuple[list[str], dict[str, float]]:
+        names = [str(name) for batch in stream for name in np.asarray(batch["corpus"]).reshape(-1)]
+        return names, data_metrics(state_counts(record(stream.get_state(), "validation state")).values())
+
+    went_on, resumed = opened(), opened()
+    try:
+        # One pass of the mix is eight rows: the ninth opens the first corpus again, the second not yet.
+        for _ in range(9):
+            next(went_on)
+        resumed.set_state(went_on.get_state())
+        assert rest(resumed) == rest(went_on)
+    finally:
+        went_on.close()
+        resumed.close()
+
+
+def test_a_repeat_restored_after_its_last_pass_counts_what_the_restored_position_holds():
+    """A mix repeated twice and read to its end, then restored in place to a position of its first
+    pass: its corpora count what that position holds, not what the whole read reached (row 2059)."""
+    from dew._records import record
+    from dew.data.compile import held
+    from dew.data.dataset import DataPartition
+    from dew.data.mixing import state_counts
+
+    stream = held(mix([counted_source("a"), counted_source("b")]).repeat(2), batch=1)(DataPartition())
+    assert isinstance(stream, grain.DatasetIterator)
+    try:
+        for _ in range(3):
+            next(stream)
+        saved = record(stream.get_state(), "validation state")
+        assert sum(1 for _ in stream) == 13
+        stream.set_state(saved)
+        assert state_counts(record(stream.get_state(), "validation state")) == state_counts(saved)
+    finally:
+        stream.close()
+
+
+def test_a_worker_repeat_restored_ended_keeps_the_counts_its_position_holds():
+    """A loading worker's repeat restored ended (`_Ended`: a pass of its inputs held none) reads no
+    more and keeps the position it was given, so its corpus's counts stand as they were saved (row
+    2059)."""
+    from dew.data.lowering import _Ended
+    from dew.data.mixing import Accepted, state_counts
+
+    def opened():
+        rows = grain.MapDataset.source([{"i": np.int32(index)} for index in range(6)]).to_iter_dataset()
+        return iter(_Ended(Accepted(rows, "a", "a")))
+
+    reading = opened()
+    for _ in range(4):
+        next(reading)
+    saved = {**reading.get_state(), "ended": True}
+    restored = opened()
+    restored.set_state(saved)
+    assert state_counts(restored.get_state()) == state_counts(saved)
+    assert next(restored, None) is None
+
+
+def test_a_live_mix_rolled_back_to_where_it_opened_no_corpus_counts_none():
+    """A mix read on and rolled back, in place, to its start, where it had opened no corpus: its
+    corpora count nothing, as nothing had been counted there; a rollback carries no counts, as a
+    repeat's rewind does (row 2059)."""
+    from dew._records import record
+    from dew.data.compile import _diagnostic
+    from dew.data.mixing import data_metrics, state_counts
+
+    reader = _diagnostic(mix([counted_source("a"), counted_source("b")]).repeat())
+    try:
+        start = reader.get_state()
+        for _ in range(6):
+            next(reader)
+        assert data_metrics(state_counts(record(reader.get_state(), "diagnostic state")).values())
+        reader.set_state(start)
+        rolled = data_metrics(state_counts(record(reader.get_state(), "diagnostic state")).values())
+        kinds = ("data/rows/", "data/rejected/")
+        counted = [value for name, value in rolled.items() if name.startswith(kinds)]
+        assert all(value == 0 for value in counted)
+    finally:
+        reader.close()

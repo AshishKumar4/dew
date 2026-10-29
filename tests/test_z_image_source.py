@@ -97,6 +97,7 @@ def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     assert_transformer_exports(source, name, layouts, params)
 
 
+@pytest.mark.whole_suite
 @pytest.mark.parametrize("name", CASES)
 def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, name):
     """The native flow is the negated source output, its gradients the negated source gradients,

@@ -44,8 +44,9 @@ green row records the checkout's Python files its tests executed
 directories under src/ that hold them, however deep (so a module added
 beside one, or an __init__.py on the way to one, changes it), the file
 itself and what every file shares (`shared`: the environment's locks, the
-CI tools, every non-Python file under tests/ and src/, the names
-of the Python files under tests/ but the test modules, and src/'s entries).
+CI tools, the names of the non-Python files under tests/ but its fixtures and
+under src/, of the Python files under tests/ but the test modules, and src/'s
+entries). A fixture is the input of the runs that opened, listed or probed it.
 A test module, or a module in a package a file never imported, is no input
 of that file's: a train that loses a head reruns only the files the head's
 modules reached (the land queue's recompose after a pull). A task
@@ -87,6 +88,7 @@ refused (`report`), its coverage partial. A target well under CI's keeps tasks s
 import argparse
 import ast
 import concurrent.futures
+import functools
 import hashlib
 import heapq
 import importlib.util
@@ -99,6 +101,7 @@ import sys
 import threading
 import time
 import tomllib
+import types
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
@@ -117,6 +120,7 @@ def _beside(name: str):
 child_groups = _beside("child_groups")
 session = _beside("session")
 r2 = _beside("r2")
+watched = _beside("watched")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
@@ -165,16 +169,34 @@ COLLECT_TASKS = 4
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
-SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/session.py",
-          "tools/armada/child_groups.py", "tools/armada/split.py", "tools/armada/executed.py",
-          "tools/armada/followed.py")
-"""The files every test file's key covers whole, beside tests/ and src/'s data, every lock (a GPU node
-builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
-names (`environment_files`): what every test process runs or reads, the session it runs in, the
-process group it runs as and the plugins loaded into it among them. The plan's own code (this file)
-runs outside the tests, so a change to it reruns none of them; nor does the durations record
-(`session.DURATIONS`), which only a split file's groups are cut from, so a group's key covers its own
-file's entries alone (`cache_key`)."""
+HARNESS = "tools/armada/"
+"""The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
+SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
+          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
+          "tools/armada/watched.py")
+"""The files every test file's key covers whole, beside every lock (a GPU node builds its environment
+from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
+and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
+the session it runs in, the process group it runs as and the plugins loaded into it among them. The
+plan's own code (this file) runs outside the tests, so a change to it reruns none of them; nor does
+the durations record (`session.DURATIONS`), which only a split file's groups are cut from, so a
+group's key covers its own file's entries alone (`cache_key`); nor does a fixture or a package's data,
+which is the input of the files whose runs opened it, however they opened it (executed.py's `Opens`)."""
+ARMADA_SEEN = ("environment", "environments", "env")
+""".armada.json's parts a test process runs in, beside its task's command and secrets (`armada_seen`):
+its pool, size, target, plan and the task's deadline and mode decide where and when tasks run, never
+what a test sees (owner, 2026-10-27: a pool change reran every file)."""
+
+
+def armada_seen(text: str | None) -> str:
+    """The parts of .armada.json (`text`, or None where there is none) a test process sees: its
+    environments, their variables (`ARMADA_SEEN`), and its task's command and secrets, as one text."""
+    if text is None:
+        return "missing"
+    config = json.loads(text)
+    task = config.get("task", {})
+    return json.dumps({**{part: config.get(part) for part in ARMADA_SEEN},
+                       "command": task.get("command"), "secrets": task.get("secrets")}, sort_keys=True)
 
 
 def environment_files() -> list[str]:
@@ -198,23 +220,32 @@ CACHE_PREFIX = f"testcache/format-{RECORD_FORMAT}"
 
 
 def shared(python: str) -> str:
-    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, every
-    non-Python file under tests/ and src/ (a fixture, a package's data), and the names of the Python
-    files under tests/ but its test modules and of src/'s own entries, whose arrival can change what an
-    import finds (a conftest.py, a helper or a top-level package that shadows another), which a record
-    does not see. A module within a package under src/ is its importers' input alone, with its
-    package's other modules (`inputs`), and a test module is no other file's: so a train that loses a
-    head runs again only what that head's modules reached."""
+    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
+    .armada.json's parts a test process sees (`armada_seen`), and the names of the Python files under
+    tests/ but its test modules and of src/'s own entries, whose arrival can change what an import finds
+    (a conftest.py, a helper or a top-level package that shadows another), and of every data file under
+    tests/ but its fixtures and under src/ (an existence probe before the recorder starts). A module within
+    a package under src/ is its importers' input alone, with its package's other modules (`inputs`), a test
+    module is no other file's, and a fixture is its openers', listers' and probers' (executed.py's `Opens`,
+    followed.py's `PROBES`): so a train that loses a head runs again only what that head's files reached
+    (owner, 2026-10-27: 8 fixtures changed reran all 485 tasks of train 222's second round)."""
     digest = hashlib.sha256(python.encode())
-    for top in ("tests", "src"):
-        for path in sorted(Path(top).rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts or path == session.DURATIONS:
-                continue
-            if path.suffix == ".py" and (top == "src" or path.name.startswith("test_")):
-                continue
+    for path in sorted(Path("tests").rglob("*.py")):
+        if "__pycache__" not in path.parts and not path.name.startswith("test_"):
             digest.update(str(path).encode())
-            if path.suffix != ".py":
-                digest.update(hashlib.sha256(path.read_bytes()).digest())
+    # The names of every data file under tests/ but its fixtures, and of every package's data: an existence
+    # probe a library makes at import, before the recorder starts, is no record's. A fixture is its openers',
+    # listers' and probers' alone, as a run records every probe it makes (followed.py's `PROBES`; Main,
+    # 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures). A build's output and a fetched
+    # payload, which a planner's checkout lacks, are not named: they are their build's and their manifest's
+    # (`built`, FETCHED, `contents`), whose names are.
+    for root in ("tests", "src"):
+        for path in sorted(Path(root).rglob("*")):
+            if (path.is_file() and path.suffix != ".py" and not built(path) and FIXTURES not in path.parents
+                    and not path.with_name(path.name + FETCHED).is_file()):
+                digest.update(b"fixture:" + str(path).encode())
+    armada = Path(".armada.json")
+    digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
@@ -227,15 +258,42 @@ def lane_inputs(python: str) -> str:
     return hashlib.sha256((shared(python) + contents(__file__).hex()).encode()).hexdigest()
 
 
+FIXTURES = Path("tests/fixtures")
+"""The tests' fixtures: each its openers', listers' and probers' input alone (`shared`), and a native reader's
+directories up to it (`native_inputs`)."""
+FETCHED = ".fetched.json"
+"""A fetched fixture's manifest's suffix, beside the payload it pins (tools/fetched_fixtures.py)."""
+
+
+def built(path: Path) -> bool:
+    """Whether `path` is a build's output, never an input: compiled bytecode, or an editable install's
+    metadata (setuptools' <name>.egg-info), which a task's environment writes into its checkout and a
+    planner's lacks."""
+    return "__pycache__" in path.parts or any(part.endswith(".egg-info") for part in path.parts)
+
+
 def contents(name: str) -> bytes:
-    """The hash of file `name`'s bytes, of directory `name`'s entries' names but its hidden ones and
-    compiled bytecode's (a run's own leftovers), or b"missing"."""
+    """The hash of file `name`'s bytes, of directory `name`'s entries' names but its hidden ones and a
+    build's (`built`), or b"missing". A fetched fixture's payload is the digest its manifest pins, whether
+    it is downloaded here or not, so a planner that never fetches it keys it as a task does. An execution
+    limit a run read (followed.py's `LIMITS`: "limit:cpu", "limit:memory") is the one binding this process
+    (host.py's `limit`): a row green on 4 vCPUs is not reused on 8, nor on a planner, which reads its own (row
+    1998, Main 2026-10-28). A path a run probed (followed.py's `PROBED`: "probe:" and the path) is its kind
+    where it is a directory, whose probe never reads its entries, and as read otherwise."""
+    if name.startswith("limit:"):
+        return hashlib.sha256(host().limit(name).encode()).digest()
+    if name.startswith("probe:"):
+        probed = name.removeprefix("probe:")
+        return b"directory" if Path(probed).is_dir() else contents(probed)
     path = Path(name)
+    manifest = path.parent / (path.name + FETCHED)
+    if path.name and manifest.is_file():
+        return bytes.fromhex(json.loads(manifest.read_text())["sha256"])
     if path.is_file():
         return hashlib.sha256(path.read_bytes()).digest()
     if path.is_dir():
         entries = sorted(entry.name for entry in path.iterdir()
-                         if not entry.name.startswith(".") and entry.name != "__pycache__")
+                         if not entry.name.startswith(".") and not built(entry))
         return hashlib.sha256("\n".join(entries).encode()).digest()
     return b"missing"
 
@@ -243,13 +301,14 @@ def contents(name: str) -> bytes:
 def cache_key(common: str, name: str, split: str, depends: list[str]) -> str:
     """The key of test file `name`'s row in `split`'s group whose run executed or read `depends`
     (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
-    file, the group and its file's entries in the durations record (`recorded_entries`), which split.py
-    cuts it from, the record's only part a run's outcome depends on."""
+    file, the group and the tests split.py cuts into it from the durations record (`members`), the record's
+    only part a run's outcome depends on: not their seconds, which each train's fold of main's durations
+    moves (Main, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000)."""
     digest = hashlib.sha256(common.encode())
     for path in inputs(name, depends):
         digest.update(path.encode() + contents(path))
     if split and split != COLLECT:
-        digest.update(split.encode() + json.dumps(recorded_entries(name), sort_keys=True).encode())
+        digest.update(split.encode() + json.dumps(members(name, split)).encode())
     return digest.hexdigest()
 
 
@@ -260,23 +319,34 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     import it tried now finds), or an __init__.py added to a namespace package on the way to one, which
     executes as the import passes, changes its key; one added to a package it never imported does not.
     tools/ itself is among them, as a test puts it, or a directory under it, on sys.path and imports a tool
-    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`)."""
+    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`). The
+    harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
+    import of a test's, so their directories are none of its inputs (Main, 2026-10-29: tools/'s entries
+    keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
     packages = {str(parent) for path in depends
-                if path.startswith(("src/", "tools/")) and path.endswith(".py")
+                if path.startswith(("src/", "tools/")) and path.endswith(".py") and not path.startswith(HARNESS)
                 for parent in Path(path).parents
                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
-    return sorted({name, *depends, *packages})
+    # A build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
+    # (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files).
+    kept = (path for path in depends if not built(Path(path.removeprefix("probe:"))))
+    return sorted({name, *kept, *packages})
+
+
+@functools.cache
+def host() -> types.ModuleType:
+    """host.py beside this file, loaded by its path, as this file puts nothing on sys.path."""
+    spec = importlib.util.spec_from_file_location("dew_host", Path(__file__).with_name("host.py"))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def cpu_class() -> str:
     """This host's CPU microarchitecture, the one class the records, the tests' compilation cache and
-    the shared XLA bundles key it by (host.py beside this file, loaded by its path, as this file puts
-    nothing on sys.path)."""
-    spec = importlib.util.spec_from_file_location("dew_host", Path(__file__).with_name("host.py"))
-    assert spec is not None and spec.loader is not None
-    host = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(host)
-    return host.cpu_class()
+    the shared XLA bundles key it by (`host`)."""
+    return host().cpu_class()
 
 
 def device_class(network: bool = False) -> str:
@@ -341,6 +411,43 @@ def record_of(key: str, token: str) -> bytes | None:
         return None
 
 
+READ_TOKEN = "DEW_XLA_CACHE_READ_TOKEN"
+"""The test cache's read-only token, which the plan reads records with (`reusable`): it never writes them."""
+
+
+def pinned_classes() -> list[str]:
+    """The CPU classes .armada.json pins its tasks to (task.cpu, one or a list), as `cpu_class` names them,
+    which their rows are recorded under, a task's on the class it lands on; none where it pins none, or the
+    tasks run on a CUDA lane, whose class (`device_class`) the plan cannot know."""
+    config = Path(".armada.json")
+    if not config.is_file() or "cuda" in os.environ.get("JAX_PLATFORMS", "").split(","):
+        return []
+    cpu = json.loads(config.read_text()).get("task", {}).get("cpu")
+    return [f"{each['vendor']}-{each['family']}-{each['model']}" for each in
+            ([cpu] if isinstance(cpu, dict) else cpu or [])]
+
+
+def reusable(python: str, names: list[str], common: str) -> set[str]:
+    """The files of `names` whose whole row ran green on exactly these inputs (`common`, and each file's
+    own, `fresh`) on any class the tasks run on (`pinned_classes`), which a task of theirs could land on,
+    read at plan time with the cache's read token (`READ_TOKEN`): a task of their own would only look each
+    up and exit. None where the plan has no token or no class (Main, 2026-10-28: a lane run with most files
+    unchanged booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
+    token, held = os.environ.get(READ_TOKEN), pinned_classes()
+    if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
+        return set()
+
+    def hit(name: str) -> bool:
+        for each in held:
+            found = recorded(record_key(python, row(python, name, ""), each, common), token)
+            if found is not None and fresh(found, name, common):
+                return True
+        return False
+
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        return {name for name, found in zip(names, pool.map(hit, names), strict=True) if found}
+
+
 def reused(python: str, name: str, split: str, common: str, network: bool = False) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
     (`device_class`), if it ran green there on exactly these inputs; else None. The record of the last
@@ -379,9 +486,14 @@ def durations_record() -> dict[str, float]:
     return json.loads(session.DURATIONS.read_text()) if session.DURATIONS.is_file() else {}
 
 
-def recorded_entries(name: str) -> dict[str, float]:
-    """Test file `name`'s entries in the durations record."""
-    return {node: seconds for node, seconds in durations_record().items() if node.split("::")[0] == name}
+def members(name: str, split: str) -> list[str]:
+    """The node ids of test file `name`'s recorded tests that split.py cuts into group `split` ("G/N"):
+    the file's entries in the durations record in node-id order, cut by their seconds (`session.groups`)."""
+    recorded = {node: seconds for node, seconds in durations_record().items() if node.split("::")[0] == name}
+    ordered = sorted(recorded)
+    index, count = (int(part) for part in split.split("/"))
+    run = session.groups([recorded[node] for node in ordered], count)[index - 1]
+    return ordered[run.start:run.stop]
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
@@ -485,10 +597,11 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
     return [(held, sorted(names)) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])]
 
 
-PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/")
-"""Where a changed file is placed by the records (executed.py): a Python file a test ran, a page or a
-notebook it read, a fixture every key covers (`shared`). A change elsewhere is placed by none, and runs
-the whole suite (`policy`)."""
+PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/", ".github/")
+"""Where a changed file is placed by the records (executed.py): a Python file a test ran, a page, a
+notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A change
+elsewhere is placed by none, and runs the whole suite (`policy`): a workflow change reran every file while
+no record placed it (Main, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows reused)."""
 PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
 """The checkout's own files at its root that tests read as a page is read, and the changelog, which
 no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
@@ -505,7 +618,15 @@ def policy(base: str) -> str:
     no pulled head had touched, under a policy that reran every file that read any tool)."""
     changed = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], check=True,
                              capture_output=True, text=True).stdout.split()
-    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".python-version"}
+    if ".armada.json" in changed:
+        before = subprocess.run(["git", "show", f"{base}:.armada.json"], capture_output=True, text=True,
+                                check=False)
+        armada = Path(".armada.json")
+        if armada_seen(before.stdout if before.returncode == 0 else None) == armada_seen(
+                armada.read_text() if armada.is_file() else None):
+            changed.remove(".armada.json")  # where and when tasks run, never what a test sees
+    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".armada.json",
+             ".python-version"}
     if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
         return "off"
     return "on"
@@ -526,12 +647,24 @@ def borrowed(timings: dict, python: str) -> dict:
     return {**timings, **{key: filled(timings.get(key, {})) for key in ("files", "rows")}}
 
 
+COLD_SECONDS = 360.0
+"""What a task adds to its estimate when it runs cold, the test cache's policy off (a lock, JAX's build or
+the recorder changed): the compiles and imports no warm run paid. Train 254's cold suite ran about 470 s a
+task where its plan estimated about 120 (1,389 tasks in 2,700 s on 242 containers, 2026-10-28)."""
+
+
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
     then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
-    the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task."""
+    the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files
+    whose rows the cache holds for exactly these inputs (`reusable`) share one task, which looks each up
+    again in its container, so the verdict names every file and containers scale with the change. Under the
+    policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by the work, not the
+    longest task, as warm estimates did."""
     cache = os.environ.get("DEW_TEST_CACHE") or "on"
+    # The whole suite's run alone (DEW_WHOLE_SUITE, every fifth publish) runs whole_suite cells (`selected`).
+    cells = "1" if os.environ.get("DEW_WHOLE_SUITE") else "0"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     recorded = recorded_tests()
     entries = []
@@ -541,8 +674,12 @@ def plan(target: float, timings: dict) -> list[dict]:
         files = every if whole else [name for name in every if name in NEWEST_FILES]
         timings = borrowed(timings, python)
         timed = weights(files, timings, python)
-        tasks: list[tuple[list[str], str, float]] = [
-            ([name], "", target) for name, seconds in timed.items() if seconds is None]
+        kept = sorted(reusable(python, [name for name, seconds in timed.items() if seconds is None
+                                        or seconds <= target], shared(python))) if cache == "on" else []
+        timed = {name: seconds for name, seconds in timed.items() if name not in kept}
+        # A lookup a file, in seconds: the task's weight is its container's start and those lookups.
+        tasks: list[tuple[list[str], str, float]] = [(kept, "", float(len(kept)))] if kept else []
+        tasks += [([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
                 at, count = measured_cut(timings, python, name) or (seconds, 1)
@@ -560,15 +697,47 @@ def plan(target: float, timings: dict) -> list[dict]:
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": group, "rows": [row(python, name, group) for name in names],
-                            "weight": weight, "cache": cache})
+                            "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache,
+                            "whole": cells})
     rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
     for index in range(COLLECT_TASKS if rest else 0):
         names = rest[index::COLLECT_TASKS]
         entries.append({"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1],
                         "tests": " ".join(names), "split": COLLECT,
                         "rows": [row(PYTHONS[-1], name, COLLECT) for name in names], "weight": target,
-                        "cache": cache})
+                        "cache": cache, "whole": cells})
     return entries
+
+
+MARKED = ("whole_suite", "release_env")
+"""The marks a file's row names its tests by, as pytest resolved them (executed.py): its whole_suite
+cells, which `slow` reports as the whole suite's alone, and its release checks, which `release_plan`
+plans."""
+RELEASE = "release:"
+"""A release check's row, beside its file's own: `row`'s group, its requirement after it."""
+
+
+def release_plan(verdict: dict) -> list[dict]:
+    """The release checks of a whole suite's `verdict` (`armada verdict <sha> --json`), a task each
+    requirement: the files whose rows name checks under it (`release_env`, as pytest resolved each test's
+    mark before any selection: executed.py), which the run's own tasks set aside, as the suite's environment
+    lacks it (`selected`). Its run's second job runs them (.github/workflows/ci.yml, `release`)."""
+    checks: dict[str, set[str]] = {}
+    for found in verdict["rows"]:
+        for requirement in found.get("release_env", {}):
+            checks.setdefault(requirement, set()).add(parsed_row(found["name"])[1])
+    return [{"release": requirement, "python": PYTHONS[0], "tests": " ".join(sorted(names))}
+            for requirement, names in sorted(checks.items())]
+
+
+def release(python: str, tests: list[str], requirement: str, out: Path) -> int:
+    """`requirement`'s release checks in `tests` (`release_plan`), as a whole suite's second job runs each:
+    its rows in `out`, each red one named, exit 1 on any."""
+    task(python, tests, "", out, session.DEADLINE, "off", release=requirement)
+    red = [found["name"] for found in json.loads(out.read_text())["rows"] if found["exitCode"]]
+    for name in red:
+        print(f"RED {name}")
+    return 1 if red else 0
 
 
 def node_of(case: ET.Element) -> str:
@@ -634,7 +803,8 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
-         grace: float = session.GRACE, coverage: Path | None = None) -> int:
+         grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
+         release: str = "") -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -644,22 +814,41 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
     file goes there (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them.
-    return tested(python, tests, split, out, deadline, cache, grace, shared(python), {}, coverage)
+    return tested(python, tests, split, out, deadline, cache, grace, shared(python), {}, coverage,
+                  whole=whole, release=release)
+
+
+def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
+    """CI's pytest `run` over `tests`, with the plugins that record what ran (executed.py), keep one group
+    of a split file (`split`, split.py) and a release check's tests (`release`, release.py). A release
+    check's pytest runs with its requirement over the suite's environment, whose torch and jax it keeps:
+    uv's overlay."""
+    grouping = (["-p", "split", f"--ci-group={split}"] if split else []) + (
+        ["-p", "release", f"--ci-release={release}"] if release else [])
+    command = [*run, "-p", "executed", *tests, *grouping]
+    return ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
+            *command[1:]] if release else command
+
+
+def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool) -> list[dict]:
+    """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), said."""
+    rows = [found for name in tests if (found := reused(python, name, group, common, network))]
+    if rows:
+        print(f"{len(rows)} files ran green on these inputs on {device_class(network)}; "
+              "their rows are reused")
+    return rows
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
-           network: bool = False) -> int:
+           network: bool = False, whole: bool = False, release: str = "") -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
-    Hub open, recorded on the network lane's class (`device_class`)."""
+    Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's."""
     began = time.monotonic()
-    rows = [found for name in tests
-            if cache != "off" and (found := reused(python, name, split, common, network))]
-    tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
-    if rows:
-        print(f"{len(rows)} files ran green on these inputs on {device_class(network)}; "
-              "their rows are reused")
+    group = split or (f"{RELEASE}{release}" if release else "")
+    rows = [] if cache == "off" or release else reused_rows(python, tests, group, common, network)
+    tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
@@ -668,13 +857,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     report = out.with_name(f"{out.name}.junit.xml")
     for stale in (report, executed_report, collection):
         stale.unlink(missing_ok=True)
-    grouping = ["-p", "split", f"--ci-group={split}"] if split else []
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["-m", "coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    command = [*selected(session.pytest_run(python, report, *measured), network), "-p", "executed", *tests,
-               *grouping]
+    run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release))
+    command = pytest_command(run, tests, split, release)
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
@@ -683,6 +871,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               "DEW_COLLECTED": str(collection)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
+    # Every data file the task's processes open, held from before pytest starts until its group stopped
+    # (`watched`): each is the input of every file the task runs.
+    opens = watched.Opens(os.getcwd())
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
 
@@ -703,6 +894,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
+    # A process of the group still running may yet open a file: no record of this task keeps a key.
+    closed = opens.closed()
+    opened = None if left else closed
     reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
@@ -747,35 +941,56 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         seconds = shares[name]
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
-        ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
+        ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([output[-4000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
+                     # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
+                     **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
-    if coverage is None:
-        # A traced run's rows, timed under tracing, are no rows to reuse.
-        record(python, ran, executed_report, common, network)
+    if coverage is None and not release:
+        # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
+        # under its requirement's overlay and on the whole suite's run alone.
+        record(python, ran, executed_report, common, network, opened)
     return 0
 
 
-def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False) -> None:
-    """Keep each row a task ran with the files its tests executed, where they read the backend and
-    its peak memory on a GPU and its children's pools: `gpu_tier` reads the reads, `gpu_needs` the
-    memory. A green row keeps
-    its key too, which `reused` reads it back by; a red row has none, so a later run never reuses
-    an earlier green row of its file."""
+def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
+    """The fixture directories, each up to tests/fixtures, of what a task's processes opened natively
+    (`watched`: an open no Python process recorded, as a tokenizer's Rust code makes): a native reader's
+    probe beside what it opened is no record's, as followed.py's `PROBES` are Python's. The fetched store
+    is none: its payloads are content-addressed, and a planner, which never downloads them, keys them as a
+    task does (`contents`)."""
+    store = FIXTURES / "fetched"
+    return {str(parent) for name in opened - recorded if FIXTURES in (path := Path(name)).parents
+            and store != path and store not in path.parents
+            for parent in path.parents if parent == FIXTURES or FIXTURES in parent.parents}
+
+
+def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False,
+           opened: set[str] | None = None) -> None:
+    """Keep each row a task ran with the files its tests executed and read, every data file the task's
+    processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
+    they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
+    reads, `gpu_needs` the memory. A green row keeps its key too, which `reused` reads it back by; a red
+    row has none, so a later run never reuses an earlier green row of its file."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return
     # A run cut short, or whose collection failed, may have written no report, or none for a file.
     executed = json.loads(executed_report.read_text()) if executed_report.is_file() else {}
     held = device_class(network)
+    if opened is not None:
+        recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
+        opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
+        if ran["depends"] is not None:
+            ran = {**ran, "depends": None if opened is None else sorted({*ran["depends"], *opened})}
         if row_["exitCode"] == 0 and name not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
@@ -878,13 +1093,22 @@ def collected(python: str, marks: str) -> dict[str, int]:
     return counts
 
 
-def selected(command: list[str], network: bool) -> list[str]:
+def selected(command: list[str], network: bool, whole: bool = False, release: bool = False) -> list[str]:
     """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
-    tests alone, every one the rest of CI sets aside."""
-    if not network:
-        return command
+    tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
+    the whole suite's own run (`whole`: DEW_WHOLE_SUITE, every fifth publish's ci/full-whole-*), whatever
+    the cache's policy: a policy-off train runs every file, never a whole-suite cell (Main, 2026-10-28:
+    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks
+    run in their own tasks alone (`release`), every one whatever else marks it, under a requirement the
+    suite's environment lacks (`release_plan`), and on no other run, the network lane's among them."""
     at = command.index(session.SELECTION[1])
-    return [*command[:at], "network", *command[at + 1:]]
+    if release:
+        chosen = "release_env"
+    elif network:
+        chosen = "network and not release_env"
+    else:
+        chosen = session.SELECTION[1] + " and not release_env" + ("" if whole else " and not whole_suite")
+    return [*command[:at], chosen, *command[at + 1:]]
 
 
 GPU_HEADROOM = (1.25, 2 ** 30)
@@ -1208,6 +1432,69 @@ def pythons(*, check: bool) -> int:
     return 1 if problems else 0
 
 
+def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> list[dict]:
+    """Each test of `verdict`'s rows (`armada verdict <sha> --json`) whose own seconds pass `target`, the
+    group target, slowest first: no cut brings its group within the target. A whole_suite cell is one too,
+    reported as running on the whole suite alone (`whole_suite`, as pytest marked it in its row:
+    executed.py), which train CI never runs (bible §7: every test past the target is reported). With `base`
+    (main's durations record), only the tests it lacks: a new slow test (owner, 2026-10-28), a cell newly
+    marked whole_suite too."""
+    found = []
+    for row_ in verdict["rows"]:
+        cells = set(row_.get("whole_suite", []))
+        for test, seconds in (row_.get("tests") or {}).items():
+            if seconds <= target or (base is not None and test in base):
+                continue
+            found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
+                          "target": target, **({"whole_suite": True} if test in cells else {})})
+    return sorted(found, key=lambda item: (-item["seconds"], item["test"]))
+
+
+def flagged(verdict: Path, new: Path | None) -> int:
+    """`slow` on the verdict at `verdict` and this checkout's group target, each test a line of JSON; with
+    `new` (a durations record), 1 where any test that record lacks passes the target."""
+    target = json.loads(Path(".armada.json").read_text())["target"]
+    base = json.loads(new.read_text()) if new is not None else None
+    found = slow(json.loads(verdict.read_text()), target, base)
+    for item in found:
+        print(json.dumps(item))
+    return 1 if found and base is not None else 0
+
+
+def task_arguments(running: argparse.ArgumentParser) -> None:
+    """The `task` operation's arguments, which armada's task command fills from a plan entry."""
+    running.add_argument("--python", choices=PYTHONS, required=True)
+    running.add_argument("--tests", required=True)
+    running.add_argument("--split", default="")
+    running.add_argument("--out", type=Path, required=True)
+    running.add_argument(
+        "--cache", required=True,
+        help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
+    running.add_argument("--whole", choices=("0", "1"), default="0",
+                         help="the plan's DEW_WHOLE_SUITE: 1 on the whole suite's run, which runs its cells")
+    running.add_argument("--deadline", type=float, default=session.DEADLINE,
+                         help="seconds before armada's own task timeout (.armada.json) to interrupt at")
+    running.add_argument("--coverage", type=Path, default=None,
+                         help="run the files under coverage.py, its data file in this directory")
+
+
+def release_arguments(planning: argparse.ArgumentParser, checking: argparse.ArgumentParser) -> None:
+    """The `release-plan` and `release` operations' arguments: a whole suite's second job (`release_plan`)."""
+    planning.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
+    checking.add_argument("--python", choices=PYTHONS, required=True)
+    checking.add_argument("--tests", required=True)
+    checking.add_argument("--requirement", required=True)
+    checking.add_argument("--out", type=Path, required=True)
+
+
+def releasing(args: argparse.Namespace) -> int:
+    """`release-plan`'s tasks printed, or `release`'s checks run (`release_plan`, `release`)."""
+    if args.operation == "release-plan":
+        print(json.dumps(release_plan(json.loads(args.verdict.read_text()))))
+        return 0
+    return release(args.python, args.tests.split(), args.requirement, args.out)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/armada/ci.py")
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -1216,18 +1503,7 @@ def main() -> int:
     planning = operations.add_parser("plan")
     planning.add_argument("--target", type=float, required=True)
     planning.add_argument("--timings", type=Path, required=True)
-    running = operations.add_parser("task")
-    running.add_argument("--python", choices=PYTHONS, required=True)
-    running.add_argument("--tests", required=True)
-    running.add_argument("--split", default="")
-    running.add_argument("--out", type=Path, required=True)
-    running.add_argument(
-        "--cache", required=True,
-        help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
-    running.add_argument("--deadline", type=float, default=session.DEADLINE,
-                         help="seconds before armada's own task timeout (.armada.json) to interrupt at")
-    running.add_argument("--coverage", type=Path, default=None,
-                         help="run the files under coverage.py, its data file in this directory")
+    task_arguments(operations.add_parser("task"))
     selecting = operations.add_parser(
         "pytest", help="pytest on the arguments as a CI task runs it, CI's selection first; its exit status")
     selecting.add_argument("--python", choices=PYTHONS, required=True)
@@ -1259,6 +1535,14 @@ def main() -> int:
     versions = operations.add_parser("pythons")
     versions.add_argument("--check", action="store_true",
                           help="refuse a .python-version other than the oldest, or a smoke of other versions")
+    flagging = operations.add_parser(
+        "slow", help="each test of a verdict past the group target, a JSON line each; --new: exit 1 on any")
+    flagging.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
+    flagging.add_argument("--new", type=Path, default=None,
+                          help="the durations record the change is measured against: only the tests it lacks")
+    release_arguments(
+        operations.add_parser("release-plan", help="a whole suite verdict's release checks, a task each"),
+        operations.add_parser("release", help="one requirement's release checks; exit 1 on a red row"))
     recording = operations.add_parser("durations")
     recording.add_argument("verdict", type=Path, help="main's CI verdict: armada verdict <sha> --json")
     args = parser.parse_args()
@@ -1267,6 +1551,10 @@ def main() -> int:
     if args.operation == "gangs":
         print(json.dumps(gangs()))
         return 0
+    if args.operation == "slow":
+        return flagged(args.verdict, args.new)
+    if args.operation in ("release-plan", "release"):
+        return releasing(args)
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
         before = durations_record()
@@ -1311,13 +1599,13 @@ def main() -> int:
         print(policy(args.base))
         return 0
     if args.operation == "plan":
-        timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
-        print(json.dumps({"include": plan(args.target, timings)}))
+        print(json.dumps({"include": plan(args.target, json.loads(args.timings.read_text())
+                                          if args.timings.is_file() else {})}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage)
+                coverage=args.coverage, whole=args.whole == "1")
 
 
 if __name__ == "__main__":

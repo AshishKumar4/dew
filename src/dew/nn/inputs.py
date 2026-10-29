@@ -18,6 +18,8 @@ from jax.core import Tracer
 from dew._coordination import agreed
 from dew.batch import (
     COORDINATES_FIELD,
+    POSITIONS_FIELD,
+    SEGMENTS_FIELD,
     VALIDITY_FIELD,
     Coordinates,
     coordinates,
@@ -25,13 +27,18 @@ from dew.batch import (
     document_ranks,
     document_starts,
     padded_rows,
+    prefix_max,
+    prefix_min,
+    prefix_sum,
     real_slots,
+    token_coordinates,
     token_ids,
     token_positions,
     token_validity,
     with_validity,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
+from dew.nn.scatter import gather_positions
 from dew.nn.sharding import explicit_spec, rows_like
 
 if TYPE_CHECKING:
@@ -227,6 +234,13 @@ class ModelInputs:
                     value.firsts.shape[0] != self.tokens.shape[0]):
                 raise ValueError(f"token field {name!r}'s documents' firsts must have batch size "
                                  f"{self.tokens.shape[0]}, got {value.firsts.shape}")
+        # The tokens' layout is their coordinates or their flat fields, one of them (`token_coordinates`).
+        laid = self.token_fields.get(COORDINATES_FIELD)
+        if isinstance(laid, Coordinates):
+            batch, length = self.tokens.shape
+            token_coordinates((batch, length), laid, segments=self.token_fields.get(SEGMENTS_FIELD),
+                              valid=self.token_fields.get(VALIDITY_FIELD),
+                              positions=self.token_fields.get(POSITIONS_FIELD))
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")
@@ -320,7 +334,7 @@ def rotate_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
     reads slot `(i + shift) % S`, so a row's first `shift` slots move to its end, and a negative
     count rotates it back."""
     slots = (jnp.arange(values.shape[1])[None, :] + shifts[:, None]) % values.shape[1]
-    return jnp.take_along_axis(values, slots.reshape(slots.shape + (1,) * (values.ndim - 2)), axis=1)
+    return gather_positions(values, slots)
 
 
 def cu_seqlens(begins: jax.Array, sequences: int, firsts: jax.Array | None = None) -> jax.Array:
@@ -377,7 +391,7 @@ def counted_places(segments=None, valid=None, positions=None) -> jax.Array | Non
     count = document_ranks(real, starts)
     if given is None:
         return count
-    firsts = starts | (real & (jnp.cumsum(real, axis=1) == 1))
+    firsts = starts | (real & (prefix_sum(real, dtype=jnp.int32) == 1))
     slots = _last_marked(firsts)
     return jnp.take_along_axis(jnp.broadcast_to(given, shape), slots, axis=1) + count
 
@@ -393,7 +407,7 @@ def numbered_blocks(tokens: Coordinates, shape: tuple[int, int], block: int) -> 
     if tokens.segments is not None:
         real = jnp.ones(shape, bool) if tokens.valid is None else jnp.broadcast_to(tokens.valid, shape)
         opens = opens | document_starts(jnp.broadcast_to(jnp.asarray(tokens.segments), shape), real)
-    numbered = jnp.cumsum(opens, axis=1, dtype=jnp.int32) - 1
+    numbered = prefix_sum(opens, dtype=jnp.int32) - 1
     if tokens.valid is None:
         return numbered
     return jnp.where(jnp.broadcast_to(tokens.valid, shape), numbered, -1)
@@ -414,14 +428,14 @@ def document_reach(segments, valid, places) -> jax.Array:
     starts = document_starts(segments, real)
     # Each real token's document, numbered per row from its first real token, and that document's
     # largest place; a padding slot's number reaches no document.
-    numbered = jnp.cumsum(starts | (real & (jnp.cumsum(real, axis=1) == 1)), axis=1, dtype=jnp.int32)
+    numbered = prefix_sum(starts | (real & (prefix_sum(real, dtype=jnp.int32) == 1)), dtype=jnp.int32)
     documents = jnp.where(real, numbered + jnp.arange(shape[0])[:, None] * (shape[1] + 1), -1)
     furthest = jax.ops.segment_max(jnp.where(real, places, jnp.iinfo(jnp.int32).min).ravel(),
                                    documents.ravel(), num_segments=shape[0] * (shape[1] + 1))
     held = jnp.take(furthest, jnp.maximum(documents, 0)).reshape(shape)
     # The slot of the next document's first real token after each slot, the row's length past the last.
     following = jnp.where(starts, index, shape[1])
-    following = jnp.flip(jax.lax.cummin(jnp.flip(following, axis=1), axis=1), axis=1)
+    following = prefix_min(following, reverse=True)
     following = jnp.pad(following[:, 1:], ((0, 0), (0, 1)), constant_values=shape[1])
     # The last real token before it, which ends the slot's document.
     ends = jnp.take_along_axis(_last_marked(real), following - 1, axis=1)
@@ -432,7 +446,7 @@ def _last_marked(marked: jax.Array) -> jax.Array:
     """Each slot's last `marked` slot at or before it `[B, S]`, 0 before any: a document's first
     slot where `marked` holds its starts (`counted_places`), its last real one where it holds the
     real tokens (`document_reach`)."""
-    return jax.lax.cummax(jnp.where(marked, jnp.arange(marked.shape[1]), 0), axis=1)
+    return jnp.asarray(prefix_max(jnp.where(marked, jnp.arange(marked.shape[1]), 0)))
 
 
 CONTEXT = "context"
@@ -734,11 +748,8 @@ def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coord
 
     starts = None if value.starts is None else jnp.concatenate(
         [value.starts, jnp.zeros((len(value.starts), width), value.starts.dtype)], axis=1)
-    # No document starts in the response: each row's firsts stand, past its last now `width` further.
-    firsts = value.firsts
-    if firsts is not None and value.starts is not None:
-        length = value.starts.shape[1]
-        firsts = jnp.where(firsts < length, firsts, length + width)
+    # No document starts in the response: its firsts built again over the longer rows (`document_firsts`).
+    firsts = None if starts is None else document_firsts(starts, value.max_segments + 1)
     return replace(value, valid=continued(value.valid, _response_validity),
                    positions=continued(value.positions, _response_positions),
                    segments=continued(value.segments, _response_document), starts=starts, firsts=firsts,
@@ -747,9 +758,9 @@ def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coord
 
 RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     VALIDITY_FIELD: _response_validity,
-    "positions": _response_positions,
+    POSITIONS_FIELD: _response_positions,
     "rotary_positions": _response_coordinates,
-    "segment_ids": _response_document,
+    SEGMENTS_FIELD: _response_document,
     "image_indices": _response_text,
     "audio_indices": _response_text,
     "image_groups": _response_text,
@@ -909,6 +920,16 @@ def request_key(key: int | jax.Array | None) -> jax.Array:
     if typed.shape != ():
         raise ValueError("key must be a single JAX PRNG key")
     return typed
+
+
+def seed_of(key: int | jax.Array) -> int | None:
+    """`key` as an integer seed, None for a JAX PRNG key, refused as `request_key` refuses it, without
+    making a key: a seed's key opens JAX's backend."""
+    if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
+        return int(key)
+    if not isinstance(key, jax.Array):
+        raise ValueError("key must be an integer seed or a single JAX PRNG key")
+    return None
 
 
 def request_rows(keys: jax.Array) -> jax.Array:

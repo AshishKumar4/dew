@@ -5,7 +5,7 @@ stage (`_Lowering.eager`): the record steps, token splits, packing and
 windows, after filling the cache before them when there is one. It keeps
 the accepted rows, each with the source position it came from, as a
 `_Memory` source, which the Grain lowering then reads by index like any
-other. Record steps, token splits, Grain's packers and cache reads run by
+other. Record steps, token splits, packers and cache reads run by
 the Grain lowering's own definitions (`dew.data.lowering`); first-fit
 packing and windows run by their indexed plans (`plan_windows`, read as
 `PackedSource` reads it, and `IndexedWindows`), so the plan can
@@ -213,6 +213,8 @@ def _memory_stages(
 ) -> Pipeline:
     derived: dict[str, str] = {}
     targets: Mapping[str, int] | None = None
+    # The source examples an objective's expansion read, where one ran here (`FlatMap.examples`).
+    examples: list[tuple[tuple[int, ...], Record]] | None = None
     documents = source.segments if isinstance(source, _Memory) else None
     # Whether the rows' targets are counted, which they carry (`recounted`, `counted_window`): by the
     # memory read this one reads on from, a count step or a layout.
@@ -267,8 +269,8 @@ def _memory_stages(
                 rows, targets = _targeted([((plan.at("accepted", index),), packed[index])
                                            for index in range(len(packed))], counter, stage.fields[0], rule)
             else:
-                # Only first-fit of tokens alone has an indexed plan; the rest is Grain's
-                # own packer, run once over the corpus as an indexed read streams it.
+                # Only first-fit of tokens alone has an indexed plan; the rest is packed once over
+                # the corpus as an indexed read streams it (`_packed`).
                 packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
                 derived["packing"] = fingerprint(sizes)
                 rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
@@ -277,6 +279,10 @@ def _memory_stages(
             documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
                              for _, value in rows), default=0)
         else:
+            if isinstance(stage, FlatMap) and stage.examples and examples is None:
+                # The corpus counts its source examples, so its counts are taken here, before an
+                # objective's step makes rows of them (`FlatMap.examples`), and not of the rows after.
+                examples = list(rows)
             expanded: list[tuple[tuple[int, ...], Record]] = []
             threads = _threads((stage,))
             if threads is None:
@@ -300,7 +306,8 @@ def _memory_stages(
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
-    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, documents)
+    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, documents,
+                         counted=rows if examples is None else examples)
 
 
 def _targeted(
@@ -376,6 +383,8 @@ def _memory_order(
     derived: dict[str, str],
     packed: Mapping[str, int] | None,
     documents: int | None,
+    *,
+    counted: Sequence[tuple[tuple[int, ...], Record]],
 ) -> Pipeline:
     rows = [
         (identifier, value if isinstance(value, bytes) else record(value, "materialized record"))
@@ -390,10 +399,9 @@ def _memory_order(
     derived["fanouts"] = fingerprint(fanouts)
     if lengths is not None:
         derived["lengths"] = fingerprint(lengths)
-    counter.accepted = len(rows)
-    counter.truncated = sum(
-        bool(value.get("_dew_truncated", False)) for _, value in rows if not isinstance(value, bytes)
-    )
+    counter.counted_anew()
+    for _, value in counted:
+        counter.delivered(value if isinstance(value, bytes) else record(value, "counted record"))
     facts: Batch = _measured_bounds(
         [record(value, "measured row") for _, value in rows if not isinstance(value, bytes)]
     )

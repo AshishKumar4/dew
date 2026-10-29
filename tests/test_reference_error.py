@@ -227,6 +227,56 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     assert min(seen[1:]) >= SIZING_FROM
 
 
+def noised_draw(seed):
+    """A draw of standard normal values beside three noises of 1e-7 of them, which arms add at chosen scales
+    (the further references' and the library arm's sites)."""
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+
+
+def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw():
+    """`also`: one Dew arm against several references on the same draws, each judged by its own check 1
+    under its own label, Dew and the truth evaluated once a draw for them all. A Dew arm on par with one
+    reference and three times another's error fails against that one alone; a site with every
+    reference on par passes; beside a plain Dew arm, a further reference of another kind than the
+    reference's is refused, as is a site with several and no named truth."""
+    calls = {"dew": 0, "truth": 0}
+
+    draw = noised_draw
+
+    def arm(scale, noise, counted=None):
+        @as_given
+        def run(x, mine, theirs, other):
+            if counted:
+                calls[counted] += 1
+            return {"value": x + scale * {"mine": mine, "theirs": theirs, "other": other}[noise]}
+        return run
+
+    @as_given
+    def truth(x, *_):
+        calls["truth"] += 1
+        return {"value": x}
+
+    dew = arm(1.0, "mine", "dew")
+    assert_as_exact(dew, arm(1.0, "theirs"), draw, "two references", seeds=16, truth_fn=truth,
+                    also={"another": arm(1.0, "other")})
+    assert calls == {"dew": 16, "truth": 16}, calls
+    with pytest.raises(GateFailure) as failed:
+        assert_as_exact(arm(3.0, "mine"), arm(3.0, "theirs"), draw, "one far", seeds=16, truth_fn=truth,
+                        also={"another": arm(1.0, "other")})
+    assert {finding.leaf for finding in failed.value.findings} == {"one far, against another['value']"}
+    with pytest.raises(ValueError):
+        assert_as_exact(dew, arm(1.0, "theirs"), draw, "no truth", seeds=16,
+                        also={"another": arm(1.0, "other")})
+
+    def plain(x, *_):
+        return {"value": x}
+
+    with pytest.raises(ValueError):
+        assert_as_exact(plain, plain, draw, "two kinds", seeds=16, truth_fn=truth,
+                        also={"given": arm(1.0, "other")})
+
+
 def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references():
     """With the owner's library arm (`library_fn`), Dew is held within PARITY of the larger of the
     reference's error and the library arm's, seed by seed, on the leaves the exception covers: a Dew
@@ -236,9 +286,7 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
     compile. Null runs judge as the site does."""
     from reference_error import null_runs
 
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+    draw = noised_draw
 
     def arm(scale, noise):
         @as_given
@@ -1524,19 +1572,84 @@ def test_a_truth_sketch_is_its_signed_sums_bit_for_bit():
         assert truth_sketch(values, seed=3).tolist() == expected
 
 
-def test_a_leaf_summary_reads_the_same_with_its_truths_rows_read_once():
-    """`leaf_summary` over a truth's rows read once (`_TruthRows.of`) is the summary that reads them
-    itself, field by field, on a leaf with rows sized, of float64 zero and exactly zero."""
+
+def _bits(value):
+    """`value` held to its bits: an array's or a float's dtype, shape and bytes (a NaN's and a zero's sign
+    included), a summary's field by field, a tuple's item by item."""
     import dataclasses
 
-    from reference_error import _TruthRows, leaf_summary
+    if dataclasses.is_dataclass(value):
+        return [(field.name, _bits(getattr(value, field.name))) for field in dataclasses.fields(value)]
+    if isinstance(value, (tuple, list)):
+        return [_bits(item) for item in value]
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    array = np.asarray(value)
+    return array.dtype.str, array.shape, array.tobytes()
 
-    truth = np.random.default_rng(0).standard_normal((6, 5))
-    truth[2] = 1e-30
-    truth[4] = 0.0
-    arm = (truth + 1e-7 * np.random.default_rng(1).standard_normal(truth.shape)).astype(np.float32)
-    alone, shared = leaf_summary(arm, truth), leaf_summary(arm, truth, _TruthRows.of(truth))
-    for field in dataclasses.fields(alone):
-        one, other = getattr(alone, field.name), getattr(shared, field.name)
-        assert np.array_equal(one, other) if isinstance(one, np.ndarray) else one == other, field.name
 
+def test_a_leaf_in_any_layout_reads_as_its_c_ordered_copy():
+    """Check 1 reads a leaf laid out otherwise, F-ordered or strided, Dew's, the reference's and the
+    truth's, as its C-ordered copy, bit for bit (`_evidence`, `leaf_summary`): every leaf lies in C order
+    beside the others of its width (`_LaidTruths`), so its sums run alike whatever its layout. The leaves
+    hold rows of float64 zero and leaves of every rank."""
+    from reference_error import _evidence, leaf_summary
+
+    rng = np.random.default_rng(2201)
+    shapes = [(70, 129), (9, 33), (5, 4, 9), (40,), (3, 2, 1), (12, 9), ()]
+    truth = {f"leaf{at}": rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3)
+             for at, shape in enumerate(shapes)}
+    truth["leaf1"][2] = 0.0
+
+    def arm():
+        return {name: (value * (1 + 2.0 ** -20 * rng.standard_normal(value.shape))).astype(np.float32)
+                for name, value in truth.items()}
+
+    def strided(array):
+        wide = np.zeros((*array.shape[:-1], 2 * array.shape[-1]), array.dtype)
+        wide[..., ::2] = array
+        return wide[..., ::2]
+
+    def otherwise(tree):
+        return {name: (np.asfortranarray, strided)[at % 2](value) if np.ndim(value) else value
+                for at, (name, value) in enumerate(tree.items())}
+
+    dew, reference, laid = otherwise(arm()), otherwise(arm()), otherwise(truth)
+    assert not any(np.asarray(value).flags.c_contiguous for tree in (dew, reference, laid)
+                   for value in tree.values() if np.ndim(value) >= 2)
+    ordered = [{name: np.ascontiguousarray(value) for name, value in tree.items()}
+               for tree in (dew, reference, laid)]
+    assert _bits(_evidence(dew, reference, laid, laid)) == _bits(_evidence(*ordered, ordered[2]))
+    for name in truth:
+        assert _bits(leaf_summary(dew[name], laid[name])) == _bits(
+            leaf_summary(ordered[0][name], ordered[2][name])), name
+
+
+def test_a_summarized_recording_reads_back_as_its_reference_reads_live():
+    """A summarized recording's evidence (`record_case`'s summary), read back as check 1 reads it
+    (`indexed_recording`'s reference), is the evidence of the same reference outputs read live
+    (`leaf_summary`), bit for bit in every field the recording keeps, its rows of float64 zero included."""
+    from reference_error import leaf_summary
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    _, live = _tiny_row(4)
+    draw, evaluate = _tiny_row_recording(live)
+
+    def truth_fn(inputs):
+        return live(inputs["x"], inputs["w"])
+
+    with jax.enable_x64(new_val=True):
+        recorded = recorder.record_case("site", draw, evaluate, truth_fn, summary=True)
+        _, reference, _ = indexed_recording(recorded, "site", int(recorded["site.seeds"]), inputs_of=draw,
+                                            truth_fn=truth_fn)
+        zero_rows = 0
+        for seed in range(len(recorded["site.input_digest"])):
+            outputs, truth = evaluate(draw(seed))
+            for name, kept in reference(np.int32(seed), draw(seed)).items():
+                read = leaf_summary(outputs[name], truth[name])
+                fields = ("mse", "worst", "zero_rows", "zero_errors", "finite", "dtype")
+                assert _bits([getattr(kept, field) for field in fields]) == _bits(
+                    [getattr(read, field) for field in fields]), (seed, name)
+                zero_rows += len(kept.zero_rows)
+    assert zero_rows

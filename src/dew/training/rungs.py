@@ -28,12 +28,14 @@ from typing import TYPE_CHECKING
 import jax
 import numpy as np
 from jax.sharding import Mesh
+from jaxlib.xla_client import LoadedExecutable
 
 from dew._records import JSON, json_value, record
 from dew.files import write_atomically
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import trace_context
 from dew.telemetry.instrumentation import StepFlops, step_flops
+from dew.training.memory import device_memory
 
 if TYPE_CHECKING:
     from dew.batch import Batch
@@ -55,7 +57,8 @@ RECORD_VERSION = 2
 
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-             mesh: Mesh, step: Callable[..., StepFn] | None = None) -> dict[str, JSON]:
+             mesh: Mesh, step: Callable[..., StepFn] | None = None,
+             capacity: int | None = None) -> dict[str, JSON]:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`'s name, the code that builds
@@ -66,7 +69,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     (`trace_context`), the libraries that compile it and the allocator and
     XLA_FLAGS settings it compiles under."""
     devices = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    limits = {f"{device.device_kind}, limit {(device.memory_stats() or {}).get('bytes_limit')}"
+    limits = {f"{device.device_kind}, limit {device_memory(device).get('bytes_limit', capacity)}"
               for device in devices}
     devices_seen: list[JSON] = [*sorted(limits)]
     leaves = [f"{jax.tree_util.keystr(path)} {np.shape(leaf)} {leaf.dtype} "
@@ -102,6 +105,7 @@ def _code() -> str:
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
                   mesh: Mesh, step: Callable[..., StepFn] | None = None,
+                  capacity: int | None = None,
                   ) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
@@ -112,7 +116,7 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     directory = rung_records()
     if directory is None or jax.process_count() > 1:
         return None, {}, None
-    key = rung_key(modules, arguments, splits, mesh, step)
+    key = rung_key(modules, arguments, splits, mesh, step, capacity)
     path = directory / f"{hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()}.json"
     if not path.exists():
         return path, key, None
@@ -142,7 +146,9 @@ def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlo
     apart two steps that differ in an objective's arguments alone; the
     executable can."""
     runtime = executable.runtime_executable()
-    fingerprint = None if runtime is None else runtime.fingerprint
+    # An executable compiled for absent devices is not loaded and has no runtime fingerprint.
+    fingerprint = (runtime.fingerprint
+                   if runtime is not None and isinstance(runtime, LoadedExecutable) else None)
     named = fingerprint.hex() if isinstance(fingerprint, bytes) else None
     counted = record(recorded, 'recorded plan').get('flops') if recorded is not None else None
     if named is not None and isinstance(counted, list) and len(counted) == 4 and counted[:1] == [named]:

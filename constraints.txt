@@ -34,13 +34,26 @@
 # the same kernel compiled from two checkouts keys alike; and a compile-only
 # Mosaic GPU target held to its own default shared memory limit; and a
 # transformation keeping a wide dtype its trace already holds, while a Python
-# type asked of a wide value still narrows as a user's request. Every CI and
-# development install takes this one build.
+# type asked of a wide value still narrows as a user's request; and Pallas's
+# Mosaic GPU interpreter transferring a thread map's constants and inputs to
+# the device once, shared by its threads (ledger 1850); and Pallas's Mosaic GPU
+# slicing, pointwise ops and broadcasts on a
+# unit row or column of a tiled array (ledger 1428); and Mosaic GPU's CP_ASYNC
+# copy of a head's [S, D] block of [B, S, H, D], a squeezed dimension between
+# sliced ones, under a tile transform (ledger 2078); and Mosaic GPU's
+# emit_pipeline carrying its ring slots rather than recomputing them each step;
+# and Mosaic GPU's WGMMA forming its shared-operand descriptors at its
+# instructions rather than hoisting them out of an enclosing loop; and Mosaic
+# GPU's TMA load coordinates reaching ptxas as values it cannot fold (the lane
+# id less the lowest lane of the copy's predicate ballot), which it had
+# miscompiled into a misaligned copy that stopped the H100 attention training
+# forward on an illegal instruction (ledger 2254; post34's form is yanked).
+# Every CI and development install takes this one build.
 # Return to a release once one ships the fixes.
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.12.0.1.post28
+jax==0.12.0.1.post35
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).

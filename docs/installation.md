@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post28,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post35,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
@@ -115,6 +115,16 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Mosaic GPU's layout inference solves groups of unknowns that no constraint relates separately, so sm80's `mma.sync` GEMM tiles find their layouts.
 - A Mosaic GPU MMA may state its warpgroup's warp split (`plgpu.mma(..., m_warps=...)`), for Ampere GEMM tiles that split their warps 2 x 2.
 - A platform-dependent conditional whose lowering keeps one branch lowers that branch inline, so a collective inside it is not a runtime conditional; on the CPU, devices diverged on such a conditional.
+- A block's Mosaic GPU warpgroups each take their own share of the reduction scratch.
+- A Mosaic GPU kernel's debug info stays out of the persistent compilation cache key, so the same kernel compiled from two checkouts keys alike.
+- A compile-only Mosaic GPU target is held to its own default shared memory limit, not the attached device's.
+- A transformation keeps a wide dtype its trace already holds, while a Python type asked of a wide value still narrows as a user's request.
+- Pallas's Mosaic GPU interpreter transfers a thread map's constants and inputs to the device once, shared by its threads.
+- Pallas's Mosaic GPU slices, applies pointwise ops to and broadcasts a unit row or column of a tiled array.
+- Mosaic GPU's CP_ASYNC copies a head's `[S, D]` block of `[B, S, H, D]`, a squeezed dimension between sliced ones, under a tile transform.
+- Mosaic GPU's `emit_pipeline` carries its ring slots rather than recomputing them each step.
+- Mosaic GPU's WGMMA forms its shared-operand descriptors at its instructions rather than hoisting them out of an enclosing loop.
+- Mosaic GPU's TMA load coordinates reach ptxas as values it cannot fold: ptxas had miscompiled a literal coordinate into a misaligned copy, which stopped the attention training forward at head dim 128 on an H100 on an illegal instruction.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 

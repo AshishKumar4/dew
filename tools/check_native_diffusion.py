@@ -7,11 +7,11 @@ component Dew wrote and its UNet recomputes the trained prediction
 (`diffusers_reads`).
 """
 import argparse
-from dataclasses import replace
 import json
-from pathlib import Path
 import sys
 import tempfile
+from dataclasses import replace
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +24,7 @@ from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling.guidance import CFG
-from dew.sampling.sample import sample
+from dew.sampling.walks import sample
 
 
 def bundle(directory, streamed: bool = False):
@@ -454,8 +454,8 @@ def regress(directory, case):
 
 
 def check_model(directory):
-    from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
     from dew.diffusion.process import DenoisingCondition
+    from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
     from dew.nn.backbones.unet_condition import UNet2DCondition
     directory = Path(directory)
     reference = np.load(directory / "reference.npz")

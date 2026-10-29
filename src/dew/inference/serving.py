@@ -25,7 +25,10 @@ program per prompt bucket plus the decode-only one.
 stays the one way to load weights and a processor, and every request runs
 the task's bound policy. A request draws with its submitted key folded as a
 one-row `TextGeneration` call folds it, so it draws the same tokens served
-or alone. `submit` returns a future for its `Generation`, `step` runs one
+or alone, except where the model's products round at boundaries that its
+programs' own roundings cross (a quantized decoder's moving weights, ledger
+2032): there each draw is on par with the model's full forward, by check 1,
+not equal to the lone task's. `submit` returns a future for its `Generation`, `step` runs one
 iteration, `run` steps until queue and rows are empty, and calling the
 server with a batch does both.
 
@@ -125,7 +128,7 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import GROUPS, KVCache, is_paged, leaf_name
+from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.visibility import with_served_blocks
@@ -204,7 +207,7 @@ _KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
 """The shape and dtype of a default key's data, read without a device."""
 
 
-def _seed(key: int | jax.Array | None) -> int | jax.Array:
+def _seed(key: int | jax.Array) -> int | jax.Array:
     """A request's key as a row holds it: an integer seed as given, for
     `_row_keys` to make into a key, or a key's data. `_row_keys` makes and
     reads every row's key with the default PRNG implementation, so a key of
@@ -479,7 +482,8 @@ class Server:
     row. A row leaves where the task's criteria end it (EOS, a stop string) or
     at its budget, and the next request takes its slot. Every request runs
     the task's policy and draws the same tokens it would draw through the
-    task alone with the same key.
+    task alone with the same key, except where the model's products round at
+    boundaries that the two programs' roundings cross (the module docstring).
 
     Build one with `from_task`. `admission` bounds the prompts one step
     prefills. A request whose prompt and budget do not fit the capacity is
@@ -567,6 +571,9 @@ class Server:
             self.group_fields = frozenset(name for name, leaf in GROUPS.items() if leaf in held)
             """The group fields some layer reads whole (`dew.nn.kv_cache.GROUPS`), whose groups its cache
             keeps beside the keys: the ones a served prompt's slot beside its tokens."""
+            self.keyed = ROUNDING_KEYS in held
+            """Whether a layer's decode cache holds its rows' rounding keys (`dew.nn.kv_cache.ROUNDING_KEYS`),
+            so a prompt's state follows its request's key, which then names its prefix too (`_prepared`)."""
             # None selects the one mixed forward of `_mixed_step`.
             self.mixed_refusal = mixed_refusal(model, shapes, rows.placement)
             """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
@@ -775,7 +782,7 @@ class Server:
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: int | jax.Array | None = None) -> Ticket:
+               key: int | jax.Array) -> Ticket:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
@@ -845,8 +852,13 @@ class Server:
         groups = {name: np.asarray(fields[name])[0][valid[0]].astype(np.int32)
                   for name in GROUPS if name in fields and name in self.group_fields}
         salt = b""
-        if context is not None or groups:
+        if context is not None or groups or self.keyed:
             hasher = hashlib.blake2b(digest_size=16)
+            if self.keyed:
+                # A cached memory rounds by the request's own key (`dew.nn.kv_cache.ROUNDING_KEYS`), so the
+                # state after a prefix is that key's: the prefix is shared only under one key.
+                hasher.update(b"seed" if isinstance(seed, int) else b"key")
+                hasher.update(np.asarray(seed).tobytes() + np.int64(fold).tobytes())
             if context is not None:
                 # The context's dtype too, so equal bytes of another dtype salt apart.
                 array_fingerprint(hasher, np.asarray(context))
@@ -956,7 +968,7 @@ class Server:
         prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
         max_new_tokens: int | None = None,
         *,
-        key: int | jax.Array | None = None,
+        key: int | jax.Array,
     ) -> list[Generation]:
         """Submit a batch, run it through, and return its generations in order.
 

@@ -22,11 +22,18 @@ from . import dc_ae, flux2, qwen_image, rae, wan
 from .api import AutoEncoder, LatentNormalization, published_source
 from .dc_ae import DCAutoencoder, load_dc_ae
 from .flux2 import Flux2Autoencoder, load_flux2_vae
-from .kl import AutoencoderKL
 from .qwen_image import QwenImageAutoencoder, load_qwen_image_vae
 from .rae import RAEAutoencoder, load_rae
-from .sd_vae import StableDiffusionVAE, published_normalization
-from .vae import FLAX_REVISIONS, PUBLISHED as KL_PUBLISHED, _vae_path
+from .sd_vae import StableDiffusionVAE, published
+from .vae import (
+    FLAX_REVISIONS,
+    FLAX_WEIGHTS,
+    PUBLISHED as KL_PUBLISHED,
+    TORCH_WEIGHTS,
+    _vae_path,
+    flax_vae,
+    located_vae,
+)
 from .wan import WanAutoencoder, load_wan_vae
 
 if TYPE_CHECKING:
@@ -53,17 +60,24 @@ class Loader(Protocol):
 
 
 def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
-                subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
+                subfolder: str | None = "vae", param_dtype: str = "float32", params: Variables | None = None,
                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
                 ) -> tuple[StableDiffusionVAE, Variables, tuple[WeightLayout, ...], dict]:
-    """Build a pipeline's AutoencoderKL, its parameters and their source
-    layouts from the torch safetensors in `subfolder`, as `Loader` does. A
-    standalone one is read by `StableDiffusionVAE` instead, which also reads
-    the SD1-era flax layouts on their own revisions (`load_pretrained_vae`)."""
-    directory, config = published_source(name_or_dir, revision, subfolder, KL_PUBLISHED,
-                                         weights=params is None, nameless=True)
-    model = AutoencoderKL.from_diffusers(config, compute)
-    shift, scale = published_normalization(config)
+    """Build an AutoencoderKL, its parameters and their source layouts, as `Loader` does: a pipeline's
+    from the torch safetensors in `subfolder`, a standalone one's (`subfolder` None) where its repo or
+    directory holds it, the SD1-era flax layouts on their own revisions included (`vae.located_vae`,
+    `revision` as it reads it, `bf16` by default). Those flax params keep the dtype their branch stores
+    (bf16 on `bf16`), the tree this module's is, their layouts written back as the torch names
+    (`vae.flax_vae`)."""
+    if subfolder is None:
+        directory, config, weights = located_vae(str(name_or_dir), revision or "bf16", params=params)
+    else:
+        directory, config = published_source(name_or_dir, revision, subfolder, KL_PUBLISHED,
+                                             weights=params is None, nameless=True)
+        weights = TORCH_WEIGHTS
+    if weights == FLAX_WEIGHTS and params is None:
+        params, shapes = flax_vae(directory / FLAX_WEIGHTS)
+    model, shift, scale = published(config, compute)
     image = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
     return bind_component(
@@ -77,24 +91,19 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
 @dataclasses.dataclass(frozen=True)
 class Registration:
     """One built-in autoencoder a source loads: its wrapper, the `_class_name`s a published config states
-    (an AutoencoderKL's, where it states none: `nameless`), the loader that builds it from a pipeline's
-    directory or a repo, and the one a standalone load takes, where it has its own (an AutoencoderKL's
-    also reads the SD1-era flax layouts, `StableDiffusionVAE`)."""
+    (an AutoencoderKL's, where it states none: `nameless`), and the loader that builds it from a pipeline's
+    directory or a repo, which a standalone load reads from its config's subfolder, or, where the
+    autoencoder `finds` its own (an AutoencoderKL's, whose SD1-era flax layouts live on their own
+    revisions: `load_kl_vae` with no subfolder), where it lives."""
     wrapper: Callable[..., AutoEncoder]
     published: tuple[str, ...]
     load: Loader
     nameless: bool = False
-    standalone: Callable[..., AutoEncoder] | None = None
-
-
-def _standalone_kl(source: str, *, revision: str, dtype, params) -> AutoEncoder:
-    """A standalone AutoencoderKL from `source`, its flax layouts included (`StableDiffusionVAE`)."""
-    return StableDiffusionVAE(source, revision=revision, dtype=dtype, params=params)
+    finds: bool = False
 
 
 REGISTRATIONS: tuple[Registration, ...] = (
-    Registration(StableDiffusionVAE, KL_PUBLISHED, load_kl_vae, nameless=True,
-                 standalone=_standalone_kl),
+    Registration(StableDiffusionVAE, KL_PUBLISHED, load_kl_vae, nameless=True, finds=True),
     Registration(DCAutoencoder, dc_ae.PUBLISHED, load_dc_ae),
     Registration(WanAutoencoder, wan.PUBLISHED, load_wan_vae),
     Registration(RAEAutoencoder, rae.PUBLISHED, load_rae),
@@ -148,11 +157,11 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
                      latent_shift: float | None = None, latent_scale: float | None = None,
                      params: Variables | None = None) -> AutoEncoder:
     """The autoencoder `modelname` publishes: the one its config's class registers (`registration`), by
-    the registration's standalone load where it has one, an AutoencoderKL's read where the config names no
-    class, and refused by name where it names one no built-in registers.
+    its registration's loader (where it lives, for one that finds it: an AutoencoderKL's, read where the
+    config names no class), and refused by name where it names one no built-in registers.
 
     `modelname` is a local directory or a Hub repo; `revision` is as
-    `load_pretrained_vae` reads it, so a class of `LOADERS` takes `main` or a
+    `vae.located_vae` reads it, so a class of `LOADERS` takes `main` or a
     commit. Supplied `params` are bound unchanged and only metadata is read,
     but for FLUX.2's latent statistics, its batch norm's running statistics
     in the weights (`load_flux2_vae`). `latent_shift` and `latent_scale`
@@ -165,11 +174,11 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
     entry = registration(class_name)
     if entry is None:
         raise ValueError(f"{modelname} holds a {class_name}, which no built-in autoencoder registers")
-    if entry.standalone is not None:
+    if entry.finds:
         # A local pipeline's autoencoder is read from its `vae/` folder; a Hub repo's, where its loader
         # finds it.
         source = str(Path(modelname) / subfolder) if subfolder and os.path.isdir(modelname) else modelname
-        autoencoder = entry.standalone(source, revision=revision, dtype=dtype, params=params)
+        autoencoder, *_ = load_kl_vae(source, dtype, revision=revision, subfolder=None, params=params)
     else:
         autoencoder, *_ = entry.load(modelname, dtype, revision=revision, subfolder=subfolder or "",
                                      params=params)

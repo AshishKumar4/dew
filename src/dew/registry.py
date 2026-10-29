@@ -73,7 +73,7 @@ if TYPE_CHECKING:
     from flax import linen as nn
 
     from dew.diffusion.presets import Preset
-    from dew.inputs.encoders import ConditionEncoder
+    from dew.inputs.condition import ConditionEncoder
     from dew.interop.composite import SourceKind
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
@@ -1384,6 +1384,7 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "tcd": "dew.sampling.solvers.gaussian:TCD",
     "unipc": "dew.sampling.solvers.unipc:UniPC",
     "unmask": "dew.diffusion.discrete:Unmask",
+    "confident": "dew.diffusion.discrete:Confident",
 })
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
@@ -1394,7 +1395,7 @@ encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases(
     "qwen_image_text": "dew.inputs.diffusion:QwenImageConditioner",
     "t5": "dew.inputs.encoders:T5Text",
     "wan_text": "dew.inputs.diffusion:WanConditioner",
-}, base="dew.inputs.encoders:ConditionEncoder")
+}, base="dew.inputs.condition:ConditionEncoder")
 metrics: Aliases[Callable[..., Metric], Metric] = Aliases("metric", {
     "accuracy": "dew.decision.metrics:Accuracy",
     "aurc": "dew.decision.metrics:AURC",
@@ -1443,6 +1444,7 @@ mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "memory": "dew.nn.mixers.memory:InContextMemoryMixer",
     "mla": "dew.nn.mla:MLAMixer",
     "mlp": "dew.nn.mixers.mlp:MLPMixer",
+    "short_conv": "dew.nn.mixers.short_conv:ShortConvMixer",
 }, base="dew.nn.mixer_base:MixerBase")
 towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "deepseek_v41": "dew.nn.vision.deepseek_v41:DeepseekV41Vision",

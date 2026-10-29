@@ -118,8 +118,9 @@ def _keeping_gradients(optimizer):
 def _decoder(*, scanned=False, remat=None, mixture=False, rows=8):
     """`_trained`'s tied bf16 decoder over fp32 parameters, as its LM objective, and the batch of
     `rows` rows it trains on."""
+    from dew.batch import TEXT_KEY
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.objectives.lm import LMObjective
     from dew.objectives.routing import ExpertBalance
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
@@ -145,7 +146,7 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     as `remat` names. With `longer`, every other step reads a batch of that
     many rows, whose shape the trainer plans apart. Returns the state, each
     step's loss and the trainer, its plan the last shape's."""
-    from dew.objectives.lm import TEXT_KEY
+    from dew.batch import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
     objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
@@ -373,11 +374,12 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
 
 
-def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(monkeypatch):
+def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
     """A window of one step that recomputes nothing holds about as much without its copies as with them:
     its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its
-    own rung neither way, the plan climbs past the rung that dropped them, and at the rung and split it
-    reaches it compiles the step with them once more and keeps them, as they fit there too."""
+    own rung neither way, the plan climbs past the rung that dropped them, and keeps them dropped at the
+    rung and split it reaches: once a plan fits, a run compiles no other (whether the copies would be
+    faster there is the offline plan's to weigh, `compile_ahead`)."""
     free = 2 ** 39
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
@@ -392,11 +394,10 @@ def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(m
     assert [(probe["narrow"], probe["fits"]) for probe in probes[:2]] == [(True, False), (False, False)]
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
     planned = {key: plan[key] for key in rung}
-    fitted, last = probes[-2], probes[-1]
+    last = probes[-1]
     assert planned != {key: base[key] for key in rung}
-    assert [{key: probe[key] for key in rung} for probe in (fitted, last)] == [planned, planned]
-    assert [(probe["narrow"], probe["fits"]) for probe in (fitted, last)] == [(False, True), (True, True)]
-    assert plan["narrow"] and state.compute is not None
+    assert {key: last[key] for key in rung} == planned and (last["narrow"], last["fits"]) == (False, True)
+    assert not plan["narrow"] and state.compute is None
 
 
 def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(monkeypatch):

@@ -30,7 +30,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#86b89027297c4ae692f149a8bdb2bb7006d22a0c
+  ARMADA: github:AshishKumar4/armada#95f06182db1b5bfe010339c7fad98665385bcc88
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -64,27 +64,28 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        # SLOP020's inventory ratchet reads the whole history; check.sh's duplicate-code gate, origin/main.
+        # The merge-base with main, which the gates that hold a checkout to main read (tools/base_history.sh).
         fetch-depth: 0
-    - uses: actions/setup-python@v5
-      with:
-        python-version-file: .python-version
-    - uses: astral-sh/setup-uv@v6
-      with:
-        enable-cache: true
-        cache-dependency-glob: locks/cpu.txt
-    - name: Install dependencies
+    - uses: oven-sh/setup-bun@v2
+    - name: Install the armada CLI
+      run: bun install --global "$ARMADA"
+    # tools/check_gates, each on an armada container of its own in the commit's environment, all failures
+    # reported, so the job lasts as long as its slowest gate, not their sum on this runner's 4 vCPUs (Main,
+    # 2026-10-28: the lint job set trains' wall at 35-41 min). SLOP020's ratchet among them holds the tolerance
+    # inventory to main's at the merge-base (BASE) and to every parent in the history, which the container's
+    # checkout carries (.armada.json's history), and the site's model list and examples to the code.
+    - name: Every cheap gate (tools/check.sh), each on armada
+      env:
+        ARMADA_URL: ${{ secrets.ARMADA_URL }}
+        ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        sh tools/install_environment.sh cpu --system
-    # tools/check_gates, side by side; SLOP020's ratchet among them holds the tolerance inventory to main's at
-    # the merge-base and to every parent in the history, and the site's model list and examples to the code.
-    - name: Every cheap gate (tools/check.sh), all failures reported
-      run: sh tools/check.sh
-    - name: Upload the complexity distribution
-      uses: actions/upload-artifact@v4
-      with:
-        name: complexity
-        path: complexity.json
+        base=$(git merge-base HEAD origin/main)
+        # A train's gates, and a push to main's, start before lanes' runs, as their suites do.
+        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*|main) priority=--priority=10 ;; ci/stage-*) priority=--priority=5 ;; *) priority= ;; esac
+        grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
+          $priority --label="lint-$GITHUB_REF_NAME" -- \
+          sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
+          sh "$base" '{item}'
     - name: The site's toolchain and dependencies
       uses: ./.github/actions/site
     - name: Check site content
@@ -192,12 +193,14 @@ jobs:
     # A straggler at the end runs again (task.speculative). Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
-    # Every suite task runs on AMD EPYC 25/17 (task.cpu): armada replaces a
-    # container on another CPU model before it takes a task. Of 1,264 containers
-    # in the 16 runs before 2026-10-20 15:00, 1,025 landed on 25/17.
-    # Per-test median time ratios against 25/17 were 2.0 on 25/1 and 1.35 on
-    # 26/17. In dew-20261020144644-dceff433, the three tasks on 25/1 were
-    # the run's three slowest.
+    # Every suite task runs on AMD EPYC 25/17 or 26/17 (task.cpu): armada
+    # replaces a container on another CPU model before it takes a task, and a
+    # row is recorded, and reused, on the class it ran on. Of 1,264 containers
+    # in the 16 runs before 2026-10-20 15:00, 1,025 landed on 25/17; on
+    # 2026-10-29 the fleet gave 26/17 and 25/1 so often that runs pinned to
+    # 25/17 alone ended unplaced. Per-test median time ratios against 25/17
+    # were 2.0 on 25/1 and 1.35 on 26/17. In dew-20261020144644-dceff433, the
+    # three tasks on 25/1 were the run's three slowest.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
     # unreported each fail it. A commit armada already graded green, as one
@@ -226,11 +229,12 @@ jobs:
       group: >-
         ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
         || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && 'armada-base')
+        || (startsWith(github.ref_name, 'ci/stage-') && 'armada-stage')
         || 'armada' }}
       cancel-in-progress: false
       queue: max
     timeout-minutes: ${{ (startsWith(github.ref_name, 'ci/full-whole-') || startsWith(github.ref_name, 'ci/base-')
-      || github.ref_name == 'base/kernels') && 110 || 60 }}
+      || github.ref_name == 'base/kernels' || needs.scope.outputs.policy == 'off') && 110 || 60 }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -247,7 +251,13 @@ jobs:
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+        # The test cache's read-only token, for the plan armada runs here (.armada.json's local plan): the files
+        # whose rows the cache holds for exactly these inputs share one task (tools/armada/ci.py `reusable`).
+        # It reads records and never writes them; a fork's pull request receives no repository secret.
+        DEW_XLA_CACHE_READ_TOKEN: ${{ secrets.DEW_XLA_CACHE_READ_TOKEN }}
         DEW_TEST_CACHE: ${{ needs.scope.outputs.policy }}
+        # The whole suite's run alone runs the whole_suite cells (tools/armada/ci.py `selected`).
+        DEW_WHOLE_SUITE: ${{ startsWith(github.ref_name, 'ci/full-whole-') && '1' || '' }}
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
           ${{ (startsWith(github.ref_name, 'ci/full-whole-') && '48')
@@ -264,15 +274,28 @@ jobs:
         case "$GITHUB_REF_NAME" in ci/base-*|base/kernels|ci/full-whole-*) gangless=1 ;; *) gangless= ;; esac
         # A train's jobs (ci/batch-*, ci/fix-*), its gangs and its suite alike, start before any other while the
         # fleet is full, and lanes' runs at a head (verdict.sh, at -10) end their newest containers to let them in
-        # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers.
-        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; *) priority= ;; esac
+        # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers. A push to
+        # base/kernels, a base/<producer> promote and the background whole suite run at a lane's whole-suite priority
+        # (-10, verdict.sh's) within their pool of 48, so they never take containers from a train, a precheck or a
+        # lane's targeted run (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger). A train staged
+        # on the testing train's tip (ci/stage-*, its own concurrency group above) runs beside it, at 5: it publishes
+        # only after that train, so it takes what that train leaves (owner and Main, 2026-10-28). A push to main the
+        # queue did not grade (a direct push: a train's tip is proven and runs neither) is its tip's only test, and
+        # runs as a train's (Main, 2026-10-29: 34c949ee8's, at 0 on a full fleet, left a gang's fourth rank unplaced
+        # past its deadline).
+        case "$GITHUB_REF_NAME" in
+          ci/batch-*|ci/fix-*|main) priority=--priority=10 ;;
+          ci/stage-*) priority=--priority=5 ;;
+          ci/base-*|base/kernels|ci/full-whole-*) priority=--priority=-10 ;;
+          *) priority= ;;
+        esac
         if [ -z "$PROVEN" ] && [ -z "$gangless" ]; then
           # A gang member lost before the start fails it within 300 s (armada#22).
           items=$(python3 tools/armada/ci.py gangs)
           echo "$items" | setsid $armada map --commit=${{ github.sha }} --items=- --size=medium \
             --pool="$(echo "$items" | python3 -c 'import json, sys; print(sum(gang["gang"] for gang in json.load(sys.stdin)))')" \
             --deadline=1800 --gang-start-timeout=300 $priority \
-            --label="${{ github.ref_name }}" -- python3 tools/armada/ci.py pytest \
+            --label="$GITHUB_REF_NAME" -- python3 tools/armada/ci.py pytest \
             --python="$(tr -d '\n' < .python-version)" --report=/tmp/dew-gang.xml \
             -- -k "{select}" --basetemp=/tmp/dew-gang tests/test_multihost.py \
             > "$RUNNER_TEMP/gangs.log" 2>&1 &
@@ -282,14 +305,48 @@ jobs:
         # above what every file takes on its containers when no row is cached (a change to a module
         # most tests import, and the daily run, which proves the commit again with every file): 160,
         # or a background run's share.
-        if [ -n "$BACKGROUND_POOL" ]; then bound="--pool=$BACKGROUND_POOL --deadline=6000"; else bound="--deadline=2700"; fi
-        if [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; then
-          setsid $armada run ${{ github.sha }} $bound $priority --label="${{ github.ref_name }}" \
+        # A cold suite (the cache's policy off: a lock, JAX's build or the recorder changed) compiles everything
+        # anew, so its deadline is 5400 s (Main, 2026-10-28: train 254's cold suite left 780 tasks unstarted at 2,698 s).
+        if [ -n "$BACKGROUND_POOL" ]; then bound="--pool=$BACKGROUND_POOL --deadline=6000"
+        elif [ "$DEW_TEST_CACHE" = off ]; then bound="--deadline=5400"
+        else bound="--deadline=2700"; fi
+        # A train staged on the testing train's tip runs on the pool its branch names (ci/stage-...-p<N>: its lease's
+        # suite share, the land queue's promote.sh), so it asks no more than it leased (Main, 2026-10-28).
+        case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) bound="$bound --pool=${GITHUB_REF_NAME##*-p}" ;; esac
+        # A commit the proven job found proved (a run that passed, or, on main, the land queue's proof of the tip it
+        # graded green, red rows its regrade passed included) runs no suite again, whatever its stored verdict or the
+        # cache's policy; but for the background whole suite, which proves main's tip anew (train 237's review).
+        proven=$PROVEN
+        case "$GITHUB_REF_NAME" in ci/full-whole-*) proven= ;; esac
+        if [ -z "$proven" ] && { [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; }; then
+          setsid $armada run ${{ github.sha }} $bound $priority --label="$GITHUB_REF_NAME" \
             > >(tee "$RUNNER_TEMP/suite.log") 2> >(tee "$RUNNER_TEMP/suite.err" >&2) &
           suite=$!
         fi
         failed=0
         if [ -n "${suite:-}" ]; then wait "$suite" || failed=1; fi
+        # The whole suite's second job: its release checks, which its own tasks set aside, a task each requirement
+        # (ci.py release-plan, from the rows naming them as pytest resolved their marks), each pytest under uv's
+        # overlay of the requirement on the suite's environment, on the suite's CPU (2173).
+        # A verdict that cannot be read (armada's 2: none, or no answer) or a plan that fails fails the job: no
+        # release check is skipped unseen; none planned is the plan's own empty answer.
+        if [ -n "$DEW_WHOLE_SUITE" ]; then
+          read=0
+          $armada verdict ${{ github.sha }} --json > "$RUNNER_TEMP/verdict.json" || read=$?
+          if [ "$read" -gt 1 ]; then
+            echo "the suite's verdict could not be read (armada verdict exit $read): its release checks are unplanned"
+            failed=1
+          elif ! checks=$(python3 tools/armada/ci.py release-plan "$RUNNER_TEMP/verdict.json"); then
+            echo "the suite's release checks could not be planned (ci.py release-plan)"
+            failed=1
+          elif [ "$checks" != "[]" ]; then
+            echo "$checks" | $armada map --commit=${{ github.sha }} --items=- --size=medium \
+              --pool="$(echo "$checks" | jq length)" --deadline=1800 $priority --label="$GITHUB_REF_NAME" \
+              --cpu="$(jq -r '[.task.cpu] | flatten | map("\(.vendor)/\(.family)/\(.model)") | join(",")' .armada.json)" \
+              -- python3 tools/armada/ci.py release --python={python} --tests={tests} --requirement={release} \
+              --out=/tmp/dew-release.json || failed=1
+          fi
+        fi
         if [ -n "${gangs:-}" ]; then
           wait "$gangs" || failed=1
           echo "--- the multi-host gangs"

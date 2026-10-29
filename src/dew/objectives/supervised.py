@@ -29,6 +29,7 @@ from flax import linen as nn
 from dew.batch import FROZEN, Batch, Variables
 from dew.inputs import InputSpec
 from dew.nn import categorical
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Aux, Objective, Ratio, Source, Step, model_rngs
 
@@ -98,24 +99,34 @@ class Supervised(Objective[Ratio]):
         return self.model.init(key, sample, method="__call__", **mode)
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        # The model's own collections besides its parameters, such as a
-        # BatchNorm's running statistics, update as it runs, and the trainer
-        # keeps the updates (`Aux.variables`).
+        statistics, aux, _ = self._scored(variables, batch, step)
+        return statistics, aux
+
+    def scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, jax.Array]:
+        """`loss`'s statistics, from the one scoring `loss` makes, with each example's share of their
+        total: the sum of its losses, its row weighted as `row_mean` weights it."""
+        statistics, _, losses = self._scored(variables, batch, step)
+        weights = self.row_weights(batch, losses.shape[0])
+        shares = losses.reshape(losses.shape[0], -1).astype(at_least_fp32(losses.dtype)).sum(-1) * weights
+        return statistics, shares
+
+    def _scored(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux, jax.Array]:
+        """The batch's loss statistics and metrics with the losses they came from, one per example. The
+        model's own collections besides its parameters, such as a BatchNorm's running statistics,
+        update as it runs in training, and the trainer keeps the updates (`Aux.variables`)."""
         held = [name for name in variables if name not in ("params", FROZEN)] if step.training else []
         mode = {} if self.mode is None else {self.mode: step.training}
         outputs, updates = self.model.apply(variables, batch[self.field],
                                             rngs=model_rngs(step.key, training=step.training),
                                             mutable=held, method="__call__", **mode)
-        return self._scored(outputs, batch, dict(updates) if held else None)
-
-    def _scored(self, outputs: Outputs, batch: Batch, updates: Variables | None) -> tuple[Ratio, Aux]:
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:
             raise ValueError("the loss returns one loss per example, not their mean; Supervised "
                              "takes the mean over the batch's rows itself")
         metrics = {name: self.row_mean(metric(outputs, batch), batch).mean()[0]
                    for name, metric in self.metrics.items()}
-        return self.row_mean(losses, batch), Aux(metrics, variables=updates)
+        aux = Aux(metrics, variables=dict(updates) if held else None)
+        return self.row_mean(losses, batch), aux, losses
 
 
 def selected(outputs: Outputs, output: tuple[int | str, ...]) -> jax.Array:

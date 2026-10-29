@@ -19,6 +19,7 @@ from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, import_path
 
 from . import joint_checkpoint
@@ -35,7 +36,7 @@ from .task import Decide
 class DecisionHeadSource(HeadComponent):
     """The head constructor reads the native backbone's output width and compute dtype."""
 
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str, *,
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         held = _records.record(self.record, "head")
         fields = _records.record(held["fields"], "head.fields")
@@ -112,6 +113,11 @@ class PretrainedDecision(Pretrained):
                    calibration=calibration, decision_tokenizer=tokenizer, writer=writer, exporter=exporter)
 
 
+LAYA_BUDGETS = {"head_max_len": 192, "option_tokens": 48}
+"""The question budgets Laya's release declares where its config states none: the tokens its question
+and options share, and the most one option keeps (`QuestionLayout.head_max_len`, `option_tokens`)."""
+
+
 def _save_laya(bundle: PretrainedDecision, directory: str | Path, *,
                max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
     Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
@@ -150,12 +156,14 @@ class DecisionSource(SourceKind):
                 {"class": import_path(DecisionHead), "fields": {
                     "layers": _records.integer(config.get("head_layers", 2), "head_layers")}},
                 _head_path, IN_PROJ)
-            layout = MarkerLayout(
-                max_len=_records.integer(config.get("max_len", 512), "max_len"),
-                head_max_len=_records.integer(config.get("head_max_len", 192), "head_max_len"),
-                option_tokens=_records.integer(config.get("option_tokens", MarkerLayout.option_tokens),
-                                              "option_tokens"),
-                parallel=config.get("option_layout", "sequential") == "parallel")
+            # The release's own budgets, as its config states them, Laya's where it states none; a
+            # budget it states as null keeps that part of the question whole.
+            head_max_len, option_tokens = (
+                None if (value := config.get(name, default)) is None else _records.integer(value, name)
+                for name, default in LAYA_BUDGETS.items())
+            layout = MarkerLayout(max_len=_records.integer(config.get("max_len", 512), "max_len"),
+                                  head_max_len=head_max_len, option_tokens=option_tokens,
+                                  parallel=config.get("option_layout", "sequential") == "parallel")
             values = config.get("temperature", [1.0, 1.0, 1.0])
             if not isinstance(values, list) or len(values) != 3:
                 raise ValueError("temperature lists choice, score and noul")

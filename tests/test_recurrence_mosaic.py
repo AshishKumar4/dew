@@ -30,7 +30,7 @@ from test_recurrence_chunk import (
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, mosaic_rule
-from dew.nn.kernels.templates import bundles, mosaic
+from dew.nn.kernels.templates import bundles, mosaic, product, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import mainloop, template
 
@@ -94,13 +94,30 @@ def interpreted(grid: list[tuple], chosen: set[tuple]) -> list:
             for values in grid]
 
 
+INTERPRETED_HEADS = {'one sequence': {'key_heads': 1, 'value_heads': 2, 'value_width': 64},
+                     'packed documents': {'value_heads': 2}}
+"""Off a GPU, the cases' heads and values narrowed to what each still checks (one sequence two key blocks and
+a key head's group of value heads, packed documents their starts on and off the chunks' grid): the
+interpreted gradient of one sequence took 300 to 390 s and of packed documents 535 to 688, past the suite's
+240 a test (row 1850); narrowed, 131 s and 336 s: one value head, or two chunks, left the packed log decay
+unresolved within 40 seeds, its extra seeds taking 784 and 934 s."""
+
+
 def geometry(case: str) -> dict:
-    """Case `case`'s operands as `SHAPES` gives them, shortened off a GPU of a family a bundle claims
-    (`INTERPRETED_LENGTH`)."""
+    """Case `case`'s operands as `SHAPES` gives them, shortened and narrowed off a GPU of a family a bundle
+    claims (`INTERPRETED_LENGTH`, `INTERPRETED_HEADS`)."""
     shape = SHAPES[case]
     if mainloop.family_of() is not None:
         return shape
-    return {**shape, 'rows': 1, 'length': min(shape['length'], INTERPRETED_LENGTH)}
+    return {**shape, 'rows': 1, 'length': min(shape['length'], INTERPRETED_LENGTH),
+            **INTERPRETED_HEADS.get(case, {})}
+
+
+PACKED_DOCUMENTS = 5
+"""The most documents a row of a packed draw holds (`draw`'s starts: its first row's five), the bound a
+packed call takes as a layer passes its batch's (`max_segments`): the template lays its launches for that
+many sequences a row, where unbounded it lays a row's every token (row 1850: the interpreted gradient's
+template arm 60 s a seed unbounded, 35 bounded)."""
 
 
 def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_heads: int, key_width: int,
@@ -136,19 +153,26 @@ def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_head
                   log_decay=log_decay, beta=beta.astype(dtype), state=state, starts=starts),)
 
 
+def template_call(given: Chunk, hooks: recurrence.Hooks):
+    """The template's call over `given`'s operands under `hooks`, as the chunked op hands them over
+    (`recurrence_chunk.chunk`): no decay a zero log decay a head, no write gate ones, the rule's form its
+    hooks'."""
+    heads = given.value.shape[:3]
+    g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
+    beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
+    # The l2 norm takes the queries and keys to fp32 at least before the rule reads them.
+    query, key = ((x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in (given.query, given.key))
+                  if hooks.l2norm else (given.query, given.key))
+    return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
+                                delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
+                                floor=hooks.floor)
+
+
 def taken(given: Chunk, hooks: recurrence.Hooks) -> bool:
     """Whether the template takes a call over `given`'s operands under `hooks` on the device its launches run
     for (`Mosaic.eligible`: every launch's shared memory and registers within a block's and a thread's, a
     decay a key dimension's declared floor)."""
-    # The operands as the chunked op hands them over (`recurrence_chunk.chunk`): no decay a zero log decay a
-    # head, no write gate ones, the rule's form its hooks'.
-    heads = given.value.shape[:3]
-    g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
-    beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
-    bound = template.MOSAIC.bind(given.query, given.key, given.value, g, beta, given.state, given.starts,
-                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
-                                 floor=hooks.floor)
-    return template.MOSAIC.eligible(bound, template.Mosaic.launched())
+    return template.MOSAIC.eligible(template_call(given, hooks), template.Mosaic.launched())
 
 
 REFUSED = (Unfitted, NotImplementedError)
@@ -186,9 +210,10 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
         if max(launch.shared for launch in launches) > generation.shared_budget(template.Mosaic.launched()):
             return None
 
-    def rule(given: Chunk):
+    def rule(given: Chunk, max_segments: int | None = None):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
-                           tiles=narrowest, starts=given.starts, scale=hooks.scale, floor=hooks.floor)
+                           tiles=narrowest, starts=given.starts, max_segments=max_segments, scale=hooks.scale,
+                           floor=hooks.floor)
 
     return rule
 
@@ -275,12 +300,83 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
                         seeds=SEEDS, truth_fn=truth)
 
 
-def test_a_gated_delta_net_named_onto_the_template_runs_it_and_matches_the_portable_rule():
-    """A layer whose route names the template (`generation.chosen(gated_delta_rule='mosaic_gpu')`) runs it:
-    its probe ahead of the gates (`on_the_port`, which binds no launches) takes the selector's own pick, not
-    a refusal, and the rule then takes the template, its output on par from float64 with the portable
-    rule's (the layer's own float64 forward the truth). The layer computes in bf16, the call the template's
-    launches hold on every family (an fp32 call's solve holds more registers than a thread has)."""
+@pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
+def test_the_mosaic_launches_state_their_work(training):
+    """A bf16 gated delta rule's forward, or its forward and gradient, through the template, lowered for the
+    GPU the test runs on, or off one an H100 (Mosaic GPU lowers no Hopper copy for an A100's device):
+    every launch states its cost (`_kernel`'s, `templates.gemm.cost`), which Dew's FLOP count reads to
+    size it (`instrumentation._stated_flops`: no launch unsized, row 1895's kernel report), their products
+    together at least the model's recurrent function's (`flops.delta_flops`: the chunked form's preparation
+    and inversion are work past it)."""
+    import re
+
+    from dew.nn.flops import delta_flops
+    from dew.telemetry.instrumentation import _stated_flops
+
+    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 128
+    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+
+    def rule(*operands):
+        return mosaic_rule(*operands, tiles=mainloop.Tiles(32, 1))[0].astype(jnp.float32).sum()
+
+    lowered_for = generation.device_generation() if mainloop.family_of() is not None else "sm90"
+    with generation.assumed(lowered_for):
+        fn = jax.grad(rule, argnums=(0, 1, 2)) if training else rule
+        text = jax.jit(fn).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
+    launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+    assert launches and all(_stated_flops(line) is not None for line in launches)
+    model = delta_flops(np.asarray([length] * rows), value_heads, width, width)
+    assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
+
+
+def test_each_launch_lowers_once_however_many_layers_call_it():
+    """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
+    test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the
+    lowered program, which both layers call (`mainloop._lowered_once`), as many as one layer's. Each call
+    site traced, lowered and serialized its own kernel: a Qwen3.5-4B step's first update waited 30 minutes
+    on its layers' identical kernels (row 2102)."""
+    import re
+
+    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 128
+    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+
+    def layers(count: int):
+        def run(query, key, value, g, beta):
+            total = jnp.float32(0.0)
+            for layer in range(count):
+                # Each layer's own queries, as each layer projects its own.
+                scaled = query * (layer + 1)
+                out = mosaic_rule(scaled, key, value, g, beta, tiles=mainloop.Tiles(32, 1))[0]
+                total = total + out.astype(jnp.float32).sum()
+            return total
+
+        return jax.grad(run, argnums=(0, 1, 2))
+
+    # The GPU the test runs on where its family takes the call, else an H100 (Mosaic GPU lowers no Hopper
+    # copy for an A100's device).
+    lowered_for = generation.device_generation() if mainloop.family_of() is not None else "sm90"
+
+    def kernels(count: int) -> int:
+        with generation.assumed(lowered_for):
+            text = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(
+                dialect="hlo")
+        return len([line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)])
+
+    one = kernels(1)
+    assert one > 0 and kernels(2) == one
+
+
+def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
+    """A layer naming the template (`generation.chosen(gated_delta_rule='mosaic_gpu')`): its output on par
+    from float64 with the portable rule's (the layer's own float64 forward the truth). The layer computes
+    in bf16, the call the template's launches hold on every family (an fp32 call's solve holds more
+    registers than a thread has)."""
     from dew.nn.linear import GatedDeltaNet
 
     x = jax.random.normal(jax.random.key(23), (1, 72, 64)).astype(jnp.bfloat16)
@@ -289,20 +385,19 @@ def test_a_gated_delta_net_named_onto_the_template_runs_it_and_matches_the_porta
     with generation.chosen(gated_delta_rule='xla'):
         params = layer.init(jax.random.key(29), x)
         want = layer.apply(params, x)
-    with generation.chosen(gated_delta_rule='mosaic_gpu'), generation.routes() as taken:
+    with generation.chosen(gated_delta_rule='mosaic_gpu'):
         got = layer.apply(params, x)
-    assert any(route.choice == 'gated_delta_rule' and route.kernel == 'mosaic_gpu' for route in taken)
     truth, terms = float64_forward(layer, params, x)
     assert_as_exact_as_the_reference(got, want, truth, 'a layer named onto the template', terms=terms)
 
 
 def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
-    """An fp32 operand's three bf16 parts (`mainloop._split`) are finite and sum to it exactly, at fp32's
+    """An fp32 operand's three bf16 parts (`product.formed`) are finite and sum to it exactly, at fp32's
     largest finite values too, past bf16's: its first part saturates there, where rounding would make it
     infinite and its remainder NaN."""
     largest = float(jnp.finfo(jnp.float32).max)
     x = jnp.array([largest, -largest, 1.0 + 2.0 ** -20, -3.0e-30, 0.0], jnp.float32)
-    parts = mainloop._split(x)
+    parts = product.formed(x, mainloop.PARTS)
     assert all(bool(jnp.all(jnp.isfinite(part))) for part in parts)
     total = sum(np.asarray(part, np.float64) for part in parts)
     np.testing.assert_array_equal(total, np.asarray(x, np.float64))
@@ -341,18 +436,52 @@ RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kd
 key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
 
 
-def compiled_cases(target: str, plans: dict, refused: list) -> list:
-    """The resource gate's cases on `target` (`KernelCase`s): each `RESOURCE_SHAPES` geometry's forward in a
-    16-bit and an fp32 call, one row and packed documents, and the gated delta rule's 16-bit training pass,
-    at the template's derived tiles and, one row's forward, at each of their variants; each case's plan by
-    its label into `plans` (`mainloop.planned`), each call the template refuses into `refused`."""
+def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.RegisterModel:
+    """A launch's register model as the compile gate decides on it (`resources.register_model`,
+    `kernel_compile.decisions`): its stated registers (`Launch.registers`) at its consumer roles
+    (`Launch.consumers`, a walk's `Tiles.walkers`)."""
+    return resources.register_model(family, launch.consumers, launch.registers)
+
+
+class Unbudgeted(template.Mosaic):
+    """The recurrence template with every launch's registers held: its derivation takes the tile it would
+    where only registers refuse one (`compiled_cases`' refused tiles)."""
+
+    def _held(self, ba, config) -> bool:
+        del ba, config
+        return True
+
+
+GATE_GROUPS = [(name, dtype, training, packed, variants) for name in RESOURCE_SHAPES
+               for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True)
+               for training in (False, True) for variants in (False, True)
+               if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
+               and not (training and (name, dtype) != ('qwen3.5-27b-gdn', jnp.bfloat16))
+               and not (variants and (training or packed))]
+"""The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group:
+every geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the gated delta
+rule's 16-bit training pass (Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key
+dimension); one row's forward at its derived tiles apart from its variants (`variants`). One test compiling
+them all took 674 seconds on sm90, a group with its variants 132 on sm80."""
+
+
+def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None = None) -> list:
+    """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
+    1971): each `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed
+    documents, and the gated delta rule's 16-bit training pass, at the template's derived tiles and, one row's
+    forward, at each of their variants; beside them the tiles the derivation takes where every register held
+    (`Template._held`) and refused for registers alone, and the fast backward its launches' registers refuse,
+    so a model over ptxas's need fails as one under it does. Each case's plan by its label into `plans`
+    (`mainloop.planned`), each call the template refuses into `refused`."""
     from fla_gdn_support import KernelCase
 
     family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
     rows, length = 1, 256
+    shared = generation.shared_budget(facts)
 
-    def cases(name: str, dtype, *, training: bool, packed: bool) -> list:
-        """The case's kernels at its derived tiles and, one row's forward, at each of its variants."""
+    def cases(name: str, dtype, *, training: bool, packed: bool, variants: bool) -> list:
+        """The case's kernels at its derived tiles, or, one row's forward, at each of its other variants
+        (`variants`)."""
         key_heads, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
 
         def array(*shape, kind=dtype):
@@ -368,31 +497,56 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
                                      floor=FLOOR if per_key else None)
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
+            held = Unbudgeted().derived(bound, facts)
+            # The tile the derivation takes where every register held, refused for its registers alone.
+            unheld = [] if held is None or held == derived else [(held, 'refused ')]
+            if derived is None and variants:
+                return []
             if derived is None:
                 # Refused: a launch's registers or shared memory past the device's at every tile.
                 refused.append(f"{name} {jnp.dtype(dtype).name}{' training' if training else ''}")
                 assert not template.MOSAIC.eligible(bound, facts)
-                return []
-            variants = template.MOSAIC.variants(bound)
+                return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
+                             kind=kind) for tiles, kind in unheld]
+            tiled = template.MOSAIC.variants(bound)
+            if variants:
+                return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
+                             kind='') for tiles in tiled[1:]]
             if training and not mainloop.backward_holds(
-                    *args, tiles=derived, family=family, shared=generation.shared_budget(facts),
-                    starts=starts, max_segments=8 if packed else None):
+                    *args, tiles=derived, family=family, shared=shared, starts=starts,
+                    max_segments=8 if packed else None):
                 # The rule's gradient is the port's or the portable math's where the fast backward's
-                # launches do not hold (`mainloop.backward_holds`): no launch of it to compile.
+                # launches do not hold (`mainloop.backward_holds`); where only their registers refuse them,
+                # the gate compiles them, held to ptxas's need.
                 refused.append(f"{name} {jnp.dtype(dtype).name} fast backward{' packed' if packed else ''}")
-                return []
-        assert variants[0] == derived, f"{name} on {target}: variants {variants} lead with no {derived}"
-        return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed)
-                for tiles in (variants[:1] if training or packed else variants)]
+                launches = template.MOSAIC._launches(bound, derived, facts, backward=True)
+                if any(launch.shared > shared for launch in launches):
+                    return []
+                return [case(name, dtype, args, starts, bound, derived, training=True, packed=packed,
+                             kind='refused ')]
+        assert tiled[0] == derived, f"{name} on {target}: variants {tiled} lead with no {derived}"
+        derived_tiles = [(derived, '')]
+        # The walks at two consumer roles a program (`Tiles.walkers`), which the derivation gives a call
+        # whose walks fill more than a wave and these shapes never do: a role's registers are its share
+        # of the program's.
+        value_width = RESOURCE_SHAPES[name][3]
+        two = (template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
+                                       wide=derived.block_o or derived.block_v)
+               if family.consumers >= 2 and not packed and value_width // derived.block_v % 2 == 0 else None)
+        walked = [] if two is None else [(two, 'two roles ')]
+        # A forward without a gradient at its own tiles (`Tiles.forward`), which no fast backward narrows.
+        alone = [] if training or derived.forward is None else [(derived.forward, 'alone ')]
+        return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
+                for tiles, kind in derived_tiles + walked + alone + ([] if training else unheld)]
 
-    def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool):
+    def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
 
         def array(*shape, kind=dtype):
             return jax.ShapeDtypeStruct(shape, kind)
 
         label = (f"{name} {jnp.dtype(dtype).name} {'training' if training else 'forward'}"
-                 f"{' packed' if packed else ''} {tiles}")
+                 f"{' packed' if packed else ''} {kind}{tiles}")
         plans[label] = template.MOSAIC._launches(bound, tiles, facts, backward=training)
 
         def call():
@@ -410,77 +564,58 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
 
             return fn, (*given, *([starts] if packed else []))
 
-        return KernelCase(label, call)
+        return KernelCase(label, call, {launch.name: _model(launch, family) for launch in plans[label]})
 
-    # Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key dimension (`forward`).
-    compiled = [kernel for name in RESOURCE_SHAPES for dtype in (jnp.bfloat16, jnp.float32)
-                for packed in (False, True) if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
-                for kernel in cases(name, dtype, training=False, packed=packed)]
-    return compiled + [kernel for packed in (False, True)
-                       for kernel in cases('qwen3.5-27b-gdn', jnp.bfloat16, training=True, packed=packed)]
+    return [kernel for group in (GATE_GROUPS if only is None else [only])
+            for kernel in cases(group[0], group[1], training=group[2], packed=group[3], variants=group[4])]
 
 
-def resource_failures(found: list, plans: dict, family: mosaic.Family) -> list[str]:
-    """The compiled cases' failures (`compile_mosaic_kernels`' records): a case that compiled no kernel; a
-    kernel past its target's shared or tensor memory, or past its plan's shared memory; a kernel that
-    spilled whose launch's stated registers its family's thread holds (`Launch.registers` within
-    `Family.registers`, the template's legality), so a legal config never spills; and a kernel with no
-    register report (ptxas's), which a kernel whose module an earlier case compiled takes from that compile
-    (`kernel_compile.inherited`)."""
-    def planned(record: dict, kernel: dict, resource: str) -> int | None:
-        """The case's plan's `resource` ('shared', 'registers') for the kernel's launch, None where no launch
-        of the plan names it."""
-        named = [getattr(launch, resource) for launch in plans[record['name']]
-                 if kernel['kernel'].startswith(launch.name)]
-        return max(named, default=None)
+def planned_failures(found: list, plans: dict) -> list[str]:
+    """Each compiled kernel past its plan's shared memory (`mainloop.planned`'s launch of its name, from
+    which the tiles are derived): the recurrence's shared-memory model, beside the register model the shared
+    gate holds to ptxas (`kernel_compile.mosaic_failures`)."""
+    def planned(record: dict, kernel: dict) -> int:
+        return max((launch.shared for launch in plans[record['name']]
+                    if kernel['kernel'].startswith(launch.name)), default=0)
 
-    def within(record: dict, kernel: dict) -> bool:
-        """Whether Mosaic's report states the kernel's shared and tensor memory, within the target's."""
-        if {'shared bytes', 'tensor memory columns'} & set(kernel['unread']):
-            return False
-        return kernel['shared'] <= record['limit'] and kernel['tmem'] <= record['tmem_limit']
-
-    kernels = [(record, kernel) for record in found for kernel in record.get('kernels', ())]
-    budget = family.registers(1)
-    unreported = [f"{record['name']} {kernel['kernel']}: no register report, and no earlier case compiled "
-                  f"its module" for record, kernel in kernels
-                  if {'registers', 'spills'} & set(kernel['unread'])]
-    return ([f"{record['name']}: {record.get('error', 'no Mosaic GPU kernel compiled')}" for record in found
-             if 'error' in record or not record.get('kernels')]
-            + [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes (limit "
-               f"{record['limit']}), {kernel['tmem']} tensor memory columns (limit {record['tmem_limit']})"
-               for record, kernel in kernels if not within(record, kernel)]
-            + [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes past its plan's "
-               f"{planned(record, kernel, 'shared')}" for record, kernel in kernels
-               if kernel['shared'] is not None
-               and not kernel['shared'] <= (planned(record, kernel, 'shared') or 0)]
-            + [f"{record['name']} {kernel['kernel']}: {kernel['spilled']} bytes spilled, its stated "
-               f"{planned(record, kernel, 'registers')} registers within the {budget} a thread holds"
-               for record, kernel in kernels
-               if kernel.get('spilled') and (planned(record, kernel, 'registers') or 0) <= budget]
-            + unreported)
+    return [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes past its plan's "
+            f"{planned(record, kernel)}" for record in found for kernel in record.get('kernels', ())
+            if kernel['shared'] is not None and not kernel['shared'] <= planned(record, kernel)]
 
 
-@pytest.mark.parametrize('target', ['sm80', 'sm90'])
-def test_the_mosaic_mainloop_compiles_within_each_gpus_shared_memory(target):
+def _gated(target: str, group: tuple):
+    """The gate's test of `target` and `group`: an A100's Kimi forward, whose refused launches spill (its
+    model and ptxas agreeing on the refusal), compiles past a group's two minutes (136 seconds), so it runs
+    on the whole suite."""
+    name, dtype, training, packed, variants = group
+    label = (f"{target}-{name}-{jnp.dtype(dtype).name}-{'training' if training else 'forward'}"
+             f"{'-packed' if packed else ''}{'-variants' if variants else ''}")
+    marks = [pytest.mark.whole_suite] if target == 'sm80' and RESOURCE_SHAPES[name][4] else []
+    return pytest.param(target, group, marks=marks, id=label)
+
+
+@pytest.mark.parametrize('target, group', [_gated(target, group) for target in ('sm80', 'sm90')
+                                           for group in GATE_GROUPS])
+def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target, group):
     """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
     CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
     227 KB) and tensor memory and at most its plan's shared memory (`mainloop.planned`, from which the tiles
-    are derived), and no launch the template's legality holds spills a register (`resource_failures`): the
-    gate's three resources. Lowering alone takes no device's budget: a launch past an A100's shared memory
-    lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
-    rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds
+    are derived, `planned_failures`), no launch the template's legality holds spills a register, and each
+    launch's register model decides as ptxas's need does, admitting a tile or refusing it (row 1971,
+    `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's
+    shared memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated
+    delta rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds
     for its own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the newer
-    targets are the CPU suite's alone."""
+    targets are the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
     if jax.default_backend() == 'gpu':
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
             pytest.skip(f"this host's ptxas builds for its {local} GPU and before, not {target}")
-    from kernel_compile import compile_mosaic_kernels
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     plans, refused = {}, []
-    found = compile_mosaic_kernels(compiled_cases(target, plans, refused), target)
-    failed = resource_failures(found, plans, bundles.of(target, jnp.bfloat16))
+    found = compile_mosaic_kernels(compiled_cases(target, plans, refused, only=group), target)
+    failed = mosaic_failures(found) + planned_failures(found, plans)
     failed += [f"{case}: no tiles derived" for case in refused
                if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
     assert not failed, "\n".join(failed)

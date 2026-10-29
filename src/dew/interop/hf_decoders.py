@@ -48,11 +48,13 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Reading,
+    SourceCode,
     WrapperFields,
     _unread,
     held_parts,
     hf_activation,
     modeling_overrides,
+    part_plan,
     record_float,
     record_int,
     refuse,
@@ -121,11 +123,19 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     return translate_config(_text_config(hf_config))
 
 
+_TEXT_TYPES = {"lfm3_vl": "lfm3"}
+"""A wrapper's text model type where its config class builds another than `<wrapper>_text`: Lfm3VlConfig
+defaults its text_config to Lfm3Config (configuration_lfm3_vl.py, `__post_init__`)."""
+
+
 def _typed(hf_config: Mapping[str, object], nested: Mapping[str, object], part: str) -> Mapping[str, object]:
     """A wrapper's nested `part` config (text, vision or audio), typed as its wrapper declares it where it
-    names no type: `<wrapper model_type>_<part>`, the class the wrapper config builds from a raw dict
-    (its `sub_configs`), so a checkpoint's copy need not repeat the tag. A stated type stays."""
-    return {"model_type": f"{_records.text(hf_config['model_type'], 'model_type')}_{part}", **nested}
+    names no type: `<wrapper model_type>_<part>` (a text config `_TEXT_TYPES`' type), the class the
+    wrapper config builds from a raw dict (its `sub_configs`), so a checkpoint's copy need not repeat the
+    tag. A stated type stays."""
+    wrapper = _records.text(hf_config['model_type'], 'model_type')
+    default = _TEXT_TYPES.get(wrapper, f"{wrapper}_text") if part == "text" else f"{wrapper}_{part}"
+    return {"model_type": default, **nested}
 
 
 def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -336,6 +346,33 @@ def _muse_glimmer_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
     return _wrapper_fields("muse_glimmer", used, text, tower, projector, image, None, video=video)
 
 
+def _lfm3_vl_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read an LFM3-VL wrapper (LiquidAI/LFM3-VL-2B): its LFM3 decoder under text_config. Its vision tower
+    (`lfm3_vl_vision`, convolutions between attention over patches) and its projector have no Dew port,
+    so a load reads its language model alone (`text_only`; `WrapperFields.unported`). d1's checkpoints
+    of it (LiquidAI/d1-2B) train their full-attention layers under a visibility of their own
+    (`d1_attention`), which no Dew layout reads: a load refuses it, the language model's function being
+    that visibility's."""
+    attention = hf_config.get("d1_attention")
+    if attention is not None:
+        refuse(f"d1_attention {attention!r}",
+               "d1 trains its full-attention layers to see across a state and its questions as no Dew "
+               "decision layout reads yet")
+    text = _wrapper_text(hf_config, used)
+    used.update(("downsample_factor", "projector_bias", "projector_hidden_act", "projector_hidden_size",
+                 "projector_layer_norm_eps", "video_token_id", "vision_start_token_id", "vision_end_token_id",
+                 "auto_map", "bos_token_id", "eos_token_id", "pad_token_id", "dtype"))
+    # Lfm3VlConfig's placeholders where a config leaves them out (configuration_lfm3_vl.py).
+    image = _defaulted_token_id(hf_config, used, "image_token_id", 125030)
+    video = _defaulted_token_id(hf_config, used, "video_token_id", 125029)
+    fields = _wrapper_fields("lfm3_vl", used, text, None, None, image, None, video=video)
+    fields["text_model_type"] = _records.text(_text_config(hf_config)["model_type"], "text_config.model_type")
+    fields["unported"] = {
+        "vision_tower.": "LFM3-VL's vision tower (lfm3_vl_vision) has no Dew port",
+        "multi_modal_projector.": "LFM3-VL's projector reads its vision tower, which has no Dew port"}
+    return fields
+
+
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Read a Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
@@ -357,7 +394,7 @@ _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
     **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
-    "muse_glimmer": _muse_glimmer_wrapper}
+    "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
@@ -406,6 +443,9 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     audio = record.get("audio_projector") is not None
     bundled = _bundled(record["model_type"])
     bare = name.removeprefix("model.")
+    for prefix in record.get("unported", {}):
+        if bare.startswith(prefix):
+            return "unported", bare
     if bare.startswith("language_model."):
         tail = bare[len("language_model."):]
         return "language_model", tail if tail.startswith(
@@ -453,16 +493,29 @@ def _equal(read: Callable[[str], Stored], first: str, second: str, checked: Chec
     return second in checked.get(first, frozenset()) or equal(read(first), read(second))
 
 
+def refuse_unported(record: WrapperFields) -> None:
+    """Refuse a whole load of a wrapper whose media components Dew has no port of (`WrapperFields.unported`),
+    naming each and the language model alone a load takes (`text_only`)."""
+    unported = record.get("unported", {})
+    if unported:
+        refuse(f"{record['model_type']}'s {', '.join(sorted(unported))}",
+               f"{'; '.join(unported[prefix] for prefix in sorted(unported))}; text_only=True loads its "
+               "language model alone")
+
+
 def _wrapper_sources(names: Collection[str], read: Callable[[str], Stored], record,
                      checked: Checked = NOTHING_CHECKED):
     """Route source names once, checking any names that claim one local leaf.
-    The table retains names, not decoded arrays, so read can be a codec accessor.
+    The table retains names, not decoded arrays, so read can be a codec accessor. A name of a component
+    Dew has no port of refuses the whole load (`refuse_unported`).
     """
     sources: dict[str, dict[str, str]] = {name: {} for name in (
         "language_model", "tower", "projector", "audio_tower", "audio_projector")}
     aliases: list[tuple[str, str]] = []
     for name in names:
         group, local = wrapper_route(name, record)
+        if group == "unported":
+            refuse_unported(record)
         previous = sources[group].get(local)
         if previous is not None:
             if not _equal(read, previous, name, checked):
@@ -495,9 +548,13 @@ def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, objec
 def language_model_names(names: Collection[str], read: Callable[[str], Stored], record: WrapperFields,
                          checked: Checked = NOTHING_CHECKED) -> dict[str, str]:
     """Each tensor name of a wrapper's language model, as its text family reads it, to the wrapper's
-    name of it (`wrapper_route`). The media towers' names are not among them, nor read: only the
+    name of it (`wrapper_route`). The media towers' names are not among them, nor read, nor a bundle's
+    decoder tensors that serve its media alone (`DecoderFamily.wrapper_media_suffixes`): only the
     language model's spellings of one tensor are compared."""
-    own = [name for name in names if wrapper_route(name, record)[0] == "language_model"]
+    bundled = _bundled(record["model_type"])
+    media = () if bundled is None else bundled.wrapper_media_suffixes
+    own = [name for name in names if wrapper_route(name, record)[0] == "language_model"
+           and not name.endswith(media)]
     return _wrapper_sources(own, read, record, checked)[0]["language_model"]
 
 
@@ -853,14 +910,12 @@ def read_decoder(
             continue
         stored = held(part.tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
-        # torch Linear holds [out, in]; a stacked expert kernel arrives
-        # [E, in, out], which is the layout dew keeps.
-        insert(
-            variables,
-            path,
-            SourceLeaf((stored,), dtype, transposed=path[-1] == "kernel" and stored.ndim == 2),
-            name,
-        )
+        # The part's plan (`part_plan`): torch Linear holds [out, in]; a stacked expert kernel arrives
+        # [E, in, out], which is the layout dew keeps. Each expert's slice goes in at its own path
+        # until `_stack_experts` stacks them.
+        plan = part_plan(part, stored, family)
+        transposed = plan is not None and plan.order is not None
+        insert(variables, path, SourceLeaf((stored,), dtype, transposed=transposed), name)
     _stack_experts(params)
     return (variables if lazy else materialize(variables)), readings
 
@@ -1005,6 +1060,8 @@ def export_config(model) -> Mapping[str, object]:
     config: dict[str, object] = {
         'model_type': family.export_model_type,
         'architectures': [family.architecture],
+        # The release's own code, which `PretrainedDecoder.from_model` writes beside the export.
+        **({} if family.release_code is None else {'auto_map': dict(family.release_code.auto_map)}),
         'hidden_size': model.emb_features,
         'num_hidden_layers': model.num_layers,
         'num_attention_heads': model.num_heads,
@@ -1078,7 +1135,7 @@ def export_config(model) -> Mapping[str, object]:
     # nested rope_parameters (modeling_olmo3.py:277-291, the spelling
     # Olmo3Config.to_dict writes); a reference with one table for the whole
     # model cannot say it, so that is refused naming the kinds.
-    tables = {kind: model.kind_of(kind).yarn or model.kind_of(kind).rope_scaling
+    tables = {kind: model.kind_of(kind).rope_scaling
               for kind in sorted(set(types))}
     ramped = {kind: table for kind, table in tables.items() if table is not None}
     per_kind = bool(ramped) and (set(ramped) != set(tables)
@@ -1187,6 +1244,12 @@ def bundles(config: Mapping[str, object]) -> bool:
             and config.get("vision_config") is not None)
 
 
+def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:
+    """A media bundle's config as its family's text checkpoint states it: the same record without its
+    vision_config, which its decoder family reads as text alone."""
+    return {name: value for name, value in config.items() if name != "vision_config"}
+
+
 @functools.cache
 def families() -> dict[str, DecoderFamily]:
     """The single mutable name table, also used for registered source aliases."""
@@ -1199,6 +1262,12 @@ def family_entry(family: str | DecoderFamily) -> DecoderFamily:
 
 def _family_of(fields: CausalTransformer) -> DecoderFamily:
     return next(family for family in ENTRIES if family.matches(fields))
+
+
+def release_code(model: CausalTransformer) -> SourceCode | None:
+    """The release whose own code is the exported family's reference (`DecoderFamily.release_code`),
+    or None for a family transformers implements."""
+    return _family_of(model).release_code
 
 
 def _family_for_config(config: Mapping[str, object]) -> DecoderFamily:

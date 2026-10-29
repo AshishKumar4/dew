@@ -83,8 +83,9 @@ PARTS = (
     ("mlp", r"/mlp/|gate_proj|up_proj|down_proj|SwiGLU|experts|nn/moe\.py"),
     ("embedding", r"[Ee]mbed|table_rows|wte|tok_emb"),
 )
-CALL_KINDS = {"gemm": "gemm", "convolution": "gemm", "attention": "attention", "triton": "pallas"}
-"""A custom call's kind here, from `custom_call_kind`'s: Pallas lowers to Triton calls."""
+CALL_KINDS = {"gemm": "gemm", "convolution": "gemm", "grouped_gemm": "gemm", "attention": "attention",
+              "triton": "pallas", "mosaic_gpu": "pallas", "mosaic_tpu": "pallas"}
+"""A custom call's kind here, from `custom_call_kind`'s: Pallas lowers to Triton and Mosaic calls."""
 FUSED_KINDS = (
     ("gemm", {"dot", "convolution"}),
     ("gather_scatter", {"gather", "scatter"}),

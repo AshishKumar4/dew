@@ -44,6 +44,7 @@ import scipy.linalg
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
+from dew.batch import prefix_sum
 from dew.mesh import LayoutRefused, logical_spec, mesh_axes
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
@@ -71,6 +72,11 @@ GROUPS = {"image_groups": "cached_image_groups", "block_groups": "cached_block_g
 layer reads it (`Append.groups`), by the field's name."""
 POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale", PLACES, *GROUPS.values()})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
+ROUNDING_KEYS = "rounding_keys"
+"""A per-row cache leaf, each row's key data of its stochastic-rounding stream `[rows, words]`, which a
+decoding layer that rounds stochastically (a quantized memory's moving weights) folds with each token's
+place and head, so a row's draws are its request's key's and its places' alone; a serving driver writes
+it from the request's key (`with_rounding_keys`), zeros where none does."""
 
 _LIMITS = {"int8": 127.0, "float8_e4m3fn": float(jnp.finfo(jnp.float8_e4m3fn).max)}
 
@@ -84,6 +90,19 @@ def leaf_name(path: tuple[jax.tree_util.KeyEntry, ...]) -> str | None:
         return None
     name = last.key
     return name if isinstance(name, str) else None
+
+
+def with_rounding_keys(cache: Mapping[str, object], keys: jax.Array) -> Mapping[str, object]:
+    """`cache` with every `ROUNDING_KEYS` leaf holding `keys`, each row's key data."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, leaf: keys.astype(leaf.dtype) if leaf_name(path) == ROUNDING_KEYS else leaf, cache)
+
+
+def with_rounding_keys_of(fresh: Mapping[str, object], held: Mapping[str, object]) -> Mapping[str, object]:
+    """`fresh`, a cache allocated anew, with the `ROUNDING_KEYS` leaves `held`, the rows' cache before
+    it, keeps: a rebuilt cache's rows round by their own keys still."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, new, old: old if leaf_name(path) == ROUNDING_KEYS else new, fresh, held)
 
 
 def overflowed(cache: Mapping[str, object], capacity: int) -> jax.Array:
@@ -813,7 +832,7 @@ def cache_positions(module: nn.Module, batch: int, length: int, valid):
         raise ValueError(f"cache validity must be {(batch, length)}, got {valid.shape}")
     allocated = module.has_variable("cache", "cache_index")
     index = module.variable("cache", "cache_index", jnp.zeros, (batch,), jnp.int32)
-    positions = index.value[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    positions = index.value[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
     positions = jnp.where(valid, positions, -1)
     if allocated:
         index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)

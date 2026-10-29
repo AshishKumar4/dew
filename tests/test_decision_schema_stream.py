@@ -40,14 +40,33 @@ QUESTIONS = {"pick": Choice("Which one?", ["a", "b", "c"]), "holds": Noul("Does 
 ROWS = [("one two three", "a"), ("four five", "b"), ("six seven eight nine", "c"), ("ten eleven", "a")] * 4
 
 
-def read_in_context(length: int = 768, head=None) -> DecisionObjective:
+def read_in_context(length: int = 768, head=None, segments: int | None = 16, max_len: int = 256,
+                    context_window: int | None = None) -> DecisionObjective:
     """A decision over the tiny Llama with fresh cross-attention before its layers, its rows' schemas
-    read as their contexts, up to `length` tokens."""
+    read as their contexts, up to `length` tokens, at most `segments` rows of `max_len` a window and
+    `context_window` tokens of their contexts."""
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=1024)
     crossed = source.with_cross_attention(CrossAttention((0, 1), length), key=0)
     width, _ = DecisionModel.head_size(crossed.model)
     head = head or JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
-    return DecisionObjective(crossed, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT, head=head)
+    layout = dataclasses.replace(LAYOUT, max_len=max_len)
+    return DecisionObjective(crossed, tokenizer=TOKENIZER, specials=SPECIALS, layout=layout, head=head,
+                             segments=segments, context_window=context_window)
+
+
+LABELS = {"a": {"holds": "true", "close": "x"}, "b": {"holds": "false", "close": "y"},
+          "c": {"holds": "true", "close": "y"}}
+SCHEMAS = (QUESTIONS, {"pick": QUESTIONS["pick"]},
+           {"close": Choice("Which letter is closest to it?", ["x", "y", "z", "w"]),
+            "holds": QUESTIONS["holds"]})
+"""Schemas of other questions, options and lengths, which rows in turn ask."""
+
+
+def labelled() -> list[Example]:
+    """`ROWS`, each asked the questions of a schema of `SCHEMAS` in turn, each answered."""
+    return [Example(state, schema, {name: answer for name, answer in {"pick": label, **LABELS[label]}.items()
+                                    if name in schema})
+            for (state, label), schema in zip(ROWS, itertools.cycle(SCHEMAS))]
 
 
 def text(tokens) -> str:
@@ -73,10 +92,7 @@ def test_a_run_reads_each_rows_schema_in_context_and_its_task_serves_alike():
     run's task answers a request, and a question asked in other words answers otherwise, as the head
     pools it from the context's pass."""
     objective = read_in_context()
-    labels = {"a": {"holds": "true", "close": "x"}, "b": {"holds": "false", "close": "y"},
-              "c": {"holds": "true", "close": "y"}}
-    rows = [Example(state, QUESTIONS, {"pick": label, **labels[label]}) for state, label in ROWS]
-    data = decision_rows(rows, 8, objective=objective.data())
+    data = decision_rows(labelled(), 8, objective=objective.data())
     [batch] = list(itertools.islice(data.train(DataPartition()), 1))
     assert "context_lengths" in batch and int(np.max(batch["context_lengths"])) > 0
     tracker = RecordingTracker()
@@ -162,3 +178,56 @@ def test_a_run_names_its_schema_read_in_context_on_the_command_line():
     assert config.segments == segments
     with pytest.raises(ValueError):
         dataclasses.replace(config, context_layers=None).prepare()
+
+
+def test_rows_whose_schema_is_their_context_pack_several_a_window_each_reading_its_own():
+    """Rows whose schemas are their contexts pack several a window, as rows of an example's context do
+    (row 2008): each question's row is the one the packer placed it in (`question_rows`), its span the
+    place of its own text in its own row's context, numbered as that row's tokens are, the row's tokens
+    its own state's; the window's contexts end to end within its context budget."""
+    from test_decision_context import windows_of
+
+    # A window of 1,024 tokens holds several rows of a short state and the framing around it, and one
+    # of 2,048 context tokens several of their schemas.
+    objective = read_in_context(segments=3, max_len=1024, context_window=2048)
+    rows = labelled()
+    several = 0
+    for window in windows_of(objective, rows, count=8):
+        segments, contexts = np.asarray(window["segments"]), np.asarray(window["context_segments"])
+        tokens, context = np.asarray(window["tokens"]), np.asarray(window["context"])
+        owners, spans = np.asarray(window["question_rows"]), np.asarray(window["spans"])
+        assert context.shape[-1] == objective.context_window
+        for batch_row in range(len(segments)):
+            standing = [number for number in np.unique(segments[batch_row]) if number > 0]
+            several += len(standing) > 1
+            for question in np.flatnonzero(np.asarray(window["questions"])[batch_row]):
+                owner, (start, end) = owners[batch_row, question], spans[batch_row, question]
+                assert owner in standing and set(contexts[batch_row, start:end]) == {owner}
+                instructions = {asked.instructions for schema in SCHEMAS for asked in schema.values()}
+                assert text(context[batch_row, start:end]) in instructions
+                real = np.asarray(window["options"])[batch_row, question]
+                for first, last in np.asarray(window["option_spans"])[batch_row, question][real]:
+                    assert set(contexts[batch_row, first:last]) == {owner}
+                held = text(tokens[batch_row][segments[batch_row] == owner])
+                assert sum(f"STATE:\n{state}\n" in held for state, _ in ROWS[:4]) == 1, held
+    assert several, "no window held more than one row"
+
+
+PACKED_SCHEMA_SEEDS = 128
+"""Check 1's declared seeds for packed rows reading their own schemas against each row alone, sized
+paired (`seeds_for` with the packed windows as `dew_fn`, 2026-10-28 on armada). The check reads 128
+draws of windows of 1,024 tokens beside 2,048 of contexts, 1,540 s on a CI core, so it runs in the whole
+suite alone (`whole_suite`)."""
+
+
+@pytest.mark.whole_suite
+def test_packed_rows_decide_each_schema_in_context_as_each_row_alone():
+    """Rows whose schemas are their contexts, packed several a window, decide each row's options as the
+    row does in a window of its own, through the unmodified objective, its cross-attention open (every
+    gate 1): each row's head pools its own schema's questions and options from the window's contexts
+    and reads its own state, the real options' logits on par from float64 (check 1, over drawn
+    parameters)."""
+    from test_decision_context import assert_packed_as_alone
+
+    packed, alone = (read_in_context(segments=most, max_len=1024, context_window=2048) for most in (3, 1))
+    assert_packed_as_alone(packed, alone, labelled()[:8], "packed schemas in context", PACKED_SCHEMA_SEEDS)

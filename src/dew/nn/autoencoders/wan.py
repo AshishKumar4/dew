@@ -42,8 +42,10 @@ from dew.interop.weights import indexed_path
 from dew.nn.kernels.options import program
 
 from ..activations import silu
-from ..attention import l2_normalized, scaled_dot_product_attention
+from ..attention import scaled_dot_product_attention
+from ..blocks import Upsample
 from ..conv import Conv
+from ..norms import l2_normalized
 from ..precision import at_least_fp32
 from .api import AutoEncoder, LatentNormalization, published_source
 from .kl import posterior_latent
@@ -225,9 +227,11 @@ class _Upsample(nn.Module):
                 later = later.reshape(batch, frames, height, width, 2, channels)
                 later = later.transpose(0, 1, 4, 2, 3, 5).reshape(batch, 2 * frames, height, width, channels)
                 x = jnp.concatenate([first, later], axis=1)
-        x = jnp.repeat(jnp.repeat(x, 2, axis=2), 2, axis=3)
-        conv = Conv(self.features // 2, (3, 3), padding=((1, 1), (1, 1)), dtype=self.dtype, name="resample_1")
-        return _frames(conv, x)
+        # Each frame doubled by nearest resize and convolved to half the channels (`blocks.Upsample`), its
+        # convolution this module's `resample_1`, as the published Wan VAE names it.
+        upsample = Upsample(self.features // 2, 2, dtype=self.dtype, conv="resample_1")
+        nn.share_scope(upsample, self)
+        return _frames(upsample, x)
 
 
 class _Encoder(nn.Module):

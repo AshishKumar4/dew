@@ -15,12 +15,12 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew._records import JSON
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
 from ..activations import GatedActivation, gated_product
-from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..cross_attention import NAME as CROSS_ATTENTION
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
@@ -41,6 +41,7 @@ from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
+from ..norms import LayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
@@ -74,7 +75,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
     """The decoder's norm factory, building each norm by its `name` as
     `specs` changes it there. 'layer' keeps torch's exact variance, the
     reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
-    (`dew.nn.attention.LayerNorm`), whose mean and square reduce in one pass,
+    (`dew.nn.norms.LayerNorm`), whose mean and square reduce in one pass,
     which the vision towers run."""
 
     def build(*, name: str) -> nn.Module:
@@ -97,7 +98,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
 
 @runtime_checkable
 class SeamNorm(Protocol):
-    """A pre-norm that owns a block's residual seam (`dew.nn.attention.RMSNorm`):
+    """A pre-norm that owns a block's residual seam (`dew.nn.norms.RMSNorm`):
     it adds a sublayer's branch to the stream it reads and hands that stream
     back beside the norm, `(x + branch, normed)`, so one fused pass takes the
     add, the norm and, in reverse, the stream's own cotangent."""
@@ -300,11 +301,6 @@ class Mixture:
                 RMSNorm, epsilon=norm_eps, scale_offset=scale_offset, scale_after_cast=scale_after_cast,
                 dtype=dtype) if self.latent_norm else None,
             dtype=dtype, precision=precision)
-
-
-LAYER_SCALAR_COLLECTIONS = {"trainable": "params", "frozen": "constants"}
-"""The collection a block keeps its layer scalar in, by mode (`BlockWiring.layer_scalar`): Google's
-release makes it a parameter, and Transformers a buffer, which Dew keeps as a constant."""
 
 
 def layer_scalar_mode(variables: Mapping[str, object], path: tuple[str, ...]) -> str | None:

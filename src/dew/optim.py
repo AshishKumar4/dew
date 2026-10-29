@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
+import functools
 import inspect
 import json
 import math
@@ -37,7 +38,7 @@ from dew._records import share
 from dew.mesh import LogicalAxes
 from dew.nn.precision import at_least_fp32, stochastic_bf16
 from dew.nn.sharding import declarations, declared_axes
-from dew.registry import JsonDict, from_record, record_argument, schedules, to_record
+from dew.registry import JsonDict, from_record, imported, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -57,8 +58,9 @@ BATCH_AXES = frozenset({'exp'})
 SELECTION_AXES = frozenset({'vocab', 'output'})
 
 
-def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Split a declared parameter's axes into a contracted and an output side.
+def _matrix_sides(axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """Split a declared parameter's axes into a contracted and an output side, None where they are
+    not two.
 
     A dimension continues the side before it when the declaration leaves it
     unnamed, as the spatial dimensions of a patch embedding are. It also
@@ -79,11 +81,7 @@ def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple
         else:
             sides.append([dimension])
     if len(sides) != 2:
-        raise ValueError(
-            f"{jax.tree_util.keystr(path)} is declared {axes}, which is not one "
-            f"contracted side and one output side, so Muon cannot tell what its "
-            f"matrix is. An axis that stacks matrices rather than being part of "
-            f"one belongs in BATCH_AXES.")
+        return None
     return tuple(sides[0]), tuple(sides[1])
 
 
@@ -95,47 +93,83 @@ def weight_decay_mask(params):
         isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "bias"), params)
 
 
-def muon_weight_dimension_numbers(params):
-    """Build a `MuonDimensionNumbers` per parameter, None where AdamW steps in.
-
-    Which group a parameter lands in is read off the logical axes its module
-    declares (`dew.nn.sharding`), the same table the sharding derivation
-    reads, so one declaration answers both questions.
+def muon_partition(params) -> dict[str, str]:
+    """Where Muon's parameter split sends each parameter (`muon_weight_dimension_numbers`), by its path
+    (`jax.tree_util.keystr`): 'muon', or 'adamw' and why, the record a run keeps of the split.
 
     AdamW takes a parameter of rank below two, a bias, and a parameter that
     maps into or out of a discrete index: the vocabulary, the model's output
     space, or the expert a router picks. That is the split four labs
-    cross-confirmed. Everything else is a matrix and goes to Muon.
+    cross-confirmed. It takes too a per-channel filter, rank 3 with an input
+    dimension of 1 (a depthwise convolution's `[channels, 1, taps]`, Gated
+    DeltaNet's conv1d), a vector a channel. Everything else is a matrix, its
+    stacked axes (an expert's) batched and its head axes one side, and goes to
+    Muon through optax's dimension numbers; a parameter that is none of these,
+    declared axes that are not one contracted and one output side or an
+    undeclared tensor of rank above two, is refused, as which of its axes form
+    the matrix is what the split cannot guess.
 
-    An undeclared matrix of rank two, or one declared with no axis named
-    (replicated, as Gemma 3n's AltUp matrices are), takes Linen's kernel
-    convention, contracting axis 0 into axis 1. An undeclared parameter of higher rank
-    raises, because its matrix axes are what this spec cannot guess, and
-    orthogonalizing the wrong pair would show up as a worse loss curve.
+    Which group a parameter lands in is read off the logical axes its module
+    declares (`dew.nn.sharding`), the same table the sharding derivation
+    reads, so one declaration answers both questions. An undeclared matrix of
+    rank two, or one declared with no axis named (replicated, as Gemma 3n's
+    AltUp matrices are), takes Linen's kernel convention, contracting axis 0
+    into axis 1.
+    """
+    return {jax.tree_util.keystr(path): reason
+            for path, (_, reason) in _placements(params).items()}
+
+
+def muon_weight_dimension_numbers(params):
+    """Build a `MuonDimensionNumbers` per parameter, None where AdamW steps in (`muon_partition`).
 
     Optax reads one spec tree shaped like the parameters and treats a None
     leaf as an AdamW parameter (optax/contrib/_muon.py:660-675).
     """
-    declared = declarations(params)
+    placed = _placements(params)
+    return jax.tree_util.tree_map_with_path(lambda path, _: placed[path][0], params)
 
-    def leaf(path: jax.tree_util.KeyPath, param: jax.Array, decays: bool):
-        if not decays:
-            return None
-        axes = declared_axes(path, param.ndim, declared)
-        # A declaration that names no axis says how the parameter shards (whole, on every device),
-        # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
-        if axes is None or all(axis is None for axis in axes):
-            if param.ndim > 2:
-                raise ValueError(
-                    f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no "
-                    "declared logical axes, so Muon cannot tell which of its axes "
-                    "form the matrix. Declare it with @logical_axes on its module.")
-            return optax.contrib.MuonDimensionNumbers()
-        named = {axis for axis in axes if axis is not None}
-        if SELECTION_AXES & named or axes[-1] in BATCH_AXES:
-            return None
-        return optax.contrib.MuonDimensionNumbers(*_matrix_sides(path, axes))
-    return jax.tree_util.tree_map_with_path(leaf, params, weight_decay_mask(params))
+
+def _placements(params) -> dict[jax.tree_util.KeyPath, tuple[optax.contrib.MuonDimensionNumbers | None, str]]:
+    """Each parameter's Muon dimension numbers, None for AdamW, and the reason (`muon_partition`), by its
+    path. A matrix's declared sides are read first, so a projection of one head, `[embed, 1, head_dim]`,
+    is the matrix its declaration names; only a parameter no declaration makes a matrix is read as a
+    per-channel filter by its shape."""
+    declared = declarations(params)
+    leaves = jax.tree_util.tree_leaves_with_path(params)
+    decaying = jax.tree_util.tree_leaves(weight_decay_mask(params))
+    placed = {}
+    for (path, param), decays in zip(leaves, decaying, strict=True):
+        placed[path] = _placement(path, param, decays, declared)
+    return placed
+
+
+def _placement(path: jax.tree_util.KeyPath, param, decays: bool,
+               declared) -> tuple[optax.contrib.MuonDimensionNumbers | None, str]:
+    if not decays:
+        return None, "adamw: a bias or of rank below two"
+    axes = declared_axes(path, param.ndim, declared)
+    # A declaration that names no axis says how the parameter shards (whole, on every device),
+    # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
+    named = None if axes is None or all(axis is None for axis in axes) else axes
+    if named is not None:
+        if SELECTION_AXES & {axis for axis in named if axis is not None} or named[-1] in BATCH_AXES:
+            return None, "adamw: a lookup into or out of a discrete index"
+        sides = _matrix_sides(named)
+        if sides is not None:
+            return optax.contrib.MuonDimensionNumbers(*sides), "muon"
+    if param.ndim == 3 and param.shape[1] == 1:
+        return None, "adamw: a per-channel filter, [channels, 1, taps], a vector a channel"
+    if named is not None:
+        raise ValueError(
+            f"{jax.tree_util.keystr(path)} is declared {named}, which is not one contracted side and one "
+            "output side, so Muon cannot tell what its matrix is. An axis that stacks matrices rather "
+            "than being part of one belongs in BATCH_AXES.")
+    if param.ndim > 2:
+        raise ValueError(
+            f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no declared logical axes, so Muon "
+            "cannot tell which of its axes form the matrix. Declare it with @logical_axes on its module.")
+    return optax.contrib.MuonDimensionNumbers(), "muon"
 
 
 def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, **opts):
@@ -1727,7 +1761,11 @@ def _rate_argument() -> tyro.constructors.PrimitiveConstructorSpec:
 class OptimConfig:
     """Holds the optimizer, learning-rate schedule and gradient clipping."""
 
-    optimizer: Optimizer = "adamw"
+    optimizer: Optimizer | str = "adamw"
+    """One of Dew's optimizers (`OPTIMIZER_MAP`), or any Optax optimizer factory by its import path,
+    `optax:sgd` or `optax:adafactor` (`dew.registry.imported`), built as `factory(learning_rate,
+    **optimizer_opts)` with `b1`, `b2` and `weight_decay` where the config sets them, so an experiment
+    on an Optax transformation records the same optimizer it ran."""
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
     learning_rate: Annotated[float | ScheduleSpec, _rate_argument()] = 2.7e-4
     """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`).
@@ -1742,8 +1780,8 @@ class OptimConfig:
     """The weight decay passed to the optimizer, None keeping its own (adamw's 1e-4, the others'
     0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
     read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
-    and vectors such as a norm's scale, timm's split for every optimizer
-    (`dew.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
+    and vectors such as a norm's scale, timm's split for every optimizer and for an Optax factory
+    given one (`dew.optim.weight_decay_mask`, its `mask`); Muon decays them as Moonlight does, and
     `param_groups` replace the split. Records written before this change decayed every
     parameter; ParamGroup('all', ('*',)) restores that."""
     b1: float | None = None
@@ -1802,6 +1840,12 @@ class OptimConfig:
                     warmups[name] = warmup
         return warmups
 
+    def groups(self, params) -> dict[str, str] | None:
+        """Where this optimizer's split sends each of `params` and why (`muon_partition`), for the
+        optimizers that split by Muon's rule ('muon', 'muonclip'); None for one that splits none. Read
+        under the axes the modules declare, as its state is initialized."""
+        return muon_partition(params) if self.optimizer in ("muon", "muonclip") else None
+
     def build(self, steps: int | None) -> optax.GradientTransformation:
         """Build the optimizer this config describes, with its schedule, parameter groups and clipping.
 
@@ -1819,7 +1863,7 @@ class OptimConfig:
             raise ValueError("b1 and b2 are fields of OptimConfig, not optimizer_opts")
         given = {'b1': self.b1, 'b2': self.b2, 'weight_decay': self.weight_decay}
         opts.update({name: value for name, value in given.items() if value is not None})
-        make: Callable[..., optax.GradientTransformation] = OPTIMIZER_MAP[self.optimizer]
+        make = self.factory()
         if self.state_dtype != 'float32':
             if self.optimizer not in STATE_OPTIMIZERS[self.state_dtype]:
                 raise ValueError(
@@ -1840,7 +1884,9 @@ class OptimConfig:
                 solvers[group.name] = group.solver(make, self.learning_rate, steps, {**opts, **decay})
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
-            if self.optimizer not in ('muon', 'muonclip'):
+            # An Optax factory takes the split with a decay it is given; Dew's own take it always.
+            if self.optimizer not in ('muon', 'muonclip') and (self.optimizer in OPTIMIZER_MAP
+                                                                 or 'weight_decay' in opts):
                 opts['mask'] = weight_decay_mask
             solver = scheduled_solver(make, self.learning_rate, steps, opts)
 
@@ -1853,6 +1899,27 @@ class OptimConfig:
         if self.ema_profiles:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        """The factory `optimizer` names: Dew's own (`OPTIMIZER_MAP`) by name, else the one its import
+        path names, whose every build is witnessed an Optax transformation."""
+        if self.optimizer in OPTIMIZER_MAP:
+            return OPTIMIZER_MAP[self.optimizer]
+        if ':' not in self.optimizer:
+            raise ValueError(f"optimizer {self.optimizer!r} is none of Dew's {sorted(OPTIMIZER_MAP)} and no "
+                             f"import path; name an Optax factory as optax:sgd")
+        named, factory = self.optimizer, imported(self.optimizer)
+
+        # The factory's own signature, which a group's `b1` schedule is checked against (`ParamGroup.solver`).
+        @functools.wraps(factory)
+        def built(learning_rate, **opts) -> optax.GradientTransformation:
+            transformation = factory(learning_rate, **opts)
+            if not isinstance(transformation, optax.GradientTransformation):
+                raise ValueError(f"optimizer {named!r} builds {type(transformation).__name__}, not an Optax "
+                                 f"gradient transformation")
+            return transformation
+
+        return built
 
     def rates(self) -> dict[str | None, dict[str, float]]:
         """The rate fields each of `build`'s solvers holds in its state

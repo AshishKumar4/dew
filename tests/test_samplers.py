@@ -9,6 +9,8 @@ form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2).
 Each solver's order of accuracy is measured against that closed form.
 """
 
+import dataclasses
+import functools
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +21,8 @@ import numpy as np
 import pytest
 from diffusion_support import SourceOracle, relative_gap, walk
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
+from tool_support import run_from
 
 from dew.diffusion import (
     ConsistencyBoundary,
@@ -105,7 +108,9 @@ def vp_process():
 
 
 def karras_process():
-    schedule = KarrasVENoiseScheduler(sigma_max=80, rho=7, sigma_data=0.5)
+    # rho a float, as FlaxDiff's KarrasVENoiseScheduler and Dew's default hold it: an int lowers the
+    # power to repeated products, an ulp off its grid (row 2061).
+    schedule = KarrasVENoiseScheduler(sigma_max=80, rho=7.0, sigma_data=0.5)
     return Process(schedule, KarrasPredictionTransform(sigma_data=0.5)), KarrasOracle()
 
 
@@ -259,6 +264,14 @@ REFUSES = {
 """The families a solver that reaches its data by `CONVERGES_ON` refuses."""
 
 
+CONFIDENCE = {"confident": "masked"}
+"""The solvers that reveal by confidence, a release's own heuristic, by the case they walk: each draws a
+position's token from its distribution but reveals the likeliest draws first, which favors likely tokens
+by design, so at its defaults it walks its case to a full reveal within the oracle's support, not to the
+oracle's frequencies (its parity is with its release's walk, tests/test_blockwise_walk.py); with no
+threshold every masked position reveals from its first draw, which samples the oracle exactly."""
+
+
 def assert_reaches_its_data(case, solver, steps=100):
     build, shape, reaches = PROCESS_CASES[case]
     reaches(generate(*build(), solver, steps, shape=shape))
@@ -267,11 +280,18 @@ def assert_reaches_its_data(case, solver, steps=100):
 @pytest.mark.parametrize("name", sorted(solvers))
 def test_every_registered_solver_samples_its_processes_and_refuses_the_rest(name):
     """Each solver `dew.registry.solvers` names, at its defaults, walks every
-    process case it integrates from the prior to the oracle's data, and a
+    process case it integrates from the prior to the oracle's data, a
+    confidence reveal its case to a full reveal (`CONFIDENCE`), and a
     solver of one process family refuses every other continuous case."""
     solver = solvers.build(name)
-    integrated = INTEGRATES.get(name)
-    for case in integrated or CONVERGES_ON.get(name, GAUSSIAN):
+    if name in CONFIDENCE:
+        build, shape, _ = PROCESS_CASES[CONFIDENCE[name]]
+        counts = np.bincount(np.asarray(generate(*build(), solver, 100, shape=shape)).ravel(),
+                             minlength=len(TOKEN_PROBS) + 1)
+        assert counts[-1] == 0 and counts.sum() > 0, counts
+        assert_reaches_its_data(CONFIDENCE[name], dataclasses.replace(solver, threshold=0.0))
+    integrated = INTEGRATES.get(name, (CONFIDENCE[name],) if name in CONFIDENCE else None)
+    for case in () if name in CONFIDENCE else integrated or CONVERGES_ON.get(name, GAUSSIAN):
         assert_reaches_its_data(case, solver)
     refused = REFUSES.get(name, ()) if integrated is None else sorted(set(FAMILIES) - set(integrated))
     for case in refused:
@@ -305,9 +325,15 @@ def test_a_solvers_settings_reach_the_data(case, solver, steps):
     assert_reaches_its_data(case, solver, steps)
 
 
-FLAXDIFF = dict(np.load(Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "solvers.npz"))
-FLAXDIFF_ROUNDING = np.load(
-    Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "rounding.npz")
+FLAXDIFF = Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "solvers.npz"
+
+
+@functools.cache
+def writer(name: str):
+    """tools/`name`.py, whose seeded draw a recording's inputs are drawn again by, loaded as a script
+    from its directory."""
+    with run_from(name, "tools") as module:
+        return module
 
 
 @dataclass(frozen=True)
@@ -324,14 +350,24 @@ class StandIn:
         return x_0, (x - x_0) / sigma
 
 
-def flaxdiff_walk(solver, x_T):
-    """Every interval of the fixture's grid from `x_T`, with the reference's
+def flaxdiff_start(solver, x_T):
+    """`solver`'s state before its first step, built on Dew's twelve-point grid on the host, where a
+    multistep solver checks its gaps: what `sample` takes beside a traced grid (`initial`). A draw's
+    grid is that grid moved within a hundredth of a spacing (the writer's JITTER), which these solvers'
+    states start no different on."""
+    process, _ = karras_process()
+    with jax.ensure_compile_time_eval():
+        return solver.init(x_T, np.asarray(process.times(12)), process, key=jax.random.key(0))
+
+
+def flaxdiff_walk(solver, x_T, times):
+    """Every interval of `times`, a draw's grid, from `x_T` in its precision, with the reference's
     stand-in denoiser read through the Karras schedule's own sigma."""
     process, _ = karras_process()
-    times = jnp.asarray(FLAXDIFF["times"])
+    times = jnp.asarray(times, x_T.dtype)
     denoise = StandIn(process)
 
-    x, state = x_T, solver.init(x_T, times, process, key=jax.random.PRNGKey(0))
+    x, state = x_T, flaxdiff_start(solver, x_T)
     latents = []
     for i in range(times.shape[0] - 1):
         t, t_next = jnp.full((x.shape[0],), times[i]), jnp.full((x.shape[0],), times[i + 1])
@@ -341,38 +377,81 @@ def flaxdiff_walk(solver, x_T):
     return jnp.stack(latents)
 
 
+def flaxdiff_walked(solver):
+    """Dew's arm of a FlaxDiff walk under `solver`: a draw's latent after every interval of its grid, and
+    the last one's pullback of its cotangent (tools/flaxdiff_solver_reference.py pairs its sizing with
+    it)."""
+    def walked(inputs):
+        x_T = jnp.asarray(inputs["x_T"])
+        times = inputs["times"]
+        latents = flaxdiff_walk(solver, x_T, times)
+        cotangent = jnp.asarray(inputs["cotangent"])
+        (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x, times)[-1], x_T)[1](cotangent)
+        return {**{f"after {index}": latent for index, latent in enumerate(latents)}, "gradient": gradient}
+
+    return walked
+
+
+def flaxdiff_outputs(closed):
+    """A closing walk's leaves: its output as it is, and through the clip to [-1, 1] of FlaxDiff's
+    `post_process`."""
+    return {"closed": closed, "clipped": jnp.clip(closed, -1, 1)}
+
+
+def flaxdiff_closed(solver):
+    """Dew's arm of a FlaxDiff closing walk under `solver`: `sample` over a draw's grid with its default
+    closing denoise (tools/flaxdiff_solver_reference.py pairs its sizing with it)."""
+    process, _ = karras_process()
+
+    def closing(inputs):
+        x_T = jnp.asarray(inputs["x_T"])
+        return flaxdiff_outputs(sample(StandIn(process), x_T, solver=solver, key=jax.random.key(0),
+                                       times=jnp.asarray(inputs["times"], x_T.dtype),
+                                       initial=flaxdiff_start(solver, x_T)))
+
+    return closing
+
+
+def assert_on_par_with_flaxdiff(site: str, dew, truth_fn=None) -> None:
+    """`dew(inputs)`, Dew's leaves on a draw, on par with `site`'s recording of FlaxDiff's own float32
+    run over its declared seeds (check 1). The truth is `truth_fn(inputs)`, `dew` unless given, run
+    widened, held to the recording's float64 sketch of FlaxDiff's float64 twin (`indexed_recording`)."""
+    seeds = declared_seeds(FLAXDIFF)[site]
+    draw, recorded, truth = indexed_recording(recording(FLAXDIFF), site, seeds,
+                                              inputs_of=writer("flaxdiff_solver_reference").draw,
+                                              truth_fn=dew if truth_fn is None else truth_fn)
+    compiled = jax.jit(dew)
+    assert_as_exact(lambda index, inputs: compiled(inputs), recorded, draw, site, seeds=seeds,
+                    truth_fn=truth)
+
+
 @pytest.mark.parametrize("name,solver", [("rk4", RK4()), ("multistep", MultiStepDPM())],
                          ids=["rk4", "multistep"])
 def test_the_closing_denoise_is_flaxdiffs_generate_samples(name, solver):
     """`sample` with its default `final_denoise` against FlaxDiff's own
     `generate_samples` (AshishKumar4/FlaxDiff@15c55b0, run as published by
     tools/flaxdiff_solver_reference.py) from the same x_T over the same
-    twelve-point grid: eleven solver intervals, then the clean prediction
-    at the grid's last point. The output is held to FlaxDiff's float64 run
-    by the float64 rule, and, through the clip to [-1, 1] that FlaxDiff's
-    `post_process` applies as the pipeline's output step, to that run's
-    clipped images: the stand-in's clean predictions reach |x| = 3, so the
-    clip moves most entries and the unclipped comparison is the one that
-    reads the walk. RK4's clipped comparison averages 8192 independent
-    initial entries, since its pointwise stages give identical rounding
-    under pixel permutations. In a 64-copy pilot, every disjoint four-copy
-    subset stayed below ratio 0.98 on default, AVX and Ice Lake CPU codegen;
-    the chosen four copies reach 0.92. Its oracle widens FlaxDiff's timestep
-    casts too, so sigma arithmetic runs in float64."""
+    twelve-point grid, each draw's its own (the writer's JITTER): eleven
+    solver intervals, then the clean prediction at the grid's last point,
+    over the recorded seeds (check 1). The output
+    is held as it is and through the clip to [-1, 1] that FlaxDiff's
+    `post_process` applies as the pipeline's output step: the stand-in's
+    clean predictions reach |x| = 3, so the clip moves most entries and the
+    unclipped comparison is the one that reads the walk. The truth is Dew's
+    walk in float64 interval by interval (`flaxdiff_walk`), closed with the
+    clean prediction at the last time: `sample`'s own float64 scan refuses
+    MultiStepDPM's float32 history (row 2063)."""
     process, _ = karras_process()
-    closed = sample(StandIn(process), jnp.asarray(FLAXDIFF["x_T"]), 12, solver=solver, key=jax.random.key(0))
-    assert_as_exact_as_the_reference(closed, FLAXDIFF[f"{name}/closed"], FLAXDIFF[f"{name}/closed_f64"],
-                                     f"{name} closed")
-    assert float(np.abs(FLAXDIFF[f"{name}/closed_f64"]).max()) > 2
-    if name == "rk4":
-        def clipped(value):
-            return jnp.clip(sample(StandIn(process), value, 12, solver=solver, key=jax.random.key(0)), -1, 1)
-        actual = jax.jit(clipped)(jnp.asarray(FLAXDIFF_ROUNDING["x_T"]))
-        assert_as_exact_as_the_reference(actual, FLAXDIFF_ROUNDING["clipped"],
-                                         FLAXDIFF_ROUNDING["clipped_f64"], "rk4 clipped")
-    else:
-        assert_as_exact_as_the_reference(jnp.clip(closed, -1, 1), FLAXDIFF[f"{name}/clipped"],
-                                         FLAXDIFF[f"{name}/clipped_f64"], f"{name} clipped")
+    closing = flaxdiff_closed(solver)
+
+    def walked_and_closed(inputs):
+        x_T = jnp.asarray(inputs["x_T"])
+        times = jnp.asarray(inputs["times"], x_T.dtype)
+        last = flaxdiff_walk(solver, x_T, times)[-1]
+        return flaxdiff_outputs(StandIn(process)(last, jnp.full((x_T.shape[0],), times[-1]))[0])
+
+    assert_on_par_with_flaxdiff(f"{name} closed", closing, walked_and_closed)
+    assert float(jnp.abs(closing(writer("flaxdiff_solver_reference").draw(0))["closed"]).max()) > 2
 
 
 @pytest.mark.parametrize("name,solver", [("rk4", RK4()), ("multistep", MultiStepDPM())],
@@ -381,22 +460,15 @@ def test_rk4_and_the_multistep_integrator_are_flaxdiffs(name, solver):
     """`RK4` and `MultiStepDPM` are FlaxDiff's `RK4Sampler` and
     `MultiStepDPM` (AshishKumar4/FlaxDiff@15c55b0, run as published by
     tools/flaxdiff_solver_reference.py): from the same x_T over FlaxDiff's
-    twelve-point grid on a rho-7 Karras schedule, with a denoiser nonlinear
+    twelve-point grid on a rho-7 Karras schedule, each draw's moved within a
+    hundredth of a spacing (the writer's JITTER), with a denoiser nonlinear
     in x, the latent after every interval, so every RK4 stage and each of the
     multistep's first, second and third order updates, and the gradient of
-    the last one through the walk, held to FlaxDiff's float64 run by the
-    float64 rule. The grid is Dew's own `times(12)`."""
+    the last one through the walk, on par with FlaxDiff's float32 run over
+    the recorded seeds (check 1). FlaxDiff's grid is Dew's own `times(12)`."""
     process, _ = karras_process()
-    np.testing.assert_array_equal(process.times(12), FLAXDIFF["times"])
-    x_T = jnp.asarray(FLAXDIFF["x_T"])
-    latents = flaxdiff_walk(solver, x_T)
-    for step in range(latents.shape[0]):
-        assert_as_exact_as_the_reference(latents[step], FLAXDIFF[f"{name}/latents"][step],
-                                         FLAXDIFF[f"{name}/latents_f64"][step],
-                                         f"{name} after interval {step}")
-    (gradient,) = jax.vjp(lambda x: flaxdiff_walk(solver, x)[-1], x_T)[1](jnp.asarray(FLAXDIFF["cotangent"]))
-    assert_as_exact_as_the_reference(gradient, FLAXDIFF[f"{name}/grad"], FLAXDIFF[f"{name}/grad_f64"],
-                                     f"{name} gradient")
+    np.testing.assert_array_equal(process.times(12), recording(FLAXDIFF)["times"])
+    assert_on_par_with_flaxdiff(f"{name} walk", flaxdiff_walked(solver))
 
 
 @pytest.mark.parametrize("solver", [DDIM(), Euler()], ids=lambda s: type(s).__name__)
@@ -674,7 +746,9 @@ def test_empty_guidance_interval_generates_the_unguided_samples():
 # EDM's own stochastic sampler
 ############################################################################################################
 
-EDM = np.load(Path(__file__).resolve().parent / "fixtures" / "edm" / "heun.npz")
+EDM = Path(__file__).resolve().parent / "fixtures" / "edm" / "heun.npz"
+
+
 
 
 class EDMOracle(nn.Module):
@@ -697,20 +771,39 @@ def edm_grid(steps: int) -> Process:
     return Process(SigmaGrid(sigmas, sigmas, 80.0), DirectPredictionTransform())
 
 
+def assert_walks_as_edm(name: str, *, final_denoise: bool) -> None:
+    """Heun with the recorded case's S_churn, S_tmin, S_tmax and S_noise from each seed's latent under
+    its key, on par with the published sampler's own float32 walk of its rho-7 grid and the same
+    per-step draws over the case's declared seeds (check 1). With `final_denoise`, the walk stops at the
+    last sigma and closes with the model's clean prediction there; without, it steps onto the zero NVlabs
+    appends."""
+    stored = recording(EDM)
+    arguments = json.loads(str(stored[f"{name}.arguments"]))
+    steps = arguments["num_steps"]
+    solver = Heun(s_churn=arguments.get("S_churn", 0.0), s_tmin=arguments.get("S_min", 0.0),
+                  s_tmax=arguments.get("S_max", float("inf")), s_noise=arguments.get("S_noise", 1.0))
+    denoiser = edm_grid(steps).denoiser(EDMOracle(), {}, {})
+    times = np.arange(steps, 0 if final_denoise else -1, -1, dtype=np.float32)
+
+    # The closing walk takes `sample`'s default, which is the closing denoise.
+    closing = {} if final_denoise else {"final_denoise": False}
+
+    @jax.jit
+    def walked(index, inputs):
+        x_T = jnp.asarray(inputs["latents"]) * np.float32(80.0)
+        return {"result": sample(denoiser, x_T, solver=solver, key=inputs["key"], times=times, **closing)}
+
+    seeds = declared_seeds(EDM)[name]
+    draw, recorded, truth = indexed_recording(stored, name, seeds, inputs_of=writer("edm_reference").draw)
+    assert_as_exact(walked, recorded, draw, name, seeds=seeds, truth_fn=truth)
+
+
 @pytest.mark.parametrize("name", ["deterministic", "churn", "churn_to_the_end"])
 def test_heun_walks_edms_algorithm_2_with_its_churn(name):
     """Heun with S_churn, S_tmin, S_tmax and S_noise against the published
     sampler on its own rho-7 grid and the same per-step draws, as exact as
-    the published sampler's own float32 walk."""
-    arguments = json.loads(str(EDM[f"{name}.arguments"]))
-    steps = arguments["num_steps"]
-    solver = Heun(s_churn=arguments.get("S_churn", 0.0), s_tmin=arguments.get("S_min", 0.0),
-                  s_tmax=arguments.get("S_max", float("inf")), s_noise=arguments.get("S_noise", 1.0))
-    x_T = jnp.asarray(EDM["latents"] * np.float32(80.0))
-    walked = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
-                    key=jax.random.PRNGKey(7), times=np.arange(steps, -1, -1, dtype=np.float32),
-                    final_denoise=False)
-    assert_as_exact_as_the_reference(walked, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
+    the published sampler's own float32 walk over the recorded seeds."""
+    assert_walks_as_edm(name, final_denoise=False)
 
 
 @pytest.mark.parametrize("name", ["deterministic", "churn"])
@@ -721,14 +814,7 @@ def test_the_closing_denoise_is_edms_last_euler_step_onto_sigma_zero(name):
     (`final_denoise`, its default) and matches the published sampler as
     exactly as its own float32 walk; the churn case's last sigma, 0.002, is
     below its S_min, so nothing is churned there."""
-    arguments = json.loads(str(EDM[f"{name}.arguments"]))
-    steps = arguments["num_steps"]
-    solver = Heun(s_churn=arguments.get("S_churn", 0.0), s_tmin=arguments.get("S_min", 0.0),
-                  s_tmax=arguments.get("S_max", float("inf")), s_noise=arguments.get("S_noise", 1.0))
-    x_T = jnp.asarray(EDM["latents"] * np.float32(80.0))
-    closed = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
-                    key=jax.random.PRNGKey(7), times=np.arange(steps, 0, -1, dtype=np.float32))
-    assert_as_exact_as_the_reference(closed, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
+    assert_walks_as_edm(name, final_denoise=True)
 
 
 class UnitEpsilon(nn.Module):
@@ -771,6 +857,11 @@ def test_an_euler_step_near_pure_noise_on_a_variance_preserving_schedule_rounds_
     assert abs(float(stepped[0, 0]) - exact) <= np.spacing(np.float32(exact))
 
 
+POSTERIOR_SEEDS = 8
+"""The DDIM posterior site's declared draws (check 1), sized by `seeds_for` paired with Dew's step on
+armada: the most any process took."""
+
+
 @pytest.mark.parametrize("case", FAMILIES)
 def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process(case):
     """DDIM at eta 1 draws its step from the forward posterior q(x_s | x_t, x_0) of the process it
@@ -779,49 +870,60 @@ def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process
     sigma_t, with sigma_{t|s}^2 = sigma_t^2 - (alpha_t / alpha_s)^2 sigma_s^2. DDIM's own form,
     alpha_s x_0 + sqrt(sigma_s^2 - std^2) eps + std z, is that posterior in float64. Each row steps
     over its own interval of the process's grid, as the walk passes a row's times, so the
-    coefficients' roundings are many: Dew's step is as near the float64 posterior as DDIM's form
-    written plainly in float32 is. Over one interval shared by every row, the coefficients round
-    once and the distance is that one rounding's: over each of a 65-point grid's 63 intervals
-    apart, Dew's step against the plain form has a median ratio of 1.00 on every process and
-    passes 2 on 2 to 3% of them, a single draw the rule's estimate does not rest on. The
-    variance-preserving special case of the deviation drew no noise on a variance-exploding
-    process and the wrong amount on a flow."""
+    coefficients' roundings are many: Dew's step is on par with DDIM's form written plainly in float32
+    over the draws (check 1), truth the posterior in float64 on the same denoiser outputs and noise. The
+    variance-preserving special case of the deviation drew no noise on a variance-exploding process and
+    the wrong amount on a flow."""
     build, shape, _ = PROCESS_CASES[case]
     process, model = build()
     grid = np.asarray(process.times(65))
-    rows = np.random.default_rng(6).integers(0, len(grid) - 2, 512)
-    t, t_next = jnp.asarray(grid[rows]), jnp.asarray(grid[rows + 1])
-    x_T = jax.random.normal(jax.random.key(4), (len(rows), *shape), jnp.float32) * 2
     params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *shape)), jnp.ones((1,)))
     denoise = process.denoiser(model, params, {})
-    key = jax.random.key(5)
-    denoised, eps = denoise(x_T, t)
     solver = DDIM(eta=1.0)
-    stepped = np.asarray(jax.jit(lambda: solver.step(x_T, t, t_next, denoised, eps, (), key, process,
-                                                      denoise)[0])())
-    denoised, eps = np.asarray(denoised), np.asarray(eps)
-    noise = np.asarray(jax.random.normal(key, x_T.shape))
-    target = t - process.sampler_schedule.step_interval(t, t_next)
-    rates = [np.asarray(rate, np.float64).reshape((-1,) + (1,) * len(shape))
-             for time in (t, target) for rate in process.sampler_schedule.rates(time)]
+    schedule = process.sampler_schedule
 
-    def deviation(dtype):
-        a_t, s_t, a_s, s_s = (rate.astype(dtype) for rate in rates)
-        return a_t, s_t, a_s, s_s, s_s / s_t * np.sqrt(s_t ** 2 - (a_t / a_s) ** 2 * s_s ** 2)
+    def draw(seed):
+        rows = np.random.default_rng([6, seed]).integers(0, len(grid) - 2, 512)
+        t, t_next = jnp.asarray(grid[rows]), jnp.asarray(grid[rows + 1])
+        x_T = jax.random.normal(jax.random.fold_in(jax.random.key(4), seed), (len(rows), *shape),
+                                jnp.float32) * 2
+        denoised, eps = denoise(x_T, t)
+        noise = jax.random.normal(jax.random.fold_in(jax.random.key(5), seed), x_T.shape, jnp.float32)
+        return x_T, t, t_next, denoised, eps, noise, np.int32(seed)
 
-    def ddim(dtype):
-        _, _, a_s, s_s, std = deviation(dtype)
-        return (a_s * denoised.astype(dtype) + np.sqrt(s_s ** 2 - std ** 2) * eps.astype(dtype)
-                + std * noise.astype(dtype))
+    def coefficients(t, t_next):
+        """alpha_t, sigma_t, alpha_s, sigma_s and DDIM's standard deviation, each shaped to a row."""
+        shaped = (-1,) + (1,) * len(shape)
+        target = t - schedule.step_interval(t, t_next)
+        # A tabulated schedule's rates are float32 at any time: widened with the time, so the truth's
+        # coefficients are float64's.
+        a_t, s_t, a_s, s_s = (jnp.reshape(rate, shaped).astype(t.dtype) for time in (t, target)
+                              for rate in schedule.rates(time))
+        return a_t, s_t, a_s, s_s, s_s / s_t * jnp.sqrt(s_t ** 2 - (a_t / a_s) ** 2 * s_s ** 2)
 
-    a_t, s_t, a_s, s_s, std = deviation(np.float64)
-    posterior = a_s * denoised + a_t * s_s ** 2 / (a_s * s_t) * eps + std * noise
+    def stepped(x_T, t, t_next, denoised, eps, noise, seed):
+        key = jax.random.fold_in(jax.random.key(5), seed)
+        return solver.step(x_T, t, t_next, denoised, eps, (), key, process, denoise)[0]
+
+    def ddim(x_T, t, t_next, denoised, eps, noise, seed):
+        _, _, a_s, s_s, std = coefficients(t, t_next)
+        return a_s * denoised + jnp.sqrt(s_s ** 2 - std ** 2) * eps + std * noise
+
+    def posterior(x_T, t, t_next, denoised, eps, noise, seed):
+        a_t, s_t, a_s, s_s, std = coefficients(t, t_next)
+        return a_s * denoised + a_t * s_s ** 2 / (a_s * s_t) * eps + std * noise
+
+    # The two forms are one in float64, to its rounding of each term, on the first draw's float32 rates.
+    _, t, t_next, denoised, eps, noise, _ = draw(0)
+    a_t, s_t, a_s, s_s = (np.asarray(rate, np.float64) for rate in coefficients(t, t_next)[:4])
+    std = s_s / s_t * np.sqrt(s_t ** 2 - (a_t / a_s) ** 2 * s_s ** 2)
     assert np.all(std > 0)
-    # The two forms are one in float64, to its rounding of each term.
-    scale = float(np.abs(posterior).max())
-    np.testing.assert_allclose(ddim(np.float64), posterior, rtol=1e-12, atol=1e-12 * scale)
-    assert_as_exact_as_the_reference(stepped, ddim(np.float32), posterior,
-                                     f"DDIM at eta 1 on the {case} process")
+    denoised, eps, noise = (np.asarray(value, np.float64) for value in (denoised, eps, noise))
+    exact = a_s * denoised + a_t * s_s ** 2 / (a_s * s_t) * eps + std * noise
+    np.testing.assert_allclose(a_s * denoised + np.sqrt(s_s ** 2 - std ** 2) * eps + std * noise, exact,
+                               rtol=1e-12, atol=1e-12 * float(np.abs(exact).max()))
+    assert_as_exact(jax.jit(stepped), jax.jit(ddim), draw, f"DDIM at eta 1 on the {case} process",
+                    seeds=POSTERIOR_SEEDS, truth_fn=posterior)
 
 
 @pytest.mark.parametrize("solver", [DDIM(eta=1.0), DDPM("small"), DDPM("large")],
@@ -848,10 +950,16 @@ def test_a_step_between_equal_levels_draws_no_noise(solver):
     np.testing.assert_array_equal(first, second)
 
 
+WALK_SEEDS = 8
+"""The DDIM-against-Diffusers walk's declared draws (check 1), sized by `seeds_for` paired with Dew's walk on
+armada."""
+
+
 def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
     """DDIM at eta 1 over a variance-preserving source grid walks as Diffusers 0.34.0's
-    `DDIMScheduler(eta=1)` given the same draws (`variance_noise`): each walked latent is as near
-    the source's float64 walk as its own float32 walk is (`float64_scheduler`)."""
+    `DDIMScheduler(eta=1)` given the same draws (`variance_noise`): every walked latent on par with the
+    source's float32 walk over the draws (check 1), truth the source's float64 walk
+    (`float64_scheduler`)."""
     import contextlib
 
     import torch
@@ -864,33 +972,41 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
     config = {"_class_name": "DDIMScheduler", "num_train_timesteps": 1000, "beta_start": 0.00085,
               "beta_end": 0.012, "beta_schedule": "scaled_linear", "clip_sample": False,
               "set_alpha_to_one": False, "timestep_spacing": "trailing"}
+    steps = 6
     schedule = SourceSchedule.from_config(config)
-    process, times = schedule.sampling(6)
-    initial = np.random.default_rng(9).normal(size=(2, 3, 64)).astype(np.float32)
+    process, times = schedule.sampling(steps)
     denoise = process.denoiser(SourceOracle(), {}, {})
-    _, walked = sample(denoise, jnp.asarray(initial), solver=DDIM(eta=1.0), key=3, times=times,
-                       final_denoise=False, record=lambda x, state, denoised: x)
-    draws = [np.asarray(jax.random.normal(jax.random.fold_in(request_key(3), index), initial.shape))
-             for index in range(len(walked))]
-
     precision = load("diffusers_wan_reference")
-    reference = []
-    for dtype in (torch.float32, torch.float64):
-        wide = dtype == torch.float64
-        with precision.float64_scheduler(scheduling_ddim) if wide else contextlib.nullcontext():
-            source = scheduling_ddim.DDIMScheduler.from_config(config)
-            source.set_timesteps(6)
-            x = torch.tensor(initial, dtype=dtype)
-            latents = []
-            for time, draw in zip(source.timesteps, draws, strict=True):
-                prediction = torch.sin(source.scale_model_input(x, time)) * 0.07 + time * 0.001
-                x = source.step(prediction, time, x, eta=1.0,
-                                variance_noise=torch.tensor(draw, dtype=dtype)).prev_sample
-                latents.append(x.numpy().copy())
-        reference.append(np.stack(latents))
-    for index, actual in enumerate(walked):
-        assert_as_exact_as_the_reference(actual, reference[0][index], reference[1][index],
-                                         f"DDIM at eta 1, step {index}")
+
+    def draw(seed):
+        return np.random.default_rng([9, seed]).normal(size=(2, 3, 64)).astype(np.float32), np.int32(seed)
+
+    def walked(initial, seed):
+        _, latents = sample(denoise, jnp.asarray(initial), solver=DDIM(eta=1.0), key=int(seed), times=times,
+                            final_denoise=False, record=lambda x, state, denoised: x)
+        return tuple(latents)
+
+    def source(dtype):
+        def run(initial, seed):
+            draws = [np.asarray(jax.random.normal(jax.random.fold_in(request_key(int(seed)), index),
+                                                  initial.shape, jnp.float32)) for index in range(steps)]
+            wide = dtype == torch.float64
+            with precision.float64_scheduler(scheduling_ddim) if wide else contextlib.nullcontext():
+                scheduler = scheduling_ddim.DDIMScheduler.from_config(config)
+                scheduler.set_timesteps(steps)
+                x = torch.tensor(np.asarray(initial), dtype=dtype)
+                latents = []
+                for time, noise in zip(scheduler.timesteps, draws, strict=True):
+                    prediction = torch.sin(scheduler.scale_model_input(x, time)) * 0.07 + time * 0.001
+                    x = scheduler.step(prediction, time, x, eta=1.0,
+                                       variance_noise=torch.tensor(noise, dtype=dtype)).prev_sample
+                    latents.append(x.numpy().copy())
+            return tuple(latents)
+        return run
+
+    assert_as_exact(as_given(walked), as_given(source(torch.float32)), draw,
+                    "DDIM at eta 1 against Diffusers", seeds=WALK_SEEDS,
+                    truth_fn=as_given(source(torch.float64)))
 
 
 def test_rk4s_update_divides_by_six_as_ieee_division_does():

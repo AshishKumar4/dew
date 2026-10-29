@@ -15,10 +15,10 @@ from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.dropout import Dropout
 
 from . import activations
-from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
 from .kernels.generation import linear_tangent
+from .norms import GroupNorm, RMSNorm
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .rope import sinusoid_frequencies, sinusoids
 from .sharding import constrain, explicit_spec, rows_taken, whole_spec
@@ -327,15 +327,19 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
 
 
 class Upsample(nn.Module):
-    """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""
+    """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`, a module named `conv`
+    (its parameters' path, as the model owning them publishes it: a UNet's `Conv_0`, a KL autoencoder's
+    `conv`)."""
     features: int
     scale: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    conv: str = "Conv_0"
 
     @nn.nowrap
     def _convolution(self, **scope):
-        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
+        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision,
+                    **({"name": self.conv} if "parent" not in scope else {}), **scope)
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:

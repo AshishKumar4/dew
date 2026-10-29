@@ -1,16 +1,35 @@
-"""A module around one causal decoder, answering the decoder's training, cache and serving hooks
-(`dew.nn.protocols`) as the decoder answers them, its decoder's parameters under the field that holds
-it: a multimodal model's language model, DiffusionGemma's text decoder."""
+"""Models around a backbone: a module around one causal decoder, answering the decoder's training, cache
+and serving hooks (`dew.nn.protocols`) as the decoder answers them, its decoder's parameters under the
+field that holds it (a multimodal model's language model, DiffusionGemma's text decoder); and a
+backbone with a head over its final states, two modules over one variables tree (`HeadedModel`)."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Self
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
+from flax.typing import Dtype
 
-from dew.batch import Variables
+from dew.batch import Variables, part, thaw
 from dew.nn.backbones.decoder_stack import DecoderBank
-from dew.nn.protocols import block_chunks_of
+from dew.nn.protocols import (
+    CrossAttending,
+    HiddenStates,
+    OutputTable,
+    VocabularyRows,
+    block_chunks_of,
+    head_table,
+    label_logits,
+)
+
+__all__ = [
+    "DecoderWrapper",
+    "HeadedModel",
+]
 
 if TYPE_CHECKING:
     from dew._records import JSON
@@ -134,3 +153,67 @@ class DecoderWrapper(nn.Module):
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
         return self._over(self._decoder.restore_recompute(record))
+
+
+@dataclass(frozen=True)
+class HeadedModel:
+    """Any backbone with final states (`HiddenStates`) and a head over them, applied as two modules
+    over one variables tree: the two under `backbone` and `head` in every collection
+    (`dew.objectives.base.joined`). Each is applied as its own module over its part, so a backbone
+    that `Pretrained.adapt` gave LoRA factors runs with its own adapter, with its base weights under
+    `frozen`. A task's model reads its rows through it (`dew.decision.DecisionModel`); a head reads
+    the backbone's final states, its vocabulary rows or its output table, and its own logits at a
+    label's tokens (`label_logits`)."""
+
+    backbone: nn.Module
+    head: nn.Module
+
+    def __post_init__(self):
+        if not isinstance(self.backbone, HiddenStates):
+            raise TypeError(f"a head reads its backbone's final states (`HiddenStates`), which a "
+                            f"{type(self.backbone).__name__} does not give")
+
+    @property
+    def context_length(self) -> int | None:
+        """The most context tokens a row carries: the backbone's cross-attention's (`CrossAttending`),
+        or None for a backbone that reads no context."""
+        if not isinstance(self.backbone, CrossAttending) or self.backbone.cross_attention is None:
+            return None
+        return self.backbone.cross_attention.context_length
+
+    def table(self, variables: Variables) -> jax.Array | np.ndarray:
+        """Return the backbone's head as `[V, D]` rows (`VocabularyRows`), which a head may read."""
+        if not isinstance(self.backbone, VocabularyRows):
+            raise TypeError(f"the head reads its backbone's vocabulary rows (`VocabularyRows`), which a "
+                            f"{type(self.backbone).__name__} does not give")
+        rows = self.backbone.apply(thaw(part(variables, "backbone")), method="vocabulary_rows")
+        if not isinstance(rows, (jax.Array, np.ndarray)):
+            raise TypeError(f"vocabulary_rows must return an array, got {type(rows).__name__}")
+        return rows
+
+    def output_table(self, variables: Variables) -> OutputTable | None:
+        """The backbone's head as one matrix (`AffineHead`), or None where no matrix alone is it."""
+        return head_table(self.backbone, thaw(part(variables, "backbone")))
+
+    def label_logits(self, variables: Variables, answers: jax.Array,
+                     ids: tuple[tuple[int, ...], ...]) -> jax.Array:
+        """The backbone's own logits `[B, N, K, V]` at each label's `ids` of each answer state of
+        `answers` `[B, N, features]` (`dew.nn.protocols.label_logits`)."""
+        return label_logits(self.backbone, thaw(part(variables, "backbone")), answers, ids)
+
+    @staticmethod
+    def head_size(backbone: nn.Module) -> tuple[int, Dtype | None]:
+        """Return the width of `backbone`'s final states, and the dtype a head over them computes in.
+
+        The backbone is traced, not run, so this costs no compute. A backbone that
+        computes in reduced precision has its head compute in it too; over
+        full-precision states a head computes at its parameters' precision.
+        """
+        tokens = jnp.zeros((1, 2), jnp.int32)
+
+        def states(key: jax.Array) -> jax.Array:
+            return backbone.init_with_output(key, tokens, method="hidden_states")[0]
+
+        shape = jax.eval_shape(states, jax.random.key(0))
+        reduced = jnp.finfo(shape.dtype).bits < 32
+        return shape.shape[-1], shape.dtype if reduced else None

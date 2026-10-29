@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from interop_support import extract_fixture
+from whole_suite import timed
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -16,10 +17,15 @@ def edges(tmp_path_factory):
                            tmp_path_factory.mktemp("native-diffusion-edges"))
 
 
-@pytest.mark.parametrize(
-    "case", ["ddim-linspace", "pndm-linspace", "ddim-clip", "euler-zero-snr", "dpm-karras", "norm", "odd",
-             "dropped"]
-)
+PAST_TARGET = {"parity": {"dpm-karras": 171}}
+"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (f58abb8a3, ledger 2133):
+DPM-Karras's schedule; every train walks the same native-source path under DDIM, DDIM-clip, Euler and
+PNDM, row 647's proof."""
+
+
+@pytest.mark.parametrize("case", timed(PAST_TARGET, "parity", ["ddim-linspace", "pndm-linspace", "ddim-clip",
+                                                                "euler-zero-snr", "dpm-karras", "norm", "odd",
+                                                                "dropped"]))
 def test_native_source_control_and_gradient_parity(edges, case):
     result = subprocess.run(
         [sys.executable, str(ROOT / "tools/check_native_diffusion_edges.py"), str(edges), case],

@@ -34,11 +34,17 @@ from typing_extensions import TypeVar
 
 from dew._hashing import array_fingerprint
 from dew._records import finite
-from dew.batch import Variables, real_slots, token_positions, valid_order, with_validity
+from dew.batch import Variables, prefix_sum, real_slots, token_positions, valid_order, with_validity
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
-from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
+from dew.nn.kv_cache import (
+    gather_cache_rows,
+    refuse_unassigned,
+    with_rounding_keys,
+    with_rounding_keys_of,
+    write_cache,
+)
 from dew.nn.protocols import (
     BlockDenoiser,
     BlockDrafting,
@@ -55,6 +61,7 @@ from dew.nn.protocols import (
     refuse_prefix,
 )
 from dew.nn.visibility import with_served_blocks
+from dew.objectives.base import ROUNDING_STREAM
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -340,8 +347,23 @@ def row_texts(decoder, generation, prompt_width: int | None) -> tuple[str, ...]:
     return decoder(rows.tokens, rows.lengths, prompt_width)
 
 
+def rounding_keys(keys: jax.Array) -> jax.Array:
+    """Each row's key data of its stochastic-rounding stream (`dew.nn.kv_cache.ROUNDING_KEYS`) from its
+    request's `keys`: a default-impl key, `ROUNDING_STREAM`'s, folded with each word of the row's key
+    in turn, so it is apart from the sampling stream whatever that key's implementation, as a training
+    step's rounding stream is apart from its dropout (`dew.objectives.base.training_rngs`)."""
+    def derived(words: jax.Array) -> jax.Array:
+        key = jax.random.key(ROUNDING_STREAM)
+        for index in range(words.shape[0]):
+            key = jax.random.fold_in(key, words[index])
+        return jax.random.key_data(key)
+
+    return jax.vmap(derived)(jax.random.key_data(keys))
+
+
 def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
-             cache: Variables | None = None) -> tuple[DecoderState, jax.Array]:
+                  cache: Variables | None = None, rounding: jax.Array | None = None
+                  ) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
     A `Selective` decoder skips the prompt-wide head, the largest array a
@@ -349,10 +371,14 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     cache seeded over the prompt (`_seeded_depths`), so the first block does
     not draft from nothing, and a block drafter's windows take every real
     prompt position's context. `cache` continues a cache the caller holds,
-    whose cursors say where each prompt resumes; None allocates an empty one.
+    whose cursors say where each prompt resumes; None allocates an empty one. `rounding` is each
+    row's stochastic-rounding key data (`rounding_keys`), which the cache then holds for every later
+    call (`dew.nn.kv_cache.with_rounding_keys`); None leaves the cache's.
     """
     batch, width = inputs.tokens.shape
     held = _empty_cache(model, params, batch, ops) if cache is None else cache
+    if rounding is not None:
+        held = with_rounding_keys(held, rounding)
     exposed = isinstance(model, Exposing)
     selective = isinstance(model, Selective)
     real = real_slots(inputs.token_fields, (batch, width))
@@ -385,7 +411,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
             raise ValueError("LongRoPE cache rebuilding recomputes the trunk's prefix alone, not a "
                              "prediction depth's or a block drafter's cache, so it decodes without drafting")
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
-        slots = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1, -1)
+        slots = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1, -1)
         history = write_cache(jnp.zeros((batch, model.max_seq_len), inputs.tokens.dtype),
                               inputs.tokens, slots)
         state = dataclasses.replace(state, tokens=history, lengths=lengths)
@@ -506,7 +532,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
         history, lengths = state.tokens, state.lengths
         original = rebuild_position(model)
         if original is not None and history is not None and lengths is not None:
-            slots = lengths[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+            slots = lengths[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
             history = write_cache(history, tokens, jnp.where(valid, slots, -1))
             following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
             crossing = (lengths <= original) & (following > original)
@@ -521,8 +547,9 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 32. Rebuilding the prefix retains the prompt's information.
                 https://github.com/huggingface/transformers/issues/49334
                 """
-                empty = model.apply(params, tokens.shape[0],
-                                     method='init_cache', mutable=['cache'])[1]['cache']
+                empty = with_rounding_keys_of(
+                    model.apply(params, tokens.shape[0], method='init_cache', mutable=['cache'])[1]['cache'],
+                    state.cache)
                 answer, updated = model.apply(
                     {**params, 'cache': empty}, history,
                     attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
@@ -632,7 +659,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
                           jnp.zeros(batch * n, bool), empty, empty)
     drafting = isinstance(strategy, Speculative)
     ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafting else None)
-    state, real = prefill_state(model, params, inputs, ops)
+    state, real = prefill_state(model, params, inputs, ops, rounding=rounding_keys(keys))
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, trips), jnp.int32)], axis=1),
         valid=jnp.concatenate([real_slots(inputs.token_fields, (batch, width)),

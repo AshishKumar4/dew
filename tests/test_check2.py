@@ -2,13 +2,19 @@
 primitive at a time, natively, each equation held to its own operation's contract, as the lane
 computes (`lane`, measured on it), and a primitive without a contract refused."""
 
+import itertools
+
 import certified as ct
 import jax
 import jax.numpy as jnp
 import ml_dtypes
+import native_certificates as nc
 import numpy as np
 import op_certificates as oc
 import pytest
+import recurrence_witness as rw
+from generation_support import INTERPRETS
+from jax.ad_checkpoint import checkpoint_name
 
 
 @pytest.mark.parametrize("dtype, subnormal, halves", [
@@ -28,8 +34,9 @@ def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, 
 
 
 @pytest.mark.parametrize("name, fn, operands", [
-    ("add", jnp.add, 2), ("sub", jnp.subtract, 2), ("mul", jnp.multiply, 2), ("div", jnp.divide, 2),
-    ("sqrt", jnp.sqrt, 1), ("log", jnp.log, 1), ("exp", jnp.exp, 1)])
+    ("add", jnp.add, 2), ("add_any", jnp.add, 2), ("sub", jnp.subtract, 2), ("mul", jnp.multiply, 2),
+    ("div", jnp.divide, 2), ("sqrt", jnp.sqrt, 1), ("rsqrt", jax.lax.rsqrt, 1), ("log", jnp.log, 1),
+    ("exp", jnp.exp, 1), ("logistic", jax.lax.logistic, 1)])
 def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(name, fn, operands):
     """The lane's own result of each operation on random float32 operands, subnormal products and
     quotients included, holds its contract at the lane's measured reach; the same result moved past
@@ -39,12 +46,13 @@ def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(n
     rng = np.random.default_rng(1)
     values = [np.float32(rng.uniform(0.01, 4, 256) * rng.choice([1, 2.0 ** -70], 256))
               for _ in range(operands)]
-    if name in ("sqrt", "log"):
+    if name in ("sqrt", "rsqrt", "log"):
         values = [np.abs(values[0])]
     result = np.asarray(jax.jit(fn)(*values))
     contract = ct.CONTRACTS[name]
     assert np.all(contract({}, values, result, oc.FLOAT32))
-    reach = ct.lane().reach[name, "float32"]
+    # A cotangents' sum is held at add's reach, as it lowers as add does.
+    reach = ct.lane().reach["add" if name == "add_any" else name, "float32"]
     stepped = result.copy()
     stepped[3] = np.nextafter(stepped[3], np.float32(np.inf)) if stepped[3] else np.float32(1e-30)
     for _ in range(2 * max(reach, 1)):
@@ -69,6 +77,26 @@ def test_a_sum_holds_in_any_order_and_a_lost_term_breaks_it():
     lost = sequential.copy()
     lost[0] = np.float32(0.0)
     assert not ct.CONTRACTS["reduce_sum"](params, [terms], lost, oc.FLOAT32)[0]
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reversed"])
+def test_a_cumulative_sum_holds_each_prefixs_bound_and_a_lost_term_breaks_it(reverse):
+    """A cumulative sum, forward and reversed, of float32 terms over seven binades and of integers that
+    wrap: the lane's own holds at every prefix; one prefix missing its largest term breaks there; an integer
+    one off breaks."""
+    rng = np.random.default_rng(6)
+    terms = np.float32(rng.normal(size=(3, 17)) * 2.0 ** rng.integers(-3, 4, (3, 17)))
+    native = np.asarray(jax.lax.cumsum(terms, axis=1, reverse=reverse))
+    params = {"axis": 1, "reverse": reverse}
+    assert np.all(ct.CONTRACTS["cumsum"](params, [terms], native, oc.FLOAT32))
+    taken = np.arange(8, 17) if reverse else np.arange(0, 9)
+    lost = native.copy()
+    lost[1, 8] -= terms[1, taken[np.argmax(np.abs(terms[1, taken]))]]
+    assert not ct.CONTRACTS["cumsum"](params, [terms], lost, oc.FLOAT32)[1, 8]
+    ints = np.int32([[2 ** 31 - 1, 1, 5], [-7, 3, 2]])
+    native = np.asarray(jax.lax.cumsum(ints, axis=1, reverse=reverse))
+    assert np.all(ct.CONTRACTS["cumsum"](params, [ints], native, None))
+    assert not np.all(ct.CONTRACTS["cumsum"](params, [ints], native + np.int32(1), None))
 
 
 def test_a_dot_holds_its_bound_and_an_element_twice_past_it_breaks_it():
@@ -234,6 +262,159 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
         assert ct.certified(fn, ints)[1] == [], fn
 
 
+def _first_equation(fn, operands, name):
+    """The first `name` equation check 2 holds running `fn` on `operands` (`certified.observing`): its
+    params, the operands its contract was given and its results."""
+    with ct.observing() as seen:
+        ct.certified(fn, *operands)
+    found = next(((params, given, results) for held, params, given, results in seen if held == name), None)
+    assert found is not None, f"no {name} equation"
+    return found
+
+
+def _off_by_one_element(result):
+    """`result` with its first element moved by one step of its storage (a flipped low bit)."""
+    wrong = np.array(result, copy=True)
+    flat = wrong.reshape(-1)
+    if flat.dtype == np.bool_:
+        flat[0] = not flat[0]
+    elif np.issubdtype(flat.dtype, np.integer):
+        flat[0] = flat[0] + 1
+    else:
+        bits = flat.view(ct._bits(flat).dtype)
+        bits[0] ^= 1
+    return wrong
+
+
+@pytest.mark.parametrize("name, fn, operands", [
+    ("pad", lambda a: jax.lax.pad(a, np.float32(-3), ((1, 2, 0), (-1, 1, 2))),
+     [np.float32(np.arange(12).reshape(3, 4))]),
+    ("iota", lambda: jax.lax.broadcasted_iota(jnp.int32, (3, 5), 1), []),
+    ("gather", lambda a, i: a[i], [np.float32(np.arange(20).reshape(5, 4)), np.int32([[4], [0], [2]])]),
+    ("gather", lambda a, i: jnp.take_along_axis(a, i, axis=1, mode="clip"),
+     [np.float32(np.arange(20).reshape(5, 4)), np.int32([[0, 9], [3, -2], [1, 1], [2, 0], [3, 3]])]),
+    ("gather", lambda a, i: jnp.take(a, i, axis=0, mode="fill", fill_value=-1.0),
+     [np.float32(np.arange(20).reshape(5, 4)), np.int32([1, 7, -1, 4])]),
+    ("gather", lambda a, i: jax.vmap(lambda row, at: row[at])(a, i),
+     [np.float32(np.arange(20).reshape(5, 4)), np.int32([3, 0, 1, 2, 3])]),
+    ("gather", lambda a, i: jnp.take_along_axis(a, i, axis=1, mode="clip"),
+     [np.arange(20).reshape(5, 4).astype(ml_dtypes.bfloat16),
+      np.int32([[0, 9], [3, -2], [1, 1], [2, 0], [3, 3]])]),
+    ("gather", lambda a, i: a[i],
+     [np.arange(20).reshape(5, 4).astype(ml_dtypes.bfloat16), np.int32([[4], [0], [2]])]),
+    ("stack", lambda a, b: jnp.stack([a, b], axis=1), [np.float32([1, 2, 3]), np.float32([4, 5, 6])]),
+    ("optimization_barrier", lambda a, b: jax.lax.optimization_barrier((a, b)),
+     [np.float32([1, 2]), np.float32([[3, 4, 5]])]),
+    ("rev", lambda a: jax.lax.rev(a, (0, 1)), [np.float32(np.arange(12).reshape(3, 4))]),
+    ("split", lambda a: jax.lax.split(a, (1, 3), axis=1), [np.float32(np.arange(12).reshape(3, 4))]),
+    ("name", lambda a: checkpoint_name(a, "held"), [np.float32([1, 2, 3])]),
+], ids=["pad", "iota", "gather", "gather clipped", "gather filled", "gather batched", "gather clipped bf16",
+        "gather bf16", "stack", "barrier", "rev", "split", "name"])
+def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn, operands):
+    """Every move check 2 certifies by a numpy oracle of XLA's semantics (`CONTRACTS`), padding with
+    interior and negative edges, an iota, a gather in each mode and batched, a stack, an optimization
+    barrier of two operands, a reversal, a split in two and a checkpoint name: the program certifies,
+    its contract holding the lane's own result at every element, and the contract refuses that result
+    with one element a step off."""
+    assert ct.certified(fn, *operands)[1] == []
+    params, given, results = _first_equation(fn, operands, name)
+    contract = ct.CONTRACTS[name]
+    for index, result in enumerate(results):
+        native = np.asarray(result)
+        # As `_held` hands it: a result of its own position reads its own part of the operands alone.
+        operands = ct.RESULT_OPERANDS[name](params, given, index) if name in ct.RESULT_OPERANDS else given
+        assert np.all(contract(params, operands, native, None)), name
+        assert not np.all(contract(params, operands, _off_by_one_element(native), None)), name
+
+
+def test_a_split_holds_each_piece_to_its_own_run():
+    """A split into two pieces of one shape: its pieces in place hold, the two swapped break, though each
+    is a run of the operand."""
+    a = np.float32(np.arange(8).reshape(2, 4))
+
+    def split(a):
+        return jax.lax.split(a, (2, 2), axis=1)
+
+    _, given, results = _first_equation(split, [a], "split")
+    eqn = jax.make_jaxpr(split)(a).jaxpr.eqns[0]
+    findings = []
+    ct._held(eqn, given, results, findings, "split")
+    assert findings == []
+    ct._held(eqn, given, results[::-1], findings, "split")
+    assert len(findings) == 2, findings
+
+
+def test_rsqrt_and_logistic_name_their_exact_values():
+    """rsqrt is exact at the powers of four and logistic at zero, which their contracts hold bit for bit:
+    a result a step off there breaks, as do a wrong pole sign and a missed limit."""
+    # Normal operands: a lane that flushes reads a subnormal one as zero, whose rsqrt is the pole.
+    fours = np.float32([1.0, 4.0, 0.25, 2.0 ** -126, 2.0 ** 126])
+    roots = np.float32([1.0, 0.5, 2.0, 2.0 ** 63, 2.0 ** -63])
+    assert np.all(ct.CONTRACTS["rsqrt"]({}, [fours], roots, oc.FLOAT32))
+    off = np.nextafter(roots, np.float32(np.inf))
+    assert not np.any(ct.CONTRACTS["rsqrt"]({}, [fours], off, oc.FLOAT32))
+    poles = np.float32([0.0, -0.0, np.inf])
+    assert np.all(ct.CONTRACTS["rsqrt"]({}, [poles], np.float32([np.inf, -np.inf, 0.0]), oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS["rsqrt"]({}, [poles], np.float32([-np.inf, np.inf, 1e-30]), oc.FLOAT32))
+    limits = np.float32([0.0, np.inf, -np.inf])
+    assert np.all(ct.CONTRACTS["logistic"]({}, [limits], np.float32([0.5, 1.0, 0.0]), oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS["logistic"]({}, [limits],
+                                               np.nextafter(np.float32([0.5, 1.0, 0.0]), np.float32(0.25)),
+                                               oc.FLOAT32))
+
+
+def test_a_barrier_holds_each_result_to_its_own_operand():
+    """An optimization barrier of two operands of one shape: its results in place hold, the two swapped
+    break, though each is one of its operands."""
+    a, b = np.float32([1, 2]), np.float32([3, 4])
+    _, given, results = _first_equation(lambda a, b: jax.lax.optimization_barrier((a, b)), [a, b],
+                                        "optimization_barrier")
+    eqn = jax.make_jaxpr(lambda a, b: jax.lax.optimization_barrier((a, b)))(a, b).jaxpr.eqns[0]
+    findings = []
+    ct._held(eqn, given, results, findings, "barrier")
+    assert findings == []
+    ct._held(eqn, given, results[::-1], findings, "barrier")
+    assert len(findings) == 2, findings
+
+
+def test_a_scan_is_certified_a_step_at_a_time_and_a_steps_finding_named_by_it():
+    """`certified` runs a scan's body once a step (forward and reversed), its carry threaded and its
+    outputs stacked, giving the lane's own scan's results; a body primitive no contract covers is found at
+    each step, by the step's path."""
+    x = np.float32(np.linspace(0.5, 2, 12).reshape(4, 3))
+
+    def cumulative(reverse):
+        def run(x):
+            return jax.lax.scan(lambda carry, row: (carry * row + 1, carry - row), np.float32(np.ones(3)), x,
+                                reverse=reverse)
+        return run
+
+    def stepped(reverse):
+        # The body's own operations, eagerly, a step at a time: the lane's, unfused.
+        carry, ys = np.float32(np.ones(3)), []
+        for row in (x[::-1] if reverse else x):
+            ys.append(jnp.subtract(carry, row))
+            carry = jnp.add(jnp.multiply(carry, row), np.float32(1))
+        return carry, jnp.stack(ys[::-1] if reverse else ys)
+
+    for reverse in (False, True):
+        outputs, findings = ct.certified(cumulative(reverse), x)
+        assert findings == []
+        for found, native in zip(jax.tree.leaves(outputs), jax.tree.leaves(stepped(reverse)), strict=True):
+            np.testing.assert_array_equal(np.asarray(found), np.asarray(native))
+    # No steps, and steps over no inputs: the carry passes through, the outputs are empty or stacked.
+    empty, findings = ct.certified(lambda x: jax.lax.scan(lambda c, row: (c + row, c * row), x[0], x[:0]), x)
+    assert findings == [] and np.asarray(empty[1]).shape == (0, 3)
+    np.testing.assert_array_equal(np.asarray(empty[0]), x[0])
+    counted, findings = ct.certified(lambda c: jax.lax.scan(lambda c, _: (c * np.float32(2), c), c, None,
+                                                            length=3), x[0])
+    assert findings == [] and np.asarray(counted[1]).shape == (3, 3)
+    _, findings = ct.certified(lambda x: jax.lax.scan(lambda c, row: (c + jnp.sin(row), None),
+                                                      np.float32(np.zeros(3)), x), x)
+    assert len(findings) == 4 and all("scan#" in finding and f"/{step}/sin" in finding
+                                      for step, finding in enumerate(findings)), findings
+
+
 def test_calls_are_certified_inside_and_unsupported_types_refused():
     """A rematerialised body is run one primitive at a time; a float16, float64-free complex or float8
     value has no contract of ours, and a key's wrapping is held to its data."""
@@ -280,3 +461,269 @@ def test_an_exp_past_its_range_is_held_at_its_neighbours_however_far():
         for native in (np.float32([np.inf, 0.0] * 3), np.float32([biggest, least] * 3)):
             assert ct.LEVELS["exp"]([far], native, oc.FLOAT32, flushes).tolist() == [1] * 6
     assert not np.any(ct.CONTRACTS["exp"]({}, [far], np.float32([1.0] * 6), oc.FLOAT32))
+
+
+def _truncating_sum(values: np.ndarray) -> np.float32:
+    """`values` summed in fp32 in their order, each add truncated toward zero, as a tensor core adds: the
+    exact sum as TwoSum's high and low parts, its nearest fp32 value stepped toward zero wherever that
+    overshoots the exact sum, low part included."""
+    total = np.float32(0)
+    for value in values:
+        high, low = oc.two_sum(np.float64(total), np.float64(value))
+        stepped = np.float32(high)
+        # The nearest value less the exact sum is (stepped - high) - low, its first difference exact.
+        beyond = np.float64(stepped) - high
+        if (high > 0 and beyond > low) or (high < 0 and beyond < low):
+            stepped = np.nextafter(stepped, np.float32(0))
+        total = stepped
+    return total
+
+
+def _outer(left, right) -> np.ndarray:
+    """`[rows, columns, depth]`: each element's products, its row of `left` times its row of `right`."""
+    return left[:, None, :] * right[None, :, :]
+
+
+def _without(products: nc.Terms, at) -> nc.Terms:
+    """`products` with each element's term at `at` (`[...]`, an index along the last axis) lost."""
+    exact, magnitudes = products.exact.copy(), products.magnitudes.copy()
+    for found in (exact, magnitudes):
+        np.put_along_axis(found, np.asarray(at)[..., None], 0.0, -1)
+    return nc.Terms(exact, magnitudes)
+
+
+def _truncating_sums(products: np.ndarray, rng) -> np.ndarray:
+    """Each element's `products` (summed along the last axis) summed by `_truncating_sum` in an order of its
+    own, as float64."""
+    flat = products.reshape(-1, products.shape[-1])
+    return np.asarray([_truncating_sum(row[rng.permutation(row.size)]) for row in flat],
+                      np.float64).reshape(products.shape[:-1])
+
+
+def _stepped_sums(products: np.ndarray, width: int, rng, exact: bool) -> list[np.ndarray]:
+    """The fp32 accumulator of each element's `products` (summed along the last axis) after each depth step
+    of `width` of them, from zero: each step's partial summed from zero by truncating adds in an order of its
+    own and added by an IEEE add (`exact`, as exact sums promote it), or each step's products added into the
+    accumulator itself by truncating adds, as the tensor cores add without exact sums."""
+    flat = products.reshape(-1, products.shape[-1])
+    states = [np.zeros(flat.shape[0], np.float32)]
+    for start in range(0, flat.shape[-1], width):
+        rows = (row[rng.permutation(row.size)] for row in flat[:, start:start + width])
+        states.append(np.asarray([np.float32(running + _truncating_sum(row)) if exact else
+                                  _truncating_sum(np.concatenate([[running], row]))
+                                  for running, row in zip(states[-1], rows, strict=True)], np.float32))
+    return [np.asarray(state, np.float64).reshape(products.shape[:-1]) for state in states]
+
+
+def _steps_held(states: list, products: nc.Terms, width: int) -> list[np.ndarray]:
+    """Each depth step's witness (`promoted_step_holds`) of `states`, the accumulators `_stepped_sums` gives,
+    against the true `products`."""
+    return [nc.promoted_step_holds(before, after, products[..., j * width:(j + 1) * width], flushes=False)
+            for j, (before, after) in enumerate(itertools.pairwise(states))]
+
+
+def _steps_apart(states: list, products: nc.Terms, width: int, fault_ends) -> list[np.ndarray]:
+    """Each depth step's separation (`separated`) of the witness's interval on the true `products`
+    (`promoted_step_ends`) from a fault's, `fault_ends(before, step)` of the accumulator before the step and
+    the step's slice of the depth."""
+    def apart(j, before):
+        step = slice(j * width, (j + 1) * width)
+        return nc.separated(nc.promoted_step_ends(before, before, products[..., step], flushes=False),
+                            fault_ends(before, step))
+
+    return [apart(j, before) for j, before in enumerate(states[:-1])]
+
+
+def test_the_truncating_model_keeps_the_low_part_of_an_add():
+    """1 less 2^-80, both exact bf16 products, truncates to fp32's value below one, which a float64 add
+    of them, rounding to one, would hide."""
+    assert _truncating_sum(np.asarray([1.0, -2.0 ** -80])) == np.nextafter(np.float32(1), np.float32(0))
+
+
+def test_a_native_dot_holds_products_that_truncate_away_below_the_normal_range():
+    """128 products of 1.5 * 2^-75 and 2^-75, each a subnormal fp32 sum truncates to zero: the output zero
+    holds, as a truncating add below the normal range loses up to a whole subnormal unit."""
+    products = nc.terms(np.multiply, np.full((1, 128), 1.5 * 2.0 ** -75), np.full((1, 128), 2.0 ** -75),
+                        fmt=oc.BFLOAT16)
+    native = np.asarray([_truncating_sum(products.exact[0])], np.float64)
+    assert native[0] == 0
+    assert np.all(nc.native_dot_holds(native, products, oc.FLOAT32, flushes=False))
+
+
+def test_a_native_dot_aligns_a_subnormal_operand_at_its_least_normal_and_no_bare_product_of_one():
+    """The native-dot contract's magnitudes (row 2084, link 3): the tensor cores' sum of `SUBNORMAL_CASE`'s
+    five fp16 products, one of the subnormal 2^-24, holds where that operand counts at fp16's least normal
+    (`nc.aligned`) and is refused at the products' own magnitudes; bare products a subnormal operand
+    may have made, any under `SUBNORMAL_REACH`, raise rather than take the tight bound, where products of 4
+    and more pass bare."""
+    left, right, native = nc.SUBNORMAL_CASE
+    products = nc.terms(np.multiply, np.asarray([left]), np.asarray([right]), fmt=rw.FLOAT16)
+    assert nc.native_dot_holds([native], products, oc.FLOAT32, flushes=False).tolist() == [True]
+    tight = nc.Terms(products.exact, np.abs(products.exact))
+    assert nc.native_dot_holds([native], tight, oc.FLOAT32, flushes=False).tolist() == [False]
+    with pytest.raises(ValueError):
+        nc.native_dot_ends(products.exact, oc.FLOAT32, flushes=False)
+    assert nc.native_dot_holds([16.0], np.full((1, 4), 4.0), oc.FLOAT32, flushes=False).tolist() == [True]
+
+
+def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_product_or_a_narrow_partial():
+    """The native-dot contract (row 2084's link 1): a GEMM's output summed from its exact bf16 products in
+    fp32 by truncating adds in any order, then rounded once to bf16 (or kept in fp32), holds at every
+    element, same-sign products included, whose truncations all err one way. Each fault is refused where it
+    lands (`assert_refused`): the same sums with their largest product lost, at more than 95% of the
+    elements; and the first half's partial rounded to bf16 before an IEEE add of the rest's, as the native
+    fault adds them, wherever that rounding outweighs the sum's own: at more than 65% of the elements of
+    Gaussian draws, whose partials sometimes cancel to a bf16 value's neighbourhood, and more than 90% of
+    draws of one sign."""
+    rng = np.random.default_rng(3)
+    for signed in (True, False):
+        left, right = (np.asarray(ml_dtypes.bfloat16(rng.normal(size=shape) if signed else
+                                                     rng.uniform(0.5, 2.0, size=shape)), np.float64)
+                       for shape in ((16, 128), (4, 128)))
+        products = nc.terms(_outer, left, right, fmt=oc.BFLOAT16)
+        summed = _truncating_sums(products.exact, rng)
+        for out, native in ((oc.FLOAT32, summed), (oc.BFLOAT16, summed.astype(ml_dtypes.bfloat16))):
+            held = nc.native_dot_holds(np.asarray(native, np.float64), products, out, flushes=False)
+            assert np.all(held), (signed, out.name)
+        lost = _without(products, np.argmax(np.abs(products.exact), -1))
+        first, rest = (_truncating_sums(half.exact, rng) for half in (products[..., :64], products[..., 64:]))
+        narrow = np.float32(first.astype(ml_dtypes.bfloat16)) + np.float32(rest)
+        narrowed = nc.narrow_partial_ends(products[..., :64], products[..., 64:], flushes=False)
+        truth = nc.native_dot_ends(products, oc.FLOAT32, flushes=False)
+        fault_lost = nc.native_dot_ends(lost, oc.FLOAT32, flushes=False)
+        # One sign's partials never cancel near a bf16 value: the emulation's claim there is 0.9.
+        for faulty, fault, share in ((_truncating_sums(lost.exact, rng), fault_lost, nc.LOST_SHARE),
+                                     (narrow, narrowed, nc.NARROW_SHARE if signed else 0.9)):
+            held = nc.native_dot_holds(np.asarray(faulty, np.float64), products, oc.FLOAT32, flushes=False)
+            nc.assert_refused(held, nc.separated(truth, fault), share)
+
+
+def test_a_tf32_operand_rounds_to_nearest_a_tie_away_from_zero():
+    """TF32 keeps 11 of fp32's 24 bits, each value read here of either sign: 1 + 2^-11, a tie, reads as
+    1 + 2^-10 (away from zero, where to even it is 1); a value just below the tie as 1; 1 + 3 2^-11, a tie at
+    an odd last bit, as 1 + 2^-9 (to even too); and a value TF32 holds as itself. At its edges: the subnormal
+    tie 2^-137 as TF32's least subnormal 2^-136, and an fp32 step below it as zero; 2^-126 - 2^-137, the tie
+    below the least normal, as 2^-126; the binade's tie 2 - 2^-11 as 2; TF32's largest value, 2^128 - 2^117,
+    as itself; and the tie past it, 2^128 - 2^116, as infinity, where an fp32 step below it reads as the
+    largest."""
+    largest, past = 2.0 ** 128 - 2.0 ** 117, 2.0 ** 128 - 2.0 ** 116
+    cases = [(1 + 2 ** -11, 1 + 2 ** -10), (1 + 2 ** -11 - 2 ** -23, 1.0), (1 + 3 * 2 ** -11, 1 + 2 ** -9),
+             (1 + 2 ** -10, 1 + 2 ** -10), (2.0 ** -137, 2.0 ** -136), (2.0 ** -137 - 2.0 ** -149, 0.0),
+             (2.0 ** -126 - 2.0 ** -137, 2.0 ** -126), (2 - 2.0 ** -11, 2.0), (largest, largest),
+             (past, np.inf), (past - 2.0 ** 104, largest)]
+    values, expected = (np.asarray([[sign * case[side] for case in cases] for sign in (1.0, -1.0)])
+                        for side in (0, 1))
+    read = nc.tf32_operand(np.float32(values))
+    assert np.array_equal(read, expected) and np.array_equal(np.signbit(read), np.signbit(expected))
+
+
+def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf16_and_a_truncation():
+    """The TF32 contract (row 2084's link 2): a GEMM of fp32 operands at the default precision, its products
+    of their TF32 values (`tf32_operand`) summed in fp32 by truncating adds in any order, holds at every
+    element; the products of its operands' bf16 values where TF32 is declared, its TF32 products where bf16
+    ones are, and the products of its operands truncated to TF32 where the tensor cores round them are each
+    refused where they land (`assert_refused`): the first two at more than 85% of the elements, the
+    truncation at more than 75% of Gaussian draws, whose products' errors partly cancel, and at more than 95%
+    of draws of one sign, whose products all err toward zero."""
+    rng = np.random.default_rng(5)
+
+    def bf16(value):
+        return np.asarray(value.astype(ml_dtypes.bfloat16), np.float64)
+
+    for signed in (True, False):
+        left, right = (np.asarray((rng.normal(size=shape) if signed else rng.uniform(0.5, 2.0, size=shape))
+                                  .astype(np.float32), np.float64) for shape in ((32, 128), (8, 128)))
+        tf32, wide, truncated = (nc.terms(_outer, read(left), read(right), fmt=fmt) for read, fmt in (
+            (nc.tf32_operand, oc.TFLOAT32), (bf16, oc.BFLOAT16),
+            (lambda value: oc.truncated(value, oc.TFLOAT32), oc.TFLOAT32)))
+        native = _truncating_sums(tf32.exact, rng)
+        assert np.all(nc.native_dot_holds(native, tf32, oc.FLOAT32, flushes=False)), signed
+        swapped, other, cut = nc.TF32_SHARES[signed]
+        for faulty, declared, given, share in ((_truncating_sums(wide.exact, rng), tf32, wide, swapped),
+                                               (native, wide, tf32, other),
+                                               (_truncating_sums(truncated.exact, rng), tf32, truncated,
+                                                cut)):
+            held = nc.native_dot_holds(faulty, declared, oc.FLOAT32, flushes=False)
+            nc.assert_refused(held, nc.separated(*(nc.native_dot_ends(products, oc.FLOAT32, flushes=False)
+                                                   for products in (declared, given))), share)
+
+
+def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_add_or_a_lost_product():
+    """The exact-sums witness (row 2084's link 2): an fp32 accumulator to which each depth step's partial,
+    summed from zero by truncating adds in any order, is added by an IEEE add holds at every step, on draws at
+    one scale and falling 2^-12 past the first step. Each fault is refused where it lands (`assert_refused`):
+    a step with its largest product lost, at more than 95% of that step's elements, and nowhere else; and,
+    on a falling draw of one sign, the same steps' products added into the accumulator by truncating adds,
+    as the tensor cores add without exact sums (`truncating_step_ends`), at more than 40% of the later
+    steps' elements, about those whose exact sum lies past the midpoint between two fp32 values, which a
+    truncation leaves below and a rounding above."""
+    rng = np.random.default_rng(7)
+    width = 16
+    for signed in (True, False):
+        left, right = (np.asarray(ml_dtypes.bfloat16(rng.normal(size=shape) if signed else
+                                                     rng.uniform(0.5, 2.0, size=shape)), np.float64)
+                       for shape in ((16, 64), (4, 64)))
+        for fall in (1.0, 2.0 ** -12):
+            products = nc.terms(_outer, left * np.where(np.arange(64) < width, 1.0, fall), right,
+                                fmt=oc.BFLOAT16)
+            held = _steps_held(_stepped_sums(products.exact, width, rng, exact=True), products, width)
+            assert all(np.all(step) for step in held), (signed, fall)
+        lost = _without(products, 2 * width + np.argmax(np.abs(products.exact[..., 2 * width:3 * width]), -1))
+        states = _stepped_sums(lost.exact, width, rng, exact=True)
+        held = _steps_held(states, products, width)
+        apart = _steps_apart(states, products, width, lambda before, step, lost=lost: nc.promoted_step_ends(
+            before, before, lost[..., step], flushes=False))
+        nc.assert_refused(held[2], apart[2], nc.LOST_SHARE)
+        assert all(np.all(held[j]) for j in (0, 1, 3)), signed
+        if not signed:
+            # A truncation's bound toward zero holds where the accumulator and every product share a sign.
+            states = _stepped_sums(products.exact, width, rng, exact=False)
+            held = _steps_held(states, products, width)
+            apart = _steps_apart(states, products, width, lambda before, step, terms=products: (
+                nc.truncating_step_ends(before, terms[..., step], flushes=False)))
+            assert not np.any(np.stack(held) & np.stack(apart))
+            nc.assert_refused(np.stack(held[1:]), np.stack(apart[1:]), nc.TRUNCATED_SHARE)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("regime", rw.REGIMES)
+def test_the_recurrence_step_witness_holds_the_interpreted_mainloop(regime):
+    """Check 2's step witness of the recurrence template (row 2084, link 3) on Mosaic GPU's interpreter, the
+    mainloop's own code on the CPU's IEEE dots: every record of a bf16 call of three chunks, its inverses,
+    weighted keys, corrected values, outputs and stored and fp32 memories, lies inside its launch step's
+    enclosure on the native records the step reads (`recurrence_witness.enclosed`), each chunk's from the
+    fp32 memory it enters, under each regime of decay (`REGIMES`); the certify build is the production
+    program bit for bit (`recorded`), and each chunk's stored entering memory is the fp32 memory the chunks
+    before it leave, rounded as stored (end_j == start_{j+1})."""
+    run = rw.recorded(*rw.draw(0, regime))
+    held = rw.witness(run, rw.interpreted_lane())
+    assert np.all(run.seams)
+    for name in rw.RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16():
+    """The step witness's faults on the interpreted mainloop, each refused where it lands
+    (`nc.assert_refused`), a memory kept across chunks (`REGIMES`' 'slow'): a document starting at the
+    second chunk, whose zero memory is refused at more than 95% of the memory the first chunk leaves; and the
+    second chunk run from that memory rounded to bf16 where fp32 is held, refused at more than 60% of the
+    fp32 memory it leaves."""
+    lane = rw.interpreted_lane()
+    operands = rw.draw(1, "slow", chunks=2)
+    truth = rw.recorded(*operands)
+    nc.assert_refused(*rw.dropped_refusals(operands, truth, 1, lane), 0.95)
+    nc.assert_refused(*rw.handed_refusals(operands, truth, 1, lane), 0.6)
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary():
+    """The step witness's faults on the interpreted mainloop, each refused where it lands
+    (`nc.assert_refused`): the decay from a difference of fp32 cumulative sums (row 2066's defect) in
+    a decay alone, refused at more than 50% of the fp32 memory each chunk leaves (the 16-bit records' grid
+    hides it); and each chunk's boundary a token early, at more than 95% of the weighted keys, corrected
+    values and outputs, and no record held where its intervals separate."""
+    lane = rw.interpreted_lane()
+    rw.assert_refusals(rw.cumsum_refusals(rw.draw(1, "decay", chunks=2), lane), {"leaving": 0.5})
+    rw.assert_refusals(rw.shifted_refusals(rw.draw(1, "mild", chunks=2), lane),
+                       {"w": 0.95, "c": 0.95, "o": 0.95})

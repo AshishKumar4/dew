@@ -328,7 +328,7 @@ class LocalTracker(_OwnedTracker):
         self.directory.mkdir(parents=True, exist_ok=True)
         self._sequence += 1
         prefix = self.directory / f'preview-{step}-{time.time_ns()}-{self._sequence}'
-        files = _write_preview(value, prefix)
+        files = write_artifact(value, prefix)
         self._write('records.jsonl', {'type': type(value).__name__, 'step': step,
                                     'time': time.time(), 'files': [path.name for path in files]})
 
@@ -417,8 +417,16 @@ def _curves(history: Mapping[str, list[tuple[int, float]]], metrics: tuple[str, 
 
 
 @functools.singledispatch
-def _write_preview(value: Reported, prefix: Path) -> list[Path]:
+def write_artifact(value: Reported, prefix: Path) -> list[Path]:
+    """`value` written as files under `prefix`, as a tracker keeps a preview (an image's PNG, an array
+    artifact's .npz), returning their paths; a type with no writer is refused."""
     raise TypeError(f'LocalTracker has no renderer for {type(value).__name__}')
+
+
+def _named(prefix: Path, suffix: str) -> Path:
+    """The file `prefix` names with `suffix` after its whole name: a split's dotted name (`test.v1`) is
+    its name, not a suffix the extension replaces."""
+    return prefix.with_name(prefix.name + suffix)
 
 
 def _write_frames(frames, encode, suffix: str, captions, prefix: Path) -> list[Path]:
@@ -428,50 +436,51 @@ def _write_frames(frames, encode, suffix: str, captions, prefix: Path) -> list[P
         path = prefix.with_name(f'{prefix.name}-{index}{suffix}')
         path.write_bytes(encode(frame))
         paths.append(path)
-    written = prefix.with_suffix('.json')
+    written = _named(prefix, '.json')
     written.write_text(json.dumps(list(captions)))
     return [*paths, written]
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: ImageGrid, prefix: Path) -> list[Path]:
     return _write_frames(_uint8(value.images), _png, '.png', value.captions, prefix)
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: VideoGrid, prefix: Path) -> list[Path]:
     return _write_frames(_uint8(value.videos), _gif, '.gif', value.captions, prefix)
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: TextSamples, prefix: Path) -> list[Path]:
-    path = prefix.with_suffix('.json')
+    path = _named(prefix, '.json')
     path.write_text(json.dumps({'prompt': value.prompt, 'texts': list(value.texts),
                                 'tokens': _home(value.tokens).tolist()}))
     return [path]
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: Representations, prefix: Path) -> list[Path]:
     return _arrays(prefix, features=value.features, labels=value.labels)
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: TokenScores, prefix: Path) -> list[Path]:
     return _arrays(prefix, losses=value.losses, weights=value.weights)
 
 
 def _arrays(prefix: Path, **arrays) -> list[Path]:
     """`arrays`, brought home, saved together under `prefix` as one .npz preview."""
-    path = prefix.with_suffix('.npz')
+    path = _named(prefix, '.npz')
     np.savez(path, allow_pickle=False, **{name: _home(array) for name, array in arrays.items()})
     return [path]
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: Decisions, prefix: Path) -> list[Path]:
+    classes = {} if value.classes is None else {"classes": value.classes}
     return _arrays(prefix, probabilities=value.probabilities, options=value.options, labels=value.labels,
-                   targets=value.targets, ordinal=value.ordinal, scored=value.scored)
+                   targets=value.targets, ordinal=value.ordinal, scored=value.scored, **classes)
 
 
 MLFLOW_NAME = re.compile(r"[/\w.\- ]{0,250}")
@@ -559,7 +568,7 @@ class MLflowTracker(_OwnedTracker):
                 self._status = value.terminal_status
             return
         with tempfile.TemporaryDirectory() as directory:
-            for path in _write_preview(value, Path(directory) / f'preview-{step}'):
+            for path in write_artifact(value, Path(directory) / f'preview-{step}'):
                 client.log_artifact(run, str(path), f'previews/step-{step}')
 
     def close(self) -> None:

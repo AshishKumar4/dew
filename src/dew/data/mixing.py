@@ -11,7 +11,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from fractions import Fraction
-from typing import Protocol, TypeGuard, overload, runtime_checkable
+from typing import Protocol, TypeGuard, runtime_checkable
 
 import grain.experimental as gx
 import grain.python as pygrain
@@ -30,8 +30,15 @@ class CorpusCounts:
     """What one corpus's read counted, under its identity (`name`, which plans and saved positions
     key it by) and the short name its metrics go by (`label`). `accepted` counts the rows it
     delivered and `truncated` those of them cut short, its source examples where an objective makes
-    several rows of each, counted before it does (`FlatMap.examples`); a rejection counts what the step
-    that drops it reads, a record or a piece or window a step made of one. `attempted` counts what its last
+    several rows of each, counted before it does (`FlatMap.examples`); `cut_examples`, `cut_rows` and
+    `cut_removed` count, by what each cut (a decision row's instructions, options, state, or a context it
+    did not read), the delivered rows a cut shortened, the rows it shortened of them, and the tokens it
+    removed (characters, for a kind that names them: `state_characters`), as the delivered rows report
+    them (`delivered`); a rejection counts what the step that
+    drops it reads, a record or a piece or window a step made of one, a member a delivered row left out
+    among them. `declined` counts, by the reason its layout refuses it, the delivered rows whose
+    augmentation a training read declines where it draws it (a decision row's "none of the above",
+    `_dew_declined`), each then read as it was admitted. `attempted` counts what its last
     filter read, for its own warning; it describes no one unit of the corpus, so no metric shows it."""
 
     name: str
@@ -42,16 +49,58 @@ class CorpusCounts:
     chunks: int = 0
     chunk_records: int = 0
     rejected: Counter[str] = dataclasses.field(default_factory=Counter)
+    cut_examples: Counter[str] = dataclasses.field(default_factory=Counter)
+    cut_rows: Counter[str] = dataclasses.field(default_factory=Counter)
+    cut_removed: Counter[str] = dataclasses.field(default_factory=Counter)
+    left_out: Counter[str] = dataclasses.field(default_factory=Counter)
+    """The members delivered rows left out, by reason (`_dew_rejected`), counted apart from the records
+    the corpus rejected whole, so a recount of the delivered rows (`counted_anew`) starts them over."""
+    declined: Counter[str] = dataclasses.field(default_factory=Counter)
+
+    def delivered(self, element: Batch | bytes) -> None:
+        """Count one row the corpus delivered: accepted, cut short where it says it was
+        (`_dew_truncated`), each cut it reports (`_dew_cut`: by what it cut, the rows it shortened and
+        the tokens it removed), the members it left out by reason (`_dew_rejected`), and the
+        augmentation a read declines for it, by reason (`_dew_declined`)."""
+        self.accepted += 1
+        if not isinstance(element, Mapping):
+            return
+        self.truncated += int(bool(element.get("_dew_truncated", False)))
+        for kind, (rows, tokens) in element.get("_dew_cut", {}).items():
+            self.cut_examples[kind] += 1
+            self.cut_rows[kind] += int(rows)
+            self.cut_removed[kind] += int(tokens)
+        for reason, count in element.get("_dew_rejected", {}).items():
+            self.left_out[reason] += int(count)
+        for reason, count in element.get("_dew_declined", {}).items():
+            self.declined[reason] += int(count)
+
+    def counted_anew(self) -> None:
+        """Start over the counts of delivered rows, for a read that counts them again whole (a memory
+        read's rows, read once more as it holds them)."""
+        self.accepted, self.truncated = 0, 0
+        for counted in (self.cut_examples, self.cut_rows, self.cut_removed, self.left_out, self.declined):
+            counted.clear()
+
+    @property
+    def refused(self) -> Counter[str]:
+        """What the corpus left out, by reason: the records it rejected whole and the members its
+        delivered rows left out (`left_out`)."""
+        return self.rejected + self.left_out
 
     def metrics(self, label: str) -> dict[str, float]:
         """The metrics a run logs of this corpus under `label`, each exact in one unit: the rows it
-        delivered and its rejections by reason as integers, the share of those rows cut short and
-        the chunks per chunked record."""
+        delivered, its rejections and the augmentation it declined by reason as integers, the share
+        of those rows cut short and the chunks per chunked record."""
         return {
             f"data/rows/{label}": self.accepted,
             f"data/truncated/{label}": self.truncated / max(1, self.accepted),
             f"data/chunks_per_record/{label}": self.chunks / max(1, self.chunk_records),
-            **{f"data/rejected/{label}/{reason}": count for reason, count in self.rejected.items()},
+            **{f"data/rejected/{label}/{reason}": count for reason, count in self.refused.items()},
+            **{f"data/cut_examples/{label}/{kind}": count for kind, count in self.cut_examples.items()},
+            **{f"data/cut/{label}/{kind}": count for kind, count in self.cut_rows.items()},
+            **{f"data/cut_removed/{label}/{kind}": count for kind, count in self.cut_removed.items()},
+            **{f"data/declined/{label}/{reason}": count for reason, count in self.declined.items()},
         }
 
     def state(self) -> Mapping[str, object]:
@@ -62,6 +111,11 @@ class CorpusCounts:
             "chunks": self.chunks,
             "chunk_records": self.chunk_records,
             "rejected": dict(self.rejected),
+            "left_out": dict(self.left_out),
+            "cut_examples": dict(self.cut_examples),
+            "cut_rows": dict(self.cut_rows),
+            "cut_removed": dict(self.cut_removed),
+            "declined": dict(self.declined),
         }
 
     def restore(self, state: Mapping[str, object]) -> None:
@@ -73,6 +127,10 @@ class CorpusCounts:
         self.rejected = Counter(
             {name: integer(value, name) for name, value in record(state["rejected"], "rejected").items()}
         )
+        # A position saved before cuts were counted holds none.
+        for name in ("cut_examples", "cut_rows", "cut_removed", "left_out", "declined"):
+            setattr(self, name, Counter({kind: integer(value, kind)
+                                         for kind, value in record(state.get(name, {}), name).items()}))
 
     def followed(self, reader: CorpusCounts) -> CorpusCounts:
         """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
@@ -101,19 +159,17 @@ class _KeepAccepted:
 
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
-        reason = element.reason if isinstance(element, Rejected) else None
-        if reason is None and self.tokens is not None and not isinstance(element, Rejected):
-            count = self.tokens(element)
-            if count < 0:
+        if isinstance(element, Rejected):
+            reason = element.reason
+        else:
+            count = None if self.tokens is None else self.tokens(element)
+            if count is not None and count < 0:
                 raise ValueError(f"corpus {self.counts.name} has a negative valid-target count: {count}")
-            if count == 0:
-                reason = "zero_targets"
-        if reason is None:
-            self.counts.accepted += 1
-            if isinstance(element, Mapping):
-                self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
-            self.consecutive = 0
-            return True
+            if count != 0:
+                self.counts.delivered(element)
+                self.consecutive = 0
+                return True
+            reason = "zero_targets"
         self.counts.rejected[reason] += 1
         self.consecutive += 1
         if not self.warned and sum(self.counts.rejected.values()) / self.counts.attempted > _WARN_OVER:
@@ -241,12 +297,12 @@ def token_weights(
 
 
 class _DeficitIterator(pygrain.DatasetIterator[Batch]):
-    """Each row from the corpus furthest below its share of the targets delivered, each corpus
-    read through its first row ahead (`_PrimeReads`)."""
+    """Each row from the corpus furthest below its share of the targets delivered, each corpus read
+    as it is drawn (`_MixReads`)."""
 
     def __init__(
         self,
-        reads: Sequence[_PrimedRead],
+        reads: Sequence[_MixRead],
         weights: tuple[int, ...],
         tokens: Callable[[Batch], int],
         keys: tuple[str, ...],
@@ -450,141 +506,124 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         )
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        group = _PrimeReads([iter(parent) for parent in self._corpora])
-        reads = [_PrimedRead(group, index) for index in range(len(self._corpora))]
+        group = _MixReads(self._corpora)
+        reads = [_MixRead(group, index) for index in range(len(self._corpora))]
         return _DeficitIterator(reads, self._weights, self._tokens, self._keys)
 
 
-class _PrimeMap:
-    def __init__(self, parents: Sequence[pygrain.MapDataset[Batch]]):
-        self.parents = tuple(parents)
-        self.lock = threading.Lock()
-        self.done = False
-        self.pending: dict[int, Batch] = {}
-
-    def read(self, parent: int, index: int) -> Batch | None:
-        with self.lock:
-            if not self.done:
-                for corpus, dataset in enumerate(self.parents):
-                    row = dataset[0]
-                    if row is not None:
-                        self.pending[corpus] = row
-                self.done = True
-            if index == 0 and parent in self.pending:
-                return self.pending.pop(parent)
-        return self.parents[parent][index]
-
-    def __getstate__(self):
-        return {name: value for name, value in self.__dict__.items() if name != "lock"}
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self.lock = threading.Lock()
+_UNOPENED = "unopened"
+"""The key of a mix's corpus's position where the mix has not opened it (`_MixRead`)."""
 
 
-class PrimedMap(pygrain.MapDataset[Batch]):
-    def __init__(self, parent: pygrain.MapDataset[Batch], group: _PrimeMap, index: int):
-        super().__init__(parent)
-        self._records, self._group, self._index = parent, group, index
+class _MixReads:
+    """Every corpus of a mix, each opened and read only as the mix draws from it: a corpus the mix has
+    not drawn holds no iterator, so no reader's threads, buffers or files, and no position but its
+    start and the counts it carries there (`state`). A mix captures every corpus's position for each
+    record it gives (a packer captures it before each record), and only the corpus it read moved, so
+    a corpus's position is captured again only after the mix reads it or it is restored."""
 
-    def __len__(self) -> int:
-        return len(self._records)
-
-    @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
-    @overload
-    def __getitem__(self, index: int) -> Batch | None: ...
-    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch] | None:
-        return self.slice(index) if isinstance(index, slice) else self._group.read(self._index, index)
-
-
-def primed_maps(parents: Sequence[pygrain.MapDataset[Batch]]) -> tuple[pygrain.MapDataset[Batch], ...]:
-    group = _PrimeMap(parents)
-    return tuple(PrimedMap(parent, group, index) for index, parent in enumerate(parents))
-
-
-class _PrimeReads:
-    """Every corpus of a mix, each read through its first row ahead. A mix
-    captures every corpus's position for each record it gives (a packer
-    captures it before each record), and only the corpora the group read
-    moved, so a corpus's position is captured again only after the group
-    reads it or it is restored (`state`)."""
-
-    def __init__(self, parents: Sequence[pygrain.DatasetIterator[Batch]]):
-        self.parents = tuple(parents)
-        self.pending: dict[int, Batch] = {}
-        # Each corpus's captured position, before the row it holds read ahead while it holds one.
+    def __init__(self, corpora: Sequence[pygrain.IterDataset[Batch]]):
+        self.corpora = tuple(corpora)
+        self.opened: dict[int, pygrain.DatasetIterator[Batch]] = {}
+        # Each opened corpus's captured position, until a read or a restore moves it.
         self.states: dict[int, Mapping[str, object]] = {}
-        # The corpora whose first row was read ahead: every corpus at the start, and one that joins
-        # a resumed mix, before the mix gives a row.
-        self.primed: set[int] = set()
+        # A position whose counters a corpus back at its start, unopened, takes on as it opens, every
+        # counter its stages keep (`rewound`): a pass a repeat reads again goes on counting each corpus.
+        self.counted: dict[int, Mapping[str, object]] = {}
+
+    def parent(self, index: int) -> pygrain.DatasetIterator[Batch]:
+        """Corpus `index`'s iterator, opened as the mix first draws from or restores it. It runs
+        under its own Grain options: the only ones Dew sets above a mix are its loading workers'
+        shared-memory floor (`min_shm_size`), which the worker boundary reads, not a corpus."""
+        if index not in self.opened:
+            opened = iter(self.corpora[index])
+            if index in self.counted:
+                opened.set_state(rewound(opened.get_state(), self.counted.pop(index)))
+            self.opened[index] = opened
+        return self.opened[index]
 
     def read(self, index: int) -> Batch:
-        for corpus, parent in enumerate(self.parents):
-            if corpus not in self.primed:
-                # Kept only once the row is read: a corpus refused as it is read ahead keeps the
-                # position, and the counts, its refusal left.
-                self.states.pop(corpus, None)
-                before = parent.get_state()
-                self.pending[corpus] = next(parent)
-                self.states[corpus] = before
-                self.primed.add(corpus)
         self.states.pop(index, None)
-        if index in self.pending:
-            return self.pending.pop(index)
-        return next(self.parents[index])
+        return next(self.parent(index))
 
-    def state(self, index: int) -> Mapping[str, object]:
-        """The position of corpus `index`: before its row read ahead while it holds one."""
+    def state(self, index: int) -> Mapping[str, object] | None:
+        """The position of corpus `index`, None where it is unopened (`counts`)."""
+        if index not in self.opened:
+            return None
         if index not in self.states:
-            self.states[index] = self.parents[index].get_state()
+            self.states[index] = self.opened[index].get_state()
         return self.states[index]
 
-    def restore(self, index: int, state: Mapping[str, object], primed: bool) -> None:
-        self.parents[index].set_state(state)
-        self.pending.pop(index, None)
+    def counts(self, index: int) -> Mapping[str, object] | None:
+        """The position whose counters corpus `index`, unopened, carries (None before it counted)."""
+        return self.counted.get(index)
+
+    def restore(self, index: int, state: Mapping[str, object]) -> None:
+        """Corpus `index` at `state`."""
         self.states.pop(index, None)
-        if primed:
-            self.primed.add(index)
-        else:
-            self.primed.discard(index)
+        self.parent(index).set_state(state)
+
+    def started(self, index: int, counted: Mapping[str, object] | None) -> None:
+        """Corpus `index` back at its start, unopened, carrying the counters of `counted`, a position
+        it held (none where it is None): a repeat's rewind hands it the corpus's live position to go on
+        counting from (`rewound`), a restore the counts it saved."""
+        self.states.pop(index, None)
+        self.close(index)
+        if counted is not None:
+            self.counted[index] = counted
+
+    def close(self, index: int) -> None:
+        self.counted.pop(index, None)
+        opened = self.opened.pop(index, None)
+        if opened is not None:
+            opened.close()
 
 
-class _PrimedRead(pygrain.DatasetIterator[Batch]):
-    """One corpus of a mix (`_PrimeReads`). The position records whether the
-    mix had read the corpus's first row ahead, so a restored mix reads each
-    corpus on from it and starts none again, but for one that joined, which it
-    reads ahead before it gives a row."""
+class _MixRead(pygrain.DatasetIterator[Batch]):
+    """One corpus of a mix (`_MixReads`): its parent's position, or, unopened, the counters it carries
+    (`_UNOPENED`). A position a mix saved while it read each corpus's first row ahead holds the
+    corpus before that row, which a restore reads next; one that held a corpus's counts alone in its
+    parent's place is a corpus at its start carrying them."""
 
-    def __init__(self, group: _PrimeReads, index: int):
-        super().__init__(group.parents[index])
+    def __init__(self, group: _MixReads, index: int):
+        super().__init__()
         self._group, self._index = group, index
 
     def __next__(self) -> Batch:
         return self._group.read(self._index)
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._group.state(self._index), "primed": self._index in self._group.primed}
+        state = self._group.state(self._index)
+        if state is None:
+            return {_UNOPENED: self._group.counts(self._index)}
+        return {"parent": state}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self._group.restore(self._index, record(state["parent"], "primed corpus"),
-                            boolean(state["primed"], "primed"))
+        if _UNOPENED in state:
+            counted = state[_UNOPENED]
+            self._group.started(self._index, None if counted is None else record(counted, "mixed corpus"))
+            return
+        parent = record(state["parent"], "mixed corpus")
+        if set(parent) <= {_COUNTER}:
+            self._group.started(self._index, parent if parent.get(_COUNTER) is not None else None)
+        else:
+            self._group.restore(self._index, parent)
 
     def close(self) -> None:
-        self._group.parents[self._index].close()
+        self._group.close(self._index)
 
 
 class _ReadDataset(pygrain.IterDataset[Batch]):
-    def __init__(self, parent: pygrain.IterDataset[Batch], group: _PrimeReads, index: int):
+    def __init__(self, parent: pygrain.IterDataset[Batch], group: _MixReads, index: int):
         super().__init__(parent)
         self._group, self._index = group, index
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _PrimedRead(self._group, self._index)
+        return _MixRead(self._group, self._index)
 
 
-class PrimedMix(pygrain.IterDataset[Batch]):
-    """Grain's weighted mix of corpora, each read through its first row ahead (`_PrimeReads`), and
+class KeyedMix(pygrain.IterDataset[Batch]):
+    """Grain's weighted mix of corpora, each read as it is drawn (`_MixReads`), and
     each keyed by its member's key (`keys`): Grain saves a keyed mix's positions by key and
     restores those it finds, so a member that joins starts at its first row and one that left is
     dropped while the others resume where they were."""
@@ -595,7 +634,7 @@ class PrimedMix(pygrain.IterDataset[Batch]):
         self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        group = _PrimeReads([iter(parent) for parent in self._corpora])
+        group = _MixReads(self._corpora)
         parents = {key: _ReadDataset(parent, group, index)
                    for index, (key, parent) in enumerate(zip(self._keys, self._corpora, strict=True))}
         weights = dict(zip(self._keys, self._weights, strict=True))
@@ -615,7 +654,11 @@ def rewound(start: Mapping[str, object], current: Mapping[str, object]) -> Mappi
     """`start`, the position a repeat rewinds its pass to, with each counter's counts as `current`
     holds them (`_COUNTER`: its counts, run of rejections and warning): a pass read again goes on
     counting the corpus, where a restored position replaces its counts. Every other part of a
-    position is the iterator's own and is left as `start` has it."""
+    position is the iterator's own and is left as `start` has it. A mix's corpus the pass had not
+    opened at its start (`_MixRead`'s `_UNOPENED`) is rewound to that, carrying the position it holds
+    now, open or not, whose counters, every one its stages keep, it takes on as it opens again."""
+    if _UNOPENED in start:
+        return {_UNOPENED: current.get("parent", current.get(_UNOPENED))}
     shared = [key for key in start if key in current]
     parts = _rewound_parts([start[key] for key in shared], [current[key] for key in shared])
     kept = {**start, **dict(zip(shared, parts, strict=True))}
@@ -706,6 +749,7 @@ def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts])
         combined.attempted = max(combined.attempted, counts.attempted)
         combined.chunks = max(combined.chunks, counts.chunks)
         combined.chunk_records = max(combined.chunk_records, counts.chunk_records)
+        # Members a row left out travel with the row, as its cuts do: the outermost counts them.
         combined.rejected.update(counts.rejected)
 
 
@@ -720,3 +764,8 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     combined.chunks += counts.chunks
     combined.chunk_records += counts.chunk_records
     combined.rejected.update(counts.rejected)
+    combined.cut_examples.update(counts.cut_examples)
+    combined.cut_rows.update(counts.cut_rows)
+    combined.cut_removed.update(counts.cut_removed)
+    combined.left_out.update(counts.left_out)
+    combined.declined.update(counts.declined)

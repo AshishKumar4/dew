@@ -25,30 +25,40 @@ compilation rather than a constant embedded in the executable.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
-from dew.batch import Batch, Variables, real_slots, thaw
-from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, DiscreteProcess, Unmask, aligned
+from dew.batch import TEXT_KEY, Batch, Variables, real_slots, thaw
+from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.moe import ROUTER_COLLECTION
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Lacks, TokenModel
 from dew.objectives.base import OMITTED, Aux, EMASpec, Omitted, Ratio, Shown, Source, Step, ended, model_rngs
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
-from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
+from dew.objectives.lm.objective import batch_text, text_preview
 from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
-from dew.sampling.sample import sample
+from dew.sampling.walks import sample
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
 
 _DEFAULT_SOLVER = Unmask()
+
+
+@runtime_checkable
+class Walking(Protocol):
+    """A loaded source that names the walk its release generates by, its solver, steps and block, or
+    None, as `dew.interop.PretrainedMaskedDecoder` does (`masked_recipe`)."""
+
+    @property
+    def masked_recipe(self) -> tuple[Confident, int, int] | None: ...
 
 
 class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variables]):
@@ -76,8 +86,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
         balance: ExpertBalance | None = None,
         ema_decay: float | None = 0.999,
-        solver: Unmask = _DEFAULT_SOLVER,
-        steps: int = MDLM_STEPS,
+        solver: Unmask | Confident | None = None,
+        steps: int | None = None,
+        block: int | None | Omitted = OMITTED,
         samples: int = 4,
         decode: Callable[[Sequence[int]], str] | None = None,
         variables: Variables | None | Omitted = OMITTED,
@@ -89,10 +100,14 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         `model` gives its logits, from its final states through its head or
         from its tokens (`chunked.reads_states`, `Logits`), and its states
         attend both ways (`TokenModel` with `causal` False), as
-        `CausalTransformer(causal=False)`'s do. `solver`
-        and `steps` set how generation unmasks, in the preview and in the
-        task `pipeline` returns, and `samples` is how many rows the preview
-        draws. `decode` turns a row of ids into the text the artifact shows;
+        `CausalTransformer(causal=False)`'s do. `solver`, `steps` and `block`
+        set how generation unmasks in the task `pipeline` returns, and `solver`
+        and `steps` how the preview does, which walks whole rows; None for
+        `solver` or `steps` and an omitted `block` take a loaded source's own
+        walk where its family declares one (`masked_recipe`, LLaDA2.0's
+        blocks), else `Unmask` over MDLM's steps and the whole response.
+        `samples` is how many rows the preview draws. `decode` turns a row of ids into the text the artifact
+        shows;
         with None, the artifact shows the ids alone.
 
         `model` may be a loaded source, such as a released LLaDA or Dream
@@ -100,6 +115,12 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         (`Objective.bind_model`), as `eos_token_ids`, the ids its task's
         responses stop at, overrides the source's (`ended`)."""
         self.eos_token_ids = ended(model, eos_token_ids)
+        # The source's own walk, where its family declares one, for what the caller omits.
+        recipe = model.masked_recipe if isinstance(model, Walking) else None
+        own_solver, own_steps, own_block = (_DEFAULT_SOLVER, MDLM_STEPS, None) if recipe is None else recipe
+        solver = own_solver if solver is None else solver
+        steps = own_steps if steps is None else steps
+        block = own_block if block is OMITTED else block
         model = self.bind_model(model, variables=variables, processor=processor)
         if not isinstance(model, TokenModel) or model.causal:
             raise Lacks("bidirectional",
@@ -113,6 +134,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         self.use_head(head_chunks, head_tile)
         self.solver = solver
         self.steps = steps
+        self.block = block
         self.samples = samples
         self.decode = decode
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
@@ -133,7 +155,8 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         """The row length, response budget, process, solver, sampling steps, end-of-sequence ids, and
         tokenizer or source processor: the task's own."""
         return MaskedSettings(seq_len=self.seq_len, max_new_tokens=self.seq_len, process=self.process,
-                              solver=self.solver, sampling_steps=self.steps, eos_token_ids=self.eos_token_ids,
+                              solver=self.solver, sampling_steps=self.steps, block=self.block,
+                              eos_token_ids=self.eos_token_ids,
                               tokenizer=recorded_tokenizer(self.processor),
                               processor=recorded_processor(self.processor))
 
@@ -177,7 +200,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         tokens, losses, weights, counted, predicted, real, sown = self._token_losses(params, batch, step,
                                                                                    train=train)
         prediction = Ratio(self.row_mean(losses, batch, weights=weights).total,
-                           self.row_mean(real.astype(jnp.float32), batch).total)
+                           self.row_mean(real.astype(at_least_fp32(losses.dtype)), batch).total)
         correct = predicted == tokens
         accuracy, _ = self.accuracy(correct.astype(losses.dtype), batch, counted).mean()
         reported = {

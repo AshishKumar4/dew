@@ -143,6 +143,34 @@ def test_a_request_refuses_a_bool_row_beside_integer_rows():
         [4, 5], [2, 3]]
 
 
+def test_tokens_laid_out_both_as_coordinates_and_as_fields_are_refused():
+    """A call that lays its tokens out twice, as `Coordinates` and as a flat field beside them, is refused
+    wherever it enters, a ModelInputs or the decoder's call, where the coordinates silently dropped the
+    field (ledger 1122). Either form alone reads as before."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.batch import COORDINATES_FIELD, coordinates
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import ModelInputs
+
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, num_kv_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
+                              attention_impl="reference")
+    tokens = jnp.asarray([[0, 3, 4, 5], [6, 7, 8, 9]], jnp.int32)
+    valid = jnp.asarray([[False, True, True, True], [True, True, True, True]])
+    laid = coordinates(tokens.shape, valid=valid)
+    variables = model.init(jax.random.key(0), tokens)
+    for field, value in (("attention_mask", valid), ("segment_ids", jnp.ones(tokens.shape, jnp.int32)),
+                         ("positions", jnp.zeros(tokens.shape, jnp.int32))):
+        with pytest.raises(ValueError):
+            ModelInputs(tokens, {COORDINATES_FIELD: laid, field: value}).validate()
+        with pytest.raises(ValueError):
+            model.apply(variables, tokens, coordinates=laid, **{field: value})
+    np.testing.assert_array_equal(model.apply(variables, tokens, coordinates=laid),
+                                  model.apply(variables, tokens, attention_mask=valid))
+
+
 def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     """The same packed, left-padded rows, as `Coordinates` (a data pipeline's
     packing) or as the validity, segment and position fields (a rollout's), are
@@ -238,13 +266,13 @@ def test_a_feed_forward_reads_blocks_of_its_own_size_from_the_layers_metadata():
 def test_packed_offsets_come_from_the_batchs_document_firsts(seed):
     """A packed batch's `cu_seqlens` (`dew.nn.inputs.cu_seqlens`) are each sequence's first token over the
     flattened tokens in order, every row's first token one, the sequences past them empty at the end: the
-    same from the batch's `Coordinates.firsts`, built once a step (a traced step's `coordinates`, a host
-    batch's at the model's entry, `with_firsts`), from the starts alone, and as the tokens marked in order
-    would give them (row 1897: a scan over the flattened tokens ran a token a loop iteration on a mesh);
-    and a request's sliced coordinates drop firsts that no longer index its slots."""
+    same from the batch's `Coordinates.firsts`, built by one builder for a traced step's coordinates and a
+    host batch's alike (`document_firsts`, row 1923), from the starts alone, and as the tokens marked in
+    order would give them (row 1897: a scan over the flattened tokens ran a token a loop iteration on a
+    mesh); and a request's sliced coordinates hold the firsts of their own slots."""
     import jax.numpy as jnp
 
-    from dew.batch import coordinates, with_firsts
+    from dew.batch import coordinates
     from dew.nn.inputs import ModelInputs, cu_seqlens
 
     rng = np.random.default_rng(seed)
@@ -262,19 +290,20 @@ def test_packed_offsets_come_from_the_batchs_document_firsts(seed):
     np.testing.assert_array_equal(cu_seqlens(tokens.starts, sequences, tokens.firsts), want)
     np.testing.assert_array_equal(cu_seqlens(tokens.starts, sequences), want)
     host = coordinates(segments=segments, max_segments=documents, xp=np)
-    assert host.firsts is None
-    np.testing.assert_array_equal(with_firsts(host).firsts, tokens.firsts)
+    assert isinstance(host.firsts, np.ndarray)
+    np.testing.assert_array_equal(host.firsts, tokens.firsts)
 
     request = ModelInputs(tokens=jnp.zeros((rows, length), jnp.int32), token_fields={"coordinates": tokens})
     sliced = request.slice_tokens(0, length - 3).token_fields["coordinates"]
-    assert sliced.firsts is None
+    np.testing.assert_array_equal(
+        sliced.firsts, coordinates(segments=segments[:, :length - 3], max_segments=documents).firsts)
 
 
 def test_a_traced_packed_batch_holds_its_documents_apart_from_its_tokens():
     """A packed batch whose coordinates a traced step built holds its documents' firsts `[B, D]` beside its
     token-aligned fields `[B, S]` (`Coordinates.TOKEN_ALIGNED`), fewer documents than slots: it validates,
-    and a slice or a rotation of its slots moves the token-aligned fields and drops the firsts, whose
-    reader rebuilds them from the moved starts."""
+    and a slice or a rotation of its slots moves the token-aligned fields and builds the firsts again from
+    the moved starts, each row's slot 0 a first."""
     import jax
     import jax.numpy as jnp
 
@@ -294,5 +323,7 @@ def test_a_traced_packed_batch_holds_its_documents_apart_from_its_tokens():
 
     firsts, sliced, sliced_firsts, rotated, rotated_firsts = jax.jit(checked)(segments)
     assert firsts.shape == (2, 3) and sliced.shape == (2, 6) and rotated.shape == (2, 8)
-    assert sliced_firsts is None and rotated_firsts is None
     np.testing.assert_array_equal(firsts, [[0, 3, 8], [0, 5, 8]])
+    np.testing.assert_array_equal(sliced_firsts, [[0, 3, 6], [0, 5, 6]])
+    # The first row rotated left a slot: its second document from slot 2.
+    np.testing.assert_array_equal(rotated_firsts, [[0, 2, 8], [0, 5, 8]])

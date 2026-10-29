@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from collections.abc import Mapping, Sequence
 
 import jax
@@ -78,8 +79,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
 
     Only an objective whose rows hold tokens gives them (`Objective.row_tokens`), so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
-    `gpu_target().kernels['xla_triton_gemm']` measured a win and no module the step runs
-    keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
+    the GPU measured a win without them (`GpuTarget.triton_gemm_fusions`) and no module the step
+    runs keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
     (`compiler_options`).
     """
     generation = device_generation()
@@ -91,7 +92,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
     modules = [entry.module for entry in objective.program_key()]
-    if (gpu_target(generation).kernels.get('xla_triton_gemm') == 'off'
+    if (not gpu_target(generation).triton_gemm_fusions
             and xla_flag('xla_gpu_enable_triton_gemm') is None
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
@@ -102,7 +103,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
 
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                         refusals: list[RuntimeError]) -> jax.stages.Compiled | None:
-    """Return `program` compiled under `options`, or None if XLA refuses it for memory.
+    """Return `program` compiled under `options`, or None if XLA refuses it for memory (`refused_for_memory`).
 
     A refusal is appended to `refusals`. XLA:TPU checks a program's temporaries
     against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
@@ -114,11 +115,37 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
     try:
         return program.compile(options)
     except jax.errors.JaxRuntimeError as error:
-        if error.error_code_string != 'RESOURCE_EXHAUSTED':
+        if not refused_for_memory(error.error_code_string, str(error)):
             raise
         _log.info("XLA refused the step for memory: %s", error)
         refusals.append(error)
         return None
+
+
+AUTOTUNED_FAILURES = re.compile(r"^Failures \((\d+)\):$", re.MULTILINE)
+"""The head of a GPU GEMM autotuner's list of what failed (XLA's `PickBestConfig`, config_selector.cc): every
+config's failure (`ConfigRunner::Failure::ToString`, config_runner.cc: `EXECUTION FAILED`, `COMPILATION
+FAILED`, `REDZONE CHECK FAILED` or `WRONG RESULTS`, then its status) and every excluded backend's line, one
+a line, as many as the head counts."""
+
+EXECUTED_OUT_OF_MEMORY = re.compile(r"^EXECUTION FAILED: RESOURCE_EXHAUSTED: ", re.MULTILINE)
+
+
+def refused_for_memory(code: str, message: str) -> bool:
+    """Whether XLA refused a program it compiled for memory, by its error's status `code` and `message`:
+    RESOURCE_EXHAUSTED, or on a GPU its GEMM autotuner finding no config it could profile (NOT_FOUND)
+    where each of the failures it lists (`AUTOTUNED_FAILURES`) is a config's execution out of device
+    memory. One that failed to compile, failed its redzone check or gave wrong results, or a backend
+    excluded beside them, is no memory refusal, and the error is raised. An A100 with 0.30 of its memory
+    to a decoder's step refused it so at the whole head's f32[65536,32000] GEMM, each of its eight configs
+    7.83 GiB short (node receipt TL-a100-offload-1338-d): the step at a rung that holds less compiles."""
+    if code == 'RESOURCE_EXHAUSTED':
+        return True
+    listed = AUTOTUNED_FAILURES.search(message)
+    if code != 'NOT_FOUND' or listed is None:
+        return False
+    count = int(listed.group(1))
+    return count > 0 and len(EXECUTED_OUT_OF_MEMORY.findall(message, listed.end())) == count
 
 
 def split_share(params: Variables) -> float:
@@ -221,22 +248,29 @@ def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defa
             'remat': recompute_record(objective), 'xla_defaults': xla_defaults, 'narrow': narrow}
 
 
-def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
+def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0,
+                  capacity: int | None = None, built: int = 0) -> int | None:
     """Return the bytes the tightest of `devices` has to spare once the step's memory is placed.
 
     The step's temporaries and new outputs are placed next to `held` more bytes
     that the loop keeps outside the step. The result is None if the executable or
-    a device reports no memory. The arguments (the state and the batch) are
+    a device reports no memory, a device stated `capacity` bytes reading as one
+    that holds them (`compile_only_gpus`' devices state none). The arguments (the state and the batch) are
     already resident and counted as in use, and the donated state's buffers are
-    reused for the outputs that alias them.
+    reused for the outputs that alias them; on a stated device, `built` bytes of them, which `held`
+    counts as the step's first call builds them, are not yet.
 
     XLA's GPU step takes all its temporaries in one allocation, so it needs one
     free block that large, not that many free bytes in total (`placeable`). Where
     the allocator `strands_temporaries`, they need room twice.
     """
     stats = executable.memory_analysis()
-    memory = [device.memory_stats() or {} for device in devices]
-    if stats is None or not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
+    if stats is None:
+        return None
+    # A device that states no memory, one compiled for and absent (`compile_only_gpus`), holds the
+    # `capacity` it is stated to, the step's arguments in it as they would be.
+    memory = [device_memory(device, capacity, stats.argument_size_in_bytes - built) for device in devices]
+    if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
     return min(placeable(m, unclaimed(d, m)) - beside
@@ -257,6 +291,18 @@ def peak_memory_gib() -> float | None:
     peaks = [stats['peak_bytes_in_use'] for device in jax.local_devices()
              if (stats := device.memory_stats()) is not None and 'peak_bytes_in_use' in stats]
     return max(peaks) / 1024 ** 3 if peaks else None
+
+
+def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
+    """What `device`'s allocator states (`Device.memory_stats`), empty where it states nothing: a CPU's,
+    or a compile-only GPU's (`dew.training.ahead.compile_only_gpus`), none of this process's own, which
+    holds no memory to read. A stated capacity models a fresh BFC pool with `arguments` resident:
+    its free block and temporary-stranding policy are read exactly as for that allocator."""
+    if device in jax.local_devices():
+        return device.memory_stats() or {}
+    return {} if capacity is None else {
+        'bytes_limit': capacity, 'bytes_in_use': arguments, 'pool_bytes': capacity,
+        'largest_free_block_bytes': capacity - arguments}
 
 
 def local_devices(mesh: Mesh) -> list:
@@ -291,7 +337,7 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
         for name in ("argument", "output", "alias", "temp", "generated_code")}
     devices_stats: list[JSON] = []
     for device in devices:
-        memory = device.memory_stats() or {}
+        memory = device_memory(device)
         reported: dict[str, JSON] = {key: int(memory[key]) for key in MEMORY_STATS if key in memory}
         devices_stats.append({"id": int(device.id), **reported,
                               "unclaimed": None if not memory else unclaimed(device, memory),
@@ -351,11 +397,11 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
     return memory['pool_bytes'] >= memory['bytes_limit'] and partitioning.lower() not in ('false', '0')
 
 
-def temporaries_factor(mesh: Mesh) -> int:
+def temporaries_factor(mesh: Mesh, capacity: int | None = None) -> int:
     """How many times its temporaries a step needs room for on this process's tightest device of
     `mesh` (`strands_temporaries`): 2 where an allocator can strand them, else 1."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return max((2 if (memory := device.memory_stats()) is not None
+    return max((2 if (memory := device_memory(device, capacity))
                 and strands_temporaries(device.platform, memory) else 1) for device in local)
 
 
@@ -370,17 +416,19 @@ def fits_everywhere(headroom: int | None) -> bool:
     return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
 
 
-def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0) -> tuple[bool, int | None]:
+def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
+              capacity: int | None = None, built: int = 0) -> tuple[bool, int | None]:
     """Whether the compiled step fits in the free memory of every device of `mesh`,
     and this process's headroom (`step_headroom`), None where it reads none.
 
-    Each device must also hold `held` more bytes, and the processes that hold
-    them agree on the answer. A step that XLA refused for memory
-    (`compiled_if_it_fits`) does not fit, and its process still takes part in the
-    agreement.
+    Each device must also hold `held` more bytes, `built` of them among the step's arguments
+    (`step_headroom`), and the processes that hold them agree on the answer. A step that XLA
+    refused for memory (`compiled_if_it_fits`) does not fit, and its process still takes part in
+    the agreement.
     """
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    headroom = None if executable is None else step_headroom(executable, local, held=held)
+    headroom = None if executable is None else step_headroom(executable, local, held=held,
+                                                             capacity=capacity, built=built)
     return fits_everywhere(-1 if executable is None else headroom), headroom
 
 

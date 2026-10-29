@@ -14,12 +14,14 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig, media_field
+from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
+from dew.config.media import media_field
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
+from dew.nn.protocols import ReadsClips
 from dew.objectives.jepa.masking import MultiBlockMask
 from dew.optim import OptimConfig
-from dew.registry import JsonDict, ModelConfig, models
+from dew.registry import JsonDict, ModelConfig
 
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
                      "ssm_state_dim", "dropout_rate", "precision")
@@ -54,7 +56,7 @@ class JepaRunConfig(RunConfig):
         varies."""
         return media_field(self.chain(), "JEPA")
 
-    def prepare(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The encoder, the predictor over its patch grid, the target-block mask
         and the probes, around the objective the run names. The predictor
         computes as the encoder does, its compute dtype and attention kernel."""
@@ -64,12 +66,14 @@ class JepaRunConfig(RunConfig):
         dataset, held = self.compiled(ObjectiveData(), self.chain(), self.validation)
         sample = self.sample()
         video = sample.key == "video"
-        if video != (models[self.model.name] is models["jepa_video_encoder"]):
-            raise ValueError("a video dataset and --model jepa_video_encoder go together")
         encoder = self.model.build()
+        if video != (isinstance(encoder, ReadsClips) and encoder.reads_clips):
+            raise ValueError("a video dataset and an encoder that reads clips (--model jepa_video_encoder) "
+                             "go together")
         # A frame is [height, width, channels], an image's or each of a clip's.
         grid = (sample.shape[-3] // encoder.patch_size, sample.shape[-2] // encoder.patch_size)
-        fields = self.model.fields
+        # The encoder's effective arguments, its class's defaults among them, as the encoder was built.
+        fields = self.model.arguments
         predictor = ModelConfig("jepa_predictor", {
             **{key: value for key, value in fields.items() if key in SHARED_MODEL_KEYS}, **self.predictor,
             "grid": grid, "factorized": video, "scan_order": encoder.scan_order,

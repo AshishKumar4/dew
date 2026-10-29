@@ -26,7 +26,7 @@ from memory_support import (
     layer,
     written,
 )
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -34,11 +34,13 @@ from dew.nn.memory import CARRY, Gate, InContextMemory, MLPMemory, Objective
 from dew.nn.mlp import GatedMLP
 
 SEEDS = {"memory decoder gradient": 512, "memory decoder decode": 16, "adapted memory": 8, "rows split": 256,
-         "rows split cms": 512}
+         "rows split cms": 512, "served memory moving": 8, "served memory projections": 8,
+         "served memory convolved": 8}
 """The sites' declared seeds where `seeds_for` on armada, each reference compared with itself, sizes them
 apart from `MEMORY_SEEDS`: the memory decoder's gradients, every parameter's leaf, and the
 continuum-memory level's rows split over a data axis at 512; the other memories' rows split at 256; the
-decoder's last logits after a cached decode at 16; an adapted memory decoder at 8."""
+decoder's last logits after a cached decode at 16; an adapted memory decoder at 8; each served memory
+(`SERVED`) at 8, paired with quantized training (`seeds_for(..., dew_fn=)`)."""
 
 
 def decoder(memory: InContextMemory | None = None, **fields):
@@ -59,42 +61,60 @@ def decoder(memory: InContextMemory | None = None, **fields):
                                 "kinds": {"memory": LayerKind(mixer=InContextMemoryMixer(memory))}, **fields})
 
 
-def test_a_memory_decoder_trains_scans_remats_and_decodes():
-    """A decoder whose first two layers are memories, which its scanned stack scans as one group, from
-    the plain loop's tree: the scanned stack's logits and gradient, and both under a remat policy that
-    keeps each memory's chunk carry (`CARRY`), are the plain loop's, on par against float64 (check 1),
-    the gradient reaching every memory's initial network; and the scanned stack's cached decode, token
-    by token after a prefill, gives the full pass's last logits (check 1)."""
+def trained(model):
+    """`model`'s logits and its parameters' gradient under a cotangent, compiled."""
+    @jax.jit
+    def run(variables, ids, cotangent):
+        logits, pull = jax.vjp(lambda held: model.apply(held, ids), variables)
+        return logits, pull(cotangent)[0]["params"]
+    return run
+
+
+def memory_draw(plain):
+    """The decoder's drawn inputs (`model_draw`) and a drawn cotangent over its logits."""
     from model_support import model_draw
 
-    from dew.nn.backbones.decoder_block import RematPolicy
-
-    plain, scanned = decoder(), decoder(scan_layers=True)
-    rematted = decoder(scan_layers=True, remat=RematPolicy(save=(CARRY,)))
-    wide = decoder(dtype=jnp.float64)
     draw_model = model_draw(plain, (ROWS, LENGTH), 37)
 
-    def trained(model):
-        """The model's logits and its parameters' gradient under a cotangent."""
-        @jax.jit
-        def run(variables, ids, cotangent):
-            logits, pull = jax.vjp(lambda held: model.apply(held, ids), variables)
-            return logits, pull(cotangent)[0]["params"]
-        return run
-
-    def draw_with_cotangent(seed: int):
+    def draw(seed: int):
         cotangent = np.random.default_rng([1648, seed]).standard_normal((ROWS, LENGTH, 37)).astype(np.float32)
         return *draw_model(seed), cotangent
+    return draw_model, draw
 
-    for name, model in (("scanned", scanned), ("rematted", rematted)):
-        assert_as_exact(trained(model), trained(plain), draw_with_cotangent,
-                        f"{name} memory decoder gradient", seeds=SEEDS["memory decoder gradient"],
-                        truth_fn=trained(wide))
-    gradient = trained(rematted)(*draw_with_cotangent(0))[1]
+
+def test_a_scanned_memory_decoder_trains_as_the_plain_loop():
+    """A decoder whose first two layers are memories, which its scanned stack scans as one group, from
+    the plain loop's tree: the scanned stack's logits and gradient are the plain loop's, on par against
+    float64 (check 1)."""
+    plain = decoder()
+    _, draw = memory_draw(plain)
+    assert_as_exact(trained(decoder(scan_layers=True)), trained(plain), draw,
+                    "scanned memory decoder gradient", seeds=SEEDS["memory decoder gradient"],
+                    truth_fn=trained(decoder(dtype=jnp.float64)))
+
+
+def test_a_rematted_memory_decoder_trains_as_the_plain_loop_reaching_every_memory():
+    """The scanned memory decoder under a remat policy that keeps each memory's chunk carry (`CARRY`):
+    its logits and gradient are the plain loop's, on par against float64 (check 1), the gradient reaching
+    every memory's initial network."""
+    from dew.nn.backbones.decoder_block import RematPolicy
+
+    plain, rematted = decoder(), decoder(scan_layers=True, remat=RematPolicy(save=(CARRY,)))
+    _, draw = memory_draw(plain)
+    assert_as_exact(trained(rematted), trained(plain), draw, "rematted memory decoder gradient",
+                    seeds=SEEDS["memory decoder gradient"], truth_fn=trained(decoder(dtype=jnp.float64)))
+    gradient = trained(rematted)(*draw(0))[1]
     for index in (0, 1):
         layer = gradient[f"layers_{index}"]["self_attn"]
         assert all(np.abs(np.asarray(leaf)).max() > 0 for name in layer if head_of((name,)) is not None
                    for leaf in jax.tree.leaves(layer[name]))
+
+
+def test_a_scanned_memory_decoder_decodes_as_its_full_pass():
+    """The scanned memory decoder's cached decode, token by token after a prefill, gives the full pass's
+    last logits, on par against float64 (check 1)."""
+    plain, scanned = decoder(), decoder(scan_layers=True)
+    draw_model, _ = memory_draw(plain)
 
     @jax.jit
     def decoded(variables, ids):
@@ -109,7 +129,7 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
         return jax.jit(lambda variables, ids: model.apply(variables, ids)[:, -1])
 
     assert_as_exact(decoded, last(plain), draw_model, "memory decoder decode",
-                    seeds=SEEDS["memory decoder decode"], truth_fn=last(wide))
+                    seeds=SEEDS["memory decoder decode"], truth_fn=last(decoder(dtype=jnp.float64)))
 
 
 ADAPTED = {"titans": ("titans", ("layers_0", "layers_1"), 2 * HEADS * 2),
@@ -424,25 +444,230 @@ def test_a_quantized_memorys_update_rounds_from_its_own_stream():
     assert not np.array_equal(np.asarray(drawn[0]), np.asarray(other[0]))
 
 
-def test_serving_quantization_refuses_a_memorys_moving_inner_weights():
-    """Serving quantization (`quantize_for_serving`) stores each weight a rule selects quantized, and the
-    products read the stored values; Dew does not yet serve a memory's W_0 stored quantized, which a
-    pattern selecting its inner weights is refused for at init (`QuantizedServingRefused`). One
-    selecting the memory's projections alone serves them, the served decoder computing what quantized
-    training computed, bit for bit."""
+class ConvolvedMemory(nn.Module):
+    """An inner network that convolves the view's vector as a one-channel signal, width kept: a memory's
+    network that runs a convolution rather than a matmul."""
+
+    dtype: jnp.dtype | None = None
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return nn.Conv(1, (3,), padding="SAME", dtype=self.dtype, name="conv")(x[..., None])[..., 0]
+
+
+class GeneralMemory(nn.Module):
+    """An inner network that maps the view's vector through a rank-three kernel (`DenseGeneral`),
+    width kept: a matmul a weight-only rule quantizes whose kernel is no [in, out] matrix."""
+
+    dtype: jnp.dtype | None = None
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return nn.DenseGeneral((2, x.shape[-1] // 2), use_bias=False, dtype=self.dtype,
+                               name="general")(x).reshape(x.shape)
+
+
+SERVED = {"moving": ((INNER,), None, True), "projections": ((r".*self_attn/[qkvo]_proj",), None, False),
+          "convolved": ((INNER,), ConvolvedMemory(), True)}
+"""The served-memory cases: the patterns serving quantizes, the memory's inner network (None: Titans'
+MLP), and whether those weights move."""
+
+
+def served_site(case: str):
+    """The served-memory site `case` (`SERVED`): the served decoder over its stored tree, from seed 0's
+    serving preparation, and check 1's arms over each seed's: the served decoder, quantized training
+    from the stored W_0, and that training in float64, with the draw."""
+    from model_support import model_draw
+
+    from dew.quantization import Quantization, decoded_stored, quantize_for_serving
+
+    patterns, network, moving = SERVED[case]
+    memory = None if network is None else InContextMemory(
+        network=network, heads=2, head_features=8, chunk=4, normalize=True,
+        learning_rate=Gate(scale=STEP), momentum=Gate(), retention=Gate(bias=-2.0))
+    model, wide = decoder(memory), decoder(memory, dtype=jnp.float64)
+    spec = Quantization(patterns=patterns)
+    draw_model = model_draw(model, (ROWS, LENGTH), 37)
+    served = quantize_for_serving(model, *draw_model(0)[:1], spec, draw_model(0)[1])[0]
+
+    def draw(seed: int):
+        variables, ids = draw_model(seed)
+        stored = quantize_for_serving(model, variables, spec, ids)[1]
+        start = {**variables, "params": decoded_stored(stored)["params"]} if moving else variables
+        return stored, start, ids
+
+    return (served, lambda stored, start, ids: served.apply(stored, ids),
+            lambda stored, start, ids: spec.apply(model).apply(start, ids), draw,
+            lambda stored, start, ids: spec.apply(wide).apply(start, ids))
+
+
+@pytest.mark.parametrize("case", SERVED)
+def test_a_served_memory_computes_the_quantized_memory_from_its_stored_w0(case):
+    """Serving quantization (`quantize_for_serving`) of two memory layers' inner networks stores each
+    head's W_0 quantized, the steps starting from the float it decodes to (`decoded_stored`), and rounds
+    every product of the moving weights, a matmul's or a convolution's, as quantized training does
+    (`moving_weights`): the served decoder computes what quantized training (`Quantization.apply`)
+    computes from the stored W_0, on par against that training in float64 (check 1). Its projections,
+    which no step moves, serve as quantized training computes them from their float weights. The same
+    tree after a round trip through the host computes the same program bit for bit."""
     pytest.importorskip("qwix")
-    from dew.nn.memory import QuantizedServingRefused
+    from dew.quantization import Annotated
+
+    served, dew_fn, reference_fn, draw, truth_fn = served_site(case)
+    held, _, ids = draw(0)
+    assert any(isinstance(leaf, Annotated)
+               for leaf in jax.tree.leaves(held, is_leaf=lambda leaf: isinstance(leaf, Annotated)))
+    reloaded = jax.tree.map(jnp.asarray, jax.device_get(held))
+    np.testing.assert_array_equal(np.asarray(served.apply(reloaded, ids)),
+                                  np.asarray(served.apply(held, ids)))
+    assert_as_exact(dew_fn, reference_fn, draw, f"served memory {case}", seeds=SEEDS[f"served memory {case}"],
+                    truth_fn=truth_fn)
+
+
+@pytest.mark.parametrize("memory", [None, "delta_rule"])
+def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(memory):
+    """A memory decoder served quantized (`TextGeneration.quantized`) under a spec that rounds the
+    backward stochastically (`bwd_qtype`, `bwd_stochastic_rounding`) draws its inner steps' rounding
+    from its request's own key (`dew.sampling.text.rounding_keys`), Titans' MLP and a linear memory
+    whose cache holds the recurrence's state alike: a task call and one live server each repeat a
+    request alike, and another key moves its likelihoods though greedy decoding draws nothing. A row's
+    stream is its own (`test_a_cached_memorys_rounding_is_each_rows_own`). Without the stream the decode
+    raised in Qwix's make_rng (ledger 2020)."""
+    pytest.importorskip("qwix")
+    from model_support import Digits
+
+    from dew.inference import RunProcessor, TextGeneration
+    from dew.inference.serving import Server
+    from dew.quantization import Quantization
+    from dew.sampling import Sampling
+
+    model = decoder(None if memory is None else layer(memory)).clone(max_seq_len=64)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    task = TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=12))
+    bound = task.quantized(Quantization(patterns=(INNER,), bwd_qtype="int8",
+                                        bwd_stochastic_rounding="uniform"))
+    server = Server.from_task(bound, slots=2, capacity=64)
+
+    def likelihoods(result) -> np.ndarray:
+        return np.asarray(result.raw_log_probs)
+
+    for generate in (lambda prompts, key: [bound(prompt, 4, key=key) for prompt in prompts],
+                     lambda prompts, key: server(prompts, 4, key=key)):
+        (first,), (again,), (moved,) = generate(["12"], 3), generate(["12"], 3), generate(["12"], 4)
+        np.testing.assert_array_equal(likelihoods(again), likelihoods(first))
+        assert not np.array_equal(likelihoods(moved), likelihoods(first))
+
+
+def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward():
+    """A memory decoder served quantized (`TextGeneration.quantized`: every inner Dense of its heads'
+    networks, weights and activations) through a server's two slots draws tokens whose likelihoods are on
+    par with the served decoder's full forward over the same tokens, against quantized training from its
+    stored W_0 in float64 (check 1; `assert_served_as_exact`), as is the lone task's over its own draws.
+    The tokens scored are each one's own: a moving weight's quantization rounds at boundaries that a 1e-7
+    relative change of the weights crosses, moving the likelihoods by 1.2e-2 where the unquantized
+    decoder moves by 1.4e-6, so a lone task batched with itself already moves its likelihoods by 8.8e-4
+    and no two programs of it draw alike by rule (ledger 2032; armada probes IG2032 and IG2032c at main
+    783ea620a)."""
+    pytest.importorskip("qwix")
+    from model_support import Digits
+    from serving_support import Served, assert_served_as_exact
+
+    from dew.inference import RunProcessor, TextGeneration
+    from dew.quantization import Quantization, decoded_stored
+    from dew.sampling import Sampling
+
+    model = decoder().clone(max_seq_len=64)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    spec = Quantization(patterns=(INNER,))
+    task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    bound = task.quantized(spec)
+    # The served decoder computes quantized training from the float its stored W_0 decodes to (`served_site`),
+    # each code times its scale in float64 for the truth, as the decoder's own decode computes it exactly.
+    with jax.enable_x64(new_val=True):
+        start = decoded_stored(widened(bound.variables))
+    assert_served_as_exact(bound, (Served(3), Served(5)), "served quantized memory",
+                           serving={"slots": 2, "capacity": 64}, alone=False,
+                           truth=(spec.apply(model), start))
+
+
+def test_a_cached_memorys_rounding_is_each_rows_own():
+    """A cached memory's stochastic rounding draws from each row's key in the cache
+    (`dew.nn.kv_cache.ROUNDING_KEYS`) folded with each token's place, or from a stream the call brings:
+    in one program over the same tokens, a row computes alike whatever key another row holds, and its
+    own key moves it; a call's own `stochastic_rounding` stream repeats and moves with its key. So a
+    served request's rounding is its key's alone, whatever batch or slot holds it (ledger 2020).
+    Weight-only serving keeps the rows' arithmetic apart, so only the stream could join them."""
+    pytest.importorskip("qwix")
+    from model_support import model_draw
+
+    from dew.nn.kv_cache import with_rounding_keys
     from dew.quantization import Quantization, quantize_for_serving
+    from dew.sampling.text import rounding_keys
 
     model = decoder()
-    ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
-    variables = model.init(jax.random.key(0), ids)
-    with pytest.raises(QuantizedServingRefused):
-        quantize_for_serving(model, variables, Quantization(patterns=(INNER,)), ids)
-    spec = Quantization(patterns=(r".*self_attn/[qkvo]_proj",))
+    variables, ids = model_draw(model, (2, LENGTH), 37)(0)
+    spec = Quantization(patterns=(INNER,), weight_only=True, bwd_qtype="int8",
+                        bwd_stochastic_rounding="uniform")
     served, held = quantize_for_serving(model, variables, spec, ids)
-    np.testing.assert_array_equal(np.asarray(served.apply(held, ids)),
-                                  np.asarray(spec.apply(model).apply(variables, ids)))
+    empty = served.apply(held, 2, method="init_cache", mutable=["cache"])[1]["cache"]
+
+    @jax.jit
+    def decoded(rounding, stream=None):
+        return served.apply({**held, "cache": with_rounding_keys(empty, rounding)}, ids, decode=True,
+                            mutable=["cache"],
+                            rngs=None if stream is None else {"stochastic_rounding": stream})[0]
+
+    keys = rounding_keys(jax.random.split(jax.random.key(1), 2))
+    other = keys.at[1].set(rounding_keys(jax.random.key(2)[None])[0])
+    mine, theirs = np.asarray(decoded(keys)), np.asarray(decoded(other))
+    np.testing.assert_array_equal(mine[0], theirs[0])
+    assert not np.array_equal(mine[1], theirs[1])
+    brought = np.asarray(decoded(keys, jax.random.key(5)))
+    np.testing.assert_array_equal(np.asarray(decoded(other, jax.random.key(5))), brought)
+    assert not np.array_equal(np.asarray(decoded(keys, jax.random.key(6))), brought)
+
+
+@pytest.mark.parametrize(("network", "weight_only", "stochastic"),
+                         [(None, None, False), (None, False, True), ("dense-general", True, True)],
+                         ids=["unquantized", "stochastic", "weight-only-dense-general"])
+def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_only, stochastic):
+    """A paged server's prefix cache shares a memory decoder's prompt state across requests where the
+    state is the tokens' alone: a memory that rounds deterministically (unquantized) keeps no rounding
+    key, so a second key reuses the first's prefix; one whose quantized backward rounds stochastically,
+    a weight-only rule's matmuls of any rank among them, keeps its request's key in the cache
+    (`dew.nn.kv_cache.ROUNDING_KEYS`) and serves, and only its own key reuses its prefix (ledger 2036)."""
+    from model_support import Digits
+
+    from dew.inference import RunProcessor, TextGeneration
+    from dew.inference.serving import Server
+    from dew.nn.kv_cache import KVCache
+    from dew.sampling import Sampling
+
+    memory = None if network is None else InContextMemory(
+        network=GeneralMemory(), heads=2, head_features=8, chunk=4, normalize=True,
+        learning_rate=Gate(scale=STEP), momentum=Gate(), retention=Gate(bias=-2.0))
+    model = decoder(memory).clone(max_seq_len=64)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    task = TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=12))
+    if weight_only is not None:
+        pytest.importorskip("qwix")
+        from dew.quantization import Quantization
+
+        task = task.quantized(Quantization(patterns=(INNER,), weight_only=weight_only, bwd_qtype="int8",
+                                           bwd_stochastic_rounding="uniform"))
+    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=16), prefix_cache=True)
+    prompt = "1" * 33
+
+    def reused(key: int) -> int:
+        before = server.prefix_hits
+        server(prompt, 2, key=key)
+        return server.prefix_hits - before
+
+    assert reused(1) == 0
+    assert (reused(2) > 0) is not stochastic
+    assert reused(1) > 0
 
 
 def test_a_qwix_quantized_linear_memory_leaves_the_recurrence():
@@ -596,3 +821,35 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     variables = model.init(jax.random.key(0), ids)
     np.testing.assert_array_equal(np.asarray(rebuilt.apply(variables, ids)),
                                   np.asarray(model.apply(variables, ids)))
+
+
+def test_a_memory_draws_its_tokens_keys_from_a_typed_rbg_stream():
+    """A training forward whose streams are typed rbg keys, not the default threefry: the memory's
+    tokens' keys are rewrapped in their stream's own implementation on both its chunked prefill and its
+    token-by-token recurrent readout (ledger 1876 NN-01), so the adapter's dropout draws on them, the
+    same key drawing the same logits and another key others."""
+    from dew.lora import LoRA
+    from dew.objectives.base import training_rngs
+
+    model = decoder(layer("gated_linear_attention"))
+    lora = LoRA(rank=2, modules=("kernel",), dropout=0.5)
+    variables, ids = factor_draw(model, lora)(0)
+    adapted = lora.apply(model, model.init(jax.random.key(0), jnp.asarray(ids)), key=0).model
+
+    @jax.jit
+    def cached(rngs):
+        cache = adapted.apply(variables, ROWS, method=adapted.init_cache, mutable=["cache"])[1]
+        logits, cache = adapted.apply({**variables, **cache}, ids[:, :6], decode=True, mutable=["cache"],
+                                      rngs=rngs)
+        reads = [logits]
+        for t in range(6, LENGTH):
+            logits, cache = adapted.apply({**variables, **cache}, ids[:, t:t + 1], decode=True,
+                                          mutable=["cache"], rngs=rngs)
+            reads.append(logits)
+        return jnp.concatenate(reads, axis=1)
+
+    first, again, other = (np.asarray(cached(training_rngs(jax.random.key(seed, impl="rbg"))))
+                           for seed in (5, 5, 6))
+    assert np.isfinite(first).all()
+    np.testing.assert_array_equal(first, again)
+    assert not np.array_equal(first, other)

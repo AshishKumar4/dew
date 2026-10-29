@@ -4,7 +4,7 @@ Each stage kind has one definition here, which every read applies and the
 memory executor (`dew.data.materialize`) calls for the stages it runs over
 the whole source: `_outputs` for a record step, `_reordered` for an order
 stage over indexed rows, `_TokenSplit` for a token split, `_packed` for
-Grain's packers, and `_fill` with `_CachedOutputs` for opening a cache and
+a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
 reading what it holds.
 
 `_Build` lowers a pipeline's stages in the order they are written, as the
@@ -76,14 +76,14 @@ from dew.data.mixing import (
     Accepted,
     Chunked,
     CorpusCounts,
-    PrimedMix,
+    KeyedMix,
     ProportionalSelection,
     Proportions,
     TokenDeficit,
-    primed_maps,
     rewound,
     token_weights,
 )
+from dew.data.packing import FirstFitPacked
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -821,16 +821,19 @@ class _Inputs(pygrain.MapDataset):
 
 
 def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
-    """`documents` packed by Grain's own packer for the stage's policy."""
+    """`documents` packed for the stage's policy: first-fit as an indexed read's plan places them
+    (`FirstFitPacked`), the rest by Grain's own packers."""
+    if stage.policy == "first-fit":
+        return FirstFitPacked(documents, stage)
     sizes = dict.fromkeys(stage.fields, stage.seq_len) | dict(stage.along)
     if stage.policy == "concat":
         cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
         return _Concatenated(gx.ConcatThenSplitIterDataset(cut, length_struct=sizes))
-    packer = gx.FirstFitPackIterDataset if stage.policy == "first-fit" else gx.BestFitPackIterDataset
     # Fields cut alike with the first share its segments and positions, as the indexed planner's
     # windows do (`packed_window`), so Grain writes no copy of them for the rest.
-    return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False,
-                  max_sequences_per_bin=stage.segments, meta_features=stage.fields[1:])
+    return gx.BestFitPackIterDataset(documents, length_struct=sizes, num_packing_bins=stage.bins,
+                                     shuffle_bins=False, max_sequences_per_bin=stage.segments,
+                                     meta_features=stage.fields[1:])
 
 
 class _Ruled(pygrain.IterDataset):
@@ -996,8 +999,10 @@ class _Passes(pygrain.IterDataset):
 
 
 class _PassesIterator(pygrain.DatasetIterator):
-    """Its parent's rows and position. The repeat restarts a pass by restoring the parent right
-    after one ends, and any other restore lands inside a pass the run already read from."""
+    """Its parent's rows and position. The repeat restarts a pass by restoring, right after one
+    ends, the very position it took as the first pass's start (Grain's `_parent_starting_state`,
+    the first this iterator gives); any other restore, a checkpoint's even once the last pass
+    ended, lands where its position says, with the counts it holds."""
 
     def __init__(self, parent: pygrain.DatasetIterator, name: str, endless: bool, certain: bool,
                  barren: bool = False):
@@ -1006,6 +1011,7 @@ class _PassesIterator(pygrain.DatasetIterator):
         self._barren = barren
         self._yielded = self._ended = False
         self._empty = 0
+        self._opening: object | None = None
 
     def __next__(self):
         try:
@@ -1028,12 +1034,16 @@ class _PassesIterator(pygrain.DatasetIterator):
         return value
 
     def get_state(self):
-        return self._rows.get_state()
+        state = self._rows.get_state()
+        if self._opening is None:
+            self._opening = state
+        return state
 
     def set_state(self, state) -> None:
-        # Right after a pass ends, this is the repeat rewinding it, which keeps the corpus's counts.
-        self._rows.set_state(rewound(state, self._rows.get_state()) if self._ended else state)
-        self._yielded, self._ended = not self._ended, False
+        # The repeat rewinding the pass that just ended keeps the corpus's counts.
+        rewinding = self._ended and state is self._opening
+        self._rows.set_state(rewound(state, self._rows.get_state()) if rewinding else state)
+        self._yielded, self._ended = not rewinding, False
 
 
 class _Barren(Exception):
@@ -1215,9 +1225,13 @@ class _Ended(pygrain.IterDataset):
 
 
 class _EndedIterator(pygrain.DatasetIterator):
+    """Its parent's rows until a pass of them holds none. Restored ended, it reads no more and
+    keeps the position it was given, the counts of its corpus's stages with it."""
+
     def __init__(self, parent: pygrain.DatasetIterator):
         super().__init__(parent)
         self._rows, self._ended = parent, False
+        self._held: Mapping[str, object] | None = None
 
     def __next__(self):
         if self._ended:
@@ -1229,13 +1243,15 @@ class _EndedIterator(pygrain.DatasetIterator):
             raise StopIteration from None
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._rows.get_state(), "ended": self._ended}
+        return {"parent": self._rows.get_state() if self._held is None else self._held, "ended": self._ended}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         # An ended repeat reads no more, so only one that reads on restores where it was.
         self._ended = boolean(state["ended"], "repeat ended")
+        parent = record(state["parent"], "repeat position")
+        self._held = parent if self._ended else None
         if not self._ended:
-            self._rows.set_state(record(state["parent"], "repeat position"))
+            self._rows.set_state(parent)
 
 
 def _reordered(stage: Shuffle | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
@@ -1359,16 +1375,23 @@ class _Build:
         source = pipeline.source
         if not isinstance(source, Mixture):
             raise ValueError("phases need the global phased lowering")
-        parents = [self.child(index).records(child, partition)
-                   for index, child in enumerate(source.pipelines)]
+        # The mix's corpora share its read budget, each reading with its share of the threads and the
+        # read-ahead: a mix of hundreds of corpora holds what a read of one does, and a corpus whose
+        # share is no thread reads on the thread that draws from it.
+        members = len(source.pipelines)
+        builds = [self.child(index) for index in range(members)]
+        builds = [dataclasses.replace(build, loading=dataclasses.replace(
+            build.loading, threads=build.loading.threads // members,
+            read_buffer=build.loading.read_buffer // members)) for build in builds]
+        parents = [build.records(child, partition)
+                   for build, child in zip(builds, source.pipelines, strict=True)]
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
-            checked = primed_maps(mapped)
-            selection = ProportionalSelection([len(parent) for parent in checked], _weights(source))
-            return pygrain.MapDataset.select_from_datasets(checked, selection)
+            selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source))
+            return pygrain.MapDataset.select_from_datasets(mapped, selection)
         streams = [
-            Accepted(_as_iter(parent, self.loading), _name(child), _label(child))
-            for parent, child in zip(parents, source.pipelines, strict=True)
+            Accepted(_as_iter(parent, build.loading), _name(child), _label(child))
+            for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
         ]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
@@ -1382,7 +1405,7 @@ class _Build:
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
             )
-        return PrimedMix(streams, source.weights, keys)
+        return KeyedMix(streams, source.weights, keys)
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int, *, marked: bool = False

@@ -43,8 +43,10 @@ input quantization at an inner site (`dew.quantization`) rounds that site's inpu
 alike, and Qwix's quantized training quantizes every product of the moving weights, its stochastic
 rounding drawing from each token's key. A frozen FP8 record's codes at an inner kernel stand for W_0's
 kernel, as they decode: in a memory only W_0 is frozen, and each application multiplies the state the
-steps move from it. Qwix's serving quantization of the inner weights is refused: Dew does not yet serve
-a memory's W_0 stored quantized (`QuantizedServingRefused`).
+steps move from it. Qwix's serving quantization stores W_0 quantized, which the steps start from as the
+float it decodes to (`dew.quantization.decoded_stored`); each product of the moving weights rounds as
+quantized training rounds it (`dew.quantization.moving_weights`), so a served memory computes what the
+quantized memory computes from the stored W_0.
 
 A linear memory (`LinearMemory`) on its given target, with no momentum, no orthogonalized or slow
 weights and each token reading its own step, whose heads each compute the linear map of their input by
@@ -67,11 +69,11 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn, traverse_util
 from flax.core import lift
 from flax.linen.transforms import lift_direct_transform
@@ -79,17 +81,21 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
 
-from dew.batch import valid_order
+from dew.batch import prefix_sum, valid_order
 from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
+from dew.nn.kv_cache import ROUNDING_KEYS
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
+from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
-from dew.quantization import decoded_frozen_fp8, quantized_products
+from dew.quantization import decoded_frozen_fp8, decoded_stored, moving_weights, quantized_products
 
-from .attention import FORWARD_MODE, LayerNorm
+from .attention import FORWARD_MODE
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks
+from .mlp import GatedMLP
+from .norms import LayerNorm
 from .precision import at_least_fp32, l2norm
 
 CARRY = MEMORY_RESIDUALS[0]
@@ -175,9 +181,10 @@ class LinearMemory(nn.Module):
 
 
 class ResidualMemory(nn.Module):
-    """`x + N(f_res(x))`: f_res linear (`hidden` None) or `Dense(D) . activation . Dense(hidden)`, N a
-    layer norm or none. TTT's f (Sec 2.7: LN and residual, f_lin or a 4x GELU MLP), Nested Learning's
-    memories (Eq 89, no norm) and Miras' (Sec 5.3)."""
+    """`x + N(f_res(x))`: f_res linear (`hidden` None) or `Dense(D) . activation . Dense(hidden)`, the
+    ungated `GatedMLP` (`up`, `down`), N a layer norm or none. TTT's f (Sec 2.7: LN and residual, f_lin
+    or a 4x GELU MLP), Nested Learning's memories (Eq 89, no norm) and Miras' (Sec 5.3). `activation`
+    names one of `dew.nn.activations.UNGATED`."""
 
     hidden: int | None = None
     activation: Literal["gelu", "silu", "relu"] = "gelu"
@@ -187,11 +194,13 @@ class ResidualMemory(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision)
-        branch = x
-        if self.hidden is not None:
-            branch = getattr(nn, self.activation)(dense(self.hidden, name="up")(branch))
-        branch = dense(x.shape[-1], name="down")(branch)
+        if self.hidden is None:
+            branch = Dense(x.shape[-1], dtype=self.dtype, precision=self.precision, name="down")(x)
+        else:
+            mlp = GatedMLP(self.hidden, x.shape[-1], self.activation, use_bias=True, linear=Dense,
+                           names=("up", "down"), dtype=self.dtype, precision=self.precision)
+            nn.share_scope(self, mlp)
+            branch = mlp(x)
         if self.norm:
             branch = LayerNorm(epsilon=1e-6, dtype=self.dtype, name="norm")(branch)
         return x + branch
@@ -199,7 +208,8 @@ class ResidualMemory(nn.Module):
 
 class MLPMemory(nn.Module):
     """Titans' deep memory: dense layers of the `hidden` widths, then one back to the view's width,
-    `activation` between them (Sec 3.1)."""
+    `activation` between them (Sec 3.1), `layers_{i}` each: each two layers in turn an ungated
+    `GatedMLP`, a last odd one a `Dense`. `activation` names one of `dew.nn.activations.UNGATED`."""
 
     hidden: tuple[int, ...]
     activation: Literal["gelu", "silu", "relu"] = "silu"
@@ -208,10 +218,18 @@ class MLPMemory(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        for index, width in enumerate((*self.hidden, x.shape[-1])):
-            if index:
-                x = getattr(nn, self.activation)(x)
-            x = Dense(width, dtype=self.dtype, precision=self.precision, name=f"layers_{index}")(x)
+        widths = (*self.hidden, x.shape[-1])
+        for first in range(0, len(widths), 2):
+            if first + 1 == len(widths):
+                return Dense(widths[first], dtype=self.dtype, precision=self.precision,
+                             name=f"layers_{first}")(x)
+            # A pair before further layers applies the activation after its second map too.
+            mlp = GatedMLP(widths[first], widths[first + 1], self.activation, use_bias=True, linear=Dense,
+                           in_features=x.shape[-1], activation_after=first + 2 < len(widths),
+                           names=(f"layers_{first}", f"layers_{first + 1}"), dtype=self.dtype,
+                           precision=self.precision)
+            nn.share_scope(self, mlp)
+            x = mlp(x)
         return x
 
 
@@ -338,8 +356,8 @@ class InContextMemory(nn.Module):
         frozen FP8 kernel is W_0's as its codes decode (`dew.quantization.decoded_frozen_fp8`): in a
         memory only W_0 is frozen, and every application multiplies the state the steps move from it.
 
-        A weight stored quantized for serving (Qwix's, `dew.quantization.quantize_for_serving`) is
-        refused (`QuantizedServingRefused`): Dew does not yet serve a memory's W_0 stored quantized."""
+        A weight stored quantized for serving (Qwix's, `dew.quantization.quantize_for_serving`) decodes
+        to the float its values and scales hold (`decoded_stored`), the W_0 the steps move from."""
         networks = [getattr(self, f"head_{head}") for head in range(self.heads)]
         if self.is_initializing():
             for network in networks:
@@ -347,12 +365,10 @@ class InContextMemory(nn.Module):
         wide = at_least_fp32(self.dtype)
         heads = []
         for network in networks:
-            variables = dict(decoded_frozen_fp8(dict(nn.meta.unbox(network.variables))))
-            flat = traverse_util.flatten_dict(dict(variables.pop("params", {})))
-            weights = {path: leaf for path, leaf in flat.items() if isinstance(leaf, jax.Array | np.ndarray)}
-            if len(weights) < len(flat):
-                raise QuantizedServingRefused("/".join(network.path),
-                                              sorted("/".join(path) for path in flat.keys() - weights.keys()))
+            variables = dict(decoded_stored(decoded_frozen_fp8(dict(nn.meta.unbox(network.variables)))))
+            # Every inner weight is an array now: frozen FP8 codes and stored quantized kernels decoded.
+            weights = {path: jnp.asarray(leaf) for path, leaf
+                       in traverse_util.flatten_dict(dict(variables.pop("params", {}))).items()}
             unknown = sorted(set(self.slow) - {path[0] for path in weights})
             if unknown:
                 raise ValueError(f"slow names {unknown}, which are none of the network's parameters "
@@ -399,18 +415,23 @@ class InContextMemory(nn.Module):
         steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places,
                        self._keys(x))
         hooks, segments = self._route(), tokens.max_segments
-        if call.decode and self._recurrence() is not None:
+        # A cached call's tokens at their places in the row's document, which the cache counts, and its
+        # rounding stream from the row's key where the call brings none (`_cached`).
+        cached, counted = self._cached(steps) if call.decode else (None, None)
+        if cached is not None and self._recurrence() is not None:
             # A linear memory's cache holds the recurrence's state on either route: the route may change
             # between the calls one cache serves, as an adapter's dropout does with the dropout stream.
-            read = self._recurrent_decoded(hooks, heads, steps, log_kept, segments)
+            read = self._recurrent_decoded(hooks, heads, steps._replace(keys=cached.keys), log_kept, segments)
         elif hooks is not None:
             read = self._recurrent(hooks, heads, steps, log_kept, max_segments=segments)[0]
-        elif call.decode:
-            read = self._decoded(heads, steps)
+        elif cached is not None:
+            read = self._decoded(heads, cached)
         elif tokens.max_segments > 1:
             read = self._stepped(heads, steps)[0]
         else:
             read = self._chunked(heads, steps)
+        if counted is not None:
+            counted()
         read = read.astype(self.dtype or x.dtype)
         if self.output:
             read = Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -419,18 +440,19 @@ class InContextMemory(nn.Module):
             read = read.reshape(batch, length, -1)
         return read
 
-    def _keys(self, x: jax.Array) -> dict[str, jax.Array] | None:
-        """Each token and head's key data `[B, S, H, ...]` of every RNG stream the call carries, each
-        split from its own stream, so the streams stay as apart as the call holds them: a training
-        forward's `dropout` and `stochastic_rounding` (`training_rngs`), and an initialization's
-        `params`, which a stream the network asks for and the call lacks falls back to, as at any
-        child; None without any. An application folds its use into its token's key (`_applied`)."""
+    def _keys(self, x: jax.Array) -> dict[tuple, jax.Array] | None:
+        """Each token and head's key data `[B, S, H, ...]` of every RNG stream the call carries, by the
+        stream's name and its key's implementation, each split from its own stream, so the streams stay
+        as apart as the call holds them: a training forward's `dropout` and `stochastic_rounding`
+        (`training_rngs`), and an initialization's `params`, which a stream the network asks for and the
+        call lacks falls back to, as at any child; None without any. An application rewraps each token's
+        data in its stream's implementation, a typed rbg key's as rbg, and folds its use in (`_applied`)."""
         assert self.scope is not None, "a bound memory has a scope"
         streams = sorted(self.scope.rngs)
         batch, length = x.shape[:2]
-        return {name: rows_like(jax.random.key_data(jax.random.split(self.make_rng(name),
-                                                                     (batch, length, self.heads))), x)
-                for name in streams} or None
+        split = {name: jax.random.split(self.make_rng(name), (batch, length, self.heads)) for name in streams}
+        return {(name, jax.random.key_impl(keys)): rows_like(jax.random.key_data(keys), x)
+                for name, keys in split.items()} or None
 
     @property
     def residuals(self) -> tuple[str, ...]:
@@ -566,7 +588,7 @@ class InContextMemory(nn.Module):
 
     # The function, token by token and chunk by chunk.
 
-    def _applied(self, head: _Head, fast: dict, x: jax.Array, keys: dict[str, jax.Array] | None = None, *,
+    def _applied(self, head: _Head, fast: dict, x: jax.Array, keys: dict[tuple, jax.Array] | None = None, *,
                  wide: bool, use: int) -> jax.Array:
         """`head`'s network at its moving weights `fast` and the ones it holds over one token's vector
         `x`, at the state's precision where `wide` (the gradients) and else the layer's dtype (a
@@ -578,15 +600,19 @@ class InContextMemory(nn.Module):
             dtype = self.dtype or x.dtype
             params = jax.tree.map(lambda leaf: leaf.astype(dtype) if self.dtype is not None else leaf, params)
             x = x.astype(dtype)
-        rngs = {} if keys is None else {name: jax.random.fold_in(jax.random.wrap_key_data(key), use)
-                                        for name, key in keys.items()}
-        out = _substituted(head.network, {**head.collections, "params": params}, rngs, x)
+        rngs = {} if keys is None else {
+            name: jax.random.fold_in(jax.random.wrap_key_data(key, impl=impl), use)
+            for (name, impl), key in keys.items()}
+        # The weights move from W_0 each call, so a serving quantization rounds their products as quantized
+        # training does, no stored copy of them existing.
+        with moving_weights():
+            out = _substituted(head.network, {**head.collections, "params": params}, rngs, x)
         if not isinstance(out, jax.Array):
             raise TypeError(f"an in-context memory's network maps a vector to one, got {type(out).__name__}")
         return out
 
     def _gradient(self, head: _Head, state: dict, key: jax.Array, target: jax.Array,
-                  keys: dict[str, jax.Array] | None) -> dict:
+                  keys: dict[tuple, jax.Array] | None) -> dict:
         """One head's gradient of the objective at the moving weights `state` for one token, in the
         state's precision, each matrix orthogonalized where `orthogonalize` asks. An adapter's B factor
         rides the state, so a retention forgets the adapter's update s A B as it forgets W_0's, and the
@@ -603,7 +629,7 @@ class InContextMemory(nn.Module):
 
         return jax.tree_util.tree_map_with_path(stepped, gradient)
 
-    def _target(self, head: _Head, state: dict, value: jax.Array, keys: dict[str, jax.Array] | None
+    def _target(self, head: _Head, state: dict, value: jax.Array, keys: dict[tuple, jax.Array] | None
                 ) -> jax.Array:
         """A token's target: its value view, or the network's image of it at `state` (Nested Learning
         Eq 84). The inner gradient holds it fixed (`_gradient` differentiates the prediction alone); the
@@ -613,11 +639,11 @@ class InContextMemory(nn.Module):
         return self._applied(head, state, value, keys, wide=True, use=TARGET)
 
     def _step(self, head: _Head, state: dict, key: jax.Array, value: jax.Array,
-              keys: dict[str, jax.Array] | None) -> dict:
+              keys: dict[tuple, jax.Array] | None) -> dict:
         """One head's gradient for one token at `state`, of the objective against its target there."""
         return self._gradient(head, state, key, self._target(head, state, value, keys), keys)
 
-    def _read(self, head: _Head, state: dict, query: jax.Array, keys: dict[str, jax.Array] | None
+    def _read(self, head: _Head, state: dict, query: jax.Array, keys: dict[tuple, jax.Array] | None
               ) -> jax.Array:
         """One head's readout of a token at `state`, at the layer's dtype."""
         return self._applied(head, state, query, keys, wide=False, use=READ)
@@ -666,8 +692,7 @@ class InContextMemory(nn.Module):
         """The readouts `[B, S, H, F]` of rows of one document, chunk by chunk (the module docstring)."""
         batch, length = steps.real.shape
         order, _ = valid_order(steps.real)
-        gathered = jax.tree.map(lambda field: jnp.take_along_axis(
-            field, order.reshape(*order.shape, *(1,) * (field.ndim - 2)), axis=1), steps)
+        gathered = jax.tree.map(lambda field: gather_positions(field, order), steps)
         laid = jax.tree.map(lambda field: sequence_blocks(field, self.chunk, leading=True), gathered)
         count = laid.real.shape[0]
         rows = tuple(_rows(head.initial, steps.real) for head in heads)
@@ -723,31 +748,49 @@ class InContextMemory(nn.Module):
         start = self.variable("cache", START, lambda: rows)
         state = self.variable("cache", STATE, lambda: rows)
         momentum = self.variable("cache", MOMENTUM, lambda: rows)
-        seen = self.variable("cache", COUNT, lambda: jnp.zeros_like(steps.real, jnp.int32)[:, 0])
-        places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
-        reads, carry = self._stepped(heads, steps._replace(places=places),
-                                     (start.value, state.value, momentum.value))
+        reads, carry = self._stepped(heads, steps, (start.value, state.value, momentum.value))
         if allocated:
             start.value, state.value, momentum.value = carry
-            seen.value = _at_last(places + 1, steps.real, seen.value)
         return reads
 
+    def _cached(self, steps: _Steps) -> tuple[_Steps, Callable[[], None]]:
+        """A cached call's steps at their places in the row's document, counted from the real tokens of
+        it the cache has seen (`COUNT`): the call's first document continues the row's, one that starts
+        in the call counts from 0; and the count's update past this call's tokens, which the caller runs
+        once its read is done, and which an allocating call leaves. Where the call's quantization rounds a
+        head's gradients stochastically (`dew.quantization.quantized_products`), the steps'
+        `stochastic_rounding` stream is the row's key in the cache (`ROUNDING_KEYS`) folded with each
+        token's place and head (`_rounding_keys`), unless the call brings its own; a memory that rounds
+        deterministically keeps no key, so its state is its tokens' alone."""
+        allocated = self.has_variable("cache", COUNT)
+        seen = self.variable("cache", COUNT, lambda: jnp.zeros_like(steps.real, jnp.int32)[:, 0])
+        places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
+        keys = dict(steps.keys or {})
+        if any(quantized_products(self, f"head_{head}").stochastic for head in range(self.heads)):
+            default = jax.random.key_data(jax.random.key(0))
+            rounding = self.variable("cache", ROUNDING_KEYS, lambda: rows_like(
+                jnp.zeros((steps.real.shape[0], *default.shape), default.dtype), steps.real))
+            if not any(name == "stochastic_rounding" for name, _ in keys):
+                keys.update(_rounding_keys(rounding.value, places, self.heads))
 
-class QuantizedServingRefused(ValueError):
-    """An in-context memory refusing inner weights stored quantized for serving (Qwix's, at the head
-    network `network`'s `leaves`): Dew does not yet serve a memory's W_0 stored quantized, which its
-    steps would start from as the weights the stored values decode to, each product of the moving
-    weights quantized afresh. Its projections serve; quantized training
-    (`dew.quantization.Quantization.apply`) quantizes every product of the moving weights."""
+        def counted() -> None:
+            if allocated:
+                seen.value = _at_last(places + 1, steps.real, seen.value)
 
-    def __init__(self, network: str, leaves: list[str]):
-        super().__init__(f"{network}'s weights {leaves} are stored quantized for serving, and Dew does not "
-                         "yet serve an in-context memory's W_0 stored quantized; select its projections "
-                         "for serving, or train it quantized")
-        self.network, self.leaves = network, leaves
+        return steps._replace(places=places, keys=keys), counted
 
-    def __reduce__(self):
-        return type(self), (self.network, self.leaves)
+
+def _rounding_keys(rows: jax.Array, places: jax.Array, heads: int) -> dict[tuple, jax.Array]:
+    """A cached call's `stochastic_rounding` stream, each token and head's key data `[B, S, H, words]`:
+    its row's key (`ROUNDING_KEYS`) folded with the token's place in its document and with the head, so
+    a row's rounding is its request's key's and its places' alone, whatever batch, slot or call holds
+    it, and a token verified and replayed at one place rounds alike."""
+    def token(row: jax.Array, place: jax.Array) -> jax.Array:
+        key = jax.random.fold_in(jax.random.wrap_key_data(row), place)
+        return jax.random.key_data(jax.vmap(lambda head: jax.random.fold_in(key, head))(jnp.arange(heads)))
+
+    words = jax.vmap(jax.vmap(token, in_axes=(None, 0)))(rows, places)
+    return {("stochastic_rounding", jax.random.key_impl(jax.random.key(0))): rows_like(words, rows)}
 
 
 class _Head(NamedTuple):
@@ -798,14 +841,14 @@ class _Steps(NamedTuple):
     a: jax.Array
     real: jax.Array
     places: jax.Array
-    keys: dict[str, jax.Array] | None
+    keys: dict[tuple, jax.Array] | None
 
 
 def _documents(steps: _Steps) -> tuple[jax.Array, jax.Array]:
     """Each document's first real token `[B, S]`, and the tokens of a call's first document `[B, S]`,
     every one up to its second document's first: in a cached call, the document its row holds."""
     begins = steps.real & (steps.places == 0)
-    return begins, jnp.cumsum(begins, axis=1) <= 1
+    return begins, prefix_sum(begins, dtype=jnp.int32) <= 1
 
 
 def _at_last(values: jax.Array, real: jax.Array, held: jax.Array) -> jax.Array:
@@ -831,7 +874,7 @@ def _within(values: jax.Array, begins: jax.Array) -> jax.Array:
     return jax.lax.associative_scan(combined, (begins, values), axis=1)[1]
 
 
-def _at(keys: dict[str, jax.Array] | None, head: int, axis: int) -> dict[str, jax.Array] | None:
+def _at(keys: dict[tuple, jax.Array] | None, head: int, axis: int) -> dict[tuple, jax.Array] | None:
     """Each stream's key data in `keys` at head `head` of its `axis`; None stays None."""
     return None if keys is None else {name: jnp.take(key, head, axis=axis) for name, key in keys.items()}
 
@@ -895,4 +938,4 @@ def _composed(first: tuple, second: tuple) -> tuple:
 
 
 __all__ = ["CARRY", "Gate", "InContextMemory", "LinearMemory", "MLPMemory", "Objective",
-           "QuantizedServingRefused", "ResidualMemory"]
+           "ResidualMemory"]

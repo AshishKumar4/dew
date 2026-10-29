@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """How much of the Hub's text generation Dew loads, by architecture.
 
-    PYTHONPATH=src python tools/hf_coverage.py census <out dir> [models]
+    PYTHONPATH=src python tools/hf_coverage.py census <out dir> [models] [--tags ...] [--orders ...] \
+        [--filters ...]
     PYTHONPATH=src python tools/hf_coverage.py classify <out dir>
+    PYTHONPATH=src python tools/hf_coverage.py loads <out dir> [--jobs N]
 
 `census` walks the Hub's text-generation models by downloads (default the top
-3000), reads each one's config.json at its current commit and writes
+3000; `--tags` and `--orders` list other pipeline tags and orders, each
+model once, and `--filters` only the models holding those Hub tags), reads
+each one's config.json at its current commit and writes
 census.json: per model its id, commit, downloads, model_type and
 architectures, or why no config was read (gated, missing). `classify`
 sorts every model into the route that loads it: a registered family (tier
@@ -18,14 +22,29 @@ a refusal with its reason, or a refusal by design (`DrafterRefused`, a
 speculative drafter that is no model on its own). Types
 transformers does not know (remote code only) have no reference to verify
 against and are counted apart. The shares are of downloads, over all types
-and over the most downloaded 200 and 50. Writes coverage.json.
+and over the most downloaded 200 and 50. Writes coverage.json. `loads`
+loads each model of the census by `Pretrained.load(weights=False)`, its
+config and its weights' safetensors headers read and no weight file fetched, each
+in a process of its own (`loaded`), so one model's refusal, whatever it
+raises, and its memory reach no other; it writes loads.json and loads.md, a
+row a model: it loads, with its parameter count; Dew refuses it, with the
+refusal; or the Hub serves it to no one without a token, which is the Hub's
+answer, not Dew's (ledger 1891). .github/workflows/census.yml runs census and
+loads daily over the most downloaded and trending text and multimodal models,
+so a new base Dew refuses is a row before a user meets it.
 """
 
 from __future__ import annotations
 
+import argparse
+import itertools
 import json
+import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,12 +53,17 @@ if TYPE_CHECKING:
     from dew.interop.verify import Unmapped, VerifiedMapping
 
 
-def census(out: Path, limit: int) -> None:
+def census(out: Path, limit: int, tags: Sequence[str] = ("text-generation",),
+           orders: Sequence[str] = ("downloads",), filters: Sequence[str] = ()) -> None:
     from huggingface_hub import HfApi, hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, GatedRepoError, RepositoryNotFoundError
 
     rows = []
-    for info in HfApi().list_models(pipeline_tag="text-generation", sort="downloads", limit=limit):
+    # A listing states a model's commit and downloads only where asked (`expand`).
+    listed = {info.id: info for tag in tags for order in orders
+              for info in HfApi().list_models(pipeline_tag=tag, sort=order, limit=limit,
+                                              filter=list(filters) or None, expand=["sha", "downloads"])}
+    for info in listed.values():
         row = {"id": info.id, "commit": info.sha, "downloads": info.downloads or 0}
         try:
             config = json.loads(Path(hf_hub_download(info.id, "config.json", revision=info.sha)).read_text())
@@ -198,9 +222,116 @@ def classify(out: Path) -> None:
     print(json.dumps(summary, indent=1))
 
 
+HUB_EXIT = 3
+"""The exit status of a load (`_LOAD`) the Hub refused, its error on its last line."""
+
+_LOAD = f"""
+import sys
+import httpx
+import jax
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
+from dew.interop import Pretrained
+try:
+    loaded = Pretrained.load(sys.argv[1], revision=sys.argv[2], weights=False, dtype="bfloat16")
+except (HfHubHTTPError, LocalEntryNotFoundError, httpx.TransportError) as error:
+    print(f"{{type(error).__name__}}: {{error}}".replace(chr(10), " "))
+    sys.exit({HUB_EXIT})
+leaves = jax.tree.leaves(loaded.variables)
+if not leaves or not all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in leaves):
+    raise ValueError("a load without its weights holds values")
+print(sum(leaf.size for leaf in leaves))
+"""
+"""A model loaded without its weights in a process of its own, every leaf a shape alone: its parameter
+count on the last line; or the Hub's error, exiting `HUB_EXIT`: an HTTP error, a failed transport, or a
+file's metadata the Hub could not be reached for (`LocalEntryNotFoundError`, which huggingface_hub
+raises for a connection or server error on an uncached file)."""
+
+
+@dataclass(frozen=True)
+class Load:
+    """One model's load without its weights: `outcome` is "loads" (with its `parameters`), "refused"
+    (Dew raised, `reason` the exception), "hub" (the Hub refused the repo, `reason` its error or
+    why the census read no config) or "killed" (a signal ended the load's process before it answered,
+    `reason` the signal: the machine's, not Dew's nor the Hub's)."""
+
+    id: str
+    commit: str | None
+    outcome: str
+    parameters: int | None = None
+    reason: str | None = None
+
+
+def loaded(repo: str, commit: str, env: dict[str, str] | None = None) -> Load:
+    """`repo` at `commit` loaded without its weights in a process of its own (`_LOAD`) under `env`
+    (this process's by default), classified by how the process exited: its parameter count where it
+    loaded, the Hub's error where it refused the repo (`HUB_EXIT`), the signal where one ended it, else
+    Dew's refusal, an exception's exit, its text the exception the process ended on (`ended_on`)."""
+    done = subprocess.run([sys.executable, "-c", _LOAD, repo, commit], env=env, capture_output=True,
+                          text=True, check=False)
+    if done.returncode == 0:
+        return Load(repo, commit, "loads", parameters=int(done.stdout.split()[-1]))
+    if done.returncode == HUB_EXIT:
+        return Load(repo, commit, "hub", reason=done.stdout.strip().splitlines()[-1])
+    if done.returncode < 0:
+        return Load(repo, commit, "killed", reason=f"signal {-done.returncode}")
+    return Load(repo, commit, "refused", reason=ended_on(done.stderr) or f"exit {done.returncode}")
+
+
+def ended_on(stderr: str) -> str:
+    """The exception a Python process's `stderr` ends on, as its last traceback states it: the first
+    unindented line after the traceback's frames, its type and message, the message's further lines
+    joined to it."""
+    tail = stderr.rsplit("Traceback (most recent call last):", 1)[-1].splitlines()
+    stated = itertools.dropwhile(lambda line: not line.strip() or line.startswith(" "), tail)
+    return " ".join(line.strip() for line in stated if line.strip())
+
+
+def loads(out: Path, jobs: int = 2, env: dict[str, str] | None = None) -> list[Load]:
+    """Each model of `out`'s census loaded without its weights (`loaded`), `jobs` at a time, a model
+    whose config the census could not read the Hub's row; writes loads.json and loads.md (`table`)."""
+    rows = json.loads((out / "census.json").read_text())
+
+    def load(row: dict) -> Load:
+        if "unread" in row or not row.get("commit"):
+            return Load(row["id"], row.get("commit"), "hub", reason=row.get("unread", "no commit"))
+        return loaded(row["id"], row["commit"], env)
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        results = list(pool.map(load, rows))
+    (out / "loads.json").write_text(json.dumps([asdict(result) for result in results], indent=1) + "\n")
+    (out / "loads.md").write_text(table(results))
+    return results
+
+
+def table(results: Sequence[Load]) -> str:
+    """`results` as Markdown: each refusal a row, then the loads a signal ended, then the Hub's, then
+    the models that load."""
+    order = {"refused": 0, "killed": 1, "hub": 2, "loads": 3}
+    counts = {outcome: sum(result.outcome == outcome for result in results) for outcome in order}
+    lines = [f"# Hub models without their weights: {counts['loads']} load, {counts['refused']} refused, "
+             f"{counts['killed']} killed, {counts['hub']} the Hub refuses", "",
+             "| model | commit | outcome | parameters or reason |",
+             "|---|---|---|---|"]
+    for result in sorted(results, key=lambda result: (order[result.outcome], result.id)):
+        detail = (f"{result.parameters:,}" if result.parameters is not None
+                  else (result.reason or "").replace("|", "\\|"))
+        lines.append(f"| {result.id} | {(result.commit or '')[:12]} | {result.outcome} | {detail} |")
+    return "\n".join(lines) + "\n"
+
+
 if __name__ == "__main__":
-    target = Path(sys.argv[2])
-    if sys.argv[1] == "census":
-        census(target, int(sys.argv[3]) if len(sys.argv) > 3 else 3000)
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("command", choices=("census", "classify", "loads"))
+    parser.add_argument("out", type=Path)
+    parser.add_argument("models", type=int, nargs="?", default=3000, help="census: models a tag and order")
+    parser.add_argument("--tags", nargs="+", default=["text-generation"], help="census: pipeline tags")
+    parser.add_argument("--orders", nargs="+", default=["downloads"], help="census: Hub sort orders")
+    parser.add_argument("--filters", nargs="+", default=[], help="census: Hub tags a model must hold")
+    parser.add_argument("--jobs", type=int, default=2, help="loads: loads at once")
+    arguments = parser.parse_args()
+    if arguments.command == "census":
+        census(arguments.out, arguments.models, arguments.tags, arguments.orders, arguments.filters)
+    elif arguments.command == "classify":
+        classify(arguments.out)
     else:
-        classify(target)
+        print(table(loads(arguments.out, arguments.jobs)), end="")

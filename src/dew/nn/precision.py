@@ -38,6 +38,64 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
+__all__ = [
+    "FP32_SUMS",
+    "L2NORM_EPS",
+    "WIDE_CPU_ARITHMETIC",
+    "accumulated",
+    "activation_and_slope",
+    "added_to",
+    "asks_default_precision",
+    "at_default_precision",
+    "at_least_fp32",
+    "bf16_dot_general",
+    "bf16_einsum",
+    "bf16_logits",
+    "bf16_product",
+    "biased",
+    "capped_logits",
+    "compensated_add",
+    "compensated_difference",
+    "compensated_sum",
+    "compensated_total",
+    "compensates_loops",
+    "configurable_precision",
+    "configured_precision",
+    "correctly_rounded_divide",
+    "divided",
+    "float32_dot_general",
+    "float32_einsum",
+    "float32_matmul",
+    "float32_products",
+    "float64_sum",
+    "fp32_result_dot_general",
+    "head_dot_general",
+    "head_product",
+    "l2norm",
+    "operand_precision",
+    "paired_sum",
+    "precision_names",
+    "products_dtype",
+    "rms_statistics",
+    "rms_weighted",
+    "rounded_operand",
+    "rounded_to",
+    "rounds_to_bf16",
+    "running_sum",
+    "running_total",
+    "scaled",
+    "scaled_logits",
+    "span_means",
+    "spread",
+    "sqrt_or_zero",
+    "stochastic_bf16",
+    "two_product",
+    "two_sum",
+    "weighted_total",
+    "wide_cpu_arithmetic",
+    "widened_reduction",
+]
+
 
 def stochastic_bf16(x, noise):
     """fp32 `x` rounded to bf16 up in magnitude with the probability of its dropped low 16 bits: `noise`'s
@@ -72,6 +130,34 @@ def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = Tr
     mean = (jnp.mean(square, axis=axis, keepdims=keepdims) if count is None
             else jnp.sum(square, axis=axis, keepdims=keepdims) / count)
     return mean, jax.lax.rsqrt(mean + epsilon)
+
+
+def activation_and_slope(gate, activation: str) -> tuple[jax.Array, jax.Array]:
+    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid'.
+
+    silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
+    zero near g = -1.28; formed as the product rule forms it, `s + g (s (1 - s))`,
+    its worst element there is half `(g s)(1 - s) + s`'s, as XLA's is."""
+    sigmoid = jax.nn.sigmoid(gate)
+    slope = sigmoid * (1.0 - sigmoid)
+    if activation == 'sigmoid':
+        return sigmoid, slope
+    return gate * sigmoid, sigmoid + gate * slope
+
+
+def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None = None,
+                 gate: jax.Array | None = None, activation: str = 'silu',
+                 rounded: Callable[[jax.Array], jax.Array] | None = None) -> jax.Array:
+    """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s,
+    or a kernel's own), times `weight`, times `activation(gate)` (`activation_and_slope`: Qwen3-Next's gated
+    norm), in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after.
+    `rounded` rounds the normalized rows before the weight multiplies them (Llama's and Qwen3's cast first,
+    `RMSNorm.scale_after_cast`). The fused norm kernel, the recurrence's gated output norm and the portable
+    gated norm compute it alike, each keeping its own memory schedule and derivative."""
+    y = x * inverse
+    if weight is not None:
+        y = (y if rounded is None else rounded(y)) * weight
+    return y if gate is None else y * activation_and_slope(gate, activation)[0]
 
 
 def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Array, jax.Array]:
@@ -356,6 +442,23 @@ def accumulated(product: Callable[..., jax.Array], *operands,
 
 L2NORM_EPS = 1e-6
 """The epsilon `l2norm` adds under its square root: FLA's, and Dory's `justnorm`'s."""
+
+
+def span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
+    """The mean of `values` `[B, L, D]` over each `[..., 2]` (start, end) span of its row.
+
+    `spans` is `[B, ...]`; an empty span, a padding slot's, gives zeros. A token no span of its row
+    reads is selected away before the product, so padding's NaN or infinity never reaches a mean (the
+    rule of `weighted_total`), and the sum is the product's `accumulated` one.
+    """
+    positions = jnp.arange(values.shape[1])
+    inside = (positions >= spans[..., :1]) & (positions < spans[..., 1:])
+    counts = jnp.maximum(jnp.sum(inside, axis=-1, keepdims=True), 1)
+    flat = inside.reshape(inside.shape[0], -1, inside.shape[-1])
+    read = jnp.where(jnp.any(flat, axis=1)[..., None], values, 0)
+    summed = accumulated(functools.partial(jnp.einsum, "bnl,bld->bnd"), flat.astype(values.dtype), read)
+    summed = summed.reshape(*inside.shape[:-1], values.shape[-1])
+    return summed / counts.astype(values.dtype)
 
 
 def l2norm(x: jax.Array, eps: float = L2NORM_EPS) -> jax.Array:

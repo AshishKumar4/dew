@@ -32,7 +32,7 @@ from dew._records import integer, record as named_fields, strings, text as named
 from dew.batch import PARAMETER_ROOTS, Variables, thaw
 from dew.cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
-from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
+from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
 from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
@@ -79,6 +79,19 @@ whose buckets would exceed `max_seq_len` keeps its own shapes, so the model
 refuses exactly the requests it would refuse without buckets. A request with
 media or multi-axis positions also keeps its own shapes.
 """
+
+
+SCORING_RUNGS = 4
+"""How many lengths a task that scores whole requests pads its passes to (`length_ladder`)."""
+
+
+def length_ladder(top: int, smallest: int, rungs: int = SCORING_RUNGS) -> tuple[int, ...]:
+    """The lengths a task that scores whole requests compiles its passes at, shortest first: `top`, the
+    layout's window, so a request at the training window reads training's shape, and its halvings, `rungs`
+    of them at most and none shorter than `smallest`, the shortest row the layout lays out. Each length is
+    one program, which the task compiles once, up front, rather than one per power of two of every
+    request's length, rows and options (`dew.decision.task.Decide.pass_shapes`)."""
+    return tuple(sorted({max(min(smallest, top), top >> step) for step in range(rungs)}))
 
 
 class Processor(Protocol):
@@ -139,7 +152,7 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
 
 def _task_inputs(processor: Processor | None, request: Request, *, images: Media | None,
                  collective: bool, max_new_tokens: int | None, default_tokens: int | None,
-                 max_length: int | None, key: int | jax.Array | None) -> tuple[ModelInputs, int, jax.Array]:
+                 max_length: int | None, key: int | jax.Array) -> tuple[ModelInputs, int, jax.Array]:
     def prepared() -> tuple[ModelInputs, int, jax.Array]:
         """Tokenize the request, size its budget and draw its key."""
         random_key = request_key(key)
@@ -373,9 +386,11 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     built-in autoencoder's by its name with its module's bare fields (`_EARLIER_AUTOENCODERS`), a
     decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
     and refused where it holds more than its name and fields (ledger 1239),
-    a processor's source as its encoded string (ledger 1641), and a Qwen or MiMo projector's earlier
-    fields (`_earlier_projectors`, ledger 1622). A record in today's shapes passes as it is. Carried to
-    1.0, when it is deleted (ledger 1552)."""
+    a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
+    fields and a decoder's or kind's YaRN field beside its rope scaling (`_earlier_model`, ledgers 1622
+    and 1898), and a row of segments' question budgets, which it ignored and an
+    earlier record wrote at their defaults (row 2006). A record in today's shapes passes
+    as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     for key in ("head", "layout"):
         held = record.get(key)
@@ -400,6 +415,15 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     if isinstance(layout, Mapping) and "name" in layout and "class" not in layout:
         current["layout"] = {"class": f"dew.decision.layout:{named(layout['name'], 'layout.name')}",
                              "fields": named_fields(layout.get("fields", {}), "layout.fields")}
+    laid = current.get("layout")
+    fields = laid.get("fields") if isinstance(laid, Mapping) else None
+    if isinstance(laid, Mapping) and isinstance(fields, Mapping) and fields.get("segments") is not None and (
+            "order" not in fields) and (
+            fields.get("head_max_len") is not None or fields.get("option_tokens") is not None):
+        # A row of segments kept its question whole and ignored the question budgets an earlier record
+        # wrote at their defaults (192 and 48) (row 2006). A record that states the row's order (2007)
+        # was written since a row of segments takes its budgets, so it keeps them.
+        current["layout"] = {**laid, "fields": {**fields, "head_max_len": None, "option_tokens": None}}
     processor = record.get("processor")
     if isinstance(processor, str):
         # A source's identity was an encoded string before typed component references (ledger 1641).
@@ -408,30 +432,86 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
     if "model" in current:
-        current = _earlier_projectors(current)
+        current = _earlier_model(current)
     return current
 
 
-def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A record's earlier Qwen or MiMo projector fields read as today's (`earlier_shapes`), wherever the
-    model nests the projector through another recorded wrapper. Carried until 1.0 (ledger 1622);
-    current constructors and source codecs accept only their current schema."""
+_EARLIER_PROJECTORS = ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector")
+_DECODER = ("dew.nn.backbones.causal_transformer:CausalTransformer", "causal_transformer")
+"""The decoder's import path and its registry alias, either of which a record names it by."""
+
+
+def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A record's model with each component in today's fields (`earlier_shapes`), wherever the model
+    nests it through another recorded wrapper: a Qwen or MiMo projector's earlier fields (ledger 1622),
+    and a decoder's and its layer kinds' YaRN field beside their rope scaling (`_one_scaling`, ledger
+    1898), whether the decoder names its class or a wrapper declares the field it fills
+    (`MultimodalTransformer.language_model`, `DiffusionGemma.text`), which records its fields alone
+    (ledger 2274). Carried until 1.0 (ledger 1552); current constructors and source codecs accept only
+    their current schema."""
     def current(value):
-        if isinstance(value, Mapping):
-            component = {key: current(field) for key, field in value.items()}
-            name, fields = component.get("class"), component.get("fields")
-            if name in ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector") \
-                    and isinstance(fields, dict) and "vision_width" in fields:
-                width, merge = fields.pop("vision_width"), fields.pop("merge_size")
-                component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
-                                     "width": width * merge ** 2,
-                                     "bias": name == "dew.nn.vision.qwen35:Qwen35Projector"}
-            return component
         if isinstance(value, list | tuple):
             return [current(field) for field in value]
-        return value
+        if not isinstance(value, Mapping):
+            return value
+        component = {key: current(field) for key, field in value.items()}
+        # A component record names its class; the run's model record (`ModelConfig`) names it too, and
+        # holds the fields it defaulted beside the ones it was given.
+        name, fields = component.get("class", component.get("name")), component.get("fields")
+        if not isinstance(fields, dict):
+            return component
+        if name in _EARLIER_PROJECTORS and "vision_width" in fields:
+            width, merge = fields.pop("vision_width"), fields.pop("merge_size")
+            component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
+                                   "width": width * merge ** 2, "bias": name == _EARLIER_PROJECTORS[0]}
+        elif name in _DECODER:
+            component["fields"] = _decoder_fields(fields)
+            defaults = component.get("defaults")
+            if isinstance(defaults, Mapping):
+                component["defaults"] = _one_scaling(defaults)
+        elif isinstance(name, str):
+            component["fields"] = _declared_decoders(name, fields)
+        return component
 
     return {**record, "model": current(record["model"])}
+
+
+def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, object]:
+    """The fields of the component class `name` with each decoder its fields declare
+    (`dew.registry.declared_type`) and record as their fields alone translated (`_decoder_fields`)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import declared_type, imported, models
+
+    owner = models[name] if name in models.paths else imported(name)
+    if not isinstance(owner, type):
+        return fields
+    return {field: (_decoder_fields(value) if isinstance(value, Mapping) and "class" not in value
+                    and declared_type(owner, field) is CausalTransformer else value)
+            for field, value in fields.items()}
+
+
+def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
+    """A decoder's fields and its layer kinds' with an earlier YaRN field read as their rope scaling
+    (`_one_scaling`)."""
+    kinds = fields.get("kinds")
+    return {**_one_scaling(fields), **({"kinds": {
+        kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
+               else _one_scaling(held)) if isinstance(held, Mapping) else held
+        for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {})}
+
+
+def _one_scaling(fields: Mapping[str, object]) -> Mapping[str, object]:
+    """A decoder's or layer kind's fields with an earlier `yarn` field read as its `rope_scaling`: the
+    fields it wrote, as YaRN's record. Fields setting both are refused: they were two scalings."""
+    current = dict(fields)
+    yarn = current.pop("yarn", None)
+    if yarn is None:
+        return current
+    if current.get("rope_scaling") is not None:
+        raise ValueError("an earlier record sets yarn and rope_scaling, two rope scalings")
+    held = yarn.get("fields", yarn) if isinstance(yarn, Mapping) else yarn
+    current["rope_scaling"] = {"rope_type": "yarn", **held} if isinstance(held, Mapping) else held
+    return current
 
 
 def settings_fields(settings: type) -> frozenset[str]:
@@ -479,21 +559,25 @@ class TextSettings(TaskSettings):
 @dataclass(frozen=True, kw_only=True)
 class MaskedSettings(TaskSettings):
     """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process,
-    the unmasking solver and its step count, and the end-of-sequence ids a response stops at,
-    beside the common ones."""
+    the unmasking solver (`Unmask`, or `Confident` for a release's blockwise walk) and its step
+    count, the places a blockwise walk unmasks together (`block`; None walks the whole response),
+    and the end-of-sequence ids a response stops at, beside the common ones."""
 
     process: DiscreteProcess
     solver: Solver
     sampling_steps: int
     eos_token_ids: tuple[int, ...] = ()
+    block: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer(self.sampling_steps, "sampling_steps")
         if len(self.eos_token_ids):
             object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
-        if not isinstance(self.solver, Unmask):
-            raise ValueError("a masked run's task unmasks with an Unmask solver")
+        if not isinstance(self.solver, Unmask | Confident):
+            raise ValueError("a masked run's task unmasks with an Unmask or a Confident solver")
+        if self.block is not None:
+            integer(self.block, "block")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -774,7 +858,7 @@ class TextGeneration(_NativeTextTask):
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  sampling: Sampling | None = None, images: Media | None = None,
                  logits: Transforms | None = None, stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation:
@@ -858,7 +942,7 @@ class BlockGeneration(_NativeTextTask):
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.block"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
@@ -877,22 +961,24 @@ class BlockGeneration(_NativeTextTask):
 
 @dataclass(frozen=True)
 class MaskedGeneration(_NativeTextTask):
-    """Samples a whole response with native MDLM, holding the prompt fixed.
+    """Samples a response with native MDLM, holding the prompt fixed: the whole response at once
+    (`Unmask`), or a block of `block` places at a time as LLaDA2's releases walk
+    (`DiscreteProcess.generate`'s `block`, `Confident`'s reveal).
 
-    It does not reproduce the source-specific remasking recipes of LLaDA or
-    Dream. EOS trims the finished response after the bidirectional
-    denoising, and does not end that denoising early. Results hold
-    refinement counts and no autoregressive action likelihoods. When a call
-    passes none, it uses the task's `steps`, its `max_new_tokens` response
-    length and its `n` continuations per prompt.
+    It does not reproduce LLaDA's or Dream's own remasking recipes. A whole-response walk's EOS
+    trims the finished response and does not end its denoising early; a blockwise walk stops a
+    row after the block that revealed its end. Results hold refinement counts and no
+    autoregressive action likelihoods. When a call passes none, it uses the task's `steps`, its
+    `max_new_tokens` response length and its `n` continuations per prompt.
     """
 
     model: nn.Module
     variables: Variables
     process: DiscreteProcess
     processor: Processor | None = None
-    solver: Unmask = dataclasses.field(default_factory=Unmask)
+    solver: Unmask | Confident = dataclasses.field(default_factory=Unmask)
     steps: int = MDLM_STEPS
+    block: int | None = None
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
     max_new_tokens: int | None = None
@@ -938,15 +1024,15 @@ class MaskedGeneration(_NativeTextTask):
         `processor`: their process, solver, step count, end-of-sequence ids and response budget. A
         live objective (`MaskedDiffusionObjective.build_task`) and a saved run (`from_saved`) build it
         alike."""
-        assert isinstance(settings.solver, Unmask)
+        assert isinstance(settings.solver, Unmask | Confident)
         return cls(model, variables, settings.process, processor, solver=settings.solver,
-                   steps=settings.sampling_steps, eos_token_ids=settings.eos_token_ids,
+                   steps=settings.sampling_steps, block=settings.block, eos_token_ids=settings.eos_token_ids,
                    max_new_tokens=settings.max_new_tokens or None)
 
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  steps: int | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.masked"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
@@ -955,7 +1041,7 @@ class MaskedGeneration(_NativeTextTask):
             generated = self.process.generate(self.model, self.placed, inputs, budget, key=random_key,
                 solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
-                eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+                eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id, block=self.block)
             return self._decoded(generated)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:

@@ -6,7 +6,8 @@ distribution, so training on it rewards honest probabilities over
 overconfident ones. Each rule here serves both roles: called on logits inside
 a step it is a per-row loss, and as a `Metric` it averages the same charge
 over a validation pass's `Decisions`. Rules can be added and scaled, as in
-`LogLoss() + 0.5 * Brier()`.
+`LogLoss() + 0.5 * Brier()`. Each rule's charge is the categorical's (`dew.nn.categorical`), which any
+objective's criterion composes on.
 
 The charge is against a target distribution t over the row's options,
 one-hot or soft, smoothed in training, and is zero for a certain, correct
@@ -24,7 +25,7 @@ import numpy as np
 
 from dew.artifacts import Artifact, Decisions
 from dew.batch import Batch
-from dew.decision.metrics import Answered
+from dew.eval.common import masked_total
 from dew.nn import categorical
 from dew.objectives.base import Metric, Shown, mean_of_totals, merge_totals
 
@@ -55,12 +56,14 @@ class ScoringRule(ABC):
     __rmul__ = __mul__
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
-        answered = Answered.of(artifact)
-        logits = np.log(np.clip(answered.probabilities, 1e-300, None))
-        charged = np.asarray(self.charge(jnp.asarray(logits), jnp.asarray(answered.targets),
-                                         jnp.asarray(answered.options), jnp.asarray(answered.ordinal)),
-                             np.float64)
-        return float(charged.sum()), float(charged.size)
+        """The rule's charge over the batch's answered questions, read at the batch's fixed shape, its
+        unanswered rows masked (`masked_total`): one program a shape, every validation split's."""
+        if not isinstance(artifact, Decisions):
+            raise TypeError(f"a decision metric reads Decisions, not {type(artifact).__name__}")
+        logits = np.log(np.clip(np.asarray(artifact.probabilities, np.float64), 1e-300, None))
+        return masked_total(type(self).charge, self, np.asarray(artifact.scored, bool), logits,
+                            np.asarray(artifact.targets, np.float64), np.asarray(artifact.options, bool),
+                            np.asarray(artifact.ordinal, bool))
 
     merge = staticmethod(merge_totals)
     finalize = staticmethod(mean_of_totals)
@@ -83,8 +86,7 @@ class Brier(ScoringRule):
     name = "brier"
 
     def charge(self, logits, target, options, ordinal):
-        p = categorical.probabilities(logits, options)
-        return jnp.sum(jnp.where(options, (p - target) ** 2, 0.0), axis=-1)
+        return categorical.brier(logits, target, options)
 
 
 @dataclass(frozen=True)
@@ -94,8 +96,7 @@ class Spherical(ScoringRule):
     name = "spherical"
 
     def charge(self, logits, target, options, ordinal):
-        p = categorical.probabilities(logits, options)
-        return 1.0 - jnp.sum(target * p, axis=-1) / jnp.linalg.norm(p, axis=-1)
+        return categorical.spherical(logits, target, options)
 
 
 @dataclass(frozen=True)
@@ -112,15 +113,12 @@ class RankedProbability(ScoringRule):
     name = "rps"
 
     def charge(self, logits, target, options, ordinal):
-        p = categorical.probabilities(logits, options)
-        gaps = (jnp.cumsum(p, axis=-1) - jnp.cumsum(jnp.where(options, target, 0.0), axis=-1)) ** 2
-        cuts = jnp.maximum(jnp.sum(options, axis=-1) - 1, 1)
-        # The last cut, past every level, is always zero.
-        return jnp.where(ordinal, jnp.sum(jnp.where(options, gaps, 0.0), axis=-1) / cuts, 0.0)
+        return jnp.where(ordinal, categorical.ranked_probability(logits, target, options), 0.0)
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
         total, _ = super().__call__(artifact, batch)
-        return total, float(np.sum(Answered.of(artifact).ordinal))
+        assert isinstance(artifact, Decisions)
+        return total, float(np.sum(np.asarray(artifact.scored, bool) & np.asarray(artifact.ordinal, bool)))
 
 
 @dataclass(frozen=True)
@@ -150,8 +148,9 @@ class Combined(ScoringRule):
 
 
 def default_metrics() -> list[Metric]:
-    """The held-out suite a decision run scores by default, fresh: accuracy, calibration error,
-    the risk-coverage area and the log loss, in that order."""
-    from dew.decision.metrics import AURC, ECE, Accuracy
+    """The held-out suite a decision run scores by default, fresh, in this order: accuracy, macro F1,
+    calibration error, the risk-coverage area, the log loss, the Brier score and the count of the
+    questions they are taken over."""
+    from dew.decision.metrics import AURC, ECE, Accuracy, MacroF1, ScoredQuestions
 
-    return [Accuracy(), ECE(), AURC(), LogLoss()]
+    return [Accuracy(), MacroF1(), ECE(), AURC(), LogLoss(), Brier(), ScoredQuestions()]

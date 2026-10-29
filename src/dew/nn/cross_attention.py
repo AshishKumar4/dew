@@ -14,7 +14,7 @@ frozen while the block trains (`dew.interop.Pretrained.with_cross_attention`).
 The reference layer is IDEFICS's `IdeficsGatedCrossAttentionLayer`
 (transformers' modeling_idefics.py), and its names are the names used here.
 Its attention is the one every cross-attention runs, a diffusion block's and
-Wan's alike (`dew.nn.attention.NormalAttention`), held in the block's own
+Wan's alike (`dew.nn.attention_blocks.NormalAttention`), held in the block's own
 scope, over the decoder's grouped key-value heads and keeping a cached call's
 keys and values; the gates, the feed-forward and the residual join are the
 block's.
@@ -56,7 +56,9 @@ from dew.batch import coordinates
 from dew.nn.dropout import Dropout
 
 from .activations import GatedActivation
-from .attention import CROSS_KEY, CROSS_VALUE, NormalAttention
+from .attention import AttentionImpl
+from .attention_blocks import CROSS_KEY, CROSS_VALUE, NormalAttention
+from .documents import CrossDocuments, holds_keys
 from .flops import counted_flops
 from .inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext
 from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
@@ -189,7 +191,7 @@ class GatedCrossAttention(nn.Module):
     head_dim: int
     ngpt: bool = False
     dropout_rate: float = 0.0
-    attention_impl: str = "auto"
+    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -256,9 +258,8 @@ class GatedCrossAttention(nn.Module):
         present = (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
         if context is not None and context.segments is not None and context.queries is not None:
             # A token whose document holds no context reads none, as its row alone would skip the block.
-            keys = context.segments[:, None, :]
-            owned = (context.queries[:, :, None] == keys) & (keys > 0)
-            present = jnp.any(owned, axis=-1).reshape(owned.shape[:2] + (1,) * (stream.ndim - 2))
+            held = holds_keys(CrossDocuments(context.queries, context.segments))
+            present = held.reshape(held.shape[:2] + (1,) * (stream.ndim - 2))
         dropout = Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
@@ -334,5 +335,5 @@ def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.
     return product[..., 0]
 
 
-__all__ = ["CROSS_CACHE", "CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "ContextEncoder",
-           "CrossAttention", "GatedCrossAttention", "crossing", "encode_context", "gated_join"]
+__all__ = ["CROSS_CACHE", "CROSS_LENGTHS", "NAME", "ContextEncoder", "CrossAttention", "GatedCrossAttention",
+           "crossing", "encode_context", "gated_join"]

@@ -78,10 +78,12 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.diffusion.discrete import Confident
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
+    from dew.nn.attention import AttentionImpl
     from dew.nn.cross_attention import CrossAttention
 
 
@@ -224,9 +226,12 @@ class Pretrained:
 
     It is used by a bundle that has no source processor to write (`from_model`).
     """
-    code: Path | None = None
-    """The directory of the source's own Python modules a load ran (`trust_remote_code`), which `save`
-    writes beside the weights: the source's snapshot, which a weights conversion may not be."""
+    code: decoder_parts.SourceCode | None = None
+    """The source's own modeling code, where its config names it (`auto_map`), which `save` writes
+    beside the weights, its modules and their relative imports (`sources.code_modules`), whether a load
+    ran them (`trust_remote_code`) or, mapped natively, kept them unexecuted, so a save opens through the
+    source's own transformers loader as the source does; read from the source's snapshot, which a
+    weights conversion may not be, when the save writes it."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -352,7 +357,7 @@ class Pretrained:
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
              param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
-             attention_impl: str = "auto", max_seq_len: int | None = None,
+             attention_impl: AttentionImpl = "auto", max_seq_len: int | None = None,
              revision: str | None = None, subfolder: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
@@ -411,9 +416,10 @@ class Pretrained:
         another kind and names that kind.
 
         `text_only=True` loads a multimodal wrapper's language model alone, as its text family's own
-        checkpoint states it (Qwen3.5's `Qwen3_5ForCausalLM`): no tower, projector or audio encoder is
-        built, nor their tensors read, and the source saves as that text checkpoint. A source that is
-        a decoder already loads as it is; a pipeline or a fallback has no language model to take.
+        checkpoint states it (Qwen3.5's `Qwen3_5ForCausalLM`; DeepSeek-V4.1's bundle as its own text
+        checkpoint): no tower, projector or audio encoder is built, nor their tensors read, and the source
+        saves as that text checkpoint. A source that is a decoder already loads as it is; a pipeline or
+        a fallback has no language model to take.
 
         `prediction_depths` keeps the first that many of a decoder's multi-token prediction depths
         (DeepSeek V3's, GLM's and Qwen3.5's `mtp` blocks): None the ones the checkpoint holds, 0
@@ -605,17 +611,17 @@ class Pretrained:
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
         destination = Path(directory)
-        # Either half may refuse the bundle, each before it writes a file.
+        # Either half may refuse the bundle, each before it writes a file, as may the source's code.
         tensors = self.export(values)
+        modules = {} if self.code is None else sources.code_modules(self.code)
         decoders.save_export_assets(destination,
                                     tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config),
                                     named=self.names_tokenizer)
-        if self.code is not None:
-            for module in sorted(self.code.rglob("*.py")):
-                written = destination / module.relative_to(self.code)
-                written.parent.mkdir(parents=True, exist_ok=True)
-                written.write_bytes(module.read_bytes())
+        for name, module in sorted(modules.items()):
+            written = destination / name
+            written.parent.mkdir(parents=True, exist_ok=True)
+            written.write_bytes(module.read_bytes())
         save_hf_layout(tensors, dict(self.config), destination, max_shard_size)
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
@@ -683,7 +689,8 @@ class PretrainedDecoder(Pretrained):
         return cls(decoder, variables, None, config, None, built,
                    {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
                    if generation_config is None else generation_config,
-                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
+                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer,
+                   code=decoders.release_code(decoder))
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.
@@ -709,19 +716,35 @@ class PretrainedMaskedDecoder(Pretrained):
     """A masked-diffusion decoder (LLaDA, Dream).
 
     It is a non-causal decoder with a mask id that generates by unmasking a whole
-    response.
+    response, or, where its family declares its release's walk (LLaDA2.0's), a
+    block at a time as the release does (`masked_recipe`).
     """
 
     model: CausalTransformer
+
+    @property
+    def masked_recipe(self) -> tuple[Confident, int, int] | None:
+        """The release's own walk this source generates by, its solver, steps and block
+        (`DecoderFamily.masked_walk` of its config, LLaDA2.0's; `Confident`), or None for a source
+        whose family declares none, an unregistered one among them, which unmasks the whole response
+        with Dew's MDLM. Its task (`text_generation`) and an objective over it
+        (`MaskedDiffusionObjective`) take it alike."""
+        from dew.diffusion.discrete import Confident
+        from dew.interop.hf_decoders import families
+
+        family = families().get(str(self.config.get("model_type")))
+        walk = None if family is None or family.masked_walk is None else family.masked_walk(self.config)
+        if walk is None:
+            return None
+        return Confident(threshold=walk.threshold, temperature=walk.temperature), walk.steps, walk.block
 
     def pipeline(self):
         return self.packed().text_generation()
 
     def text_generation(self) -> MaskedGeneration:
-        """Build the masked generation task this source describes.
-
-        It uses Dew's MDLM sampler, which refines a whole response with Unmask, not
-        the source family's own generation recipe.
+        """Build the masked generation task this source describes, walking as its release does where
+        its family declares the walk (`masked_recipe`), else refining a whole response with Dew's MDLM
+        sampler (`Unmask`), not its family's own recipe.
         """
         from dew.diffusion.discrete import MDLM
 
@@ -730,8 +753,10 @@ class PretrainedMaskedDecoder(Pretrained):
         if mask_id is None:
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
         audit_masked(config, generation)
+        recipe = self.masked_recipe
+        walked = {} if recipe is None else {"solver": recipe[0], "steps": recipe[1], "block": recipe[2]}
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
-                                self.text_processor,
+                                self.text_processor, **walked,
                                 eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
@@ -877,7 +902,7 @@ def _no_language_model(name: str, kind: str) -> NoReturn:
 
 
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
-                          revision: str | None = None, attention_impl: str = "auto",
+                          revision: str | None = None, attention_impl: AttentionImpl = "auto",
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
                           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                           text: bool = True, text_only: bool = False,
@@ -950,7 +975,7 @@ def _pipeline_weights(source: sources.SourceReference, root: Path, index: Mappin
 
 def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: str | None,
                         placed: Callable[[Variables], Variables], *, streaming: bool, dtype: str,
-                        attention_impl: str, param_dtype: str, variables: Variables | None = None,
+                        attention_impl: AttentionImpl, param_dtype: str, variables: Variables | None = None,
                         text: bool = True, stored: sources.StoredWeights | None = None) -> PretrainedPipeline:
     """The pipeline `index` describes, assembled from the directory its
     source resolved to (a snapshot, a single file's conversion or a DDUF
@@ -1098,7 +1123,7 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
 
 def _pipeline_source(source: sources.SourceReference, root: Path, single_file: str | None,
                      dduf_file: str | None, placed: Callable[[Variables], Variables], *, dtype: str,
-                     attention_impl: str, param_dtype: str, streaming: bool,
+                     attention_impl: AttentionImpl, param_dtype: str, streaming: bool,
                      size: tuple[int, ...] | None = None, variables: Variables | None = None,
                      text: bool = True) -> PretrainedPipeline | None:
     """The source as a latent diffusion pipeline, or None when it is a decoder.
@@ -1160,7 +1185,7 @@ def _names_a_model(directory: Path) -> bool:
 def _loaded_kind(reference: sources.SourceReference, directory: Path, composite: CompositeSource | None, *,
                  fallback: str | None, gguf_file: str | None, single_file: str | None,
                  dduf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
-                 weights: bool, dtype: str, param_dtype: str, attention_impl: str,
+                 weights: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                  max_seq_len: int | None, overrides: Mapping[str, object] | None,
                  trust_remote_code: bool, text_only: bool,
                  prediction_depths: int | None = None) -> tuple[Pretrained, bool]:
@@ -1240,6 +1265,22 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
     """Refuse `overrides` on a route whose model no override reaches, rather than load without them."""
     if overrides is not None:
         raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
+
+
+def _kept_code(route: SourceRoute, remote: Path | None, config: Mapping[str, object],
+               reference: sources.SourceReference, root: Path) -> decoder_parts.SourceCode | None:
+    """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config names it
+    (`auto_map`): in the snapshot a verification from parts ran it from, or, of a natively mapped
+    source, beside the config the load read (`reference`, its component folder), at the metadata
+    snapshot's commit (`root`), never run."""
+    auto_map = config.get("auto_map")
+    if not isinstance(auto_map, Mapping):
+        return None
+    if isinstance(route, VerifiedRoute) and route.verified.source is not None and remote is not None:
+        return decoder_parts.SourceCode(remote, None, auto_map)
+    if Path(reference.name).is_dir():
+        return decoder_parts.SourceCode(reference.directory(root), None, auto_map)
+    return decoder_parts.SourceCode(reference.name, root.name, auto_map, folder=reference.subfolder)
 
 
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
@@ -1374,7 +1415,8 @@ class _Built(NamedTuple):
 
 
 def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperFields,
-                    tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str, attention_impl: str,
+                    tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str,
+                    attention_impl: AttentionImpl,
                     max_seq_len: int | None, param_dtype: str, lazy: bool,
                     checked: decoders.Checked) -> _Built:
     """A multimodal wrapper, `record` its translated config: the decoder under its text_config and the
@@ -1526,7 +1568,7 @@ def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransforme
 
 
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.Stored], directory: Path,
-                    route: DecoderRoute | VerifiedRoute, *, dtype: str, attention_impl: str,
+                    route: DecoderRoute | VerifiedRoute, *, dtype: str, attention_impl: AttentionImpl,
                     max_seq_len: int | None, param_dtype: str, lazy: bool, quantized: bool,
                     checked: decoders.Checked) -> _Built:
     """A decoder of a registered family, or of one it was verified as (tier 2), as `route` read it.
@@ -1636,7 +1678,7 @@ def _composite_description(directory: Path,
 
 def _load_composite_source(source: sources.SourceReference, root: Path,
                            description: CompositeSource, *, placed: Callable[[Variables], Variables],
-                           streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
+                           streaming: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                            max_seq_len: int | None, weights: bool,
                            overrides: Mapping[str, object] | None = None,
                            code: Path | None = None, prediction_depths: int | None = None) -> Pretrained:
@@ -1664,6 +1706,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                          text_only=False, overrides=overrides, prediction_depths=prediction_depths)
         forwarded = isinstance(routed.route, TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and component.tensor_prefix)
+        config_root = root
         if weights or reads_shared:
             weight_source = source.component(component.weights_folder)
             root = weight_source.weights(root)
@@ -1678,7 +1721,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides,
-            remote=remote, routed=routed, prediction_depths=prediction_depths)
+            remote=remote, routed=routed, prediction_depths=prediction_depths, config_root=config_root)
     else:
         _unread_overrides(overrides, "a release without a native backbone")
     missing = False
@@ -1758,15 +1801,20 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
+        # A bundle its own family reads whole states its text checkpoint without its vision_config, its
+        # decoder's names and their codec unchanged; another wrapper's language model is its text family's
+        # checkpoint, under names its quantization's module selection does not follow.
         if decoders.bundles(config):
-            raise ValueError(f"{config.get('model_type')} reads its media bundle whole as one decoder "
-                             "family; text_only takes a wrapper whose language model is its own text "
-                             "family's checkpoint")
-        if source_quantization(config) is not None:
+            config = decoders.bundle_text_config(config)
+        elif source_quantization(config) is not None:
             raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
                              "names the wrapper's modules, which its text checkpoint renames")
-        config = decoders.language_model_config(config)
+        else:
+            config = decoders.language_model_config(config)
         route = source_route(config, remote=remote, pinned=pinned)
+    elif isinstance(route, WrapperRoute):
+        # Before any weight downloads, as the routing of the wrapper's names would (`_wrapper_sources`).
+        decoders.refuse_unported(route.wrapper)
     elif text_only and isinstance(route, DiffusionGemmaRoute):
         raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
                          "its whole model")
@@ -1789,7 +1837,7 @@ class _Translated(NamedTuple):
 def _translated(config: Mapping[str, object],
                 route: DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute,
                 tensors: Mapping[str, unread.Stored], directory: Path, *, dtype: str, param_dtype: str,
-                attention_impl: str, max_seq_len: int | None, streaming: bool) -> _Translated:
+                attention_impl: AttentionImpl, max_seq_len: int | None, streaming: bool) -> _Translated:
     """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
     weights decoded, the decoder, media wrapper or DiffusionGemma translated and checked against its
     tree, and any stored input scales bound. No processor, generation config or bundle is built."""
@@ -1901,20 +1949,22 @@ def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
 
 def _load_native_source(source: sources.SourceReference, root: Path, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
-                        dtype: str, param_dtype: str, attention_impl: str,
+                        dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                         max_seq_len: int | None, weights: bool = True,
                         component: NativeComponent | None = None,
                         tensors: Mapping[str, unread.Stored] | None = None,
                         overrides: Mapping[str, object] | None = None,
                         remote: Path | None = None, pinned: sources.SourceReference | None = None,
                         routed: _Routed | None = None,
-                        text_only: bool = False, prediction_depths: int | None = None
-                        ) -> tuple[Pretrained, bool]:
+                        text_only: bool = False, prediction_depths: int | None = None,
+                        config_root: Path | None = None) -> tuple[Pretrained, bool]:
     """Decode native source weights and bind their processors and export layout, and whether the
     bundle is a wrapper's language model taken alone (`text_only`). `remote` is the source's own code
     where the load runs it, and `pinned` where it was fetched (`source_route`). `routed` is the route a
     caller decided for this config already (`_routed`), a composite's for its backbone before reading
     its weights, which the load takes rather than route the config, and verify its code, again.
+    `config_root` is the snapshot the source's config was read from, which pins its own code
+    (`_kept_code`): a composite's, before its weights resolve; `root` where None.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
     their own routes; this boundary handles native decoders and media wrappers,
@@ -1922,13 +1972,17 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     `overrides` (`Pretrained.load`'s `modeling_overrides`) join the source's own.
     """
     name_or_dir, commit = source.name, source.revision
+    # Before any weights resolve: a conversion's snapshot may be another commit than the config's.
+    config_root = root if config_root is None else config_root
     directory = source.directory(root)
     gguf_path = None if gguf_file is None else source.file(root, gguf_file)
+    # The config's own folder, where a source keeps the code it names (`_kept_code`).
+    configured = source if component is None else source.component(component.config_folder)
     if component is None:
         config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
     else:
         config = component.config
-        directory = source.component(component.config_folder).directory(root)
+        directory = configured.directory(root)
     mamba_ssm = mamba2.is_mamba_ssm(config)
     config = _native_config(config, overrides)
     family = config.get("model_type")
@@ -1980,9 +2034,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                     # The weights' commit: a pickle repo's may be its conversion's.
                     revision=resolved_commit,
                     tokenizer="byte" if named == "byte" else None,
-                    # The modules a verification from parts ran, from the source's own snapshot.
-                    code=remote if isinstance(route, VerifiedRoute) and route.verified.source is not None
-                    else None)
+                    code=_kept_code(route, remote, config, configured, config_root))
 
     if family == "diffusion_gemma":
         return bundle(PretrainedBlockDecoder), False

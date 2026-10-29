@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.decision import Decide, DecisionInputs, Encoded, MarkerLayout, Question
+from dew.decision import Decide, DecisionInputs, Encoded, Question
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 TINY = FIXTURES / "tiny"
@@ -23,7 +23,8 @@ def cases() -> dict:
 
 def rows(checkpoint: Decide, *, parallel: bool):
     """Every question of every case, laid out by Dew, keyed as the fixture keys them."""
-    layout = MarkerLayout(checkpoint.layout.max_len, checkpoint.layout.head_max_len, parallel=parallel)
+    # The release's layout, its budgets as it states them, in each option order.
+    layout = replace(checkpoint.layout, parallel=parallel)
     name = "parallel" if parallel else "sequential"
     for case, request in cases().items():
         state = layout.state(checkpoint.tokenizer, checkpoint.specials, request["state"])

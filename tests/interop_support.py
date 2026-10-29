@@ -1,8 +1,10 @@
 """What several interop tests read off a reference: a checkpoint's stored
 bytes, a source autoencoder's vector-Jacobian products, the audio features
-a checkpoint's own extractor makes and the pad row of its token lookup; and a
+a checkpoint's own extractor makes and the pad row of its token lookup; a tiny
+checkpoint's transformers reference run in the test over check 1's draws; and a
 Hub cache an offline process resolves a repo from."""
 
+import contextlib
 import functools
 import json
 import shutil
@@ -80,6 +82,64 @@ def float64_logits(loaded):
     return lambda inputs: {"logits": model.apply(variables, jnp.asarray(inputs["input_ids"]))}
 
 
+def fixture_ids(directory: Path, mask=None):
+    """Check 1's draw over the tiny checkpoint at `directory`: a seed's ids uniform over its config's
+    vocabulary in the shape of its `input_ids.npy`, 0 where `mask` is false (the pad its recorder wrote
+    into padded rows), the same on every run."""
+    shape = np.load(directory / "input_ids.npy").shape
+    vocabulary = json.loads((directory / "config.json").read_text())["vocab_size"]
+
+    def draw(seed):
+        ids = np.random.default_rng(seed).integers(0, vocabulary, shape).astype(np.int32)
+        return (ids if mask is None else np.where(mask, ids, 0).astype(np.int32),)
+
+    return draw
+
+
+def transformers_model(directory: Path, *, masked: bool = False):
+    """transformers' own class for the checkpoint at `directory`, as its config names it, the masked LM
+    where `masked` and else the causal LM, in float32 on eager attention and eager experts, in eval mode:
+    the reference a tiny checkpoint's recorder ran (tools/hf_reference.py), run in the test."""
+    import torch
+    import transformers
+
+    auto = transformers.AutoModelForMaskedLM if masked else transformers.AutoModelForCausalLM
+    return auto.from_pretrained(directory, dtype=torch.float32, attn_implementation="eager",
+                                experts_implementation="eager").eval()
+
+
+def transformers_arms(model, run):
+    """Check 1's reference and truth over the transformers `model`: `run(model, *inputs)` under
+    `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by its float64
+    twin (`tools.torch_precision.float64_twin`) inside `float64`, each run `as_given`, its tensors returned
+    as NumPy arrays."""
+    import torch
+
+    from tools.torch_precision import float64, float64_twin
+
+    def tensor(value):
+        value = np.asarray(value)
+        return torch.from_numpy(value.astype(np.int64) if np.issubdtype(value.dtype, np.integer) else value)
+
+    def arm(network, precision):
+        @as_given
+        def given(*inputs):
+            with precision(), torch.no_grad():
+                return jax.tree.map(lambda out: out.numpy(), run(network, *map(tensor, inputs)))
+        return given
+
+    return arm(model, contextlib.nullcontext), arm(float64_twin(model), float64)
+
+
+def next_token_losses(model, ids):
+    """The torch causal LM `model`'s cross entropy at each next token of `ids` in its logits' precision,
+    the per-token losses `LMObjective.token_scores` returns (a `run` of `transformers_arms`)."""
+    import torch
+
+    logits = model(ids, use_cache=False).logits
+    return torch.nn.functional.cross_entropy(logits[:, :-1].transpose(1, 2), ids[:, 1:], reduction="none")
+
+
 def extract_fixture(archive: Path, directory: Path) -> Path:
     with tarfile.open(archive) as source:
         source.extractall(directory, filter="data")
@@ -108,17 +168,23 @@ def hub_cache(cache: Path, repo_id: str, source: Path,
     return commit
 
 
+def respelled(source: Path, directory: Path, edit) -> Path:
+    """`source`'s checkpoint copied to `directory` under the config `edit` returns from its own."""
+    shutil.copytree(source, directory)
+    (directory / "config.json").write_text(json.dumps(edit(json.loads((source / "config.json").read_text()))))
+    return directory
+
+
 def without_config_field(source: Path, directory: Path, *path: str) -> Path:
     """`source`'s checkpoint copied to `directory` with the config field at `path` (a key, nested
-    keys after it) left out, as a config that leaves it to its default writes it."""
-    shutil.copytree(source, directory)
-    config = json.loads((directory / "config.json").read_text())
-    section = config
-    for key in path[:-1]:
-        section = section[key]
-    del section[path[-1]]
-    (directory / "config.json").write_text(json.dumps(config))
-    return directory
+    keys after it) left out, as a config that leaves it to its default writes it (`respelled`)."""
+    def dropped(config):
+        section = config
+        for key in path[:-1]:
+            section = section[key]
+        del section[path[-1]]
+        return config
+    return respelled(source, directory, dropped)
 
 
 def fixture_with_meta(path: Path) -> tuple[dict[str, np.ndarray], dict]:

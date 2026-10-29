@@ -417,36 +417,44 @@ class KernelOp(tokamax.Op):
     revision: int = 1
 
     def __call__(self, *args, **kwargs):
+        # One path for every config (row 1866): bound once, the op's own config, a pin or a pick checked
+        # against the call itself (`pinnable`: a template's legality), the heuristic otherwise. The launch's
+        # key, which traces its hooks, is built only where a collector, a pin or a tuning read reads it.
+        ba = self.bind(*args, **kwargs)
         config = self.config
         if config is None:
-            ba = self.bind(*args, **kwargs)
-            keyed = self.keyed(ba)
             if (collected := cache.KERNEL_SEEN.value) is not None:
-                collected.found.append((self, keyed))
-            config = self._chosen(ba, keyed)
+                collected.found.append((self, self.keyed(ba)))
+            config = self._chosen(ba)
             if collected is not None:
                 collected.found.taken.append((config, ba))
+        elif not self.pinnable(ba, config):
+            raise Unpinnable(type(self).__name__, config, self.unpinnable(ba, config))
+        # The launch runs on its bound arguments, the facts its binding states from its operands (a
+        # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them.
         if cache.KERNEL_LAUNCHES.value:
             # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
             # each traced array for its devices (`keyed`).
-            return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *args, **kwargs)
-        return self._fwd(*args, config=config, **kwargs)[0]
+            return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *ba.args,
+                                       **ba.kwargs)
+        return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
 
     def chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         """The config a launch of `ba` takes where it traces now: the op's own `config` where it carries
         one, else a config pinned for its kernel (`pinned`, raising `Unpinnable` where its key's legal
         configs do not hold it), else in a tuning run its key's pick (`_pick`), else its own shapes'
         heuristic."""
-        return self.config if self.config is not None else self._chosen(ba, self.keyed(ba))
+        return self.config if self.config is not None else self._chosen(ba)
 
-    def _chosen(self, ba: tokamax.BoundArguments, keyed: tokamax.BoundArguments) -> Hashable:
+    def _chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         pins = dict(cache.KERNEL_PINS.value)
         if type(self) in pins:
             pin = pins[type(self)]
-            if not self.pinnable(keyed, pin):
-                raise Unpinnable(type(self).__name__, pin, self.unpinnable(keyed, pin))
+            # A pin holds for the call's own shapes, as an explicit config does (`__call__`).
+            if not self.pinnable(ba, pin):
+                raise Unpinnable(type(self).__name__, pin, self.unpinnable(ba, pin))
             return pin
-        pick = _pick(keyed) if _READING.get() else None
+        pick = _pick(self.keyed(ba)) if _READING.get() else None
         # A pick measured at another shape of its key the launch's own shapes cannot take is not taken.
         if pick is None or not self.pinnable(ba, pick.fastest_config):
             return ba.heuristics_config

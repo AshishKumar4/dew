@@ -30,6 +30,7 @@ from dew.registry import resolve_dtype
 
 if TYPE_CHECKING:
     from dew.interop.streaming import LazyTree, WeightLayout
+    from dew.nn.attention import AttentionImpl
 
 
 def flag(config: Mapping[str, object], name: str, *, default: bool) -> bool:
@@ -45,7 +46,7 @@ def flag(config: Mapping[str, object], name: str, *, default: bool) -> bool:
 
 
 def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                attention_impl="auto") -> NativeFields[UNet2DCondition]:
+                attention_impl: AttentionImpl = "auto") -> NativeFields[UNet2DCondition]:
     """Read a Diffusers UNet config into the fields `UNet2DCondition` takes.
 
     A control whose active value this UNet cannot compute raises rather than
@@ -303,7 +304,7 @@ def unet_layouts(shapes: Mapping[str, tuple[int, ...]], model: UNet2DCondition) 
 
 
 def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-               attention_impl="auto") -> NativeFields[SD3Transformer]:
+               attention_impl: AttentionImpl = "auto") -> NativeFields[SD3Transformer]:
     """Read a published `SD3Transformer2DModel` config into native model fields.
 
     Every geometry control the source declares is read. A control whose active
@@ -419,7 +420,7 @@ def _sd3_path(name: str) -> tuple[str, ...] | None:
 
 
 def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                attention_impl="auto") -> NativeFields[FluxTransformer]:
+                attention_impl: AttentionImpl = "auto") -> NativeFields[FluxTransformer]:
     """Read a published `FluxTransformer2DModel` config into native model fields.
 
     Every geometry control the source declares is read, including whether it
@@ -452,7 +453,7 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
 
 
 def flux2_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                 attention_impl="auto") -> NativeFields[Flux2Transformer]:
+                 attention_impl: AttentionImpl = "auto") -> NativeFields[Flux2Transformer]:
     """Read a published `Flux2Transformer2DModel` config into native model
     fields, refusing a patch size the pipeline does not use."""
     if _records.integer(config.get("patch_size", 1), "patch_size") != 1:
@@ -524,7 +525,7 @@ def flux2_path(name: str, rank: int) -> tuple[str, ...]:
 
 
 def z_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                   attention_impl="auto") -> NativeFields[ZImageTransformer]:
+                   attention_impl: AttentionImpl = "auto") -> NativeFields[ZImageTransformer]:
     """Read a published `ZImageTransformer2DModel` config into native model
     fields, refusing what the port does not compute: another patch size,
     grouped keys and values, no query and key norms, or the Omni model's
@@ -602,7 +603,7 @@ def z_image_path(name: str, rank: int) -> tuple[str, ...]:
 
 
 def wan_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-               attention_impl="auto") -> NativeFields[WanTransformer]:
+               attention_impl: AttentionImpl = "auto") -> NativeFields[WanTransformer]:
     """Read a published `WanTransformer3DModel` config into native model
     fields, refusing what the text-to-video port does not compute: the
     image-to-video models' image embedder and added key and value
@@ -747,7 +748,7 @@ def sd3_layouts(shapes: Mapping[str, tuple[int, ...]]) -> tuple[WeightLayout, ..
 
 
 def qwen_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
-                      attention_impl="auto") -> NativeFields[QwenImageTransformer]:
+                      attention_impl: AttentionImpl = "auto") -> NativeFields[QwenImageTransformer]:
     """Read a published `QwenImage21Transformer2DModel` config into native fields.
 
     Every control the class declares is read. Its pipeline hands the latent

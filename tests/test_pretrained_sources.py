@@ -88,8 +88,8 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
     record = hf_decoders.translate_config(released)
     expected, attention_factor = ROPE_INIT_FUNCTIONS["yarn"](Qwen3Config.from_dict(released), None)
 
-    scaling = YarnScaling(**record["yarn"])
-    assert record["yarn"]["factor"] == 4.0 and record["yarn"]["original_max_position_embeddings"] == 32768
+    scaling = YarnScaling(**record["rope_scaling"])
+    assert scaling.factor == 4.0 and scaling.original_max_position_embeddings == 32768
     assert (
         np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy()))
         < 1e-7
@@ -123,7 +123,7 @@ task = dew.pipeline(sys.argv[1], dtype="bfloat16", param_dtype="auto")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from dew.nn.attention import RMSNorm
+from dew.nn.norms import RMSNorm
 a = jax.random.normal(jax.random.key(0), (512, 64), jnp.bfloat16)
 b = (jax.random.normal(jax.random.key(1), (512, 64)) * 0.37).astype(jnp.bfloat16)
 norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
@@ -172,7 +172,7 @@ else:
             return jnp.sum(variables["params"]["w"] ** 2), Aux({})
     trainer = Trainer(Probe(), optax.sgd(0.1), key=0)
     trainer.initial_state()
-from dew.nn.attention import RMSNorm
+from dew.nn.norms import RMSNorm
 a = jax.random.normal(jax.random.key(0), (512,64), jnp.bfloat16)
 b = (jax.random.normal(jax.random.key(1), (512,64)) * 0.37).astype(jnp.bfloat16)
 norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
@@ -367,34 +367,22 @@ def test_a_tensor_two_shards_both_hold_is_refused_by_both_readers(tmp_path):
             read()
 
 
-_CONFIG_ONLY = """
-import sys
-import jax
-from dew.interop import Pretrained
-loaded = Pretrained.load(sys.argv[1], revision=sys.argv[2], weights=False, dtype="bfloat16")
-leaves = jax.tree.leaves(loaded.variables)
-assert leaves and all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in leaves)
-print(sum(leaf.size for leaf in leaves))
-"""
-
-
 @pytest.mark.network
 def test_a_hub_decoder_loaded_without_its_weights_downloads_none(tmp_path):
     """`Pretrained.load(weights=False)` of a Hub decoder reads its config and its weights' safetensors
-    headers over HTTP, none of its weights downloaded, so a config-only check of a large base runs
+    headers over HTTP, none of its weight files downloaded, so a config-only check of a large base runs
     on a small disk (ledger 1888): a fresh cache holds no weight file after it, and its variables are
-    the shapes of SmolLM2-135M's parameters."""
-    import subprocess
-    import sys
+    the shapes of SmolLM2-135M's parameters, every leaf a shape alone (the census's load,
+    tools/hf_coverage.py's `loaded`)."""
+    from tool_support import load
 
     repo, revision = "HuggingFaceTB/SmolLM2-135M", "93efa2f097d58c2a74874c7e644dbc9b0cee75a2"
     src = str(Path(__file__).resolve().parents[1] / "src")
     env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "cache"), "PYTHONPATH": src,
            "DEW_HUB_ANSWERS": str(tmp_path / "answers")}
-    done = subprocess.run([sys.executable, "-c", _CONFIG_ONLY, repo, revision], env=env, check=False,
-                          capture_output=True, text=True)
-    assert done.returncode == 0, done.stderr[-3000:]
-    assert 130_000_000 < int(done.stdout.split()[-1]) < 140_000_000
+    row = load("hf_coverage").loaded(repo, revision, env)
+    assert row.outcome == "loads", row.reason
+    assert row.parameters is not None and 130_000_000 < row.parameters < 140_000_000
     assert not [path for path in (tmp_path / "cache").rglob("*") if path.suffix in (".safetensors", ".bin")]
 
 

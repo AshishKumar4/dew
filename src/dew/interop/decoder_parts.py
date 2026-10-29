@@ -13,14 +13,15 @@ import dataclasses
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple, NoReturn, Protocol, TypedDict
+from typing import NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
-from dew._model_types import SANDWICH_NORMS
+from dew._model_types import LAYER_SCALAR_COLLECTIONS, SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
@@ -28,7 +29,7 @@ from dew.interop.unread import Stored, equal, valued
 from dew.interop.weights import check_tree
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS, Mixture
+from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
@@ -305,6 +306,10 @@ class WrapperFields(AudioFields):
     tokens_per_image: int | None
     video_token_id: int | None
     extra_placeholder_ids: tuple[int, ...]
+    unported: NotRequired[Mapping[str, str]]
+    """The wrapper's media components Dew has no port of, by their tensors' prefix (past `model.`) to
+    the reason: a load takes its language model alone (`text_only`), and a multimodal load refuses
+    them by name."""
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
@@ -867,11 +872,11 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
     if ropes.scaling is not None:
         if apart and 'sliding_attention' in layer_types:
             full = kinds.setdefault('full_attention', native_fields(LayerKind)())
-            full[ramp_field(ropes.scaling)] = ropes.scaling
+            full['rope_scaling'] = ropes.scaling
         else:
-            config[ramp_field(ropes.scaling)] = ropes.scaling
+            config['rope_scaling'] = ropes.scaling
     if ropes.local_scaling is not None:
-        kinds['sliding_attention'][ramp_field(ropes.local_scaling)] = ropes.local_scaling
+        kinds['sliding_attention']['rope_scaling'] = ropes.local_scaling
     return config
 
 
@@ -885,10 +890,6 @@ def nested_ramp(ramp: Ramp | None) -> Ramp | None:
     return native_fields(YarnScaling)(**{**ramp, 'truncate': True})
 
 
-def ramp_field(ramp: Ramp) -> str:
-    """The field a ramp lands under, on the model or a kind: `rope_scaling` reads the llama3 ramp
-    over the plain frequencies, `yarn` replaces them."""
-    return 'rope_scaling' if ramp['rope_type'] == 'llama3' else 'yarn'
 
 
 
@@ -1457,7 +1458,7 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     def names(path: tuple[str, ...]) -> str | tuple[str, ...] | None:
         if (len(path) == 6 and path[2:4] == ('mlp', 'experts') and path[-1] == 'kernel'
                 and model.mixture is not None):
-            named = tuple(family.tensor_name('.'.join((*path[1:4], str(expert), *path[4:])), config)
+            named = tuple(family.tensor_name('.'.join(expert_path(path, expert)[1:]), config)
                           for expert in range(model.mixture.experts))
             if any(name is None for name in named):
                 raise ValueError(f'{path} has no tensor name for each expert')
@@ -1468,17 +1469,17 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     # A packed tensor's geometry is the model's, read as a translated config spells it.
     geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
                 'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
-    return layout_tensors(_packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
+    return layout_tensors(packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
 
 
 def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
                  names: Callable[[tuple[str, ...]], str | tuple[str, ...] | None]) -> dict[str, WeightLayout]:
     """Bind each leaf, by its path collection first, to the source tensor `names` gives it.
 
-    A leaf is stored as the load oriented it, a 2-D kernel transposed. None
-    writes nothing, as for the tied head. A tuple names one source tensor per
-    expert of a stacked leaf, in expert order: the slices the load stacked
-    (`hf_decoders._stack_experts`).
+    A leaf is stored as the load oriented it (`stored_order`), a matrix
+    kernel's two axes swapped. None writes nothing, as for the tied head. A
+    tuple names one source tensor per expert of a stacked leaf, in expert
+    order: the slices the load stacked (`expert_slot`).
     """
     layouts: dict[str, WeightLayout] = {}
     for path, value in leaves.items():
@@ -1494,23 +1495,25 @@ def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
         else:
             raise ValueError(f"{'.'.join(path)} holds {value.shape}, not one slice for each of "
                              f"{len(named)} named experts")
-        kernel = path[-1] == 'kernel' and len(shape) == 2
+        # A tree built natively stores each leaf as it is shaped: no grouped rows folded.
+        order = stored_order(path, len(shape), len(shape))
+        stored = shape if order is None else tuple(shape[axis] for axis in order)
         for target, expert in slices:
             if target in layouts:
                 raise ValueError(f"{'.'.join(path)} and {layouts[target].paths[0]} both write {target}")
-            layouts[target] = WeightLayout(target, (path,), shape[::-1] if kernel else shape,
-                                           (1, 0) if kernel else None, expert_index=expert)
+            layouts[target] = PartPlan(path, expert, order).layout(target, stored)
     return layouts
 
 
-def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
-                    config: Mapping[str, object]) -> dict[str, WeightLayout]:
-    """`layouts` with each `packed` source tensor built from its parts' layouts,
-    in the place of its first part."""
+def packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packed"],
+                   config: Mapping[str, object] | None = None) -> dict[str, WeightLayout]:
+    """`layouts` with each `packed` source tensor built from its parts' layouts (`Packed.layout`),
+    in the place of its first part, the rest as they are: what an export writes, whether its parts'
+    leaves are a decoder's tree or tensors held in memory. A part whose record's other parts nothing
+    writes, or a packed tensor written beside its parts, is refused."""
     source: dict[str, WeightLayout] = {}
     for name, layout in layouts.items():
-        found = next(((packing, part) for packing in packed for part in packing.parts
-                      if name.endswith(part)), None)
+        found = packed_part(packed, name)
         if found is None:
             source[name] = layout
             continue
@@ -1519,10 +1522,23 @@ def _packed_layouts(layouts: Mapping[str, WeightLayout], packed: Sequence["Packe
         missing = [stem + other for other in packing.parts if stem + other not in layouts]
         if missing:
             raise ValueError(f'{stem}{packing.name} packs {name} with {missing}, which nothing writes')
+        if stem + packing.name in layouts and packing.name not in packing.parts:
+            raise ValueError(f'{stem}{packing.name} is written both whole and as its parts {packing.parts}')
         if part == packing.parts[0]:
             source[stem + packing.name] = packing.layout(
                 stem + packing.name, [layouts[stem + other] for other in packing.parts], config)
     return source
+
+
+def packed_part(packed: Sequence["Packed"], name: str) -> tuple["Packed", str] | None:
+    """The `packed` record one of whose parts the tensor `name` is, and that part's suffix."""
+    return next(((packing, part) for packing in packed for part in packing.parts if name.endswith(part)),
+                None)
+
+
+def packing_of(packed: Sequence["Packed"], name: str) -> "Packed | None":
+    """The `packed` record the source tensor `name` is, if any."""
+    return next((packing for packing in packed if name.endswith(packing.name)), None)
 
 
 def layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, object],
@@ -1645,28 +1661,14 @@ class Packed:
         back = tuple(range(ndim)) if self.transpose is None else tuple(
             int(k) for k in np.argsort(self.transpose))
         transpose = tuple(order[k] for k in back)
+        if self.chunks is not None and config is None:
+            raise ValueError(f'{name} needs translated geometry to interleave its projections')
         runs = None if self.chunks is None or config is None else self.chunks(config)
         return WeightLayout(name, tuple(path for part in parts for path in part.paths),
                             tuple(shape[k] for k in back),
                             None if transpose == tuple(range(ndim)) else transpose,
                             None if len(parts) == 1 else order[axis] - ndim,
                             chunks=None if runs == 1 else runs)
-
-
-def split_packed(tensors: Mapping[str, Stored], packed: Sequence[Packed],
-                 config: Mapping[str, object] | None = None) -> dict[str, Stored]:
-    """`tensors` with each one a `packed` record names split into its parts
-    (`Packed.split`), the rest as they are, each part held once
-    (`_held_twice`)."""
-    split: dict[str, Stored] = {}
-    for name, tensor in tensors.items():
-        packing = next((packing for packing in packed if name.endswith(packing.name)), None)
-        parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
-        for part, value in parts.items():
-            kept = split.setdefault(part, value)
-            if kept is not value:
-                _held_twice(name, part, kept, value)
-    return split
 
 
 def _held_twice(name: str, part: str, kept: Stored, value: Stored) -> None:
@@ -1706,6 +1708,77 @@ class Reading(NamedTuple):
     parts: tuple[Part, ...]
 
 
+def stored_order(path: tuple[str, ...], stored_ndim: int, leaf_ndim: int) -> tuple[int, ...] | None:
+    """The axis order that writes the leaf at `path`, of `leaf_ndim` axes past any expert's, back as the
+    tensor the checkpoint stores, of `stored_ndim`: a kernel stored as a matrix, a torch Linear's
+    `[out, in]`, is the leaf's `[in, out]` with those two axes swapped, under any the leaf holds ahead
+    of them (a grouped projection's groups, which DeepSeek V4's stored rows fold); None for any other
+    leaf, and for a kernel stored with more axes, which its pack orders (`Packed.transpose`). The one
+    orientation a load reads a part by (`hf_decoders.read_decoder`) and both exports write it back by
+    (`decoder_bindings`, `leaf_layouts`)."""
+    if path[-1] != 'kernel' or stored_ndim != 2:
+        return None
+    lead = leaf_ndim - 2
+    return (*range(lead), lead + 1, lead)
+
+
+def expert_slot(path: tuple[str, ...]) -> tuple[tuple[str, ...], int] | None:
+    """The stacked leaf a per-expert `experts/K/<projection>/kernel` path is a slice of, and K: a load
+    stacks the experts' kernels in K's order on the leaf's first axis (`hf_decoders._stack_experts`),
+    and an export writes each back from its slice (`WeightLayout.expert_index`). None for any other
+    path. `expert_path` is its inverse."""
+    if len(path) >= 4 and path[-4] == 'experts' and path[-3].isdigit() and path[-1] == 'kernel':
+        return (*path[:-3], path[-2], path[-1]), int(path[-3])
+    return None
+
+
+def expert_path(stacked: tuple[str, ...], expert: int) -> tuple[str, ...]:
+    """The per-expert path whose kernel is slice `expert` of the stacked leaf at `stacked`
+    (`expert_slot`'s inverse)."""
+    return (*stacked[:-2], str(expert), *stacked[-2:])
+
+
+class PartPlan(NamedTuple):
+    """How one stored tensor fills its leaf and is written back from it, the one weight plan a load
+    reads by and both exports write by: the leaf (the stacked one, for an expert's slice) and the
+    expert it is (`expert_slot`), the order that writes the leaf back as the stored tensor
+    (`stored_order`), the dtype the checkpoint stores it in where a leaf's would differ (an index
+    table's integer width; a floating weight is written in its leaf's dtype, bfloat16 and FP8
+    included), and the length a zero-padded tensor stores past its leaf (`DecoderFamily.zero_padded`).
+    A load builds its `SourceLeaf` from it, the import-derived bindings and the native export their
+    `WeightLayout`s (`layout`)."""
+
+    path: tuple[str, ...]
+    expert: int | None
+    order: tuple[int, ...] | None
+    dtype: np.dtype | None = None
+    padded: int | None = None
+
+    def layout(self, name: str, shape: tuple[int, ...], place: Callable[[tuple[str, ...]], tuple[str, ...]]
+               = tuple) -> WeightLayout:
+        """The layout that writes the `shape`d stored tensor `name` back from its leaf, placed in the
+        tree that holds it by `place`."""
+        return WeightLayout(name, (place(self.path),), tuple(shape), self.order, None, self.expert,
+                            self.dtype, self.padded)
+
+
+def part_plan(part: Part, stored: Stored, family: "DecoderFamily",
+              leaf_rank: Callable[[tuple[str, ...], int | None], int] | None = None) -> PartPlan | None:
+    """The plan of `part`, stored as `stored` (the part itself, or an unpacked tensor as the checkpoint
+    holds it before `prepare` reshaped it), None where no leaf takes it. `leaf_rank` reads the rank its
+    leaf has past an expert's axis, which a matrix kernel's orientation swaps under (DeepSeek V4's
+    grouped projection holds a group axis its stored rows fold); the stored tensor's rank without it."""
+    if part.path is None:
+        return None
+    path, expert = expert_slot(part.path) or (part.path, None)
+    order = stored_order(path, stored.ndim, stored.ndim)
+    if order is not None and leaf_rank is not None:
+        order = stored_order(path, stored.ndim, leaf_rank(path, expert))
+    dtype = None if jnp.issubdtype(stored.dtype, jnp.floating) else stored.dtype
+    padded = stored.shape[0] if part.name.endswith(family.zero_padded) else None
+    return PartPlan(path, expert, order, dtype, padded)
+
+
 def held_parts(readings: Sequence[Reading]) -> dict[str, Part]:
     """Each part `readings` hold, once: the tree's one leaf for a part a fused tensor and a tensor
     of its own both store (`_held_twice`)."""
@@ -1718,31 +1791,31 @@ def held_parts(readings: Sequence[Reading]) -> dict[str, Part]:
     return held
 
 
-def joined_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed]) -> dict[str, np.ndarray]:
-    """`split_packed`'s inverse for parts held in memory: each `packed`
-    record's parts under one stem concatenated on its axis into the tensor it
-    names, the rest as they are. A record that transposes or interleaves its
-    parts in runs is exported through its layout (`Packed.layout`) instead."""
-    joined: dict[str, np.ndarray] = {}
-    held: dict[tuple[str, Packed], dict[str, np.ndarray]] = {}
+def split_packed(tensors: Mapping[str, Stored], packed: Sequence[Packed],
+                 config: Mapping[str, object] | None = None) -> dict[str, Stored]:
+    """`tensors` with each one a `packed` record names split into its parts
+    (`packed_readings`), the rest as they are, each part held once
+    (`held_parts`): the readings of a source no decoder's path map reads."""
+    return {name: part.tensor for name, part in held_parts(packed_readings(tensors, packed, config)).items()}
+
+
+def packed_readings(tensors: Mapping[str, Stored], packed: Sequence[Packed],
+                    config: Mapping[str, object] | None = None, *,
+                    stored: Mapping[str, Stored] | None = None,
+                    path: Callable[[str], tuple[str, ...] | None] | None = None) -> tuple[Reading, ...]:
+    """`tensors` as a path map reads them, in their order: each one a `packed` record names split into
+    its parts (`Packed.split`: views, or copies where parts interleave in runs), the rest whole, each
+    part with the leaf `path` says it fills (None without one). `stored` holds the tensors as the
+    checkpoint stores them where `tensors` are another's reading of them (`DecoderFamily.prepare`'s);
+    by default they are."""
+    readings = []
     for name, tensor in tensors.items():
-        found = next(((packing, part) for packing in packed for part in packing.parts if name.endswith(part)),
-                     None)
-        if found is None:
-            joined[name] = tensor
-        else:
-            packing, part = found
-            held.setdefault((name.removesuffix(part), packing), {})[part] = tensor
-    for (stem, packing), parts in held.items():
-        if packing.transpose is not None or packing.widths is not None or packing.chunks is not None:
-            raise ValueError(f"{stem}{packing.name} transposes or interleaves its parts; "
-                             "export it by its layout")
-        if set(parts) != set(packing.parts):
-            raise ValueError(f"{stem}{packing.name} needs {packing.parts}, "
-                             f"and the tensors hold {sorted(parts)}")
-        joined[stem + packing.name] = np.concatenate([parts[part] for part in packing.parts],
-                                                     axis=packing.axis)
-    return joined
+        packing = packing_of(packed, name)
+        parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
+        # One read of each: a lazy mapping builds a tensor on every access (`LazyTensors`).
+        readings.append(Reading(name, tensor if stored is None else stored.get(name), packing, tuple(
+            Part(part, value, None if path is None else path(part)) for part, value in parts.items())))
+    return tuple(readings)
 
 
 _QKV = ('q_proj', 'k_proj', 'v_proj')
@@ -1796,6 +1869,34 @@ class WeightPreparer(Protocol):
 
     def __call__(self, tensors: Mapping[str, Stored],
                  config: Mapping[str, object] | None = None, /) -> Mapping[str, Stored]: ...
+
+
+@dataclass(frozen=True)
+class SourceCode:
+    """A source's own modeling code, which a save writes beside the weights (`sources.code_modules`) so
+    transformers opens the save with it: the `source` holding it (a Hub repo, or a local directory), the
+    commit to read it at (None for a directory), and the `auto_map` its config names it by. A family's
+    reference release (`DecoderFamily.release_code`), or a loaded source's own (`Pretrained.code`)."""
+
+    source: str | Path
+    revision: str | None
+    auto_map: Mapping[str, str | list[str | None] | None]
+    folder: str | None = None
+    """The component folder within a Hub repo the code sits in beside its config, as a load selects it
+    (`SourceReference.subfolder`); a directory source is that folder already."""
+
+
+@dataclass(frozen=True)
+class MaskedWalk:
+    """How a masked diffusion release generates, its own recipe: a response walked `block` places at a
+    time over `steps` each, drawing at `temperature` and revealing the draws past `threshold` of their
+    distribution, else a quota's most confident (`dew.diffusion.discrete.Confident`), as LLaDA2.0's
+    `generate` defaults do (modeling_llada2_moe.py's block_length, steps, threshold and temperature)."""
+
+    block: int
+    steps: int
+    threshold: float
+    temperature: float
 
 
 @dataclass(frozen=True)
@@ -1860,6 +1961,9 @@ class DecoderFamily:
     """Reads a media bundle released under the family's own model_type, which
     keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
+    wrapper_media_suffixes: tuple[str, ...] = ()
+    """Suffixes of a bundle's decoder tensors that serve its media alone, which its language model read
+    as its text checkpoint drops (`hf_decoders.language_model_names`): V4.1's routers' image-span bias."""
     defaults: Mapping[str, object] = field(default_factory=dict)
     """The computational fields the family's config class fills where a file
     omits them, which the shared readers would otherwise default for every
@@ -1868,6 +1972,10 @@ class DecoderFamily:
     aliases: Mapping[str, str] = field(default_factory=dict)
     """The config class's `attribute_map`: another spelling of a field, read as that field before
     `defaults` fill what neither spells."""
+    release_code: SourceCode | None = None
+    """The release whose own code is the family's reference, where transformers has no class for it:
+    a model exported natively (`PretrainedDecoder.from_model`) writes its `auto_map` and its modules,
+    fetched at that commit, so the export opens through that code as the release does."""
     repeated: Mapping[str, str] = field(default_factory=dict)
     """Fields a release repeats under another name that the config class neither declares nor reads,
     each with the field it repeats: read where the release states that field at the same value, as the
@@ -1883,6 +1991,10 @@ class DecoderFamily:
     """Config fields whose explicit null disables a component. Other null export fields remove
     a generic field the family does not read; these survive as JSON null instead of taking the
     source config class's default."""
+    masked_walk: Callable[[Mapping[str, object]], MaskedWalk | None] | None = None
+    """The release's own generation recipe for a masked diffusion source that walks in blocks, by its
+    config (`MaskedWalk`), which its task runs (`PretrainedMaskedDecoder.masked_recipe`); None, or a
+    config it maps to None, unmasks the whole response with Dew's MDLM."""
     padding_idx: bool = False
     """Whether the source builds its token embeddings with padding_idx=config.pad_token_id
     (nn.Embedding's, or Gemma's scaled word embedding over it), so the pad row takes no gradient
@@ -1910,13 +2022,8 @@ class DecoderFamily:
         # One read of each tensor: a lazy mapping builds a tensor on every access
         # (`LazyTensors`), and `prepare` and the stored tensors share these.
         stored = dict(tensors)
-        readings = []
-        for name, tensor in self.prepare(stored, config).items():
-            packing = self.packing(name)
-            parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
-            readings.append(Reading(name, stored.get(name), packing, tuple(
-                Part(part, value, self.source_path(part, config)) for part, value in parts.items())))
-        return tuple(readings)
+        return packed_readings(self.prepare(stored, config), self.packed, config, stored=stored,
+                               path=lambda part: self.source_path(part, config))
 
     def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
         """The source name the dew path `name` exports under."""
@@ -1926,7 +2033,7 @@ class DecoderFamily:
 
     def packing(self, name: str) -> Packed | None:
         """The `packed` entry the source tensor `name` is, if any."""
-        return next((packing for packing in self.packed if name.endswith(packing.name)), None)
+        return packing_of(self.packed, name)
 
     def stored_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
         """The leaf a tensor fills as the checkpoint stores it, before `readings` splits it: None
