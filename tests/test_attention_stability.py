@@ -32,6 +32,7 @@ import numpy as np
 import pytest
 from attention_oracle import exact_attention
 from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, with_gradients
+from whole_suite import timed
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -882,27 +883,13 @@ PAST_TARGET = {
                     ("a resumed state beside an overflowing column",): 120,
                     ("a column near fp32's least normal beside an overflowing one",): 119,
                     ("a cotangent on a small column beside an overflowing one",): 118},
-    "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "natural"): 143}}
+    "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "default"): 143}}
 """The cases past or within 5 s of a group's 120 s target, by test and case, each its seconds on armada in
 train 281's or 283's CI (5861ec46b, 8089624e4; rows 2117, 2193, 2204): the whole suite's run holds them
 (`timed`), every other case of their tests runs each train."""
 
 
-def timed(test: str, cases: list) -> list:
-    """`cases` (a test's arguments, a tuple of several or one value) with those `PAST_TARGET` names under
-    `test` marked to the whole suite's run; a case already marked (`pytest.param`) as it is."""
-    slow = PAST_TARGET[test]
-
-    def one(case):
-        if isinstance(case, type(pytest.param())):
-            return case
-        values = case if isinstance(case, tuple) else (case,)
-        return pytest.param(*values, marks=pytest.mark.whole_suite) if values in slow else case
-
-    return [one(case) for case in cases]
-
-
-ACCURATE_ARMS = timed("accurate", [(family, name) for family in TEMPLATE_FAMILIES
+ACCURATE_ARMS = timed(PAST_TARGET, "accurate", [(family, name) for family in TEMPLATE_FAMILIES
                                    for name in _mainloops(FAMILIES[family], ACCURATE)])
 """Each template family beside each mainloop that takes it in the accurate form (`_mainloops`): a case of
 its own, so none holds a CPU task past the suite's target (row 1849)."""
@@ -976,7 +963,7 @@ GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",)
 256 draws interpreted take past the CPU suite's 240 s target (218-257 s, row 1849)."""
 
 
-@pytest.mark.parametrize("family", timed("frozen default", [
+@pytest.mark.parametrize("family", timed(PAST_TARGET, "frozen default", [
     pytest.param(family, marks=pytest.mark.gpu(reason="256 draws of the Triton mainloop, compiled"))
     if family in GPU_TRITON_FAMILIES else family
     for family in TEMPLATE_FAMILIES if FAMILIES[family].folded or FAMILIES[family].overflows]))
@@ -989,7 +976,7 @@ def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at
     _default_is_finite(family, "triton")
 
 
-@pytest.mark.parametrize("family", timed("frozen rows", [family for family in TEMPLATE_FAMILIES
+@pytest.mark.parametrize("family", timed(PAST_TARGET, "frozen rows", [family for family in TEMPLATE_FAMILIES
                                                         if FAMILIES[family].overflows]))
 def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass(family):
     """The Triton mainloop's default backward asked for its unsplit first pass (`split=False`) over sums that
@@ -1120,10 +1107,11 @@ def test_gradients_at_a_scale_far_below_one_are_on_par(options, name, dtype):
 DECODED = [(family, form) for family, form in FAMILY_RUNS
            if FAMILIES[family].draw(0)[0].shape[1] == 1 and FAMILIES[family].draw(0)[0].shape[3] >= 16
            and not isinstance(FAMILIES[family].draw(0)[3], tuple)
-           and not (form == "default" and jnp.dtype(FAMILIES[family].dtype) == jnp.float32)]
+           and not (form == "natural" and jnp.dtype(FAMILIES[family].dtype) == jnp.float32)]
 """The families a decode step is: one query a row, a head width the decode kernel takes (16 to 256),
-sinks or none (a resumed state is the template's); fp32 operands in the natural form alone, which is the
-decode kernel's default for them (ledger 2151)."""
+sinks or none (a resumed state is the template's); fp32 operands in the default form alone, which resolves
+to natural logits for them (`decode_attention._spec`, ledger 2151), so the resolution a caller gets is the
+one checked."""
 
 
 def _cache(array: jax.Array) -> jax.Array:
@@ -1157,7 +1145,7 @@ def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
     return decoded, forward
 
 
-@pytest.mark.parametrize("family, form", timed("decode", DECODED),
+@pytest.mark.parametrize("family, form", timed(PAST_TARGET, "decode", DECODED),
                          ids=[f"{family}-{form}" for family, form in DECODED])
 def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
     """The decode kernel's output, interpreted on a CPU and compiled on a GPU (its guarded launch and merge),

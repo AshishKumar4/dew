@@ -27,18 +27,23 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import json
 import logging
 import pickle
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import jax
 import jax.experimental.topologies as topologies
+import numpy as np
 from jax.experimental import serialize_executable
 
+from dew._records import JSON, record
 from dew.batch import Batch
-from dew.nn.kernels.generation import capability, gpu_target
+from dew.nn.kernels.generation import assumed, capability, gpu_target
 from dew.telemetry.instrumentation import StepFlops, step_flops
+from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
     from dew.data.dataset import Loader
@@ -51,7 +56,7 @@ THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
 (CUDA C++ Programming Guide, "Technical Specifications per Compute Capability")."""
 
 
-def target_config(generation: str) -> str:
+def target_config(generation: str, capacity: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
     (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
     multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
@@ -74,6 +79,7 @@ def target_config(generation: str) -> str:
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
   memory_bandwidth: {int(bandwidth)}
+  device_memory_size: {0 if capacity is None else capacity}
   clock_rate_ghz: {clock / 1e9}
   shared_memory_per_block_optin: {shared}
   cuda_compute_capability {{
@@ -89,10 +95,13 @@ device_description_str: "{target.device_kind}"
 
 
 @functools.cache
-def compile_only_gpus(generation: str, count: int = 1) -> tuple:
+def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = None) -> tuple:
     """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
-    program over them, a mesh's collectives included, as for that many of the generation's GPUs."""
-    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=target_config(generation),
+    program over them, a mesh's collectives included, as for that many of the generation's GPUs.
+    `capacity` states bytes per device to XLA's scheduler and rematerialization pass, not only Dew's
+    admission check; absent it, XLA's target states zero rather than a hardware capacity."""
+    config = target_config(generation, capacity)
+    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=config,
                                             topology=f"1x1x{count}")
     return tuple(topology.devices[:count])
 
@@ -122,6 +131,15 @@ class AheadOfTime:
     alias_bytes: int
     temp_bytes: int
     code_bytes: int
+    plan: JSON = None
+    """The plan the run's own fit search makes on those
+    GPUs (`Trainer.plan`): every program it compiled, each with the footprint derived for it beside
+    XLA's memory of it, and the plan it took."""
+    planned_seconds: float | None = None
+    """The seconds that search took, its derivations and every compile: the time a run spends planning
+    before its first step on those GPUs."""
+    capacity: int | None = None
+    """The stated bytes per target GPU, or None where no memory capacity was supplied."""
 
     @property
     def peak_bytes(self) -> int:
@@ -176,11 +194,19 @@ def program_of(lowered: jax.stages.Lowered) -> str:
 class AheadTarget:
     """Where a configured run compiles its first step ahead and saves it, then exits, training nothing
     (`TrainerConfig.compile_ahead`): for `devices` GPUs of the CUDA `generation` (`compile_only_gpus`),
-    which this host need not have, written to `path` (`AheadOfTime.save`)."""
+    which this host need not have, written to `path` (`AheadOfTime.save`). Where `capacity_gib` states
+    each GPU's memory, the run's own plan there is made and reported with it (`compile_ahead`): the
+    offline answer to what fits, a run with its remat set told of no rung but its own."""
 
     generation: str
     devices: int
     path: str
+    capacity_gib: float | None = None
+
+    @property
+    def capacity(self) -> int | None:
+        """The stated bytes per GPU, read both when building its topology and when planning."""
+        return None if self.capacity_gib is None else int(self.capacity_gib * 2**30)
 
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
                                   steps: int | None) -> CompiledAhead:
@@ -195,7 +221,7 @@ class AheadTarget:
                              "its rollout's, which it makes only as it trains")
         trainer.reading(loader)
         trainer.validate(steps=steps)
-        ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh))
+        ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh), self.capacity)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -210,6 +236,11 @@ class CompiledAhead(SystemExit):
         self.path, self.ahead = path, ahead
         _log.info("the step compiled ahead for %s %s GPUs holds %s bytes a device at its peak; saved to "
                   "%s", ahead.devices, ahead.generation, ahead.peak_bytes, path)
+        if ahead.plan is not None:
+            probes = record(ahead.plan, "plan")["probes"]
+            assert isinstance(probes, list)
+            _log.info("planned on them in %.1f s, %d programs compiled, the plan %s", ahead.planned_seconds,
+                      len(probes), json.dumps(ahead.plan))
 
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> Batch:
@@ -224,14 +255,21 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch)
     return device
 
 
-def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> AheadOfTime:
+def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
+                                   capacity: int | None = None) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only GPUs its
-    mesh is built over (`compile_only_gpus`) and never run: the step `fit` would compile there, as its
-    plan's first candidate lowers it (`Trainer._candidate`), traced as on those GPUs
-    (`dew.nn.kernels.generation.assumed`), at the base rung and the first split, its state the fresh
-    one the trainer builds, abstract and placed by its layout, its batch `batch` as `fit` hands it to
-    the step (`step_batch`), compiled with the options the run's compile there takes. Only GPUs: XLA's
-    CPU executable, loaded again, finds none of its fused functions."""
+    mesh is built over (`compile_only_gpus`) and never run. The planner `Trainer.compile` uses
+    (`Trainer._compiled_plan`) selects and compiles the step once; that executable is serialized, not compiled
+    again. Its batch is what `fit` hands to its step (`step_batch`), its fresh state abstract, and
+    tracing reads the target's kernel choices (`assumed`). The plan reports every compile and the
+    time the search took. `capacity` states bytes per GPU; absent it, memory fit is unknown rather
+    than measured. Profiling, tuning and rollout require execution and are refused."""
+    if capacity is not None and capacity <= 0:
+        raise ValueError("compile-ahead capacity must be positive bytes per GPU")
+    if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
+        raise ValueError("compile-ahead needs a device-resident step over its loader, with no lower_for")
+    if trainer.tune_kernels or pgle_runs():
+        raise ValueError("compile-ahead cannot run kernel tuning or AutoPGLE on absent GPUs")
     devices = list(trainer.device_mesh.devices.flat)
     generations = {gpu_target(device.device_kind).generation for device in devices}
     if {device.platform for device in devices} != {"gpu"} or len(generations) != 1:
@@ -239,10 +277,17 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                          "mesh is built over (MeshSpec.build(compile_only_gpus(generation, count))); this "
                          f"mesh holds {sorted({device.device_kind for device in devices})}")
     (generation,) = generations
+    if capacity is not None:
+        mesh = trainer.device_mesh
+        devices = compile_only_gpus(generation, len(devices), capacity)
+        trainer.mesh = trainer.device_mesh = trainer.state_mesh = jax.sharding.Mesh(
+            np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names, axis_types=mesh.axis_types)
+    began = time.perf_counter()
     start = trainer._started()
-    lowered, options = trainer._lowered_for(start.abstract, step_batch(trainer, batch), generation,
-                                            trainer.device_mesh)
-    compiled = lowered.compile(options)
+    with assumed(generation):
+        planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity)
+    seconds = time.perf_counter() - began
+    lowered, compiled = planned.candidate.lowered, planned.executable
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)
     memory = compiled.memory_analysis()
     if memory is None:
@@ -253,4 +298,5 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         flops=step_flops(compiled),
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
-        code_bytes=memory.generated_code_size_in_bytes)
+        code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
+        capacity=capacity)
