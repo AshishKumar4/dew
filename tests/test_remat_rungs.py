@@ -223,7 +223,14 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
 
 
-@pytest.mark.parametrize("name", PATHS)
+WHOLE_SUITE_PATHS = ("deepseek-v4-tiny",)
+"""The checkpoints whose rungs take past a group's target to step (DeepSeek V4's hyper-connected
+layers, 130 s on armada at 727e70cb1, 256 s before the rungs left tests/test_model_protocols.py), each
+run by the whole suite alone (`whole_suite`)."""
+
+
+@pytest.mark.parametrize("name", [pytest.param(name, marks=pytest.mark.whole_suite)
+                                  if name in WHOLE_SUITE_PATHS else name for name in PATHS])
 def test_a_checkpoints_remat_rungs_step_as_it_does(name):
     source, read = loaded(name), reads(name, "float32")
     _climbs_and_restores(name, source.model, source.variables, (read.tokens,), method="logits")
