@@ -554,16 +554,17 @@ def test_only_a_run_on_the_examples_clock_carries_its_count_to_the_step(tmp_path
 
 def test_a_clocked_run_whose_split_is_planned_compiles_one_step():
     """Every batch of a clocked run carries whether it closes its window, so a run whose first compile
-    plans its split keeps one step program: one compile over its batches of one shape, its short last
-    batch filled to it."""
+    plans its split keeps one step program: nothing compiles after its first step over its batches of one
+    shape, its short last batch filled to it."""
     (x,) = clocked_records(0)
     tracker = RecordingTracker()
     optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
     Trainer(Echoed(), optim, key=0, tracker=tracker).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
                                                          log_every=1)
-    # `train/compiles` counts the step's compiles over the whole fit (`Interval.compiles`).
+    # `train/compiles` counts the step's compiles over the whole fit (`Interval.compiles`): the first
+    # step's planning and its program, and none after.
     logged = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
-    assert len(logged) > 1 and logged[-1]["train/compiles"] == 1
+    assert len(logged) > 1 and logged[0]["train/compiles"] == logged[-1]["train/compiles"] > 0
 
 
 def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():
