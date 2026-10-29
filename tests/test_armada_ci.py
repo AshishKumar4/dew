@@ -338,10 +338,11 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     install_compiler(tmp_path / "tests/compiler")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
-    # The session fixture's files in a task of their own, where it reads for every file.
-    fixtures = ["tests/test_one.py", "tests/test_two.py"]
+    # The session fixture's files in a task of their own, where it reads for every file, and the file whose
+    # helper changes below in one of its own, as what a process ran before a file is that file's input too.
+    fixtures, alone = ["tests/test_one.py", "tests/test_two.py"], ["tests/test_plain.py"]
     ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
-    for tests in ([name for name in ran if name not in fixtures], fixtures):
+    for tests in ([name for name in ran if name not in fixtures + alone], fixtures, alone):
         ci.task("3.12", tests, "", out, 600.0)
         assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
             f"3.12:{name}": 0 for name in tests}
