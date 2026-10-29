@@ -13,6 +13,7 @@ refusal of a vocabulary mismatch, and a real trainer run on CPU where the
 teacher never moves and a resumed run lands where the straight one does.
 """
 
+import dataclasses
 import functools
 import itertools
 import json
@@ -496,3 +497,91 @@ def test_a_distillation_trains_for_a_count_of_its_students_tokens():
     alone = Trainer(objective.student, optax.sgd(0.0), key=0).fit(fixed(batch), tokens=3 * tokens,
                                                                   log_every=1)
     assert int(distilled.step) == int(alone.step) == 3
+
+
+def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_kl_reward():
+    """On-policy distillation at the tokens the batch holds (`divergence='selected'`, alpha 1): its
+    gradient is the score function of each sampled token weighted by its log-ratio
+    log pi_s(y) - log pi_t(y), the teacher frozen, as the hand formula over the two models' own
+    log-likelihoods gives it, bit for bit; the reported estimate is that log-ratio's mean."""
+    arrays = fixture()
+    objective, params = fixture_objective(arrays, alpha=1.0, temperature=1.0, beta=0.0, features=[],
+                                          divergence="selected")
+    batch = fixture_batch(arrays)
+    student, teacher = objective.student, objective.teacher
+
+    def by_hand(student_params):
+        _, _, own = student.predict(objective.student_variables({**params, "params": student_params}), batch,
+                                    step_at(), train=False)
+        _, _, held = teacher.predict(params[TEACHER], batch, step_at(), train=False)
+        ratio = jax.lax.stop_gradient(held.losses - own.losses)
+        weights = own.weights.astype(jnp.float32)
+        return jnp.sum(ratio * -own.losses * weights) / jnp.sum(weights)
+
+    found = jax.grad(lambda p: objective.scalar_loss({**params, "params": p}, batch, step_at())[0])(
+        params["params"])
+    expected = jax.grad(by_hand)(params["params"])
+    jax.tree.map(np.testing.assert_array_equal, objective.student_variables({"params": found})["params"],
+                 objective.student_variables({"params": expected})["params"])
+    with pytest.raises(ValueError):
+        DistillationObjective(student, teacher, divergence="selected", temperature=2.0)
+
+
+@pytest.mark.parametrize("scores", [True, False], ids=["scores and states", "states alone"])
+def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on(scores):
+    """A teacher whose paired layers' states, and its scores too or not, are NaN at one position (row
+    0's last) leaves that position out of every distillation term, the soft one and the features': the
+    loss and the student's gradient (its projections' included) equal, bit for bit, those the intact
+    teacher gives with that position's label padded out, and the excluded weight is reported."""
+    arrays = fixture()
+    objective, params = fixture_objective(arrays, alpha=1.0)
+    batch = fixture_batch(arrays)
+    padded = {TEXT_KEY: batch[TEXT_KEY].at[0, SEQ].set(META["pad_id"])}
+    original = objective.teacher.predict
+
+    def broken(variables, held, step, **kwargs):
+        statistics, aux, prediction = original(variables, held, step, **kwargs)
+
+        def failed(value):
+            return value.at[0, SEQ - 1].set(jnp.nan)
+
+        hidden = tuple(failed(state) for state in prediction.hidden)
+        if not scores:
+            return statistics, aux, dataclasses.replace(prediction, hidden=hidden)
+        return statistics, aux, dataclasses.replace(
+            prediction, logits=failed(prediction.logits), losses=failed(prediction.losses), hidden=hidden)
+
+    def distilled(batch):
+        def total(trained):
+            loss, aux = objective.loss({**params, "params": trained}, batch, step_at())
+            return loss.total, aux.metrics
+
+        (loss, metrics), gradient = jax.value_and_grad(total, has_aux=True)(params["params"])
+        return loss, metrics["distill/teacher_nonfinite"], gradient
+
+    intact = distilled(padded)
+    objective.teacher.predict = broken
+    failed = distilled(batch)
+    assert len(objective.features) == 2
+    assert (float(intact[1]), float(failed[1])) == (0.0, 1.0)
+    np.testing.assert_array_equal(failed[0], intact[0])
+    jax.tree.map(np.testing.assert_array_equal, failed[2], intact[2])
+
+
+def test_a_teacher_with_another_tokenizer_of_the_same_size_is_refused(tmp_path):
+    """Two tokenizers whose vocabularies are the same size but map two strings to each other's ids are
+    refused: the term compares one id's probabilities on both sides. The same tokenizer twice is not."""
+    import shutil
+
+    student, teacher = (LMObjective(model, SEQ, ema_decay=None) for model in models())
+    chat = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
+    swapped = tmp_path / "swapped"
+    shutil.copytree(chat, swapped)
+    spec = json.loads((swapped / "tokenizer.json").read_text())
+    vocabulary = spec["model"]["vocab"]
+    first, second = sorted(vocabulary, key=vocabulary.get)[100:102]
+    vocabulary[first], vocabulary[second] = vocabulary[second], vocabulary[first]
+    (swapped / "tokenizer.json").write_text(json.dumps(spec))
+    DistillationObjective(student, teacher, tokenizers=(str(chat), str(chat)))
+    with pytest.raises(ValueError):
+        DistillationObjective(student, teacher, tokenizers=(str(chat), str(swapped)))

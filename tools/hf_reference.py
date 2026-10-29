@@ -344,14 +344,13 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     generate drops the prefix at that crossing (transformers issue #49334),
     so that output is recorded separately from the intended continuation.
     """
+    from reference_source import padded_probe
     from torch_precision import float64, float64_twin
 
     write_tiny(name, model)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
-    mask = np.ones_like(ids, bool)
-    mask[1, :3] = False
-    np.save(directory / 'attention_mask.npy', mask)
+    np.save(directory / 'attention_mask.npy', padded_probe(ids)[0])
     model.eval()
     with torch.no_grad():
         generated = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,

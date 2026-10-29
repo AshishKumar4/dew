@@ -18,7 +18,6 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections import Counter
 from pathlib import Path
 
 import compile_evidence
@@ -29,6 +28,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
+from dew.training._lowering import triton_kernels
 from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
@@ -40,9 +40,6 @@ Triton call's, or one of XLA's own fusions XLA emits so (`loop_multiply_fusion`)
 
 UNIQUIFIED = re.compile(r"__\d+$")
 """The suffix XLA gives a kernel name's later launches in a program (`recurrence_cumulated__1`)."""
-
-TRITON_CALL = re.compile(r'custom_call_target="__gpu\$xla\.gpu\.triton".*?\bname = "([^"]+)"')
-"""A Triton kernel's call in XLA's optimized HLO, with the kernel's name, which its launch line carries."""
 
 
 @functools.cache
@@ -81,20 +78,20 @@ def compile_kernels(cases, generation: str) -> list[dict]:
         sequences = _compiled(case, generation, record)
         if sequences is None:
             continue
-        thunks, programs = sequences
-        record.update(triton_evidence(programs, thunks))
+        thunks, calls = sequences
+        record.update(triton_evidence(calls, thunks))
     return found
 
 
-def triton_evidence(programs: list[str], thunks: list[str]) -> dict:
-    """What XLA's optimized `programs` and thunk sequences (`thunks`) say of a program's Triton kernels:
-    the largest shared bytes a call launches with, or why they say nothing. Each Triton call (an HLO
-    custom call, named by its kernel) states its shared bytes in a launch line of its own, named as the
-    call is, XLA numbering a name's later calls (recurrence_cumulated__1): XLA's own fusions launch as
-    custom kernels too, and one kernel's name can begin another's (attention_forward,
-    attention_forward_headroom). A call with no launch line of its own, or a program that calls no
-    Triton kernel, is no evidence its kernel compiled within its block (row 1381)."""
-    calls = Counter(name for text in programs for name in TRITON_CALL.findall(text))
+def triton_evidence(calls: dict[str, int], thunks: list[str]) -> dict:
+    """What XLA's thunk sequences (`thunks`) say of a program's Triton kernels, its calls by name with the
+    call sites of each (`calls`, the lowering reader's `triton_kernels`, which owns the inventory): the
+    largest shared bytes a call launches with, or why they say nothing. Each Triton call states its shared
+    bytes in a launch line of its own, named as the call is, XLA numbering a name's later calls
+    (recurrence_cumulated__1): XLA's own fusions launch as custom kernels too, and one kernel's name can
+    begin another's (attention_forward, attention_forward_headroom). A call with no launch line of its
+    own, or a program that calls no Triton kernel, is no evidence its kernel compiled within its block
+    (row 1381)."""
     launches: dict[str, list[int]] = {}
     for text in thunks:
         for name, size in KERNEL.findall(text):
@@ -107,10 +104,11 @@ def triton_evidence(programs: list[str], thunks: list[str]) -> dict:
     return {"shared": max(size for name in calls for size in launches[name])}
 
 
-def _compiled(case, generation: str, record: dict) -> tuple[list[str], list[str]] | None:
+def _compiled(case, generation: str, record: dict) -> tuple[list[str], dict[str, int]] | None:
     """`case` lowered as on the CUDA `generation` (`assumed`, `gpu_mesh`) and compiled by XLA for a
-    compile-only device of it: XLA's thunk sequences and optimized programs, or None, `record` holding why:
-    the error, or the shared bytes of a block XLA refused."""
+    compile-only device of it: XLA's thunk sequences and the lowered program's Triton calls by name
+    (`triton_kernels`), or None, `record` holding why: the error, or the shared bytes of a block XLA
+    refused."""
     mesh = _device(generation)
     replicated = NamedSharding(mesh, PartitionSpec())
     fn, args = case.call()
@@ -134,8 +132,7 @@ def _compiled(case, generation: str, record: dict) -> tuple[list[str], list[str]
             else:
                 record["shared"] = int(refused.group(1))
             return None
-        return ([path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")],
-                [path.read_text() for path in Path(dump).glob("*after_optimizations.txt")])
+        return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")], triton_kernels(lowered)
 
 
 def mosaic_kernels(directory: str) -> list[dict]:
