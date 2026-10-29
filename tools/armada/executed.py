@@ -248,16 +248,22 @@ def pytest_sessionfinish(session):
         shutil.rmtree(children)
         lost = {name for name, child in found.items() if not child["followed"]}
         recorded = {}
+        # What the files this process ran before a file executed or probed is that file's input too: a module
+        # an earlier one imported lazily, a cached reader that probed a fixture, a generator it started, serve
+        # the file without running again (row 2228).
+        earlier: set[str] = set()
         for name, files in own.items():
             child = found.get(name, {"files": set(), "reads": set(), "peak": None, "shares": 0, "pools": 0})
             whole = name not in spawned | lost
             # The share a process of this file takes: its own peak, or a child's that took its fraction.
             peaks = [held for held in (gpu_peak(), child["peak"]) if held is not None]
             peak = max(peaks) if len(own) == 1 and whole and peaks else None
-            recorded[name] = {"depends": sorted(files | shared | child["files"]) if whole else None,
+            ran = files | child["files"]
+            recorded[name] = {"depends": sorted(ran | shared | earlier) if whole else None,
                               "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere
                                               | child["reads"]),
                               "peak": peak, "shares": child["shares"], "pools": child["pools"]}
+            earlier |= ran
         Path(out).write_text(json.dumps(recorded))
     # Each file's collection, which accounts for a file whose every test the selection set aside (`ci.py`).
     if counted := os.environ.get("DEW_COLLECTED"):
