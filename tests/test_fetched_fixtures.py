@@ -205,7 +205,8 @@ def test_a_release_file_is_pinned_whole_read_by_its_sha_and_leaves_recordings_as
     pin = store.pins(root)[name]
     held = f"releases/{pin['sha256']}/modeling_site.py"
     assert (pin["kind"], pin["path"], pin["bytes"]) == ("release", held, len(code))
-    assert stored == root / store.LOCAL / pin["path"] and store.local(name, root) == stored
+    assert stored == root / store.LOCAL / "releases" / f"{pin['sha256']}.release"
+    assert store.local(name, root) == stored
     assert stored.read_bytes() == code
     assert store.pins(root)[LARGE] == before and store.local(LARGE, root) == recording
     _uploaded(store, root)

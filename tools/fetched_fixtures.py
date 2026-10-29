@@ -14,8 +14,9 @@ reads each file back anonymously at that commit and checks it before the pin tak
 `check` is check.sh's rule: no recording over IN_GIT in git, and every pin whole and uploaded.
 A release's own file a test reads offline (a remote-code release's modeling code, its config) is the
 store's second kind (`RELEASE`, `pin_release`): kept whole whatever its size, under
-releases/<sha256>/<its name>, its pin naming the release and its license, read and checked by sha256
-as a recording is and held to none of the recordings' rules.
+releases/<sha256>/<its name> in the store and releases/<sha256>.release in the checkout's local copy
+(no Python suffix, so no linter reads a release's code as the checkout's), its pin naming the release
+and its license, read and checked by sha256 as a recording is and held to none of the recordings' rules.
 
 Usage, from the checkout:
   python tools/fetched_fixtures.py fetch
@@ -83,8 +84,9 @@ def digest(data: bytes) -> str:
 
 def _stored(pin: dict, root: Path) -> Path:
     if pin.get("kind") == RELEASE:
-        # Built from its parts, never the pin's path itself, so no pin reaches outside the store.
-        return root / LOCAL / "releases" / _sha(pin) / _file_name(pin["path"])
+        # Under its validated sha256 alone, never the pin's path, so no pin reaches outside the store; and
+        # under no Python suffix, so a release's code held here is no Python a checkout's linters read.
+        return root / LOCAL / "releases" / f"{_sha(pin)}.release"
     return root / LOCAL / f"{pin['sha256']}.npz"
 
 
