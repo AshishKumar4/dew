@@ -21,6 +21,11 @@ from dew.nn.kernels.templates.gemm import template
 TINY, LARGEST = float(np.finfo(np.float32).tiny), float(np.finfo(np.float32).max)
 
 
+class LessFinite(AssertionError):
+    """A seam's order not finite where its float64 run is a normal float32 (and the plain formula's is
+    finite): what the contract refuses, apart from an order that does not run."""
+
+
 def normal_float32(values) -> np.ndarray:
     """Whether each float64 value is a float32 a few roundings inside its normal range: from just above
     the least normal to just below the largest, or zero."""
@@ -92,8 +97,9 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
             if plainly is not None:
                 held &= np.isfinite(plainly)
             broken = held & ~np.isfinite(value)
-            assert not broken.any(), (f"{label}, {name}, leaf {index}: {int(broken.sum())} values not finite "
-                                      f"where float64's are normal float32s, e.g. {value[broken][:3]}")
+            if broken.any():
+                raise LessFinite(f"{label}, {name}, leaf {index}: {int(broken.sum())} values not finite where "
+                                 f"float64's are normal float32s, e.g. {value[broken][:3]}")
 
 
 EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
@@ -200,7 +206,7 @@ def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
     direction = (jnp.ones((3,), jnp.float32),)
     cotangent = jnp.ones((3,), jnp.float32)
     assert_contract(jnp.abs, x, direction, cotangent, "the plain formula", plain_fn=jnp.abs)
-    with pytest.raises(AssertionError, match="not finite where float64"):
+    with pytest.raises(LessFinite):
         assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a squared root",
                         plain_fn=jnp.abs)
 
