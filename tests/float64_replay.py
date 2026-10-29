@@ -150,9 +150,18 @@ def _replayed_equation(equation, values, used):
         operands, initial = tuple(values[:count]), tuple(values[count:])
         return list(jax.lax.reduce(operands, initial, combine, params["dimensions"]))
     if name == "cond":
-        # Replayed eagerly, the branch index is concrete: the branch the program takes, alone.
-        branch = params["branches"][int(values[0])]
-        return _replayed(branch.jaxpr, branch.consts, values[1:], used)
+        # Replayed eagerly, the branch index is concrete: the branch the program takes, alone. Inside a
+        # scan's step it is traced: every branch replayed, the conditional bound over them.
+        index, operands = values[0], values[1:]
+        try:
+            branch = params["branches"][int(index)]
+        except jax.errors.ConcretizationTypeError:
+            branches = tuple(jax.make_jaxpr(
+                lambda *given, branch=branch: _replayed(branch.jaxpr, branch.consts, list(given)))(
+                    *(jax.ShapeDtypeStruct(jnp.shape(value), jnp.result_type(value)) for value in operands))
+                for branch in params["branches"])
+            return equation.primitive.bind(index, *operands, **{**params, "branches": branches})
+        return _replayed(branch.jaxpr, branch.consts, operands, used)
     if name in ("name", "optimization_barrier"):
         return list(values)
     if name == "scan":
