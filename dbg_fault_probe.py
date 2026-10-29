@@ -25,6 +25,31 @@ stages = int(variant[-1]) if variant.startswith("stages") else 2
 residuals = variant != "noresiduals"
 causal = variant == "causal"
 
+if "coordzero" in variant:
+    from jaxlib.mlir import ir
+    from jaxlib.mlir.dialects import llvm
+    original_asm = llvm.inline_asm
+    def is_zero(value):
+        op = value.owner
+        if not isinstance(op, ir.Operation):
+            return False
+        if op.name in ("arith.index_cast", "arith.index_castui", "llvm.trunc", "llvm.sext"):
+            return is_zero(op.operands[0])
+        if op.name in ("arith.constant", "llvm.mlir.constant"):
+            return ir.IntegerAttr(op.attributes["value"]).value == 0
+        return False
+    def coordinate_asm(result_type, operands, asm, constraints, **kwargs):
+        if "cp.async.bulk.tensor.5d" in asm and "shared::cta.global" in asm:
+            operands = list(operands)
+            for index in range(4, len(operands)):
+                if is_zero(operands[index]):
+                    operands[index] = original_asm(
+                        operands[index].type, [],
+                        "mov.u32 $0, %tid.x; and.b32 $0, $0, 127;", "=r",
+                        has_side_effects=True, asm_dialect=0)
+        return original_asm(result_type, operands, asm, constraints, **kwargs)
+    llvm.inline_asm = coordinate_asm
+
 if variant == "consumers2forced":
     a.MosaicForward.register_budget = lambda self, config: 256
 if "swizzle64" in variant:
