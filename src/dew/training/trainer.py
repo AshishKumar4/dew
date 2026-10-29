@@ -280,8 +280,7 @@ class Trainer(Generic[Loss, Effects]):
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
         derived config. `record` makes each step return in its metrics what each evaluation, replays
         too, sampled or passed as a boundary (`taken_record`).
-        `links` states an axis's `Link` by name in place of measuring it (`_links`); a step compiled
-        ahead states those it traced with (`AheadOfTime.links`), over any given here.
+        `links` states an axis's `Link` by name in place of measuring it (`_links`).
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -325,8 +324,6 @@ class Trainer(Generic[Loss, Effects]):
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
         self._stated_links = dict(links or {})
-        # A step compiled ahead is the program its own links decided: a run handed it traces with them.
-        self._ahead_links = {} if ahead is None else ahead.links
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
         self._refusal: str | None = None
@@ -855,6 +852,11 @@ class Trainer(Generic[Loss, Effects]):
             pending = jax.jit(allocate, out_shardings=placement)()
         return dataclasses.replace(state, accumulation=pending)
 
+    @functools.cached_property
+    def _ahead_links(self) -> dict[str, float | None]:
+        """The figures the step compiled ahead traced with (`AheadOfTime.links`), at the run's first trace."""
+        return {} if self._ahead is None else self._ahead.links
+
     def _links(self, mesh: Mesh) -> dict[str, Link]:
         """The links of `mesh`'s tensor and sequence axes, those it splits,
         for one trace. Every process lists the mesh's devices alike and
@@ -864,7 +866,7 @@ class Trainer(Generic[Loss, Effects]):
         axis's bandwidth is measured once per mesh, and not at all for a
         device the peak table does not name (a CPU's among them), where it
         decides nothing, or over a compile-only GPU (`dew.training.ahead`), which no process holds to
-        measure, so its axis spreads nothing; a link the run states (`links`) is taken as stated."""
+        measure; a link the run states (`links`) as stated, unless a step compiled ahead holds its own."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
