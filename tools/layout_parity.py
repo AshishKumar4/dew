@@ -405,9 +405,9 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     the case's one-device state is computed (`_initial`), every other
     trainer copies it onto its mesh: every layout starts from the very state
     one device does, without a compile of the model's initialization on each.
-    A layout's own draw of it is another program, whose rounding a bitwise
-    comparison would judge (docs/design/testing.md). `record` makes each
-    step return what its loss drew and started from (`Arm`)."""
+    A layout's own draw of it is another program, which `held_draw` holds to
+    one device's by check 1 (docs/design/testing.md, Layout invariance).
+    `record` makes each step return what its loss drew and started from (`Arm`)."""
     import benchmark_models as bench
     import jax
     import optax
@@ -452,6 +452,48 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     elif devices is not None:
         trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
     return trainer
+
+
+def held_draw(model: str, layout: str, *, seeds: int, devices: int | None = None) -> None:
+    """Check 1 of `model`'s initial parameters as `layout` draws them, each split over its mesh, against
+    one device's draw (docs/design/testing.md, Layout invariance): over `seeds` keys, the layout's own
+    draw (Dew's arm) and one device's (the reference), each the trainer's initializer compiled with the
+    placement its mesh gives the parameters, held to their float64 truth, the one-device program
+    replayed in float64 from its own random bits (tests/float64_replay.py), which every layout draws
+    alike. The draws compile through Dew's seam (`compiler_options`), as the gate compiles a Dew arm
+    (`dew_programs`). A layout Dew refuses raises its `LayoutRefused`."""
+    import jax
+    import numpy as np
+
+    from dew.nn.kernels.options import compiler_options
+
+    sys.path.insert(0, str(REPO / "tests"))
+    from float64_replay import float64_replay
+    from reference_error import assert_as_exact, dew_programs
+
+    case, _ = model_case(model, "float32", {}, {})
+    split = _trainer(case, LAYOUTS[layout], devices=devices)
+    alone = _trainer(case, {}, one_device=True)
+    placement = split._started().shardings.variables["params"]
+
+    def drawing(trainer):
+        def draw(seed):
+            state = trainer.initial_state(trainer.objective.initializer, jax.random.key(seed))
+            return state.variables["params"]
+        return draw
+
+    def compiled(trainer, **placed):
+        programs: list[Any] = []
+
+        def run(seed):
+            if not programs:
+                programs.append(jax.jit(drawing(trainer), compiler_options=compiler_options(), **placed))
+            return programs[0](seed)
+        return dew_programs(run)
+
+    assert_as_exact(compiled(split, out_shardings=placement), compiled(alone),
+                    lambda seed: (np.int32(seed),), f"{model} on {layout}: its initial parameters",
+                    seeds=seeds, truth_fn=float64_replay(drawing(alone)))
 
 
 _initial: dict[tuple[str, int], Any] = {}
