@@ -176,7 +176,7 @@ class DecisionRunConfig(DecoderRunConfig):
     """How a context becomes the states its cross-attention reads
     (`DecisionModel.context_encoder`): the backbone's token table, or the
     backbone's own pass over it. With `context_layers` alone."""
-    def _prepared(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
         run after it trains. The checkpoint decides the backbone; the model

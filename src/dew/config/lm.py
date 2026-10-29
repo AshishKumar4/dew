@@ -90,7 +90,7 @@ class LMRunConfig(DecoderRunConfig):
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")
 
-    def _prepared(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The objective this run names over its token files.
 
         The files decide the vocabulary; training and sampling decide the

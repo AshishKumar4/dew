@@ -933,7 +933,7 @@ _RANDOM_SEARCH = RandomSearch()
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     """A whole run's configuration. A kind of run subclasses it with its own
-    settings and builds what it trains from them (`_prepared`, which `prepare` calls
+    settings and builds what it trains from them (`build_run`, which `prepare` calls
     on the run with its Hub sources pinned); `run` trains it.
     """
 
@@ -1254,14 +1254,14 @@ class RunConfig:
         return run_class.from_dict(named[1])
 
     def prepare(self) -> Prepared:
-        """Build what this run trains, as `_prepared` builds it from the run with its Hub sources pinned
+        """Build what this run trains, as `build_run` builds it from the run with its Hub sources pinned
         (`pinned`), so the record names what it started from and is what it loads."""
-        return self.pinned()._prepared()
+        return self.pinned().build_run()
 
-    def _prepared(self) -> Prepared:
-        """Build what this run trains: the objective its record names around
-        its model, on its data. A kind of run with settings of its own builds
-        from them in its own `_prepared`."""
+    def build_run(self) -> Prepared:
+        """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
+        pins them first): the objective its record names around its model, on its data. A kind of
+        run with settings of its own builds from them in its own `build_run`."""
         if self.objective is None or self.lora is not None:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")

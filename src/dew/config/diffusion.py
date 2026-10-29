@@ -364,7 +364,7 @@ class DiffusionRunConfig(RunConfig):
             given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
         return given
 
-    def _prepared(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The objective `build` makes, with the run's Hub sources pinned
         (`pinned`), on its data, whose captions the objective's conditions
         tokenize. `val_metrics` score each validation, and Flow-GRPO samples
