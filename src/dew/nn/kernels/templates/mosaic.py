@@ -536,8 +536,8 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def column_registers(self, columns: int, dtype) -> int:
         """The registers a consumer thread holds for a vector of `columns` entries of `dtype` in the
         accumulator's column layout (`column`), broadcast over its rows: a family whose register model
-        counts hooks (`counts_hooks`) states it."""
-        raise NotImplementedError(f"{self.name}'s register model takes no column vector (`counts_hooks`)")
+        prices such a vector (a hook's, a template's per-row statistics) states it."""
+        raise NotImplementedError(f"{self.name}'s register model takes no column vector")
 
     def narrowest_columns(self, dtype) -> int:
         """The fewest columns a staged operand block of `dtype` takes: a row of the narrowest swizzle

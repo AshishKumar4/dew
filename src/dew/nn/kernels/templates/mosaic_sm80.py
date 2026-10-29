@@ -150,6 +150,15 @@ class Mma(mosaic.Family):
         # (CONSUMERS2); two consumers in one program took 1.04 to 1.50 (CONSUMERS1).
         return cost.REGISTERS // (consumers * resources.THREADS * self.registers(consumers))
 
+    def column_registers(self, columns: int, dtype) -> int:
+        # The accumulator's tiles are `m_warps * 16` rows by `n_warps * 8` columns, each warp's 16 x 8 a
+        # thread's two columns a row (jax/experimental/mosaic/gpu/mma.py:63, `MMALayouts`' accumulator
+        # tiling), so a column vector broadcast over the rows holds two entries a thread in each of the
+        # vector's `columns / (n_warps * 8)` tiles: a quarter of its columns at four row warps, as
+        # warpgroup MMA's, an eighth at two, a sixteenth at one.
+        per_thread = -(-columns * 2 // (4 // self.m_warps * 8))
+        return -(-per_thread * jnp.dtype(dtype).itemsize // 4)
+
     def column_unit(self, dtype) -> int:
         # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
         # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64
