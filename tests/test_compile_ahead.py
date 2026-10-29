@@ -373,11 +373,12 @@ def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     target = MeshSpec(tensor=2).build(compile_only_gpus("sm90", 2))
     stated = compile_ahead(latent(target, links=FAST), batch)
-    assert stated.links == FAST
+    (recorded,) = stated.links.values()
+    assert (recorded.bytes_per_second, recorded.flops_per_second, recorded.spread) == (1e18, 1e9, True)
     assert stated.program != compile_ahead(latent(target), batch).program
     other = {"tensor": Link(1.0, 1.0)}
     with caplog.at_level("WARNING", logger="dew.training.ahead"):
-        assert stated.over(other) == FAST and stated.over(FAST) == FAST
+        assert stated.over(other) == stated.over(FAST) == stated.links
     assert len(caplog.records) == 1
     parsed = LMRunConfig.cli(["trainer.compile-ahead:ahead", "--trainer.compile-ahead.generation", "sm90",
                               "--trainer.compile-ahead.devices", "2", "--trainer.compile-ahead.path", "step",

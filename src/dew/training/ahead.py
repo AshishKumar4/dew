@@ -160,7 +160,11 @@ class AheadOfTime:
     def over(self, stated: Mapping[str, Link]) -> dict[str, Link]:
         """The links a run handed this step traces with, for every program it compiles: the step's own
         (`links`), which the run's `stated` ones give way to, as it says once where they differ."""
-        differ = {axis: link for axis, link in stated.items() if self.links.get(axis, link) != link}
+        def figures(link: Link) -> tuple[float | None, float | None]:
+            return link.bytes_per_second, link.flops_per_second
+
+        differ = {axis: link for axis, link in stated.items() if axis in self.links
+                  and figures(self.links[axis]) != figures(link)}
         if differ:
             _log.warning("this run states links %s, and the step compiled ahead traced with %s; the run "
                          "traces with the step's", differ, {axis: self.links[axis] for axis in differ})
