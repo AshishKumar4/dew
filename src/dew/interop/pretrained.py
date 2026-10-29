@@ -224,9 +224,12 @@ class Pretrained:
 
     It is used by a bundle that has no source processor to write (`from_model`).
     """
-    code: Path | None = None
-    """The directory of the source's own Python modules a load ran (`trust_remote_code`), which `save`
-    writes beside the weights: the source's snapshot, which a weights conversion may not be."""
+    code: decoder_parts.SourceCode | None = None
+    """The source's own modeling code, where its config names it (`auto_map`), which `save` writes
+    beside the weights, its modules and their relative imports (`sources.code_modules`), whether a load
+    ran them (`trust_remote_code`) or, mapped natively, kept them unexecuted, so a save opens through the
+    source's own transformers loader as the source does; read from the source's snapshot, which a
+    weights conversion may not be, when the save writes it."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -605,17 +608,17 @@ class Pretrained:
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
         destination = Path(directory)
-        # Either half may refuse the bundle, each before it writes a file.
+        # Either half may refuse the bundle, each before it writes a file, as may the source's code.
         tensors = self.export(values)
+        modules = {} if self.code is None else sources.code_modules(self.code)
         decoders.save_export_assets(destination,
                                     tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config),
                                     named=self.names_tokenizer)
-        if self.code is not None:
-            for module in sorted(self.code.rglob("*.py")):
-                written = destination / module.relative_to(self.code)
-                written.parent.mkdir(parents=True, exist_ok=True)
-                written.write_bytes(module.read_bytes())
+        for name, module in sorted(modules.items()):
+            written = destination / name
+            written.parent.mkdir(parents=True, exist_ok=True)
+            written.write_bytes(module.read_bytes())
         save_hf_layout(tensors, dict(self.config), destination, max_shard_size)
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
@@ -683,7 +686,8 @@ class PretrainedDecoder(Pretrained):
         return cls(decoder, variables, None, config, None, built,
                    {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
                    if generation_config is None else generation_config,
-                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
+                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer,
+                   code=decoders.release_code(decoder))
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.
@@ -1242,6 +1246,22 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
         raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
 
 
+def _kept_code(route: SourceRoute, remote: Path | None, config: Mapping[str, object],
+               reference: sources.SourceReference, root: Path) -> decoder_parts.SourceCode | None:
+    """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config names it
+    (`auto_map`): in the snapshot a verification from parts ran it from, or, of a natively mapped
+    source, beside the config the load read (`reference`, its component folder), at the metadata
+    snapshot's commit (`root`), never run."""
+    auto_map = config.get("auto_map")
+    if not isinstance(auto_map, Mapping):
+        return None
+    if isinstance(route, VerifiedRoute) and route.verified.source is not None and remote is not None:
+        return decoder_parts.SourceCode(remote, None, auto_map)
+    if Path(reference.name).is_dir():
+        return decoder_parts.SourceCode(reference.directory(root), None, auto_map)
+    return decoder_parts.SourceCode(reference.name, root.name, auto_map, folder=reference.subfolder)
+
+
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
                    gguf_path: Path | None) -> tuple[Mapping[str, object], Mapping[str, unread.Stored] | None]:
     """The decoder's config, and its tensors where the config came with them
@@ -1664,6 +1684,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                          text_only=False, overrides=overrides, prediction_depths=prediction_depths)
         forwarded = isinstance(routed.route, TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and component.tensor_prefix)
+        config_root = root
         if weights or reads_shared:
             weight_source = source.component(component.weights_folder)
             root = weight_source.weights(root)
@@ -1678,7 +1699,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides,
-            remote=remote, routed=routed, prediction_depths=prediction_depths)
+            remote=remote, routed=routed, prediction_depths=prediction_depths, config_root=config_root)
     else:
         _unread_overrides(overrides, "a release without a native backbone")
     missing = False
@@ -1911,13 +1932,15 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                         overrides: Mapping[str, object] | None = None,
                         remote: Path | None = None, pinned: sources.SourceReference | None = None,
                         routed: _Routed | None = None,
-                        text_only: bool = False, prediction_depths: int | None = None
-                        ) -> tuple[Pretrained, bool]:
+                        text_only: bool = False, prediction_depths: int | None = None,
+                        config_root: Path | None = None) -> tuple[Pretrained, bool]:
     """Decode native source weights and bind their processors and export layout, and whether the
     bundle is a wrapper's language model taken alone (`text_only`). `remote` is the source's own code
     where the load runs it, and `pinned` where it was fetched (`source_route`). `routed` is the route a
     caller decided for this config already (`_routed`), a composite's for its backbone before reading
     its weights, which the load takes rather than route the config, and verify its code, again.
+    `config_root` is the snapshot the source's config was read from, which pins its own code
+    (`_kept_code`): a composite's, before its weights resolve; `root` where None.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
     their own routes; this boundary handles native decoders and media wrappers,
@@ -1925,13 +1948,17 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     `overrides` (`Pretrained.load`'s `modeling_overrides`) join the source's own.
     """
     name_or_dir, commit = source.name, source.revision
+    # Before any weights resolve: a conversion's snapshot may be another commit than the config's.
+    config_root = root if config_root is None else config_root
     directory = source.directory(root)
     gguf_path = None if gguf_file is None else source.file(root, gguf_file)
+    # The config's own folder, where a source keeps the code it names (`_kept_code`).
+    configured = source if component is None else source.component(component.config_folder)
     if component is None:
         config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
     else:
         config = component.config
-        directory = source.component(component.config_folder).directory(root)
+        directory = configured.directory(root)
     mamba_ssm = mamba2.is_mamba_ssm(config)
     config = _native_config(config, overrides)
     family = config.get("model_type")
@@ -1983,9 +2010,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                     # The weights' commit: a pickle repo's may be its conversion's.
                     revision=resolved_commit,
                     tokenizer="byte" if named == "byte" else None,
-                    # The modules a verification from parts ran, from the source's own snapshot.
-                    code=remote if isinstance(route, VerifiedRoute) and route.verified.source is not None
-                    else None)
+                    code=_kept_code(route, remote, config, configured, config_root))
 
     if family == "diffusion_gemma":
         return bundle(PretrainedBlockDecoder), False
