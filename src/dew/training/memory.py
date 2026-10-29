@@ -297,16 +297,18 @@ def peak_memory_gib() -> float | None:
     return max(peaks) / 1024 ** 3 if peaks else None
 
 
-def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | None = None) -> int | None:
+def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | None = None,
+                     built: int = 0) -> int | None:
     """The bytes a step whose derived footprint is `footprint` would leave free on its tightest device, as
     `step_headroom` reads a compiled step's: its temporaries the derivation names, its residuals and
     gradient, in one block beside what it holds (`Footprint.held`), twice where the allocator strands
     them; None where the derivation names no residuals (a step over several devices) or a device
-    states no memory. The resident state is in use already, or, on a stated device, its arguments.
-    XLA's workspace beyond these is no term of it (`dew.training.footprint`): a compile confirms."""
+    states no memory. The resident state is in use already, or, on a stated device, its arguments but
+    the `built` bytes its first call builds, which `held` counts. XLA's workspace beyond these is no
+    term of it (`dew.training.footprint`): a compile confirms."""
     if footprint.residuals is None:
         return None
-    memory = [device_memory(device, capacity, sum(footprint.resident.values())) for device in devices]
+    memory = [device_memory(device, capacity, sum(footprint.resident.values()) - built) for device in devices]
     if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     temporaries = footprint.residuals + footprint.gradients

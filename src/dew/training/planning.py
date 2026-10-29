@@ -502,15 +502,20 @@ class FitSearch[LossT, EffectsT]:
     capacity: int | None = None
     """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
     compiled ahead for it states them (`AheadTarget.capacity`)."""
-    derive: Callable[[int, bool], Footprint | None] | None = None
-    """The derived footprint of the step at a split, at the objective's rung and `narrow`, traced and not
-    lowered (`dew.training.footprint`), which picks the search's first rung (`derived_start`)."""
+    derive: Callable[[int, bool], Candidate] | None = None
+    """The step at a split, at the objective's rung and `narrow`, traced and not lowered, for its derived
+    footprint (`dew.training.footprint`), which picks the search's first rung (`derived_start`); None
+    for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh, self.capacity)
         self.started = self.remat_rung()
+        record = recompute_record(self.objective)
+        # Whether any module the run trains sets its own remat, which it compiles at alone.
+        self.remat_set = any(entry is not None for entry in (record if isinstance(record, list)
+                                                             else [record]))
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
         self.required = compiler_options(*self.objective.towers()) or None
 
@@ -535,26 +540,32 @@ class FitSearch[LossT, EffectsT]:
         ladder no rung of which fits; so does a run that sets its remat, which compiles at it alone.
         The derivation names no XLA workspace, so a 'fits' is a first guess and the compile the
         decision."""
-        if self.derive is None or self.started != json.dumps(None):
+        if self.derive is None or self.resumed is not None or self.remat_set:
             return
-        base = (tuple(entry.module for entry in self.objective.program_key()), self.narrow)
+        base = (tuple(entry.module for entry in self.objective.program_key()), head_tile_of(self.objective),
+                head_fused_of(self.objective))
         narrow = self.narrow
         while True:
-            footprint = self.derive(split, narrow)
-            headroom = None if footprint is None else derived_headroom(footprint, local_devices(self.mesh),
-                                                                          self.capacity)
+            candidate = self.derive(split, narrow)
+            footprint = candidate.footprint
+            headroom = None if footprint is None else derived_headroom(
+                footprint, local_devices(self.mesh), self.capacity, candidate.built)
             label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
                                  "label": label, "terms": None if footprint is None else footprint.record()})
             if label != "refuses":
                 break
-            # Climbing past the base rung drops the narrow copies, as the search's own climb does.
+            # The search's own climb drops the narrow copies first, at the same head and remat.
+            if narrow and candidate.copies:
+                narrow = False
+                continue
             narrow = False
             if not self.onward(lambda: recompute_more(self.objective, self.base)):
                 break
         if label != "fits":
             self.objective.substitute(list(base[0]))
-            narrow = base[1]
+            self.objective.restore_head(base[1], fused=base[2])
+            narrow = self.narrow
         elif self.remat_rung() != self.started:
             _log.info("the derivation says the step fits from remat %s; compiling there first",
                       self.remat_rung())

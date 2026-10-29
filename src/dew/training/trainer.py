@@ -1052,9 +1052,9 @@ class Trainer(Generic[Loss, Effects]):
         search = FitSearch(
             lower, lambda candidate: step_options(self.objective, candidate.micro,
                                                   candidate.prepared.variables, mesh),
-            self.objective, mesh, self._xla_defaults, self._narrow,
-            None if self._base_rung is None else self._base_rung[1], resumed, ahead=self._ahead,
-            capacity=capacity, derive=lambda split, narrow: lower(split, narrow, lowering=False).footprint)
+            self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
+            else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
+            derive=None if recorded is not None else functools.partial(lower, lowering=False))
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
@@ -1179,8 +1179,9 @@ class Trainer(Generic[Loss, Effects]):
         with assumed(generation), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
             split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
-            return self._candidate(state, batch, schedule, batch_shardings(mesh, batch), NamedSharding(mesh, P()),
-                                   split, None, None, mesh=mesh, platforms=('cuda',)).lowered
+            placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
+            return self._candidate(state, batch, schedule, placement, replicated, split, None, None,
+                                   mesh=mesh, platforms=('cuda',)).lowered
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
