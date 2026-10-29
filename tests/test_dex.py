@@ -42,8 +42,8 @@ def reference(attention, projection, strength, cotangent):
 
 def draw(seed):
     rng = np.random.default_rng([0xDE, seed])
-    attention = rng.standard_normal((2, 5, 4, 8)).astype(np.float32)
-    projection = (rng.standard_normal((len(HEADS), 8, 8)) / np.sqrt(8)).astype(np.float32)
+    attention = rng.standard_normal((4, 64, 4, 16)).astype(np.float32)
+    projection = (rng.standard_normal((len(HEADS), 16, 16)) / np.sqrt(16)).astype(np.float32)
     strength = np.float32(rng.uniform(0.1, 0.9))
     cotangent = rng.standard_normal(attention.shape).astype(np.float32)
     return attention, projection, strength, cotangent
@@ -143,7 +143,7 @@ def test_a_loaded_source_takes_dex_and_computes_its_folded_output_projection():
     recipe = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", dex=extension)
     # The paper's recipe: the extension and the attention's key, value and output projections train, the
     # rest frozen.
-    trained = {key[-2] if key[-1] == "kernel" else key[-1]
+    trained = {key[-2] if key[-1] in ("kernel", "bias") else key[-1]
                for key in flatten_dict(recipe.variables["params"])}
     assert trained == {"k_proj", "v_proj", "o_proj", "dex_projection", "dex_lambda"}
     assert FROZEN in recipe.variables
