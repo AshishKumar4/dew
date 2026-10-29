@@ -214,7 +214,7 @@ def test_a_zero_of_the_wrong_sign_or_a_missed_exact_value_is_no_rounding(flushes
     """exp(-1000) is positive and under the least value past zero: +0 is level 1, and -0 no rounding of
     it; sqrt(-0) is -0 exactly and +0 no rounding of it; exp(±0) is 1 and log(1) is +0 exactly, so a step
     of the grid off either, which a measured reach would otherwise admit, is no rounding either."""
-    dtype = ct.VALUES[fmt.name]
+    dtype = oc.DTYPES[fmt.name]
 
     def at(values):
         return np.asarray(values, np.float64).astype(dtype)
@@ -556,7 +556,7 @@ def test_a_native_dot_aligns_a_subnormal_operand_at_its_least_normal_and_no_bare
     (`nc.aligned`) and is refused at the products' own magnitudes; bare products, which a subnormal operand
     may have made, are refused rather than take the tight bound."""
     left, right, native = nc.SUBNORMAL_CASE
-    products = nc.terms(np.multiply, np.asarray([left]), np.asarray([right]), fmt=rw.FLOAT16)
+    products = nc.terms(np.multiply, np.asarray([left]), np.asarray([right]), fmt=oc.FLOAT16)
     assert nc.native_dot_holds([native], products, oc.FLOAT32, flushes=False).tolist() == [True]
     tight = nc.Terms(products.exact, np.abs(products.exact))
     assert nc.native_dot_holds([native], tight, oc.FLOAT32, flushes=False).tolist() == [False]

@@ -30,19 +30,14 @@ import dataclasses
 import math
 from typing import NamedTuple
 
-import ml_dtypes
 import numpy as np
 from certified import allowance
 from native_certificates import TRUNCATING, truncating_underflow
-from op_certificates import BFLOAT16, FLOAT32, Format, rounded
+from op_certificates import BFLOAT16, FLOAT16, FLOAT32, Format, above, below, grid_index, nearest, stepped
 
 from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.templates.recurrence import mainloop
 
-FLOAT16 = Format("float16", 11, -14, 15)
-"""fp16, the inverse's merges' staged dtype in a 16-bit call (`mainloop._merges`)."""
-
-DTYPES = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16, "float16": np.float16}
 CHUNK = mainloop.CHUNK
 LOG2E = mainloop.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
@@ -76,30 +71,6 @@ def _outward(lo, hi) -> Iv:
     return Iv(np.nextafter(lo, -np.inf), np.nextafter(hi, np.inf))
 
 
-def nearest(x, fmt: Format) -> np.ndarray:
-    x = np.asarray(x, np.float64)
-    return rounded(x, np.zeros_like(x), fmt)
-
-
-def _toward(x, fmt: Format, direction: float) -> np.ndarray:
-    """The next value of `fmt` after each of its values `x` toward `direction`."""
-    dtype = DTYPES[fmt.name]
-    x = np.asarray(x, np.float64).astype(dtype)
-    return np.nextafter(x, np.full(x.shape, direction, dtype)).astype(np.float64)
-
-
-def below(x, fmt: Format) -> np.ndarray:
-    """The greatest value of `fmt` at or below each `x`."""
-    found = nearest(x, fmt)
-    return np.where(found > x, _toward(found, fmt, -np.inf), found)
-
-
-def above(x, fmt: Format) -> np.ndarray:
-    """The least value of `fmt` at or above each `x`."""
-    found = nearest(x, fmt)
-    return np.where(found < x, _toward(found, fmt, np.inf), found)
-
-
 def onto(iv: Iv, fmt: Format) -> Iv:
     """The values of `fmt` within `iv`: what a value known to be on `fmt`'s grid takes."""
     return Iv(above(iv.lo, fmt), below(iv.hi, fmt))
@@ -113,7 +84,7 @@ def cast(iv: Iv, fmt: Format) -> Iv:
 def cell(x, fmt: Format) -> Iv:
     """The values that round to nearest to each `x` of `fmt`: between its midpoints with its neighbours."""
     x = np.asarray(x, np.float64)
-    return Iv((x + _toward(x, fmt, -np.inf)) / 2, (x + _toward(x, fmt, np.inf)) / 2)
+    return Iv((x + stepped(x, fmt, -np.inf)) / 2, (x + stepped(x, fmt, np.inf)) / 2)
 
 
 def meet(a: Iv, b: Iv) -> Iv:
@@ -230,7 +201,7 @@ def exp2(x: Iv, lane: Lane) -> Iv:
     lo = np.asarray(np.float32(np.exp2(x.lo) * (1 - 2.0 ** -50)), np.float64)
     hi = np.asarray(np.float32(np.exp2(x.hi) * (1 + 2.0 ** -50)), np.float64)
     for _ in range(lane.reach):
-        lo, hi = _toward(lo, FLOAT32, -np.inf), _toward(hi, FLOAT32, np.inf)
+        lo, hi = stepped(lo, FLOAT32, -np.inf), stepped(hi, FLOAT32, np.inf)
     return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
 
 
@@ -386,12 +357,6 @@ def stored_memory(iv: Iv, lane: Lane) -> Iv:
     return staged(iv)
 
 
-def _index(x) -> np.ndarray:
-    """Each fp32 value's place on fp32's grid, in steps from zero."""
-    bits = np.abs(np.asarray(x, np.float64)).astype(np.float32).view(np.uint32).astype(np.int64)
-    return np.where(np.signbit(np.asarray(x, np.float64)), -bits, bits)
-
-
 def exp2_reach(native) -> int:
     """The most steps of the fp32 grid `native(x)`, an fp32 `exp2` of fp32 operands, lies from `2^x` correctly
     rounded (`op_certificates.exp2_rounded`), over the fractions `algebra.raised` and `algebra.decayed` take,
@@ -401,7 +366,8 @@ def exp2_reach(native) -> int:
     rng = np.random.default_rng(2084)
     x = np.concatenate([np.linspace(-2, 2, 1 << 16, dtype=np.float32), np.arange(-2, 3, dtype=np.float32),
                         rng.uniform(-2, 2, (1 << 16) - 5).astype(np.float32)])
-    return int(np.max(np.abs(_index(np.asarray(native(x), np.float64)) - _index(exp2_rounded(x, FLOAT32)))))
+    found = grid_index(np.asarray(native(x), np.float64))
+    return int(np.max(np.abs(found - grid_index(exp2_rounded(x, FLOAT32)))))
 
 
 RECORDS = ("a", "w", "c", "o", "h", "leaving")

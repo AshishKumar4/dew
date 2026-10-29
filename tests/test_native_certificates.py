@@ -48,7 +48,7 @@ from native_certificates import (
     tf32_operand,
     truncating_step_ends,
 )
-from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, Format, truncated
+from op_certificates import BFLOAT16, FLOAT16, FLOAT32, TFLOAT32, Format, truncated
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import template
@@ -573,7 +573,7 @@ def test_subnormal_operands_certify_natively_at_their_formats_least_normal(dtype
     (`aligned`): the native forward's element summing `SUBNORMAL_CASE`'s five fp16 products, and
     every element of a forward of rows a quarter of whose values are subnormals of `dtype` (Gaussian draws
     beside them), holds with each such operand counted at its format's least normal."""
-    fmt = rw.FLOAT16 if dtype == jnp.float16 else BFLOAT16
+    fmt = FLOAT16 if dtype == jnp.float16 else BFLOAT16
     values = np.float16 if dtype == jnp.float16 else ml_dtypes.bfloat16
     rng = np.random.default_rng([2084, 3, 7])
     x, w, _ = draw(0, signed=True, dtype=values)

@@ -62,6 +62,11 @@ FORMATS = {"float32": FLOAT32, "bfloat16": BFLOAT16}
 TFLOAT32 = Format("tfloat32", 11, -126, 127)
 """TF32: fp32's range at 11 bits, the operands a GPU's tensor cores multiply fp32 products in at the default
 precision (src/dew/nn/kernels/templates/product.py); no array holds it, so it is no dtype's (FORMATS)."""
+FLOAT16 = Format("float16", 11, -14, 15)
+"""fp16, a 16-bit product's operand beside bf16 (the recurrence inverse's merges): not a format whose
+lanes the certifier measures (`FORMATS`)."""
+DTYPES = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16, "float16": np.float16}
+"""Each format's NumPy type, by name."""
 
 
 def two_sum(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -177,6 +182,37 @@ def fraction_rounded(value: fractions.Fraction, fmt: Format) -> float:
     return sign * float(result)
 
 
+def nearest(x, fmt: Format) -> np.ndarray:
+    """Each float64 `x` rounded to nearest in `fmt` (`rounded`)."""
+    x = np.asarray(x, np.float64)
+    return rounded(x, np.zeros_like(x), fmt)
+
+
+def stepped(x, fmt: Format, direction: float) -> np.ndarray:
+    """The next value of `fmt` after each of its values `x` toward `direction`, subnormals kept."""
+    dtype = DTYPES[fmt.name]
+    x = np.asarray(x, np.float64).astype(dtype)
+    return np.nextafter(x, np.full(x.shape, direction, dtype)).astype(np.float64)
+
+
+def below(x, fmt: Format) -> np.ndarray:
+    """The greatest value of `fmt` at or below each `x`."""
+    found = nearest(x, fmt)
+    return np.where(found > x, stepped(found, fmt, -np.inf), found)
+
+
+def above(x, fmt: Format) -> np.ndarray:
+    """The least value of `fmt` at or above each `x`."""
+    found = nearest(x, fmt)
+    return np.where(found < x, stepped(found, fmt, np.inf), found)
+
+
+def grid_index(x) -> np.ndarray:
+    """Each fp32 value's place on fp32's grid, in steps from zero."""
+    bits = np.abs(np.asarray(x, np.float64)).astype(np.float32).view(np.uint32).astype(np.int64)
+    return np.where(np.signbit(np.asarray(x, np.float64)), -bits, bits)
+
+
 def gamma(terms: int, fmt: Format) -> float:
     """γ(k) = ku/(1-ku), rounded up to a float64, or inf where ku ≥ 1."""
     product = terms * fractions.Fraction(fmt.unit_roundoff)
@@ -206,7 +242,7 @@ def exact_sum(terms: np.ndarray, axis: int) -> np.ndarray:
 def mismatches(native, oracle, fmt: Format) -> np.ndarray:
     """Where a native value is not bit for bit its oracle, in the native format's own bits: signed
     zeros and infinities compared as bits, and a NaN on either side a mismatch."""
-    dtype = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16}[fmt.name]
+    dtype = DTYPES[fmt.name]
     native = np.asarray(native).astype(dtype)
     oracle = np.asarray(oracle, np.float64).astype(dtype)
     bits = np.uint32 if fmt.name == "float32" else np.uint16
