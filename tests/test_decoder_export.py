@@ -1223,11 +1223,12 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
     written = json.loads((tmp_path / "config.json").read_text())
     assert written["index_share_for_mtp_iteration"] == model.index_share_for_mtp_iteration
     if model.num_nextn_predict_layers:
-        states = model.apply(variables, jnp.asarray(ids), method="hidden_states")
-        prediction = model.apply(variables, states, jnp.asarray(ids), method="mtp_logits")[0]
-        reloaded_states = restored.model.apply(restored.variables, jnp.asarray(ids), method="hidden_states")
-        reloaded_prediction = restored.model.apply(
-            restored.variables, reloaded_states, jnp.asarray(ids), method="mtp_logits")[0]
+        # Each forward compiled once, as a user runs it, not op by op.
+        def depths(model, variables):
+            states = model.apply(variables, jnp.asarray(ids), method="hidden_states")
+            return model.apply(variables, states, jnp.asarray(ids), method="mtp_logits")[0]
+        prediction = jax.jit(functools.partial(depths, model))(variables)
+        reloaded_prediction = jax.jit(functools.partial(depths, restored.model))(restored.variables)
         np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
         np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
                                    prediction, atol=LOGITS, rtol=0)
