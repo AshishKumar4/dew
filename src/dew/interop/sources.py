@@ -322,7 +322,8 @@ def snapshot(name_or_dir: str, revision: str | None, *,
         conversion = None
         if selected or recorded_hub_answer(question) is not None:
             try:
-                conversion = hub_answer(question, lambda: _conversion_revision(name_or_dir, directory.name)).value
+                conversion = hub_answer(
+                    question, lambda: _conversion_revision(name_or_dir, directory.name)).value
             except (HfHubHTTPError, OfflineModeIsEnabled):
                 conversion = None
         if conversion is not None:
