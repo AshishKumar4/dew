@@ -824,7 +824,6 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
 
 
 @pytest.mark.parametrize("name", [name for name in TINY if name not in (
-    'bloom-tiny',
     'falcon-mha-tiny',
     'falcon-tiny',
     'gpt-bigcode-tiny',
@@ -832,7 +831,6 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
     'gpt-neox-tiny',
     'gpt2-tiny',
     'gptj-tiny',
-    'opt-tiny',
     'phi-tiny',
     'phi3-tiny',
     'starcoder2-tiny',
