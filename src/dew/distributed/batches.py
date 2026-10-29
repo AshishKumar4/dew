@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import contextlib
 import json
 import logging
 import pickle
@@ -379,6 +380,8 @@ class DevicePrefetchIterator:
         # first `next` sets (`peek`).
         self._first: Batch | None = None
         self._placing = False
+        # Taken around each placement, and by `held` for the length of a caller's block.
+        self._placement = threading.Lock()
         self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
         self._withdraw_exit: Callable[[], None] | None = None
         # No source work may start until the caller owns this object. In
@@ -472,7 +475,7 @@ class DevicePrefetchIterator:
                         self._first = None
                     if self._stop.is_set():
                         break
-                with region("data.place"), nn.logical_axis_rules(self._rules):
+                with region("data.place"), nn.logical_axis_rules(self._rules), self._placement:
                     placed = shard_batch(mesh, batch, self._reads)
                 batch = None
                 with region("data.enqueue"), self._ready:
@@ -507,6 +510,21 @@ class DevicePrefetchIterator:
                 with self._ready:
                     self._done.set()
                     self._ready.notify_all()
+
+    @contextlib.contextmanager
+    def held(self) -> Iterator[None]:
+        """Place no batch while the caller's block runs, a placement under way finishing first; the
+        worker reads on meanwhile, and its next placement waits for the block to end.
+
+        A run holds its prefetcher while it does device work beside its steps (a compile, an
+        evaluation, a checkpoint): XLA's GPU pool gives an allocation the lowest block it fits, so a
+        batch placed while that work holds memory lands past it, inside the free block the next step's
+        temporaries take whole, and stays there until a later step reads it (row 2088: a 4B's step that
+        fit its 50.35 GiB block before its first validation pass found it split after the pass, by a
+        batch the stream read ahead of the pass). The block must not read this iterator, whose next
+        batch may wait on the placement it holds."""
+        with self._placement:
+            yield
 
     def _discard(self) -> None:
         """Drop every batch already queued, without waiting for more."""

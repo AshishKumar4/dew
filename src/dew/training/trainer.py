@@ -1426,7 +1426,7 @@ class Trainer(Generic[Loss, Effects]):
                     run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
                 if len(compiled) > known:
-                    with self._startup.phase("warm", "warming the evaluations", when=not known):
+                    with self._startup.phase("warm", "warming the evaluations", when=not known), run.held():
                         self._warm_evaluations(plan, state, shardings)
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
@@ -1749,7 +1749,7 @@ class Trainer(Generic[Loss, Effects]):
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
             self._read_taken(run)
-            with region("evaluate"):
+            with region("evaluate"), run.held():
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
                 run.evaluation = self._evaluation(plan, state, shardings, run.training, names)
@@ -1776,8 +1776,9 @@ class Trainer(Generic[Loss, Effects]):
         assert run.notice is not None
         stopping = paused or cut or (not ending and run.notice.reached())
         if not ending:
-            self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
-                        full=stopping)
+            with run.held():
+                self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
+                            full=stopping)
         if plan.observe:
             plan.observe.at(current, state)
         if run.stopped:
@@ -2171,7 +2172,7 @@ class Trainer(Generic[Loss, Effects]):
             # a program whose collectives its peers' never meet.
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
-            with region("compile"):
+            with region("compile"), run.held():
                 compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
