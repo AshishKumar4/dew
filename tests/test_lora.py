@@ -1540,7 +1540,8 @@ from dew.interop.pretrained import Pretrained
 from dew.lora import LoRA
 
 decoder = Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference")
-spec = LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0, source=sys.argv[2], weight_name=sys.argv[3])
+spec = LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0, source=sys.argv[2],
+            weight_name=sys.argv[3] or None)
 bundled = decoder.adapt(spec, key=0)
 ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6) % decoder.model.vocab_size
 np.save(sys.argv[4], np.asarray(bundled.model.apply(bundled.variables, ids)))
@@ -1586,3 +1587,45 @@ def test_an_adapter_named_by_its_folder_fetches_the_files_it_reads_alone(decoder
         fetched = {read.file for read in hub.served if read.repo == "local/checkpoints" and read.file}
     np.testing.assert_array_equal(np.load(tmp_path / "hub.npy"), logits)
     assert fetched <= {"checkpoint-10/adapter_config.json", "checkpoint-10/adapter_model.safetensors"}
+
+
+FILTERED = """
+import sys
+from huggingface_hub import hf_hub_download
+
+for name in sys.argv[2:]:
+    hf_hub_download(sys.argv[1], name)
+"""
+"""Another tool's download of a repo's named files alone into the Hub cache, as `huggingface-cli download
+REPO FILES` makes it."""
+
+
+def test_an_adapter_another_tool_cached_alone_loads_offline(decoder, tmp_path):
+    """A Hub repo whose adapter pair another tool cached alone, the repo's other files never fetched and
+    no Dew answer recorded, loads offline: its commit read from the cache's ref and its files from that
+    commit (`SourceReference.pinned`, `cached`), computing what `LoRA.load` of the pair computes, bit for
+    bit."""
+    import subprocess
+    import sys
+
+    from local_hub import LocalHub, hub_environment
+
+    drawn = decoder.adapt(LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0), key=0)
+    moved = {**drawn.variables, "params": jax.tree.map(lambda leaf: leaf + 0.05, drawn.variables["params"])}
+    drawn.adapter.save(moved, tmp_path / "pair")
+    (tmp_path / "trainer_state.json").write_text("{}")
+    served = {name: tmp_path / "pair" / name for name in (lora.PEFT_CONFIG, lora.PEFT_WEIGHTS)}
+    repo = {**served, "trainer_state.json": tmp_path / "trainer_state.json"}
+    with LocalHub({"local/filtered": repo}) as hub:
+        done = subprocess.run([sys.executable, "-c", FILTERED, "local/filtered", *served],
+                              env=hub_environment(hub, tmp_path), capture_output=True, text=True, check=False)
+        assert done.returncode == 0, done.stderr[-3000:]
+    gone = {**hub_environment(None, tmp_path, offline=True), "DEW_HUB_ANSWERS": str(tmp_path / "no-answers")}
+    done = subprocess.run([sys.executable, "-c", ADAPT_IMPORTED, str(LLAMA), "local/filtered", "",
+                           str(tmp_path / "offline.npy")], env=gone, capture_output=True, text=True,
+                          check=False)
+    assert done.returncode == 0, done.stderr[-3000:]
+    expected = LoRA.load(decoder.model, decoder.variables, tmp_path / "pair", layouts=decoder.layouts)
+    ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6) % decoder.model.vocab_size
+    np.testing.assert_array_equal(np.load(tmp_path / "offline.npy"),
+                                  np.asarray(expected.model.apply(expected.variables, ids)))

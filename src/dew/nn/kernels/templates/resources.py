@@ -202,9 +202,6 @@ def producer_registers(consumers: int) -> int:
     return PRODUCER_REGISTERS if RAISES_HONORED else entry_registers(consumers + 1)
 
 
-CONSUMER_REGISTERS = consumer_registers(2)
-"""Two consumer warpgroups' registers a thread (`consumer_registers`)."""
-
 @dataclasses.dataclass(frozen=True)
 class Scope:
     """A program's shared-memory allocations by lifetime, as its kernel scopes them (`shared_bytes`): those
