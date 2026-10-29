@@ -130,7 +130,7 @@ rows = Files(table, format="csv").pipe(decisions, question="team").read("memory"
 DecisionRunConfig.cli(["--pretrained", "local/chat", "--trainer.name", "run",
                        "--trainer.checkpoint-dir", root, "--trainer.steps", "1", "--trainer.compilation-cache-dir", "None",
                        "--trainer.multi-host", "False", "--trainer.eval-every", "None",
-                       "--trainer.checkpoint-every", "1", "--model.dtype", "float32", "--calibrate", "False"],
+                       "--trainer.checkpoint-every", "1", "--model.dtype", "float32", "--no-calibrate"],
                       default=DecisionRunConfig(data=rows.loading(Loading(workers=0)))).run()
 """
 """A recorded decision run over a Hub backbone, through the command line, in a process of its own: the
