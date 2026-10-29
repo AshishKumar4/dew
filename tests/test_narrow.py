@@ -374,11 +374,12 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
 
 
-def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(monkeypatch):
+def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
     """A window of one step that recomputes nothing holds about as much without its copies as with them:
     its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its
-    own rung neither way, the plan climbs past the rung that dropped them, and at the rung and split it
-    reaches it compiles the step with them once more and keeps them, as they fit there too."""
+    own rung neither way, the plan climbs past the rung that dropped them, and keeps them dropped at the
+    rung and split it reaches: once a plan fits, a run compiles no other (whether the copies would be
+    faster there is the offline plan's to weigh, `compile_ahead`)."""
     free = 2 ** 39
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
@@ -393,11 +394,10 @@ def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(m
     assert [(probe["narrow"], probe["fits"]) for probe in probes[:2]] == [(True, False), (False, False)]
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
     planned = {key: plan[key] for key in rung}
-    fitted, last = probes[-2], probes[-1]
+    last = probes[-1]
     assert planned != {key: base[key] for key in rung}
-    assert [{key: probe[key] for key in rung} for probe in (fitted, last)] == [planned, planned]
-    assert [(probe["narrow"], probe["fits"]) for probe in (fitted, last)] == [(False, True), (True, True)]
-    assert plan["narrow"] and state.compute is not None
+    assert {key: last[key] for key in rung} == planned and (last["narrow"], last["fits"]) == (False, True)
+    assert not plan["narrow"] and state.compute is None
 
 
 def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(monkeypatch):

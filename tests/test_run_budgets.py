@@ -699,6 +699,23 @@ def test_a_stream_that_runs_out_after_a_ranked_step_ends_on_a_whole_checkpoint(t
     assert Checkpoints(str(tmp_path)).latest == 1
 
 
+def test_a_cooldown_branch_on_a_step_that_ranks_a_weights_only_best_runs_on_past_it(tmp_path):
+    """A cooldown branch taken at a step whose evaluation ranks a best kept as weights alone, on a
+    stream that may run out: the branch reopens the stream, the save asks it whether the step is the
+    run's last before writing the weights, and the run trains on to its end (the save asked while it held
+    the reopened stream's placements, which its first batch waited on forever: row 2088's review)."""
+    from dew.training import Cooldowns
+
+    x = np.random.default_rng(0).normal(size=(6 * BATCH, FEATURES)).astype(np.float32)
+    objective = Pulled()
+    state = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
+                    checkpoints=Checkpoints(str(tmp_path))).fit(
+        compile(Pipeline(Memory({"x": x})).repeat(1).batch(BATCH), read="memory",
+                validation=Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)), steps=4, eval_every=2,
+        best=Best(objective.loss, weights_only=True), cooldowns=Cooldowns(at=(2,), length=1))
+    assert int(state.step) == 4
+
+
 def test_a_run_resumed_where_its_finite_stream_ran_out_ends_there_with_nothing_to_read(tmp_path):
     """A one-pass read of the corpus under a run asked for more steps than it holds ends where the read
     runs out, on a checkpoint; resumed with a higher cap it opens the read where it stopped, finds it

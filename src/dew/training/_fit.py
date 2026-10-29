@@ -4,6 +4,7 @@ training stream (`waited_read`)."""
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import math
@@ -406,6 +407,11 @@ class FitRun:
         if self.ran_out:
             batch = drained(batch, interval.consumed, examples)
         return {**batch, CLOSES_WINDOW: np.bool_(last)}, position
+
+    def held(self) -> contextlib.AbstractContextManager[None]:
+        """The training stream's placements held for a block of device work beside the steps
+        (`DevicePrefetchIterator.held`), none to hold once the stream is closed."""
+        return contextlib.nullcontext() if self.train is None else self.train.held()
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:

@@ -37,13 +37,10 @@ def test_qwen35_moe_text_and_images_match_the_conditional_reference():
 
 
 def test_advertised_mtp_without_weights_loads_the_actual_conditional_trunk(tmp_path):
-    from shutil import copytree
+    from interop_support import respelled
 
-    checkpoint = tmp_path / 'checkpoint'
-    copytree(DIRECTORY, checkpoint)
-    config = json.loads((checkpoint / 'config.json').read_text())
-    config['text_config']['mtp_num_hidden_layers'] = 1
-    (checkpoint / 'config.json').write_text(json.dumps(config))
+    checkpoint = respelled(DIRECTORY, tmp_path / 'checkpoint', lambda config: {
+        **config, 'text_config': {**config['text_config'], 'mtp_num_hidden_layers': 1}})
     advertised = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
     original = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     ids = np.load(DIRECTORY / 'text_input_ids.npy')

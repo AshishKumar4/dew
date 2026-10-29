@@ -25,7 +25,10 @@ program per prompt bucket plus the decode-only one.
 stays the one way to load weights and a processor, and every request runs
 the task's bound policy. A request draws with its submitted key folded as a
 one-row `TextGeneration` call folds it, so it draws the same tokens served
-or alone. `submit` returns a future for its `Generation`, `step` runs one
+or alone, except where the model's products round at boundaries that its
+programs' own roundings cross (a quantized decoder's moving weights, ledger
+2032): there each draw is on par with the model's full forward, by check 1,
+not equal to the lone task's. `submit` returns a future for its `Generation`, `step` runs one
 iteration, `run` steps until queue and rows are empty, and calling the
 server with a batch does both.
 
@@ -479,7 +482,8 @@ class Server:
     row. A row leaves where the task's criteria end it (EOS, a stop string) or
     at its budget, and the next request takes its slot. Every request runs
     the task's policy and draws the same tokens it would draw through the
-    task alone with the same key.
+    task alone with the same key, except where the model's products round at
+    boundaries that the two programs' roundings cross (the module docstring).
 
     Build one with `from_task`. `admission` bounds the prompts one step
     prefills. A request whose prompt and budget do not fit the capacity is

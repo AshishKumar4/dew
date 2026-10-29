@@ -16,6 +16,7 @@ from dew.objectives.base import Metric, Shown
 
 if TYPE_CHECKING:
     from dew.state import TrainState
+    from dew.training._fit import FitRun
     from dew.training.interval import Interval
 
 
@@ -51,9 +52,10 @@ def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
 
 
 def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: Mesh,
-               marked: Callable[[Batch], Batch], interval: Interval) -> Batch:
+               marked: Callable[[Batch], Batch], interval: Interval, run: FitRun) -> Batch:
     """`batch` sampled through `rollout`, its host preparation `marked` and placed on `mesh`
-    (`shard_batch`), its seconds counted in `interval`; without a rollout, the batch as it is.
+    (`shard_batch`), its seconds counted in `interval`, `run`'s stream placing nothing meanwhile
+    (`FitRun.held`); without a rollout, the batch as it is.
 
     Host-side and untraceable: sampling, scoring, advantages. The key folds the
     step key once more, keeping the rollout's draws off the step's stream; both
@@ -66,7 +68,8 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
         return batch
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-    batch = shard_batch(mesh, marked(rollout(state, batch, key)))
+    with run.held():
+        batch = shard_batch(mesh, marked(rollout(state, batch, key)))
     interval.rollout_seconds += time.perf_counter() - began
     return batch
 
