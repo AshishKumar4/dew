@@ -19,15 +19,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import attention_and_grads, attention_terms, exact_attention, kept, qkv, value_and_grads
+from attention_oracle import attention_and_grads, exact_attention, kept, qkv, value_and_grads
 from flax import linen as nn
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    distance,
-    with_gradients,
-)
+from reference_error import as_given, assert_as_exact, distance, with_gradients
 
 from dew.nn import kernels
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
@@ -315,20 +309,14 @@ def float64_attention(query, key, value, causal, window=(-1, -1), sinks=None):
     return exact_attention(query[None], key[None], value[None], sinks, keep=keep)[0]
 
 
-def window_terms(query, key, value, cotangent, causal, window=(-1, -1), sinks=None):
-    """`attention_terms` of `float64_attention`'s output and gradients for `[S, H, D]` arrays."""
-    terms = attention_terms(query[None], key[None], value[None], cotangent[None],
-                            kept(query.shape[0], key.shape[0], causal=causal, window=window), sinks)
-    return [x[0] for x in terms]
-
-
-def output_and_gradients(attend, cotangent, *arrays):
-    """`attend`'s output and the gradients of its inputs under `cotangent`, as float64 host arrays."""
-    out, pull = jax.vjp(attend, *arrays)
-    return [np.asarray(x, np.float64) for x in (out, *pull(cotangent))]
-
-
-FLASH_SEEDS = {"dense twin": 8, "packed twin": 8}
+FLASH_SEEDS = {"dense twin": 8, "packed twin": 8, "centred window": 8, "cross sequences": 8,
+               **{f"packed documents {width} {causal} {sunk}": 8 for width in (128, 256)
+                  for causal in (True, False) for sunk in (False, True)},
+               **{f"cross documents {width}": 8 for width in (64, 128)},
+               **{f"{kernel} {width}": 8 for kernel in ("flash", "cudnn") for width in (128, 256)},
+               **{f"window {case}": 8 for case in ("64 64 2 True None True", "64 64 2 True 128 True",
+                                                   "192 128 2 True 128 True", "64 64 8 False 65 False")},
+               **{f"packed rows {window}": 8 for window in (None, 128)}}
 """Each GPU kernel site's declared draws against the xla kernel (check 1), by its case: sized by `seeds_for`
 paired on an A100 and an H100, the larger of the two."""
 
@@ -345,6 +333,15 @@ def attended(implementation, **options):
 def exact_attended(keep):
     """`attended`'s float64 truth: `exact_attention` of the keys `keep` keeps, and its gradients."""
     return with_gradients(lambda q, k, v, *sinks: exact_attention(q, k, v, *sinks, keep=keep))
+
+
+def on_rows(rows, attend):
+    """`attend`'s output and query gradient at the rows `rows` (`[B, S]`) keeps, its other leaves whole: a
+    packed call's real tokens, whose padding the kernels may attend otherwise."""
+    def run(*drawn):
+        out, d_query, *rest = attend(*drawn)
+        return out[rows], d_query[rows], *rest
+    return run
 
 
 def attention_draw(site: int, query, key, value=None, *, sinks: bool = False, rows=None, dtype=jnp.bfloat16):
@@ -483,8 +480,8 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
 def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, head_dim,
                                                                    without_deterministic_ops):
     """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's and cuDNN's output
-    and three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
-    measured from float64; on Hopper that holds FlashAttention-3 and cuDNN's 256-wide heads to it."""
+    and three input gradients on par (check 1) with the xla kernel's from float64, over drawn operands
+    and cotangents; on Hopper that holds FlashAttention-3 and cuDNN's 256-wide heads to it."""
     from dew.nn.attention_kernels import cudnn_max_head_dim
     if implementation == 'flash':
         flash_here()
@@ -492,24 +489,10 @@ def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementatio
             pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
     elif head_dim > cudnn_max_head_dim():
         pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
-    query, _, _ = qkv((1, 1024, 8, head_dim))
-    _, key, value = qkv((1, 1024, 2, head_dim), seed=1)
-    cotangent = qkv((1, 1024, 8, head_dim), seed=2)[0]
-
-    def kernel(implementation):
-        return jax.jit(lambda q, k, v: scaled_dot_product_attention(
-            q, k, v, implementation=implementation, causal=True))
-
-    fused = output_and_gradients(kernel(implementation), cotangent, query, key, value)
-    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
-    with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(np.asarray(x[0], np.float64)) for x in (query, key, value, cotangent)]
-        truth = output_and_gradients(functools.partial(float64_attention, causal=True), wide[3],
-                                     *wide[:3])
-    terms = window_terms(query[0], key[0], value[0], cotangent[0], causal=True)
-    for name, got, theirs, want, summed in zip(("o", "dq", "dk", "dv"), fused, reference, truth, terms,
-                                               strict=True):
-        assert_as_exact_as_the_reference(got[0], theirs[0], want, name, terms=summed)
+    assert_as_exact(attended(implementation, causal=True), attended('xla', causal=True),
+                    attention_draw(478, (1, 1024, 8, head_dim), (1, 1024, 2, head_dim)),
+                    f"{implementation} at {head_dim} wide", seeds=FLASH_SEEDS[f"{implementation} {head_dim}"],
+                    truth_fn=exact_attended(kept(1024, 1024, causal=True)))
 
 
 @on_gpu
@@ -523,63 +506,38 @@ def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float6
         width, value_width, kv_heads, causal, window, sinks, without_deterministic_ops):
     """FlashAttention with a sliding window, attention sinks or a value narrower than the query, as
     'auto' sends such calls on sm80, sm89 and sm90: its output and the gradients of the query, key,
-    value and sinks lie within tests/reference_error.py's rule of the xla kernel's, both measured
-    from float64."""
+    value and sinks on par (check 1) with the xla kernel's from float64, over drawn operands and
+    cotangents."""
     flash_here()
-    rng = np.random.default_rng(57)
-    query = jnp.asarray(rng.normal(size=(1, 1024, 8, width)), jnp.bfloat16)
-    key = jnp.asarray(rng.normal(size=(1, 1024, kv_heads, width)), jnp.bfloat16)
-    value = jnp.asarray(rng.normal(size=(1, 1024, kv_heads, value_width)), jnp.bfloat16)
-    cotangent = jnp.asarray(rng.normal(size=(1, 1024, 8, value_width)), jnp.bfloat16)
-    logits = jnp.asarray(rng.normal(size=(8,)) * 2, jnp.float32)
-
-    def kernel(implementation):
-        return jax.jit(lambda q, k, v, s: scaled_dot_product_attention(
-            q, k, v, implementation=implementation, causal=causal, sliding_window=window,
-            sinks=s if sinks else None))
-
-    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value, logits)
-    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value, logits)
     sides = (-1, -1) if window is None else (window - 1, 0 if causal else window - 1)
-    with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(np.asarray(x[0], np.float64)) for x in (query, key, value, cotangent)]
-        wide_sinks = jnp.asarray(np.asarray(logits, np.float64))
-        truth = output_and_gradients(
-            lambda q, k, v, s: float64_attention(q, k, v, causal, sides, s if sinks else None),
-            wide[3], *wide[:3], wide_sinks)
-    terms = window_terms(query[0], key[0], value[0], cotangent[0], causal, sides, logits if sinks else None)
-    for name, got, theirs, want, summed in zip(("o", "dq", "dk", "dv"), fused[:4], reference[:4], truth[:4],
-                                               terms, strict=True):
-        assert_as_exact_as_the_reference(got[0], theirs[0], want, name, terms=summed)
-    if sinks:
-        assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
+    draw = attention_draw(517, (1, 1024, 8, width), (1, 1024, kv_heads, width),
+                          (1, 1024, kv_heads, value_width), sinks=sinks)
+    assert_as_exact(attended('flash', causal=causal, sliding_window=window),
+                    attended('xla', causal=causal, sliding_window=window), draw,
+                    f"flash with a window of {window} and sinks {sinks}, {width} wide over {kv_heads} keys",
+                    seeds=FLASH_SEEDS[f"window {width} {value_width} {kv_heads} {causal} {window} {sinks}"],
+                    truth_fn=exact_attended(kept(1024, 1024, causal=causal, window=sides)))
 
 
 @on_gpu
 def test_a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without_deterministic_ops):
     """A bidirectional window over more keys than queries (256 queries over 512 keys, 32 each side)
     keeps the keys `structural_mask` centres on each query's row, Dew's contract, whichever kernel
-    'auto' picks on this GPU: its output and gradients within tests/reference_error.py's rule of the
-    xla kernel's, both from float64. FlashAttention aligns a window to the last key, the keys 256
-    further on, so 'auto' leaves it such a call and an explicit 'flash' refuses it, while it takes
-    the same window square."""
+    'auto' picks on this GPU: its output and gradients on par (check 1) with the xla kernel's from
+    float64, over drawn operands and cotangents. FlashAttention aligns a window to the last key, the
+    keys 256 further on, so 'auto' leaves it such a call and an explicit 'flash' refuses it, while it
+    takes the same window square."""
     flash_here()
-    rng = np.random.default_rng(61)
-    query = jnp.asarray(rng.normal(size=(1, 256, 8, 64)), jnp.bfloat16)
-    key, value = (jnp.asarray(rng.normal(size=(1, 512, 8, 64)), jnp.bfloat16) for _ in range(2))
-    cotangent = jnp.asarray(rng.normal(size=query.shape), jnp.bfloat16)
 
     def kernel(implementation):
         return jax.jit(lambda q, k, v: scaled_dot_product_attention(
             q, k, v, implementation=implementation, sliding_window=33))
 
-    found = output_and_gradients(kernel('auto'), cotangent, query, key, value)
-    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
-    with jax.enable_x64(new_val=True):
-        truth = output_and_gradients(kernel('reference'), jnp.asarray(cotangent, jnp.float64),
-                                     *(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
-    for name, got, theirs, want in zip(("o", "dq", "dk", "dv"), found, reference, truth, strict=True):
-        assert_as_exact_as_the_reference(got[0], theirs[0], want[0], name)
+    draw = attention_draw(554, (1, 256, 8, 64), (1, 512, 8, 64))
+    assert_as_exact(attended('auto', sliding_window=33), attended('xla', sliding_window=33), draw,
+                    "a window over more keys than queries", seeds=FLASH_SEEDS["centred window"],
+                    truth_fn=attended('reference', sliding_window=33))
+    query, key, value, _ = draw(0)
     with pytest.raises(ValueError):
         kernel('flash')(query, key, value)
     kernel('flash')(query, key[:, :256], value[:, :256]).block_until_ready()
@@ -598,58 +556,24 @@ def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(win
                                                                              without_deterministic_ops):
     """Rows packing documents of uneven lengths, padding after them, through flash as its varlen
     sequences (`segment_ids` with their declared `max_segments`), causal, also with a 128-key window
-    and sinks: every real token's output and query gradient, and every key and value gradient, lie
-    within tests/reference_error.py's rule of the xla kernel's under the document mask, both measured
-    from float64 per document. The padding attends among itself on flash and to nothing under the
-    mask, and its rows carry no gradient."""
+    and sinks: every real token's output and query gradient, and every key and value gradient, on par
+    (check 1) with the xla kernel's under the document mask from float64, over drawn operands and
+    cotangents. The padding attends among itself on flash and to nothing under the mask, and its rows
+    carry no gradient."""
     flash_here()
-    rng = np.random.default_rng(23)
     lengths = [[700, 1, 220, 103], [129, 383, 400, 112]]
     segments = documents(lengths)
     real = segments != 0
-    query = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)), jnp.bfloat16)
-    key = jnp.asarray(rng.normal(size=(2, 1024, 2, 64)), jnp.bfloat16)
-    value = jnp.asarray(rng.normal(size=(2, 1024, 2, 64)), jnp.bfloat16)
-    cotangent = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)) * real[:, :, None, None], jnp.bfloat16)
-    logits = jnp.asarray(rng.normal(size=(8,)) * 2, jnp.float32)
-
-    def kernel(implementation):
-        return jax.jit(lambda q, k, v, s: scaled_dot_product_attention(
-            q, k, v, implementation=implementation, causal=True, sliding_window=window,
-            sinks=s if sinks else None, segment_ids=jnp.asarray(segments), max_segments=3))
-
-    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value, logits)
-    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value, logits)
+    options = {"causal": True, "sliding_window": window, "segment_ids": jnp.asarray(segments),
+               "max_segments": 3}
     sides = (-1, -1) if window is None else (window - 1, 0)
-    truth = [np.zeros_like(x) for x in fused]
-    terms = [np.zeros_like(x) for x in fused[:4]]
-    with jax.enable_x64(new_val=True):
-        for row in range(2):
-            begin = 0
-            for length in lengths[row][:-1]:
-                piece = slice(begin, begin + length)
-                wide = [jnp.asarray(np.asarray(x[row, piece], np.float64))
-                        for x in (query, key, value, cotangent)]
-                exact = output_and_gradients(
-                    lambda q, k, v, s: float64_attention(q, k, v, causal=True, window=sides,
-                                                         sinks=s if sinks else None),
-                    wide[3], *wide[:3], jnp.asarray(np.asarray(logits, np.float64)))
-                for whole, part in zip(truth[:4], exact[:4], strict=True):
-                    whole[row, piece] = part
-                for whole, part in zip(terms, window_terms(
-                        *(x[row, piece] for x in (query, key, value, cotangent)), causal=True, window=sides,
-                        sinks=logits if sinks else None), strict=True):
-                    whole[row, piece] = part
-                truth[4] += exact[4]
-                begin += length
-    for name, index in (("o", 0), ("dq", 1)):
-        assert_as_exact_as_the_reference(fused[index][real], reference[index][real], truth[index][real], name,
-                                         terms=terms[index][real])
-    for name, index in (("dk", 2), ("dv", 3)):
-        assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name,
-                                         terms=terms[index])
-    if sinks:
-        assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
+
+    draw = attention_draw(592, (2, 1024, 8, 64), (2, 1024, 2, 64), sinks=sinks, rows=real)
+    assert_as_exact(on_rows(real, attended('flash', **options)), on_rows(real, attended('xla', **options)),
+                    draw, f"packed rows, a window of {window}, sinks {sinks}",
+                    seeds=FLASH_SEEDS[f"packed rows {window}"],
+                    truth_fn=on_rows(real, exact_attended(kept(1024, 1024, causal=True, window=sides,
+                                                           segment_ids=segments))))
 
 
 @on_gpu
@@ -658,46 +582,24 @@ def test_queries_reading_another_sequences_documents_on_flash_are_as_exact_as_th
     """A decision head's option slots read the window's tokens of their own row: queries packed by
     their documents (`segment_ids`), keys by theirs (`key_segment_ids`), through flash as packed
     sequences of their own lengths. Every real query's output and gradient, and every key and value
-    gradient, lie within tests/reference_error.py's rule of the xla kernel's under the document
-    mask, both measured from float64 per document; a document no query reads takes no gradient, and
-    a padding query, or one whose document holds no key, reads nothing."""
+    gradient, on par (check 1) with the xla kernel's under the document mask from float64, over drawn
+    operands and cotangents; a document no query reads takes no gradient, and a padding query, or one
+    whose document holds no key, reads nothing."""
     flash_here()
-    rng = np.random.default_rng(29)
     queries = documents([[20, 1, 40, 35], [9, 0, 30, 57]])
     # Row 0's second document has a query and no key.
     keys = documents([[300, 0, 500, 224], [129, 383, 400, 112]])
     real = queries != 0
-    query = jnp.asarray(rng.normal(size=(2, 96, 8, 64)), jnp.bfloat16)
-    key = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)), jnp.bfloat16)
-    value = jnp.asarray(rng.normal(size=(2, 1024, 8, 64)), jnp.bfloat16)
-    cotangent = jnp.asarray(rng.normal(size=(2, 96, 8, 64)) * real[:, :, None, None], jnp.bfloat16)
+    options = {"segment_ids": jnp.asarray(queries), "key_segment_ids": jnp.asarray(keys), "max_segments": 3}
+    keep = ((queries[:, None, :, None] == keys[:, None, None, :]) & real[:, None, :, None])
 
-    def kernel(implementation):
-        return jax.jit(lambda q, k, v: scaled_dot_product_attention(
-            q, k, v, implementation=implementation, segment_ids=jnp.asarray(queries),
-            key_segment_ids=jnp.asarray(keys), max_segments=3))
-
-    fused = output_and_gradients(kernel('flash'), cotangent, query, key, value)
-    reference = output_and_gradients(kernel('xla'), cotangent, query, key, value)
-    np.testing.assert_array_equal(fused[0][~real], 0)
-    np.testing.assert_array_equal(fused[0][0][queries[0] == 2], 0)
-    truth = [np.zeros_like(x, np.float64) for x in fused]
-    with jax.enable_x64(new_val=True):
-        for row in range(2):
-            for document in range(1, 4):
-                asking, read = queries[row] == document, keys[row] == document
-                if not asking.any() or not read.any():
-                    continue
-                pieces = (query[row][asking], key[row][read], value[row][read], cotangent[row][asking])
-                wide = [jnp.asarray(np.asarray(x, np.float64)) for x in pieces]
-                exact = output_and_gradients(lambda q, k, v: float64_attention(q, k, v, causal=False),
-                                             wide[3], *wide[:3])
-                for whole, part, at in zip(truth, exact, (asking, asking, read, read), strict=True):
-                    whole[row][at] = part
-    for name, index in (("o", 0), ("dq", 1)):
-        assert_as_exact_as_the_reference(fused[index][real], reference[index][real], truth[index][real], name)
-    for name, index in (("dk", 2), ("dv", 3)):
-        assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name)
+    draw = attention_draw(651, (2, 96, 8, 64), (2, 1024, 8, 64), rows=real)
+    assert_as_exact(on_rows(real, attended('flash', **options)), on_rows(real, attended('xla', **options)),
+                    draw, "queries over another sequence's documents", seeds=FLASH_SEEDS["cross sequences"],
+                    truth_fn=on_rows(real, exact_attended(keep)))
+    out = np.asarray(jax.jit(attended('flash', **options))(*draw(0))[0])
+    np.testing.assert_array_equal(out[~real], 0)
+    np.testing.assert_array_equal(out[0][queries[0] == 2], 0)
 
 
 @on_gpu

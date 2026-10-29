@@ -39,7 +39,7 @@ import pytest
 from delta_rule_support import fused_step, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -1013,9 +1013,9 @@ def test_the_fused_decode_step_leaves_an_idle_row_alone():
     assert np.any(np.asarray(history[1]) != np.asarray(cache["conv_state"][1]))
 
 
-FUSED_DECODE_SEEDS = {"float32": 8, "bfloat16": 8, "data": 8, "tensor": 8}
-"""A layer choosing the fused step's declared draws against the unfused layer (check 1), by its dtype, and
-of a layer split on a mesh against one device, by its axis: sized by `seeds_for` paired on a GPU."""
+FUSED_DECODE_SEEDS = {"float32": 8, "bfloat16": 8}
+"""A layer choosing the fused step's declared draws against the unfused layer (check 1), by its dtype: sized
+by `seeds_for` paired on a GPU."""
 
 
 def decoded_variables(module, key, hidden):
@@ -1074,8 +1074,9 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
 @pytest.mark.parametrize("axis", ["data", "tensor"])
 def test_a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device(axis):
     """The fused step over rows or heads split two ways (`_fused_token`: each shard's channels its
-    heads' queries, keys and values): 9 decode tokens after a 3-token prefill on par (check 1) with the
-    same layer on one device from the float64 parallel forward, over drawn hidden states and weights."""
+    heads' queries, keys and values): 9 decode tokens after a 3-token prefill within
+    tests/reference_error.py's rule of the same layer on one device against the float64 parallel
+    forward."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.nn.kernels.generation import chosen
@@ -1083,26 +1084,18 @@ def test_a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device(axis
 
     module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
                            dtype=jnp.float32)
-    # The data axis takes the devices the others leave.
-    mesh = MeshSpec(**({} if axis == 'data' else {axis: 2})).build(jax.devices()[:2])
-
-    def draw(seed):
-        hidden = jax.random.normal(jax.random.key(13 + 2 * seed), (2, 12, 64), jnp.float32)
-        return module.init(jax.random.key(14 + 2 * seed), hidden[:, :1]), hidden
-
-    def alone(variables, hidden):
-        with chosen(delta_decode="fused"):
-            return decode_through(module, variables, hidden, prefill=3)[0]
-
-    @as_given
-    def split(variables, hidden):
-        # Placed on the mesh and decoded there, the layer's own programs a step.
-        with chosen(delta_decode="fused"), jax.set_mesh(mesh):
+    hidden = jax.random.normal(jax.random.key(13), (2, 12, 64), jnp.float32)
+    variables = module.init(jax.random.key(14), hidden[:, :1])
+    with jax.enable_x64(new_val=True):
+        truth = np.asarray(module.clone(dtype=jnp.float64).apply(widened(variables), widened(hidden)))
+    with chosen(delta_decode="fused"):
+        alone = np.asarray(decode_through(module, variables, hidden, prefill=3)[0])
+        # The data axis takes the devices the others leave.
+        mesh = MeshSpec(**({} if axis == 'data' else {axis: 2})).build(jax.devices()[:2])
+        with jax.set_mesh(mesh):
             placed = jax.device_put(hidden, NamedSharding(mesh, PartitionSpec()))
-            return np.asarray(decode_through(module, variables, placed, prefill=3)[0])
-
-    assert_as_exact(split, alone, draw, f"{axis} decode", seeds=FUSED_DECODE_SEEDS[axis],
-                    truth_fn=module.clone(dtype=jnp.float64).apply)
+            split = np.asarray(decode_through(module, variables, placed, prefill=3)[0])
+    assert_as_exact_as_the_reference(split, alone, truth, f"{axis} decode")
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])

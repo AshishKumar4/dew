@@ -84,6 +84,11 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
                     truth_fn=jax.jit(run(recurrence)))
 
 
+STEEP_SEEDS = 8
+"""The keys' gradient under a steep first decay's declared draws against the portable math (check 1), sized
+by `seeds_for` paired on armada."""
+
+
 @ON_A_GPU
 def test_the_keys_gradient_takes_the_gated_keys_range_under_a_steep_first_decay():
     """The port's keys' gradient through its WY backward (`fla_kda.bwd_wy_dqkg`) over the range the forward
@@ -93,23 +98,26 @@ def test_the_keys_gradient_takes_the_gated_keys_range_under_a_steep_first_decay(
     memory's cotangent alone, so its key's gradient is its write's through the range to the chunk's end
     (the chunk's pairs, whose decays the rounded prefix loses too, take nothing: ledger 2098's). From the
     rounded prefix alone the gradient differentiated a write the forward did not make (1 where the write
-    decays by about exp(-62 * 0.02), row 2103). On par with the portable math from float64 on the draw
-    (the gate's one-draw rule)."""
-    q, k, v, g, beta, h0, _, dht = support.delta_operands(0, 1, 64, 1, 1, 16, 16, per_key=True)
+    decays by about exp(-62 * 0.02), row 2103). On par (check 1) with the portable math from float64,
+    over drawn operands in that shape."""
     alone = (jnp.arange(64) == 1)[None, :, None]
-    k, v, beta = k * alone[..., None], v * alone[..., None], jnp.where(alone, 1.0, 0.0)
-    g = (-0.02 + 0.005 * jnp.tanh(g)).at[:, 0].set(-1e8)
-    drawn = (q, k, v, g, beta, h0, jnp.zeros_like(v), dht)
 
-    def key_gradient(rule, operands) -> np.ndarray:
-        *given, out_grad, final_grad = operands
-        # Its output, final memory, then the queries' and the keys' gradients.
-        return np.asarray(jax.jit(through(rule, out_grad, final_grad))(*given)[3], np.float64)
+    def draw(seed):
+        q, k, v, g, beta, h0, _, dht = support.delta_operands(seed, 1, 64, 1, 1, 16, 16, per_key=True)
+        k, v, beta = k * alone[..., None], v * alone[..., None], jnp.where(alone, 1.0, 0.0)
+        g = (-0.02 + 0.005 * jnp.tanh(g)).at[:, 0].set(-1e8)
+        return q, k, v, g, beta, h0, jnp.zeros_like(v), dht
 
-    with jax.enable_x64(new_val=True):
-        exact = key_gradient(recurrence, widened(drawn))
-    assert_as_exact_as_the_reference(key_gradient(fla_rule, drawn), key_gradient(math, drawn), exact,
-                                     "fla_kda's keys' gradient under a steep first decay")
+    def key_gradient(rule):
+        def run(*operands):
+            *given, out_grad, final_grad = operands
+            # Its output, final memory, then the queries' and the keys' gradients.
+            return through(rule, out_grad, final_grad)(*given)[3]
+        return run
+
+    assert_as_exact(key_gradient(fla_rule), key_gradient(math), draw,
+                    "fla_kda's keys' gradient under a steep first decay", seeds=STEEP_SEEDS,
+                    truth_fn=key_gradient(recurrence))
 
 
 BF16_LAYER_SEEDS = 64
