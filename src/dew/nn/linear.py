@@ -377,37 +377,6 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
-def entering_state(decay, write, axis: str):
-    """The state entering this shard of a sequence the mesh axis `axis`
-    splits, inside a `shard_map` that holds it manual: a recurrent mixer's
-    scan run from zero on each shard, corrected by what the earlier shards
-    leave (Mamba-2's `_ssd`, Mamba-1's `_sequence_scan`).
-
-    Shard r's span is affine in its entering state: it leaves `exp(A_r) h +
-    B_r`, with `decay` `A_r` the span's log decay (Mamba-2's `[B, H]` a head,
-    Mamba-1's `[B, D, N]` a channel and state dimension, broadcast over the
-    write's trailing axes) and `write` `B_r` the state it leaves from zero.
-    Spans compose as `(A_1 + A_2, exp(A_2) B_1 + B_2)`, associative with
-    identity `(0, 0)`, what `ppermute` hands a shard with no source. So the
-    prefix is a Kogge-Stone scan, shifts 1, 2, 4, ... for `ceil(log2 n)` rounds
-    and one more to make it exclusive (zero on the first shard), one pair per
-    shard per round where lm-engine's `_SerialPrefixScan` gathers all n.
-    Autodiff transposes each `ppermute`."""
-    shards = jax.lax.axis_size(axis)
-    trailing = (1,) * (write.ndim - decay.ndim)
-
-    def shifted(value, shift: int):
-        return jax.lax.ppermute(value, axis, [(r, r + shift) for r in range(shards - shift)])
-
-    shift = 1
-    while shift < shards:
-        earlier_decay, earlier_write = shifted(decay, shift), shifted(write, shift)
-        write = jnp.exp(decay).reshape(decay.shape + trailing) * earlier_write + write
-        decay = earlier_decay + decay
-        shift *= 2
-    return shifted(write, 1)
-
-
 def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
     """`local(*tokens, *whole)` in a `manual_map` that splits the rows and the sequence of each of `tokens`
     (`[B, S, ...]` or None) as the rule table places a `[batch, length, ...]` activation, `whole` on every
