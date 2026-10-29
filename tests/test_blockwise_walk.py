@@ -78,6 +78,108 @@ def _release_reveal(confidence: np.ndarray, quota: int, threshold: float) -> np.
     return chosen
 
 
+def test_llada2s_task_walks_as_its_release_and_generates_the_recorded_prompts():
+    """LLaDA2's task (`text_generation`, what `dew.pipeline` and a run return) walks as its release's
+    `generate` defaults do: blocks of 32 over 32 steps each, revealing past 0.95 (`Confident`); and the
+    task, at the recording's settings, generates each recorded prompt's tokens through its own call, the
+    public path a user's request takes (ledger 2174). The settings a saved run records take the same
+    walk."""
+    from dew.inference.tasks import MaskedGeneration, MaskedSettings
+
+    recorded = json.loads((FIXTURES / "llada2-tiny" / "generate.json").read_text())
+    settings = recorded["settings"]
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
+    task = source.text_generation()
+    assert isinstance(task, MaskedGeneration) and isinstance(task.solver, Confident)
+    assert (task.solver.threshold, task.solver.temperature, task.block, task.steps) == (0.95, 0.0, 32, 32)
+    walked = replace(task, solver=Confident(threshold=settings["threshold"], top_k=settings["top_k"]),
+                     steps=settings["steps"], block=settings["block_length"],
+                     eos_token_ids=(settings["eos_id"],))
+    for row in recorded["rows"]:
+        generation = walked(jnp.asarray([row["prompt"]], jnp.int32), settings["gen_length"], key=0).host()
+        start = len(row["prompt"])
+        response = np.asarray(generation.tokens)[0, start:start + int(generation.lengths[0])]
+        assert response.tolist() == row["generated"], (row["prompt"], response.tolist())
+    saved = MaskedSettings(seq_len=16, max_new_tokens=8, tokenizer=None, processor=None,
+                           process=task.process, solver=walked.solver,
+                           sampling_steps=walked.steps, block=walked.block,
+                           eos_token_ids=walked.eos_token_ids)
+    rebuilt = MaskedGeneration.from_settings(task.model, task.variables, saved, task.processor)
+    assert (rebuilt.solver, rebuilt.block, rebuilt.steps) == (walked.solver, walked.block, walked.steps)
+
+
+def test_llada2s_task_continues_stops_and_takes_a_zero_budget():
+    """LLaDA2's blockwise task over padded rows: its greedy reveal draws every continuation of a prompt
+    alike (`n`); an end token it draws stops a row there, the rest padding; and a zero budget returns
+    the prompts with no response and no refinement."""
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
+    task = replace(source.text_generation(), block=4, steps=4)
+    tokens = jnp.asarray([[0, 3, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
+    inputs = ModelInputs(tokens, {"attention_mask": jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]],
+                                                                bool)})
+    single = task(inputs, 8, key=7).host()
+    many = task(inputs, 8, key=7, n=3).host()
+    np.testing.assert_array_equal(many.tokens.reshape(3, 3, 12), np.repeat(single.tokens[:, None], 3, 1))
+    eos = int(single.tokens[0, 5])
+    stopped = replace(task, eos_token_ids=(eos,))(inputs, 8, key=7).host()
+    for row, response in enumerate(single.tokens[:, 4:]):
+        hits = np.flatnonzero(response == eos)
+        length = int(hits[0]) + 1 if hits.size else 8
+        assert (int(stopped.lengths[row]), bool(stopped.terminated[row])) == (length, bool(hits.size))
+        np.testing.assert_array_equal(stopped.tokens[row, 4:4 + length], response[:length])
+        np.testing.assert_array_equal(stopped.tokens[row, 4 + length:], task.pad_token_id)
+    empty = task(inputs, 0, key=7, n=2).host()
+    np.testing.assert_array_equal(empty.tokens, np.repeat(np.asarray(tokens), 2, axis=0))
+    np.testing.assert_array_equal(empty.lengths, 0)
+    np.testing.assert_array_equal(empty.decoder_steps, 0)
+
+
+def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
+    """An objective over a loaded LLaDA2.0 source takes its walk by default (`masked_recipe`); a run of
+    it saves the walk in its record, and the run's task (`MaskedGeneration.from_run`, `dew.pipeline` of
+    the run) holds the same solver, block and steps and generates the live task's tokens, as
+    `dew.pipeline` of the source itself walks (ledger 2174)."""
+    import grain.python as grain
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data import ByteTokenizer
+    from dew.data.dataset import Loader
+    from dew.diffusion.discrete import MDLM
+    from dew.inference import RunProcessor, pipeline
+    from dew.inference.tasks import MaskedGeneration
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.training import Trainer
+
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="xla")
+    solver, steps, block = source.masked_recipe
+    # LLaDA2.2 generates with an editing stage Dew does not run: its source, and a config Dew's export
+    # writes for it (its block routing, no DELETE or SPLIT ids), take MDLM.
+    from dew.interop.hf_decoders import family_entry
+
+    assert Pretrained.load(FIXTURES / "llada22-tiny").masked_recipe is None
+    exported = {**json.loads((FIXTURES / "llada22-tiny" / "config.json").read_text())}
+    for field in ("delete_token_id", "split_token_id"):
+        exported.pop(field)
+    assert family_entry("llada2_moe").masked_walk(exported) is None
+    assert isinstance(pipeline(str(FIXTURES / "llada2-tiny")).solver, Confident)
+    objective = MaskedDiffusionObjective(source, MDLM(mask_id=source.model.mask_token_id)(), 8,
+                                         ema_decay=None, processor=RunProcessor(ByteTokenizer()))
+    assert (objective.solver, objective.steps, objective.block) == (solver, steps, block)
+    rows = jax.device_count()
+    stream = grain.MapDataset.source([{"text": np.full((rows, 8), 7, np.int32)}]).repeat().to_iter_dataset()
+    data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
+    state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(19),
+                    checkpoints=Checkpoints(str(tmp_path / "run"))).fit(data, steps=1, checkpoint_every=1,
+                                                                         log_every=1)
+    live = objective.pipeline(state)
+    prompt = jnp.asarray([[3, 5, 6]], jnp.int32)
+    expected = live(prompt, 8, key=7).host().tokens
+    for restored in (MaskedGeneration.from_run(str(tmp_path / "run")), pipeline(str(tmp_path / "run"))):
+        assert (restored.solver, restored.steps, restored.block) == (solver, steps, block)
+        np.testing.assert_array_equal(restored(prompt, 8, key=7).host().tokens, expected)
+
+
 def test_confident_spreads_a_fixed_quota_where_no_block_is_walked():
     """Without a block, `Confident`'s quota spreads the slots masked at the walk's first step over its
     steps, fixed: eight masked slots over three steps reveal 3, 3 and 2 at a threshold no draw passes,

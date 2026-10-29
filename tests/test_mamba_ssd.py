@@ -108,7 +108,13 @@ def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
                         and value.tobytes() == other.tobytes()), f"{case}: {name} differs"
 
 
-@pytest.mark.parametrize("case", CASES)
+WHOLE_SUITE_CASES = {"bf16": 256, "ragged-documents": 130, "wide-state-documents": 297}
+"""The port's cases whose interpreted seeds take a group past its two minutes (seconds, train 270's CI on
+f58abb8a3, ledger 2119), which the whole suite runs."""
+
+
+@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.whole_suite)
+                                  if case in WHOLE_SUITE_CASES else case for case in CASES])
 def test_the_port_is_as_exact_as_mamba_ssm(case):
     """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
 

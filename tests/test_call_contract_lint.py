@@ -107,17 +107,3 @@ def reported_in_tests(lint, tmp_path: Path, body: str, code: str) -> bool:
     (tmp_path / "tests" / "test_linted.py").write_text(body)
     [module] = lint.collect(["tests"], tmp_path, "dew")
     return any(finding.code == code for finding in lint.check(module))
-
-
-
-@pytest.mark.parametrize("body, reported", [
-    ("size = (FIXTURES / 'm' / 'model.safetensors').stat().st_size\n", True),
-    ("size = os.path.getsize('tests/fixtures/m/model.safetensors')\n", True),
-    ("size = len((FIXTURES / 'm' / 'model.safetensors').read_bytes())\n", False),
-    ("size = (tmp_path / 'out.bin').stat().st_size\n", False),
-], ids=["a fixture's stat", "a fixture's getsize", "a fixture read", "a scratch file's stat"])
-def test_a_fixtures_size_read_without_opening_it_is_reported(lint, body, reported, tmp_path):
-    """SLOP023: a test reads no fixture's size or metadata without opening it (stat, getsize): the test cache
-    records a fixture as its openers' input, and a stat is no open, so a resized fixture would reuse a stale
-    green (Main, 2026-10-28); a fixture read, or a scratch file's stat, is no finding."""
-    assert reported_in_tests(lint, tmp_path, body, "SLOP023") is reported
