@@ -889,12 +889,12 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         del views
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
 
-    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
+    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *, first: jax.Array | int = 0,
             refills: bool = True) -> "dict[str, Ring] | Feed":
-        """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`): on a layout with a
-        producer, the rings, which its producer loads from `views` (`stream`); on one whose consumers feed
-        them (`ConsumerFed.fed`), a `Feed`."""
-        del views, lo, hi, wg, refills
+        """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`), the walk taking the same
+        `first`: on a layout with a producer, the rings, which its producer loads from `views` (`stream`);
+        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`."""
+        del views, lo, hi, wg, first, refills
         return streams
 
     def stream(self, streams, views: dict, lo, hi) -> None:
@@ -1113,19 +1113,21 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
 @dataclasses.dataclass(frozen=True)
 class Feed:
-    """A walk's steps `lo` to `hi` (ring counters) as a consumer-fed walk reads them (`ConsumerFed`): the
-    loading consumer (`loads`, one warpgroup's traced flag) loads step `counter` into each of `rings` from
-    its view of `views` at the step's place in the walk (`counter - lo`), the first steps before the walk
-    (`primed`) and each later one once the slot it reuses is given back (`refilled`): by the walk after
-    each step's release, or where `refills` is False by the template, at a point of its own (a walk whose
-    turns order its consumers refills past the turn that lets the other finish); the loading consumer
-    waits at the walk's end for every slot's last release where it `drains` (a plain walk's; `persist`
-    drains after a program's last tile)."""
+    """A walk's steps `lo` to `hi` (its indices, `walk`'s segment bounds) as a consumer-fed walk reads them
+    (`ConsumerFed`), step `index` in the rings' slot of counter `index - first` (`walk`'s `first`, as
+    `Slots` takes it): the loading consumer (`loads`, one warpgroup's traced flag) loads each step into
+    each of `rings` from its view of `views` at the step's place in the walk (`index - lo`), the first
+    steps before the walk (`primed`) and each later one once the slot it reuses is given back
+    (`refilled`, at the given step's counter): by the walk after each step's release, or where `refills`
+    is False by the template, at a point of its own (a walk whose turns order its consumers refills past
+    the turn that lets the other finish); the loading consumer waits at the walk's end for every slot's
+    last release where it `drains` (a plain walk's; `persist` drains after a program's last tile)."""
     rings: dict[str, Ring]
     views: dict
     lo: jax.Array
     hi: jax.Array
     loads: jax.Array
+    first: jax.Array | int = 0
     refills: bool = True
     drains: bool = False
 
@@ -1133,19 +1135,19 @@ class Feed:
     def stages(self) -> int:
         return min(ring.stages for ring in self.rings.values())
 
-    def load(self, counter) -> None:
+    def load(self, index) -> None:
         for name, ring in self.rings.items():
-            ring.load(counter, viewed(self.views[name], ring.smem.shape[1:], counter - self.lo))
+            ring.load(index - self.first, viewed(self.views[name], ring.smem.shape[1:], index - self.lo))
 
     def primed(self) -> None:
-        """The tile's first steps, a slot each, loaded."""
+        """The walk's first steps, a slot each, loaded."""
         for ahead in range(self.stages):
             pl.when(self.loads & (self.lo + ahead < self.hi))(lambda ahead=ahead: self.load(self.lo + ahead))
 
     def refilled(self, counter) -> None:
-        """Step `counter`'s slots, given back, take the tile's step a ring ahead where it has one: its load
-        waits until every consumer has given them back (`Ring.load`)."""
-        ahead = counter + self.stages
+        """The step at ring counter `counter`, its slots given back, has them take the walk's step a ring
+        ahead where it has one: its load waits until every consumer has given them back (`Ring.load`)."""
+        ahead = counter + self.first + self.stages
         pl.when(self.loads & (ahead < self.hi))(lambda: self.load(ahead))
 
     def drained(self) -> None:
@@ -1154,7 +1156,7 @@ class Feed:
         @pl.when(self.loads)
         def _():
             for ring in self.rings.values():
-                ring.drain(self.hi)
+                ring.drain(self.hi - self.first)
 
 
 class ConsumerFed[Accumulator](RingFamily[Accumulator]):
@@ -1188,11 +1190,11 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         raise NotImplementedError(f"{self.name}'s consumers each walk every step of their rings (`fed`)")
 
-    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
+    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *, first: jax.Array | int = 0,
             refills: bool = True) -> "dict[str, Ring] | Feed":
-        """`RingFamily.fed`: a `Feed` of steps `lo` to `hi` from `views`, its first steps primed by the
-        loading consumer, drained at its walk's end."""
-        feed = Feed(streams, views, lo, hi, wg == self.loader, refills=refills, drains=True)
+        """`RingFamily.fed`: a `Feed` of steps `lo` to `hi` from `views`, at the walk's `first`, its first
+        steps primed by the loading consumer, drained at its walk's end."""
+        feed = Feed(streams, views, lo, hi, wg == self.loader, first=first, refills=refills, drains=True)
         feed.primed()
         return feed
 
@@ -1201,6 +1203,10 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
                 ) -> tuple[C, tuple[jax.Array, ...]]:
         if not isinstance(streams, Feed):
             raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
+        # The feed loads each step at the ring counter the walk reads it at, both `index - first`.
+        first = streams.first if isinstance(first, int) and first == 0 else first
+        if first is not streams.first:
+            raise ValueError(f"{self.name}'s fed walk takes the `first` its feed was made with (`fed`)")
         if in_flight and len(segments) > 1:
             # A segment's last step's release waits for the walk's end, which the feed's next segment, its
             # loads behind that release, would never reach.
