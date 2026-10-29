@@ -477,14 +477,18 @@ def earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, object]:
-    """The fields of the component class `name` with each decoder its fields declare
-    (`dew.registry.declared_type`) and record as their fields alone translated (`_decoder_fields`)."""
+    """The fields of the component class `name`, by import path or by its alias of any kind (a mixer's
+    `attention`), with each decoder its fields declare (`dew.registry.declared_type`) and record as
+    their fields alone translated (`_decoder_fields`); unchanged where `name` names no one class."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.registry import declared_type, imported, models
+    from dew.registry import KINDS, declared_type, imported
 
-    owner = models[name] if name in models.paths else imported(name)
-    if not isinstance(owner, type):
+    named = [imported(name)] if ":" in name else [imported(kind.paths[name]) for kind in KINDS
+                                                   if name in kind.paths]
+    classes = [member for member in named if isinstance(member, type)]
+    if len(classes) != 1:
         return fields
+    (owner,) = classes
     return {field: (_decoder_fields(value) if isinstance(value, Mapping) and "class" not in value
                     and declared_type(owner, field) is CausalTransformer else value)
             for field, value in fields.items()}

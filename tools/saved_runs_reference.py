@@ -1,7 +1,7 @@
 """Write a saved run of each run kind at this checkout, for tests/test_saved_runs.py to read at every
 later main (row 2282).
 
-Each kind's run (tests/test_saved_runs.py's `SAVED_KINDS`: tests/test_run_options.py's `KINDS`, its data
+Each kind's run (tests/saved_run_kinds.py's `SAVED_KINDS`: tests/test_run_options.py's `KINDS`, its data
 as there, synthetic tickets, the repo's tiny image records and token files, the tiny Laya fixture, and an
 LM run over a tiny multimodal source) trains two steps from Python and keeps its last
 checkpoint; its run directory, the run.json and the checkpoint, is packed as an xz tarball, held as the
@@ -34,6 +34,36 @@ sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tools")]
 CORPUS = "tests/fixtures/saved_runs"
 
 
+def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
+    """The directory `run` as the corpus holds it: an xz tarball of it under `name`, its members in
+    name order, none with an owner, every one at time 0 and of one mode a kind, and each of `places`,
+    a directory of the machine that wrote it (its scratch directory, its checkout), read in every text
+    file as the place a later checkout reads it from, so the archive names no user, host or directory
+    of the writer's; a binary file, which a later main reads as it was written, is kept as it is."""
+    packed = io.BytesIO()
+    with tarfile.open(fileobj=packed, mode="w:xz") as archive:
+        for path in sorted([run, *run.rglob("*")]):
+            info = tarfile.TarInfo((Path(name) / path.relative_to(run)).as_posix())
+            info.mtime, info.uid, info.gid, info.uname, info.gname = 0, 0, 0, "", ""
+            if path.is_dir():
+                info.type, info.mode = tarfile.DIRTYPE, 0o755
+                archive.addfile(info)
+                continue
+            data = path.read_bytes()
+            try:
+                text = data.decode()
+            except UnicodeDecodeError:
+                text = None
+            if text is not None:
+                # The longest place first, so a checkout within a scratch directory is read whole.
+                for place in sorted(places, key=len, reverse=True):
+                    text = text.replace(place, places[place])
+                data = text.encode()
+            info.size, info.mode = len(data), 0o644
+            archive.addfile(info, io.BytesIO(data))
+    return packed.getvalue()
+
+
 def main() -> None:
     import os
 
@@ -48,7 +78,7 @@ def main() -> None:
 
     import numpy as np
     from fetched_fixtures import save
-    from test_saved_runs import SAVED_KINDS
+    from saved_run_kinds import SAVED_KINDS
 
     from dew.config import TrainerConfig
 
@@ -65,12 +95,11 @@ def main() -> None:
             # A source the repo holds is recorded by its path in the repo, which a later checkout reads
             # where it sits; a resume refuses another source (`RunConfig.check_resume`).
             if getattr(run, "pretrained", None) is not None:
-                run = dataclasses.replace(run, pretrained=Path(run.pretrained).relative_to(ROOT).as_posix())
+                held = (ROOT / run.pretrained).resolve()
+                run = dataclasses.replace(run, pretrained=held.relative_to(ROOT).as_posix())
             run.prepare().train(kind)
-            packed = io.BytesIO()
-            with tarfile.open(fileobj=packed, mode="w:xz") as archive:
-                archive.add(root / "runs" / kind, arcname=kind)
-            save(written / f"{kind}.npz", {"run": np.frombuffer(packed.getvalue(), np.uint8)},
+            packed = anonymous(root / "runs" / kind, kind, {str(root): ".", str(ROOT): "."})
+            save(written / f"{kind}.npz", {"run": np.frombuffer(packed, np.uint8)},
                  reference=f"Dew {commit[:12]}, tools/saved_runs_reference.py", license="MIT", root=args.root)
     source = {"commit": commit, "kinds": sorted(SAVED_KINDS)}
     (args.root / written / "source.json").write_text(json.dumps(source, indent=1) + "\n")
