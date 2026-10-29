@@ -795,6 +795,7 @@ PACKED_SEEDS = 256
 on armada."""
 
 
+@pytest.mark.whole_suite
 def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_model():
     """`dew.pipeline` packs a decoder's projections before quantizing them; served packed, its logits
     and its draws' log-likelihoods, a task's and a server's, are on par (check 1) with the canonical

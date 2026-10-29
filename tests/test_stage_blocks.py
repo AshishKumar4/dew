@@ -166,7 +166,10 @@ def runs_a_pipeline(spec: MeshSpec, model, variables, call, inputs, microbatches
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("case", "layout"), CELLS, ids=[f"{case}-{layout}" for case, layout in CELLS])
+@pytest.mark.parametrize(("case", "layout"), [
+    pytest.param(case, layout, id=f"{case}-{layout}",
+                 marks=pytest.mark.whole_suite if (case, layout) == ("unet", "fsdp2_stage2") else ())
+    for case, layout in CELLS])
 def test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes(case, layout):
     """The model runs its blocks as a pipeline over the stage axis, and its output and gradients are
     on par with one device's, both measured from float64 (check 1). Before, every model but a
