@@ -635,8 +635,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                      None if staged is None else staged.at[index], coords_of, params_of, adds,
                                      store_tiles, shares, part)
             # Its consumers' own loads of its query stream where they feed it (`Family.fed`).
-            fed = (family.fed(streams, views, lo, hi, index) if isinstance(family, mosaic.ConsumerFed)
-                   else streams)
+            fed = (family.fed(streams, views, lo, hi, index, first=lo)
+                   if isinstance(family, mosaic.ConsumerFed) else streams)
             key_sums, (dk, dv) = family.walk(fed, ((step, lo, hi),),
                                              tuple(family.zeros((block_k,)) for _ in key_refs),
                                              tuple((block_k, share) for _, share in shares), walk.interpret,
