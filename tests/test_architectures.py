@@ -40,7 +40,7 @@ from dew.data.images import CAPTIONS
 from dew.diffusion import presets
 from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
-from dew.nn.attention import Stage
+from dew.nn.attention_blocks import Stage
 from dew.nn.text_checkpoints import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective

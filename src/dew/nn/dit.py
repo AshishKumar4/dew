@@ -21,15 +21,17 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
+from dew.nn.attention import AttentionImpl
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
 from .activations import gelu_exact_torch, gelu_tanh
-from .attention import LayerNorm, NormalAttention, QKNorm
+from .attention_blocks import NormalAttention, QKNorm
 from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .mlp import GatedMLP
+from .norms import LayerNorm
 from .precision import at_least_fp32, float32_dot_general, fp32_result_dot_general, weighted_total
 from .rope import rotary_freqs
 from .scan_orders import (
@@ -452,7 +454,7 @@ class _BlockOptions(TypedDict):
     precision: PrecisionLike
     force_fp32_for_softmax: bool
     norm_epsilon: float
-    attention_impl: str
+    attention_impl: AttentionImpl
 
 
 class _AttentionBlockOptions(_BlockOptions):
@@ -473,7 +475,7 @@ class _TransformerOptions(nn.Module, kw_only=True):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
-    attention_impl: str = 'auto'
+    attention_impl: AttentionImpl = 'auto'
 
     @nn.nowrap
     def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
@@ -583,7 +585,7 @@ class ModulatedBlock(nn.Module):
     gelu_approximate: bool = True
     qkv_bias: bool = True
     qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     # ssm mixer options
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True

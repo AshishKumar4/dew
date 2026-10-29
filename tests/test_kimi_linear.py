@@ -6,8 +6,9 @@ shape of every tensor (read off the 20 shard headers). kimi-linear-tiny is
 written by tools/kimi_linear_reference.py from the pinned modeling_kimi.py
 with fla-core 0.4.0's kernels in fp32 on CUDA, its gate weighing the
 released selection by the unbiased scores, as K3's revision of the file and
-vLLM do. Its numerics.npz is the same model evaluated in float64
-(tools/kimi_float64_reference.py), which Dew and the reference are both
+vLLM do. Its numerics.npz is the same released model evaluated in float64
+on the CPU, fla's kernels answered by its own torch references
+(tools/kimi_linear_reference.py truth), which Dew and the reference are both
 measured from (tests/reference_error.py). No model weights are downloaded
 at test time.
 """

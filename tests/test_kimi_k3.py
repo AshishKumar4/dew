@@ -5,8 +5,9 @@ every tensor of moonshotai/Kimi-K3 at f831ab6 (read off the 96 shard
 headers). kimi-k3-tiny is written by tools/kimi_k3_reference.py from the
 pinned modeling_kimi_linear.py with fla-core 0.5.2's kernels in fp32 on
 CUDA; its routed experts are compressed-tensors MXFP4 as in the release.
-Its numerics.npz is the same model evaluated in float64
-(tools/kimi_float64_reference.py), which Dew and the reference are both
+Its numerics.npz is the same released model evaluated in float64 on the
+CPU, fla's kernels answered by its own torch references
+(tools/kimi_k3_reference.py truth), which Dew and the reference are both
 measured from (tests/reference_error.py). No model weights are downloaded
 at test time.
 """

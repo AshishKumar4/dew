@@ -148,6 +148,8 @@ def idefics_block(wide: bool):
     return run
 
 
+# The bfloat16 block runs in the whole suite alone (132 s, ledger 2158); every train computes and
+# differentiates it in float32.
 @pytest.mark.parametrize("dtype", [pytest.param(np.float32, id="float32"),
                                    pytest.param(jnp.bfloat16, id="bfloat16", marks=pytest.mark.whole_suite)])
 def test_the_block_computes_and_differentiates_as_idefics(dtype):
@@ -493,23 +495,23 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
     server = Server.from_task(served_task(), slots=2, capacity=128)
     wide = request(0)
     with pytest.raises(ValueError):
-        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2)
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2, key=0)
     with pytest.raises(ValueError):
-        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2)
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2, key=0)
     for length in (-1, 3):
         with pytest.raises(ValueError):
             server.submit(dataclasses.replace(wide, conditioning={
-                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2)
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2, key=0)
     model = decoder().clone(max_seq_len=128)
     plain = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
                            RunProcessor(Digits()), sampling=Sampling(temperature=0))
     with pytest.raises(ValueError):
-        Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2)
+        Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2, key=0)
     with jax.enable_x64(new_val=True):
         wrapped = np.asarray([2 ** 32 + 1], np.int64)
         with pytest.raises(ValueError):
             server.submit(dataclasses.replace(wide, conditioning={
-                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2)
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2, key=0)
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():

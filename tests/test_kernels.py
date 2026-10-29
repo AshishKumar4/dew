@@ -29,7 +29,8 @@ from reference_error import (
 )
 
 from dew.nn import kernels
-from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
+from dew.nn.attention import scaled_dot_product_attention, weighted_values
+from dew.nn.attention_blocks import NormalAttention
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template

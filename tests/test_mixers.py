@@ -27,7 +27,7 @@ from residual_orders import orders, permuted, residual_width
 
 from dew.batch import coordinates
 from dew.nn import linear
-from dew.nn.attention import alibi_bias
+from dew.nn.attention_masks import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
