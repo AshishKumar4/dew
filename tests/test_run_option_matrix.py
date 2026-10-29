@@ -220,14 +220,16 @@ def test_a_kinds_run_stops_on_a_plateau_of_its_training_loss(kind, tmp_path):
 def test_a_kinds_run_is_profiled_and_trains_quantized_as_set(kind, tmp_path):
     """A profiler window of a step after one of warmup (`profile`) writes a trace of the run's step where
     the window names, and the run saves its final step alone (`checkpoint_final`, its default); a run
-    whose trunk trains quantized (`quantization`) computes its first step's loss otherwise than the
-    run in its compute dtype does, from the one key and data."""
+    whose trunk trains quantized (`quantization`) computes its second step's loss otherwise than the
+    run in its compute dtype does, from the one key and data: the first's gradient flows through the
+    quantized trunk, where a DiT's first loss reads none of it (its output projection is zero at init,
+    adaLN-zero)."""
     window = {"directory": str(tmp_path / "trace"), "steps": 1, "warmup": 1}
     profiled = trained(kind, tmp_path, "profiled", **{"trainer.steps": 3, "trainer.profile": window})
     assert list((tmp_path / "trace").rglob("*.xplane.pb")) and saved(profiled) == [3]
     quantized = trained(kind, tmp_path, "quantized", **{
-        "trainer.steps": 1, "trainer.quantization": trainer_record("quantization", Quantization())})
-    assert scalars(quantized)[1]["train/loss"] != scalars(profiled)[1]["train/loss"]
+        "trainer.steps": 2, "trainer.quantization": trainer_record("quantization", Quantization())})
+    assert scalars(quantized)[2]["train/loss"] != scalars(profiled)[2]["train/loss"]
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
