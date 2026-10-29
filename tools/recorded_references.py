@@ -152,7 +152,7 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
 
 def record_logits(directory: Path, model, wide, command: str, *, reference: str, revision: str, license: str,
                   draw=None, padded: Mapping[str, np.ndarray] | None = None, planned: bool = True,
-                  **details) -> Path:
+                  extra=None, **details) -> Path:
     """The tiny decoder at `directory`'s reference recorded over check 1's seeds, which its test reads in
     the reference's place (a release's remote code or a release apart from the suite's, which the test
     cannot run; hf_reference.py `write_logits_recording`'s): each seed's ids, `draw(seed)` (`{"input_ids":
@@ -161,7 +161,9 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
     (`torch_precision.float64_twin`), inside `torch_precision.float64`, as the leaf `logits`; and with
     `padded`, the fields the reference's padded rows take
     (`attention_mask` and its `position_ids`), the leaf `padded_logits` too: its logits over the ids
-    padded with 0 where the mask is false, at the mask's valid places. The count is planned on Dew's own
+    padded with 0 where the mask is false, at the mask's valid places; and with `extra`, the leaves
+    `extra(network, tokens)` gives over the unpadded ids (a looped model's exit gates), the reference's
+    alone, so its count is not planned on Dew. The count is planned on Dew's own
     load of the fixture, its padded rows under the mask alone, or, not `planned`, where Dew cannot load
     beside the reference's release (Ouro's transformers 4.56.2 pins a huggingface_hub older than Dew's
     interop imports), on the reference alone (`record_case`), and confirmed on the reference; the
@@ -188,6 +190,8 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
             if mask is not None:
                 rows = torch.from_numpy(np.where(mask, ids, 0).astype(np.int64))
                 out["padded_logits"] = network(input_ids=rows, **fields, use_cache=False).logits.numpy()[mask]
+            if extra is not None:
+                out.update({name: value.numpy() for name, value in extra(network, tokens).items()})
         return out
 
     def evaluate(inputs):
@@ -205,6 +209,8 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
             return out
         return run
 
+    if planned and extra is not None:
+        raise ValueError("a recording with leaves of the reference's alone is not planned on Dew")
     proxy = truth_proxy = None
     if planned:
         from dew.interop import Pretrained

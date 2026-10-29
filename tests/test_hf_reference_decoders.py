@@ -65,7 +65,7 @@ def test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_refere
         wide = logits(loaded.model.clone(dtype=jnp.float64), widened(loaded.variables))
         recorded, reference, truth = indexed_recording(
             recording(path), 'logits', seeds, truth_fn=lambda inputs: wide(inputs['input_ids']),
-            inputs_of=lambda seed: {'input_ids': draw(seed)[0]})
+            inputs_of=lambda seed: {'input_ids': draw(seed)[0]}, leaves=('logits', 'padded_logits'))
         assert_as_exact(lambda index, inputs: ours(inputs['input_ids']), reference, recorded,
                         f'{name} logits', seeds=seeds, truth_fn=truth)
         ids = np.load(directory / 'input_ids.npy')
