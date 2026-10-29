@@ -12,17 +12,17 @@ first on the path:
 
 tests/fixtures/hf/ouro-tiny/ is a random OuroForCausalLM of two layers over a
 width of 16, four query heads of 8 over two key/value heads, its stack run
-three times, with fp32 and float64 logits, left-padded logits, the cached
-greedy continuation and each pass's exit-gate logits. ouro-1.4b/ pins the
+three times, with fp32 logits, left-padded logits and the cached greedy
+continuation. ouro-1.4b/ pins the
 released config; `--full` adds probe.npz, the released model's argmax and 64
 of its logit columns on the probe ids, which the network test holds the
 loaded checkpoint to. `--padding` records instead the rows the release's own
 token lookup leaves untrained under ouro-tiny's config with its pad id stated,
 left out and null (`reference_source.record_padding`), as padding.json there.
-`--recording` records instead ouro-tiny's unpadded and left-padded logits over
-check 1's seeds (`recorded_references.record_logits`), as recorded_logits.npz
-there, which tests/test_hf_reference_decoders.py reads where the remote code
-cannot run.
+`--recording` records instead ouro-tiny's unpadded and left-padded logits and
+its exit gates over check 1's seeds (`recorded_references.record_logits`), as
+recorded_logits.npz there, which tests/test_hf_reference_decoders.py and
+tests/test_ouro.py read where the remote code cannot run.
 """
 
 import argparse
@@ -34,7 +34,7 @@ import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 from reference_source import config_lookups, hub_modules, record_padding
-from torch_precision import float64, float64_twin
+from torch_precision import float64_twin
 
 REPO, REVISION = 'ByteDance/Ouro-1.4B', '574fa66cb8bf5abdc979642d01cf2b79b16bfab1'
 FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
@@ -85,16 +85,11 @@ def write_tiny(modeling) -> None:
     padded = np.where(mask, ids, 0)
     positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
     arrays = {'input_ids': ids, 'attention_mask': mask}
-    arrays['logits'], arrays['exit_logits'] = outputs(model, ids)
+    arrays['logits'], _ = outputs(model, ids)
     arrays['padded_logits'], _ = outputs(model, padded, mask, positions)
     with torch.no_grad():
         arrays['generated'] = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
                                              max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
-    # Its float64 twin (`float64_twin`): built inside the widening, so the rotary table is computed in
-    # float64 rather than widened from fp32; the weights are the same.
-    truth = last_pass(float64_twin(model, lambda: modeling.OuroForCausalLM(config)))
-    with float64():
-        arrays['logits_f64'], arrays['exit_logits_f64'] = outputs(truth, ids)
     for name, array in arrays.items():
         np.save(directory / f'{name}.npy', array)
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
@@ -102,7 +97,8 @@ def write_tiny(modeling) -> None:
 
 def write_recording(modeling) -> None:
     """ouro-tiny's committed weights in the remote code's class, fp32 on eager attention reading its last
-    pass, and their float64 twin, recorded over check 1's seeds with the rows `write_tiny` padded."""
+    pass, and their float64 twin, recorded over check 1's seeds with the rows `write_tiny` padded and each
+    pass's exit-gate logits (`outputs`)."""
     import transformers
     from recorded_references import record_logits
 
@@ -111,10 +107,13 @@ def write_recording(modeling) -> None:
                                                                attn_implementation='eager'))
     truth = last_pass(float64_twin(model, lambda: modeling.OuroForCausalLM(model.config)))
     mask = np.load(directory / 'attention_mask.npy')
+    def exits(network, tokens):
+        return {'exit_logits': torch.stack(network.model(input_ids=tokens, use_cache=False)[2])}
+
     record_logits(directory, model, truth,
                   'PYTHONPATH=/tmp/tf456:src:tools .venv-3.12/bin/python tools/ouro_reference.py --recording',
                   reference='OuroForCausalLM (remote code)', revision=f'{REPO}@{REVISION}',
-                  license='Apache-2.0', transformers=transformers.__version__, planned=False,
+                  license='Apache-2.0', transformers=transformers.__version__, planned=False, extra=exits,
                   padded={'attention_mask': mask, 'position_ids': np.maximum(np.cumsum(mask, -1) - 1, 0)})
 
 
