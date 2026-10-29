@@ -57,6 +57,7 @@ from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
 from dew.mesh import LogicalAxes
+from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
@@ -345,7 +346,8 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     key folded by the layer, and a training call that drops with no key is refused."""
     from torchax.interop import jax_view, torch_view
 
-    from dew.nn.attention import causal_attention_mask, scaled_dot_product_attention
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.attention_masks import causal_attention_mask
     from dew.nn.kv_cache import write_cache
     from dew.nn.local_attention import compacted
     from dew.nn.visibility import windowed
@@ -771,7 +773,7 @@ class TorchGraph:
 
     module: JittableModule
     persistent: tuple[str, ...]
-    attention_impl: str | None = None
+    attention_impl: AttentionImpl | None = None
     shapes: Mapping[str, Mapping[str, jax.ShapeDtypeStruct]] = field(default_factory=dict)
     """The source's variables, `params` and `buffers`, as shapes and dtypes: what an initialization,
     which holds none of them, traces the forward over (`TorchCausalLM._run`)."""
@@ -1243,7 +1245,7 @@ class TorchCausalLM(nn.Module):
             raise TypeError("a tier-3 model has no cross-attention to read a context with")
         laid = self._laid(tokens, packing)
         if attention_key_runs is not None:
-            from dew.nn.attention import visibility_mask
+            from dew.nn.attention_masks import visibility_mask
 
             # The runs as the mask they state, the stated visibility this path reads.
             length = jnp.shape(tokens)[1]
@@ -1352,7 +1354,7 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 
 def load(source: sources.SourceReference, root: Path, *, dtype: str,
-         param_dtype: str, attention_impl: str, max_seq_len: int | None,
+         param_dtype: str, attention_impl: AttentionImpl, max_seq_len: int | None,
          admission: TorchAdmission | None = None, weights: bool = True) -> PretrainedFallback:
     """Load the causal LM `source` selects through transformers and torchax.
 

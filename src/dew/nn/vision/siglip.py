@@ -17,8 +17,8 @@ from dew import _records
 from dew.batch import Variables
 from dew.interop.unread import Stored, held
 from dew.interop.weights import checkpoint_array, in_params
-from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import TOWER_ACTIVATIONS, _encoder_layer_path, tower_activation
 from dew.registry import Record

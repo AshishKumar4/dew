@@ -36,10 +36,10 @@ from reference_error import (
 )
 from tuned import each_config
 
-from dew.nn import attention
+from dew.nn import attention, norms
 from dew.nn.activations import gated_product, packed_gated_product
-from dew.nn.attention import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
 from dew.nn.kernels import norm_swiglu, tuning
+from dew.nn.norms import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
 
 pytestmark = pytest.mark.kernel
 
@@ -106,10 +106,10 @@ def fused_gated(epsilon: float, dtype, activation: str):
 
 
 def fused_unweighted(epsilon: float):
-    """`attention.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`), as `fused_seam`
+    """`norms.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`), as `fused_seam`
     is."""
     def portable(x, scale):
-        return attention.unweighted_rmsnorm(x, epsilon, implementation="xla")
+        return norms.unweighted_rmsnorm(x, epsilon, implementation="xla")
 
     return lambda x: norm_swiglu.rms_norm(x, None, epsilon, x.dtype, offset=False, after_cast=False,
                                           portable=portable, inverse_rounded=True)
@@ -265,14 +265,14 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 @pytest.mark.parametrize("case", ["random-2x3x31", "random-3x257x17", "random-5x2x128", "aligned-1x128",
                                   "large-1x128", "small-1x128"])
 def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(dtype, case):
-    """`attention.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`): the inverse RMS
+    """`norms.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`): the inverse RMS
     reduced in fp32 and rounded to the input's dtype before it multiplies, as DeepSeek-V4's and GLM's
     unweighted norms round it, and its reverse rounded where XLA's is; its output and input gradient
     within the float64 gate of XLA's, random rows, a row of 1.5 under a cotangent of ones, whose two
     gradient contributions cancel, and rows of 0.5 under cotangents of 1.5 * 2**119, finite through
     XLA's transposes, and of a subnormal (2**-140 in fp32, 2**-130 in bf16), which they do not halve."""
     def unweighted(x):
-        return attention.unweighted_rmsnorm(x, 1e-6, implementation="xla")
+        return norms.unweighted_rmsnorm(x, 1e-6, implementation="xla")
 
     kind, shape = case.split("-")
     shape = tuple(int(size) for size in shape.split("x"))
@@ -657,7 +657,7 @@ def fused_function(name, fused: bool):
         return lambda gate, up: product(jnp.stack([gate, up], -2))
     if name == "unweighted":
         return lambda x, other, scale: (fused_unweighted(1e-6)(x) if fused else
-                                        attention.unweighted_rmsnorm(x, 1e-6, implementation="xla"))
+                                        norms.unweighted_rmsnorm(x, 1e-6, implementation="xla"))
     if name in ("rms", "stream"):
         # The rms norm offsets its weight and rounds before it; the stream does neither.
         rounded = name == "rms"

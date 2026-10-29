@@ -44,6 +44,7 @@ from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
+from dew.nn.attention import attention_implementation
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention
 from dew.nn.protocols import RematChoosing
@@ -183,6 +184,12 @@ class DecisionRunConfig(DecoderRunConfig):
         flags choose only its compute dtype and attention kernel;
         `param_dtype` chooses the loaded checkpoint's storage dtype. `remat`
         chooses its layer recomputation before looping or attaching LoRA."""
+        pinned = self.pinned_adapter()
+        # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
+        return pinned.prepare() if pinned is not self else self._prepared()
+
+    def _prepared(self) -> Prepared:
+        """`prepare`'s run, its imported adapter pinned."""
         from dew.interop import Pretrained
 
         self.sourced_model()
@@ -191,7 +198,7 @@ class DecisionRunConfig(DecoderRunConfig):
             raise ValueError(f"--model sets {decided}, which {self.pretrained} decides; only dtype and "
                              "attention_impl are choices")
         dtype = str(self.model.fields.get("dtype") or "float32")
-        attention_impl = str(self.model.fields.get("attention_impl", "auto"))
+        attention_impl = attention_implementation(str(self.model.fields.get("attention_impl", "auto")))
         budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
                    "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
                    "framing": self.framing, "segments": self.segments, "order": self.order,
