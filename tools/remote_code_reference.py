@@ -374,8 +374,10 @@ def main() -> None:
         return
     with tempfile.TemporaryDirectory() as scratch:
         if arguments.opens is not None:
-            for name in arguments.names:
-                opens(name, arguments.opens, Path(scratch))
+            # One export is one fixture's save: it opens beside that fixture's release alone.
+            if len(arguments.names) != 1:
+                parser.error(f"--opens checks one fixture's export, and {len(arguments.names)} are named")
+            opens(arguments.names[0], arguments.opens, Path(scratch))
             return
         if arguments.padding:
             for name in arguments.names:

@@ -152,18 +152,21 @@ class InputSpec:
             if not condition.encoder.reads_captions
         }
 
-    def check(self, batch: Batch) -> None:
+    def check(self, batch: Batch, *, whole: bool = True) -> None:
         """Raise `ValueError` if `batch` is missing a field this spec names or has a wrong shape.
 
         The sample and the mask must have their declared per-example shapes.
-        A `ModelInputs` field's shape is taken from its token rows."""
+        A `ModelInputs` field's shape is taken from its token rows. A batch that
+        need not be `whole`, a validation split's that an objective may score
+        from fewer fields (a rollout's prompts alone), is held to the shapes of
+        the fields it carries."""
         for condition in self.conditions.values():
-            if condition.field not in batch:
+            if condition.field not in batch and whole:
                 raise ValueError(
                     f"objective.inputs needs condition field {condition.field!r} in the training batch"
                 )
         for declared in (self.sample, self.mask):
-            if declared is None:
+            if declared is None or (declared.key not in batch and not whole):
                 continue
             if declared.key not in batch:
                 raise ValueError(f"objective.inputs needs field {declared.key!r} in the training batch")
