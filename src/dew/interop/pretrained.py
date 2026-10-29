@@ -78,6 +78,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.diffusion.discrete import Confident
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
@@ -414,9 +415,10 @@ class Pretrained:
         another kind and names that kind.
 
         `text_only=True` loads a multimodal wrapper's language model alone, as its text family's own
-        checkpoint states it (Qwen3.5's `Qwen3_5ForCausalLM`): no tower, projector or audio encoder is
-        built, nor their tensors read, and the source saves as that text checkpoint. A source that is
-        a decoder already loads as it is; a pipeline or a fallback has no language model to take.
+        checkpoint states it (Qwen3.5's `Qwen3_5ForCausalLM`; DeepSeek-V4.1's bundle as its own text
+        checkpoint): no tower, projector or audio encoder is built, nor their tensors read, and the source
+        saves as that text checkpoint. A source that is a decoder already loads as it is; a pipeline or
+        a fallback has no language model to take.
 
         `prediction_depths` keeps the first that many of a decoder's multi-token prediction depths
         (DeepSeek V3's, GLM's and Qwen3.5's `mtp` blocks): None the ones the checkpoint holds, 0
@@ -713,19 +715,35 @@ class PretrainedMaskedDecoder(Pretrained):
     """A masked-diffusion decoder (LLaDA, Dream).
 
     It is a non-causal decoder with a mask id that generates by unmasking a whole
-    response.
+    response, or, where its family declares its release's walk (LLaDA2.0's), a
+    block at a time as the release does (`masked_recipe`).
     """
 
     model: CausalTransformer
+
+    @property
+    def masked_recipe(self) -> tuple[Confident, int, int] | None:
+        """The release's own walk this source generates by, its solver, steps and block
+        (`DecoderFamily.masked_walk` of its config, LLaDA2.0's; `Confident`), or None for a source
+        whose family declares none, an unregistered one among them, which unmasks the whole response
+        with Dew's MDLM. Its task (`text_generation`) and an objective over it
+        (`MaskedDiffusionObjective`) take it alike."""
+        from dew.diffusion.discrete import Confident
+        from dew.interop.hf_decoders import families
+
+        family = families().get(str(self.config.get("model_type")))
+        walk = None if family is None or family.masked_walk is None else family.masked_walk(self.config)
+        if walk is None:
+            return None
+        return Confident(threshold=walk.threshold, temperature=walk.temperature), walk.steps, walk.block
 
     def pipeline(self):
         return self.packed().text_generation()
 
     def text_generation(self) -> MaskedGeneration:
-        """Build the masked generation task this source describes.
-
-        It uses Dew's MDLM sampler, which refines a whole response with Unmask, not
-        the source family's own generation recipe.
+        """Build the masked generation task this source describes, walking as its release does where
+        its family declares the walk (`masked_recipe`), else refining a whole response with Dew's MDLM
+        sampler (`Unmask`), not its family's own recipe.
         """
         from dew.diffusion.discrete import MDLM
 
@@ -734,8 +752,10 @@ class PretrainedMaskedDecoder(Pretrained):
         if mask_id is None:
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
         audit_masked(config, generation)
+        recipe = self.masked_recipe
+        walked = {} if recipe is None else {"solver": recipe[0], "steps": recipe[1], "block": recipe[2]}
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
-                                self.text_processor,
+                                self.text_processor, **walked,
                                 eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
@@ -1779,14 +1799,16 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
+        # A bundle its own family reads whole states its text checkpoint without its vision_config, its
+        # decoder's names and their codec unchanged; another wrapper's language model is its text family's
+        # checkpoint, under names its quantization's module selection does not follow.
         if decoders.bundles(config):
-            raise ValueError(f"{config.get('model_type')} reads its media bundle whole as one decoder "
-                             "family; text_only takes a wrapper whose language model is its own text "
-                             "family's checkpoint")
-        if source_quantization(config) is not None:
+            config = decoders.bundle_text_config(config)
+        elif source_quantization(config) is not None:
             raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
                              "names the wrapper's modules, which its text checkpoint renames")
-        config = decoders.language_model_config(config)
+        else:
+            config = decoders.language_model_config(config)
         route = source_route(config, remote=remote, pinned=pinned)
     elif isinstance(route, WrapperRoute):
         # Before any weight downloads, as the routing of the wrapper's names would (`_wrapper_sources`).
