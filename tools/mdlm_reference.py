@@ -16,15 +16,13 @@ The backbone is a stand-in whose logits are `hidden @ head`, two weights the
 fixture stores. The loss's two `torch.rand` draws are the uniforms
 `MaskedDiffusionObjective` draws from `jax.random.key(0)`: the split's
 first key for the times and its second for the masking. What lands: the
-rows, the weights, the uniforms and the corrupted rows; and the reverse
-step's categorical over each position of a partly masked row, normalized,
-which is the distribution `_ddpm_update` draws from. `--record` records
-instead the per-token loss, the batch's mean loss and its gradient in both
-weights, in float32 and in float64, over check 1's seeds of rows, weights
-and the objective's draws (`drawn_inputs`, `record_case`), as
-tests/fixtures/mdlm/recorded_nelbo.npz.
+rows, the weights, the corrupted rows and times, the per-token loss, the
+batch's mean loss and its gradient in both weights, in float32 and in
+float64; and the reverse step's categorical over each position of a
+partly masked row, normalized, which is the distribution `_ddpm_update`
+draws from.
 
-    PYTHONPATH=src:tools python tools/mdlm_reference.py [--record]
+    PYTHONPATH=src python tools/mdlm_reference.py
 """
 
 from __future__ import annotations
@@ -44,7 +42,6 @@ from torch_precision import replaced
 
 COMMIT = "c112c526d193436838c98d81455ee51f90309470"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mdlm" / "loss.npz"
-RECORDING = FIXTURE.with_name("recorded_nelbo.npz")
 METHODS = {"_sample_t", "q_xt", "forward", "_process_sigma", "_subs_parameterization",
            "_forward_pass_diffusion", "_maybe_sub_sample", "_loss", "_ddpm_update"}
 ROWS, LENGTH, FEATURES, VOCAB = 4, 16, 8, 12
@@ -108,86 +105,30 @@ def recording(q_xt, seen: list):
     return recorded
 
 
-def uniforms(seed: int) -> dict[str, np.ndarray]:
-    """The two uniforms `MaskedDiffusionObjective` draws from `jax.random.key(seed)`: the split's first
-    key for the times and its second for the masking."""
-    time_key, mask_key, _ = jax.random.split(jax.random.key(seed), 3)
-    return {"time_uniform": np.asarray(jax.random.uniform(time_key, (ROWS,))),
-            "mask_uniform": np.asarray(jax.random.uniform(mask_key, (ROWS, LENGTH)))}
-
-
-def drawn_inputs(seed: int) -> dict[str, np.ndarray]:
-    """Check 1's draw of the loss: rows of ordinary tokens, the stand-in's two weights, standard normal,
-    from `seed`'s generator; the objective's uniforms from `jax.random.key(seed)` (`uniforms`), with the
-    seed the objective's key is made from; and the rows `MaskedDiffusionObjective`'s process corrupts
-    under that key, which MDLM's loss reads in both precisions (`nelbo`): a uniform within a rounding of
-    its move chance masks or not by which precision compares it, which would part the two losses by a
-    whole token's term. The same on every run."""
-    import jax.numpy as jnp
-
-    from dew.diffusion.discrete import MDLM as Process
-
-    generator = np.random.default_rng([0x3D1, seed])
-    tokens = generator.integers(0, MASK, (ROWS, LENGTH))
-    process = Process(mask_id=MASK)()
-    time_key, mask_key, _ = jax.random.split(jax.random.key(seed), 3)
-    corrupted, _ = process.corrupt(mask_key, jnp.asarray(tokens), process.sample_t(time_key, ROWS))
-    return {"seed": np.asarray(seed, np.int64), "tokens": tokens,
-            "hidden": generator.standard_normal((ROWS, LENGTH, FEATURES)).astype(np.float32),
-            "head": generator.standard_normal((FEATURES, VOCAB)).astype(np.float32),
-            "corrupted": np.asarray(corrupted), **uniforms(seed)}
-
-
-def nelbo(reference, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
-    """MDLM's `_loss` over `inputs` (`drawn_inputs`) at `dtype`: the per-token loss, the batch's mean
-    and its gradient in both weights, its two `torch.rand` draws the inputs' uniforms and its `q_xt`
-    the inputs' corrupted rows."""
-    backbone = Backbone(inputs["hidden"], inputs["head"], dtype)
-    model = stand_in(reference, backbone)
-    model.q_xt = lambda x, move_chance: torch.tensor(inputs["corrupted"])
-    tokens = torch.tensor(inputs["tokens"])
-    # `q_xt` reads the inputs' corrupted rows, so the loss draws the times' uniforms alone.
-    with drawn(torch.tensor(inputs["time_uniform"], dtype=dtype)):
-        loss = model._loss(tokens, torch.ones_like(tokens, dtype=dtype))
-    loss.loss.backward()
-    return {"nlls": loss.nlls.detach().numpy(), "loss": loss.loss.detach().numpy(),
-            "grad_hidden": backbone.hidden.grad.numpy(), "grad_head": backbone.head.grad.numpy()}
-
-
-def record() -> None:
-    """The loss over check 1's seeds (`record_case`), the inputs drawn again by the test
-    (`drawn_inputs`), its count sized paired with Dew's loss (tests/test_mdlm_reference.py `nelbo`), as
-    check 1 judges it: rows of 16 tokens put few masked terms in a draw, so each arm's error is
-    heavy-tailed across draws alike, and the reference against itself on other draws never resolves."""
-    from recorded_references import provenance, record_case, save
-    from test_mdlm_reference import nelbo as ours
-
-    reference = published()
-    def evaluate(inputs):
-        return nelbo(reference, inputs, torch.float32), nelbo(reference, inputs, torch.float64)
-
-    recorded = record_case("nelbo", drawn_inputs, evaluate, store_inputs=False, dew=jax.jit(ours))
-    made = provenance("kuleshov-group/mdlm", COMMIT, "cpu",
-                      "PYTHONPATH=src:tools python tools/mdlm_reference.py --record", torch=torch.__version__)
-    print(save(RECORDING, {**recorded, "nelbo.provenance": made}, reference="kuleshov-group/mdlm",
-               license="Apache-2.0"))
-
-
 def main() -> None:
     reference = published()
     generator = np.random.default_rng(9)
     arrays = {"tokens": generator.integers(0, MASK, (ROWS, LENGTH)),
               "hidden": generator.standard_normal((ROWS, LENGTH, FEATURES)).astype(np.float32),
-              "head": generator.standard_normal((FEATURES, VOCAB)).astype(np.float32), **uniforms(0)}
+              "head": generator.standard_normal((FEATURES, VOCAB)).astype(np.float32)}
+    time_key, mask_key, _ = jax.random.split(jax.random.key(0), 3)
+    arrays["time_uniform"] = np.asarray(jax.random.uniform(time_key, (ROWS,)))
+    arrays["mask_uniform"] = np.asarray(jax.random.uniform(mask_key, (ROWS, LENGTH)))
     for dtype, tail in ((torch.float32, ""), (torch.float64, "_f64")):
-        model = stand_in(reference, Backbone(arrays["hidden"], arrays["head"], dtype))
+        backbone = Backbone(arrays["hidden"], arrays["head"], dtype)
+        model = stand_in(reference, backbone)
         tokens = torch.tensor(arrays["tokens"])
         seen = []
         model.q_xt = recording(model.q_xt, seen)
         with drawn(torch.tensor(arrays["time_uniform"], dtype=dtype),
                    torch.tensor(arrays["mask_uniform"], dtype=dtype)):
-            model._loss(tokens, torch.ones_like(tokens, dtype=dtype))
+            loss = model._loss(tokens, torch.ones_like(tokens, dtype=dtype))
+        loss.loss.backward()
         arrays[f"corrupted{tail}"] = seen[0].numpy()
+        arrays[f"nlls{tail}"] = loss.nlls.detach().numpy()
+        arrays[f"loss{tail}"] = np.asarray(loss.loss.item())
+        arrays[f"grad/hidden{tail}"] = backbone.hidden.grad.numpy()
+        arrays[f"grad/head{tail}"] = backbone.head.grad.numpy()
     # The reverse step's categorical from t to s over a row with every other
     # position masked: `_ddpm_update`'s q_xs, normalized per position.
     backbone = Backbone(arrays["hidden"], arrays["head"], torch.float64)
@@ -214,9 +155,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import sys
-
-    if sys.argv[1:] == ["--record"]:
-        record()
-    else:
-        main()
+    main()

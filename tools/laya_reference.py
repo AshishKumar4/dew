@@ -12,8 +12,8 @@ fp32 and again in float64, and writes
 
 - layouts.json: each question's token ids and option markers, which Dew's
   layout must reproduce exactly;
-- logits.npz, for the released checkpoint: each question's option logits, fp32
-  under `<layout>/<case>/<id>` and float64 under `<layout>/<case>/<id>/f64`;
+- logits.npz: each question's option logits, fp32 under `<layout>/<case>/<id>`
+  and float64 under `<layout>/<case>/<id>/f64`;
 - answers.json: `Agent.system_one` on each request, the published wire
   answers, in fp32 on the CPU;
 
@@ -23,13 +23,9 @@ Two checkpoints: `tiny`, a random three-layer encoder and two-layer head
 with a byte-level BPE vocabulary trained here, written whole under
 tests/fixtures/laya/tiny; and with `--real`, the released English
 checkpoint at LAYA_REVISION, whose references go to tests/fixtures/laya/real
-for the network test. `--record` records instead the tiny checkpoint's
-option logits, both layouts, fp32 and float64, over check 1's seeds of
-requests whose texts are drawn again (`drawn_cases`), as
-tests/fixtures/laya/tiny/recorded_logits.npz, which tests/test_decision_laya.py
-holds Dew to.
+for the network test.
 
-    PYTHONPATH=src:tools python tools/laya_reference.py [--real | --record]
+    PYTHONPATH=src:tools python tools/laya_reference.py [--real]
 """
 
 import argparse
@@ -127,12 +123,8 @@ def write_tiny(directory: Path) -> None:
         "temperature_by_options": {"choice:3-5": 1.2, "choice:11+": 0.3, "noul:2": 2.0}}, indent=2) + "\n")
 
 
-def runs(directory: Path):
-    """Laya's agent over `directory`, as a function of requests and a layout: each question's option
-    logits by `<layout>/<case>/<id>` (what `Agent` runs: `_check_question` and `_to_internal`,
-    `build_sequence` over the state tokenized once, `collate_items` and `DecisionModel.forward`), in
-    fp32, or `wide` by its float64 twin inside `float64`; and each question's layout by the same key.
-    Returns the agent, Laya's common module and the function."""
+def references(directory: Path, out: Path) -> None:
+    """Laya's layouts, logits in fp32 and float64, and agent answers for `directory`."""
     from torch_precision import float64, float64_twin
 
     agent_module, common = _laya()
@@ -145,11 +137,10 @@ def runs(directory: Path):
     encoder = directory / "encoder"
     exact = float64_twin(model, lambda: common.build_model(
         config, encoder_dir=str(encoder) if encoder.exists() else None, pretrained=False))
-
-    def run(requests: dict, parallel: bool, wide: bool = False) -> tuple[dict, dict]:
+    layouts, logits = {}, {}
+    for parallel in (False, True):
         name = "parallel" if parallel else "sequential"
-        layouts, logits = {}, {}
-        for case, request in requests.items():
+        for case, request in CASES.items():
             state = request["state"]
             state_ids = tokenizer(common.serialize_state(state).replace(tokenizer.mask_token, " "),
                                   add_special_tokens=False)["input_ids"]
@@ -171,125 +162,27 @@ def runs(directory: Path):
                              batch["marker_mask"], batch["qtype"])
                 extra = ({"position_ids": batch["position_ids"], "option_ids": batch["option_ids"]}
                          if parallel else {})
-                if wide:
-                    with float64(), torch.no_grad():
-                        logits[key] = exact(*arguments, **extra)[0][0].double().numpy()
-                else:
-                    with torch.no_grad():
-                        logits[key] = model(*arguments, **extra)[0][0].numpy()
-        return logits, layouts
-
-    return agent, run
-
-
-def references(directory: Path, out: Path, *, logits: bool = True) -> None:
-    """Laya's layouts, logits in fp32 and float64 unless not `logits`, and agent answers for
-    `directory`."""
-    agent, run = runs(directory)
-    layouts, found = {}, {}
-    for parallel in (False, True):
-        fp32, laid = run(CASES, parallel)
-        wide, _ = run(CASES, parallel, wide=True)
-        layouts.update(laid)
-        found.update({**fp32, **{f"{key}/f64": value for key, value in wide.items()}})
+                with torch.no_grad():
+                    logits[key] = model(*arguments, **extra)[0][0].numpy()
+                with float64(), torch.no_grad():
+                    logits[f"{key}/f64"] = exact(*arguments, **extra)[0][0].double().numpy()
     answers = {case: agent.system_one(request["state"], request["questions"])
                for case, request in CASES.items()}
     out.mkdir(parents=True, exist_ok=True)
     (out / "layouts.json").write_text(json.dumps(layouts) + "\n")
-    if logits:
-        np.savez(out / "logits.npz", **found)
+    np.savez(out / "logits.npz", **logits)
     (out / "answers.json").write_text(json.dumps(answers, indent=1) + "\n")
-
-
-WORDS = sorted({word for case in CASES.values() for word in json.dumps(case).replace("\\", " ").split()
-                if word.isalpha()})
-"""The words a drawn request's text is made of: those the committed cases hold, which the tiny
-tokenizer was trained on."""
-
-
-def drawn_cases(seed: int) -> dict[str, np.ndarray]:
-    """Check 1's draw of the requests: `CASES` with every free text (a state's string, a message's
-    content, an instruction's question, an option's description) drawn again from `WORDS` at its own
-    word count, a bracketed marker kept where it stands; their structure (the question types, the
-    option labels a dict names, the conversation's turns, a None) kept, so each case lays out as it
-    does, cut where it is; a list's labels are drawn distinct, case aside. As JSON's UTF-8 bytes, under
-    `cases` (an array a program can take beside the draw's other inputs, `requests`), the same on every
-    run."""
-    generator = np.random.default_rng([0x1A7A, seed])
-
-    def text(value: str) -> str:
-        return " ".join(word if word.startswith("[") else str(generator.choice(WORDS))
-                        for word in value.split())
-
-    def drawn(value, key=None):
-        if isinstance(value, str):
-            return value if key in ("type", "role") else text(value)
-        if isinstance(value, dict):
-            return {name: drawn(item, name) for name, item in value.items()}
-        if isinstance(value, list):
-            # A list of options is their labels, the answer keys, which must differ: drawn until they do.
-            items = [drawn(item) for item in value]
-            while len({json.dumps(item).lower() for item in items}) < len(items):
-                items = [drawn(item) for item in value]
-            return items
-        return value
-
-    return {"cases": np.frombuffer(json.dumps(drawn(CASES)).encode(), np.uint8)}
-
-
-def requests(inputs) -> dict:
-    """The requests a draw (`drawn_cases`) holds."""
-    return json.loads(np.asarray(inputs["cases"], np.uint8).tobytes().decode())
-
-
-def record(directory: Path) -> Path:
-    """Laya's option logits over check 1's seeds of requests (`drawn_cases`, `record_case`), both
-    layouts, fp32 and float64, as recorded_logits.npz in `directory`, its count sized paired with
-    Dew's logits (tests/test_decision_laya.py `logits`), as check 1 judges them: a question's few option
-    logits make each arm's error heavy-tailed across draws alike, and Laya against itself on other
-    draws never resolves."""
-    import transformers
-    from recorded_references import provenance, record_case, save
-    from test_decision_laya import logits
-
-    from dew.decision import Decide
-
-    _, run = runs(directory)
-    checkpoint = Decide.from_pretrained(directory, attention_impl="xla")
-
-    def ours(inputs):
-        drawn = requests(inputs)
-        return {key: value for parallel in (False, True)
-                for key, value in logits(checkpoint, parallel=parallel, requests=drawn).items()}
-
-    def evaluate(inputs):
-        drawn = requests(inputs)
-        fp32 = {key: value for parallel in (False, True) for key, value in run(drawn, parallel)[0].items()}
-        wide = {key: value for parallel in (False, True)
-                for key, value in run(drawn, parallel, wide=True)[0].items()}
-        return fp32, wide
-
-    recorded = record_case("laya", drawn_cases, evaluate, store_inputs=False, dew=ours)
-    made = provenance("NandhaKishorM/laya", LAYA_COMMIT, "cpu",
-                      "PYTHONPATH=src:tools python tools/laya_reference.py --record",
-                      transformers=transformers.__version__, torch=torch.__version__)
-    return save(directory / "recorded_logits.npz", {**recorded, "laya.provenance": made},
-                reference="NandhaKishorM/laya", license="Apache-2.0")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--real", action="store_true", help="also the released English checkpoint")
-    parser.add_argument("--record", action="store_true", help="only the tiny checkpoint's logits over seeds")
     args = parser.parse_args()
-    if args.record:
-        print(record(FIXTURES / "tiny"))
-        return
     FIXTURES.mkdir(parents=True, exist_ok=True)
     (FIXTURES / "cases.json").write_text(json.dumps(CASES, indent=1, ensure_ascii=False) + "\n")
     tiny = FIXTURES / "tiny"
     write_tiny(tiny)
-    references(tiny, tiny, logits=False)
+    references(tiny, tiny)
     if args.real:
         from huggingface_hub import snapshot_download
 

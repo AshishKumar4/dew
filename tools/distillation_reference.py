@@ -227,7 +227,7 @@ def main() -> None:
 
     # The teacher's outputs are not stored: the test runs the teacher's forward as the objective does.
     arrays = {**flat(student_vars, "student/"), **flat(teacher_vars, "teacher/"), **projections,
-              "tokens": tokens}
+              "tokens": tokens, "student_logits": student_logits}
     for index, own in enumerate(student_states):
         arrays[f"student_feature_{index}"] = own
     for kind in ("cosine", "l2"):

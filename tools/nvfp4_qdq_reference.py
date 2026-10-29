@@ -8,11 +8,11 @@ to fp32 for the rounding comparison. Both files run through transformers
 5.16.1 from_pretrained; only redundant weight QDQ is disabled, checked
 bit for bit before recording. Input QDQ stays enabled.
 
-The quantizer's fp32 result is recorded per Linear call, together with
-the input, scale and weights, for a bit-for-bit codec/quantizer test. The
-checkpoints' logits are run in the test (tests/interop_support.py
-`compressed_tensors_arms`), their float64 truth widening the model's continuous
-operations while the quantizer keeps its fp32 codes and scales.
+Float64 widens the model's continuous operations. The quantizer itself
+still computes its fp32 codes/scales before widening the QDQ result,
+since changing a discontinuous quantizer's dtype changes its function.
+Its fp32 result is separately recorded per Linear call, together with
+the input, scale and weights, for a bit-for-bit codec/quantizer test.
 
 Environment (~/.cache/dew/reference-venvs/nvfp4-storage): torch 2.14.0+cpu,
 transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
@@ -21,6 +21,7 @@ transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
 """
 
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -30,6 +31,7 @@ from compressed_tensors.quantization.utils.helpers import generate_gparam
 from compressed_tensors_mxfp4_reference import TIES
 from nvfp4_storage_reference import ARGS, compress
 from safetensors.torch import save_file
+from torch_precision import float64, float64_twin
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "nvfp4_qdq"
@@ -84,7 +86,7 @@ def checkpoint(e4m3: bool) -> None:
             module.quantization_status = QuantizationStatus.COMPRESSED
     with torch.no_grad():
         np.testing.assert_array_equal(model(ids, use_cache=False).logits.numpy(), reference)
-    arrays = {"ids": ids.numpy()}
+    arrays = {"ids": ids.numpy(), "logits": reference}
     for name, module in model.named_modules():
         if name not in calibration:
             continue
@@ -108,8 +110,38 @@ def checkpoint(e4m3: bool) -> None:
         arrays["probe/qdq"] = forward_quantize(module, probe, "input", inputs).numpy()
         arrays["probe/qdq_bf16"] = forward_quantize(module, probe.bfloat16(), "input", inputs).float().numpy()
         arrays["probe/global"] = module.input_global_scale.numpy()
+    # The float64 truth read from the same files inside `float64`, so its rotary table is float64's (the
+    # float32 read cast afterwards keeps float32's), the float32 read's decoded weights and quantizer
+    # state loaded into it, its wrappers the same.
+    exact = float64_twin(model, lambda: AutoModelForCausalLM.from_pretrained(
+        directory, dtype=torch.float64, attn_implementation="eager"))
+    for module in exact.modules():
+        if hasattr(module, "quantization_status"):
+            module.quantization_status = QuantizationStatus.COMPRESSED
+    direct_float = torch.Tensor.float
+
+    def quantize_wide(module, value, base_name, args):
+        # The quantizer defines the discrete function in fp32. Its stored
+        # globals must stay fp32 even though the surrounding model widens.
+        overall = module.input_global_scale
+        module.input_global_scale = torch.nn.Parameter(direct_float(overall), requires_grad=False)
+        try:
+            return forward_quantize(module, direct_float(value), base_name, args).double()
+        finally:
+            module.input_global_scale = overall
+
+    with float64(), torch.no_grad(), patch(
+            "compressed_tensors.quantization.lifecycle.forward.forward_quantize", quantize_wide):
+        arrays["logits_f64"] = exact(ids, use_cache=False).logits.numpy()
+    for module in model.modules():
+        module.quantization_enabled = False
+    with torch.no_grad():
+        arrays["weight_only_logits"] = model(ids, use_cache=False).logits.numpy()
     np.savez(directory / "reference.npz", **arrays)
-    print(directory.name, sorted(arrays))
+    rms = float(np.sqrt(np.mean((reference - arrays["logits_f64"]) ** 2)))
+    apart = float(np.sqrt(np.mean((reference - arrays["weight_only_logits"]) ** 2)))
+    print(directory.name, "reference RMS from float64", rms,
+          "QDQ RMS from weight-only", apart)
 
 
 if __name__ == "__main__":

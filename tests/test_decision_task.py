@@ -10,7 +10,7 @@ import jax
 import numpy as np
 import pytest
 from decision_support import decision_rows
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from steady_state import steady_state
 
 from dew.artifacts import Decisions
@@ -168,25 +168,22 @@ def test_strict_answers_drop_the_extensions_and_hold_jevs_fields(decide):
 
 
 def test_a_small_budget_splits_passes_without_moving_a_logit(decide):
-    """Every question of every case at a budget of two rows a pass, on par with Laya's one-row logits
-    over its recording's seeds of requests (check 1, tests/test_decision_laya.py `recorded`)."""
-    from test_decision_laya import drawn_requests, recorded
-
+    """Every question of every case at a budget of two rows a pass, held to
+    Laya's one-row logits under the float64 rule."""
     small = replace(decide, budget=Budget(tokens=256, rows=2))
-
-    @as_given
-    def budgeted(index, inputs):
-        rows, keys = [], []
-        for case, request in drawn_requests(inputs).items():
-            laid = small._encoded(request["state"], {name: Question.from_wire(wire)
-                                                     for name, wire in request["questions"].items()})
-            rows.extend(laid)
-            keys.extend(f"sequential/{case}/{encoded.questions[0].name}" for encoded in laid)
-        return {key: logits[0, :len(encoded.questions[0].options)]
-                for key, encoded, logits in zip(keys, rows, small.logits(rows), strict=True)}
-
-    draw, reference, truth, seeds = recorded(parallel=False)
-    assert_as_exact(budgeted, reference, draw, "budgeted logits", seeds=seeds, truth_fn=truth)
+    rows, keys = [], []
+    for case, request in CASES.items():
+        laid = small._encoded(request["state"], {name: Question.from_wire(wire)
+                                                 for name, wire in request["questions"].items()})
+        rows.extend(laid)
+        keys.extend(f"sequential/{case}/{encoded.questions[0].name}" for encoded in laid)
+    found = [logits[0, :len(encoded.questions[0].options)]
+             for encoded, logits in zip(rows, small.logits(rows), strict=True)]
+    with np.load(TINY / "logits.npz") as reference:
+        assert_as_exact_as_the_reference(np.concatenate(found),
+                                         np.concatenate([reference[key] for key in keys]),
+                                         np.concatenate([reference[f"{key}/f64"] for key in keys]),
+                                         "budgeted logits")
 
 
 def test_a_tournament_takes_each_group_winner_to_the_final(decide):

@@ -135,13 +135,30 @@ def author_weight(stored: dict[str, torch.Tensor], stem: str) -> torch.Tensor:
                                double_scale=stored[stem + ".weight_scale_2"], block_sizes={-1: 16})
 
 
-def references(directory: Path, arrays: dict | None = None):
-    """The committed ModelOpt checkpoint at `directory` as the author decodes and runs it on CUDA: the
-    fp32 reference (transformers' Qwen3 over `author_weight`'s decoded weights, each input quantizer a
-    forward hook), its float64 twin with the same hooks, the hooks, the stored tensors and the quantized
-    stems; each fp32 forward's per-Linear inputs and QDQ outputs kept in `arrays` where given."""
-    from torch_precision import float64_twin
+def tiny(*, mixed: bool = False) -> None:
+    from torch_precision import float64, float64_twin
 
+    torch.manual_seed(2049)
+    config = Qwen3Config(vocab_size=96, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
+                        num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+                        max_position_embeddings=64, tie_word_embeddings=True)
+    config._attn_implementation = "eager"
+    config.architectures = ["Qwen3ForCausalLM"]
+    ids = torch.tensor([[2, 8, 17, 5, 23, 9, 51, 43], [31, 16, 3, 19, 42, 11, 78, 39]], device="cuda")
+    model = Qwen3ForCausalLM(config).to("cuda", dtype=torch.bfloat16).eval()
+    scheme = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
+    if mixed:
+        scheme = {'algorithm': 'max', 'quant_cfg': [
+            {'quantizer_name': '*', 'enable': False},
+            {'quantizer_name': '*self_attn.*weight_quantizer', 'cfg': {'num_bits': (4, 3), 'axis': None}},
+            {'quantizer_name': '*self_attn.*input_quantizer', 'cfg': {'num_bits': (4, 3), 'axis': None}},
+            {'quantizer_name': '*mlp.*weight_quantizer', 'cfg': {
+                'num_bits': (2, 1), 'block_sizes': {-1: 16, 'type': 'dynamic', 'scale_bits': (4, 3)}}},
+        ]}
+    model = mtq.quantize(model, scheme,
+                         forward_loop=lambda module: module(ids, use_cache=False))
+    directory = ROOT / ('mixed' if mixed else 'tiny')
+    export_hf_checkpoint(model, dtype=torch.bfloat16, export_dir=directory)
     stored = load_file(directory / "model.safetensors", device="cuda")
     config = Qwen3Config.from_pretrained(directory)
     del config.quantization_config
@@ -151,10 +168,10 @@ def references(directory: Path, arrays: dict | None = None):
     suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
     parts = {stem + suffix for stem in quantized for suffix in suffixes}
     state = {name: value.float() for name, value in stored.items() if name not in parts}
+    arrays = {"ids": ids.cpu().numpy()}
     for stem in quantized:
         state[stem + ".weight"] = author_weight(stored, stem).float()
-        if arrays is not None:
-            arrays[stem + "/weight"] = state[stem + ".weight"].cpu().numpy()
+        arrays[stem + "/weight"] = state[stem + ".weight"].cpu().numpy()
     missing, unexpected = reference.load_state_dict(state, strict=False)
     assert missing == ["lm_head.weight"] and not unexpected, (missing, unexpected)
     reference.tie_weights()
@@ -181,80 +198,18 @@ def references(directory: Path, arrays: dict | None = None):
             if value.dtype == torch.float64:
                 return (quantize(direct_float(value)).double(),)
             output = quantize(value)
-            if arrays is not None:
-                arrays[stem + "/forward_inputs"] = value.detach().cpu().numpy()
-                arrays[stem + "/forward_qdq"] = output.detach().cpu().numpy()
-                if not is_fp8:
-                    arrays[stem + "/forward_sm89_qdq"] = author_qdq(value, overall,
-                                                                    corrected=False).cpu().numpy()
+            arrays[stem + "/forward_inputs"] = value.detach().cpu().numpy()
+            arrays[stem + "/forward_qdq"] = output.detach().cpu().numpy()
+            if not is_fp8:
+                arrays[stem + "/forward_sm89_qdq"] = author_qdq(value, overall, corrected=False).cpu().numpy()
             return (output,)
 
         hooks += [model.get_submodule(stem).register_forward_pre_hook(input_hook)
                   for model in (reference, wide)]
-    return reference, wide, hooks, stored, quantized
-
-
-def record(name: str) -> None:
-    """The committed checkpoint `name`'s logits over check 1's seeds of ids (tests/interop_support.py
-    `fixture_ids`), the reference's and its float64 twin's (`references`), sized on the reference alone,
-    as recorded_logits.npz beside it, which tests/test_codec_checkpoints.py reads: the author's input
-    QDQ runs on CUDA alone."""
-    from interop_support import fixture_ids
-    from recorded_references import provenance, record_case, save as saved
-    from torch_precision import float64
-
-    directory = ROOT / name
-    with np.load(directory / "reference.npz") as stored:
-        draw = fixture_ids(directory, shape=stored["ids"].shape)
-    reference, wide, _, _, _ = references(directory)
-
-    def evaluate(inputs):
-        ids = torch.from_numpy(inputs["input_ids"].astype(np.int64)).cuda()
-        with torch.no_grad():
-            logits = reference(ids, use_cache=False).logits.cpu().numpy()
-        with float64(), torch.no_grad():
-            truth = wide(ids, use_cache=False).logits.cpu().numpy()
-        return {"logits": logits}, {"logits": truth}
-
-    recorded = record_case("logits", lambda seed: {"input_ids": draw(seed)[0]}, evaluate, store_inputs=False)
-    made = provenance("NVIDIA ModelOpt", mtq.__version__ if hasattr(mtq, "__version__") else "0.47.0",
-                      torch.cuda.get_device_name(), f"python tools/modelopt_nvfp4_reference.py record {name}",
-                      torch=torch.__version__)
-    print(saved(directory / "recorded_logits.npz", {**recorded, "logits.provenance": made},
-                reference="NVIDIA ModelOpt", license="Apache-2.0"))
-
-
-def tiny(*, mixed: bool = False) -> None:
-    from torch_precision import float64
-
-    original_to = torch.Tensor.to
-    torch.manual_seed(2049)
-    config = Qwen3Config(vocab_size=96, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
-                        num_attention_heads=4, num_key_value_heads=2, head_dim=16,
-                        max_position_embeddings=64, tie_word_embeddings=True)
-    config._attn_implementation = "eager"
-    config.architectures = ["Qwen3ForCausalLM"]
-    ids = torch.tensor([[2, 8, 17, 5, 23, 9, 51, 43], [31, 16, 3, 19, 42, 11, 78, 39]], device="cuda")
-    model = Qwen3ForCausalLM(config).to("cuda", dtype=torch.bfloat16).eval()
-    scheme = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
-    if mixed:
-        scheme = {'algorithm': 'max', 'quant_cfg': [
-            {'quantizer_name': '*', 'enable': False},
-            {'quantizer_name': '*self_attn.*weight_quantizer', 'cfg': {'num_bits': (4, 3), 'axis': None}},
-            {'quantizer_name': '*self_attn.*input_quantizer', 'cfg': {'num_bits': (4, 3), 'axis': None}},
-            {'quantizer_name': '*mlp.*weight_quantizer', 'cfg': {
-                'num_bits': (2, 1), 'block_sizes': {-1: 16, 'type': 'dynamic', 'scale_bits': (4, 3)}}},
-        ]}
-    model = mtq.quantize(model, scheme,
-                         forward_loop=lambda module: module(ids, use_cache=False))
-    directory = ROOT / ('mixed' if mixed else 'tiny')
-    export_hf_checkpoint(model, dtype=torch.bfloat16, export_dir=directory)
-    arrays = {"ids": ids.cpu().numpy()}
-    reference, wide, hooks, stored, quantized = references(directory, arrays)
     with torch.no_grad():
-        logits = reference(ids, use_cache=False).logits.cpu().numpy()
+        arrays["logits"] = reference(ids, use_cache=False).logits.cpu().numpy()
     with float64(), torch.no_grad():
-        truth = wide(ids, use_cache=False).logits.cpu().numpy()
+        arrays["logits_f64"] = wide(ids, use_cache=False).logits.cpu().numpy()
     for hook in hooks:
         hook.remove()
     generator = torch.Generator(device="cuda").manual_seed(2050)
@@ -276,7 +231,8 @@ def tiny(*, mixed: bool = False) -> None:
             arrays[stem + "/sm89_qdq"] = author_qdq(probe, overall, corrected=False).cpu().numpy()
     np.savez(directory / "reference.npz", **arrays)
     assert torch.Tensor.to is original_to
-    print("tiny", directory, "reference RMS", float(np.sqrt(np.mean((logits - truth) ** 2))))
+    print("tiny", directory, "reference RMS", float(np.sqrt(np.mean(
+        (arrays["logits"] - arrays["logits_f64"]) ** 2))))
     differences = {stem: int(np.count_nonzero(
         arrays[stem + "/forward_qdq"].view(np.uint32)
         != arrays[stem + "/forward_sm89_qdq"].view(np.uint32))) for stem in quantized
@@ -333,7 +289,5 @@ if __name__ == "__main__":
         tiny()
     elif sys.argv[1] == 'mixed':
         tiny(mixed=True)
-    elif sys.argv[1] == 'record':
-        record(sys.argv[2])
     else:
         real()
