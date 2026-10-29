@@ -262,35 +262,11 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
 
 
 def _first_equation(fn, operands, name):
-    """The first `name` equation `fn` runs on `operands`, calls included: its params, the operands it was
-    given and its results, the program run one equation at a time as `certified` runs it."""
-    from jax.extend import core
-    from reference_error import _body
-
-    def run(jaxpr, consts, arguments):
-        env = dict(zip(jaxpr.constvars, consts, strict=True))
-        env.update(zip(jaxpr.invars, arguments, strict=True))
-
-        def read(var):
-            return np.asarray(var.val, var.aval.dtype) if isinstance(var, core.Literal) else env[var]
-
-        for eqn in jaxpr.eqns:
-            given, body = [read(var) for var in eqn.invars], _body(eqn)
-            if body is not None:
-                found = run(*body, given)
-                if found is not None:
-                    return found
-                results = jax.core.eval_jaxpr(*body, *given)
-            else:
-                results = eqn.primitive.bind(*given, **eqn.params)
-                results = list(results) if eqn.primitive.multiple_results else [results]
-                if eqn.primitive.name == name:
-                    return eqn.params, given, results
-            env.update(zip(eqn.outvars, results, strict=True))
-        return None
-
-    closed = jax.make_jaxpr(fn)(*operands)
-    found = run(closed.jaxpr, closed.consts, operands)
+    """The first `name` equation check 2 holds running `fn` on `operands` (`certified.observing`): its
+    params, the operands its contract was given and its results."""
+    with ct.observing() as seen:
+        ct.certified(fn, *operands)
+    found = next(((params, given, results) for held, params, given, results in seen if held == name), None)
     assert found is not None, f"no {name} equation"
     return found
 

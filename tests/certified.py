@@ -3,6 +3,7 @@ held on the operands its execution gave it to its primitive's contract (CONTRACT
 oracles of tests/op_certificates.py; a primitive no contract covers fails the site
 (`assert_certified`), and the lane's arithmetic is held as it computes, measured on it (`lane`)."""
 
+import contextlib
 import dataclasses
 import fractions
 import functools
@@ -1122,10 +1123,27 @@ def _scanned(params, operands, findings, where: str) -> list:
     return [value for (value,) in walked]
 
 
+_OBSERVING: list[list] = []
+
+
+@contextlib.contextmanager
+def observing():
+    """Every equation `certified` holds within, `(name, params, operands, results)` in the order held: what
+    each contract was given (`_held`), read where it is given."""
+    seen: list = []
+    _OBSERVING.append(seen)
+    try:
+        yield seen
+    finally:
+        _OBSERVING.remove(seen)
+
+
 def _held(eqn, operands, results, findings, at) -> None:
     import jax
 
     name = eqn.primitive.name
+    for seen in _OBSERVING:
+        seen.append((name, eqn.params, list(operands), list(results)))
     if name not in CONTRACTS:
         findings.append(f"{at}: uncertifiable, no contract for {name}")
         return
