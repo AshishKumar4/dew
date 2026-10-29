@@ -77,6 +77,7 @@ inconclusive, repeats work or fails in any other way.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import functools
 import hashlib
@@ -946,10 +947,9 @@ class Judge:
         self.case, self.references, self.label = case, references, label
         self._arm: Arm | None = None
         self._anchor: Anchor | None = None
-        self._records: dict[int, Witnessed] = {}
         self._batches: dict[int, int] = {}
         self._selections: tuple[Any, Callable] | None = None
-        self._ahead: dict[int, Any] = {}
+        self._ahead: collections.OrderedDict[int, Any] = collections.OrderedDict()
         self._pool: Any = None
 
     def batch_seed(self, seed: int) -> int:
@@ -1017,8 +1017,10 @@ class Judge:
         """Draw `seed`'s reference and float64 anchor, and the `AHEAD` draws' after it, on two threads
         beside the caller, which runs a layout's draw meanwhile: each of a draw's three programs keeps
         about half of a CI task's four cores busy, so the three together run in about half the time.
-        The draws ahead are held until read, the oldest dropped past twice `AHEAD` (a later read takes
-        them from `references`, or computes them again)."""
+        The pairs are held in the order they were last asked for, the least recently asked dropped past
+        twice `AHEAD` once it has finished, so a pending draw is never dropped and recomputed; each
+        layout of a model restarts its draws at 0 and finds the earlier layout's pairs still held, or
+        held by `references`."""
         import concurrent.futures
 
         import jax
@@ -1028,13 +1030,17 @@ class Judge:
 
         def both(at: int) -> tuple[Drawn, Drawn]:
             with jax.enable_x64(new_val=True):
-                return self._drawn_reference(at), self._drawn_anchor(at)
+                reference = self._drawn_reference(at)
+                return reference, self._drawn_anchor(at, reference.record)
 
         for at in range(seed, seed + self.AHEAD + 1):
-            if at not in self._ahead:
+            if at in self._ahead:
+                self._ahead.move_to_end(at)
+            else:
                 self._ahead[at] = self._pool.submit(both, at)
-        while len(self._ahead) > 2 * self.AHEAD:
-            self._ahead.pop(min(self._ahead))
+        finished = [at for at, pair in self._ahead.items() if pair.done()]
+        for at in finished[:max(0, len(self._ahead) - 2 * self.AHEAD)]:
+            del self._ahead[at]
 
     def _from_ahead(self, seed: int, anchor: bool) -> Drawn:
         """Draw `seed`'s reference, or its anchor where `anchor`: ahead (`ahead`) where it runs there,
@@ -1051,14 +1057,14 @@ class Judge:
 
     def _drawn_reference(self, seed: int) -> Drawn:
         chosen = self.batch_seed(seed)
-        drawn = self.references.held("reference", self.case, chosen, lambda: self.arm(chosen))
-        self._records[chosen] = drawn.record
-        return drawn
+        return self.references.held("reference", self.case, chosen, lambda: self.arm(chosen))
 
-    def _drawn_anchor(self, seed: int) -> Drawn:
+    def _drawn_anchor(self, seed: int, witnessed: Witnessed | None = None) -> Drawn:
+        """Draw `seed`'s float64 anchor from `witnessed`, the reference's record of that draw (drawn
+        here where not given), held by the caller beside the reference rather than kept here."""
         chosen = self.batch_seed(seed)
-
-        witnessed = self._records[chosen] if chosen in self._records else self._drawn_reference(seed).record
+        if witnessed is None:
+            witnessed = self._drawn_reference(seed).record
 
         def computed():
             if self._anchor is None:
