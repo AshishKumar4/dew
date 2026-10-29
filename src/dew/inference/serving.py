@@ -117,7 +117,7 @@ from dew.inference.tasks import (
     shape_bucket,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
-from dew.nn.cross_attention import CrossAttention
+from dew.nn.cross_attention import CrossBlocks
 from dew.nn.inputs import (
     CONTEXT,
     CONTEXT_LENGTHS,
@@ -517,7 +517,7 @@ class Server:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
         self.model = model
-        self.cross: tuple[CrossAttention, int, np.dtype] | None = None
+        self.cross: tuple[CrossBlocks, int, np.dtype] | None = None
         """The model's cross-attention layers and its context's width and dtype, where a request may
         carry a context beside its prompt."""
         if isinstance(model, CrossAttending) and model.cross_attention is not None:
@@ -908,7 +908,7 @@ class Server:
         """A request's context as its real tokens on the host, `[length, features]`, in the dtype
         the model reads a context in (`CrossAttending.context_dtype`), refused where it is not one
         row of the model's width, counts tokens it does not hold, or holds more than the
-        cross-attention layers cache (`CrossAttention.context_length`)."""
+        cross-attention layers cache (`CrossBlocks.context_length`)."""
         assert self.cross is not None
         cross, features, dtype = self.cross
         # Checked where it is, on the host: admission places the batch (`_admit`), never the request.

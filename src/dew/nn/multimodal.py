@@ -30,7 +30,7 @@ from dew.nn.vision import ProjectorBase, TowerBase, TowerGeometry
 from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
-    from dew.nn.cross_attention import CrossAttention
+    from dew.nn.cross_attention import CrossBlocks
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
 
@@ -256,7 +256,7 @@ class MultimodalTransformer(DecoderWrapper):
         return parameter_flops(self.language_model, lengths)
 
     @property
-    def cross_attention(self) -> CrossAttention | None:
+    def cross_attention(self) -> CrossBlocks | None:
         return self.language_model.cross_attention
 
     @property
@@ -272,7 +272,7 @@ class MultimodalTransformer(DecoderWrapper):
         return self.language_model.cross_flops(lengths, context_lengths)
 
     @nn.nowrap
-    def with_cross_attention(self, cross: CrossAttention | None) -> Self:
+    def with_cross_attention(self, cross: CrossBlocks | None) -> Self:
         return self._over(self.language_model.with_cross_attention(cross))
 
     @nn.nowrap
