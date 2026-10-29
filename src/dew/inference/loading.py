@@ -128,7 +128,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
                              f"{run.objective.__name__}, whose task is another; load a step with `step`")
     loaded = task.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
     # A Dew task traces in the attention form its run trained in (`SavedRun.formed`).
-    return run.formed(loaded) if isinstance(loaded, SavedRunTask) else loaded
+    return run.formed(loaded)
 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,

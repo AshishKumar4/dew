@@ -69,7 +69,14 @@ from dew.decision.questions import (
 )
 from dew.files import write_atomically
 from dew.inference import scoring
-from dew.inference.tasks import SavedRun, SavedRunTask, length_ladder, shape_bucket, traced_in_its_form
+from dew.inference.tasks import (
+    InItsForm,
+    SavedRun,
+    SavedRunTask,
+    length_ladder,
+    shape_bucket,
+    traced_in_its_form,
+)
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
@@ -199,7 +206,7 @@ def _calibrated(directory: str) -> tuple[Mapping[str, object], Weights] | None:
 
 
 @dataclass(frozen=True)
-class Decide(SavedRunTask):
+class Decide(SavedRunTask, InItsForm):
     """Answers typed questions about a state, with one forward pass per batch.
 
     `decide(state, questions)` returns one answer per question, with its
@@ -670,6 +677,7 @@ class Decide(SavedRunTask):
         plan = RowPlan.over(mesh_of(held), count)
         return plan.host(self._forward(held, plan.place(plan.pad(padded))))[:len(rows)]
 
+    @traced_in_its_form
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
                  media: ModelInputs | None = None) -> jax.Array:
         """`model.logits`, compiled with the XLA options its backbone and head take where they run

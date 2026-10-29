@@ -23,7 +23,7 @@ from dew._records import JSON
 from dew.artifacts import uint8_pixels
 from dew.batch import Variables, thaw
 from dew.diffusion.process import Conditioning, Process
-from dew.inference.tasks import SavedRun, SavedRunTask, traced_in_its_form
+from dew.inference.tasks import InItsForm, SavedRun, SavedRunTask, traced_in_its_form
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, host_rows, local_rows, mesh_of, request_key
@@ -157,7 +157,7 @@ class ImageSettings:
 
 
 @dataclass(frozen=True, eq=False)
-class TextToImage(SavedRunTask):
+class TextToImage(SavedRunTask, InItsForm):
     """Generates images from text prompts with a trained diffusion model and its encoders.
 
     Call it as `pipe(prompts, key=0)` or
@@ -407,6 +407,7 @@ class TextToImage(SavedRunTask):
                                          "image input shapes and sampling must agree across processes")
         return self._inputs(settled, owns_grid=self.grid is not None or times is not None)
 
+    @traced_in_its_form
     def _inputs(self, settled: _Resolved, *, owns_grid: bool) -> DenoisingInputs:
         """The conditions encoded and the initial state built for `settled`, placed for its rows. A grid
         the task or the caller chose (`owns_grid`) travels with them."""
@@ -609,6 +610,7 @@ class TextToImage(SavedRunTask):
             samples["mask"] = (value >= (128 if value.dtype == np.uint8 else 0.5)).astype(np.float32)
         return samples
 
+    @traced_in_its_form
     def _encoded(self, settled: _Resolved) -> tuple[dict, dict, jax.Array]:
         """The two encoded conditioning branches and the initial state.
 

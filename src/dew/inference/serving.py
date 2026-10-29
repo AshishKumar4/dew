@@ -500,7 +500,7 @@ class Server:
                  sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: Finishing,
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
                  default_budget: int | None, max_length: int | None, decode_steps: int,
-                 prefix: int | Literal["prompt"] | None = None, attention_form: str = "fast") -> None:
+                 prefix: int | Literal["prompt"] | None = None, attention_form: str | None = None) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
@@ -539,7 +539,8 @@ class Server:
         self.default_budget = default_budget
         self.max_length = max_length
         self.prefix: int | Literal["prompt"] | None = prefix
-        # The form its task's run trained in (`SavedRunTask.traced`), which every step traces in.
+        # The form its task's run trained in (`InItsForm`), which every step traces in; None, the one
+        # chosen around it.
         self.attention_form = attention_form
         self.decode_steps = decode_steps
         self.steps = 0
@@ -629,7 +630,8 @@ class Server:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
         in the attention form its task's run trained in."""
         with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
-              generation.chosen(attention_form=self.attention_form)):
+              contextlib.nullcontext() if self.attention_form is None
+              else generation.chosen(attention_form=self.attention_form)):
             yield
 
     @classmethod

@@ -39,6 +39,7 @@ from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates import attention_route
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
 from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
@@ -290,11 +291,21 @@ class SavedRun:
     record: Mapping[str, object]
     step: int
 
-    def formed[TaskT: SavedRunTask](self, task: TaskT) -> TaskT:
-        """`task`, built from this run (`from_saved`), in the attention form its step trained in, which its
-        record names (`Objective.inference_record`); a record written before it named one trained fast."""
-        form = named(self.record.get("attention_form", "fast"), "attention_form")
-        return task if form == task.attention_form else replace(task, attention_form=form)
+    @property
+    def attention_form(self) -> str | None:
+        """The attention form the run's step trained in (`Objective.inference_record`); None for a record
+        written before it named one."""
+        form = self.record.get("attention_form")
+        if form is not None and form not in attention_route.FORMS:
+            raise ValueError(f"this run records attention_form={form!r}, none of {attention_route.FORMS}")
+        return form
+
+    def formed[TaskT](self, task: TaskT) -> TaskT:
+        """`task`, built from this run (`from_saved`), in the attention form its step trained in where it
+        traces in one (`InItsForm`); a task of another class reads `attention_form` itself."""
+        if not isinstance(task, InItsForm) or task.attention_form == self.attention_form:
+            return task
+        return replace(task, attention_form=self.attention_form)
 
     @classmethod
     def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
@@ -352,9 +363,29 @@ class SavedRun:
         return objective.model_tree(variables)
 
 
-def traced_in_its_form[TaskT: SavedRunTask, **P, R](
+@dataclass(frozen=True, kw_only=True)
+class InItsForm:
+    """A task whose calls trace in the attention form its run trained in (`attention_form`, `traced`),
+    as Dew's saved tasks do: a task built from a run (`SavedRun.formed`) takes the form the run's record
+    names, and a task built otherwise, a preview's during its run's fit, traces in the form chosen
+    around it."""
+
+    attention_form: str | None = None
+    """The form the template's attention computes in (`attention_route.FORMS`), as the loaded step was
+    trained in it (`Objective.inference_record`); None traces in the form chosen around the call."""
+
+    def traced(self) -> contextlib.AbstractContextManager[None]:
+        """The block a call of this task traces in: its run's attention form (`generation.chosen`), which
+        JAX keys its trace and compile caches on, so another form's task traces its own programs."""
+        if self.attention_form is None:
+            return contextlib.nullcontext()
+        return generation.chosen(attention_form=self.attention_form)
+
+
+def traced_in_its_form[TaskT: InItsForm, **P, R](
         call: Callable[Concatenate[TaskT, P], R]) -> Callable[Concatenate[TaskT, P], R]:
-    """`call`, a saved task's method, traced in its run's attention form (`SavedRunTask.traced`)."""
+    """`call`, a method of a task or its helper, traced in its run's attention form (`InItsForm.traced`),
+    on whichever thread runs it."""
     @functools.wraps(call)
     def traced(task: TaskT, *arguments: P.args, **keywords: P.kwargs) -> R:
         with task.traced():
@@ -362,21 +393,11 @@ def traced_in_its_form[TaskT: SavedRunTask, **P, R](
     return traced
 
 
-@dataclass(frozen=True, kw_only=True)
 class SavedRunTask:
     """A task a saved run loads as (`dew.objectives.base.SavedTask`): `from_run` pins the run's checkpoint
     once (`SavedRun.pinned`) and builds the task from it with the class's `from_saved`, which
-    `dew.pipeline` and `dew export` call on the run they pinned themselves. Its calls trace in the
-    attention form its run trained in (`attention_form`, `traced`)."""
-
-    attention_form: str = "fast"
-    """The form the template's attention computes in (`attention_route.FORMS`), as the loaded step was
-    trained in it (`Objective.inference_record`): an accurate run's calls take the accurate products."""
-
-    def traced(self) -> contextlib.AbstractContextManager[None]:
-        """The block a call of this task traces in: its run's attention form (`generation.chosen`), which
-        JAX keys its trace and compile caches on, so another form's task traces its own programs."""
-        return generation.chosen(attention_form=self.attention_form)
+    `dew.pipeline` and `dew export` call on the run they pinned themselves, in the attention form its run
+    trained in where the task traces in one (`InItsForm`, `SavedRun.formed`)."""
 
     if TYPE_CHECKING:
         @classmethod
@@ -701,7 +722,7 @@ def held(variables: Variables) -> Variables:
                          if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=False)
 
 
-class _NativeTextTask(SavedRunTask):
+class _NativeTextTask(SavedRunTask, InItsForm):
     """The lifecycle Dew's three text tasks share, over their own `model`,
     `variables` and `processor`: frozen weights, rebinding, loading a run
     (`SavedRunTask`), and the row decoder their generations carry. Each task

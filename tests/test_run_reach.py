@@ -16,7 +16,7 @@ from test_block_sft import assert_tree_equal
 from test_eval_harness import instance
 from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_files
 from test_run_option_matrix import recorded
-from test_run_options import decision, lm, scalars, trained
+from test_run_options import decision, diffusion, lm, scalars, trained
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
@@ -180,7 +180,7 @@ def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_saved_run_is_served_scored_and_loaded_in_the_attention_form_it_trained_in(tmp_path, monkeypatch):
+def test_a_saved_run_is_served_scored_and_loaded_in_the_form_it_trained_in(tmp_path, attention_forms):
     """A run recorded "accurate" records its form with its checkpoints (`Objective.inference_record`), and
     every way a saved run is loaded traces its attention in it, with no form chosen around the call
     (row 2255): its task from the run (`TextGeneration.from_run`) and from `dew.pipeline` generate, a
@@ -190,8 +190,33 @@ def test_a_saved_run_is_served_scored_and_loaded_in_the_attention_form_it_traine
     from dew.eval.harness import DewLM
     from dew.inference.serving import Server
     from dew.inference.tasks import TextGeneration
-    from dew.nn import attention
     from dew.nn.kernels import generation
+
+    run = lm(tmp_path, drawn=False)
+    trained(run, tmp_path, "accurate", trainer={"attention_form": "accurate", "checkpoint_final": True})
+    trained(run, tmp_path, "fast", trainer={"checkpoint_final": True})
+
+    forms = attention_forms
+    accurate, fast = (str(tmp_path / "runs" / name) for name in ("accurate", "fast"))
+    assert generation.chosen_kernel("attention_form", "fast") == "fast"
+    loaded = TextGeneration.from_run(accurate)
+    assert forms(lambda: loaded("ab", max_new_tokens=1, key=0)) == {"accurate"}
+    assert forms(lambda: dew.pipeline(accurate)("ab", max_new_tokens=1, key=0)) == {"accurate"}
+    assert forms(lambda: DewLM(loaded).loglikelihood([instance("a", "b")])) == {"accurate"}
+    server = Server.from_task(loaded, slots=1, capacity=64)
+    assert forms(lambda: (server.submit("ab", max_new_tokens=1, key=0), server.run())) == {"accurate"}
+    assert forms(lambda: TextGeneration.from_run(fast)("ab", max_new_tokens=1, key=0)) == {"fast"}
+    # A task built from a model in the run, as its previews are, traces in the form chosen around it.
+    with generation.chosen(attention_form="accurate"):
+        built = TextGeneration(loaded.model, loaded.variables, loaded.processor, sampling=loaded.sampling)
+        assert forms(lambda: built("ab", max_new_tokens=1, key=0)) == {"accurate"}
+
+
+@pytest.fixture
+def attention_forms(monkeypatch):
+    """The attention forms the calls of a block trace in: `forms(call)` runs `call` and returns the form
+    of each attention call it traced (`attention_case`), on whichever thread traced it."""
+    from dew.nn import attention
 
     seen: list[str] = []
     case = attention.attention_case
@@ -202,24 +227,31 @@ def test_a_saved_run_is_served_scored_and_loaded_in_the_attention_form_it_traine
         return found
 
     monkeypatch.setattr(attention, "attention_case", observed)
-    run = lm(tmp_path, drawn=False)
-    trained(run, tmp_path, "accurate", trainer={"attention_form": "accurate", "checkpoint_final": True})
-    trained(run, tmp_path, "fast", trainer={"checkpoint_final": True})
 
     def forms(call) -> set[str]:
         seen.clear()
         call()
         return set(seen)
+    return forms
 
-    accurate, fast = (str(tmp_path / "runs" / name) for name in ("accurate", "fast"))
-    assert generation.chosen_kernel("attention_form", "fast") == "fast"
-    loaded = TextGeneration.from_run(accurate)
-    assert forms(lambda: loaded("ab", max_new_tokens=1, key=0)) == {"accurate"}
-    assert forms(lambda: dew.pipeline(accurate)("ab", max_new_tokens=1, key=0)) == {"accurate"}
-    assert forms(lambda: DewLM(loaded).loglikelihood([instance("a", "b")])) == {"accurate"}
-    server = Server.from_task(loaded, slots=1, capacity=64)
-    assert forms(lambda: (server.submit("ab", max_new_tokens=1, key=0), server.run())) == {"accurate"}
-    assert forms(lambda: TextGeneration.from_run(fast)("ab", max_new_tokens=1, key=0)) == {"fast"}
+
+@pytest.mark.mesh(devices=8)
+def test_a_saved_decision_and_image_run_trace_their_helpers_in_their_form(tmp_path, attention_forms):
+    """A decision run recorded "accurate" compiles its scoring passes, on its worker threads, in the
+    accurate attention form (`Decide.compile_scoring`), and an image run's prepared denoising inputs
+    encode its conditions in it (`TextToImage.prepare`), each through a numerical helper its call
+    shares (row 2255's review)."""
+    from dew.decision.task import Decide
+    from dew.inference.images import TextToImage
+
+    for kind, build in (("decision", decision), ("diffusion", diffusion)):
+        trained(build(tmp_path / kind, drawn=False), tmp_path, kind,
+                trainer={"attention_form": "accurate", "checkpoint_final": True})
+    decide = Decide.from_run(str(tmp_path / "runs" / "decision"))
+    assert attention_forms(decide.compile_scoring) == {"accurate"}
+    images = TextToImage.from_run(str(tmp_path / "runs" / "diffusion"))
+    assert attention_forms(lambda: images.prepare(["a cat"], steps=2, key=5)) <= {"accurate"}
+    assert attention_forms(lambda: images(["a cat"], steps=2, key=5)) == {"accurate"}
 
 
 def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_called(tmp_path):
