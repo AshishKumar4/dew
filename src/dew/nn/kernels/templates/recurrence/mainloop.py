@@ -820,7 +820,6 @@ def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callab
     family.roles(1, consumer, lambda: family.stream(streams, views, 0, steps))
 
 
-@_lowered_once
 def _solving(call: _Call) -> mosaic.Family:
     """The bundle the solve launch issues by: on a GPU of warpgroup MMA its layout without a producer
     (`bundles.layouts`' last, `mosaic_sm90.FED`), whose consumers hold a program's entry registers and two
@@ -836,6 +835,7 @@ def _solving(call: _Call) -> mosaic.Family:
     return layouts[-1] if layouts and call.family is layouts[0] else call.family
 
 
+@_lowered_once
 def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     """`(a [R, HV * C], w [R, HV * Dk], u [R, HV * Dv])` as `call.held` of each chunk and value head under a
     decay a head, fla's kkt_solve and recompute_w_u in one program (FlashQLA's first kernel): the keys'
