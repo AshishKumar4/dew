@@ -1,6 +1,9 @@
-# The environment tools/kimi_k3_reference.py records the Kimi K3 fixture in (uv pip install -r).
+# The environment tools/kimi_k3_reference.py records the Kimi K3 fixture in (uv pip install -r). compressed-tensors
+# 0.17.1 declares torch>=2.10, and the recorded environment holds it beside torch 2.8.0:
+# uv pip install --override <(echo torch==2.8.0+cu128) -r tools/kimi_k3_reference.requirements.txt
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.8.0+cu128
 transformers==4.56.2
 fla-core==0.5.2
 compressed-tensors==0.17.1
+psutil
