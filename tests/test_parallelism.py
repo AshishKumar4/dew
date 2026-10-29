@@ -616,6 +616,48 @@ class Releasing(PeakToPeak):
         return super().__call__(artifact, batch)
 
 
+def test_a_runs_step_loop_never_waits_on_its_log_writer():
+    """Each step's log is read and written off the step loop (row 2313): a tracker that blocks on the
+    run's first log holds no step back, the run stepping on to its last while that write waits, and
+    the run's end writes every log, in order, once the tracker is let go."""
+    import threading
+
+    from dew.training.observe import Observe
+
+    released, reached = threading.Event(), threading.Event()
+
+    class Blocking:
+        def __init__(self):
+            self.steps = []
+
+        def log(self, scalars, step):
+            if "train/loss" in scalars:
+                if not self.steps:
+                    released.wait()
+                self.steps.append(step)
+
+        def artifact(self, value, step):
+            pass
+
+    def stepped(state):
+        if int(state.step) == 6:
+            reached.set()
+        return int(state.step)
+
+    tracker = Blocking()
+    trainer = make_trainer(tracker=tracker)
+    run = threading.Thread(target=lambda: trainer.fit(
+        Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=6, log_every=1,
+        eval_every=None, observe=Observe(1, stepped)))
+    run.start()
+    try:
+        assert reached.wait(timeout=120), "the step loop waited on its first log"
+    finally:
+        released.set()
+        run.join()
+    assert tracker.steps == [1, 2, 3, 4, 5, 6]
+
+
 def test_a_run_places_no_training_batch_while_it_evaluates():
     """A run whose training stream falls behind and catches up during a validation pass places the
     caught-up batch after the pass, beside the step that reads it, never during it: on a GPU, a batch

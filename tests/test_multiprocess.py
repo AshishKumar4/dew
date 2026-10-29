@@ -1527,6 +1527,16 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
 
 
 @pytest.mark.distributed
+def test_a_tracker_failing_off_the_step_loop_stops_both_processes_at_one_tick(tmp_path):
+    """Rank 0's tracker fails writing its second log, which its writer does off the step loop (row 2313):
+    both processes end with its error, having run the same steps, as the loop agrees on each write's
+    outcome at a tick every process reaches alike, never on the writer's thread."""
+    reports = run_pool("training_log_failure", tmp_path, 2)
+    assert all("tracker logging failed" in (report["error"] or "") for report in reports), reports
+    assert reports[0]["steps"] == reports[1]["steps"] and len(reports[0]["steps"]) < 8, reports
+
+
+@pytest.mark.distributed
 @pytest.mark.parametrize("axis", ["stage", "sequence"])
 def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, axis):
     reports = run_pool("evaluation_replicas", tmp_path, 2, devices=1, name=axis)
