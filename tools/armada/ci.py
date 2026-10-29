@@ -815,9 +815,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
            network: bool = False, whole: bool = False, release: str = "") -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
-    Hub open, recorded on the network lane's class (`device_class`). With `release`, the release checks that
-    requirement's marks name alone, their pytest under uv's overlay of it on the suite's environment, each
-    file's row the release's (`RELEASE`)."""
+    Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's."""
     began = time.monotonic()
     group = split or (f"{RELEASE}{release}" if release else "")
     rows = [found for name in tests
