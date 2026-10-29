@@ -183,16 +183,29 @@ def staged(iv: Iv, lane: Lane) -> Iv:
     return iv if lane.held is None else cast(iv, lane.held)
 
 
-def dot(a: Iv, b: Iv, lane: Lane) -> Iv:
+def aligned(iv: Iv, fmt: Format) -> np.ndarray:
+    """Each operand's magnitude as a tensor core aligns its products by: its own, but a subnormal of `fmt`'s
+    at `fmt`'s least normal, its exponent field's (`dot`)."""
+    magnitude = np.maximum(np.abs(iv.lo), np.abs(iv.hi))
+    least = 2.0 ** fmt.emin
+    return np.where((magnitude > 0) & (np.minimum(np.abs(iv.lo), np.abs(iv.hi)) < least),
+                    np.maximum(magnitude, least), magnitude)
+
+
+def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
     """`a @ b` (`[M, K] @ [K, N]`) as one product the tensor cores accumulate in fp32: each term's exact range
-    (products of 16-bit values, or of three bf16 parts an fp32 operand's, the six whose orders sum under
-    three, within 2^-24 of the fp32 values' product), summed within the native-dot contract's bound
+    (products of 16-bit values of `fmt`, or of three bf16 parts an fp32 operand's, the six whose orders sum
+    under three, within 2^-24 of the fp32 values' product), summed within the native-dot contract's bound
     (`certified.native_dot_holds`: gamma_n at a truncating add's unit, n the terms that may be nonzero, an add
-    of an exact zero exact), the float64 sums within n 2^-52 of their own."""
+    of an exact zero exact), the float64 sums within n 2^-52 of their own. The bound's magnitudes are the
+    terms' as the tensor cores align them (`aligned`): a subnormal operand's at `fmt`'s least normal, the
+    exponent its field holds. Five fp16 products, one of the subnormal 2^-24 and 1, summed to 752 fp32 units
+    from their exact sum on an A100 (mma.sync) and an H100 (wgmma), as if each term were kept to 2^-37, 2^-23
+    under 2^-14 (row 2084, link 3), where their own magnitudes' bound admits 12."""
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
     parts = 6 if lane.wide else 1
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1) * parts
-    magnitude = np.maximum(np.abs(terms.lo), np.abs(terms.hi)).sum(-1)
+    magnitude = (aligned(a, fmt)[:, None, :] * aligned(b, fmt).T[None, :, :]).sum(-1) * (1 + 2.0 ** -50)
     unit = 2.0 ** -(FLOAT32.precision - 1)  # a truncating add's
     gammas = np.nextafter(live * unit / (1 - live * unit), np.inf)
     underflow = 2.0 ** FLOAT32.emin if lane.flushes else 2.0 ** (FLOAT32.emin - FLOAT32.precision + 1)
@@ -288,8 +301,10 @@ def inverse(k, beta, exponents: Exponents, lane: Lane) -> Iv:
     width = 2
     while width < CHUNK:
         lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
-        power = dot(merge(current), merge(lower_a), lane)
-        joined = dot(merge(where(lower, power, point(np.zeros((CHUNK, CHUNK))))), merge(current), lane)
+        staged16 = BFLOAT16 if lane.wide else FLOAT16
+        power = dot(merge(current), merge(lower_a), lane, staged16)
+        masked = where(lower, power, point(np.zeros((CHUNK, CHUNK))))
+        joined = dot(merge(masked), merge(current), lane, staged16)
         current = fp32(add(current, joined), lane)
         width *= 2
     return Iv(current.lo - identity, current.hi - identity)
