@@ -23,7 +23,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.attention import attention_kernel, exchanged_heads_attention
+from dew.nn.attention import attention_kernel
+from dew.nn.attention_parallel import exchanged_heads_attention
 from dew.telemetry.benchmark import samples
 from dew.training import MeshSpec
 

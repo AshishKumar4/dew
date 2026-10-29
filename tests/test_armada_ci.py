@@ -1727,15 +1727,16 @@ def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
 
 
 def planned_checkout(ci, root: Path, monkeypatch, cache_worker,
-                     pinned: str) -> tuple[Path, Callable[[], list[str]]]:
+                     *pinned: str) -> tuple[Path, Callable[[], list[str]]]:
     """Three 3.12 test files, each weighing about a task of its own, run green on CPU class
     GenuineIntel-6-143 against the shared test cache (`cached_checkout`), in a checkout whose .armada.json
-    pins its tasks to `pinned` (vendor-family-model), with the cache's read token: where their verdict is
-    written, and the plan's 3.12 entries' files, each entry's sorted."""
+    pins its tasks to `pinned` (vendor-family-model, one or several), with the cache's read token: where
+    their verdict is written, and the plan's 3.12 entries' files, each entry's sorted."""
     verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
-    vendor, family, model = pinned.split("-")
+    classes = [{"vendor": vendor, "family": int(family), "model": int(model)}
+               for vendor, family, model in (each.split("-") for each in pinned)]
     config = json.loads((ROOT / ".armada.json").read_text())
-    config["task"]["cpu"] = {"vendor": vendor, "family": int(family), "model": int(model)}
+    config["task"]["cpu"] = classes[0] if len(classes) == 1 else classes
     (root / ".armada.json").write_text(json.dumps(config))
     names = ("a", "b", "c")
     written(root, {f"test_{name}.py": "from pathlib import Path\n"
@@ -1802,6 +1803,19 @@ def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, m
     armada_task(ci, monkeypatch, verdict)
     (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+
+
+def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Tasks pinned to several CPU classes (.armada.json's task.cpu a list) land on any of them, so the plan
+    reuses a file whose row ran green on these inputs on any pinned class, and plans the rest: rows split by
+    class, the plan reading each pinned class's (Main, 2026-10-29: the suite widened to 25/17 and 26/17, the
+    fleet's own classes, as one class starved lanes' verdicts)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17",
+                                        "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
 def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):

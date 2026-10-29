@@ -512,7 +512,7 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean
 
 def _rounded_inverse(inverse, rounded: bool, dtype, interpret: bool):
     """The fp32 inverse RMS a row multiplies by: rounded to `dtype` first where the model rounds it
-    (`dew.nn.attention.unweighted_rmsnorm`), whose product with the input then rounds once."""
+    (`dew.nn.norms.unweighted_rmsnorm`), whose product with the input then rounds once."""
     return _round(inverse, dtype, interpret) if rounded else inverse
 
 

@@ -24,7 +24,7 @@ from reference_error import (
     with_gradients,
 )
 
-from dew.nn.attention import GroupNorm, LayerNorm, Stage
+from dew.nn.attention_blocks import Stage
 from dew.nn.autoencoders.vae import FlaxEncoder, translate_vae_weights
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.joint import DoubleStreamBlock, JointAttention
@@ -32,6 +32,7 @@ from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.unet import Unet
 from dew.nn.conv import Conv
 from dew.nn.dit import ModulatedBlock, TextContext
+from dew.nn.norms import GroupNorm, LayerNorm
 from dew.nn.scan_orders import hilbert_indices, zigzag_indices
 from dew.registry import models
 
@@ -609,7 +610,7 @@ def test_a_stage_names_the_dials_the_block_supports(rng):
 @pytest.mark.parametrize("dtype", [None, jnp.float32, jnp.bfloat16])
 def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, rng):
     """An unchanged stage inherits the model dtype, or fp32 when both leave it unset."""
-    from dew.nn.attention import stage_attention
+    from dew.nn.attention_blocks import stage_attention
 
     expected_dtype = dtype or jnp.float32
     stage = Stage(heads=2)
@@ -632,7 +633,7 @@ GROUP_NORM_SEEDS = 32
 @pytest.mark.parametrize("dtype", [None, jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(2, 6, 16), (2, 4, 5, 16)])
 def test_group_norm_is_flax_s(rng, dtype, shape):
-    """Without an activation, `dew.nn.attention.GroupNorm` is flax's
+    """Without an activation, `dew.nn.norms.GroupNorm` is flax's
     `nn.GroupNorm`, with its parameter tree: its statistics in the module's
     dtype, else the input's, at least fp32, and its result cast by flax's dtype
     rule, as near float64 over drawn inputs and parameters as flax's (check 1,
@@ -721,7 +722,7 @@ LAYER_NORM_SEEDS = 64
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize('dtype', [None, jnp.bfloat16, jnp.float32])
 def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_scale, use_bias, dtype):
-    """`dew.nn.attention.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing: the
+    """`dew.nn.norms.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing: the
     same parameter tree and auto-named scope; its output and the gradients of its input and
     parameters as near float64 over drawn inputs and parameters as flax's own (check 1); and its
     pullback holds the input as it arrived, no wider copy of the activations."""

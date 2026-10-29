@@ -1,7 +1,7 @@
 """Sharded cuDNN attention compiles once across processes. jax partitions its cuDNN call through
 `custom_partitioning`, whose lowering on several devices names the partitioner by a process address
 (`str(id(...))` in the custom call's backend config), which the persistent cache key keeps; Dew runs
-the kernel per shard (`dew.nn.attention.per_shard`), where jax lowers no partitioner."""
+the kernel per shard (`dew.nn.attention_parallel.per_shard`), where jax lowers no partitioner."""
 
 import json
 import os

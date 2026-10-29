@@ -51,13 +51,8 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.batch import prefix_sum, real_places, valid_order
 from dew.mesh import LogicalAxes
-from dew.nn.attention import (
-    RMSNorm,
-    causal_attention_mask,
-    reference_attention,
-    unweighted_rmsnorm,
-    visibility_mask,
-)
+from dew.nn.attention import reference_attention
+from dew.nn.attention_masks import causal_attention_mask, visibility_mask
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
@@ -65,6 +60,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places
 from dew.nn.kv_cache import KVCache, KVStore, cache_positions, cached_validity, open_kv_cache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.mla import IndexerFront
+from dew.nn.norms import RMSNorm, unweighted_rmsnorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import LongRopeScaling, Scaling, rotary_freqs, rotate
 from dew.nn.scatter import gather_positions

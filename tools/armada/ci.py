@@ -412,30 +412,34 @@ READ_TOKEN = "DEW_XLA_CACHE_READ_TOKEN"
 """The test cache's read-only token, which the plan reads records with (`reusable`): it never writes them."""
 
 
-def pinned_class() -> str | None:
-    """The one CPU class .armada.json pins its tasks to (task.cpu), as `cpu_class` names it, which their rows
-    are recorded under; None where it pins none or several, or the tasks run on a CUDA lane, whose class
-    (`device_class`) the plan cannot know."""
+def pinned_classes() -> list[str]:
+    """The CPU classes .armada.json pins its tasks to (task.cpu, one or a list), as `cpu_class` names them,
+    which their rows are recorded under, a task's on the class it lands on; none where it pins none, or the
+    tasks run on a CUDA lane, whose class (`device_class`) the plan cannot know."""
     config = Path(".armada.json")
     if not config.is_file() or "cuda" in os.environ.get("JAX_PLATFORMS", "").split(","):
-        return None
+        return []
     cpu = json.loads(config.read_text()).get("task", {}).get("cpu")
-    return f"{cpu['vendor']}-{cpu['family']}-{cpu['model']}" if isinstance(cpu, dict) else None
+    return [f"{each['vendor']}-{each['family']}-{each['model']}" for each in
+            ([cpu] if isinstance(cpu, dict) else cpu or [])]
 
 
 def reusable(python: str, names: list[str], common: str) -> set[str]:
     """The files of `names` whose whole row ran green on exactly these inputs (`common`, and each file's
-    own, `fresh`) on the class the tasks run on (`pinned_class`), read at plan time with the cache's read
-    token (`READ_TOKEN`): a task of their own would only look each up and exit. None where the plan has no
-    token or no single class (Main, 2026-10-28: a lane run with most files unchanged booted a container a
-    task)."""
-    token, held = os.environ.get(READ_TOKEN), pinned_class()
-    if not token or held is None or "DEW_XLA_CACHE_URL" not in os.environ:
+    own, `fresh`) on any class the tasks run on (`pinned_classes`), which a task of theirs could land on,
+    read at plan time with the cache's read token (`READ_TOKEN`): a task of their own would only look each
+    up and exit. None where the plan has no token or no class (Main, 2026-10-28: a lane run with most files
+    unchanged booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
+    token, held = os.environ.get(READ_TOKEN), pinned_classes()
+    if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return set()
 
     def hit(name: str) -> bool:
-        found = recorded(record_key(python, row(python, name, ""), held, common), token)
-        return found is not None and fresh(found, name, common)
+        for each in held:
+            found = recorded(record_key(python, row(python, name, ""), each, common), token)
+            if found is not None and fresh(found, name, common):
+                return True
+        return False
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         return {name for name, found in zip(names, pool.map(hit, names), strict=True) if found}

@@ -25,6 +25,7 @@ from dew.config.media import media_field
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
+from dew.nn.attention import attention_implementation
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.protocols import IntervalModel, TimeScaled
@@ -66,7 +67,7 @@ if TYPE_CHECKING:
     # classes, which a reader and a checker need.
     PresetSpec = Preset
 
-# Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
+# Every other dial of a stage is `dew.nn.attention_blocks.Stage`'s own default, and
 # a stage that names one restates it.
 ATTENTION = {"heads": 8}
 
@@ -448,7 +449,7 @@ class DiffusionRunConfig(RunConfig):
         return load_diffusion_source(
             reference.name, revision=reference.revision, dtype=self._compute or "bfloat16",
             param_dtype=self.pretrained_param_dtype,
-            attention_impl=str(self.model.fields.get("attention_impl", "auto")),
+            attention_impl=attention_implementation(str(self.model.fields.get("attention_impl", "auto"))),
             size=self.sample_field().shape[:-1],
             variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"),
             text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"),
