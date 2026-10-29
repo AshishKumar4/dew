@@ -44,7 +44,7 @@ def entry(x_ref, out_ref):
         else:
             pl.when(wg == 0)(lambda: consumer(wg))
             pl.when(wg == 1)(producer)
-    body()
+
 
 run = plgpu.kernel(entry, out_type=jax.ShapeDtypeStruct((2, 64, 32, 64, width), jnp.float32),
                    grid=(2, 64, 32), grid_names=("batch", "query", "head"),
