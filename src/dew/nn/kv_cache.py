@@ -44,6 +44,7 @@ import scipy.linalg
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
+from dew.batch import prefix_sum
 from dew.mesh import LayoutRefused, logical_spec, mesh_axes
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
@@ -831,7 +832,7 @@ def cache_positions(module: nn.Module, batch: int, length: int, valid):
         raise ValueError(f"cache validity must be {(batch, length)}, got {valid.shape}")
     allocated = module.has_variable("cache", "cache_index")
     index = module.variable("cache", "cache_index", jnp.zeros, (batch,), jnp.int32)
-    positions = index.value[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    positions = index.value[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
     positions = jnp.where(valid, positions, -1)
     if allocated:
         index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)
