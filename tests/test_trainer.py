@@ -112,6 +112,24 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
                 if "train/tokens" in scalars] == logged
 
 
+def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
+    """A run whose optimizer splits by Muon's rule records, as it starts, where the split sent each
+    parameter and why (`FitStarted.groups`): the regression's kernel to Muon, its bias to AdamW. A run
+    of an optimizer it was handed built records none (row 2087)."""
+    from dew.telemetry.records import FitStarted
+
+    def started(optimizer):
+        tracker = RecordingTracker()
+        make_trainer(optimizer=optimizer, tracker=tracker).fit(dataset(), steps=1)
+        (record,) = [value for _, value in tracker.artifacts if isinstance(value, FitStarted)]
+        return record.groups
+
+    groups = started(OptimConfig(optimizer="muon", learning_rate=1e-2))
+    assert groups is not None
+    assert sorted(groups.values()) == ["adamw: a bias or of rank below two", "muon"]
+    assert started(None) is None
+
+
 def test_a_runs_start_reports_each_phase_it_took_once(caplog):
     """A run's start logs each phase as it starts and with the seconds it took when it ends (the data's
     preparation, the step's compile, the evaluations' warming), and reports each phase's seconds once,

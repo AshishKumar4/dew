@@ -1,0 +1,76 @@
+{
+ "reference": "inclusionAI/LLaDA2.0-mini@dad945cac317da394b390f82c7b40691d8a881ed",
+ "transformers": "4.57.1",
+ "torch": "2.9.0+cpu",
+ "command": "tools/llada_moe_reference.py --generate llada2-tiny",
+ "settings": {
+  "block_length": 4,
+  "steps": 4,
+  "gen_length": 8,
+  "top_k": 1,
+  "threshold": 0.95,
+  "eos_id": 1
+ },
+ "mask_id": 120,
+ "mask_logit": "held at -inf",
+ "rows": [
+  {
+   "prompt": [
+    124,
+    78,
+    17
+   ],
+   "generated": [
+    44,
+    112,
+    88,
+    112,
+    44,
+    77,
+    77,
+    80
+   ]
+  },
+  {
+   "prompt": [
+    70,
+    40,
+    39,
+    13,
+    33
+   ],
+   "generated": [
+    77,
+    44,
+    99,
+    89,
+    112,
+    112,
+    44,
+    77
+   ]
+  },
+  {
+   "prompt": [
+    76,
+    25,
+    38,
+    69,
+    93,
+    52,
+    6,
+    28
+   ],
+   "generated": [
+    112,
+    32,
+    89,
+    47,
+    112,
+    112,
+    28,
+    28
+   ]
+  }
+ ]
+}
