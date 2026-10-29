@@ -397,9 +397,9 @@ class GRPOObjective(TokenScorer):
         weights = self._weights(terms, effective, keep)
         # Summed once rounded (`compensated_sum`): the session weights' sum is their count.
         mass = jax.lax.stop_gradient(compensated_sum(weights, tuple(range(weights.ndim))))
-        if self.aggregation == "constant":
-            # Each session's sum over the constant, averaged over the sessions (their session weights sum
-            # to their count): a kept token weighs one over the constant.
+        if self.aggregation_tokens is not None:
+            # The constant aggregation: each session's sum over the constant, averaged over the sessions
+            # (their session weights sum to their count), a kept token weighing one over the constant.
             weights = effective.astype(weights.dtype) / self.aggregation_tokens
         if self.policy_loss in ("gspo", "gmpo"):
             # A sequence's tokens share its term: summed once a sequence, as its paper's form sums it.

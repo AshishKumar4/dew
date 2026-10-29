@@ -86,12 +86,14 @@ def _schedule(value: Weight) -> optax.Schedule:
 
 def _refuse_other_tokenizers(student: str, teacher: str) -> None:
     """Refuse a teacher whose tokenizer's vocabulary, each string's id, differs from the student's."""
-    from dew.data.text import tokenizer_for
+    from dew.data.text import HFTokenizer, tokenizer_for
 
     def vocabulary(name: str) -> dict[str, int]:
         # Dew's byte tokenizer's ids are the bytes themselves; an HF tokenizer's are its vocabulary's.
         held = tokenizer_for(name)
-        return {"byte": held.vocab_size} if name == "byte" else dict(held.tokenizer.get_vocab())
+        if isinstance(held, HFTokenizer):
+            return dict(held.tokenizer.get_vocab())
+        return {"byte": held.vocab_size}
 
     if student != teacher and vocabulary(student) != vocabulary(teacher):
         raise ValueError(f"the teacher's tokenizer {teacher} maps strings to other ids than the student's "

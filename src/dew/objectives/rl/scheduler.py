@@ -865,7 +865,11 @@ class RolloutScheduler:
         assert self.reference is not None
         from dew.training.transaction import with_ema
 
-        reference = scored_rows(self.reference, with_ema(state.variables, state.ema), packed)
+        frozen = with_ema(state.variables, state.ema)
+        if frozen is None:
+            raise ValueError("the rewards' reference penalty reads the frozen starting policy, and the "
+                             "state holds none; build it from the objective that names the penalty")
+        reference = scored_rows(self.reference, frozen, packed)
         shaping = (None if rollouts is None else
                    reference_penalties(rollouts, packed, reference, self.reference.reward_kl))
         whitening = self._whitening(mesh, rollouts or [], shaping) if self.estimator == "global" else None

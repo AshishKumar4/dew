@@ -98,14 +98,15 @@ class PromptRollout:
 
     def build(self, objective, decode):
         """The scheduler drawing over `objective`'s policy, decoding completions with `decode`."""
-        from dew.objectives.rl import RolloutScheduler
-        from dew.objectives.rl.methods import method
+        from dew.objectives.rl import Reward, RolloutScheduler
+        from dew.objectives.rl.methods import Rollout, method
         from dew.registry import imported
 
-        reward = imported(self.reward)
-        settings = ({"estimator": self.estimator or "group"} if self.method is None
+        named = imported(self.reward)
+        reward: Reward = named() if isinstance(named, type) else named
+        settings = (Rollout(estimator=self.estimator or "group") if self.method is None
                     else method(self.method).rollout(self.max_new_tokens))
-        return RolloutScheduler.sampled(objective, reward() if isinstance(reward, type) else reward,
+        return RolloutScheduler.sampled(objective, reward,
                                         decode=decode, groups=self.groups, max_new_tokens=self.max_new_tokens,
                                         truncation=self.truncation, sampling=self.sampling, admit=self.admit,
                                         **settings)

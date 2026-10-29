@@ -20,9 +20,19 @@ set only what the method leaves free: its group size, its reference penalty's we
 import dataclasses
 import math
 from collections.abc import Mapping
-from typing import Any
+from typing import TypedDict
 
 from .grpo import GRPOObjective
+
+
+class Rollout(TypedDict, total=False):
+    """A method's scheduler settings (`RolloutScheduler`): its estimator, DAPO's dynamic sampling, and
+    its overlong punishment's budget and cache where it has one."""
+
+    estimator: str
+    varied: bool
+    overlong: tuple[int, int]
+
 
 _NO_PENALTY = {"beta": 0.0, "reward_kl": 0.0}
 
@@ -33,30 +43,30 @@ class Method:
     fixed at 0) and its rollout's (the estimator, `RolloutScheduler.varied` and `.overlong`). `budget`
     is whether its reduction divides by the response budget (Dr. GRPO's constant)."""
 
-    objective: Mapping[str, Any]
+    objective: Mapping[str, object]
     estimator: str
     varied: bool = False
     overlong: bool = False
     budget: bool = False
 
-    def settings(self, max_new_tokens: int) -> dict[str, Any]:
+    def settings(self, max_new_tokens: int) -> Mapping[str, object]:
         """The objective settings the method fixes for a response budget of `max_new_tokens`."""
         settings = dict(self.objective)
         if self.budget:
             settings["aggregation_tokens"] = max_new_tokens
         return settings
 
-    def rollout(self, max_new_tokens: int, overlong_cache: int | None = None) -> dict[str, Any]:
+    def rollout(self, max_new_tokens: int, overlong_cache: int | None = None) -> Rollout:
         """The scheduler's settings for a response budget of `max_new_tokens`: the estimator, DAPO's
         dynamic sampling, and its overlong punishment over the last `overlong_cache` tokens of the
         budget (a quarter of it by default)."""
-        settings: dict[str, Any] = {"estimator": self.estimator, "varied": self.varied}
+        settings = Rollout(estimator=self.estimator, varied=self.varied)
         if self.overlong:
             settings["overlong"] = (max_new_tokens, overlong_cache or max(1, max_new_tokens // 4))
         return settings
 
     def build(self, model, seq_len: int, *, max_new_tokens: int, overlong_cache: int | None = None,
-              **options) -> tuple[GRPOObjective, dict[str, Any]]:
+              **options) -> tuple[GRPOObjective, Rollout]:
         """The method's objective over `model` and its rollout's settings (`rollout`); `options` set what
         the method leaves free, and one it fixes is refused."""
         settings = self.settings(max_new_tokens)

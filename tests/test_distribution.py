@@ -830,6 +830,13 @@ def scheduled(tmp_path: Path, mesh: dict, processes: int, *flags: str) -> tuple[
         return json.loads(out.read_text()), {name: params[name] for name in params.files}
 
 
+def every_row(record: dict) -> dict[str, np.ndarray]:
+    """Every row every process handed the step, sorted: groups complete in any order."""
+    stacked = {name: np.concatenate(value) for name, value in record["rows"].items()}
+    order = np.lexsort(stacked["input_ids"].T[::-1])
+    return {name: value[order] for name, value in stacked.items()}
+
+
 def handed(record: dict, process: int) -> dict[str, np.ndarray]:
     """The rows `process` handed the step."""
     return {name: np.asarray(rows[process]) for name, rows in record["rows"].items()}
@@ -845,14 +852,7 @@ def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_
     pool, pooled = scheduled(tmp_path, {"fsdp": 2}, 2)
     alone, single = scheduled(tmp_path, {"fsdp": 2}, 1)
     assert pool["partition"] == {"count": 2, "readers": 1} and pool["step"] == 1
-
-    def rows(record: dict) -> dict[str, np.ndarray]:
-        """Every row every process handed the step, sorted: groups complete in any order."""
-        stacked = {name: np.concatenate(value) for name, value in record["rows"].items()}
-        order = np.lexsort(stacked["input_ids"].T[::-1])
-        return {name: value[order] for name, value in stacked.items()}
-
-    together, reference = rows(pool), rows(alone)
+    together, reference = every_row(pool), every_row(alone)
     for name in ("input_ids", "response_mask", "behavior_log_probs"):
         np.testing.assert_array_equal(together[name], reference[name])
     np.testing.assert_allclose(together["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
@@ -868,14 +868,7 @@ def test_the_global_estimator_whitens_every_share_by_the_whole_batch(tmp_path):
     own whitening."""
     pool, _ = scheduled(tmp_path, {"fsdp": 2}, 2, "--estimator", "global")
     alone, _ = scheduled(tmp_path, {"fsdp": 2}, 1, "--estimator", "global")
-
-    def rows(record: dict) -> dict[str, np.ndarray]:
-        """Every row every process handed the step, sorted: groups complete in any order."""
-        stacked = {name: np.concatenate(value) for name, value in record["rows"].items()}
-        order = np.lexsort(stacked["input_ids"].T[::-1])
-        return {name: value[order] for name, value in stacked.items()}
-
-    together, reference = rows(pool), rows(alone)
+    together, reference = every_row(pool), every_row(alone)
     assert np.unique(np.abs(reference["advantages"])).size > 2
     for name in ("input_ids", "response_mask", "advantages"):
         np.testing.assert_array_equal(together[name], reference[name])
