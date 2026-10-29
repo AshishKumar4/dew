@@ -366,12 +366,12 @@ def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
     devices, runs a model under the mixture and the objective the command gives and writes its rows to
     --out; --window, which is check 1's, without --seeds is refused."""
     import json
-    import os
     import subprocess
     import sys
 
-    environment = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=8",
-                   "JAX_PLATFORMS": "cpu"}
+    from process_support import worker_env
+
+    environment = worker_env(8)
 
     def tool(*flags):
         return subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), *flags],
