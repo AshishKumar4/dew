@@ -3,15 +3,15 @@ at a fixed commit, mixed by tokens and packed into rows a trainer reads.
 
     python recipes/lm/mixture.py --show 2000
 
-The sources are English Wikipedia's 2023-11-01 dump (prose, `text`), The Stack v1's filtered Python functions
-(`content`) and UltraChat 200k's SFT conversations (`messages`), each read as the Hub stores it, streamed from its
-own Parquet shards. Text and code are tokenized and ended by EOS; a conversation is rendered through the
+The sources are English Wikipedia's 2023-11-01 dump (prose, `text`), The Stack v1's filtered Python
+functions (`content`) and UltraChat 200k's SFT conversations (`messages`), each read as the Hub stores it,
+streamed from its own Parquet shards. Text and code are tokenized and ended by EOS; a conversation is rendered through the
 tokenizer's chat template, and keeps only its tokens, as a pretraining row does not weigh speakers apart. The
 tokenizer is SmolLM2's, whose template renders each message the same whatever follows it, as `chat.template`
 needs (Qwen3's drops an earlier turn's reasoning once a later one follows, which it refuses). The
 three are mixed at 70/20/10 by valid target tokens (`mix(by="tokens")`) and packed first-fit into rows of
 `SEQ_LEN + 1` tokens. `--show N` reads the first N mixed documents and prints what a run would log of them
-(`Dataset.stats`): each source's rows and tokens, whose shares stand beside the shares asked; `build` returns
+(`Dataset.stats`), then each source's tokens among them and its share beside the share asked; `build` returns
 the batched pipeline for `trainer.fit`.
 """
 
@@ -22,7 +22,8 @@ import tyro
 from dew.data import Hub, chat, mix, text
 from dew.data.pipeline import Pipeline
 
-TOKENIZER, TOKENIZER_REVISION = "HuggingFaceTB/SmolLM2-360M-Instruct", "a10cc1512eabd3dde888204e902eca88bddb4951"
+TOKENIZER = "HuggingFaceTB/SmolLM2-360M-Instruct"
+TOKENIZER_REVISION = "a10cc1512eabd3dde888204e902eca88bddb4951"
 SEQ_LEN = 2048
 WEIGHTS = {"web": 0.7, "code": 0.2, "chat": 0.1}
 
@@ -67,8 +68,17 @@ class Args:
 
 
 def main(args: Args) -> None:
-    for metric, value in sorted(mixed(tokenizer()).stats(records=args.show).items()):
+    tok = tokenizer()
+    counts = mixed(tok).stats(records=args.show)
+    for metric, value in sorted(counts.items()):
         print(f"{metric}: {value:g}")
+    # The mix read each source's first rows in order: the same rows read alone hold its tokens.
+    parts = sources(tok)
+    tokens = {name: parts[name].stats(records=int(counts[f"data/rows/{name}"]))["data/tokens"]
+              for name in WEIGHTS}
+    total = sum(tokens.values())
+    for name, weight in WEIGHTS.items():
+        print(f"{name}: {tokens[name]:.0f} tokens, {tokens[name] / total:.3f} of the mix (asked {weight})")
 
 
 if __name__ == "__main__":
