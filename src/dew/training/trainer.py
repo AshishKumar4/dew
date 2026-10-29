@@ -281,7 +281,8 @@ class Trainer(Generic[Loss, Effects]):
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
         derived config. `record` makes each step return in its metrics what each evaluation, replays
         too, sampled or passed as a boundary (`taken_record`).
-        `links` states an axis's `Link` by name in place of measuring it (`_links`).
+        `links` states an axis's `Link` by name in place of measuring it (`_links`); a step compiled
+        ahead states those it traced with (`AheadOfTime.links`), over any given here.
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -324,7 +325,8 @@ class Trainer(Generic[Loss, Effects]):
         # The links the last compiled step decided its projections by, which say whether one spread over
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
-        self._stated_links = dict(links or {})
+        # A step compiled ahead is the program its own links decided, so a run handed it traces with them.
+        self._stated_links = {**dict(links or {}), **({} if ahead is None else ahead.links)}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
         self._refusal: str | None = None
