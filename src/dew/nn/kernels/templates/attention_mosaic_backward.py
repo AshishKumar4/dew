@@ -65,8 +65,8 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     consumers' resident keys and values; dK's output stage and dV's (the one stage where the widths agree),
     fp32, each its program's share of the `columns`; each consumer's stage for its key gradients' sums; the
     two loads' barriers; a fused launch's (`BackwardTiles.fused`) staged score cotangents and dQ tile each
-    consumer's; where its logits' queries are staged (`BackwardTiles.staged_logits`) each consumer's tile of
-    them; and its query and output-cotangent streams, and its logits' queries' unless
+    consumer's; where its logits' queries are staged (`BackwardTiles.staged_logits`) one slot's of them and
+    their two turns; and its query and output-cotangent streams, and its logits' queries' unless
     staged, in `stages` slots (`Family.streams`). On a layout whose consumers feed their rings
     (`split_queries`) the consumers share one key block, held once, and each takes its share of a slot's
     queries: every block a product of theirs reads staged at the swizzle their share's contraction takes
@@ -92,7 +92,10 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         scoped += [plgpu.SMEM((consumers, block_k, rows), dtype),
                    plgpu.SMEM((consumers, rows, width), jnp.float32)]
     if config.staged_logits:
-        scoped.append(mosaic.staged((consumers, rows, width), dtype, swizzle))
+        # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
+        # and the two turns that order its writes against their products' reads (`_staged_logits`).
+        scoped += [mosaic.staged((block_q, width), dtype, swizzle), plgpu.Barrier(num_arrivals=consumers),
+                   plgpu.Barrier(num_arrivals=consumers)]
     else:
         blocks["logits"] = ((block_q, width), dtype)
     swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
@@ -413,12 +416,11 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # (`BackwardTiles.staged_logits`; a third of the launch at Qwen3-8B, ET-SWAPABL-h100). dK from the call's
     # own, which the power would flush where a query is 2^-126 at the scale 2^-10.
     if logits_stage is not None:
-        # The share's rows (32 of a slot's 64 where its consumers split them) read strided, a thread a run
-        # of a row's entries, not in the accumulator's layout (warpgroup MMA's takes whole 64-row tiles),
-        # by a plain transfer (no optimized one reads a swizzled tile into a strided layout).
-        rows = plgpu.load(q_slot, layout=plgpu.Layout.WG_STRIDED(q_slot.shape, vec_size=8), optimized=False)
-        logits_slot = family.staged(by_power(rows, walk.spec.prescale), logits_stage)
+        logits_slot = _staged_logits(walk, logits_stage, slots["queries"], part)
     s = family.product(k_smem, logits_slot.transpose((1, 0)), shape)
+    if logits_stage is not None:
+        # Its share of the staged queries read (the product waited): the next step's stage may be written.
+        plgpu.barrier_arrive(logits_stage[2])
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
@@ -456,6 +458,36 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
         key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
         carry = tuple(total + piece for total, piece in zip(carry, key_pieces, strict=True))
     return carry, (dk_acc, dv_acc)
+
+
+def _staged_logits(walk: _Backward, stage: tuple, q_slot, part: tuple):
+    """A step's logits' queries, the slot `q_slot`'s taken by the call's power, staged in `stage` (its ref,
+    its written and read turns, the consumer's index): the first consumer stages the whole slot (a share of
+    32 of its 64 rows takes no warpgroup-MMA tile to load and store), once every consumer has read the last
+    step's (`read`, which each arrives at past its product and arrives at once before its walk), and every
+    consumer waits for it (`written`); the consumer's share of it, `part`'s rows."""
+    ref, written, read, index = stage
+    family = walk.program.family
+    plgpu.barrier_wait(read)
+
+    @pl.when(index == 0)
+    def _():
+        family.staged(by_power(family.tile_of(q_slot), walk.spec.prescale), ref)
+
+    plgpu.barrier_arrive(written)
+    plgpu.barrier_wait(written)
+    first, count = part
+    return ref if count == ref.shape[0] else ref.at[pl.ds(first, count)]
+
+
+def _logits_stage(allocated: list, index) -> tuple | None:
+    """Consumer `index`'s staged logits' queries (`_staged_logits`' `stage`) from their `allocated` ref and
+    turns, its read turn's first arrival made (no step's stage is written before it); None where its
+    launch streams them."""
+    if not allocated:
+        return None
+    plgpu.barrier_arrive(allocated[2])
+    return (*allocated, index)
 
 
 def _grading(shares: tuple) -> bool:
@@ -826,7 +858,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[holder], v_smem.at[holder]
-            stage = logits_stages[0].at[index] if logits_stages else None
+            stage = _logits_stage(logits_stages, index)
             adds = None
             if walk.fused:
                 parts_stage, dq_stages = fused_stages
