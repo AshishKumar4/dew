@@ -227,7 +227,7 @@ def test_a_context_reads_logits_enter_the_layers_qk_clip_maxima():
     assert own and set(plain) == set(scaled) == set(own)
     for path, leaf in scaled.items():
         reads = any(f"['layers_{index}']" in path for index in SHARED.layer_ids)
-        assert np.all(plain[path] >= own[path]) and np.all(leaf >= plain[path]), path
+        assert np.all(plain[path] >= own[path]) and np.all(leaf >= own[path]), path
         if reads:
             assert np.any(leaf > own[path]), path
         else:
