@@ -30,6 +30,7 @@ import contextlib
 import functools
 import os
 from collections.abc import Callable, Sequence
+from typing import overload
 
 import jax
 import jax.numpy as jnp
@@ -838,6 +839,14 @@ def paired_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
 
 type Running = jax.Array | tuple[jax.Array, ...]
 """A running sum (`running_sum`), stacked along its leading axis or held as that axis's parts."""
+
+
+@overload
+def added_to(running: jax.Array, term: jax.Array) -> jax.Array: ...
+
+
+@overload
+def added_to(running: tuple[jax.Array, ...], term: jax.Array) -> tuple[jax.Array, ...]: ...
 
 
 def added_to(running: Running, term: jax.Array) -> Running:
