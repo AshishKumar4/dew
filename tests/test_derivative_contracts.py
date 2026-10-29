@@ -28,6 +28,12 @@ def normal_float32(values) -> np.ndarray:
     return (size == 0) | ((size >= TINY * (1 + 2.0**-16)) & (size <= LARGEST * (1 - 2.0**-16)))
 
 
+def pulled(fn, primals, cotangent):
+    """`fn`'s reverse derivative at `primals` pulling back `cotangent` in the output's own dtype."""
+    out, pull = jax.vjp(fn, *primals)
+    return pull(jax.tree.map(lambda given, made: jnp.asarray(given, made.dtype), cotangent, out))
+
+
 def orders(fn, primals, direction, cotangent):
     """`fn` at each order the contract holds, by name: the primal, a forward and a reverse derivative, a
     forward derivative of the gradient of the output's sum against `cotangent` and a second forward
@@ -45,7 +51,7 @@ def orders(fn, primals, direction, cotangent):
     return {
         "primal": lambda: fn(*primals),
         "jvp": lambda: forward(fn)(*primals),
-        "vjp": lambda: jax.vjp(fn, *primals)[1](cotangent),
+        "vjp": lambda: pulled(fn, primals, cotangent),
         "jvp of grad": lambda: jax.jvp(gradient(fn), primals, direction)[1],
         "second jvp": lambda: jax.jvp(forward(fn), primals, direction)[1],
         "jvp of grad, remat": lambda: jax.jvp(gradient(remat), primals, direction)[1],
@@ -61,13 +67,14 @@ def ran(order, label: str, name: str):
         raise AssertionError(f"{label}: its {name} does not run: {type(error).__name__}: {error}") from error
 
 
-def assert_contract(fn, primals, direction, cotangent, label: str) -> None:
-    """Every order of `fn` runs at the draw, and each leaf is finite wherever the same order's float64
-    run is a normal float32."""
+def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None) -> None:
+    """Every order of `fn` runs at the draw, and each leaf is finite wherever the same order of its float64
+    run is a normal float32: `fn`'s own in float64, or `truth_fn`'s, the plain float64 formula, where `fn`
+    computes in a fixed precision whatever its inputs' (a declared dot algorithm)."""
     narrow = orders(fn, primals, direction, cotangent)
     with jax.enable_x64(new_val=True):
         wide_primals, wide_direction, wide_cotangent = widened((primals, direction, cotangent))
-        wide = orders(fn, wide_primals, wide_direction, wide_cotangent)
+        wide = orders(truth_fn or fn, wide_primals, wide_direction, wide_cotangent)
         truths = {name: ran(order, f"{label} in float64", name) for name, order in wide.items()}
     for name, order in narrow.items():
         values = jax.tree.leaves(ran(order, label, name))
@@ -121,7 +128,7 @@ def test_an_embedding_lookup_holds_every_order(edge):
     ids = jnp.asarray([[0, 3, 3, 10], [7, 0, 2, 2]], jnp.int32)
     (direction,) = normal_draw(1870, table.shape, scale=EDGES[edge])
     (cotangent,) = normal_draw(1871, (2, 4, 6))
-    assert_contract(lambda table: table_rows(table, ids, jnp.float32), (table,), (direction,), cotangent,
+    assert_contract(lambda table: table_rows(table, ids, table.dtype), (table,), (direction,), cotangent,
                     f"an embedding lookup {edge}")
 
 
@@ -137,7 +144,11 @@ def test_a_bf16_dot_holds_every_order(edge):
     def dot(lhs, rhs):
         return precision.bf16_dot_general(lhs, rhs, (((1,), (0,)), ((), ())))
 
-    assert_contract(dot, primals, direction, cotangent, f"a bf16 dot {edge}")
+    def exact(lhs, rhs):
+        # The operands as the algorithm reads them, rounded to bf16, then multiplied in float64.
+        return jnp.matmul(*(jnp.asarray(jnp.asarray(x, jnp.bfloat16), x.dtype) for x in (lhs, rhs)))
+
+    assert_contract(dot, primals, direction, cotangent, f"a bf16 dot {edge}", truth_fn=exact)
 
 
 def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch):
