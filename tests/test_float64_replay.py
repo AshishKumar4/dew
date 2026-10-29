@@ -143,18 +143,21 @@ def test_a_float32_program_replays_to_itself_run_in_float64(name):
 def test_what_a_programs_results_do_not_read_is_not_replayed():
     """A program whose result drops a value it computed, as a module's init drops its forward pass,
     replays without it: a float operation the replay has no rule for (`tan`) runs nowhere when no
-    result reads it, inside a jit, or a scan's step as an output or a carry no read carry reads, and
-    the result is its program's in float64."""
+    result reads it, inside a jit, or a scan's step as an output, a carry no read carry reads, or a
+    conditional's result on the step, and the result is its program's in float64."""
     x = np.random.default_rng(3).uniform(0.5, 2.0, (6, 7)).astype(np.float32)
 
     def dropping(x):
         return (jnp.tan(x), _arithmetic(x))[1]
 
     def scanned(x):
-        # A carry the result reads, and an output and a carry it does not.
+        # A carry the result reads, an output and a carry it does not, and a conditional on the step
+        # whose result the carry reads one of.
         def body(carry, row):
             kept, dropped = carry
-            return (kept + _arithmetic(row), dropped * jnp.tan(row)), jnp.tan(row)
+            taken, _ = jax.lax.cond(row[0] > 1, lambda row: (row, jnp.tan(row)),
+                                    lambda row: (row, jnp.tan(row)), row)
+            return (kept + _arithmetic(taken), dropped * jnp.tan(row)), jnp.tan(row)
         return jax.lax.scan(body, (x[0] * 0, x[0]), x)[0][0]
 
     replayed = np.asarray(float64_replay(jax.jit(dropping))(x))

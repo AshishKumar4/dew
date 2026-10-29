@@ -5,7 +5,7 @@ draws, whose float32 bits a float64 run would draw otherwise)."""
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import _floating, as_given, equations
+from reference_error import _floating, as_given, equations, scan_groups
 
 REPLAYED = frozenset({
     "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "square", "exp", "expm1", "log", "erf",
@@ -96,20 +96,15 @@ def _wide(dtype):
     return jnp.float64 if _floating(dtype) else dtype
 
 
-def _scanned(equation) -> tuple[int, int]:
-    """A scan's constants and carries, its step's first operands: by its counts where it states them,
-    else as the operands and results whose shapes the step keeps, a scanned operand or result being
-    the stack of the step's (one dimension more)."""
-    params = equation.params
-    if "num_carry" in params:
-        return params["num_consts"], params["num_carry"]
-    body = params["jaxpr"].jaxpr
-
-    def kept(outer, inner):
-        return next((index for index, (one, other) in enumerate(zip(outer, inner, strict=False))
-                     if one.aval.shape != other.aval.shape), min(len(outer), len(inner)))
-    carries = kept(equation.outvars, body.outvars)
-    return kept(equation.invars, body.invars) - carries, carries
+def _filled(graph, used):
+    """`graph` (a closed jaxpr) replayed as a program of its widened operands, its results those of
+    `used` and zeros of their widened types for the rest, so a step or a branch keeps its signature
+    while the replay reads what its used results read alone."""
+    def run(*operands):
+        outputs = _replayed(graph.jaxpr, graph.consts, list(operands), used)
+        return [jnp.zeros(variable.aval.shape, _wide(variable.aval.dtype)) if output is None else output
+                for output, variable in zip(outputs, graph.jaxpr.outvars, strict=True)]
+    return run
 
 
 def _carried(body, consts: int, carries: int, used):
@@ -156,9 +151,8 @@ def _replayed_equation(equation, values, used):
         try:
             branch = params["branches"][int(index)]
         except jax.errors.ConcretizationTypeError:
-            branches = tuple(jax.make_jaxpr(
-                lambda *given, branch=branch: _replayed(branch.jaxpr, branch.consts, list(given)))(
-                    *(jax.ShapeDtypeStruct(jnp.shape(value), jnp.result_type(value)) for value in operands))
+            branches = tuple(jax.make_jaxpr(_filled(branch, used))(
+                *(jax.ShapeDtypeStruct(jnp.shape(value), jnp.result_type(value)) for value in operands))
                 for branch in params["branches"])
             return equation.primitive.bind(index, *operands, **{**params, "branches": branches})
         return _replayed(branch.jaxpr, branch.consts, operands, used)
@@ -168,14 +162,11 @@ def _replayed_equation(equation, values, used):
         # The body, replayed in float64 for its operands' widened dtypes, as the scan's own: of its
         # results those the scan's used results read through every step (`_carried`), the rest zeros.
         body = params["jaxpr"]
-        reading = _carried(body.jaxpr, *_scanned(equation), used)
+        reading = _carried(body.jaxpr, *scan_groups(params, len(values)), used)
 
-        def step(*operands):
-            outputs = _replayed(body.jaxpr, body.consts, list(operands), reading)
-            return [jnp.zeros(variable.aval.shape, _wide(variable.aval.dtype)) if output is None else output
-                    for output, variable in zip(outputs, body.jaxpr.outvars, strict=True)]
-        widened = jax.make_jaxpr(step)(*(jax.ShapeDtypeStruct(variable.aval.shape, _wide(variable.aval.dtype))
-                                         for variable in body.jaxpr.invars))
+        widened = jax.make_jaxpr(_filled(body, reading))(
+            *(jax.ShapeDtypeStruct(variable.aval.shape, _wide(variable.aval.dtype))
+              for variable in body.jaxpr.invars))
         return equation.primitive.bind(*values, **{**params, "jaxpr": widened})
     if next(equations(params), None) is not None:
         # A call this replay does not open may hold float arithmetic its integer boundary hides.

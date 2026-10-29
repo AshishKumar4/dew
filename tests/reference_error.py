@@ -2229,6 +2229,13 @@ def _applied(equation, inputs, given, wanted: bool):
                      for energy, value in zip(made, outputs, strict=True)]
 
 
+def scan_groups(params, operands: int) -> tuple[int, int]:
+    """A scan equation's (`params`, of `operands` operands) constants and carries, its step's first
+    operands, as its operand tree declares them (`ft_in`)."""
+    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(operands)).unpack())
+    return constants, carries
+
+
 def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
     """A scan (lax.scan's equation `params`) over `inputs` a step at a time, as the gate's evaluators
     walk one (`float64_terms`, check 2's `certified`): each input a tuple of lanes, a value and what an
@@ -2237,7 +2244,7 @@ def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
     thread from step to step and each further output stacks over the steps in scan order, a lane where
     every step has one (else None); an empty scan's from its outvars' avals, its `lanes` - 1 others None."""
     jaxpr = params["jaxpr"].jaxpr
-    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
+    constants, carries = scan_groups(params, len(inputs))
     consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
                          inputs[constants + carries:])
     ys = []
