@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 from rl_support import TinyHead
 
 from dew.objectives.rl import RolloutScheduler, Synchronous
@@ -94,7 +94,8 @@ def dew_term(name, **settings):
 def paper(objective, dtype):
     """A paper's objective `objective(per-session arrays) -> loss` and its gradient in `dtype`, by
     autodiff of the formula written over each session's tokens alone: in float32 the reference, in
-    float64 the truth."""
+    float64 the truth. It reads each draw's sessions off its mask on the host, so the gate runs it as
+    given."""
     def term(policy, old, reference, advantage, mask, segments, weights):
         spans = sessions_of(np.asarray(mask), np.asarray(segments))
         with jax.enable_x64(new_val=True):
@@ -105,7 +106,7 @@ def paper(objective, dtype):
                                   for row, columns in spans])
             current = jnp.asarray(policy, dtype)
             return jax.device_get((value(current), jax.grad(value)(current)))
-    return term
+    return as_given(term)
 
 
 def clipped(ratio, advantage, low, high):
@@ -198,11 +199,11 @@ def test_the_global_estimator_whitens_the_whole_batch_over_its_data_shares(share
     mean, the batch of those whitened, with the paper's epsilon. Split into data shares, each share's
     moments pooled (`pooled`), every share's members are whitened by the whole batch's mean and
     deviation, as one share's are."""
-    rewards = {"a": [1.0, 0.0, 0.5], "b": [2.0, 2.0, -1.0], "c": [4.0, -3.0]}
-    sessions = {task: [Session(task, "g", sample, 0, (), Status.COMPLETED, reward)
-                       for sample, reward in enumerate(values)] for task, values in rewards.items()}
-    parts = [[*sessions["a"], *sessions["b"], *sessions["c"]]] if shares == 1 else [
-        [*sessions["a"], *sessions["b"]], sessions["c"]]
+    rewards = {0: [1.0, 0.0, 0.5], 1: [2.0, 2.0, -1.0], 2: [4.0, -3.0]}
+    sessions = {task: [session(task, sample, reward, (1,)) for sample, reward in enumerate(values)]
+                for task, values in rewards.items()}
+    parts = [[*sessions[0], *sessions[1], *sessions[2]]] if shares == 1 else [
+        [*sessions[0], *sessions[1]], sessions[2]]
     whitening = pooled([centred_moments(part) for part in parts])
     found = np.asarray([values[0] for part in parts
                         for values in advantages(part, "global", whitening=whitening)])
