@@ -191,11 +191,11 @@ PACKED_SEEDS = 16
 
 
 def every_case_row(task: Decide) -> list:
-    """Every case's questions about a short state of its own, as `task` lays them out, a row a question:
-    rows a window holds several of."""
+    """Every case's questions about one short state, as `task` lays them out, a row a question: rows a
+    window holds several of."""
     return [row for request in CASES.values()
-            for row in task._encoded(request["state"][:40], {name: Question.from_wire(wire)
-                                                             for name, wire in request["questions"].items()})]
+            for row in task._encoded("A short note.", {name: Question.from_wire(wire)
+                                                       for name, wire in request["questions"].items()})]
 
 
 def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
