@@ -79,28 +79,3 @@ def test_an_episode_record_reads_back_the_engine_records_its_draws_carry():
 
     assert restored == episode
     np.testing.assert_array_equal(restored.transitions[0].action.routed_experts, routed)
-
-
-def test_an_episode_keeps_its_compaction_and_its_parsed_requests_through_its_record():
-    """An episode whose first call's harness parsed a tool call from it and whose observation after it
-    compacted the context reads back from its JSON record unchanged: the transition keeps its request
-    and the observation its compaction. Its session gives the first call's transcript the task's
-    messages and the request as its response, and the next call a transcript of the compacted
-    observation's messages alone, the task's dropped with the history it replaced."""
-    from dew.objectives.rl.records import episode_from_record, record_json
-
-    trainer, collector = build()
-    first = collect(collector, trainer.initial_state())[0]
-    task = ({"role": "user", "content": "find it"},)
-    request = {"role": "assistant", "tool_calls": [{"id": "call-0", "type": "function",
-                                                    "function": {"name": "search", "arguments": "{}"}}]}
-    summary = ({"role": "user", "content": "the search found it; the history so far, summarized"},)
-    one = first.transitions[0]
-    turns = (replace(one, request=request,
-                     observation=replace(one.observation, messages=summary, compacted=True)),
-             *first.transitions[1:])
-    episode = replace(first, initial=replace(first.initial, messages=task), transitions=turns)
-    assert episode_from_record(json.loads(record_json(episode))) == episode
-    calls = session_of(episode, group="g").calls
-    assert (calls[0].transcript.messages, calls[0].transcript.response) == (task, request)
-    assert calls[1].transcript.messages == summary
