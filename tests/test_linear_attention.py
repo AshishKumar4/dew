@@ -124,9 +124,9 @@ def portable(query, key, value, g, beta, state=None):
     return chunk_delta_rule(query, key, value, g[..., None], beta, state)
 
 
-CHUNKED_SEEDS = 8
+CHUNKED_SEEDS = 16
 """The chunked rule's declared draws against `torch_chunk_gated_delta_rule` (check 1), sized by `seeds_for`
-paired with the portable rule."""
+paired with the portable rule on armada."""
 
 
 def rule_draw(reference, seed: int):

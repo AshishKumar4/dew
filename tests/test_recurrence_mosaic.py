@@ -374,7 +374,7 @@ def test_each_launch_lowers_once_however_many_layers_call_it():
 
 NAMED_SEEDS = 8
 """A layer named onto the template's declared draws against the portable rule (check 1), sized by
-`seeds_for` paired with the template's launches, interpreted."""
+`seeds_for` paired with the template's launches, interpreted on armada."""
 
 
 def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():

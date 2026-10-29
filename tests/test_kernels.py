@@ -11,6 +11,7 @@ a call it refuses raises. What actually executes on a CUDA device runs with
 kernel's own numbers are tests/test_attention_splash.py.
 """
 
+import contextlib
 import functools
 import itertools
 
@@ -79,16 +80,15 @@ def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_dete
     row of 64 beside queries of two rows of 32, or another sequence's keys of one row of 32 beside
     their ids of two rows of 16, flatten to as many tokens and would be read as the next row's: the
     call names the ids. Each well-formed twin, dense with grouped heads and packed, gives its output
-    and gradients within tests/reference_error.py's rule of the xla kernel's, both measured from
-    float64 per row or document."""
+    and gradients on par (check 1) with the xla kernel's from float64, over drawn operands and
+    cotangents."""
     flash_here()
     rng = np.random.default_rng(31)
 
     def normal(*shape):
         return jnp.asarray(rng.normal(size=shape), jnp.bfloat16)
 
-    query, cotangent = normal(2, 32, 4, 64), normal(2, 32, 4, 64)
-    key, value = normal(2, 32, 2, 64), normal(2, 32, 2, 64)
+    query, key = normal(2, 32, 4, 64), normal(2, 32, 2, 64)
     own = {"segment_ids": jnp.asarray(documents([[20, 12, 0], [9, 23, 0]])), "max_segments": 2}
     cross = {"segment_ids": own["segment_ids"], "max_segments": 2,
              "key_segment_ids": jnp.asarray(documents([[10, 6, 0], [4, 12, 0]]))}
@@ -111,31 +111,11 @@ def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_dete
                            normal(1, keys, 2, 64))
         assert not isinstance(refused.value, KernelRefused)
 
-    def exact(pieces):
-        """`[o, dq, dk, dv]` from float64 and their `window_terms`, each `(row, slice)` causal alone."""
-        truth = [np.zeros(x.shape, np.float64) for x in (query, query, key, value)]
-        terms = [np.zeros(x.shape, np.float64) for x in (query, query, key, value)]
-        with jax.enable_x64(new_val=True):
-            for row, piece in pieces:
-                parts = [x[row, piece] for x in (query, key, value, cotangent)]
-                wide = [jnp.asarray(np.asarray(x, np.float64)) for x in parts]
-                for whole, part in zip(truth, output_and_gradients(
-                        lambda q, k, v: float64_attention(q, k, v, causal=True), wide[3], *wide[:3]),
-                        strict=True):
-                    whole[row, piece] = part
-                for whole, part in zip(terms, window_terms(*parts, causal=True), strict=True):
-                    whole[row, piece] = part
-        return truth, terms
-
-    rows = [(0, slice(0, 32)), (1, slice(0, 32))]
-    documents_ = [(0, slice(0, 20)), (0, slice(20, 32)), (1, slice(0, 9)), (1, slice(9, 32))]
-    for packed, pieces in (({}, rows), (own, documents_)):
-        fused = output_and_gradients(jax.jit(attend('flash', **packed)), cotangent, query, key, value)
-        reference = output_and_gradients(jax.jit(attend('xla', **packed)), cotangent, query, key, value)
-        truth, terms = exact(pieces)
-        for name, index in (("o", 0), ("dq", 1), ("dk", 2), ("dv", 3)):
-            assert_as_exact_as_the_reference(fused[index], reference[index], truth[index],
-                                             f"{name} {'packed' if packed else 'dense'}", terms=terms[index])
+    for packed, name in (({}, "dense"), (own, "packed")):
+        keep = kept(32, 32, causal=True, segment_ids=packed.get("segment_ids"))
+        assert_as_exact(attended('flash', causal=True, **packed), attended('xla', causal=True, **packed),
+                        attention_draw(75, (2, 32, 4, 64), (2, 32, 2, 64)), f"flash's {name} twin",
+                        seeds=FLASH_SEEDS[f"{name} twin"], truth_fn=exact_attended(keep))
 
 
 SHARDED_SEEDS = 8
@@ -348,16 +328,53 @@ def output_and_gradients(attend, cotangent, *arrays):
     return [np.asarray(x, np.float64) for x in (out, *pull(cotangent))]
 
 
+FLASH_SEEDS = {"dense twin": 8, "packed twin": 8}
+"""Each GPU kernel site's declared draws against the xla kernel (check 1), by its case: sized by `seeds_for`
+paired on an A100 and an H100, the larger of the two."""
+
+
+def attended(implementation, **options):
+    """`scaled_dot_product_attention`'s output and the gradients of its queries, keys, values and, where
+    drawn, its sinks' logits under the cotangent drawn after them (`with_gradients`)."""
+    def attend(q, k, v, *sinks):
+        return scaled_dot_product_attention(q, k, v, implementation=implementation,
+                                            sinks=sinks[0] if sinks else None, **options)
+    return with_gradients(attend)
+
+
+def exact_attended(keep):
+    """`attended`'s float64 truth: `exact_attention` of the keys `keep` keeps, and its gradients."""
+    return with_gradients(lambda q, k, v, *sinks: exact_attention(q, k, v, *sinks, keep=keep))
+
+
+def attention_draw(site: int, query, key, value=None, *, sinks: bool = False, rows=None, dtype=jnp.bfloat16):
+    """A draw of normal queries, keys and values of shapes `query`, `key` and `value` (the keys' by default)
+    in `dtype`, a sink logit a query head N(0, 4) in fp32 where `sinks`, and a normal cotangent of the
+    output's shape zero on the rows `rows` (`[B, S]`) does not keep: one stream a seed, `site`'s."""
+    value = value or key
+
+    def draw(seed):
+        rng = np.random.default_rng([site, seed])
+        arrays = [jnp.asarray(rng.normal(size=shape), dtype) for shape in (query, key, value)]
+        if sinks:
+            arrays.append(jnp.asarray(rng.normal(size=(query[-2],)) * 2, jnp.float32))
+        cotangent = rng.normal(size=(*query[:-1], value[-1]))
+        if rows is not None:
+            cotangent = cotangent * np.asarray(rows)[:, :, None, None]
+        return (*arrays, jnp.asarray(cotangent, dtype))
+    return draw
+
+
 @on_gpu
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("sunk", [False, True])
 def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time(
         head_dim, causal, sunk, without_deterministic_ops):
-    """Documents packed back to back, one a single token, with an empty sequence between two: each
-    document's output and its three input gradients lie within tests/reference_error.py's rule of
-    FlashAttention's own on that document alone, both measured from float64, and with a 64-key
-    window and sinks so does the sinks' gradient summed over the documents. Not bitwise: on one
+    """Documents packed back to back, one a single token, with an empty sequence between two: the
+    documents' outputs and their three input gradients on par (check 1) with FlashAttention's own on
+    each document alone from float64, over drawn operands and cotangents, and with a 64-key window and
+    sinks so is the sinks' gradient summed over the documents. Not bitwise: on one
     short document the dense forward splits its keys across blocks (`_splits`) and the packed one
     does not, so the two round differently (on an RTX 4080, 1.0003 to 1.012 times apart in RMS)."""
     flash = flash_here()
@@ -365,45 +382,30 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
     lengths = [700, 1, 0, 333, 64]
     starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
-    query, _, _ = qkv((int(starts[-1]), 8, head_dim))
-    _, key, value = qkv((int(starts[-1]), 2, head_dim), seed=1)
-    cotangent = qkv((int(starts[-1]), 8, head_dim), seed=2)[0]
-    logits = jnp.asarray(np.random.default_rng(3).normal(size=(8,)) * 2, jnp.float32)
+    tokens = int(starts[-1])
     window = (63, 0 if causal else 63) if sunk else (-1, -1)
+    ids = np.repeat(np.arange(1, len(lengths) + 1), lengths)[None]
 
-    def options(sinks):
-        return {"is_causal": causal, "window_size": window, "sinks": sinks if sunk else None}
+    def options(*sinks):
+        return {"is_causal": causal, "window_size": window, "sinks": sinks[0] if sunk else None}
 
-    packed = output_and_gradients(
-        lambda q, k, v, s: flash.flash_mha_varlen(q, k, v, starts, max(lengths), **options(s)),
-        cotangent, query, key, value, logits)
-    dense_sinks, true_sinks = [], []
-    for begin, end in itertools.pairwise(starts):
-        if begin == end:
-            continue
-        pieces = (query[begin:end], key[begin:end], value[begin:end])
-        dense = output_and_gradients(
-            lambda q, k, v, s: flash.flash_mha(q[None], k[None], v[None], **options(s))[0],
-            cotangent[begin:end], *pieces, logits)
-        with jax.enable_x64(new_val=True):
-            wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end], logits)]
-            truth = output_and_gradients(
-                lambda q, k, v, s: float64_attention(q, k, v, causal, window, s if sunk else None),
-                wide[3], *wide[:3], wide[4])
-        dense_sinks.append(dense[4])
-        true_sinks.append(truth[4])
-        terms = window_terms(*pieces, cotangent[begin:end], causal, window, logits if sunk else None)
-        documents = (x[begin:end] for x in packed[:4])
-        for name, got, theirs, want, summed in zip(("o", "dq", "dk", "dv"), documents, dense[:4], truth[:4],
-                                                   terms, strict=True):
-            if distance(theirs, want) == 0:  # a one-token document's attention is exact either way
-                np.testing.assert_array_equal(got, theirs)
-            else:
-                assert_as_exact_as_the_reference(got, theirs, want, f"{name} of the document at {begin}",
-                                                 terms=summed)
-    if sunk:
-        assert_as_exact_as_the_reference(packed[4], np.sum(dense_sinks, axis=0), np.sum(true_sinks, axis=0),
-                                         "dsinks")
+    def packed(q, k, v, *sinks):
+        return flash.flash_mha_varlen(q, k, v, starts, max(lengths), **options(*sinks))
+
+    def alone(q, k, v, *sinks):
+        # Each document through the dense kernel apart, the empty one skipped, joined in their order.
+        return jnp.concatenate([flash.flash_mha(q[None, begin:end], k[None, begin:end], v[None, begin:end],
+                                                **options(*sinks))[0]
+                                for begin, end in itertools.pairwise(starts) if begin < end])
+
+    def exact(q, k, v, *sinks):
+        keep = kept(tokens, tokens, causal=causal, window=window, segment_ids=ids)
+        return exact_attention(q[None], k[None], v[None], *sinks, keep=keep)[0]
+
+    draw = attention_draw(355, (tokens, 8, head_dim), (tokens, 2, head_dim), sinks=sunk)
+    assert_as_exact(with_gradients(packed), with_gradients(alone), draw, f"packed documents, {head_dim} wide",
+                    seeds=FLASH_SEEDS[f"packed documents {head_dim} {causal} {sunk}"],
+                    truth_fn=with_gradients(exact))
 
 
 @on_gpu
@@ -412,38 +414,41 @@ def test_queries_packed_against_keys_of_their_own_lengths_attend_their_own_docum
                                                                                      without_deterministic_ops):
     """Cross-attention between packed documents: sequence i's queries, packed by their own offsets,
     attend sequence i's keys, packed by theirs, as a decision head's option slots read their own
-    row's tokens. Each document's output and its query, key and value gradients lie within
-    tests/reference_error.py's rule of FlashAttention's own on that document alone, both measured
-    from float64, a one-query document and an empty one among them; a document's keys no query
-    reads take no gradient."""
+    row's tokens. The documents' outputs and their query, key and value gradients on par (check 1) with
+    FlashAttention's own on each document alone from float64, over drawn operands and cotangents, a
+    one-query document and an empty one among them; a document's keys no query reads take no
+    gradient."""
     flash = flash_here()
     queries, keys = [30, 1, 0, 45, 7], [700, 333, 50, 120, 64]
     starts, key_starts = (np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
                           for lengths in (queries, keys))
-    query = qkv((int(starts[-1]), 8, head_dim))[0]
-    _, key, value = qkv((int(key_starts[-1]), 2, head_dim), seed=1)
-    cotangent = qkv((int(starts[-1]), 8, head_dim), seed=2)[0]
-    packed = output_and_gradients(
-        lambda q, k, v: flash.flash_mha_varlen(q, k, v, starts, max(queries), key_cu_seqlens=key_starts,
-                                               key_max_seqlen=max(keys)),
-        cotangent, query, key, value)
-    for (begin, end), (key_begin, key_end) in zip(itertools.pairwise(starts), itertools.pairwise(key_starts),
-                                                  strict=True):
-        if begin == end:
-            np.testing.assert_array_equal(packed[2][key_begin:key_end], 0)
-            np.testing.assert_array_equal(packed[3][key_begin:key_end], 0)
-            continue
-        pieces = (query[begin:end], key[key_begin:key_end], value[key_begin:key_end])
-        dense = output_and_gradients(lambda q, k, v: flash.flash_mha(q[None], k[None], v[None])[0],
-                                     cotangent[begin:end], *pieces)
-        with jax.enable_x64(new_val=True):
-            wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (*pieces, cotangent[begin:end])]
-            truth = output_and_gradients(lambda q, k, v: float64_attention(q, k, v, causal=False), wide[3],
-                                         *wide[:3])
-        rows = (slice(begin, end), slice(begin, end), slice(key_begin, key_end), slice(key_begin, key_end))
-        for name, got, at, theirs, want in zip(("o", "dq", "dk", "dv"), packed, rows, dense, truth,
-                                               strict=True):
-            assert_as_exact_as_the_reference(got[at], theirs, want, f"{name} of the document at {begin}")
+    length, key_length = int(starts[-1]), int(key_starts[-1])
+
+    def packed(q, k, v):
+        return flash.flash_mha_varlen(q, k, v, starts, max(queries), key_cu_seqlens=key_starts,
+                                      key_max_seqlen=max(keys))
+
+    def alone(q, k, v):
+        # Each document's queries over its own keys through the dense kernel apart, joined in their order.
+        return jnp.concatenate([flash.flash_mha(q[None, begin:end], k[None, key_begin:key_end],
+                                                v[None, key_begin:key_end])[0]
+                                for (begin, end), (key_begin, key_end) in zip(
+                                    itertools.pairwise(starts), itertools.pairwise(key_starts), strict=True)
+                                if begin < end])
+
+    asking, read = (np.repeat(np.arange(len(lengths)), lengths) for lengths in (queries, keys))
+    keep = (asking[:, None] == read[None, :])[None, None]
+
+    def exact(q, k, v):
+        return exact_attention(q[None], k[None], v[None], keep=keep)[0]
+
+    draw = attention_draw(411, (length, 8, head_dim), (key_length, 2, head_dim))
+    assert_as_exact(with_gradients(packed), with_gradients(alone), draw, f"cross documents, {head_dim} wide",
+                    seeds=FLASH_SEEDS[f"cross documents {head_dim}"], truth_fn=with_gradients(exact))
+    unread = np.repeat([begin == end for begin, end in itertools.pairwise(starts)], keys)
+    _, _, d_key, d_value = jax.jit(with_gradients(packed))(*draw(0))
+    np.testing.assert_array_equal(np.asarray(d_key)[unread], 0)
+    np.testing.assert_array_equal(np.asarray(d_value)[unread], 0)
 
 
 @on_gpu
@@ -739,31 +744,36 @@ def test_a_query_reading_another_sequences_documents_reads_its_own_documents_key
                                        rtol=1e-12, atol=1e-14)
 
 
+CROSS_DOCUMENT_SEEDS = 8
+"""The TPU kernels' cross documents against xla's declared draws (check 1), sized by `seeds_for` paired on
+armada."""
+
+
 def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_exact_as_xla():
     """Packed queries over a context packed by its own documents (`key_segment_ids`) on 'tpu', which
-    interprets off a TPU: the output and the three gradients within tests/reference_error.py's rule of
-    xla's against float64, a document of the queries' the context lacks among them; xla's sums are
-    the TPU's, fp32 (`FP32_SUMS`), and a CPU runs them on its reference path."""
+    interprets off a TPU: the output and the three gradients on par (check 1) with xla's from float64,
+    over drawn operands and cotangents, a document of the queries' the context lacks among them; xla's
+    sums are the TPU's, fp32 (`FP32_SUMS`), and a CPU runs them on its reference path."""
     queries = jnp.asarray([[1] * 40 + [2] * 30 + [3] * 30 + [0] * 28])
     keys = jnp.asarray([[1] * 50 + [3] * 50 + [0] * 28])
-    arrays = [jax.random.normal(jax.random.key(seed), (1, 128, 2, 128), jnp.float32) for seed in range(3)]
-    cotangent = jax.random.normal(jax.random.key(3), (1, 128, 2, 128), jnp.float32)
 
-    def derivatives(implementation, *arrays):
+    def draw(seed):
+        return tuple(jax.random.normal(key, (1, 128, 2, 128), jnp.float32)
+                     for key in jax.random.split(jax.random.fold_in(jax.random.key(742), seed), 4))
+
+    def derivatives(implementation, precision=None):
         def attend(q, k, v):
             return scaled_dot_product_attention(q, k, v, implementation=implementation, segment_ids=queries,
                                                 key_segment_ids=keys, max_segments=3)
 
-        out, pull = jax.vjp(attend, *arrays)
-        return (out, *pull(cotangent.astype(out.dtype)))
+        def run(*drawn):
+            with jax.default_matmul_precision(precision) if precision else contextlib.nullcontext():
+                return with_gradients(attend)(*drawn)
+        return run
 
-    found = derivatives("tpu", *arrays)
-    with jax.default_matmul_precision(FP32_SUMS):
-        reference = derivatives("xla", *arrays)
-    with jax.enable_x64(new_val=True):
-        truth = derivatives("reference", *(jnp.asarray(x, jnp.float64) for x in arrays))
-    for name, got, want, exact in zip(("out", "dq", "dk", "dv"), found, reference, truth, strict=True):
-        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
+    assert_as_exact(derivatives("tpu"), derivatives("xla", FP32_SUMS), draw,
+                    "the tpu kernels' cross documents", seeds=CROSS_DOCUMENT_SEEDS,
+                    truth_fn=derivatives("reference"))
 
 
 def key_length_call(implementation, query, key, value, lengths, **kwargs):
@@ -876,16 +886,22 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_than_jax_nn():
     assert mine <= 0.75 * theirs, (mine, theirs)
 
 
+FORWARD_MODE_SEEDS = 8
+"""fp32 attention summed in float64 against jax.nn's declared draws (check 1), sized by `seeds_for` paired
+on armada."""
+
+
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
 def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     """fp32 reference attention over 300 keys, whose products a CPU sums in float64
     (`dew.nn.precision.accumulated`), as a consistency model's JVP runs it under
-    `forward_mode_attention` (sCM, rCM): its value, tangent and three gradients are within
-    tests/reference_error.py's rule of jax.nn.dot_product_attention's against float64."""
+    `forward_mode_attention` (sCM, rCM): its value, tangent and three gradients on par (check 1) with
+    jax.nn.dot_product_attention's from float64, over drawn primals, tangents and cotangents."""
     from dew.nn.attention import forward_mode_attention
 
-    arrays = [jax.random.normal(jax.random.key(seed), (1, 300, 2, 16), jnp.float32) for seed in range(7)]
-    primals, tangents, cotangent = arrays[:3], arrays[3:6], arrays[6]
+    def draw(seed):
+        return tuple(jax.random.normal(key, (1, 300, 2, 16), jnp.float32)
+                     for key in jax.random.split(jax.random.fold_in(jax.random.key(880), seed), 7))
 
     def reference(q, k, v):
         return scaled_dot_product_attention(q, k, v, implementation="reference", causal=True)
@@ -893,18 +909,17 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     def plain(q, k, v):
         return jax.nn.dot_product_attention(q, k, v, is_causal=True, implementation="xla")
 
-    def derivatives(attend, *primals):
-        with forward_mode_attention():
-            out, tangent = jax.jvp(attend, primals, tuple(t.astype(primals[0].dtype) for t in tangents))
-        _, pull = jax.vjp(attend, *primals)
-        return (out, tangent, *pull(cotangent.astype(out.dtype)))
+    def derivatives(attend):
+        def run(*arrays):
+            primals, tangents, cotangent = arrays[:3], arrays[3:6], arrays[6]
+            with forward_mode_attention():
+                out, tangent = jax.jvp(attend, primals, tuple(t.astype(primals[0].dtype) for t in tangents))
+            _, pull = jax.vjp(attend, *primals)
+            return (out, tangent, *pull(cotangent.astype(out.dtype)))
+        return run
 
-    found, theirs = derivatives(reference, *primals), derivatives(plain, *primals)
-    with jax.enable_x64(new_val=True):
-        truth = derivatives(reference, *(jnp.asarray(x, jnp.float64) for x in primals))
-    names = ("out", "tangent", "dq", "dk", "dv")
-    for name, got, want, exact in zip(names, found, theirs, truth, strict=True):
-        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
+    assert_as_exact(derivatives(reference), derivatives(plain), draw, "fp32 attention summed in float64",
+                    seeds=FORWARD_MODE_SEEDS, truth_fn=derivatives(reference))
 
 
 def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
@@ -1030,39 +1045,51 @@ def test_normal_attention_ends_each_rows_keys_at_its_length_as_a_prefix_mask_doe
                                   module.apply(params, queries, context, mask=prefix))
 
 
+ALL_TRUE_SEEDS = {"reference": 8, "xla": 8}
+"""An all-True mask against the unmasked call's declared draws (check 1), by implementation, sized by
+`seeds_for` paired on armada."""
+
+
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
 def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):
     """A key the mask drops leaves the output bitwise unchanged when its value
     moves, which the unmasked call does not. An all-True mask computes the
     unmasked attention, but not always bitwise: XLA:GPU fuses the masked
-    softmax differently (2.4e-7 apart on an A100), so it is held to
-    tests/reference_error.py's rule against the unmasked call, both measured
-    from float64."""
+    softmax differently (2.4e-7 apart on an A100), so it is held on par
+    (check 1) with the unmasked call from float64, over drawn inputs and
+    weights."""
     module = NormalAttention(16, heads=2, dim_head=8, attention_impl=implementation)
-    rng = np.random.default_rng(0)
-    queries = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.float32)
-    context = jnp.asarray(rng.normal(size=(2, 7, 16)), jnp.float32)
-    moved = context.at[:, 3].add(10.0)
-    params = module.init(jax.random.key(0), queries, context)
     kept = jnp.ones((2, 1, 5, 7), bool)
+
+    def draw(seed):
+        rng = np.random.default_rng([1034, seed])
+        queries = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.float32)
+        context = jnp.asarray(rng.normal(size=(2, 7, 16)), jnp.float32)
+        return module.init(jax.random.key(seed), queries, context), queries, context
+
+    params, queries, context = draw(0)
+    moved = context.at[:, 3].add(10.0)
     dropped = kept.at[..., 3].set(False)
     np.testing.assert_array_equal(module.apply(params, queries, context, mask=dropped),
                                   module.apply(params, queries, moved, mask=dropped))
     assert not np.array_equal(module.apply(params, queries, context), module.apply(params, queries, moved))
-    weights = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), params["params"])
 
-    def projected(tokens: jax.Array, name: str) -> np.ndarray:
-        return np.einsum("bsc,chd->bshd", np.asarray(tokens, np.float64), weights[name]["kernel"]) + \
-            weights[name]["bias"]
+    def truth(params, queries, context):
+        weights = params["params"]
 
-    q, k, v = projected(queries, "to_q"), projected(context, "to_k"), projected(context, "to_v")
-    logits = np.einsum("bshd,bthd->bhst", q, k) / np.sqrt(8)
-    probabilities = np.exp(logits - logits.max(-1, keepdims=True))
-    attended = np.einsum("bhst,bthd->bshd", probabilities / probabilities.sum(-1, keepdims=True), v)
-    truth = np.einsum("bshd,hdc->bsc", attended, weights["to_out_0"]["kernel"]) + weights["to_out_0"]["bias"]
-    assert_as_exact_as_the_reference(np.asarray(module.apply(params, queries, context, mask=kept)),
-                                     np.asarray(module.apply(params, queries, context)), truth,
-                                     f"{implementation} attention under an all-True mask")
+        def projected(tokens, name):
+            return np.einsum("bsc,chd->bshd", tokens, weights[name]["kernel"]) + weights[name]["bias"]
+
+        q, k, v = projected(queries, "to_q"), projected(context, "to_k"), projected(context, "to_v")
+        logits = np.einsum("bshd,bthd->bhst", q, k) / np.sqrt(8)
+        probabilities = np.exp(logits - logits.max(-1, keepdims=True))
+        attended = np.einsum("bhst,bthd->bshd", probabilities / probabilities.sum(-1, keepdims=True), v)
+        out = weights["to_out_0"]
+        return np.einsum("bshd,hdc->bsc", attended, out["kernel"]) + out["bias"]
+
+    assert_as_exact(functools.partial(module.apply, mask=kept), module.apply, draw,
+                    f"{implementation} attention under an all-True mask",
+                    seeds=ALL_TRUE_SEEDS[implementation], truth_fn=truth)
 
 
 def eligibility_cases():
