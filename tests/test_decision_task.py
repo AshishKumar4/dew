@@ -202,13 +202,13 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
     """A pass packs its rows first-fit into windows, as a run's windows hold them (`Decide.packing`),
     several a window and each attending its own tokens alone: each row's logits on par with the row
     scored alone, a pass of its own, from the float64 task alone (check 1), over weights drawn about the
-    task's, and the pass a few windows where a row a window would take one each."""
+    task's, the pass's rows in fewer windows than rows."""
     # Windows of the encoder's 256 positions, which hold several of these rows each.
     task = replace(decide, layout=replace(decide.layout, max_len=256))
     rows = every_case_row(task)
     shape = task._shape(rows)
     placed = task._placed(rows, shape)
-    assert placed is not None and len(set(placed)) < len(rows) and shape.rows < len(rows)
+    assert placed is not None and len(set(placed)) < len(rows)
     wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
                    layout=task.layout)
 

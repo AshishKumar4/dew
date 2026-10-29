@@ -233,7 +233,8 @@ class Decide(SavedRunTask):
         if not isinstance(bundle, PretrainedDecision):
             raise TypeError(f"{name} declares no decision task")
         # The name a caller asked for, a Hub folder included, not the cache path it resolved to.
-        return cls.of(bundle, name=str(name) if subfolder is None else f"{name}/{subfolder}")
+        task = cls.of(bundle, name=str(name) if subfolder is None else f"{name}/{subfolder}")
+        return replace(task, variables=_served(task.model, task.variables))
 
     @classmethod
     def of(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
@@ -289,8 +290,9 @@ class Decide(SavedRunTask):
                 averaged = checkpoints.stored(step).get("ema") is not None
         else:
             averaged = ema
-        task = cls._recorded(directory, record, saved_model(record, dtype).build(), variables,
-                             Weights(step, averaged), dtype)
+        backbone = saved_model(record, dtype).build()
+        task = cls._recorded(directory, record, backbone, variables, Weights(step, averaged), dtype)
+        task = replace(task, variables=_served(task.model, task.variables))
         saved = epath.Path(directory) / TASK_FILE
         if not saved.exists():
             return task
@@ -1047,6 +1049,18 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
         return self.decide._wire_response(payload.questions,
                                           *self.decide._replied(payload.questions, payload.rows, outputs),
                                           details=self.details)
+
+
+def _served(model: DecisionModel, variables: Variables) -> Variables:
+    """A loaded task's weights, its own to give up (`dew.inference.projections.packed_owned`), with the
+    backbone's projections packed as a served decoder's are: the one layout a task holds whatever a
+    source stored, a run's packed or an export's apart, so its loads compute one program (ledger 2299).
+    A task over a bundle's borrowed weights (`Decide.of`) reads them as the bundle holds them."""
+    from dew.batch import part
+    from dew.inference.projections import packed_owned
+
+    return joined({"backbone": packed_owned(model.backbone, part(variables, "backbone")),
+                   "head": part(variables, "head")})
 
 
 def decoded_images(images: object) -> list[Image.Image]:
