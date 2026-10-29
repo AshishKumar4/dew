@@ -60,7 +60,7 @@ from dew.lora import LoRA
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_route
 from dew.objectives.base import Effects, Loss, Metric, Objective
-from dew.optim import OptimConfig
+from dew.optim import OptimConfig, ParamGroup
 from dew.quantization import Quantization
 from dew.registry import (
     Annotation,
@@ -253,27 +253,6 @@ _JSON_FLAG = tyro.constructors.PrimitiveConstructorSpec(
 def _flag_json(text: str) -> JSON:
     """A JSON flag's value: its JSON, or None for `None`, as every optional flag spells it."""
     return None if text == "None" else json.loads(text)
-
-
-def fresh_parameters(objective: Objective) -> tuple[str, ...]:
-    """The parameters a run draws fresh over the loaded base its objective holds (`held_variables`), by
-    name (`parameter_name`): each its objective trains that the held tree does not hold, a head or a
-    projector it draws (`Objective.complete_variables`), and each of a cross-attention block, which a
-    source draws beside its own weights (`Pretrained.with_cross_attention`, `crossing`). None for an
-    objective that holds no trained base, whose every trained parameter is drawn alike, a frozen
-    tower's beside them or not. An adapter's factors (`Pretrained.adapt`) are the held tree's, and
-    keep their rate."""
-    from dew.nn.cross_attention import crossing
-    from dew.optim import parameter_name
-
-    held = objective.held_variables()
-    loaded = {path for path, _ in jax.tree_util.tree_leaves_with_path((held or {}).get("params", {}))}
-    # A run whose held trees train nothing, a frozen tower beside a model drawn whole, adds to no base.
-    if not loaded:
-        return ()
-    trained = jax.eval_shape(lambda: objective.init(jax.random.key(0)))["params"]
-    return tuple(parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)
-                 if path not in loaded or crossing(tuple(getattr(entry, "key", entry) for entry in path)))
 
 
 def _best_argument():
@@ -1552,6 +1531,7 @@ class RunConfig:
         # The record names the run's directory, so its run.json trains the same run again.
         self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
+        self = dataclasses.replace(self, optim=self.grouped(objective))
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
@@ -1589,10 +1569,6 @@ class RunConfig:
 
             # The whole pool accepts the resume before its record is replaced or its state restored.
             agreed("run resume", check_resumed)
-            # A new run's modules drawn fresh over a loaded base learn at their own rate, which its
-            # record keeps, so its resume reads the groups it trained in (`OptimConfig.with_fresh`).
-            if agreed_same("run resumes", lambda: checkpoints.resumed(trainer.resume)) is None:
-                self = dataclasses.replace(self, optim=self.optim.with_fresh(fresh_parameters(objective)))
             agreed("run metadata", record_run)
             # The trainer (`built`) holds mesh, microbatches, layout, accumulation, split, dynamic_scale,
             # profile, tune_kernels and any step compiled ahead; prepare_process read the process fields,
@@ -1637,6 +1613,16 @@ class RunConfig:
         mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
         with generation.chosen(attention_form=self.trainer.attention_form):
             return target.compiled(self.built(objective, mesh, rollout), dataset, steps)
+
+    def grouped(self, objective: Objective) -> OptimConfig:
+        """The run's optimizer, each group that claims the modules its objective draws fresh beside a
+        loaded base matching them (`ParamGroup.fresh`, `Objective.fresh_modules`), which every process
+        agrees on before any records it; as configured where no group claims them."""
+        if not any(group.fresh for group in self.optim.param_groups):
+            return self.optim
+        groups = agreed_same("run param groups", lambda: to_record(
+            self.optim.with_fresh(objective.fresh_modules()).param_groups, tuple[ParamGroup, ...]))
+        return dataclasses.replace(self.optim, param_groups=from_record(tuple[ParamGroup, ...], groups))
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,

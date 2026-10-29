@@ -86,15 +86,6 @@ def _matrix_sides(axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]] 
     return tuple(sides[0]), tuple(sides[1])
 
 
-FRESH_LEARNING_RATE_MULTIPLIER = 100.0
-"""How much faster than a loaded base the modules a run draws fresh over it learn by default
-(`OptimConfig.with_fresh`): a base fine-tunes at a rate a fresh module barely moves at. On a toy task
-whose answer is in a context only cross-attention reads (a four-layer decoder, blocks before layers 1
-and 3, AdamW, 1000 steps, tests/test_fresh_rate.py), the blocks learned nothing at the base's 1e-5
-(held loss 4.50 against the no-context 4.51), little with only their gates at 100 times (4.47), and as
-at 1e-3 throughout with every weight of theirs at 100 times (2.72)."""
-
-
 def weight_decay_mask(params):
     """Mark every parameter but the biases and the vectors, which weight decay spares by default:
     nanoGPT's split (model.py, `GPT.configure_optimizers`), with Megatron Core's and timm's `bias`
@@ -1295,7 +1286,7 @@ class ParamGroup:
     """
 
     name: str
-    patterns: tuple[str, ...]
+    patterns: tuple[str, ...] = ()
     learning_rate_multiplier: float = 1.0
     weight_decay: float | None = None
     spared: bool = False
@@ -1304,10 +1295,14 @@ class ParamGroup:
     schedule: ScheduleBase | None = None
     b1: ScheduleBase | None = None
     bounds: tuple[float, float] | None = None
+    fresh: bool = False
+    """Whether the group claims the modules its run draws fresh beside a loaded base, ahead of its own
+    `patterns` (`Objective.fresh_modules`): what `OptimConfig.with_fresh` names before a run records
+    the group."""
 
     def __post_init__(self):
         object.__setattr__(self, "patterns", tuple(self.patterns))
-        if not self.patterns:
+        if not self.patterns and not self.fresh:
             raise ValueError(f"param group {self.name!r} matches no pattern")
         if self.learning_rate_multiplier <= 0:
             raise ValueError(
@@ -1897,12 +1892,16 @@ class OptimConfig:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):
                 raise ValueError(f"param group names repeat: {names}")
+            claiming = [group.name for group in self.param_groups if group.fresh]
+            if claiming:
+                raise ValueError(f"param groups {claiming} claim the modules a run draws fresh, which the "
+                                 f"run names (`OptimConfig.with_fresh`) before it builds their optimizer")
             solvers = {}
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
-                spared = {'mask': weight_decay_mask} if group.spared and self._spares(opts) else {}
-                solvers[group.name] = group.solver(make, self.learning_rate, steps,
-                                                   {**opts, **decay, **spared})
+                grouped = {**opts, **decay}
+                spared = {'mask': weight_decay_mask} if group.spared and self._spares(grouped) else {}
+                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**grouped, **spared})
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
             if self._spares(opts):
@@ -1946,17 +1945,22 @@ class OptimConfig:
         return self.optimizer not in ('muon', 'muonclip') and (self.optimizer in OPTIMIZER_MAP
                                                                or 'weight_decay' in opts)
 
-    def with_fresh(self, names: Sequence[str]) -> OptimConfig:
-        """This config with the parameters `names` (`parameter_name`s) learning at
-        `FRESH_LEARNING_RATE_MULTIPLIER` times its rate, in a group of their own, and every other at
-        its own (`param_groups`, each sparing what the ungrouped decay spares), where it names no
-        groups: a run's default for the modules it draws fresh over a loaded base. Unchanged where it
-        names groups, which say every parameter's rate, or where no parameter is fresh."""
-        if self.param_groups or not names:
-            return self
-        fresh = ParamGroup("fresh", tuple(glob.escape(name) for name in names),
-                           learning_rate_multiplier=FRESH_LEARNING_RATE_MULTIPLIER, spared=True)
-        return dataclasses.replace(self, param_groups=(fresh, ParamGroup("loaded", ("*",), spared=True)))
+    def with_fresh(self, modules: Sequence[str]) -> OptimConfig:
+        """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the
+        parameters of `modules`, each a module's path under `params` as a parameter's name begins
+        (`parameter_name`), ahead of its own patterns: the groups a run records and trains in, its
+        modules drawn fresh beside a loaded base (`Objective.fresh_modules`). Refused where such a group
+        then matches nothing, in a run that draws nothing fresh."""
+        claimed = tuple(f"{glob.escape(module)}/*" for module in modules)
+        groups = []
+        for group in self.param_groups:
+            if group.fresh:
+                if not claimed and not group.patterns:
+                    raise ValueError(f"param group {group.name!r} claims the modules its run draws fresh "
+                                     f"beside a loaded base, and it draws none")
+                group = dataclasses.replace(group, patterns=(*claimed, *group.patterns), fresh=False)
+            groups.append(group)
+        return dataclasses.replace(self, param_groups=tuple(groups))
 
     def rates(self) -> dict[str | None, dict[str, float]]:
         """The rate fields each of `build`'s solvers holds in its state

@@ -231,6 +231,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  consistency: float = 0.0, context_window: int | None = None):
         held: Variables | None = None
         self.image_processor = None
+        # What the backbone's source drew fresh over its weights, under the model's `backbone`.
+        self._fresh_backbone = tuple(f"backbone/{module}" for module in getattr(backbone, "fresh", ()))
         match backbone:
             case Decide():
                 model, held = backbone.model, backbone.variables
@@ -311,6 +313,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Nothing beyond the held parts: `complete_variables` draws the part the tree lacks."""
         return held or {}
+
+    def fresh_modules(self) -> tuple[str, ...]:
+        """What the backbone's source drew fresh (`Pretrained.fresh`), and the head where it is drawn
+        beside a held backbone (`complete_variables`)."""
+        held = self.variables or {}
+        loaded = any("backbone" in collection for collection in held.values())
+        drawn = loaded and not any("head" in collection for collection in held.values())
+        return self._fresh_backbone + (("head",) if drawn else ())
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Draw whichever of the backbone and the head `tree` does not hold."""

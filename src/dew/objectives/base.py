@@ -958,6 +958,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise NotImplementedError(f"{type(self).__name__} draws no fresh tree: give it variables, "
                                   "or implement fresh_variables")
 
+    def fresh_modules(self) -> tuple[str, ...]:
+        """The modules this objective trains that are drawn fresh beside a loaded base, by their paths
+        under `params` (`backbone/layers_1/cross_attention`, `head`), which a run's fresh group claims
+        (`dew.optim.ParamGroup.fresh`): none by default, an objective declaring what it draws beside
+        the base it holds and what its source drew (`Pretrained.fresh`)."""
+        return ()
+
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Return `tree`, held or drawn, with what the objective's own modules
         add: a loss head, a projector, a phase's split. The default adds nothing."""
