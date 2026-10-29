@@ -632,10 +632,9 @@ def test_a_resumed_run_continues_its_admitted_plan_without_timing(tmp_path, monk
 
     first = run(1)
     first.fit(windows(corpus), steps=2, checkpoint_every=2)
-    assert "timed" not in first.plan and first.plan["remat"] is None
+    assert first.plan["remat"] is None
     resumed = run(None)
     resumed.fit(windows(corpus), steps=4, checkpoint_every=2)
-    assert "timed" not in resumed.plan
     assert (resumed.plan["split"], resumed.plan["remat"]) == (first.plan["split"], first.plan["remat"])
 
 
@@ -646,9 +645,10 @@ def test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling(monkey
     trainer = lm()
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH)
-    step = trainer.compile(state, BATCH, trials)
+    with Compiles("step") as compiles:
+        step = trainer.compile(state, BATCH, trials)
     assert (trainer.plan["split"], trainer.plan["remat"]) == (2, None)
-    assert "timed" not in trainer.plan
+    assert compiles.count == len(trainer.plan["probes"])
     assert all(probe["remat"] is None for probe in trainer.plan["probes"])
     state, loss, *_ = step(state, BATCH)
     assert np.isfinite(float(loss))
@@ -669,7 +669,7 @@ def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, r
     with Compiles("step") as compiles:
         trainer.compile(state, BATCH, trials)
     assert compiles.count == 1
-    assert trainer.plan["remat"] == remat and "timed" not in trainer.plan
+    assert trainer.plan["remat"] == remat
     assert len(trainer.plan["probes"]) == 1
 
 
@@ -678,7 +678,6 @@ def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, r
 def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeypatch, remat):
     """A real fit over two devices keeps its nonterminal or terminal explicit policy once admitted.
     No optional compile or timing is hidden in fit's internally created Trials (row 2153)."""
-    monkeypatch.setenv("DEW_UNTIMED_FRONTIER", "0")
     free(monkeypatch, LIMIT)
     corpus = token_files(tmp_path)
     trainer = windowed(tmp_path, 1, remat=REMAT_POLICIES[remat])
@@ -687,7 +686,6 @@ def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeyp
         state = trainer.fit(windows(corpus), steps=1, checkpoint_every=None, checkpoint_final=False)
     assert compiles.count == 1 and int(state.step) == 1
     assert [probe["remat"] for probe in trainer.plan["probes"]] == [remat]
-    assert "timed" not in trainer.plan
 
 
 @pytest.mark.parametrize("split", [1, 2])
@@ -698,8 +696,9 @@ def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, split):
     trainer = lm()
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH)
-    trainer.compile(state, BATCH, trials)
-    assert "timed" not in trainer.plan
+    with Compiles("step") as compiles:
+        trainer.compile(state, BATCH, trials)
+    assert compiles.count == len(trainer.plan["probes"])
     assert trainer.objective.model.remat is None
     assert (trainer.plan["split"], None, True) in asked(trainer)
     assert all(remat is None for _, remat, _ in asked(trainer))
@@ -806,8 +805,9 @@ def test_a_run_trains_only_its_requested_steps_without_timing_a_frontier(monkeyp
     free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
                                                                   checkpoint_every=None)) - 1)
     trainer = windowed(tmp_path / "timed", None)
-    state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
-    assert "timed" not in trainer.plan
+    with Compiles("step") as compiles:
+        state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
+    assert compiles.count == len(trainer.plan["probes"])
     assert int(state.step) == 3
 
 

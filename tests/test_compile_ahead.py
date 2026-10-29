@@ -27,12 +27,12 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, links=None, split=1):
+def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
               **({"attention_impl": "xla"} if xla else {})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, links=links)
+                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead)
 
 
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
@@ -84,6 +84,30 @@ def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_pat
     assert any(probe.headroom is not None and probe.headroom < 0 for probe in probes)
 
 
+def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, monkeypatch):
+    """On a compile-only GPU of stated memory, a step read in two microbatches, whose first call builds
+    its window's gradient sum, needs room for that sum once: the stated pool holds the step's arguments,
+    the sum among them, and beside them the outputs that alias none, the temporaries and the batches
+    prefetched next to the step (the 2113 review: the sum was counted among the arguments and again
+    beside them, so an offline plan could refuse a step that fits)."""
+    from dew.distributed.batches import batch_shardings, prefetched_bytes
+    from dew.training.ahead import compile_ahead, compile_only_gpus, step_batch
+    from dew.training.memory import temporaries_factor
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    capacity = 2**30
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=2)
+    rows = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    ahead = compile_ahead(trainer, rows, capacity=capacity)
+    (probe,) = listed(record(ahead.plan, "plan")["probes"], "probes", read=record, what="probes")
+    batch = step_batch(trainer, rows)
+    prefetched = prefetched_bytes(batch, batch_shardings(trainer.device_mesh, batch))
+    temporaries = ahead.temp_bytes * temporaries_factor(trainer.device_mesh, capacity)
+    assert probe["fits"] is True
+    assert probe["headroom"] == (capacity - ahead.argument_bytes - (ahead.output_bytes - ahead.alias_bytes)
+                                 - prefetched - temporaries)
+
+
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("spec", [MeshSpec(fsdp=8), MeshSpec(), MeshSpec(fsdp=4, tensor=2)],
                          ids=["fsdp8", "data8", "fsdp4_tensor2"])
@@ -95,12 +119,7 @@ def test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_e
     from dew.training.ahead import compile_ahead, compile_only_gpus, step_batch
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    links = None
-    if spec.tensor == 2:
-        from dew.nn.sharding import Link
-
-        links = {"tensor": Link(None, None)}
-    absent = fine_tune(spec.build(compile_only_gpus("sm90", 8)), links=links)
+    absent = fine_tune(spec.build(compile_only_gpus("sm90", 8)))
     ahead = compile_ahead(absent, batch)
     run = fine_tune(spec.build())
     state, _, _ = run.place()
