@@ -329,7 +329,8 @@ def inputs(name: str, depends: list[str]) -> list[str]:
                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
     # A build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
     # (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files).
-    return sorted({name, *(path for path in depends if not built(Path(path.removeprefix("probe:")))), *packages})
+    kept = (path for path in depends if not built(Path(path.removeprefix("probe:"))))
+    return sorted({name, *kept, *packages})
 
 
 @functools.cache
