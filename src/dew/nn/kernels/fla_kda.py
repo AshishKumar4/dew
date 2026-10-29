@@ -732,8 +732,10 @@ class BwdIntra(_Launch):
 
     NAME = "bwd_intra"
     KEYS, VALUES = "k", None
-    # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 2.49 -> 1.98 ms.
-    PICKS = _picks(Tiles(64, 0, 4, 1), small=Tiles(32, 0, 4, 1))
+    revision: int = 3
+    # A program walks its chunk's tokens holding six fp32 tiles of its rows by its key block: 16 columns
+    # keep them in a thread's registers.
+    PICKS = _picks(Tiles(16, 0, 4, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, g_lo: jax.Array | None, beta: jax.Array,
              daqk: jax.Array, dakk: jax.Array, dq: jax.Array, dk: jax.Array, db: jax.Array, last: jax.Array,
