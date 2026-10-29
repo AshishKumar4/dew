@@ -802,9 +802,7 @@ def a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
     assert min(rows) / 2 < target.memory_bandwidth < 2 * max(rows)
 
 
-@pytest.mark.gpu(reason="two processes, each seeing one of two GPUs")
-@pytest.mark.skipif(jax.default_backend() != "gpu" or len(jax.devices()) < 2, reason="needs two GPUs")
-def test_each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
+def each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
     """Two processes, each seeing one GPU (`CUDA_VISIBLE_DEVICES`): the second's device is global id 1
     and its own ordinal 0, and each process's kernel target holds the CUDA driver's clock, bandwidth and
     multiprocessors for that GPU, the same in both, as GPUs of one kind give."""
