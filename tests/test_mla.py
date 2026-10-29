@@ -37,8 +37,9 @@ import pytest
 import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
+from quantized_basis import dequantized_in_own_basis
 from recording import RecordingTracker
-from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 from selection_margins import indexer_margins
 from tool_support import load
 
@@ -63,6 +64,7 @@ from dew.nn.rope import (
     yarn_inv_freq,
     yarn_query_scale,
 )
+from dew.nn.sharding import down_projection
 from dew.nn.visibility import prefix_groups
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
@@ -74,7 +76,7 @@ GENERATOR = load("mla_reference")
 """tools/mla_reference.py, whose configs and transformers classes build the reference blocks."""
 
 SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 8, "value columns": 8,
-         "yarn": 16, "visibility": 16}
+         "yarn": 16, "visibility": 16, "sparse int8 latent decode": 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
 
@@ -348,6 +350,89 @@ def test_a_paged_latent_cache_decodes_what_the_compact_cache_decodes(name, quant
 
     np.testing.assert_array_equal(decoded(KVCache(quantized=quantized, page_size=4)),
                                   decoded(KVCache(quantized=quantized)))
+
+
+def uncached_dequantized_steps(module, variables, hidden, quantized: str):
+    """The block's per-step outputs over `hidden` with no cache: every position's projections
+    computed once, its latents (dense) or expanded keys and values (sparse) replaced by their
+    dequantized-in-own-basis selves, and each step's query attending the slots up to its own in
+    a cache-shaped row, so a cached decode is held to a computation that never enters the
+    stored basis."""
+    def steps(m, x):
+        batch, length, _ = x.shape
+        capacity = m.max_seq_len
+        place = down_projection(x, (m.q_lora_rank or 0) + m.kv_lora_rank + m.qk_rope_head_dim)
+        queries, q_resid = m._queries(x, place)
+        latent, rot = m._latents(x, place)
+        q_pass, q_rot = jnp.split(queries, [m.qk_nope_head_dim], axis=-1)
+        q_rot, rot, freqs_cos, freqs_sin = m._rotated(q_rot, rot, jnp.arange(length))
+        query = m._scaled_query(q_pass, q_rot)
+        slots = jnp.arange(capacity)
+
+        def slotted(values):
+            """`values` [B, length, ...] in `capacity` slots, zero past them, as an unwritten
+            cache slot reads."""
+            return jnp.pad(values, ((0, 0), (0, capacity - length)) + ((0, 0),) * (values.ndim - 2))
+
+        if m.sparse:
+            key, value = m._expand(latent, rot)
+            held = (slotted(dequantized_in_own_basis(key, quantized, keys=True)),
+                    slotted(dequantized_in_own_basis(value, quantized, keys=False)))
+            index_keys = (m._rotated_index_keys(m._index_keys(x, jnp.ones(x.shape[:2], bool)),
+                                                freqs_cos, freqs_sin) if m.indexed else None)
+            keep = jnp.broadcast_to(slots[None, None, :length] <= jnp.arange(length)[None, :, None],
+                                    (batch, length, length))
+            selection, _ = m._selection(x, q_resid, index_keys, keep, freqs_cos, freqs_sin,
+                                         MixerCall(), jnp.ones(x.shape[:2], bool),
+                                         slots=jnp.arange(length))
+            visible = ((selection[..., None] == slots) & (selection[..., None] >= 0)).any(axis=-2)
+        else:
+            held = (slotted(dequantized_in_own_basis(latent, quantized, keys=True)),
+                    slotted(dequantized_in_own_basis(rot, quantized, keys=False)))
+            visible = jnp.broadcast_to(slots[None, None, :] <= jnp.arange(length)[None, :, None],
+                                        (batch, length, capacity))
+        outputs = []
+        for step in range(length):
+            written = (slots <= step).reshape((1, capacity) + (1,) * (held[0].ndim - 2))
+            first, second = (jnp.where(written, part, 0) for part in held)
+            key, value = (first, second) if m.sparse else m._expand(first, second)
+            outputs.append(m._attend(query[:, step:step + 1], key, value, x[:, step:step + 1],
+                                     visible[:, None, step:step + 1], m.attention_impl))
+        return jnp.concatenate(outputs, axis=1)
+
+    return module.apply(variables, hidden, method=lambda m, x: steps(m, x))
+
+
+@pytest.mark.parametrize("quantized", ["int8", "float8_e4m3fn"])
+@pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
+def test_a_quantized_latent_cache_decodes_what_dequantizing_in_the_own_basis_computes(name, quantized):
+    """A quantized latent cache's decode held to no cache at all: each step as the block computes
+    it over latents (V3) or expanded keys and values (V3.2) dequantized in their own basis
+    (`dequantized_in_own_basis`, plain jnp from the layout's rule). Bit for bit where the cache's
+    own read-back is the same values in the same basis (the dense latents read back plain,
+    float8 unrotated); the sparse int8 step, whose logits the cache forms in the rotated basis
+    from a rotated query, sums in another order, so it is on par with the own-basis run from
+    that run in float64 over its declared draws (check 1). A basis conversion dropped on either side,
+    the sparse query's or the dense latents' plain read-back, moves the cached steps off this
+    computation, where a paged-against-compact comparison at one format runs the same conversion on
+    both arms."""
+    settings = CONFIG[SETTINGS[name]]
+    variables = block_variables(fixture(name))
+    module = mla_module(settings, kv_cache=KVCache(quantized=quantized))
+    decoded = jax.jit(lambda hidden: decode_loop(module, variables, hidden))
+    own = jax.jit(lambda hidden: uncached_dequantized_steps(module, variables, hidden, quantized))
+
+    def draw(seed):
+        return (block_draw(name)(seed)[0][:, :8],)
+
+    if name == "mla_v32" and quantized == "int8":
+        assert_as_exact(decoded, own, draw, "sparse int8 latent decode",
+                        seeds=SEEDS["sparse int8 latent decode"],
+                        truth_fn=lambda hidden: uncached_dequantized_steps(module, widened(variables), hidden,
+                                                                           quantized))
+    else:
+        (hidden,) = draw(0)
+        np.testing.assert_array_equal(np.asarray(decoded(hidden)), np.asarray(own(hidden)))
 
 
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n"])
