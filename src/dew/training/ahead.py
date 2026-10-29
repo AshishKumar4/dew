@@ -131,6 +131,11 @@ class AheadOfTime:
     alias_bytes: int
     temp_bytes: int
     code_bytes: int
+    links: dict[str, float | None]
+    """The bandwidth of each split axis's link the step decided its projections by (`Trainer.links`):
+    on compile-only GPUs none measured (None), so none spreads. A run handed the step traces with these
+    in place of measuring its own (`Trainer`'s `ahead`), which could spread a projection the step does
+    not and lower another program, and its checkpoints record them (`link_figures`)."""
     plan: JSON = None
     """The plan the run's own fit search makes on those
     GPUs (`Trainer.plan`): every program it compiled, each with the footprint derived for it beside
@@ -299,4 +304,4 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
-        capacity=capacity)
+        capacity=capacity, links={axis: link.bytes_per_second for axis, link in trainer.links.items()})

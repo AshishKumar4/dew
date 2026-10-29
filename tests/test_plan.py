@@ -219,10 +219,23 @@ def test_a_step_whose_rows_an_explicit_axis_types_is_read_whole():
     assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), 1, trainer._split) == [1]
 
 
-def lm(split=None, accumulation=1, **fields):
+EXECUTED: list[int] = []
+"""One entry for each time a compiled program ran a `Counted` objective's loss."""
+
+
+class Counted(LMObjective):
+    """An `LMObjective` whose loss reports each run of a program over it (`jax.debug.callback`): a
+    step's microbatch, or a trial's, counts once, which a compile alone does not."""
+
+    def loss(self, variables, batch, step):
+        jax.debug.callback(lambda: EXECUTED.append(1))
+        return super().loss(variables, batch, step)
+
+
+def lm(split=None, accumulation=1, objective=LMObjective, **fields):
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=SEQ, **fields)
-    return one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+    return one_device(Trainer(objective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
                               split=split, accumulation=accumulation))
 
 
@@ -594,10 +607,10 @@ def windows(corpus):
                    loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
-def windowed(directory, split, remat=None):
+def windowed(directory, split, remat=None, objective=LMObjective):
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
                               max_seq_len=8, remat=remat)
-    return one_device(Trainer(LMObjective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
+    return one_device(Trainer(objective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
                               split=split, layout=Layout(min_shard=1, tolerance=1.0),
                               checkpoints=Checkpoints(str(directory / "run"))))
 
@@ -640,18 +653,22 @@ def test_a_resumed_run_continues_its_admitted_plan_without_timing(tmp_path, monk
 
 def test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling(monkeypatch):
     """A batch that needs two microbatches keeps the first fitting plan, without compiling a
-    different remat to ask whether it is faster. Even explicitly supplied timing trials are not run."""
+    different remat to ask whether it is faster. Even explicitly supplied timing trials are not run:
+    the compile runs no program, and a step then runs its two microbatches alone (row 2230)."""
     free(monkeypatch, needs(monkeypatch, lm(split=1)) - 1)
-    trainer = lm()
+    trainer = lm(objective=Counted)
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH)
+    EXECUTED.clear()
     with Compiles("step") as compiles:
         step = trainer.compile(state, BATCH, trials)
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (2, None)
+    jax.effects_barrier()
+    assert (trainer.plan["split"], trainer.plan["remat"], len(EXECUTED)) == (2, None, 0)
     assert compiles.count == len(trainer.plan["probes"])
     assert all(probe["remat"] is None for probe in trainer.plan["probes"])
     state, loss, *_ = step(state, BATCH)
-    assert np.isfinite(float(loss))
+    jax.effects_barrier()
+    assert np.isfinite(float(loss)) and len(EXECUTED) == 2
 
 
 @pytest.mark.mesh(devices=2)
@@ -662,13 +679,15 @@ def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, r
     or explicitly terminal, and whether or not supplied Trials would time another plan faster."""
     free(monkeypatch, LIMIT)
     policy = None if remat is None else REMAT_POLICIES[remat]
-    trainer = lm(remat=policy)
+    trainer = lm(remat=policy, objective=Counted)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH) if trials_given else None
+    EXECUTED.clear()
     with Compiles("step") as compiles:
         trainer.compile(state, BATCH, trials)
-    assert compiles.count == 1
+    jax.effects_barrier()
+    assert compiles.count == 1 and not EXECUTED
     assert trainer.plan["remat"] == remat
     assert len(trainer.plan["probes"]) == 1
 
@@ -680,11 +699,15 @@ def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeyp
     No optional compile or timing is hidden in fit's internally created Trials (row 2153)."""
     free(monkeypatch, LIMIT)
     corpus = token_files(tmp_path)
-    trainer = windowed(tmp_path, 1, remat=REMAT_POLICIES[remat])
+    trainer = windowed(tmp_path, 1, remat=REMAT_POLICIES[remat], objective=Counted)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
+    EXECUTED.clear()
     with Compiles("step") as compiles:
-        state = trainer.fit(windows(corpus), steps=1, checkpoint_every=None, checkpoint_final=False)
-    assert compiles.count == 1 and int(state.step) == 1
+        state = trainer.fit(windows(corpus), steps=1, checkpoint_every=None, checkpoint_final=False,
+                            eval_every=None)
+    jax.effects_barrier()
+    # The one step's one microbatch, and no trial beside it.
+    assert compiles.count == 1 and int(state.step) == 1 and len(EXECUTED) == 1
     assert [probe["remat"] for probe in trainer.plan["probes"]] == [remat]
 
 
