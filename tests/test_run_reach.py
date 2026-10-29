@@ -22,7 +22,9 @@ from dew.cli.main import main
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources.tokens import TokenFiles
-from dew.optim import OneCycle, OptimConfig, ParamGroup
+from dew.optim import OneCycle, OptimConfig, ParamGroup, optimizers
+from dew.registry import ModelConfig
+from dew.training._lowering import Lowered
 
 pytestmark = pytest.mark.mesh
 
@@ -145,11 +147,10 @@ def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run
 @pytest.mark.mesh(devices=8)
 def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
     """`trainer.attention_form` is the form every attention of the run trains in (row 2245), on the
-    default route ('auto'): a run recorded "accurate" runs each attention it traces on the template or
-    the reference path, which compute the form (row 2350), as its step's own kernel report records, and
-    `dew train` of its own record, under a new name, runs them as it did. That the fast form keeps a
-    GPU's old routes is the selector's (tests/test_attention_route.py); a CPU runs fp32 attention on
-    the reference path in either form."""
+    default route ('auto'): lowered for an H100, a 16-bit run recorded "accurate" routes each attention
+    to the template or the reference path, which compute the form, where the same run recorded with
+    none routes it to an old route (row 2350), and `dew train` of an accurate run's own record, under a
+    new name, runs its attention on the kernels it ran."""
     run = lm(tmp_path, drawn=False)
 
     def kernels(name: str) -> set[str]:
@@ -157,11 +158,24 @@ def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
         return {route["kernel"] for route in compiled["plan"]["kernels"]["routes"]
                 if route["choice"] == "attention"}
 
-    trained(run, tmp_path, "accurate", trainer={"attention_form": "accurate"})
-    recorded_run = tmp_path / "runs" / "accurate" / "run.json"
+    # On an H100 target, which its step is lowered for (`--trainer.lower-for`), a 16-bit run takes an old
+    # route in the fast form, so the routes it lowers say which form the run took.
+    sixteen = dataclasses.replace(run, model=ModelConfig(run.model.name, {**run.model.fields,
+                                                                          "dtype": "bfloat16"}))
+
+    def lowered(name: str, fields) -> set[str]:
+        with pytest.raises(Lowered) as raised:
+            trained(sixteen, tmp_path, name, trainer={**fields, "lower_for": "sm90"})
+        return {route["kernel"] for route in raised.value.kernels.record()["routes"]
+                if route["choice"] == "attention"}
+
+    accurate = lowered("accurate", {"attention_form": "accurate"})
+    assert accurate and accurate <= {"template", "reference"}
+    assert not lowered("fast", {}) & {"template", "reference"}
+    trained(run, tmp_path, "cpu", trainer={"attention_form": "accurate"})
+    recorded_run = tmp_path / "runs" / "cpu" / "run.json"
     assert main(["train", str(recorded_run), "--set", "trainer.name=again"]) == 0
-    assert kernels("accurate") <= {"template", "reference"} and kernels("accurate")
-    assert kernels("again") == kernels("accurate")
+    assert kernels("again") == kernels("cpu")
 
 
 def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_called(tmp_path):
@@ -174,6 +188,8 @@ def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_ca
         OptimConfig(optimizer="os:mkdir", optimizer_opts={"path": str(made)}).build(4)
     assert not made.exists()
     params = {"w": np.ones((2, 3), np.float32)}
+    # Dew's own optimizers name the same factory by their alias and by their import path.
+    assert optimizers["adamw"] is optimizers[optimizers.paths["adamw"]]
     solver = OptimConfig(optimizer="optax:lars", learning_rate=0.1, weight_decay=1e-4).build(4)
     update, _ = solver.update({"w": np.full((2, 3), 0.5, np.float32)}, solver.init(params), params)
     assert np.all(np.asarray(update["w"]) < 0)

@@ -651,7 +651,9 @@ def test_an_accurate_call_the_template_refuses_runs_the_reference_path_on_ieee_p
     mask = jnp.tril(jnp.ones((64, 64), bool))[None, None]
 
     def attend(query):
-        return attention.scaled_dot_product_attention(query, query, query, mask=mask)
+        # A caller's explicit default precision, which the float32 products keep where it is named.
+        return attention.scaled_dot_product_attention(query, query, query, mask=mask,
+                                                      precision=jax.lax.Precision.DEFAULT)
 
     with chosen(attention_form="accurate"):
         lowered = jax.jit(jax.grad(lambda query: attend(query).sum())).lower(query).as_text()

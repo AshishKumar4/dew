@@ -171,7 +171,8 @@ def _placement(path: jax.tree_util.KeyPath, param, decays: bool,
     return optax.contrib.MuonDimensionNumbers(), "muon"
 
 
-def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, **opts):
+def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None,
+                 **opts) -> optax.GradientTransformation:
     """Run Muon over the matrices and AdamW over the rest, on one schedule. The AdamW group decays
     its norms and biases too, at `adam_weight_decay` or else `weight_decay`: Moonlight shares the
     decay among matrix and non-matrix parameters, RMSNorm's included (arXiv 2502.16982, 2.2)."""
@@ -460,7 +461,7 @@ def stepped(params, updates, before, after):
     return jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(moved), list(held.values()))
 
 
-def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
+def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts) -> optax.GradientTransformation:
     """Chain `_muon_groups` with the QK-Clip that follows the update."""
     return optax.chain(
         _muon_groups(learning_rate, **opts),
@@ -931,14 +932,14 @@ def _adam_chain(moments: optax.GradientTransformation, learning_rate, weight_dec
 
 
 def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
-          mask=None, *, nesterov: bool = False, nu_dtype=None):
+          mask=None, *, nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """optax.adam over `scale_by_adam`, with torch's coupled weight decay."""
     return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
                        learning_rate, weight_decay, mask, coupled=True)
 
 
 def _adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=1e-4,
-           mask=None, *, nesterov: bool = False, nu_dtype=None):
+           mask=None, *, nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """optax.adamw over `scale_by_adam`."""
     return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
                        learning_rate, weight_decay, mask, coupled=False)

@@ -123,6 +123,9 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
     chosen = task.default_step(str(root)) if step is None and issubclass(task, SavedRunTask) else None
     if chosen is not None:
         run = SavedRun.pinned(str(root), chosen, trust)
+        if run.objective.saved_task is not task:
+            raise ValueError(f"step {chosen} of {root}, which its task loads by default, was written by "
+                             f"{run.objective.__name__}, whose task is another; load a step with `step`")
     return task.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
 
 
