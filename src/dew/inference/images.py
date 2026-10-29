@@ -31,8 +31,8 @@ from dew.nn.kernels.options import program
 from dew.objectives.base import OMITTED, Omitted
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
-from dew.sampling.sample import sampling_modules, walk_and_decode
 from dew.sampling.solvers import DDIM, Solver
+from dew.sampling.walks import sampling_modules, walk_and_decode
 from dew.telemetry.profile import region
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)

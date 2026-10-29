@@ -43,7 +43,7 @@ from dew.objectives.lm.chunked import final_read, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.objective import batch_text, text_preview
 from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
-from dew.sampling.sample import sample
+from dew.sampling.walks import sample
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
