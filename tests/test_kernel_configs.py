@@ -244,11 +244,20 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once():
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.compiled(lowered(), relower=lowered)
-        misses = report.misses()
-    first, stepped = traced
+        misses, refused = report.misses(), report.refused_launches()
+    first, stepped = traced[:2]
     assert stepped != first
     assert [(miss.config, miss.stepped) for miss in misses][:1] == [(first, True)]
     assert all(miss.config == stepped and not miss.stepped for miss in misses[1:])
+    # Another process seeded with the run's refusals (its plan's) derives the stepped-down tile at once.
+    with (report.refusals(), generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        report.refuse(refused)
+        lowered()
+    refused_configs = {config for _, config in refused}
+    assert first in refused_configs and traced[2] not in refused_configs
+    if stepped not in refused_configs:
+        assert traced[2] == stepped
 
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),

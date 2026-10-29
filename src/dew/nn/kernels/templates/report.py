@@ -151,6 +151,21 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
         return identity in registry.refused
 
 
+def refused_launches() -> tuple[tuple[str, Hashable], ...]:
+    """Every (launch identity, config) refused in this context (a `refusals` scope's or the process's),
+    ordered: a run records them with its plan, so every process loading it seeds them (`refuse`) and
+    derives the stepped-down configs alike, and the compilation cache only holds those."""
+    with _GUARD:
+        return tuple(sorted(_registry().refused, key=repr))
+
+
+def refuse(entries) -> None:
+    """Each `(identity, config)` of `entries` (`refused_launches`') refused in this context, as a compile's
+    spill refuses it: a run seeding a plan's refusals before it lowers."""
+    for identity, config in entries:
+        _record((identity, config), None)
+
+
 def misses() -> tuple[Miss, ...]:
     """The kernels this process's compiles found spilling (`compiled`), for a run's telemetry: a `refusals`
     scope's own within it."""
