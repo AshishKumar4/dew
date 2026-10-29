@@ -148,11 +148,6 @@ _FINAL = "final_residual"
     # square kernel takes the shape heuristic the way the other indexed
     # projections do.
 })
-def _unnormed(x):
-    """A trunk's final states as they are, where it ends in no norm (`CausalTransformer.final_norm`)."""
-    return x
-
-
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
@@ -259,15 +254,6 @@ class CausalTransformer(nn.Module):
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
-    post_residual_norms: bool = False
-    """Whether each block norms its stream after each sublayer joins it, the original Transformer's post-LN
-    block (OPT-350m's), with no pre-norms (`BlockWiring.residual_norms`)."""
-    final_norm: bool = True
-    """Whether the trunk ends in a norm before the head; OPT-350m's post-LN decoder has none."""
-    embedding_features: int | None = None
-    """The token embedding's width where it differs from the stream's (OPT-350m's word_embed_proj_dim): a
-    bias-free projection takes the lookup in (`project_in`) and another takes the final states out to it
-    before the head (`project_out`), which reads the table at this width."""
     parallel_residual: bool = False
     """Whether attention and the feed-forward both read the same residual, as in GPT-NeoX."""
     shared_parallel_norm: bool = False
@@ -502,7 +488,6 @@ class CausalTransformer(nn.Module):
         field of its own (docs/design/api.md): the one value the stack's blocks, the prediction depths,
         DSpark's stages and the FLOP count build with."""
         return BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
-                           residual_norms=self.post_residual_norms,
                            layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
                            shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
 
@@ -786,11 +771,8 @@ class CausalTransformer(nn.Module):
                           for index in range(self.altup.num_inputs - 1)})
         if self.loop is not None and self.loop.exit_gate:
             sites['early_exit_gate'] = (self.emb_features, 1)
-        if self.embedding_features is not None:
-            sites['project_in'] = (self.embedding_features, self.emb_features)
-            sites['project_out'] = (self.emb_features, self.embedding_features)
         if not self.tie_embeddings:
-            sites['lm_head'] = (self.embedding_features or self.emb_features, self.vocab_size)
+            sites['lm_head'] = (self.emb_features, self.vocab_size)
         if self.head_transform is not None:
             sites['head_dense'] = (self.emb_features, self.emb_features)
         if self.continuum is not None:
@@ -927,17 +909,10 @@ class CausalTransformer(nn.Module):
         ple = self.per_layer_input_dim
 
         self.embed_tokens = TokenEmbedding(
-            num_embeddings=self.vocab_size, features=self.embedding_features or self.emb_features,
+            num_embeddings=self.vocab_size, features=self.emb_features,
             dtype=self.dtype, name='embed_tokens', padding_idx=self.padding_idx,
             embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                             else nn.initializers.normal(self.initializer_range)))
-        if self.embedding_features is not None:
-            self.project_in = Dense(projections['project_in'][1], use_bias=False, dtype=self.dtype,
-                                    precision=self.precision, name='project_in',
-                                    **normal_kernel(self.initializer_range))
-            self.project_out = Dense(projections['project_out'][1], use_bias=False, dtype=self.dtype,
-                                     precision=self.precision, name='project_out',
-                                     **normal_kernel(self.initializer_range))
         if self.embedding_dropout_rate:
             self.embedding_dropout = Dropout(self.embedding_dropout_rate, name="embedding_dropout")
         if self.embedding_norm:
@@ -1385,8 +1360,6 @@ class CausalTransformer(nn.Module):
     def head_logits(self, x):
         """The fp32 head over states the continuum level already read (`continuum_states`), or a
         model without one's final states: `_logits` past the level."""
-        if self.embedding_features is not None:
-            x = self.project_out(x)
         if self.head_transform is not None:
             x = self.head_norm(ungated_activation(self.head_transform, self.head_dense(x)))
         # fp32 logits whose product follows the compute dtype
@@ -1529,8 +1502,7 @@ class CausalTransformer(nn.Module):
         if self.embedding_scale:
             x = (x * jnp.asarray(math.sqrt(self.emb_features),
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
-        x = scaled(x, self.embedding_multiplier)
-        return x if self.embedding_features is None else self.project_in(x)
+        return scaled(x, self.embedding_multiplier)
 
     @property
     def embedding_factor(self) -> float:
@@ -2178,13 +2150,13 @@ class CausalTransformer(nn.Module):
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
         the parameter itself, with `_logits`'s scale, bias, softcap and precision, the compute dtype
         its product follows and a checkpoint's quantizer of its input.
-        None where no matrix alone is the head: past a `head_transform`, a continuum level or an
-        embedding's own width (`project_out`), or where `lm_head`'s parameters are not its kernel
-        alone: `dew.lora`'s factors beside it, which its interceptor adds, or no kernel at all, a
-        frozen FP8 head's, whose codes its FP8 product reads instead."""
+        None where no matrix alone is the head: past a `head_transform` or a continuum level, or
+        where `lm_head`'s parameters are not its kernel alone: `dew.lora`'s factors beside it, which
+        its interceptor adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product
+        reads instead."""
         head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
         if (self.head_transform is not None or self.continuum is not None
-                or self.embedding_features is not None or (head is not None and set(head) != {"kernel"})):
+                or (head is not None and set(head) != {"kernel"})):
             return None
         return self._head_table()
 
@@ -2231,8 +2203,6 @@ class CausalTransformer(nn.Module):
             self.norm = l2norm
             self.logit_scale = self.param('logit_scale', nn.initializers.constant(self.ngpt.start),
                                           (self.vocab_size,), jnp.float32)
-        elif not self.final_norm:
-            self.norm = _unnormed
         else:
             self.norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
