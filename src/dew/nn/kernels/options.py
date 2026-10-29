@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unp
 
 import jax
 import numpy as np
-from jax._src import config as jax_config
+from jax._src import config as jax_config, core as jax_core
 from jax.sharding import Sharding
 
 from dew.devices import xla_flag
@@ -179,7 +179,10 @@ class OuterProgram:
         return jax.jit(traced, **self.arguments)
 
     def __call__(self, *args, **kwargs):
-        if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves((args, kwargs))):
+        # Within another trace, a tracer its arguments hold or one its function closes over, the
+        # enclosing program compiles this one as part of its own; under `jax.disable_jit` its jit runs
+        # the function as Python.
+        if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self.jitted(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
         with self._compiling:
