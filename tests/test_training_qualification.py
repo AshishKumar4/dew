@@ -139,8 +139,12 @@ def qualified(tmp_path_factory, request) -> Path:
     torch.manual_seed(13)
     source_model(request.param, len(tokenizer)).save_pretrained(directory / "source")
     tokenizer.save_pretrained(directory / "source")
-    finish(spawn(directory, "baseline"), "baseline")
+    # The baseline and the interrupted run share nothing but the compilation cache, which each writes, so
+    # they run together; the resumed run reads the interruption's checkpoint, and every program from the
+    # cache, after both.
+    baseline = spawn(directory, "baseline")
     kill_when_ready(spawn(directory, "interrupted"), directory / "ready-to-kill")
+    finish(baseline, "baseline")
     finish(spawn(directory, "resumed"), "resumed")
     return directory
 

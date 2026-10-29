@@ -135,6 +135,13 @@ def test_a_batch_fills_out_with_its_own_rows_in_turn_and_never_from_none():
 EVALUATED = sorted(set(objectives) - ROLLOUT)
 """Every registered objective with an evaluation loss."""
 
+POOLED = (("block_diffusion", "distillation", "lm", "mean_flow", "masked_diffusion", "supervised"),
+          ("guidance_distillation",), ("ladd", "decision", "shortcut"), ("jepa", "diffusion", "rcm", "dpo"))
+"""`EVALUATED` in the parts `tests/test_multiprocess.py` runs its passes on a pool in, each about as long as
+the others, by each objective's seconds alone on one process (guidance distillation's Flux about 119,
+LADD's 47, JEPA's 40, the decision objective's 36, the rest under 30), so no part passes CI's group
+target; the first, the lightest, also scores `Perplexity`."""
+
 
 def evaluated(name: str, windows, tmp_path) -> dict:
     """`name`'s pass over a split of `RECORDS` in batches of `ROWS`, run on

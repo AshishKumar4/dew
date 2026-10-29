@@ -2299,17 +2299,16 @@ def mode_step_fits(args) -> dict:
 
 
 def mode_whole_validation(args) -> dict:
-    """The validation passes of the evaluated objectives in `--part` i/n (the
-    ith, i + nth, ... of them), and in part 0 `Perplexity`'s, on this pool, as
-    `tests/test_whole_validation.py` runs them on one process."""
+    """The validation passes of the evaluated objectives in `--part` i (`POOLED`'s ith), and in part 0
+    `Perplexity`'s, on this pool, as `tests/test_whole_validation.py` runs them on one process."""
     import jax
     from objective_data import corpus_windows
-    from test_whole_validation import EVALUATED, evaluated, perplexity
+    from test_whole_validation import POOLED, evaluated, perplexity
 
-    index, parts = (int(value) for value in args.part.split("/"))
+    index = int(args.part)
     root = Path(args.run_dir) / f"process{jax.process_index()}"
     windows = corpus_windows(root / "corpus")
-    passes = {name: evaluated(name, windows, root / name) for name in EVALUATED[index::parts]}
+    passes = {name: evaluated(name, windows, root / name) for name in POOLED[index]}
     if index:
         return {"passes": passes}
     return {"passes": passes, "perplexity": perplexity(windows), "one": perplexity(windows, 1)}
@@ -2460,7 +2459,7 @@ def parse_args(argv=None):
     parser.add_argument("--tokens", help="the committed token store the run trains on")
     parser.add_argument("--held-tokens", help="the committed token store it validates on")
     parser.add_argument("--seq-len", type=int, default=8)
-    parser.add_argument("--part", default="0/1", help="i/n: whole_validation's share of the objectives")
+    parser.add_argument("--part", default="0", help="i: whole_validation's part of the objectives (`POOLED`)")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through a compiled global order, whose "

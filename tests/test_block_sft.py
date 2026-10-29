@@ -467,18 +467,30 @@ def test_denoiser_image_gradient_obeys_encoder_detachment(image_source):
     assert norms[0] > 1e-6
     assert norms[1] == 0
 
-def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
-    """Native lifecycle evidence, not an official image-conditioned SFT oracle."""
-    loaded, inputs, obj, variables, _ = image_source
+def image_run(inputs):
+    """The image SFT run's batch, its data and its key."""
     rows = math.lcm(2, jax.device_count())
     batch = {"text": jax.tree.map(lambda leaf: np.concatenate([leaf] * (rows // 2)), inputs)}
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
-    run_key = jax.random.key(2)
+    return batch, data, jax.random.key(2)
+
+
+def test_an_image_sft_trainers_update_is_the_objectives(image_source):
+    """The image SFT trainer's update is the objective's at the step's draws, the float64 twin of the
+    loaded multimodal fixture the truth (`assert_updates_as_the_objective`)."""
+    _, inputs, obj, variables, _ = image_source
+    batch, data, run_key = image_run(inputs)
     wide = Pretrained.load(FIXTURE.parent / "diffusion-gemma-workflow", dtype="float64", attention_impl="xla",
                            max_seq_len=32)
     twin = BlockDiffusionObjective(wide.model, prompt_length=8, variables=wide.variables)
     assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, UPDATE_SEEDS["image"])
+
+
+def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
+    """Native lifecycle evidence, not an official image-conditioned SFT oracle."""
+    loaded, inputs, obj, variables, _ = image_source
+    batch, data, run_key = image_run(inputs)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)

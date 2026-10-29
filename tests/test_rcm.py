@@ -229,16 +229,17 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     np.testing.assert_array_equal(np.asarray(table), np.asarray(
         state.variables["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]))
 
+    @jax.jit
     def gradients(step):
         def loss(tree):
             return task.loss({**params, "params": tree}, batch,
-                             Step(jnp.asarray(step), jax.random.PRNGKey(4), None))[0].total
+                             Step(step, jax.random.PRNGKey(4), None))[0].total
         return jax.grad(loss)(params["params"])
 
     def size(tree):
         return float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(tree)))
 
-    student, critic = gradients(3), gradients(2)
+    student, critic = gradients(jnp.asarray(3)), gradients(jnp.asarray(2))
     assert size({k: v for k, v in student.items() if k != FAKE_SCORE}) > 0 and size(student[FAKE_SCORE]) == 0
     assert size({k: v for k, v in critic.items() if k != FAKE_SCORE}) == 0 and size(critic[FAKE_SCORE]) > 0
 
@@ -248,9 +249,11 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     start = adapted.init(jax.random.PRNGKey(0))
     assert {path[-1].key for path, _ in jax.tree_util.tree_flatten_with_path(start["params"])[0]
             if path[0].key != FAKE_SCORE} == {"lora_A", "lora_B"}
-    for step in (Step(jnp.asarray(at), jax.random.PRNGKey(4), None) for at in (3, 2)):
-        np.testing.assert_allclose(*(objective.loss(tree, batch, step)[0].total
-                                     for objective, tree in ((adapted, start), (task, params))), rtol=1e-5)
+    losses = [jax.jit(lambda tree, step, objective=objective: objective.loss(tree, batch, Step(
+        step, jax.random.PRNGKey(4), None))[0].total) for objective in (adapted, task)]
+    for at in (3, 2):
+        np.testing.assert_allclose(*(loss(tree, jnp.asarray(at)) for loss, tree in zip(
+            losses, (start, params), strict=True)), rtol=1e-5)
     trainer = Trainer(adapted, optax.adam(1e-3), key=jax.random.PRNGKey(5))
     tuned = trainer.initial_state()
     tuned, *_ = trainer.compile(tuned, batch)(tuned, batch)
