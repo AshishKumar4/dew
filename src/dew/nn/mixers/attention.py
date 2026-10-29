@@ -632,12 +632,14 @@ class CausalSelfAttention(nn.Module):
         return group_fields(self.ctx.causal, images=self.bidirectional_images,
                             blocks=self.bidirectional_blocks)
 
-    def _reads_whole_blocks(self, metadata: AttentionMetadata | None, *, uncached: bool) -> bool:
-        """Whether an `uncached` call of the layer reads blocks each its document's whole
-        (`AttentionMetadata.whole_blocks`): the blocks read both ways are the documents (the rows where the
-        call names none), the non-causal call by documents, which every kernel that takes one
-        (FlashAttention's, cuDNN's) runs. A block's keys are past the window, so it bounds none, and its
-        blocks go unread. A cached call reads its cache's groups as before."""
+    def _reads_whole_blocks(self, metadata: AttentionMetadata | None, prefix, append: Append | None,
+                            decode: bool) -> bool:
+        """Whether an uncached call of the layer (no canvas `prefix`, no `append` and not `decode`) reads
+        blocks each its document's whole (`AttentionMetadata.whole_blocks`): the blocks read both ways are
+        the documents (the rows where the call names none), the non-causal call by documents, which every
+        kernel that takes one (FlashAttention's, cuDNN's) runs. A block's keys are past the window, so it
+        bounds none, and its blocks go unread. A cached call reads its cache's groups as before."""
+        uncached = prefix is None and append is None and not decode
         return uncached and self.bidirectional_blocks and metadata is not None and metadata.whole_blocks
 
     def _key_groups(self, metadata: AttentionMetadata | None, history: dict[str, jax.Array], decode: bool,
@@ -1028,8 +1030,7 @@ class CausalSelfAttention(nn.Module):
             # from them (`attention_kernel`).
             documents = segment_ids
         groups = _Groups() if prefix is not None else self._key_groups(attention_metadata, history, decode, S)
-        uncached = prefix is None and append is None and not decode
-        if self._reads_whole_blocks(attention_metadata, uncached=uncached):
+        if self._reads_whole_blocks(attention_metadata, prefix, append, decode):
             causal, window, groups = False, None, groups._replace(block_groups=None)
         # Over the keys the call reads, the cache's or the prefix's joined.
         masked = self._mask_kernel(query, key, decode)
