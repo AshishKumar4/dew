@@ -527,28 +527,42 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
         DistillationObjective(student, teacher, divergence="selected", temperature=2.0)
 
 
-def test_a_teacher_position_scored_non_finitely_is_counted_and_never_trained_on():
-    """A teacher whose logits are NaN at one position leaves that position out of the distillation term:
-    the loss and its gradient are finite and equal the loss over the other positions alone, and the
-    excluded weight is reported."""
+def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on():
+    """A teacher whose scores and paired layers' states are NaN at one position (row 0's last) leaves
+    that position out of every distillation term, the soft one and the features': the loss and the
+    student's gradient (its projections' included) equal, bit for bit, those the intact teacher gives
+    with that position's label padded out, and the excluded weight is reported."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, alpha=1.0)
     batch = fixture_batch(arrays)
+    padded = {TEXT_KEY: batch[TEXT_KEY].at[0, SEQ].set(META["pad_id"])}
     original = objective.teacher.predict
 
     def broken(variables, held, step, **kwargs):
         statistics, aux, prediction = original(variables, held, step, **kwargs)
-        logits = prediction.logits.at[0, 1].set(jnp.nan)
-        return statistics, aux, dataclasses.replace(prediction, logits=logits,
-                                                    losses=prediction.losses.at[0, 1].set(jnp.nan))
 
+        def failed(value):
+            return value.at[0, SEQ - 1].set(jnp.nan)
+
+        return statistics, aux, dataclasses.replace(
+            prediction, logits=failed(prediction.logits), losses=failed(prediction.losses),
+            hidden=tuple(failed(state) for state in prediction.hidden))
+
+    def distilled(batch):
+        def total(trained):
+            loss, aux = objective.loss({**params, "params": trained}, batch, step_at())
+            return loss.total, aux.metrics
+
+        (loss, metrics), gradient = jax.value_and_grad(total, has_aux=True)(params["params"])
+        return loss, metrics["distill/teacher_nonfinite"], gradient
+
+    intact = distilled(padded)
     objective.teacher.predict = broken
-    loss, aux = objective.loss(params, batch, step_at())
-    gradient = jax.grad(lambda p: objective.scalar_loss({**params, "params": p}, batch, step_at())[0])(
-        params["params"])
-    assert np.isfinite(float(loss.total))
-    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(gradient))
-    assert float(aux.metrics["distill/teacher_nonfinite"]) > 0
+    failed = distilled(batch)
+    assert len(objective.features) == 2
+    assert (float(intact[1]), float(failed[1])) == (0.0, 1.0)
+    np.testing.assert_array_equal(failed[0], intact[0])
+    jax.tree.map(np.testing.assert_array_equal, failed[2], intact[2])
 
 
 def test_a_teacher_with_another_tokenizer_of_the_same_size_is_refused(tmp_path):

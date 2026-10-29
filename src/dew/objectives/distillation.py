@@ -308,9 +308,13 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         weights = student.weights.astype(jnp.float32)
         mass = statistics.mass
         counted = jnp.where(mass > 0, mass, 1)
-        # A position the teacher scores non-finitely is left out, its scores made finite before any
-        # arithmetic so no NaN reaches a gradient through the masked branch.
+        # A position where anything the teacher gives is non-finite, its scores or a paired layer's
+        # states, is left out of every term, each made finite before any arithmetic so no NaN reaches a
+        # gradient through the masked branch.
+        states = teacher.hidden if self.features else ()
         finite = jnp.all(jnp.isfinite(teacher.logits), axis=-1) & jnp.isfinite(teacher.losses)
+        for state in states:
+            finite = finite & jnp.all(jnp.isfinite(state), axis=-1)
         held = jnp.where(finite[..., None], teacher.logits, 0)
         teacher_losses = jnp.where(finite, teacher.losses, 0)
         scored = weights * finite
@@ -334,11 +338,11 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         if self.features:
             projections = variables["params"].get(PROJECTIONS, {})
             distances = []
-            for index, (own, other) in enumerate(zip(student.hidden, teacher.hidden, strict=True)):
+            for index, (own, other) in enumerate(zip(student.hidden, states, strict=True)):
                 if own.shape[-1] != other.shape[-1]:
                     own = accumulated(jnp.matmul, own.astype(jnp.float32), projections[f"projection_{index}"])
-                distances.append(self._distance(own, other))
-            feature = (self.row_mean(jnp.stack(distances), batch, rows=1, weights=weights).total
+                distances.append(self._distance(own, jnp.where(finite[..., None], other, 0)))
+            feature = (self.row_mean(jnp.stack(distances), batch, rows=1, weights=scored).total
                        / len(self.features))
             total = total + beta * feature
             reported.update({"distill/beta": beta, "distill/feature": feature / counted})
