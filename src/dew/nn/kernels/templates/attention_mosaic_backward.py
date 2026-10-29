@@ -463,6 +463,9 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
+    # The tile's queries' statistics read before its products, which their loads run under (read past them,
+    # 2.32 against 2.07 ms at Qwen3-8B causal, ET-A05AB5-h100).
+    rows = rows_of(q_first)
     # The logits from the query taken by its power in registers (`_Backward.scaled`), dK from the call's own.
     keys = k_smem.transpose((1, 0))
     s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), keys, walk.interpret)
@@ -471,8 +474,8 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
 
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
-        exponentials, weights, cotangents, _, _ = _scores(walk, coords_of(q_first), (), s, dp,
-                                                          *rows_of(q_first), masked=masked)
+        exponentials, weights, cotangents, _, _ = _scores(walk, coords_of(q_first), (), s, dp, *rows,
+                                                          masked=masked)
         return exponentials, weights, cotangents
 
     exponentials, weights, cotangents = lax.cond(whole(index), functools.partial(scores, masked=False),
