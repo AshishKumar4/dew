@@ -103,11 +103,11 @@ def _call(eqn, *operands, **params):
 
 
 def _custom(eqn, *operands, **params):
-    # A custom derivative, its rule unread but traced: bound on the held tiles' entries at the shape it was
-    # traced at (a reshape keeps each entry's place in their order, its outputs' as its inputs'), where its
-    # program and its derivative's act one entry at a time (`_axis_free`), so any order of the entries is
-    # theirs.
+    # A custom derivative whose program and rule act one entry at a time (`_axis_free`): its program and its
+    # rule's pullback, both traced at its own shapes, run entry for entry on the held tiles (`_run`), the
+    # rule kept as the held call's own (`jax.custom_vjp`), so no tile is reshaped (Mosaic GPU lowers none).
     traced = [var.aval for var in eqn.invars]
+    cotangents = [var.aval for var in eqn.outvars]
 
     def call(*values):
         return eqn.primitive.bind(*values, **eqn.primitive.get_bind_params(params))
@@ -115,21 +115,30 @@ def _custom(eqn, *operands, **params):
     floating = [index for index, aval in enumerate(traced)
                 if jax.numpy.issubdtype(aval.dtype, jax.numpy.inexact)]
 
-    def pulled(*values):
-        outs, pull = jax.vjp(lambda *chosen: call(*[chosen[floating.index(index)] if index in floating
-                                                     else value for index, value in enumerate(values)]),
-                             *(values[index] for index in floating))
-        return pull(jax.tree.map(jax.numpy.ones_like, outs))
+    def pulled(*values_and_cotangents):
+        values, given = values_and_cotangents[:len(traced)], values_and_cotangents[len(traced):]
+        _, pull = jax.vjp(lambda *chosen: call(*[chosen[floating.index(index)] if index in floating
+                                                  else value for index, value in enumerate(values)]),
+                          *(values[index] for index in floating))
+        return pull(list(given))
 
-    shapes = {aval.shape for aval in traced} - {()}
-    programs = [params["call_jaxpr"], jax.make_jaxpr(pulled)(*traced)]
+    shapes = {aval.shape for aval in (*traced, *cotangents)} - {()}
+    primal, pullback = params["call_jaxpr"], jax.make_jaxpr(pulled)(*traced, *cotangents)
     if len(shapes) > 1 or not all(_axis_free(program.jaxpr, *shapes) and not _tiles_in(program)
-                                  for program in programs):
+                                  for program in (primal, pullback)):
         raise Untransposable(f"a {eqn.primitive.name} whose program or derivative reads an axis or a "
                              "constant tile")
-    out = call(*[jax.lax.reshape(value, aval.shape) if aval.ndim == 2 else value
-                 for value, aval in zip(operands, traced, strict=True)])
-    return [jax.lax.reshape(value, _swapped(value.shape)) if value.ndim == 2 else value for value in out]
+
+    @jax.custom_vjp
+    def held(*values):
+        return _run(primal.jaxpr, primal.consts, values)
+
+    def held_pullback(values, given):
+        grads = iter(_run(pullback.jaxpr, pullback.consts, [*values, *given]))
+        return tuple(next(grads) if index in floating else None for index in range(len(values)))
+
+    held.defvjp(lambda *values: (held(*values), values), held_pullback)
+    return held(*operands)
 
 
 def _tiles_in(closed) -> bool:
