@@ -1779,8 +1779,8 @@ class Trainer(Generic[Loss, Effects]):
         aux = {name: value for name, value in aux.items() if name not in (TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         run.stepped = (loss, aux, accepted)
-        consumed = interval.consumed, interval.consumed_before
-        logged = plan.falls(plan.log_every, current, real, before, consumed)
+        counts = {"tokens": (real, before), "examples": (interval.consumed, interval.consumed_before)}
+        logged = plan.falls(plan.log_every, current, counts)
         if logged:
             self._take(plan, run, interval, state)
 
@@ -1793,18 +1793,18 @@ class Trainer(Generic[Loss, Effects]):
                 due = elapsed >= plan.checkpoint_every.total_seconds()
                 run.checkpoint_due = agree_process_phase(None, phase="checkpoint clock", available=due) > 0
         else:
-            run.checkpoint_due = plan.falls(plan.checkpoint_every, current, real, before, consumed)
-        run.local_due = plan.falls(plan.local_every, current, real, before, consumed)
-        due = plan.due(current, real, before, consumed)
-        evaluation_due = bool(due) or plan.falls(plan.eval_every, current, real, before, consumed)
+            run.checkpoint_due = plan.falls(plan.checkpoint_every, current, counts)
+        run.local_due = plan.falls(plan.local_every, current, counts)
+        due = plan.due(current, counts)
+        evaluation_due = bool(due) or plan.falls(plan.eval_every, current, counts)
         # A run's last step, its budget's or the step after which its stream runs out, is scored and saved
         # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
         # evaluates or pauses could save first (a ranked save scores every suite), so only there is the
         # stream read ahead (`FitRun.ends_here`): no other step's save waits on a batch a stream has yet to
         # make.
         ending = plan.finished(current, real) or (
-            (evaluation_due or plan.paused(current, real, consumed[0])) and run.ends_here(interval))
-        paused = not ending and plan.paused(current, real, consumed[0])
+            (evaluation_due or plan.paused(current, real, interval.consumed)) and run.ends_here(interval))
+        paused = not ending and plan.paused(current, real, interval.consumed)
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
             self._read_taken(run)
@@ -1822,7 +1822,7 @@ class Trainer(Generic[Loss, Effects]):
         # decay, so those due together are one branch.
         crossed = run.committed_examples(interval, plan.example_points, state,
                                          (self._split or 1) * self.accumulation)
-        due = next((branch for branch in plan.branches if branch.due(current, real, before, crossed)), None)
+        due = next((b for b in plan.branches if b.due(current, {**counts, "examples": crossed})), None)
         branch = None if due is None else due.pending(current, self.accumulation)
         if ending and branch is not None and checkpoints is not None:
             # Kept before the step's final save makes the run look complete (`Checkpoints.cooldown`).

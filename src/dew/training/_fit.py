@@ -35,7 +35,7 @@ from dew.optim import OptimConfig, reclocked
 from dew.state import TrainState
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
-from dew.training.cadence import Cadence, Examples, Tokens
+from dew.training.cadence import Cadence, Clock, Counted
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, Taken, TokenClock
@@ -96,7 +96,7 @@ class FitPlan:
 
     dataset: Loader
     steps: int | None
-    log_every: int | Tokens | Examples
+    log_every: int | Counted
     eval_every: Cadence
     tokens: int | None
     checkpoint_every: Cadence | datetime.timedelta
@@ -147,8 +147,10 @@ class FitPlan:
         branch's tokens, or the end of a schedule's stage. None where nothing it reads does."""
         cadences = (self.log_every, self.eval_every, self.checkpoint_every, self.local_every,
                     *(suite.every for suite in self.suites.values()))
-        nexts = [(real // every.every + 1) * every.every for every in cadences if isinstance(every, Tokens)]
-        branches = [branch.at.every for branch in self.branches if isinstance(branch.at, Tokens)]
+        nexts = [(real // every.every + 1) * every.every for every in cadences
+                 if isinstance(every, Counted) and every.clock == "tokens"]
+        branches = [branch.at.every for branch in self.branches
+                    if isinstance(branch.at, Counted) and branch.at.clock == "tokens"]
         ends = (self.tokens, self.pause[1], *(self.dataset.token_ends or ()), *nexts, *branches)
         return min((end for end in ends if end is not None and end > real), default=None)
 
@@ -180,10 +182,9 @@ class FitPlan:
         """Whether an evaluation can run before the end's: on a cadence shorter than the run, or to
         rank a checkpoint written before its end."""
         def before_end(every: Cadence | str | datetime.timedelta) -> bool:
-            if isinstance(every, Tokens):
-                return self.tokens is None or every.every < self.tokens
-            if isinstance(every, Examples):
-                return every.every < self.dataset.examples if self.dataset.examples is not None else True
+            if isinstance(every, Counted):
+                length = {"tokens": self.tokens, "examples": self.dataset.examples}[every.clock]
+                return length is None or every.every < length
             return bool(every) and (self.steps is None or not isinstance(every, int) or every < self.steps)
 
         cadences = (self.eval_every, *(suite.every for suite in self.suites.values()))
@@ -191,15 +192,13 @@ class FitPlan:
             (self.validation or self.best or self.stop) and before_end(self.checkpoint_every))
 
     @staticmethod
-    def falls(every: Cadence | str | datetime.timedelta, step: int, real: int, before: int,
-              consumed: tuple[int, int] = (0, 0)) -> bool:
-        """Whether a cadence of steps (`int`), of committed tokens (`Tokens`, the step having brought them
-        from `before` to `real`) or of consumed examples (`Examples`, the step having brought them to the
-        first of `consumed` from the second) falls on `step`; a duration or none never does here."""
-        if isinstance(every, Tokens):
-            return every.due(real, before)
-        if isinstance(every, Examples):
-            return every.due(*consumed)
+    def falls(every: Cadence | str | datetime.timedelta, step: int,
+              counts: Mapping[Clock, tuple[int, int]] | None = None) -> bool:
+        """Whether a cadence of steps (`int`) or of a counted clock (`Counted`, the step having brought
+        each clock's count from the second of its `counts` to the first) falls on `step`; a duration or
+        none never does here."""
+        if isinstance(every, Counted):
+            return every.due(counts or {})
         return isinstance(every, int) and bool(every) and step % every == 0
 
     @staticmethod
@@ -207,7 +206,7 @@ class FitPlan:
                  metrics: Sequence[Metric], steps: int | None, tokens: int | None, accumulation: int,
                  written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
                  checkpoints: Checkpoints | None = None, examples: int | None = None) -> tuple[
-                     int | Tokens | Examples, Cadence, Cadence | datetime.timedelta, Cadence,
+                     int | Counted, Cadence, Cadence | datetime.timedelta, Cadence,
                      dict[str, EvalSuite]]:
         """`fit`'s log, validation and checkpoint cadences, its `checkpoints`' local one
         (`Checkpoints.local_every`), and its suites' (`validation_suites`), each
@@ -235,8 +234,9 @@ class FitPlan:
 
     @property
     def example_points(self) -> tuple[int, ...]:
-        """The consumed examples its cooldown branches of examples begin at (`Examples`)."""
-        return tuple(branch.at.every for branch in self.branches if isinstance(branch.at, Examples))
+        """The consumed examples its cooldown branches of examples begin at (`Counted`)."""
+        return tuple(branch.at.every for branch in self.branches
+                     if isinstance(branch.at, Counted) and branch.at.clock == "examples")
 
     def recorded(self, config: OptimConfig | None, accumulation: int, *, clocked: bool = False
                  ) -> dict[str, JSON]:
@@ -287,12 +287,10 @@ class FitPlan:
                                  'step': run.current, 'rule': rule}
         return stopping.should_stop
 
-    def due(self, step: int, real: int = 0, before: int = 0, consumed: tuple[int, int] = (0, 0)
-            ) -> tuple[str, ...]:
-        """The suites whose own cadence falls on `step`, which brought the committed tokens from
-        `before` to `real` and the consumed examples as `consumed` says (`falls`)."""
-        return tuple(name for name, suite in self.suites.items()
-                     if self.falls(suite.every, step, real, before, consumed))
+    def due(self, step: int, counts: Mapping[Clock, tuple[int, int]] | None = None) -> tuple[str, ...]:
+        """The suites whose own cadence falls on `step`, which brought each counted clock's count as
+        `counts` says (`falls`)."""
+        return tuple(name for name, suite in self.suites.items() if self.falls(suite.every, step, counts))
 
 
 @dataclasses.dataclass

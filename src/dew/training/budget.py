@@ -15,7 +15,7 @@ import tyro
 from dew._records import JSON, is_share, recorded_duration, share
 from dew.data.dataset import Loader
 from dew.objectives.base import Metric, TrainingScalar
-from dew.training.cadence import Cadence, Examples, Tokens
+from dew.training.cadence import Cadence, Counted
 from dew.training.evaluation import Summary
 
 
@@ -83,8 +83,8 @@ def every_step(value: int | str | None, steps: int | None, tokens: int | None, a
     """`value`, a cadence of steps or a share of the run such as `5%` (`dew._records.share`), resolved
     once against the run's planned length: a share of `steps` microsteps, `accumulation` an update,
     the whole updates nearest it and at least one; of a token budget alone, a cadence of that many
-    committed tokens (`Tokens`); of a run bounded to `examples` no pass counts steps ahead of, a cadence
-    of that many consumed examples (`Examples`). A share of a run with no planned length is refused by
+    committed tokens (`Counted`); of a run bounded to `examples` no pass counts steps ahead of, a cadence
+    of that many consumed examples. A share of a run with no planned length is refused by
     `name`."""
     if not isinstance(value, str):
         return value
@@ -94,19 +94,17 @@ def every_step(value: int | str | None, steps: int | None, tokens: int | None, a
     if steps is not None:
         return max(1, round(fraction * (steps // accumulation))) * accumulation
     if tokens is not None:
-        return Tokens(max(1, math.ceil(fraction * tokens)))
+        return Counted(max(1, math.ceil(fraction * tokens)), "tokens")
     if examples is not None:
-        return Examples(max(1, math.ceil(fraction * examples)))
+        return Counted(max(1, math.ceil(fraction * examples)), "examples")
     raise ValueError(f"{name}={value!r} is a share of the run, which has no planned length: give it "
                      "steps=, epochs=, examples= or tokens=")
 
 
 def recorded(cadence: Cadence | str | datetime.timedelta) -> JSON:
     """`cadence` as a run's plan records it: its steps, its committed tokens or its duration."""
-    if isinstance(cadence, Tokens):
-        return {"tokens": cadence.every}
-    if isinstance(cadence, Examples):
-        return {"examples": cadence.every}
+    if isinstance(cadence, Counted):
+        return {cadence.clock: cadence.every}
     if isinstance(cadence, datetime.timedelta):
         return recorded_duration(cadence)
     return cadence

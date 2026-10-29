@@ -15,7 +15,7 @@ from typing import Literal
 from dew import _records
 from dew._records import JSON, is_share, share
 from dew.training.budget import every_step, recorded
-from dew.training.cadence import Examples, Tokens
+from dew.training.cadence import Clock, Counted
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,9 +82,9 @@ class Cooldowns:
 @dataclasses.dataclass(frozen=True)
 class Branch:
     """One cooldown point as a run resolved it: a step, or a committed-token count whose passing step
-    branches (`Tokens`)."""
+    branches (`Counted`)."""
 
-    at: int | Tokens | Examples
+    at: int | Counted
     cooldowns: Cooldowns
 
     def pending(self, current: int, accumulation: int) -> Pending:
@@ -93,13 +93,11 @@ class Branch:
         return {"step": current, "steps": self.cooldowns.steps(current, accumulation),
                 "shape": self.cooldowns.shape}
 
-    def due(self, step: int, real: int, before: int, consumed: tuple[int, int] = (0, 0)) -> bool:
-        """Whether the step `step`, which brought the committed tokens from `before` to `real` and the
-        consumed examples to the first of `consumed` from the second, branches."""
-        if isinstance(self.at, Tokens):
-            return before < self.at.every <= real
-        if isinstance(self.at, Examples):
-            return consumed[1] < self.at.every <= consumed[0]
+    def due(self, step: int, counts: Mapping[Clock, tuple[int, int]] | None = None) -> bool:
+        """Whether the step `step`, which brought each counted clock's count from the second of its
+        `counts` to the first, branches: at its step, or where it crosses its point."""
+        if isinstance(self.at, Counted):
+            return self.at.crossed(counts or {})
         return step == self.at
 
     def recorded(self) -> JSON:
