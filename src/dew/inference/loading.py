@@ -140,7 +140,7 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
-    # What the source builds (`SourceOptions.keywords`), as a run's source loads it.
+    # What the source builds, as a run's source loads it (`SourceOptions.keywords`).
     loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
                               **options.keywords())
               if dtype is None else
