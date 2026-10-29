@@ -19,10 +19,11 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew.interop.weights import ParamTree, indexed_path, stored_shape, translate_parameters
-from dew.nn.attention import GroupNorm, NormalAttention
+from dew.nn.attention_blocks import NormalAttention
 from dew.nn.autoencoders.api import check_class
 from dew.nn.blocks import ResidualBlock, Upsample
 from dew.nn.conv import Conv
+from dew.nn.norms import GroupNorm
 
 _log = logging.getLogger(__name__)
 

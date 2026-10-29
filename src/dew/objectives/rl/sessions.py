@@ -222,7 +222,10 @@ class Session:
     tell its members and their retries apart. `reward` is the verifier's
     score, required when the status is trainable (`Status.trainable`).
     `components` holds the verifier's sub-scores for logging, and `detail`
-    says where the verdict or the failure came from.
+    says where the verdict or the failure came from. `source` names the
+    dataset or rule its task came from, a prompt's `data_source`
+    (`PromptRecord`), which `session_metrics` reports each one's rewards
+    and statuses under; empty where the task names none.
     """
 
     task: str
@@ -234,6 +237,7 @@ class Session:
     reward: float | None
     components: Mapping[str, float] = field(default_factory=lambda: MappingProxyType({}))
     detail: str = ""
+    source: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, Status):
@@ -768,6 +772,31 @@ def sampled_values(batch: Mapping[str, np.ndarray],
     return out
 
 
+def source_metrics(sessions: Sequence[Session], truncation: str = "mask") -> dict[str, float]:
+    """Each source's share of its sessions per status, `source/<source>/status/<name>`, and the mean
+    reward its trained sessions train on, `source/<source>/reward/mean`, for every `Session.source`
+    named, where the sessions come from more than one source (sessions naming none count as one).
+    A source is a prompt's `data_source`, so two mixture members sharing one report together,
+    and sessions whose tasks name none (an environment's, a harness's) report under no source."""
+    by_source: dict[str, list[Session]] = {}
+    for session in sessions:
+        by_source.setdefault(session.source, []).append(session)
+    if len(by_source) < 2:
+        return {}
+    metrics: dict[str, float] = {}
+    for source, mine in sorted(by_source.items()):
+        if not source:
+            continue
+        for status in Status:
+            metrics[f"source/{source}/status/{status.value}"] = (
+                sum(session.status == status for session in mine) / len(mine))
+        trained = [reward for session in mine
+                   if (reward := _trained_reward(session, truncation)) is not None]
+        if trained:
+            metrics[f"source/{source}/reward/mean"] = float(np.mean(trained))
+    return metrics
+
+
 def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray], *,
                     latencies: Sequence[float] | None = None,
                     version: int | None = None, truncation: str = "mask") -> dict[str, float]:
@@ -783,6 +812,9 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
       the mean of every verifier score, whatever the session trains on, 0.0
       where none was scored.
     - `length/mean`, the mean count of sampled ids per session.
+    - Per `Session.source` that names one, where the sessions come from
+      more than one: `source/<source>/reward/mean` as `reward/mean` over that
+      source's sessions, and `source/<source>/status/<name>` as `status/<name>`.
     - `latency/p50`, `p90`, `p99`, `max` over `latencies`, seconds per session.
     - `lag/mean`, `lag/max`: `version` minus each trainable id's version.
 
@@ -822,6 +854,7 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
         metrics.update(
             {f"reward/component/{name}": float(np.mean(values)) for name, values in components.items()}
         )
+    metrics.update(source_metrics(sessions, truncation))
     if latencies:
         seconds = np.asarray(latencies, np.float64)
         for label, quantile in (("p50", 50), ("p90", 90), ("p99", 99)):

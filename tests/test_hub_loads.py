@@ -2,12 +2,11 @@
 Hub on the loopback (tests/local_hub.py), which keeps every request it answers."""
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-from local_hub import LocalHub
+from local_hub import LocalHub, hub_environment
 from tool_support import REPO_ROOT, load
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
@@ -38,10 +37,7 @@ def test_the_census_loads_each_model_without_its_weights_and_rows_each_refusal(t
              "local/bare": {"model.safetensors": source / "model.safetensors"}}
     out = tmp_path / "census"
     with LocalHub(repos) as hub:
-        env = {**{name: value for name, value in os.environ.items()
-                  if name not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")},
-               "HF_ENDPOINT": hub.endpoint, "HF_HUB_CACHE": str(tmp_path / "cache"),
-               "DEW_HUB_ANSWERS": str(tmp_path / "answers"), "PYTHONPATH": str(REPO_ROOT / "src")}
+        env = hub_environment(hub, tmp_path)
         for command in (["census", str(out), "10"], ["loads", str(out), "--jobs", "3"]):
             done = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "hf_coverage.py"), *command],
                                   env=env, capture_output=True, text=True, check=False)
@@ -65,4 +61,5 @@ def test_the_census_loads_each_model_without_its_weights_and_rows_each_refusal(t
     reads = hub.sent("local/decoder", "model.safetensors")
     assert reads and all(read.asked is not None and read.asked[0] in (0, 8) for read in reads), hub.served
     assert sum(read.sent for read in reads) < decoder["model.safetensors"].stat().st_size, hub.served
-    assert not [path for path in (tmp_path / "cache").rglob("*") if path.suffix in (".safetensors", ".bin")]
+    cached = Path(env["HF_HUB_CACHE"]).rglob("*")
+    assert not [path for path in cached if path.suffix in (".safetensors", ".bin")]

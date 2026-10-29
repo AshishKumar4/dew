@@ -177,15 +177,14 @@ def respelled(source: Path, directory: Path, edit) -> Path:
 
 def without_config_field(source: Path, directory: Path, *path: str) -> Path:
     """`source`'s checkpoint copied to `directory` with the config field at `path` (a key, nested
-    keys after it) left out, as a config that leaves it to its default writes it."""
-    shutil.copytree(source, directory)
-    config = json.loads((directory / "config.json").read_text())
-    section = config
-    for key in path[:-1]:
-        section = section[key]
-    del section[path[-1]]
-    (directory / "config.json").write_text(json.dumps(config))
-    return directory
+    keys after it) left out, as a config that leaves it to its default writes it (`respelled`)."""
+    def dropped(config):
+        section = config
+        for key in path[:-1]:
+            section = section[key]
+        del section[path[-1]]
+        return config
+    return respelled(source, directory, dropped)
 
 
 def fixture_with_meta(path: Path) -> tuple[dict[str, np.ndarray], dict]:

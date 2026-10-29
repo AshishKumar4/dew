@@ -19,6 +19,7 @@ from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, import_path
 
 from . import joint_checkpoint
@@ -35,7 +36,7 @@ from .task import Decide
 class DecisionHeadSource(HeadComponent):
     """The head constructor reads the native backbone's output width and compute dtype."""
 
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str, *,
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         held = _records.record(self.record, "head")
         fields = _records.record(held["fields"], "head.fields")

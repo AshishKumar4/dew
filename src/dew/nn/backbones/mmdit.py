@@ -14,7 +14,6 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.dense import Dense
 
-from ..attention import LayerNorm
 from ..dit import (
     ROPE_THETA,
     RematChoice,
@@ -25,6 +24,7 @@ from ..dit import (
     rope_for_scan,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
+from ..norms import LayerNorm
 from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
 from ..scan_orders import patchify, unpatchify

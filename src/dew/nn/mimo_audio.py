@@ -28,7 +28,6 @@ from dew.nn.precision import float32_dot_general
 from dew.registry import Record
 
 from .activations import gelu_exact
-from .attention import LayerNorm, RMSNorm
 from .audio import AudioEncoding
 from .backbones.decoder_block import BlockWiring, DecoderBlock
 from .blocks import TokenEmbedding
@@ -36,6 +35,7 @@ from .inputs import AttentionMetadata, sequence_blocks
 from .mixer_base import MixerContext
 from .mixers.attention import CausalSelfAttention
 from .mlp import GatedMLP
+from .norms import LayerNorm, RMSNorm
 from .quantizers import residual_quantize
 from .vision import TowerBase, TowerGeometry
 

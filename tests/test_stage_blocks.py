@@ -166,6 +166,8 @@ def runs_a_pipeline(spec: MeshSpec, model, variables, call, inputs, microbatches
 
 
 @pytest.mark.mesh(devices=8)
+# The UNet over fsdp2_stage2 runs in the whole suite alone (162 s, ledger 2135); every train still
+# stacks the UNet's stages over stage2_sequence2.
 @pytest.mark.parametrize(("case", "layout"), [
     pytest.param(case, layout, id=f"{case}-{layout}",
                  marks=pytest.mark.whole_suite if (case, layout) == ("unet", "fsdp2_stage2") else ())

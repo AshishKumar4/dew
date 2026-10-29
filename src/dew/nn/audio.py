@@ -31,8 +31,8 @@ from dew.nn.rope import sinusoid_frequencies, sinusoids
 from dew.registry import from_record
 
 from .activations import activation
-from .attention import LayerNorm, RMSNorm
 from .conv import Conv
+from .norms import LayerNorm, RMSNorm
 from .sharding import logical_axes
 from .vision import TowerBase, TowerGeometry
 from .vision.gemma4 import clipped_linear

@@ -60,6 +60,9 @@ class JepaRunConfig(RunConfig):
         """The encoder, the predictor over its patch grid, the target-block mask
         and the probes, around the objective the run names. The predictor
         computes as the encoder does, its compute dtype and attention kernel."""
+        if (pinned := self.pinned_adapter()) is not self:
+            # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
+            return pinned.prepare()
         # Compiled once, before the objective, whose EMA ramps over the run's length: JEPA reads its
         # batches as the chain makes them, with no stages of its own.
         self.built_fresh()
