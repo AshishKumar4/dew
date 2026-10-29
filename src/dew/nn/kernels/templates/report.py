@@ -2,16 +2,26 @@
 registers a thread and spilled bytes, and Mosaic's resource estimate (the shared bytes and tensor memory
 columns a kernel asks for), written for each kernel Mosaic compiles while they are on (`reported`), at XLA's
 compile of the program around it, with a device or a compile-only one (`dew.training.ahead`'s
-`compile_only_gpus`). The CPU suite's compile gate reads them (tests/kernel_compile.py); a run never does:
-its resources are derived from the models (`templates.resources`, owner 10-27)."""
+`compile_only_gpus`). The CPU suite's compile gate reads them (tests/kernel_compile.py), and so does a run's
+compile (`compiled`, owner 10-29, bible §6): a launch whose kernel spills is refused (`refused`) and its
+program lowered once more, where the launch's derivation takes the next config by its own rule, each such
+refusal a model miss (`misses`). Each kernel's name carries the launch that traced it (`named`), so its
+reports name the launch and its config."""
 
 import contextlib
+import contextvars
 import dataclasses
 import hashlib
+import logging
 import os
 import re
+import tempfile
 import threading
+from collections.abc import Callable, Hashable, Iterator
 from pathlib import Path
+
+import jax
+import tokamax
 
 DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
 """The settings that turn Mosaic GPU's reports on, written under `MOSAIC_GPU_DUMP_TO`."""
@@ -29,6 +39,225 @@ DUMP_NAME = re.compile(r'mosaic_gpu\.dump_basename = "[^"]*"')
 """The one attribute of Mosaic's module dump that names the dump (its counter) rather than the module."""
 
 
+LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
+"""The suffix a kernel's name carries for the launch that traced it (`named`): the digest of its launch."""
+
+_log = logging.getLogger("dew.kernels")
+
+
+@dataclasses.dataclass(frozen=True)
+class Launch:
+    """A template launch as it traced: its identity apart from its config (`_identity`), its op's name and
+    its config, none of its traced values."""
+    identity: str
+    op: str
+    config: Hashable
+
+
+_TRACING: contextvars.ContextVar[str | None] = contextvars.ContextVar("tracing_launch", default=None)
+"""The digest of the launch tracing now (`launching`), which its kernels' names carry (`named`)."""
+_LAUNCHES: dict[str, Launch] = {}
+"""Each launch this process traced, by its digest."""
+@dataclasses.dataclass
+class _Registry:
+    """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), and each miss."""
+    refused: set[tuple[str, Hashable]] = dataclasses.field(default_factory=set)
+    missed: list["Miss"] = dataclasses.field(default_factory=list)
+
+
+_PROCESS = _Registry()
+"""The process's registry, every thread's."""
+_SCOPE: contextvars.ContextVar[_Registry | None] = contextvars.ContextVar("refusals_scope", default=None)
+"""A `refusals` scope's own registry, in its context alone."""
+_GUARD = threading.Lock()
+"""Serializes the registries' reads and updates between threads."""
+
+
+def _registry() -> _Registry:
+    return _SCOPE.get() or _PROCESS
+
+
+class Exhausted(ValueError):
+    """A derivation that finds no config left for a launch (`base.Unfitted`): a relowering after a spill
+    that ends so keeps the first program (`compiled`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Miss:
+    """A kernel a run's compile found spilling (`compiled`): its name, its launch's op and config (None
+    where no launch of this process traced it), its registers and spilled bytes, and whether its launch's
+    config was refused and its program lowered again (`stepped`)."""
+    kernel: str
+    op: str | None
+    config: Hashable | None
+    registers: int | None
+    spilled: int | None
+    stepped: bool
+
+
+def _identity(op, arguments: tokamax.BoundArguments) -> str:
+    """A launch's identity apart from its config, the same in every process: its op as its picks name it
+    (`tuning.KernelOp.keyed`) and its arguments exactly, its arrays by their own shapes and dtypes (no
+    key's bucket: two launches a key shares compile two kernels) and its hooks by what they compute
+    (`traced`)."""
+    def described(name, value):
+        if name in op.HOOKS:
+            return op.traced(name, value)
+        return jax.tree.map(lambda leaf: (tuple(leaf.shape), str(leaf.dtype)) if hasattr(leaf, "dtype")
+                            and hasattr(leaf, "shape") else leaf, value)
+    return repr((op.keyed(arguments).op, tuple((name, described(name, value))
+                                               for name, value in sorted(arguments.arguments.items()))))
+
+
+def _digest(text: str) -> str:
+    return hashlib.blake2b(text.encode(), digest_size=5).hexdigest()
+
+
+@contextlib.contextmanager
+def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterator[None]:
+    """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
+    the same in every process, and their reports name the launch (`Report.launch`, `traced`)."""
+    identity = _identity(op, arguments)
+    digest = _digest(f"{identity}|{config!r}")
+    with _GUARD:
+        _LAUNCHES.setdefault(digest, Launch(identity, type(op).__name__, config))
+    token = _TRACING.set(digest)
+    try:
+        yield
+    finally:
+        _TRACING.reset(token)
+
+
+def named(name: str | None) -> str | None:
+    """A kernel's name carrying the launch tracing it (`launching`; `kernel` for an unnamed one), as is
+    where none is."""
+    digest = _TRACING.get()
+    return name if digest is None else f"{name or 'kernel'}__l{digest}"
+
+
+def traced(digest: str) -> Launch | None:
+    """The launch this process traced under `digest` (a report's `launch`), or None."""
+    return _LAUNCHES.get(digest)
+
+
+def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
+    """Whether a compile of this process refused `op`'s launch of `arguments` at `config`: its kernel
+    spilled (`compiled`). A template's legality reads it, so its derivation takes the next config."""
+    registry = _registry()
+    if not registry.refused:
+        return False
+    identity = (_identity(op, arguments), config)
+    with _GUARD:
+        return identity in registry.refused
+
+
+def refused_launches() -> tuple[tuple[str, Hashable], ...]:
+    """Every (launch identity, config) refused in this context (a `refusals` scope's or the process's),
+    ordered: a run records them with its plan, so every process loading it seeds them (`refuse`) and
+    derives the stepped-down configs alike, and the compilation cache only holds those."""
+    with _GUARD:
+        return tuple(sorted(_registry().refused, key=repr))
+
+
+def refuse(entries) -> None:
+    """Each `(identity, config)` of `entries` (`refused_launches`') refused in this context, as a compile's
+    spill refuses it: a run seeding a plan's refusals before it lowers."""
+    for identity, config in entries:
+        _record((identity, config), None)
+
+
+def misses() -> tuple[Miss, ...]:
+    """The kernels this process's compiles found spilling (`compiled`), for a run's telemetry: a `refusals`
+    scope's own within it."""
+    with _GUARD:
+        return tuple(_registry().missed)
+
+
+@contextlib.contextmanager
+def refusals() -> Iterator[None]:
+    """Within the block, this context's compiles refuse and record apart from the process's (a test's
+    scope): its refusals and misses start empty and go with it, other threads' and the process's left as
+    they are."""
+    token = _SCOPE.set(_Registry())
+    try:
+        yield
+    finally:
+        _SCOPE.reset(token)
+
+
+def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None") -> None:
+    registry = _registry()
+    with _GUARD:
+        if refusal is not None:
+            registry.refused.add(refusal)
+        if miss is not None:
+            registry.missed.append(miss)
+
+
+def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
+             relower: Callable[[], jax.stages.Lowered]) -> jax.stages.Compiled:
+    """`lowered` compiled, read through Mosaic's reports (`reported`): where a kernel of a template's launch
+    spills, that launch's config is refused (`refused`), the miss recorded (`misses`, logged), and the
+    program `relower`ed once and compiled; `relower` traces afresh, so each refused launch's derivation
+    takes the next config by its own rule. A kernel spilling again is refused and recorded, not stepped
+    again; a relowering whose derivations find no config left (`Exhausted`) keeps the first program, its
+    misses recorded as not stepped. A program loaded from the persistent compilation cache runs no ptxas
+    and reports nothing."""
+    executable, spilling = _compiled_reported(lowered, options)
+    found = _misses_of(spilling)
+    refusals = [refusal for refusal, _, _ in found if refusal is not None]
+    for refusal in refusals:
+        _record(refusal, None)
+    if not refusals:
+        _recorded(found, stepped=False)
+        return executable
+    try:
+        relowered = relower()
+    except Exhausted as failed:
+        _log.warning("relowering after a spill found no config: %s; the first program runs", failed)
+        _recorded(found, stepped=False)
+        return executable
+    _recorded(found, stepped=True)
+    executable, spilling = _compiled_reported(relowered, options)
+    again = _misses_of(spilling)
+    for refusal, _, _ in again:
+        if refusal is not None:
+            _record(refusal, None)
+    _recorded(again, stepped=False)
+    return executable
+
+
+def _misses_of(spilling: list["Report"]) -> list[tuple[tuple[str, Hashable] | None, "Report", Launch | None]]:
+    """Each spilling kernel's refusal (its launch's identity and config, None for a kernel no launch of
+    this process traced), its report and its launch."""
+    found = []
+    for report in spilling:
+        launch = None if report.launch is None else traced(report.launch)
+        found.append((None if launch is None else (launch.identity, launch.config), report, launch))
+    return found
+
+
+def _recorded(found: list, *, stepped: bool) -> None:
+    """Each of `found`'s misses recorded and logged, stepped down where `stepped` and its kernel a
+    launch's."""
+    for _, report, launch in found:
+        miss = Miss(report.kernel, None if launch is None else launch.op,
+                    None if launch is None else launch.config, report.registers, report.spilled,
+                    stepped and launch is not None)
+        _record(None, miss)
+        _log.warning("kernel %s spilled %s bytes at %s registers (%s at %s); %s", miss.kernel, miss.spilled,
+                     miss.registers, miss.op, miss.config,
+                     "its launch steps down" if miss.stepped else "no step-down")
+
+
+def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
+                       ) -> tuple[jax.stages.Compiled, list["Report"]]:
+    with tempfile.TemporaryDirectory() as directory:
+        with reported(directory):
+            executable = lowered.compile(options)
+        return executable, [found for found in reports(directory) if found.spilled]
+
+
 @dataclasses.dataclass(frozen=True)
 class Report:
     """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
@@ -36,7 +265,8 @@ class Report:
     kernel's functions), what the reports left `unread`: either report without the other, or a field
     neither states, is no evidence the kernel is within its resources; and its `module`, the digest of
     Mosaic's module after layout inference less its dump's name, which two compiles of one module share:
-    Mosaic compiles a module once a process, so a later compile of it reports no ptxas run of its own."""
+    Mosaic compiles a module once a process, so a later compile of it reports no ptxas run of its own; and
+    the digest of the launch that traced it (`launching`), which its name carried, or None."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -44,6 +274,7 @@ class Report:
     spilled: int | None
     unread: tuple[str, ...] = ()
     module: str | None = None
+    launch: str | None = None
 
     def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
         """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
@@ -76,19 +307,25 @@ def reported(directory: str, *, ptx: bool = False):
                     os.environ[name] = value
 
 
+def kernel_name(stem: str) -> str:
+    """A kernel's name from a report file's stem: less Mosaic's counter (`KERNEL_COUNTER`) and the launch
+    its name carried (`LAUNCH_SUFFIX`)."""
+    return LAUNCH_SUFFIX.sub("", KERNEL_COUNTER.sub("", stem))
+
+
 def reports(directory: str) -> list[Report]:
     """Each kernel's `Report` in `directory`, its reports and module dump paired by the kernel's name less the
     counter Mosaic appends (`KERNEL_COUNTER`); the compiles a directory holds name each kernel once."""
-    named: dict[str, dict[str, Path]] = {}
+    by_kernel: dict[str, dict[str, Path]] = {}
     for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas"),
                          ("module", ".after_layout_inference.txt")):
         for path in Path(directory).glob(f"*{suffix}"):
-            found = named.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
+            found = by_kernel.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
             # Paired by name: compiles that name a kernel twice would pair the wrong reports.
             assert kind not in found, f"{path.name} and {found[kind].name} compiled under one name"
             found[kind] = path
     found_reports = []
-    for name, found in sorted(named.items()):
+    for name, found in sorted(by_kernel.items()):
         text = found["resources"].read_text() if "resources" in found else ""
         log = found["ptxas"].read_text() if "ptxas" in found else ""
         shared, tmem = SHARED.search(text), TENSOR_MEMORY.search(text)
@@ -96,11 +333,13 @@ def reports(directory: str) -> list[Report]:
         unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
                                                  ("registers", registers), ("spills", spills)) if not read)
         module = found.get("module")
+        launch = LAUNCH_SUFFIX.search(name)
         found_reports.append(Report(
-            name, int(shared.group(1)) if shared else None, sum(map(int, tmem.groups())) if tmem else None,
-            max(map(int, registers), default=None),
+            LAUNCH_SUFFIX.sub("", name), int(shared.group(1)) if shared else None,
+            sum(map(int, tmem.groups())) if tmem else None, max(map(int, registers), default=None),
             max((int(stores) + int(loads) for stores, loads in spills), default=None), unread,
-            hashlib.sha256(DUMP_NAME.sub("", module.read_text()).encode()).hexdigest() if module else None))
+            hashlib.sha256(DUMP_NAME.sub("", module.read_text()).encode()).hexdigest() if module else None,
+            launch.group(1) if launch else None))
     return found_reports
 
 

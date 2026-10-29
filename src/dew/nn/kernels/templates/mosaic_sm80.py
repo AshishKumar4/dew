@@ -15,7 +15,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import cost, mosaic, resources
+from dew.nn.kernels.templates import cost, mosaic, report, resources
 from dew.nn.sharding import per_shard
 
 
@@ -213,7 +213,8 @@ class Mma(mosaic.Family):
         per_shard(name or self.name)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
-                            interpret=mosaic.interpreted(interpret), kernel_name=name, cost_estimate=cost)
+                            interpret=mosaic.interpreted(interpret),
+                            kernel_name=report.named(name), cost_estimate=cost)
 
     def scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
