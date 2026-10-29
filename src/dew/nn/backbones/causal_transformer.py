@@ -124,12 +124,13 @@ from .decoder_stack import (
     SharedPassView,
     StackView,
     StageSplit,
+    banked_collections,
     microbatch_count,
     run_pipeline,
     run_stack,
     split_stages,
 )
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, layer_index, scan_groups
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_index, scan_groups
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -1964,39 +1965,7 @@ class CausalTransformer(nn.Module):
         `ValueError`, and so do some banks without the others when there are
         no rows.
         """
-        runs = {group_name(first, count): [f'layers_{index}' for index in range(first, first + count)]
-                for first, count in self.groups if count > 1}
-        banked = []
-        for collection, tree in self.variables.items():
-            banks = set(tree) & set(runs)
-            if not banks:
-                continue
-            mixed = False
-            for bank, layers in runs.items():
-                rows = [layer for layer in layers if layer in tree]
-                if not rows:
-                    continue
-                mixed = True
-                if bank not in tree:
-                    continue
-                shared = {tuple(entry.key for entry in path)
-                          for path, _ in jax.tree_util.tree_leaves_with_path(tree[bank])}
-                for layer in rows:
-                    overlap = shared & {tuple(entry.key for entry in path)
-                                        for path, _ in jax.tree_util.tree_leaves_with_path(tree[layer])}
-                    if overlap:
-                        raise ValueError(
-                            f"collection {collection!r} holds {'/'.join(overlap.pop())} both in "
-                            f"the bank {bank} and in its layer {layer}; a leaf is read from one")
-            if mixed:
-                continue
-            if banks != set(runs):
-                raise ValueError(
-                    f"collection {collection!r} holds the banks {sorted(banks)} "
-                    f"of the runs {sorted(runs)} and not the others; a store holds every "
-                    f"run's bank or every layer's own subtree")
-            banked.append(collection)
-        return tuple(banked)
+        return banked_collections(self.groups, self.variables)
 
     def residual_dtype(self, x, *, train: bool, decode: bool, per_layer_input,
                        attention_metadata=None) -> jnp.dtype:
