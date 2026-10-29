@@ -240,14 +240,6 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
     _check_spans(case, spans, (ROWS, queries, 4, 2), interpret=interpret, backward=backward, form=form)
 
 
-def _training_forward(query, key, value, spans, interpret: bool):
-    """The training forward a backward check reads residuals from: this mainloop's, or Triton's where this
-    one runs no compiled training call (an H100's, `attention_mosaic.TRAINING_FAULT`), as the route feeds
-    it."""
-    takes = interpret or attention_mosaic.forward_takes(query, key, value, spans, residuals=True)
-    return attention_mosaic.forward if takes else attention_triton.forward
-
-
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
                     residuals_from=None, target: generation.GpuTarget | None = None,
                     config: attention_mosaic.BackwardTiles | None = None):
@@ -259,9 +251,10 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call])
     draw = _drawn(shape, jnp.bfloat16, keys=keys)
     accurate, config = (False, config) if form is None else BACKWARD_FORMS[form]
+    trained = attention_mosaic.forward if residuals_from is None else residuals_from
+
     def ours(query, key, value, dout):
         with _device(interpret, target):
-            trained = residuals_from or _training_forward(query, key, value, spans, interpret)
             residuals = trained(query, key, value, spans, residuals=True, interpret=interpret)[1:]
             with _pinned(backward=config):
                 grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
@@ -295,10 +288,9 @@ def test_the_training_forward_is_on_par_interpreted(call, natural):
 
 @ON_HOPPER
 @pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
-@pytest.mark.skip(reason=attention_mosaic.TRAINING_FAULT)
 @pytest.mark.parametrize("call", CALLS)
 def test_the_training_forward_is_on_par_on_an_h100(call):
-    """The training forward's output, bf16, compiled on an H100, once it runs there again (row 2254)."""
+    """The training forward's output, bf16, compiled on an H100."""
     _check_forward(call, jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, training=True)
 
 
