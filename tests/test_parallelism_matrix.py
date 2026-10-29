@@ -48,6 +48,7 @@ them."""
 import jax
 import pytest
 from tool_support import load
+from whole_suite import timed
 
 CELLS: dict[str, tuple[str, ...]] = {
     "dense_sft": ("fsdp4", "tensor2_sequence2"),
@@ -104,22 +105,26 @@ def references(tmp_path_factory):
     return tool, tool.References(tmp_path_factory.mktemp("layout-draws"), prepare=True, reserve=4 << 30)
 
 
-WHOLE_SUITE: frozenset[tuple[str, str]] = frozenset({("edm2", "tensor4"), ("edm2", "fsdp2_tensor2")})
-"""The run-once cells the whole suite alone runs: compile-bound, each takes 123-132 s alone on an
-armada 25/17 worker and 113.8 and 98.4 s in a warm task there (2026-10-29), about 154 and 133 s on
-the fleet's 26/17 workers (1.35x), past a task's 120 s target, and no smaller model cuts the
-compile."""
+PAST_TARGET = {"test_each_layout_of_a_model_runs_or_is_refused_as_stated": {
+    ("edm2", "tensor4", None): 123.0, ("edm2", "fsdp2_tensor2", None): 131.7}}
+"""The run-once cells past a group's 120 s target, which the whole suite alone runs (`whole_suite.timed`):
+compile-bound, each timed alone on an armada 25/17 worker (om-edm2-time, 2026-10-29), about 1.35 times
+that on the fleet's 26/17 workers; no smaller model cuts the compile."""
 
 
-def cells(*, judged: bool) -> list:
-    """The cells as a test's parameters, their layouts on every device but CELLS_ON_FOUR's, on four:
+def cells(*, judged: bool) -> list[tuple[str, str, int | None]]:
+    """The cells as a test's arguments, their layouts on every device but CELLS_ON_FOUR's, on four:
     for the accuracy test (`judged`) every cell but the run-once ones (`RUN_ONCE`), and for the
-    run-once test those alone, WHOLE_SUITE's marked to run on the whole suite."""
-    return [pytest.param(model, layout, devices, id=f"{model}-{layout}" + ("-on-four" if devices else ""),
-                         marks=pytest.mark.whole_suite if (model, layout) in WHOLE_SUITE else ())
+    run-once test those alone."""
+    return [(model, layout, devices)
             for table, devices in ((CELLS, None), (CELLS_ON_FOUR, 4))
             for model, layouts in sorted(table.items()) for layout in layouts
             if judged != ((model, layout) in RUN_ONCE)]
+
+
+def named(cases) -> list[str]:
+    """Each cell's test id: its model and layout, on four where it runs there."""
+    return [f"{model}-{layout}" + ("-on-four" if devices else "") for model, layout, devices in cases]
 
 
 def statuses(rows):
@@ -131,7 +136,9 @@ def statuses(rows):
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells(judged=False))
+@pytest.mark.parametrize(("model", "layout", "devices"),
+                         timed(PAST_TARGET, "test_each_layout_of_a_model_runs_or_is_refused_as_stated",
+                               cells(judged=False)), ids=named(cells(judged=False)))
 def test_each_layout_of_a_model_runs_or_is_refused_as_stated(model, layout, devices, references):
     """Each run-once layout (`RUN_ONCE`) compiles and takes its first step, its sample the one-device
     reference's and its FLOPs an even split, or is refused for the reason REFUSED gives: a refused cell
@@ -146,7 +153,7 @@ def test_each_layout_of_a_model_runs_or_is_refused_as_stated(model, layout, devi
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells(judged=True))
+@pytest.mark.parametrize(("model", "layout", "devices"), cells(judged=True), ids=named(cells(judged=True)))
 def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model, layout, devices,
                                                                            references):
     """Each layout's first step matches one device's by the floor judge (`layout_parity.floored`): its

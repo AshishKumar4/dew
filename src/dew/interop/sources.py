@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import re
 from collections.abc import Collection
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -93,11 +94,29 @@ class SourceReference:
         return snapshot(self.name, self.revision, weights=False) / (self.subfolder or "")
 
     def pinned(self) -> SourceReference:
-        """This source at the commit its revision resolves to now, as a run records it: the snapshot's
-        own, which offline is the one the cache holds. A local directory is as it is."""
-        if os.path.isdir(self.name):
+        """This source at the commit its revision resolves to now, as a run records it: the Hub's
+        answer, recorded so an offline run resolves it alike (`hub_answer`), and offline where it was
+        never asked, the commit the cache's ref holds, whatever files of it the cache holds. A local
+        directory, or a source named at a commit, is as it is."""
+        if os.path.isdir(self.name) or (self.revision is not None and _COMMIT.fullmatch(self.revision)):
             return self
-        return replace(self, revision=snapshot(self.name, self.revision, weights=False).name)
+        from huggingface_hub import HfApi
+        from huggingface_hub.errors import OfflineModeIsEnabled
+
+        try:
+            commit = hub_answer(("commit", self.name, self.revision or "main"),
+                                lambda: HfApi().model_info(self.name, revision=self.revision).sha).value
+        except OfflineModeIsEnabled:
+            commit = _cached_commit(self.name, self.revision or "main")
+        return replace(self, revision=commit)
+
+    def cached(self) -> Path:
+        """The cache's snapshot folder of this source's commit (`pinned` first), where its files land as
+        they are fetched (`file`), with none fetched here."""
+        if os.path.isdir(self.name):
+            return Path(self.name)
+        commit = self.pinned().revision
+        return _cache_folder(self.name) / "snapshots" / str(commit)
 
     def spelled(self) -> str:
         """The `repo@revision` spelling `parse` reads back, or the name alone."""
@@ -266,6 +285,28 @@ def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
         present = sorted(name for name in repo_files(str(name_or_dir), directory) if name.endswith(suffix))
         raise FileNotFoundError(f"{name_or_dir} at {directory.name} has no {filename!r}; "
                                 f"its {suffix} files are {present}") from error
+
+
+_COMMIT = re.compile(r"[0-9a-f]{40}")
+"""A Hub commit's spelling."""
+
+
+def _cache_folder(name: str) -> Path:
+    """The Hub cache's folder of the model repo `name`."""
+    from huggingface_hub import constants
+
+    return Path(constants.HF_HUB_CACHE) / f"models--{name.replace('/', '--')}"
+
+
+def _cached_commit(name: str, revision: str) -> str:
+    """The commit the Hub cache's ref `revision` of `name` holds, refused where the cache holds none."""
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    ref = _cache_folder(name) / "refs" / revision
+    if not ref.is_file():
+        raise OfflineModeIsEnabled(f"{name}@{revision} was never resolved online and the cache holds no "
+                                   "ref of it")
+    return ref.read_text().strip()
 
 
 def repo_files(name: str, directory: Path) -> set[str]:
