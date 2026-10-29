@@ -1691,3 +1691,24 @@ def test_a_summarized_recording_reads_back_as_its_reference_reads_live():
                     [getattr(read, field) for field in fields]), (seed, name)
                 zero_rows += len(kept.zero_rows)
     assert zero_rows
+
+
+def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
+    """A leaf recorded as each row's RMS distance from its float64 truth (`rows_summary`) reads as the leaf
+    whole does (`leaf_summary`): its worst row, the rows its truth sizes zero, their errors and own sizes,
+    its finiteness and dtype; and a leaf of no rows is exact, as `leaf_summary` reads one."""
+    from reference_error import _rows_rms, leaf_summary, rows_summary
+
+    rng = np.random.default_rng(1848)
+    truth = rng.standard_normal((6, 8))
+    truth[2] = 0.0  # a row the truth sizes zero
+    reference = (truth + rng.standard_normal((6, 8)) * 1e-6).astype(np.float32)
+    whole = leaf_summary(reference, truth)
+    read = rows_summary(_rows_rms(reference.astype(np.float64) - truth, 8), truth, finite=True,
+                        dtype="float32", mse=whole.mse)
+    for field in ("mse", "worst", "zero_rows", "zero_errors", "finite", "dtype", "zero_sizes", "worst_log"):
+        np.testing.assert_array_equal(getattr(read, field), getattr(whole, field), err_msg=field)
+    empty, exact = (rows_summary(np.zeros(0), np.zeros((0, 4)), finite=True, dtype="float32"),
+                    leaf_summary(np.zeros((0, 4), np.float32), np.zeros((0, 4))))
+    for field in ("mse", "worst", "zero_rows", "finite"):
+        np.testing.assert_array_equal(getattr(empty, field), getattr(exact, field), err_msg=field)

@@ -560,7 +560,7 @@ QUANTIZED_MODULE_LISTS = ("modules_to_not_convert", "ignore", "exclude_modules",
 
 
 def language_model_quantization(hf_config: Mapping[str, object], record: WrapperFields,
-                                inventory: Callable[[], Collection[str] | None]) -> dict[str, object]:
+                                inventory: Callable[[], Collection[str] | None]) -> dict[str, object] | None:
     """A wrapper's quantization_config as its language model's text checkpoint states it: every module
     selection under the text family's names (`wrapper_route`), a tower's or a projector's modules left
     out. The selections are the lists (`QUANTIZED_MODULE_LISTS`), ModelOpt's per-layer table
@@ -568,8 +568,14 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
     `.weight` routes; a pattern (`re:`, matched as compressed-tensors matches it, from a module name's
     start) is resolved over the wrapper's own modules, those of `inventory`'s tensor names, into the
     text names of the language model's it matches; an entry no wrapper module is named by (a class, as
-    `Linear`) applies to either checkpoint alike and stays."""
-    quantization = dict(_records.record(hf_config["quantization_config"], "quantization_config"))
+    `Linear`) applies to either checkpoint alike and stays. A ModelOpt key naming a container, which
+    the codec reads as every module beneath it a longer key does not name (`_modelopt_algo`), names
+    each of the language model's modules it selects so. The record is the wrapper's or its
+    text_config's (`codecs.quantization_record`); None where it is ModelOpt's and no layer of the
+    language model survives, which is a dense text checkpoint."""
+    from dew.interop.codecs import quantization_record
+
+    quantization = dict(_records.record(quantization_record(hf_config), "quantization_config"))
     modules: list[str] | None = None
 
     def wrapper_modules() -> list[str]:
@@ -607,9 +613,25 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
         if isinstance(quantization.get(field), list):
             quantization[field] = projected(quantization[field], field)
     if isinstance(quantization.get("quantized_layers"), Mapping):
-        layers = _records.record(quantization["quantized_layers"], "quantized_layers")
-        quantization["quantized_layers"] = {name: entry for module, entry in layers.items()
-                                            if (name := renamed(str(module))) is not None}
+        layers = {str(module): entry for module, entry in
+                  _records.record(quantization["quantized_layers"], "quantized_layers").items()}
+
+        def selecting(module: str) -> str | None:
+            # The longest key naming the module or a container of it, as the codec reads the table.
+            return max((key for key in layers if module == key or module.startswith(key + ".")),
+                       key=len, default=None)
+
+        table: dict[str, object] = {}
+        for key, entry in layers.items():
+            try:
+                named = [renamed(key)]
+            except ValueError:  # a container: each module beneath it the key selects
+                named = [renamed(module) for module in wrapper_modules()
+                         if module.startswith(key + ".") and selecting(module) == key]
+            table.update({name: entry for name in named if name is not None})
+        if not table:
+            return None
+        quantization["quantized_layers"] = table
     if isinstance(quantization.get("config_groups"), Mapping):
         groups = {}
         for group, entry in _records.record(quantization["config_groups"], "config_groups").items():

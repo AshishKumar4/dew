@@ -1530,8 +1530,12 @@ def compressed_tensors(quantization: Mapping[str, object],
 MODELOPT_PARTS = ('.weight_scale', '.weight_scale_2', '.input_scale')
 """ModelOpt's E4M3 block scales, fp32 global weight multiplier and fp32 input multiplier."""
 
+CT_PARTS = ('.weight_scale', '.weight_packed', '.weight_shape', '.weight_global_scale', '.input_global_scale',
+            '.weight_zero_point', '.weight_g_idx')
+"""compressed-tensors' tensors beside a weight it codes (`_ct_parts`, `_ct_partners`)."""
+
 SIDECARS = tuple(sorted({*PACKED_SUFFIXES, '.weight' + SCALE_SUFFIX, '.weight' + STORE_SCALE_SUFFIX,
-                         *MODELOPT_PARTS, *GPTQ_SUFFIXES}, key=len, reverse=True))
+                         *MODELOPT_PARTS, *GPTQ_SUFFIXES, *CT_PARTS}, key=len, reverse=True))
 """Every codec's tensors beside a weight it stores, by suffix, longest first: they belong to the
 module whose `.weight` they code (`hf_decoders.wrapper_route`)."""
 
@@ -1728,12 +1732,22 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
                 "safetensors repo it was converted from (the model card's base_model)")
 
 
+def quantization_record(config: Mapping[str, object]) -> object:
+    """A config's `quantization_config`, or its text_config's where it declares it there alone (KimiK3Config
+    lifts `text_config.quantization_config` onto itself, configuration_kimi_k3.py:282-283); None for
+    neither."""
+    quantization = config.get("quantization_config")
+    text = config.get("text_config")
+    if quantization is None and isinstance(text, Mapping):
+        quantization = text.get("quantization_config")
+    return quantization
+
+
 def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None = None,
                         grid: Mapping[str, Stored] | None = None) -> SourceQuantization | None:
     """Return the format a config's `quantization_config` declares, or None.
 
-    A wrapper may declare it on its text_config alone: KimiK3Config lifts
-    `text_config.quantization_config` onto itself (configuration_kimi_k3.py:282-283).
+    A wrapper may declare it on its text_config alone (`quantization_record`).
     An fp8 config that declares `expert_dtype`, in quantization_config or
     beside it, is DeepSeek-V4's `.scale` storage; `scale_dtype` is the dtype
     the source stored those scales in, which the codec writes back, and
@@ -1741,10 +1755,7 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
     (`SourceQuantization.grid`).
     """
     _refuse_mlx(config)
-    quantization = config.get("quantization_config")
-    text = config.get("text_config")
-    if quantization is None and isinstance(text, Mapping):
-        quantization = text.get("quantization_config")
+    quantization = quantization_record(config)
     if quantization is None:
         return None
     if not isinstance(quantization, Mapping):

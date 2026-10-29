@@ -246,8 +246,9 @@ def record_distances(label: str, draw, distances: Mapping[str, np.ndarray], trut
     count's (1 + REDRAW) times kept, each kept seed's evidence read from its rows (`rows_summary`) beside
     its truth's sketch."""
     names = list(distances)
-    errors = np.stack([np.mean(np.square(np.asarray(distances[name], np.float64)), axis=1) for name in names],
-                      axis=1)
+    # A leaf of no rows is exact, its error zero.
+    errors = np.stack([np.mean(np.square(rows), axis=1) if rows.shape[1] else np.zeros(rows.shape[0])
+                       for rows in (np.asarray(distances[name], np.float64) for name in names)], axis=1)
     confirmed = seeds_resolving(errors, names, label)
     kept = (1 + REDRAW) * confirmed
 

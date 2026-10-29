@@ -536,10 +536,11 @@ def test_a_quantized_wrapper_loads_text_only_as_its_quantized_text_checkpoint(tm
     jax.tree.map(np.testing.assert_array_equal, taken.variables, expected.variables)
 
 
-def modelopt_fp8(directory, layers: list[str]):
+def modelopt_fp8(directory, layers: list[str], *, table: dict | None = None, nested: bool = False):
     """The checkpoint at `directory` with the weight of each module of `layers` stored as ModelOpt's FP8
     exporter writes it (E4M3 codes under one float32 `weight_scale`, beside a static `input_scale`), as
-    a MIXED_PRECISION table naming those modules."""
+    a MIXED_PRECISION table naming those modules, or `table` where given; declared on its text_config
+    where `nested`."""
     import ml_dtypes
 
     from dew.interop.safetensors_io import read_file, write_file
@@ -555,28 +556,44 @@ def modelopt_fp8(directory, layers: list[str]):
     write_file(stored, directory / "model.safetensors", {"format": "pt"})
     config = json.loads((directory / "config.json").read_text())
     producer = {"name": "modelopt", "version": "0.47.0"}
-    config["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
-                                     "kv_cache_quant_algo": None, "producer": producer,
-                                     "quantized_layers": {module: {"quant_algo": "FP8"} for module in layers}}
+    record = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", "kv_cache_quant_algo": None,
+              "producer": producer,
+              "quantized_layers": table or {module: {"quant_algo": "FP8"} for module in layers}}
+    (config["text_config"] if nested else config)["quantization_config"] = record
     (directory / "config.json").write_text(json.dumps(config))
     return directory
 
 
-def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_and_all(tmp_path):
-    """A Qwen3.5 wrapper whose ModelOpt per-layer table names a projection, the head and a tower's layer
-    in FP8 loads `text_only` as the text checkpoint quantized alike does: the table keyed by the text
+TEXT_FP8 = ["model.language_model.layers.0.mlp.down_proj", "lm_head"]
+"""The wrapper's language-model modules the ModelOpt scenarios store in FP8."""
+
+
+@pytest.mark.parametrize("table", ["modules", "container", "nested", "tower alone"])
+def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_and_all(table, tmp_path):
+    """A Qwen3.5 wrapper whose ModelOpt per-layer table puts a projection, the head and a tower's layer in
+    FP8 loads `text_only` as the text checkpoint quantized alike does: the table keyed by the text
     family's names, the tower's entry dropped, the head's scales read beside it, its variables that
-    checkpoint's leaf for leaf and its logits that checkpoint's."""
+    checkpoint's leaf for leaf and its logits that checkpoint's. So does a table that names a layer's
+    projections by their container (`model.language_model.layers.0.mlp`), each a module of the text
+    checkpoint's table, one declared on the wrapper's text_config, and one whose tower's layer alone is
+    quantized, whose language model is the dense text checkpoint."""
     import shutil
 
     from dew.interop import Pretrained
 
     source = FIXTURES / "qwen35-native-tiny"
-    wrapper = modelopt_fp8(Path(shutil.copytree(source, tmp_path / "wrapper")), [
-        "model.language_model.layers.0.mlp.down_proj", "lm_head", "model.visual.blocks.0.attn.qkv"])
+    tower = "model.visual.blocks.0.attn.qkv"
+    fp8 = {"quant_algo": "FP8"}
+    mlp = [f"model.language_model.layers.0.mlp.{name}_proj" for name in ("gate", "up", "down")]
+    texts = {"modules": TEXT_FP8, "container": [*mlp, "lm_head"], "nested": TEXT_FP8,
+             "tower alone": []}[table]
+    tables = {"container": {"model.language_model.layers.0.mlp": fp8, "lm_head": fp8, tower: fp8}}
+    wrapper = modelopt_fp8(Path(shutil.copytree(source, tmp_path / "wrapper")), [*texts, tower],
+                           table=tables.get(table), nested=table == "nested")
     plain = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
     plain.save(tmp_path / "text")
-    text = modelopt_fp8(tmp_path / "text", ["model.layers.0.mlp.down_proj", "lm_head"])
+    renamed = [module.replace("model.language_model.", "model.") for module in texts]
+    text = modelopt_fp8(tmp_path / "text", renamed) if renamed else tmp_path / "text"
     load = {"dtype": "float32", "attention_impl": "reference"}
     taken, expected = Pretrained.load(wrapper, text_only=True, **load), Pretrained.load(text, **load)
     # Each load binds its input quantization in a class of its own, so the two compute alike, not one class.
@@ -605,3 +622,20 @@ def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_p
     assert projected["config_groups"]["fp8"]["targets"] == [
         "Linear", "model.layers.0.mlp.down_proj", "model.layers.0.mlp.up_proj"]
     assert projected["ignore"] == ["lm_head", "model.layers.1"]
+
+
+def test_every_codecs_tensors_beside_a_weight_route_as_the_weight_does():
+    """Each tensor a codec stores beside a weight (`codecs.SIDECARS`: compressed-tensors' packed codes,
+    shape, scales, zero points and act order, ModelOpt's and GPTQ's) routes where its weight does, the
+    head's beside the head and a layer's beside its language model's module, a tower's to the tower."""
+    from dew.interop.codecs import SIDECARS
+    from dew.interop.hf_decoders import translate_wrapper_config, wrapper_route
+
+    config = json.loads((FIXTURES / "qwen35-native-tiny" / "config.json").read_text())
+    record = translate_wrapper_config(config)
+    for module in ("lm_head", "model.language_model.layers.0.mlp.down_proj",
+                   "model.visual.blocks.0.attn.qkv"):
+        component, weight = wrapper_route(f"{module}.weight", record)
+        stem = weight.removesuffix(".weight")
+        for suffix in SIDECARS:
+            assert wrapper_route(module + suffix, record) == (component, stem + suffix)

@@ -1811,7 +1811,10 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
             config = decoders.bundle_text_config(config)
         elif source_quantization(config) is not None:
             quantization = decoders.language_model_quantization(config, language, inventory)
-            config = {**decoders.language_model_config(config), "quantization_config": quantization}
+            config = {key: value for key, value in decoders.language_model_config(config).items()
+                      if key != "quantization_config"}
+            if quantization is not None:
+                config["quantization_config"] = quantization
         else:
             config = decoders.language_model_config(config)
         route = source_route(config, remote=remote, pinned=pinned)
