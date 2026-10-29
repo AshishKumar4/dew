@@ -719,7 +719,8 @@ def test_dense_mla_reads_a_pairwise_mask_as_the_reference_masks():
 def test_a_call_s_own_mask_replaces_its_rows_validity():
     """A call's own mask replaces its rows' validity as it replaces their causality, as the shared core
     reads it: a real query may read a key the rows mark padding where the mask keeps it, on par with
-    transformers' block under that mask alone (check 1)."""
+    transformers' block under that mask alone (check 1), each token rotated at its place among the real
+    tokens (`Coordinates.places`)."""
     rule = np.broadcast_to((VIS_SLOTS[:, None] // 4) == (VIS_SLOTS[None, :] // 4),
                            (2, VIS_LENGTH, VIS_LENGTH))
     valid = np.ones((2, VIS_LENGTH), bool)
@@ -727,7 +728,9 @@ def test_a_call_s_own_mask_replaces_its_rows_validity():
     call = MixerCall(metadata=AttentionMetadata(
         pairwise_mask=jnp.asarray(rule), coordinates=coordinates(valid=jnp.asarray(valid))))
     module = visibility_module()
-    assert_masks_as_the_reference(lambda v, h: module.apply(v, h, call), rule, "mla own mask over padding")
+    places = np.maximum(np.cumsum(valid, axis=1) - 1, 0)
+    assert_masks_as_the_reference(lambda v, h: module.apply(v, h, call), rule, "mla own mask over padding",
+                                  positions=places)
 
 
 def test_dense_mla_reads_its_window_as_the_reference_masks():
