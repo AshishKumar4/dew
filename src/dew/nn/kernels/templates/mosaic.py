@@ -1186,6 +1186,12 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     def registers(self, consumers: int) -> int:
         return resources.entry_registers(consumers)
 
+    def programs(self, consumers: int) -> int:
+        """`Family.programs`: as many as the register file holds at the program's entry registers, each of
+        its `consumers` warpgroups' threads at them (`registers`), no producer beside them: a one-warpgroup
+        program's 255 hold two a multiprocessor, where a producer's layout holds one."""
+        return max(1, 64 * 1024 // (consumers * resources.THREADS * (self.registers(consumers) + 1)))
+
     def warpgroups(self, consumers: int) -> int:
         return consumers
 
