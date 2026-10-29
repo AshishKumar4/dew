@@ -502,7 +502,7 @@ class TrainerConfig:
     Scalars, records and objective previews are tracked; checkpoints are not uploaded.
     """
     publish: bool = False
-    """Publish the final checkpoint to W&B; requires `wandb` and `checkpoint_final`."""
+    """Publish the final checkpoint to W&B; requires `wandb`, online, and `checkpoint_final`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
@@ -590,6 +590,9 @@ class TrainerConfig:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
+        if self.publish and self.wandb is not None and self.wandb.offline:
+            raise ValueError("trainer.publish links the final checkpoint into W&B's registry, which an "
+                             "offline W&B run cannot reach; track online to publish")
         if self.attention_form not in attention_route.FORMS:
             raise ValueError(f"--trainer.attention-form is one of the template's forms "
                              f"{attention_route.FORMS}, not {self.attention_form!r}")
