@@ -69,7 +69,7 @@ def cumulated_decay(key, batch, length, value_heads, width=None):
                        jnp.float32)
 
 
-def separated(g):
+def separated_prefix(g):
     """A cumulated decay as the kernels take it, its whole part and fraction (`algebra.separated`), exact."""
     return recurrence_algebra.separated(g, jnp.zeros_like(g))
 
@@ -103,7 +103,7 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     q, k, v, h, g = output_operands(*shape, dtype)
     scale = shape[4] ** -0.5
     launch = fla_gdn.ChunkFwdO(config=tiles)
-    got = launch(q, k, v, support.entered_states(h), *separated(g), *chunked_launch.sequences(*shape[:2]),
+    got = launch(q, k, v, support.entered_states(h), *separated_prefix(g), *chunked_launch.sequences(*shape[:2]),
                  scale=scale, chunk=64, interpret=INTERPRETED)
     want = support.reference_o(q, k, v, h, g, scale=scale)
     assert got.shape == want.shape and got.dtype == want.dtype
@@ -149,7 +149,7 @@ def test_the_w_u_kernel_is_flas_recompute(dtype, shape):
     g = cumulated_decay(keys[4], batch, length, value_heads)
     want = support.reference_w_u(k, v, beta, a, g)
     kernel = functools.partial(fla_gdn.recompute_w_u, interpret=INTERPRETED)
-    whole, fraction = separated(g)
+    whole, fraction = separated_prefix(g)
     got = kernel(k, v, beta, a, whole, g_lo=fraction)
     for name, mine, theirs in zip(("w", "u"), got, want, strict=True):
         assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
@@ -169,7 +169,7 @@ def test_the_kkt_solve_kernel_inverts_flas_matrix(dtype, shape):
     g = cumulated_decay(keys[2], batch, length, value_heads)
     want = support.reference_kkt_solve(k, g, beta)
     kernel = functools.partial(fla_gdn.kkt_solve, interpret=INTERPRETED)
-    whole, fraction = separated(g)
+    whole, fraction = separated_prefix(g)
     got = kernel(k, whole, beta, g_lo=fraction)
     assert got.shape == want.shape and got.dtype == want.dtype
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 2e-3)
@@ -192,7 +192,7 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
     # The port stores each memory at its slot (`chunked_launch.Sequences`).
     want = support.entered_states(h), corrected, final
     kernel = functools.partial(fla_gdn.chunk_fwd_h, interpret=INTERPRETED)
-    whole, fraction = separated(g)
+    whole, fraction = separated_prefix(g)
     got = kernel(k, w, u, whole, h0, g_lo=fraction)
     for name, mine, theirs in zip(("h", "v_new", "final"), got, want, strict=True):
         assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
@@ -220,7 +220,7 @@ def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape, per_key):
     # The port stores each memory's gradient at its slot (`chunked_launch.Sequences`).
     want = support.left_grads(dh), dh0, dv2
     kernel = functools.partial(fla_gdn.chunk_bwd_dhu, scale=scale, interpret=INTERPRETED)
-    whole, fraction = separated(g)
+    whole, fraction = separated_prefix(g)
     got = kernel(q, k, w, whole, dht, do, dv, g_lo=fraction)
     for name, mine, theirs in zip(("dh", "dh0", "dv2"), got, want, strict=True):
         assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
@@ -240,7 +240,7 @@ def test_the_dv_local_kernel_is_flas(dtype, shape):
     scale = width ** -0.5
     want = support.reference_dv_local(q, k, g, do, scale=scale)
     kernel = functools.partial(fla_gdn.chunk_bwd_dv_local, scale=scale, interpret=INTERPRETED)
-    whole, fraction = separated(g)
+    whole, fraction = separated_prefix(g)
     got = kernel(q, k, whole, do, g_lo=fraction)
     assert got.shape == want.shape and got.dtype == want.dtype
     assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
@@ -267,7 +267,7 @@ def test_the_dqkwg_kernel_is_flas(dtype, shape):
     want = support.reference_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale)
     kernel = functools.partial(fla_gdn.chunk_bwd_dqkwg, scale=scale, interpret=INTERPRETED)
     states = (support.entered_states(h), dv, do, support.left_grads(dh))
-    whole, fraction = separated(g)
+    whole, fraction = separated_prefix(g)
     got = kernel(q, k, v, w, whole, *states, g_lo=fraction)
     names = ("dq", "dk", "dw", "decay pairs", "decay from the start")
     for name, mine, theirs in zip(names, jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
@@ -332,7 +332,7 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype,
     want[3] = np.flip(np.cumsum(np.flip(cumulated, 2), 2), 2).reshape(want[3].shape)
     a = jnp.asarray(np.moveaxis(inverse, 2, 3).reshape(batch, length, heads, 64), dtype)
     kernel = functools.partial(fla_gdn.prepare_wy_repr_bwd, interpret=INTERPRETED)
-    whole, fraction = separated(g)
+    whole, fraction = separated_prefix(g)
     got = kernel(k, v, beta, whole, a, dw, du, terms=no_terms(g), g_lo=fraction)
     for name, mine, theirs in zip(("dk", "dv", "db", "dg"), got, want, strict=True):
         assert mine.shape == theirs.shape, name
@@ -352,14 +352,14 @@ def test_the_wy_backward_gives_the_same_gradients_on_every_call_at_qwen35_08b_sh
     beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads))).astype(jnp.bfloat16)
     g = cumulated(-jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0),
                                    scale=fla_gdn.RCP_LN2)
-    whole, fraction = separated(g)
+    whole, fraction = separated_prefix(g)
     a = fla_gdn.kkt_solve(k, whole, beta, g_lo=fraction)
     dw, du, dk = (jax.random.normal(key, k.shape).astype(jnp.bfloat16) for key in keys[4:])
     backward = jax.jit(functools.partial(fla_gdn.prepare_wy_repr_bwd, terms=no_terms(g), g_lo=fraction))
     first = [np.asarray(x) for x in backward(k, v, beta, whole, a, dw, du, dk)]
     for _ in range(4):
-        again = backward(k, v, beta, whole, a, dw, du, dk)
-        for name, again, was in zip(("dk", "dv", "db", "dg"), again, first, strict=True):
+        found = backward(k, v, beta, whole, a, dw, du, dk)
+        for name, again, was in zip(("dk", "dv", "db", "dg"), found, first, strict=True):
             np.testing.assert_array_equal(np.asarray(again), was, err_msg=name)
 
 
@@ -378,7 +378,7 @@ def test_the_wy_backward_adds_the_keys_gradient_so_far_once_per_key_head(value_h
     dw = jax.random.normal(keys[5], (batch, length, value_heads, width))
     du = jax.random.normal(keys[6], (batch, length, value_heads, columns))
     earlier = jax.random.normal(keys[7], k.shape)
-    whole, fraction = separated(g)
+    whole, fraction = separated_prefix(g)
     backward = functools.partial(fla_gdn.prepare_wy_repr_bwd, terms=no_terms(g), g_lo=fraction,
                                  interpret=INTERPRETED)
     alone = backward(k, v, beta, whole, a, dw, du)
