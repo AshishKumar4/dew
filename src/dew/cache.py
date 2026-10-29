@@ -281,18 +281,28 @@ def _shared_by_pool(directory: str) -> bool:
     return all(seen_by_every_process(directory))
 
 
+def hub_ref(repo: str, revision: str | None, *, repo_type: str = "model") -> Path:
+    """The Hub cache's ref file of `revision` of `repo` (its default branch's where None), the commit
+    huggingface_hub, or `hub_commit`, last wrote for it."""
+    from huggingface_hub import constants
+    from huggingface_hub.file_download import repo_folder_name
+
+    storage = Path(constants.HF_HUB_CACHE) / repo_folder_name(repo_id=repo, repo_type=repo_type)
+    return storage / "refs" / (revision or constants.DEFAULT_REVISION)
+
+
 def hub_commit(repo: str, revision: str | None, *, repo_type: str = "model") -> HubAnswer[str]:
     """The commit `revision` of the Hub's `repo` names now, its default branch's where None, as a run
     records it. Online the Hub's answer (`hub_answer`), written to the Hub cache's ref of the revision as
     huggingface_hub writes it on a download, so another process sharing the cache resolves it alike;
-    offline the cache's ref, whichever tool wrote it, else the answer recorded online, both `recorded`."""
+    offline the answer recorded online, which every other record of the commit is keyed by (a dataset's
+    listing and shard facts), else the cache's ref (`hub_ref`), whichever tool wrote it, both
+    `recorded`."""
     from huggingface_hub import HfApi, constants
     from huggingface_hub.errors import OfflineModeIsEnabled
-    from huggingface_hub.file_download import repo_folder_name
 
     from dew.files import write_atomically
 
-    storage = Path(constants.HF_HUB_CACHE) / repo_folder_name(repo_id=repo, repo_type=repo_type)
     branch = revision or constants.DEFAULT_REVISION
     # The keys earlier runs recorded: a model's default branch as main, a dataset's as HEAD.
     question = (("commit", repo, branch) if repo_type == "model"
@@ -305,15 +315,12 @@ def hub_commit(repo: str, revision: str | None, *, repo_type: str = "model") -> 
             raise ValueError(f"HF {repo!r} did not resolve {branch} to a commit")
         return listing.sha
 
-    ref = storage / "refs" / branch
+    ref = hub_ref(repo, revision, repo_type=repo_type)
     try:
         answer = hub_answer(question, ask)
     except OfflineModeIsEnabled:
         if not ref.is_file():
             raise
-        return HubAnswer(ref.read_text().strip(), recorded=True)
-    if answer.recorded and ref.is_file():
-        # Offline the cache's ref stands over an answer recorded before another tool moved it.
         return HubAnswer(ref.read_text().strip(), recorded=True)
     if not answer.recorded and branch != answer.value and (
             not ref.is_file() or ref.read_text().strip() != answer.value):

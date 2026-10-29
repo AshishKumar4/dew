@@ -134,10 +134,16 @@ def own_data_cache(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
-def own_hub_answers(monkeypatch, tmp_path_factory):
+def own_hub_answers(monkeypatch, tmp_path_factory, request):
     """Each test keeps its own recorded Hub answers (`dew.cache.hub_answer`): a commit one test's
-    stand-in answered is not another's offline record."""
+    stand-in answered is not another's offline record. A test that reaches no network keeps its own
+    Hub cache too, whose refs its stand-ins' answers write (`dew.cache.hub_commit`), never the
+    runner's cache."""
     monkeypatch.setenv("DEW_HUB_ANSWERS", str(tmp_path_factory.mktemp("hub-answers")))
+    if request.node.get_closest_marker("network") is None:
+        from huggingface_hub import constants
+
+        monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path_factory.mktemp("hub-cache")))
 
 
 MAPPINGS = Path("/proc/self/maps")
