@@ -446,64 +446,6 @@ def nvfp4_qdq_case(kind: str) -> tuple[Path, dict[str, np.ndarray]]:
         return directory, dict(reference)
 
 
-def compressed_tensors_arms(directory: Path, *, input_qdq: bool):
-    """Check 1's reference and truth over the compressed-tensors checkpoint at `directory`, run in the
-    test as tools/nvfp4_qdq_reference.py and tools/nvfp4_storage_reference.py run them, each a function
-    of a draw's ids run `as_given`: transformers reading the files through compressed-tensors' CPU
-    reader in fp32 (`torch.nn.Module.float` promoting a decoded bf16 tree), its redundant weight QDQ off
-    (`QuantizationStatus.COMPRESSED`, which the NVFP4 QDQ recorder checks bit for bit) and its input QDQ
-    enabled where `input_qdq`, every quantizer off otherwise (weight-only storage); and that read's
-    float64 twin inside `float64`, whose input quantizer keeps its fp32 codes and scales and widens
-    their result, as changing a discontinuous quantizer's dtype changes its function."""
-    from unittest.mock import patch
-
-    import torch
-    from compressed_tensors.quantization import QuantizationStatus
-    from compressed_tensors.quantization.lifecycle.forward import forward_quantize
-    from transformers import AutoModelForCausalLM
-
-    from tools.torch_precision import float64, float64_twin
-
-    def compressed(model):
-        for module in model.modules():
-            if hasattr(module, "quantization_status"):
-                module.quantization_status = QuantizationStatus.COMPRESSED
-            if not input_qdq:
-                module.quantization_enabled = False
-        return model
-
-    model = compressed(AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float32,
-                                                            attn_implementation="eager").eval())
-    torch.nn.Module.float(model)
-    # The float64 truth read from the same files inside `float64`, so its rotary table is float64's, the
-    # float32 read's decoded weights and quantizer state loaded into it.
-    exact = compressed(float64_twin(model, lambda: AutoModelForCausalLM.from_pretrained(
-        directory, dtype=torch.float64, attn_implementation="eager")))
-    direct_float = torch.Tensor.float
-
-    def quantize_wide(module, value, base_name, args):
-        # The quantizer defines the discrete function in fp32. Its stored globals stay fp32.
-        overall = module.input_global_scale
-        module.input_global_scale = torch.nn.Parameter(direct_float(overall), requires_grad=False)
-        try:
-            return forward_quantize(module, direct_float(value), base_name, args).double()
-        finally:
-            module.input_global_scale = overall
-
-    @as_given
-    def reference(ids):
-        with torch.no_grad():
-            return model(torch.from_numpy(np.asarray(ids, np.int64)), use_cache=False).logits.numpy()
-
-    @as_given
-    def truth(ids):
-        with float64(), torch.no_grad(), patch(
-                "compressed_tensors.quantization.lifecycle.forward.forward_quantize", quantize_wide):
-            return exact(torch.from_numpy(np.asarray(ids, np.int64)), use_cache=False).logits.numpy()
-
-    return reference, truth
-
-
 def clearing_selections(loaded, draw, label: str):
     """`draw`, for a decoder that selects discontinuously (a mixture's routing, Gemma 3n's gaussian
     top-k), redrawn until its selections clear `selection_margins.MARGIN`, so the float32 runs and the

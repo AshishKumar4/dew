@@ -113,7 +113,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
-from model_support import flat_tree, llada_draw, llada_fields
+from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -1520,7 +1520,6 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
     the LM objective's `mtp_weight` trains the step's weights."""
     import torch
 
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from tools.torch_precision import float64
 
     reference = nemotron_step_source(tmp_path / "ultra-step")
@@ -1534,8 +1533,7 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
     draw = fixture_ids(FIXTURES / "nemotron-h-moe-latent-tiny")
 
     def step_logits(ids):
-        hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-        return model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0]
+        return prediction_logits(model, variables, ids)
 
     @as_given
     def fp32(ids):

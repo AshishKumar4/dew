@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from lm_support import token_batch_of
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, prediction_logits
 from reference_error import assert_as_exact
 from test_lm_objective import assert_as_exact_over_instances, written_cross_entropy
 
@@ -100,8 +100,7 @@ def test_a_depth_reads_the_token_after_its_position():
     changed = ids.at[0, -1].set((ids[0, -1] + 1) % VOCAB)
 
     def depth_logits(tokens):
-        hidden = model.apply(params, tokens, method=CausalTransformer.hidden_states)
-        return model.apply(params, hidden, tokens, method=CausalTransformer.mtp_logits)[0]
+        return prediction_logits(model, params, tokens)
 
     before, after = depth_logits(ids), depth_logits(changed)
     assert jnp.array_equal(before[:, :-1], after[:, :-1])
