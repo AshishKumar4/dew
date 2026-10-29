@@ -703,7 +703,7 @@ ROUTES = {
     # mode, whether the GPU's row names the port, and whether the rule takes the port there.
     "mixed dtypes": ((jnp.bfloat16, jnp.float32, jnp.bfloat16), 64, (2, 64), "reverse", True, True),
     "bf16 keys 256 wide": ((jnp.bfloat16,) * 3, 256, (2, 64), "reverse", True, True),
-    "forward mode": ((jnp.bfloat16,) * 3, 64, (2, 64), "forward", True, False),
+    "forward mode": ((jnp.bfloat16,) * 3, 64, (2, 64), "forward", True, True),
     "fp32 keys 256 wide": ((jnp.float32,) * 3, 256, (2, 64), "reverse", True, False),
     "bf16 keys 512 wide": ((jnp.bfloat16,) * 3, 512, (2, 64), "reverse", True, False),
     "a row naming XLA": ((jnp.bfloat16,) * 3, 64, (2, 64), "reverse", False, False),
@@ -792,7 +792,8 @@ def test_both_routes_return_the_operands_common_dtype(label):
 
 
 @pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
-@pytest.mark.parametrize("label", sorted(label for label, route in ROUTES.items() if route[5]))
+@pytest.mark.parametrize("label", sorted(label for label, route in ROUTES.items()
+                                         if route[5] and route[3] == "reverse"))
 def test_where_the_rule_takes_the_port_it_is_as_exact_as_fla(label):
     """The rule a layer calls (`chunk_gated_delta_rule`) at each geometry the port takes, mixed
     dtypes and the widest bf16 keys: its output, final memory and every operand's gradient as near the

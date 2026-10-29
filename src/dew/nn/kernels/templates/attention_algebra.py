@@ -196,7 +196,9 @@ class Coords(NamedTuple):
     first and past-last keys `[bq]` (`intervals`), with documents the queries' and keys' ids `ids`,
     `[bq]` and `[bk]`, and with dropout its entries' draw `drop` (`Draw`). A tile whose rows are its keys
     (`keys_first`: `[bk, bq]`, a program's `K Qᵀ`) holds them so too, `q_pos` `[1, bq]` and `k_pos`
-    `[bk, 1]`; its queries' and keys' vectors broadcast along its own axes (`queries`, `keys`)."""
+    `[bk, 1]`; its queries' and keys' vectors broadcast along its own axes (`queries`, `keys`). A
+    mainloop that reads its walk's tile a part at a time states the tile's keys (`tile_keys`), which a
+    part past the call's keys lies within (`key_count`)."""
 
     q_pos: jax.Array
     k_pos: jax.Array
@@ -204,6 +206,7 @@ class Coords(NamedTuple):
     ids: tuple[jax.Array, jax.Array] | None = None
     drop: Draw | None = None
     keys_first: bool = False
+    tile_keys: int | None = None
 
     def queries(self, x: jax.Array, like: jax.Array) -> jax.Array:
         """A per-query `x` (`[bq]`) broadcast over the tile `like`."""
@@ -220,8 +223,9 @@ class Coords(NamedTuple):
         return jnp.max(tile, axis=0 if self.keys_first else -1)
 
     def key_count(self, like: jax.Array) -> int:
-        """The keys the tile `like` holds."""
-        return like.shape[0 if self.keys_first else 1]
+        """The keys the walk's tile holds: `like`'s, or the tile's whole where `like` is a part of it
+        (`tile_keys`)."""
+        return like.shape[0 if self.keys_first else 1] if self.tile_keys is None else self.tile_keys
 
     def hooked(self, score_mod: Callable | None) -> Callable | None:
         """`score_mod`, written over `[bq, bk]` tiles, as this tile's layout runs it: taken axis for axis on a
@@ -830,7 +834,13 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array, products: jax.Array | None =
         tile = s.max(axis=-1)
     else:
         tile = (products.max(axis=-1) if spec.factor > 0 else products.min(axis=-1)) * spec.factor
-    new = jnp.maximum(m, tile)
+    return peaked(spec, m, jnp.maximum(m, tile))
+
+
+def peaked(spec: Forward, m: jax.Array, new: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`peak`'s running maximum `new` (at least `m`) and the factor the state before it takes from `m` to
+    it: a mainloop that takes a tile's maximum a part of the tile at a time (`peak` of each) states the
+    tile's whole by it."""
     return new, carried(spec, m, _safe(spec, new))
 
 

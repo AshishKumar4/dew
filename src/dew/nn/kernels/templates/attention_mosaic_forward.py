@@ -85,7 +85,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), out_dtype or dtype))
     if residuals or peaks:
         scoped.append(plgpu.SMEM((consumers, block_q), jnp.int32))
-    scoped += [plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_arrivals=consumers)]
+    scoped += [family.load_barriers(consumers), family.schedule(consumers)]
     blocks = {"keys": ((block_k, width), dtype)}
     if not peaks:
         blocks["values"] = ((block_k, value_width), dtype)
@@ -556,12 +556,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
         streamed = _streamed([program.reach(pair_first + index * block_q, spans_of, row)[:2]
                               for index in range(consumers)])
 
-        def turn(*, arrive: bool = True, wait: bool = True):
-            # The consumers' turns on the tensor cores, where a program has two (a schedule barrier).
-            if consumers > 1 and arrive:
-                plgpu.barrier_arrive(schedule)
-            if consumers > 1 and wait:
-                plgpu.barrier_wait(schedule)
+        turn = functools.partial(family.turn, schedule, consumers)
 
         def consumer(index):
             first = pair_first + index * block_q

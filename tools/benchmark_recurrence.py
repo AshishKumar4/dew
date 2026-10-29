@@ -170,8 +170,9 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
                                          for requirement in SCAN.kernel('pallas').failed(case))
             cotangents = (given['dy'], given['dfinal'])
         else:
+            # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
             hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                                     scale=shape.key_width ** -0.5)
+                                     scale=shape.key_width ** -0.5, write_bound=1.0)
             inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
                       given['beta'].astype(bf16))
 

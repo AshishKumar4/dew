@@ -16,6 +16,7 @@ from fla_gdn_support import CONV_SHAPES
 from reference_error import (
     FACTOR,
     assert_as_exact,
+    assert_as_exact_as_the_reference,
     assert_rounds_where_the_reference_does,
     chain_roundings,
     distance,
@@ -82,6 +83,37 @@ def kernel_conv(x, weights, activation, shift, *, valid, segments, parts, dtype)
     return short_conv.conv(x, weights, shift, None if valid is None else valid.astype(jnp.int8), segments,
                            parts, activation=activation, eps=1e-6, dtype=jnp.dtype(dtype),
                            interpret=jax.default_backend() != "gpu")
+
+
+@pytest.mark.parametrize("staged", ["jit", "remat"])
+def test_the_kernels_take_forward_mode_however_a_caller_stages_them(staged):
+    """`jax.jvp` of the conv on the kernels (interpreted off a GPU), a normalised piece among its pieces,
+    staged by a jit or by a remat as a layer's `nn.remat` stages it: its tangent XLA's conv's
+    (`short_conv.conv`'s `generation.linear_tangent`), on par with XLA's from float64. Its selector once
+    routed by whether it saw a JVP tracer, which a remat hides, and there the kernels' custom VJP raised
+    (row 2395)."""
+    parts = ((64, 32), (64, None))
+    x, weights, shift, _ = operands(1, 40, parts, dtype=jnp.float32, bias=True)
+    tangents = tuple(jnp.asarray(np.random.default_rng(3 + index).normal(size=t.shape), t.dtype)
+                     for index, t in enumerate((x, weights, shift)))
+
+    def kernels(x, weights, shift):
+        return kernel_conv(x, weights, activation=True, shift=shift, valid=None, segments=None, parts=parts,
+                           dtype=x.dtype)
+
+    def xla(x, weights, shift):
+        return xla_conv1d(x, weights, activation=True, bias=shift, parts=parts, dtype=x.dtype)
+
+    def tangent(pieces, *primals_and_tangents):
+        rule = jax.jit(pieces) if staged == "jit" else jax.checkpoint(pieces)
+        return jax.jvp(rule, primals_and_tangents[:3], primals_and_tangents[3:])[1]
+
+    mine = tangent(kernels, x, weights, shift, *tangents)
+    theirs = tangent(xla, x, weights, shift, *tangents)
+    with jax.enable_x64(new_val=True):
+        exact = tangent(xla, *widened((x, weights, shift, *tangents)))
+    for index, (found, reference, value) in enumerate(zip(mine, theirs, exact, strict=True)):
+        assert_as_exact_as_the_reference(found, reference, value, f"{staged} piece {index}")
 
 
 def truth(x, weights, shift, valid, parts, grads, activation=True, segments=None):
