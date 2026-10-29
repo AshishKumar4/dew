@@ -711,7 +711,8 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
 
 
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
-                   live_cotangents: bool = False, primal: Callable | None = None) -> Callable:
+                   live_cotangents: bool = False, primal: Callable | None = None,
+                   nested: bool = True) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
@@ -731,7 +732,9 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
     cotangent is never formed. `primal(*operands)` gives the output where no derivative is taken (a kernel
-    that saves nothing), `forward`'s where None."""
+    that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
+    it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
+    policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -775,7 +778,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         return forward(*operands)[0] if primal is None else primal(*operands)
 
     def bounded_jvp(primals, tangents):
-        output, saved = produced(*primals)
+        output, saved = (produced if nested else forward)(*primals)
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)

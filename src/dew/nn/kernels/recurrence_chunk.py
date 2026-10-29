@@ -765,24 +765,30 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     """`run(kernel, *operands)` on the kernel a selector gives each product (`kernel_of('forward')`,
     `kernel_of('training')`), differentiated at every order through the portable math (`run('xla', ...)`,
     `generation.linear_tangent`): the forward's kernel where no derivative is taken, the training kernel's
-    forward and its own pullback in reverse mode, and the portable tangent in forward mode however a jit, a
-    scan or a remat staged the call, where a kernel's custom VJP gives none (row 2395). The cells' products
-    differ (`PORT_CELLS`, `SCAN_CELLS`, or a template that trains no such call), and a trace cannot tell
-    them apart before its gradient is asked. A training kernel that refused the call refuses where a
-    gradient is traced, not a forward alone."""
+    forward and its own pullback in reverse mode, and the portable tangent, in the kernels' dtypes, in
+    forward mode however a jit, a scan or a remat staged the call, where a kernel's custom VJP gives none
+    (row 2395). The training kernel's forward runs as it is (not `nested`), so the residuals its port names
+    (`dew.nn.mixer_base.DELTA_RESIDUALS`) are a remat policy's to keep. The cells' products differ
+    (`PORT_CELLS`, `SCAN_CELLS`, or a template that trains no such call), and a trace cannot tell them apart
+    before its gradient is asked. A training kernel that refused the call refuses where a gradient is
+    traced, not a forward alone."""
     forward = kernel_of('forward')
     try:
         training = functools.partial(run, kernel_of('training'))
     except KernelRefused as refusal:
         training = functools.partial(_refusing, refusal)
-    portable = functools.partial(run, 'xla')
+    primal = functools.partial(run, forward)
+
+    def portable(*operands):
+        shapes = jax.eval_shape(primal, *operands)
+        return jax.tree.map(lambda x, shape: x.astype(shape.dtype), run('xla', *operands), shapes)
 
     def pulled(pullback, operands, cotangent):
         del operands
         return pullback(cotangent)
 
-    return generation.linear_tangent(functools.partial(jax.vjp, training), pulled, portable,
-                                     primal=functools.partial(run, forward))(*operands)
+    return generation.linear_tangent(functools.partial(jax.vjp, training), pulled, portable, primal=primal,
+                                     nested=False)(*operands)
 
 
 def _refusing(refusal: KernelRefused, *operands):
