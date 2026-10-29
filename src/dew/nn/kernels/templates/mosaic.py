@@ -1174,9 +1174,10 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     def warpgroups(self, consumers: int) -> int:
         return consumers
 
-    def roles(self, consumers: int, consumer, producer) -> None:
+    def roles(self, consumers: int, consumer, producer):
+        # Every consumer runs one program: its value the program's, for a scope after the walk's.
         del consumers, producer
-        consumer(lax.axis_index("wg"))
+        return consumer(lax.axis_index("wg"))
 
     def stream(self, streams, views: dict, lo, hi) -> None:
         raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")

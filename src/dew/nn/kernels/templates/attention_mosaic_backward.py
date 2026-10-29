@@ -448,38 +448,59 @@ def _resident_loaded(family: mosaic.Family, copies, index, *, shared: bool) -> N
         plgpu.barrier_wait(barrier)
 
 
-def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, index,
-                consumers: int) -> None:
-    """A dK/dV consumer's dK and dV (and its key gradients' sums) to their `views`, through its `stages`
-    (dK's output stage, dV's, the key gradients'): with `consumers` sharing its keys, each consumer's sums
-    over its queries added in a fixed order and stored once by the first (`mosaic.summed_across`)."""
+def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, index) -> None:
+    """A dK/dV consumer's dK and dV (and its key gradients' sums) of its own keys to their `views`, through
+    its `stages` (dK's output stage, dV's, the key gradients')."""
     out_smem, dv_smem, rows_smem = stages
     dk, dv, *key_sums = sums
     dk_view, dv_view, *key_views = views
-    if consumers == 1:
-        dk_stage = out_smem.at[index, pl.ds(0, dk.shape[0])]
-        if dv_smem is out_smem:
-            family.stored((dk, dv), (dk_view, dv_view), smem=dk_stage)
-        else:
-            family.stored((dk,), (dk_view,), smem=dk_stage)
-            family.stored((dv,), (dv_view,), smem=dv_smem.at[index])
-        if key_sums:
-            # Each key gradient, the walk's row sums, to the `[B, H, Kp]` outputs.
-            family.stored(tuple(key_sums), tuple(key_views), smem=rows_smem.at[index])
-        return
-    # Each sum's output stage holds the other consumer's part first (`mosaic.summed_across`'s `parts`): the
-    # first consumer reads it into its own before it stages the total there, so the sums take no shared
-    # memory past the walk's (a width of 256's two shares' parts passed an H100's block, 263256 bytes).
-    rows = dk.shape[0]
-    stages_of = (out_smem.at[pl.ds(0, 1), pl.ds(0, rows)],
-                 out_smem.at[pl.ds(0, 1), pl.ds(0, rows)] if dv_smem is out_smem else dv_smem.at[pl.ds(0, 1)],
-                 *[rows_smem.at[pl.ds(0, 1)]] * len(key_sums))
-    for value, view, stage in zip(sums, views, stages_of, strict=True):
-        def total(ready, value=value, view=view, stage=stage):
-            mosaic.summed_across(value, stage, ready, index, consumers,
-                                 lambda summed: family.stored((summed,), (view,), smem=stage.at[0]))
+    dk_stage = out_smem.at[index, pl.ds(0, dk.shape[0])]
+    if dv_smem is out_smem:
+        family.stored((dk, dv), (dk_view, dv_view), smem=dk_stage)
+    else:
+        family.stored((dk,), (dk_view,), smem=dk_stage)
+        family.stored((dv,), (dv_view,), smem=dv_smem.at[index])
+    if key_sums:
+        # Each key gradient, the walk's row sums, to the `[B, H, Kp]` outputs.
+        family.stored(tuple(key_sums), tuple(key_views), smem=rows_smem.at[index])
 
-        pl.run_scoped(total, plgpu.Barrier(num_arrivals=consumers - 1, num_barriers=1), collective_axes="wg")
+
+def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], *, fused: bool, widths: bool) -> tuple:
+    """The dK/dV program's refs by role: its nine inputs, its spans' and hook parameters' (`treedef` of
+    `leaves`), its dQ (a fused launch's), dK and dV outputs, its scoped allocations (`_dkv_scoped`) and its
+    key and tile gradients' outputs."""
+    inputs, refs = refs[:9], refs[9:]
+    unflattened, refs = treedef.unflatten(refs[:leaves]), refs[leaves:]
+    dq_ref, refs = (refs[0], refs[1:]) if fused else (None, refs)
+    dk_ref, dv_ref, *refs = refs
+    grad_refs, refs = refs[:len(graded)], refs[len(graded):]
+    keyed = tuple([ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == wanted]
+                  for wanted in (Kind.KEY, Kind.TILE))
+    return inputs, unflattened, (dq_ref, dk_ref, dv_ref), _dkv_scoped(refs, fused=fused, widths=widths), keyed
+
+
+def _shared_views(outputs, graded: list[Kind], block_k: int) -> tuple:
+    """dK's, dV's and each key gradient's view (`outputs`, the dK/dV launch's) at the program's key block, the
+    one its consumers share (`split_queries`)."""
+    dk_ref, dv_ref, *grad_refs = outputs
+    row, head = lax.axis_index("batch"), lax.axis_index("heads")
+    keys = pl.ds(lax.axis_index("k_tiles") * block_k, block_k)
+    key_views = [ref.at[row, head, keys] for ref, kind in zip(grad_refs, graded, strict=True)
+                 if kind == Kind.KEY]
+    return dk_ref.at[row, keys, head], dv_ref.at[row, keys, head], *key_views
+
+
+def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: int) -> None:
+    """The sums of the `consumers` sharing a key block (each over its share of the queries) added in a fixed
+    order and stored once to their `views` (`mosaic.summed_across`), each in a scope after the walk's,
+    whose shared memory it reuses (`mosaic.summing`)."""
+    for value, view in zip(sums, views, strict=True):
+        def total(stage, value=value, view=view, **scratch):
+            mosaic.summed_across(value, scratch, lax.axis_index("wg"), consumers,
+                                 lambda summed: family.stored((summed,), (view,), smem=stage))
+
+        pl.run_scoped(total, plgpu.SMEM(value.shape, jnp.float32), **mosaic.summing(value.shape, consumers),
+                      collective_axes="wg")
 
 
 def _dkv_scoped(refs, *, fused: bool, widths: bool) -> tuple:
@@ -568,15 +589,10 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds)))
 
     def body(*refs, streams):
-        (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
-        (spans_of, score_refs), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
-        dq_ref, refs = (refs[0], refs[1:]) if walk.fused else (None, refs)
-        dk_ref, dv_ref, *refs = refs
-        grad_refs, refs = refs[:len(graded)], refs[len(graded):]
-        k_smem, v_smem, staged, out_smem, dv_smem, rows_smem, k_loaded, v_loaded = _dkv_scoped(
-            refs, fused=walk.fused, widths=value_width == width)
-        key_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.KEY]
-        tile_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.TILE]
+        inputs, (spans_of, score_refs), (dq_ref, dk_ref, dv_ref), held, (key_refs, tile_refs) = _dkv_refs(
+            refs, treedef, len(leaves), graded, fused=walk.fused, widths=value_width == width)
+        q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
+        k_smem, v_smem, staged, out_smem, dv_smem, rows_smem, k_loaded, v_loaded = held
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
 
         views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
@@ -628,25 +644,31 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             if not split:
                 # The tiles past this block's last reader its partner reads.
                 family.passed(streams, hi, streamed[1], first=streamed[0])
-            out = (row, pl.ds(k_first, block_k), head)
-            key_views = tuple(ref.at[row, head, pl.ds(k_first, block_k)] for ref in key_refs)
-            _dkv_stored(family, (dk, dv, *key_sums), (dk_ref.at[out], dv_ref.at[out], *key_views),
-                        (out_smem, dv_smem, rows_smem), index, consumers if split else 1)
             if tile_refs:
                 _unread_tiles(family, store_tiles, len(tile_refs), (block_k, count), (lo, hi), q_steps,
                               block_q, part[0])
+            if split:
+                # The consumers' sums, added in a scope after the walk's (`_summed_stored`).
+                return dk, dv, *key_sums
+            out = (row, pl.ds(k_first, block_k), head)
+            key_views = tuple(ref.at[row, head, pl.ds(k_first, block_k)] for ref in key_refs)
+            _dkv_stored(family, (dk, dv, *key_sums), (dk_ref.at[out], dv_ref.at[out], *key_views),
+                        (out_smem, dv_smem, rows_smem), index)
+            return None
 
         def producer():
             family.stream(streams, views, *streamed)
 
-        family.roles(consumers, consumer, producer)
+        return family.roles(consumers, consumer, producer)
 
     scoped, rings = _dkv_allocations(family, program.tiles, width, value_width, query.dtype,
                                      parts=_parts(walk.accurate, query.dtype), stages=stages,
                                      columns=program.tiles.columns)
 
     def entry(*refs):
-        family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
+        summed = family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
+        if summed is not None:
+            _summed_stored(family, summed, _shared_views(refs[9 + len(leaves):], graded, block_k), consumers)
 
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
