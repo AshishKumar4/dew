@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Every layout of a model against one device: the loss and each gradient leaf, on check 1.
+"""Every layout of a model against one device: the loss and each gradient leaf, by the floor judge or
+check 1.
 
 Each process builds the one-device reference on its first local device, then
 each layout's trainer on the global mesh, from one key and one initial state,
 and runs the trainer's own compiled first step. The optimizer is `stash`
 before adam, so the gradient the step handed the optimizer is kept whole.
 
-A layout is judged by the gate's check 1 (tests/reference_error.py,
-`assert_as_exact`): over the model's draws, each a seed of its global batch
-(`benchmark_models.global_batch`), every gradient leaf and the loss within
-PARITY of the one-device reference's own error from the step computed in
-float64, with check 1's redraw and its row rule. `works`, MISMATCH, or
-INCONCLUSIVE where the draws do not resolve it, which never passes. `--seeds` sets the draws' count,
-one for every model; with none, each layout runs once, its sample held to the reference's (`ran`).
-`floored` judges one layout's first step against one device by the floor judge instead, the
-parallelism matrix's accuracy judge while check 1's draws cannot shard across its tasks.
+By default a layout's first step is judged by the floor judge (`floored`), the parallelism matrix's
+accuracy judge while check 1's draws cannot shard across its tasks: each gradient leaf and the loss
+within FLOOR_FACTOR of the reference's own deviation. `--seeds N` judges it by the gate's check 1
+instead (tests/reference_error.py, `assert_as_exact`): over the model's N draws, each a seed of its
+global batch (`benchmark_models.global_batch`), every gradient leaf and the loss within PARITY of
+the one-device reference's own error from the step computed in float64, with check 1's redraw and
+its row rule. `works`, MISMATCH, or INCONCLUSIVE where the draws do not resolve it, which never
+passes. `--seeds 0` runs each layout once, its sample held to the reference's (`ran`).
 
 The float64 truth is the anchor (`Anchor`): the case's float64 twin, its
 model's fields the native model's but its dtype, over the reference's own
@@ -54,8 +54,8 @@ The same command runs in one process or under `dew launch`, where the global
 batch is placed from every process alike:
 
     python tools/layout_parity.py --models dense --layouts data4,fsdp4,tensor4
-    python tools/layout_parity.py --models dense moe --references refs --prepare  # one device
-    python tools/layout_parity.py --models dense moe --references refs              # every device
+    python tools/layout_parity.py --models dense moe --seeds 8 --references refs --prepare  # one device
+    python tools/layout_parity.py --models dense moe --seeds 8 --references refs              # every device
     python tools/layout_parity.py --models moe --layouts expert4,data2_expert2,expert2_fsdp2 \\
         --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}' \\
         --objective '{"balance": {"aux_loss_alpha": 0.01}}'
@@ -1310,7 +1310,7 @@ PERMUTATIONS = 16
 """The row orders the floor judge's permutation floor draws (`permutation_floor`)."""
 
 
-_floor_held: dict[tuple[str, str, int | None], tuple[Any, ...]] = {}
+_floor_held: dict[tuple[str, str, int | None, str], tuple[Any, ...]] = {}
 """Each floor-judged model's batch, one-device first step and floors by its dtype and device count, as
 the first layout's `floored` computed them in this process: a model's layouts judge against the same
 reference, so its permutation floor's runs and float64 anchor run once for them all."""
@@ -1324,7 +1324,8 @@ def _floor_reference(model: str, case, reference, dtype: str, devices: int | Non
     reference past `rounding_limit` refuses, as does a floor past it (`widest_floor`)."""
     import benchmark_models as bench
 
-    key = (model, dtype, devices)
+    # The case as resolved, its mixture and objective among it, as `_initial` keys a reference.
+    key = (model, dtype, devices, repr(case))
     if key not in _floor_held:
         batch = bench.global_batch(case)
         ref_losses, ref_gradient, compiled = trained(reference, {}, batch, steps=1, one_device=True)
@@ -1352,23 +1353,26 @@ def _floor_reference(model: str, case, reference, dtype: str, devices: int | Non
     return _floor_held[key]
 
 
-def floored(model: str, layout: str, *, dtype: str, devices: int | None = None) -> dict[str, Any]:
+def floored(model: str, layout: str, *, dtype: str, devices: int | None = None,
+            mixture: dict[str, Any] | None = None, objective: dict[str, Any] | None = None) -> dict[str, Any]:
     """`layout`'s first step on `model` held to the one-device reference by the floor judge: each
     gradient leaf and the loss within FLOOR_FACTOR of the reference's floors (`_floor_reference`),
     and its devices' FLOPs to an even split (`flops_bound`), REDUNDANT past it. A model with
     residual orders is judged over them instead (`run_orders`), as `run` judges it. A layout Dew
     refuses by design is a refused row, and a failing layout, or a reference no layout can be
-    judged by, an error row, as `run` reports them."""
+    judged by, an error row, as `run` reports them. `mixture` and `objective` are merged into the
+    model's as `run` merges them."""
     import jax
 
     from dew._coordination import agreed
     from dew.mesh import LayoutRefused
 
-    case, reference = model_case(model, dtype, {}, {})
+    mixture, objective = mixture or {}, objective or {}
+    case, reference = model_case(model, dtype, mixture, objective)
     if case.orders:
         with jax.enable_x64(new_val=True):
             return run_orders(
-                [model], (layout,), dtype=dtype, devices=devices, mixture={}, objective={},
+                [model], (layout,), dtype=dtype, devices=devices, mixture=mixture, objective=objective,
                 out=Path("out/layout-parity-orders"), speak=lambda line: None)[0]
     try:
         batch, ref_losses, ref_gradient, floors, loss_floor, reference_flops = agreed(
@@ -1938,33 +1942,42 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
                           speak=lambda line: print(line, flush=True))
         print('\n'.join(summary(rows)), flush=True)
         raise SystemExit(verdict(rows))
+    def keep(rows: list[dict[str, Any]]) -> None:
+        if speaker and out is not None:
+            out.write_text(json.dumps(rows, indent=1))
+
+    mixed, aimed = json.loads(mixture), json.loads(objective)
+    orders_out = Path('out/layout-parity-orders') if out is None else out.parent / f'{out.stem}-orders'
     if seeds is None:
         # The floor judge, which CI's matrix and its multi-host gangs run until check 1's draws shard
-        # across tasks (`floored`): a layout at a time, through agreed phases on a pool.
-        if prepare or references is not None:
-            raise SystemExit("--prepare and --references are check 1's draws; give --seeds")
-        rows = [floored(model, layout, dtype=dtype, devices=devices)
-                for model in models for layout in layouts]
+        # across tasks (`floored`): a layout at a time, through agreed phases on a pool, a model with
+        # residual orders over them once for all its layouts (`run_orders`), as `run` judges it.
+        if prepare or references is not None or window != 1:
+            raise SystemExit("--prepare, --references and --window are check 1's draws; give --seeds")
+        rows: list[dict[str, Any]] = []
+        for model in models:
+            if zoo()[model].orders:
+                rows += run_orders([model], layouts, dtype=dtype, devices=devices, mixture=mixed,
+                                   objective=aimed, out=orders_out,
+                                   speak=lambda line: print(line, flush=True) if speaker else None)
+            else:
+                rows += [floored(model, layout, dtype=dtype, devices=devices, mixture=mixed, objective=aimed)
+                         for layout in layouts]
+            keep(rows)
         if speaker:
             print("\n".join(summary(rows)), flush=True)
         raise SystemExit(verdict(rows))
     store = References(references, prepare)
     if prepare:
-        if not prepared(models, dtype=dtype, seeds=seeds, windows=window, mixture=json.loads(mixture),
-                        objective=json.loads(objective), references=store,
+        if not prepared(models, dtype=dtype, seeds=seeds, windows=window, mixture=mixed, objective=aimed,
+                        references=store,
                         speak=lambda line: print(line, flush=True)):
             raise SystemExit(1)
         return
 
-    def keep(rows: list[dict[str, Any]]) -> None:
-        if speaker and out is not None:
-            out.write_text(json.dumps(rows, indent=1))
-
-    rows = run(models, layouts, dtype=dtype, seeds=seeds, windows=window, mixture=json.loads(mixture),
-               objective=json.loads(objective), references=store,
-               speak=lambda line: print(line, flush=True) if speaker else None, keep=keep,
-               devices=devices,
-               orders_out=None if out is None else out.parent / f'{out.stem}-orders')
+    rows = run(models, layouts, dtype=dtype, seeds=seeds, windows=window, mixture=mixed, objective=aimed,
+               references=store, speak=lambda line: print(line, flush=True) if speaker else None, keep=keep,
+               devices=devices, orders_out=orders_out)
     if speaker:
         print("\n".join(summary(rows)), flush=True)
     raise SystemExit(verdict(rows))

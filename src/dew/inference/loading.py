@@ -49,6 +49,8 @@ def pipeline(
     step: int | str | None = None,
     revision: str | None = None,
     trust: Sequence[str] = (),
+    text_only: bool = False,
+    prediction_depths: int | None = None,
 ) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask:
     """Load the inference task for `source`, with its weights placed once.
 
@@ -69,7 +71,11 @@ def pipeline(
     selects a run's checkpoint and `revision` pins a Hub source; passing
     `revision` for a run directory or `step` for a source raises
     `ValueError`. `trust` names the packages outside Dew a run's record may
-    import, as `trust_remote_code` does in transformers.
+    import, as `trust_remote_code` does in transformers. `text_only` and
+    `prediction_depths` select what a source loads, as `Pretrained.load`
+    takes them: a wrapper's language model alone, and the prediction depths
+    kept; a run's record selects its own, so passing either for a run
+    directory raises `ValueError`.
 
     Loading a task also points XLA at the on-disk executable cache, unless a
     cache directory is already set, so a restarted process reuses what it
@@ -98,13 +104,16 @@ def pipeline(
     if root.is_dir() and (root / RUN_FILE).is_file():
         if revision is not None:
             raise ValueError("revision pins a Hub source; a run directory has checkpoints, selected by step")
+        if text_only or prediction_depths is not None:
+            raise ValueError("text_only and prediction_depths select what a source loads; a run's record "
+                             "selects its own model")
         return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
                          param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step,
                          trust=trust)
     if step is not None:
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
-                        revision=revision)
+                        revision=revision, text_only=text_only, prediction_depths=prediction_depths)
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
@@ -124,17 +133,19 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
-                 revision: str | None) -> SavedTask:
+                 revision: str | None, text_only: bool, prediction_depths: int | None) -> SavedTask:
     from dew.distributed.placement import MeshSpec as DefaultMesh
     from dew.inference.projections import packed_owned
     from dew.interop import Pretrained, PretrainedPipeline
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
-    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
+    # The source's selection (`text_only`, `prediction_depths`), as `Pretrained.load` takes it.
+    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
+                              text_only=text_only, prediction_depths=prediction_depths)
               if dtype is None else
               Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
-                              layout=layout))
+                              layout=layout, text_only=text_only, prediction_depths=prediction_depths))
     if not isinstance(loaded, PretrainedPipeline):
         # The task owns the weights it loaded: their projections pack once, where they were placed.
         # (Public bundle.pipeline borrows weights; packing here may relinquish the unpacked device
