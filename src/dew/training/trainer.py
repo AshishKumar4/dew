@@ -1050,14 +1050,15 @@ class Trainer(Generic[Loss, Effects]):
         if self._rung() != before:
             _log.warning("taking the saved plan, from the ahead step or %s", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
+        start = candidates.index(first) if isinstance(first, int) and first in candidates else 0
         search = FitSearch(
             lower, lambda candidate: step_options(self.objective, candidate.micro,
                                                   candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow,
             None if self._base_rung is None else self._base_rung[1], resumed, ahead=self._ahead,
             capacity=capacity)
-        planned, probes = search.admitted(
-            candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
+        with assumed(None if self._ahead is None else self._ahead.derived_for(gpu_target())):
+            planned, probes = search.admitted(candidates, start)
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
         self._ahead = search.ahead
         self.objective.substitute(list(planned.modules))
@@ -1186,8 +1187,7 @@ class Trainer(Generic[Loss, Effects]):
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
         (`dew.training.narrow`), by path under `params`: on every GPU unless
-        `chosen` turns them off, for a step this trainer composes, without a
-        loss scale."""
+        `chosen` turns them off, for a step this trainer composes, without a loss scale."""
         if (chosen_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
                 or self.step is not None or self.dynamic_scale or FROZEN in state.variables):
             return {}
