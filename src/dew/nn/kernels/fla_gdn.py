@@ -70,7 +70,7 @@ shared bytes at its narrowest tile (CPU compile)."""
 def _paired(rows, columns, rows_lo=None, columns_lo=None):
     """The decay from each column position to each row position, `[R, C]`: `exp2(g_r - g_c)`, of the prefix
     separated into its whole part and fraction where the fractions are given (`algebra.between`)."""
-    if rows_lo is None:
+    if rows_lo is None or columns_lo is None:
         return jnp.exp2(rows[:, None] - columns[None, :])
     return algebra.between((rows[:, None], rows_lo[:, None]), (columns[None, :], columns_lo[None, :]))
 
