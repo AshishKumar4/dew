@@ -146,8 +146,8 @@ def nelbo(reference, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarr
     model = stand_in(reference, backbone)
     model.q_xt = lambda x, move_chance: torch.tensor(inputs["corrupted"])
     tokens = torch.tensor(inputs["tokens"])
-    with drawn(torch.tensor(inputs["time_uniform"], dtype=dtype),
-               torch.tensor(inputs["mask_uniform"], dtype=dtype)):
+    # `q_xt` reads the inputs' corrupted rows, so the loss draws the times' uniforms alone.
+    with drawn(torch.tensor(inputs["time_uniform"], dtype=dtype)):
         loss = model._loss(tokens, torch.ones_like(tokens, dtype=dtype))
     loss.loss.backward()
     return {"nlls": loss.nlls.detach().numpy(), "loss": loss.loss.detach().numpy(),
