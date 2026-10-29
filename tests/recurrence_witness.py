@@ -27,13 +27,25 @@ decay's base-2 prefix within `EXPONENT_BOUND` of its exact value (XLA's compensa
 then the kernel's own roundings of its differences."""
 
 import dataclasses
+import functools
 import math
 from typing import NamedTuple
 
 import numpy as np
 from certified import allowance
 from native_certificates import TRUNCATING, truncating_underflow
-from op_certificates import BFLOAT16, FLOAT16, FLOAT32, Format, above, below, grid_index, nearest, stepped
+from op_certificates import (
+    BFLOAT16,
+    FLOAT16,
+    FLOAT32,
+    Format,
+    above,
+    below,
+    exp2_rounded,
+    grid_index,
+    nearest,
+    stepped,
+)
 
 from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.templates.recurrence import mainloop
@@ -193,13 +205,12 @@ def blocked(a: Iv, b: Iv, lane: Lane) -> Iv:
 
 
 def exp2(x: Iv, lane: Lane) -> Iv:
-    """`exp2` of a value within `x`: within `lane.reach` steps of the fp32 grid of its correctly rounded
-    value, the float64 `exp2` within 2^-50 of it; zero where it may fall below the normal range (ex2's flush,
-    or a scaling's last product rounding there)."""
-    # The correctly rounded results' least and greatest (round to nearest is monotone), then the reach: a
-    # floor or ceiling onto the grid first would admit one step more than the measured reach.
-    lo = np.asarray(np.float32(np.exp2(x.lo) * (1 - 2.0 ** -50)), np.float64)
-    hi = np.asarray(np.float32(np.exp2(x.hi) * (1 + 2.0 ** -50)), np.float64)
+    """`exp2` of an fp32 value within `x`: within `lane.reach` steps of the fp32 grid of its correctly rounded
+    value (`op_certificates.exp2_rounded`, verified), at the least and greatest fp32 operands within `x`
+    (round to nearest is monotone); zero where it may fall below the normal range (ex2's flush, or a
+    scaling's last product rounding there)."""
+    lo = exp2_rounded(above(x.lo, FLOAT32), FLOAT32)
+    hi = exp2_rounded(below(x.hi, FLOAT32), FLOAT32)
     for _ in range(lane.reach):
         lo, hi = stepped(lo, FLOAT32, -np.inf), stepped(hi, FLOAT32, np.inf)
     return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
@@ -361,8 +372,6 @@ def exp2_reach(native) -> int:
     """The most steps of the fp32 grid `native(x)`, an fp32 `exp2` of fp32 operands, lies from `2^x` correctly
     rounded (`op_certificates.exp2_rounded`), over the fractions `algebra.raised` and `algebra.decayed` take,
     (-2, 2): 2^17 of them, densely and drawn, the integers there (exact cases) among them."""
-    from op_certificates import exp2_rounded
-
     rng = np.random.default_rng(2084)
     x = np.concatenate([np.linspace(-2, 2, 1 << 16, dtype=np.float32), np.arange(-2, 3, dtype=np.float32),
                         rng.uniform(-2, 2, (1 << 16) - 5).astype(np.float32)])
@@ -374,15 +383,15 @@ RECORDS = ("a", "w", "c", "o", "h", "leaving")
 """The records the witness holds (`enclosed`)."""
 
 
+@functools.cache
 def interpreted_lane() -> Lane:
-    """The arithmetic Mosaic GPU's interpreter runs a launch in, a CPU process's XLA: its `exp2`'s reach
-    (`exp2_reach`) and whether it flushes (`certified.lane`), a 16-bit call."""
-    import jax
-    import jax.numpy as jnp
+    """The arithmetic Mosaic GPU's interpreter runs a launch in, a CPU process's XLA: its `exp2`'s reach and
+    whether it flushes, as check 2 measures the lane (`certified.lane`: a level `n` lies at most `n` steps of
+    the grid from the correctly rounded value), a 16-bit call."""
     from certified import lane
 
-    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes,
-                mainloop.block_of(mainloop.INTERPRETED))
+    measured = lane()
+    return Lane(measured.reach["exp2", "float32"], measured.flushes, mainloop.block_of(mainloop.INTERPRETED))
 
 
 @dataclasses.dataclass(frozen=True)

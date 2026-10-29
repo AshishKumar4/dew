@@ -210,6 +210,13 @@ def _exp_interval(values, bits):
     return _interval(lambda iv, x: iv.exp(x))(np.clip(values, *EXP_RANGE), bits)
 
 
+def _exp2_interval(values, bits):
+    """exp2's outward enclosure, exp(x ln 2), at each finite value, taken at (-160, 130)'s nearer end beyond
+    it: below it every 2^x is under half fp32's least subnormal, above it past fp32's largest, in every
+    format no wider than fp32 the verdicts of the ends'."""
+    return _interval(lambda iv, x: iv.exp(x * iv.log(2)))(np.clip(values, -160.0, 130.0), bits)
+
+
 def _erfinv_enclosed(values, bits):
     """An outward enclosure of erfinv at each value in (-1, 1): mpmath's erfinv at `bits`, widened by
     2^-(bits - 24) of itself, verified at its two ends by erfc at `bits` + 64 bits, 2^40 times finer
@@ -244,6 +251,16 @@ def _exp_special(value):
     """exp's limits at the infinities and its one exact value, exp(±0) = 1, named."""
     named = ~np.isfinite(value) | (value == 0)
     return np.select([value == np.inf, value == -np.inf, value == 0], [np.inf, 0.0, 1.0], np.nan), named
+
+
+def _exp2_special(value):
+    """exp2's limits at the infinities and its exact values, 2^n at the integers whose power is a normal
+    value of every format no wider than fp32 (-126 to 127), named."""
+    integer = np.isfinite(value) & (value == np.rint(value)) & (value >= -126) & (value <= 127)
+    named = ~np.isfinite(value) | integer
+    expected = np.select([value == np.inf, value == -np.inf, integer],
+                         [np.inf, 0.0, np.exp2(np.where(integer, value, 0.0))], np.nan)
+    return expected, named
 
 
 def _erfinv_special(value):
@@ -721,6 +738,7 @@ LEVELS = {
     "sqrt": _arithmetic(_root),
     "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     "exp": _transcendental(_exp_interval, _exp_special),
+    "exp2": _transcendental(_exp2_interval, _exp2_special),
     "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
     "rsqrt": _transcendental(_interval(lambda iv, x: 1 / iv.sqrt(x)), _rsqrt_special),
     "logistic": _transcendental(_logistic_interval, _logistic_special),
@@ -776,6 +794,12 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[0] = 0.0
         drawn = [value]
+    elif name == "exp2":
+        # Across fp32's range, a quarter near zero and a quarter at the integers, its exact values.
+        value = rng.uniform(-150, 128, PROBES)
+        value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        value[quarter:2 * quarter] = rng.integers(-126, 128, quarter)
+        drawn = [value]
     elif name == "rsqrt":
         value = np.abs(scaled(-149, 127))
         value[:quarter] = 4.0 ** rng.integers(-74, 64, quarter)
@@ -829,6 +853,7 @@ CONTRACTS = {
     "convert_element_type": _converted,
     "log": _rounding("log", None),
     "exp": _rounding("exp", None),
+    "exp2": _rounding("exp2", None),
     "erf_inv": _rounding("erf_inv", None),
     "rsqrt": _rounding("rsqrt", None),
     "logistic": _rounding("logistic", None),

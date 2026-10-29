@@ -36,7 +36,7 @@ def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, 
 @pytest.mark.parametrize("name, fn, operands", [
     ("add", jnp.add, 2), ("add_any", jnp.add, 2), ("sub", jnp.subtract, 2), ("mul", jnp.multiply, 2),
     ("div", jnp.divide, 2), ("sqrt", jnp.sqrt, 1), ("rsqrt", jax.lax.rsqrt, 1), ("log", jnp.log, 1),
-    ("exp", jnp.exp, 1), ("logistic", jax.lax.logistic, 1)])
+    ("exp", jnp.exp, 1), ("exp2", jnp.exp2, 1), ("logistic", jax.lax.logistic, 1)])
 def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(name, fn, operands):
     """The lane's own result of each operation on random float32 operands, subnormal products and
     quotients included, holds its contract at the lane's measured reach; the same result moved past
