@@ -329,11 +329,9 @@ def _image_zoo() -> dict[str, Any]:
                                                       {"features": 64, "heads": 4}],
                                            "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
                      image_size=16, **images),
-        # Eight pixels a side, its attention at four: each run-once cell of it fits a CI task's
-        # target on the fleet's slower hosts (26/17, about 1.35x 25/17).
         "edm2": Case("edm2_unet", {"model_channels": 32, "channel_mult": [1, 2], "num_blocks": 1,
-                                   "attn_resolutions": [4], "channels_per_head": 16, "output_channels": 4},
-                     image_size=8, **images),
+                                   "attn_resolutions": [8], "channels_per_head": 16, "output_channels": 4},
+                     image_size=16, **images),
         "mmdit": Case("sd3_transformer", {"in_channels": 4, "out_channels": 4, "num_layers": 2, "heads": 4,
                                           "head_dim": 8, "joint_attention_dim": 16,
                                           "caption_projection_dim": 32, "pooled_projection_dim": 32,
