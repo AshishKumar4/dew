@@ -27,6 +27,7 @@ from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
     attention_mosaic_program,
+    attention_portable,
     attention_triton,
     resources,
 )
@@ -290,12 +291,14 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
                     residuals_from=None, target: generation.GpuTarget | None = None,
                     config: attention_mosaic.BackwardTiles | None = None, width: int = 128,
                     value_width: int | None = None, spans: template.KeySpans | None = None,
-                    drop: bool = False):
+                    drop: bool = False, kept: bool | str = True):
     """The backward in the form `form` names (`_backward_form`; None, the default form at `config`, else its
     derived one) over the call form `call` of `shape` (or `spans` where given; its keys `keys`, its query
     heads `width` wide and its value heads `value_width`) on `target` (`_device`), from the training
-    forward's residuals at its pick: this mainloop's, or `residuals_from`'s (another mainloop's `forward`, as
-    the route feeds the Triton mainloop's), with `drop` under probability dropout (`_dropping`)."""
+    forward's residuals at its pick: this mainloop's, those `kept` names (its anchor's split sums, or
+    `template.OUTPUT`'s output, check 1 then judging D's rounding a term at a time), or `residuals_from`'s
+    (another mainloop's `forward`, as the route feeds the Triton mainloop's), with `drop` under probability
+    dropout (`_dropping`)."""
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call]) if spans is None else spans
     hooks = _dropping(shape) if drop else None
@@ -305,7 +308,7 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
 
     def ours(query, key, value, dout):
         with _device(interpret, target):
-            residuals = trained(query, key, value, spans, hooks, residuals=True, interpret=interpret)[1:]
+            residuals = trained(query, key, value, spans, hooks, residuals=kept, interpret=interpret)[1:]
             with _pinned(backward=config):
                 grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                                   accurate=accurate, interpret=interpret)
@@ -315,7 +318,43 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
         _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
         return pull(dout)
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form}", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form} {kept}",
+                    seeds=SEEDS, terms=kept == template.OUTPUT)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("form", ["default", "fused"])
+@pytest.mark.parametrize("call", CALLS)
+def test_the_backward_from_the_kept_output_is_on_par_interpreted(call, form):
+    """The backward from a training forward that keeps its output for D (`template.OUTPUT`: the inference
+    walk's rows, no anchor, `rowsum(dO ⊙ O)` of the rounded output, as FlashAttention's is), in two launches
+    and in one: within check 1 of the reference from float64, its D's rounding judged a term at a time."""
+    _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, kept=template.OUTPUT)
+
+
+@INTERPRETS
+def test_the_plain_jax_backward_takes_the_kept_outputs_residuals():
+    """The plain-JAX mainloop's backward from residuals a Mosaic training forward keeps its output in
+    (`template.OUTPUT`: no anchor key, each query's -1, the seam's anchor value row zero there), as the
+    route hands a Mosaic forward's residuals to whichever mainloop runs the backward: within check 1 of the
+    reference from float64, a term at a time."""
+    shape = SHAPES["interpreted"]
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+
+    def ours(query, key, value, dout):
+        with _device(interpret=True):
+            residuals = attention_mosaic.forward(query, key, value, spans, residuals=template.OUTPUT,
+                                                 interpret=True)[1:]
+        grads = attention_portable.backward(query, key, value, spans, None, dout, block_q=64, block_k=64,
+                                            pad=64, residuals=residuals)
+        return grads.query, grads.key, grads.value
+
+    def reference(query, key, value, dout):
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), query, key, value)
+        return pull(dout)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(shape, jnp.bfloat16, 128),
+                    "plain-JAX backward from the kept output", seeds=SEEDS, terms=True)
 
 
 @INTERPRETS
