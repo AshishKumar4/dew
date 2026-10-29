@@ -227,7 +227,9 @@ class GpuTarget:
     generation: str
     device_kind: str
     shared_limit: int | None = None
-    dense_peaks: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict)
+    # Out of the hash (still compared), so a target keys a cache: a template's launches lowered once each
+    # (`mainloop._lowered_once`).
+    dense_peaks: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict, hash=False)
     aliases: tuple[str, ...] = ()
     multiprocessors: int | None = None
     clock_hz: float | None = None

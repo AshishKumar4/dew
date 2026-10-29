@@ -9,8 +9,17 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import fixture_ids, transformers_arms, transformers_model
 from model_support import flat_tree
-from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
+from reference_error import (
+    FACTOR,
+    assert_as_exact,
+    declared_seeds,
+    distance,
+    indexed_recording,
+    recording,
+    widened,
+)
 from test_hf_decoders import (
     GEMMA4_MOE,
     assert_padded_speculation_is_greedy,
@@ -27,48 +36,106 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 ROUTED = {'qwen2-moe-tiny': 'Qwen2-MoE', 'granitemoe-tiny': 'Granite MoE', 'minimax-m2-tiny': 'MiniMax-M2'}
-"""Routed decoders whose recorded fixtures carry the reference's float32 and float64 logits, whole,
-padded and cached: Qwen2-MoE's fused experts and shared gate, Granite MoE's packed experts, MiniMax-M2's
-router state, recorded from the corrected reference."""
+"""Routed decoders with padded fixtures: Qwen2-MoE's fused experts and shared gate, Granite MoE's packed
+experts, MiniMax-M2's router state, recorded from the corrected reference."""
+
+RECORDED = ('minimax-m2-tiny', 'minimax-m2-fp8-tiny')
+"""The routed decoders whose reference is transformers 5.18.0, past the suite's release (MiniMax-M2's
+rotary fix, tools/reference_releases.py), so the test cannot run it: each one's logits recorded over
+check 1's seeds in its recorded_logits.npz (tools/hf_reference.py `--minimax-m2-recording`), whose
+declared count it reads. transformers 5.17.0 reads every other one as its recorder did, in the test."""
+
+ROUTED_SEEDS = 8
+"""Each in-test routed decoder's declared draws of ids against transformers' logits (check 1), whole,
+prefilled and stepped through the cache, and left-padded, sized by `seeds_for` paired with Dew's logits
+on the CPU."""
+
+
+def assert_routed(name: str, ours, label: str, leaf: str = 'logits', *, wide=None, **fields) -> None:
+    """Check 1 of `ours(model, variables)`, Dew's fp32 function of a draw's ids (`fixture_ids`), against
+    transformers' logits over them, the padded rows' `fields` beside them (their `attention_mask`, which
+    pads the ids with 0, and `position_ids`) at the mask's valid places: run in the test from its float64
+    twin, or for a `RECORDED` decoder its recording's `leaf`, the truth Dew's `wide` (by default `ours`)
+    run in float64 and held to the recording's sketch (`indexed_recording`)."""
+    import torch
+
+    directory = FIXTURES / name
+    model, variables = fp32_decoder(directory)
+    draw = fixture_ids(directory)
+    if name in RECORDED:
+        path = directory / 'recorded_logits.npz'
+        seeds = declared_seeds(path)['logits']
+        fp32 = ours(model, variables)
+        wide = (wide or ours)(model.clone(dtype=jnp.float64), widened(variables))
+        recorded, reference, truth = indexed_recording(
+            recording(path), 'logits', seeds, leaves=(leaf,), truth_fn=lambda inputs: {leaf: wide(
+                inputs['input_ids'])}, inputs_of=lambda seed: {'input_ids': draw(seed)[0]})
+        assert_as_exact(lambda index, inputs: {leaf: fp32(inputs['input_ids'])}, reference, recorded, label,
+                        seeds=seeds, truth_fn=truth)
+        return
+    tensors = {key: torch.from_numpy(value) for key, value in fields.items()}
+    valid = tensors.get('attention_mask')
+
+    def read(model, ids):
+        if valid is None:
+            return model(ids, use_cache=False).logits
+        return model(torch.where(valid, ids, 0), **tensors, use_cache=False).logits[valid]
+
+    reference, truth = transformers_arms(transformers_model(directory), read)
+    assert_as_exact(ours(model, variables), reference, draw, label, seeds=ROUTED_SEEDS, truth_fn=truth)
+
+
+def whole(model, variables):
+    """`model`'s logits over a draw's ids, for `assert_routed`."""
+    return lambda ids: model.apply(variables, ids)
 
 
 @pytest.mark.parametrize('name', (*ROUTED, 'minimax-m2-fp8-tiny'))
 def test_a_routed_decoders_logits_match_the_reference(name):
+    """Dew's logits are on par with transformers', from float64, over drawn ids (check 1), with the
+    recorded reference's argmax on the fixture's ids."""
+    assert_routed(name, whole, f'{name} logits')
     directory = FIXTURES / name
     model, variables = fp32_decoder(directory)
-    reference = np.load(directory / 'logits.npy')
     logits = np.asarray(model.apply(variables, np.load(directory / 'input_ids.npy')))
-    truth = np.load(directory / 'logits_f64.npy')
-    assert_as_exact_as_the_reference(logits, reference, truth, f'{name} logits')
-    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
+    np.testing.assert_array_equal(logits.argmax(-1), np.load(directory / 'logits.npy').argmax(-1))
 
 
 @pytest.mark.parametrize('name', ROUTED)
 def test_a_routed_decoders_prefill_and_token_steps_match_the_reference(name):
-    directory = FIXTURES / name
-    model, variables = fp32_decoder(directory)
-    ids = np.load(directory / 'input_ids.npy')
-    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
-    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
-    pieces = [np.asarray(out)]
-    for index in range(4, ids.shape[1]):
-        out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
-                                 decode=True, mutable=['cache'])
-        pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1), np.load(directory / 'logits.npy'),
-                                     np.load(directory / 'logits_f64.npy'), f'{ROUTED[name]} cache')
+    """Four ids prefilled into the cache and the rest stepped one at a time give logits on par with
+    transformers' uncached forward, from float64, over drawn ids (check 1)."""
+    def stepped(model, variables):
+        def run(ids):
+            state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
+            out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
+            pieces = [out]
+            for index in range(4, ids.shape[1]):
+                out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
+                                         decode=True, mutable=['cache'])
+                pieces.append(out)
+            return jnp.concatenate(pieces, axis=1)
+        return run
+
+    # The truth is the whole forward's in float64: a recording holds no cache walk of its own.
+    assert_routed(name, stepped, f'{ROUTED[name]} cache', wide=whole)
 
 
 @pytest.mark.parametrize('name', ROUTED)
 def test_a_routed_decoders_padded_routing_matches_the_reference(name):
-    model, variables = fp32_decoder(FIXTURES / name)
-    arrays = np.load(FIXTURES / name / 'padded.npz')
-    logits = np.asarray(model.apply(
-        variables, arrays['input_ids'], positions=arrays['position_ids'],
-        attention_mask=arrays['attention_mask']))
-    valid = arrays['attention_mask']
-    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
-                                     arrays['logits_f64'][valid], f'{ROUTED[name]} padded')
+    """Left-padded rows under their mask and positions route as transformers' do: their logits are on par
+    with its, from float64, over drawn ids (check 1)."""
+    with np.load(FIXTURES / name / 'padded.npz') as arrays:
+        valid, positions = arrays['attention_mask'], arrays['position_ids']
+
+    def padded(model, variables):
+        def run(ids):
+            rows = jnp.where(valid, ids, 0)
+            return model.apply(variables, rows, positions=positions, attention_mask=valid)[valid]
+        return run
+
+    assert_routed(name, padded, f'{ROUTED[name]} padded', 'padded_logits', attention_mask=valid,
+                  position_ids=positions)
 
 
 @pytest.mark.parametrize('name', ROUTED)

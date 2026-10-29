@@ -48,22 +48,6 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
    "note": "--float64 opt-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
   },
-  "hf/phi3-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/phi3-tiny/padded_logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/phi3-tiny/short_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/phi3-tiny/short_logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/phi3-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -72,27 +56,11 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/phi3-tiny/generation_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/phi3-tiny/generation_logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/bloom-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/bloom-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/bloom-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/bloom-tiny/padded_logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -108,23 +76,7 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/gpt-neo-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gpt-neo-tiny/padded_logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/gpt-neo-tiny/generated.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/phi-tiny/losses.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/phi-tiny/losses_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -133,14 +85,6 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/phi-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/phi-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/phi-tiny/padded_logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -156,14 +100,6 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/falcon-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/falcon-tiny/padded_logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/falcon-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -176,23 +112,7 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/falcon-mha-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/falcon-mha-tiny/padded_logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/falcon-mha-tiny/generated.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gptj-tiny/losses.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gptj-tiny/losses_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -201,14 +121,6 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/gptj-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gptj-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gptj-tiny/padded_logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -260,31 +172,11 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/modernbert-tiny/hidden.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/modernbert-tiny/hidden_bf16.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/modernbert-tiny/hidden_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/modernbert-tiny/padded_hidden.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/modernbert-tiny/padded_hidden_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/modernbert-tiny/packed_hidden.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/modernbert-tiny/packed_hidden_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -3972,14 +3864,6 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/gpt-bigcode-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gpt-bigcode-tiny/padded_logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/gpt-bigcode-mha-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -3989,14 +3873,6 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/gpt-bigcode-mha-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gpt-bigcode-mha-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gpt-bigcode-mha-tiny/padded_logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -4012,14 +3888,6 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/starcoder2-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/starcoder2-tiny/padded_logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/mamba-tiny/generated.npy": {
    "tool": "tools/mamba_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -4032,14 +3900,6 @@
    "tool": "tools/mamba_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/mamba-tiny/padded_logits.npy": {
-   "tool": "tools/mamba_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/mamba-tiny/padded_logits_f64.npy": {
-   "tool": "tools/mamba_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/mimo-v2-flash-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -4049,14 +3909,6 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/mimo-v2-flash-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/mimo-v2-flash-tiny/padded_logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/mimo-v2-flash-tiny/padded_logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -4081,10 +3933,6 @@
    "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
   },
   "hf/ouro-tiny/padded_logits.npy": {
-   "tool": "tools/ouro_reference.py",
-   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
-  },
-  "hf/ouro-tiny/padded_logits_f64.npy": {
    "tool": "tools/ouro_reference.py",
    "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
   },
