@@ -1,13 +1,14 @@
 """Each named RL method (dew.objectives.rl.methods) against its paper's objective, written apart from Dew
-in float64 numpy: the policy term's value and its gradient in each token's log-probability, over drawn
-sessions packed two to a row, on par with the paper's form by check 1 (tests/reference_error.py); the
-advantage estimators, DAPO's dynamic sampling and its overlong punishment by their equations."""
+over each session's tokens: the policy term's value and its gradient in each token's log-probability,
+over drawn sessions packed two to a row, Dew run in float64 within float64 rounding of the paper's form
+(`assert_computes_the_oracle`), where any difference in the function moves it by orders of magnitude;
+the global estimator and DAPO's overlong punishment by their equations."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import as_given, assert_as_exact
+from reference_error import assert_computes_the_oracle
 from rl_support import TinyHead
 
 from dew.objectives.rl.grpo import _Terms
@@ -17,7 +18,11 @@ from dew.objectives.rl.sessions import Call, Session, Status, advantages, overlo
 LENGTHS = ((3, 5), (4, 2))
 """Each row's two sessions' trained token counts."""
 WIDTH = 12
-SEEDS = 16
+DRAWS = 8
+"""The drawn batches each method is compared over."""
+ROUNDINGS = 4 * WIDTH
+"""The longest chain of float64 roundings a term goes through: a session's tokens summed, its ratio
+exponentiated and clipped, the sessions summed, each a few roundings."""
 
 
 def draw(seed):
@@ -50,35 +55,37 @@ def sessions_of(mask, segments):
 
 def dew_term(name, **settings):
     """The method's policy term over a draw, through `GRPOObjective.policy_ratio`, and its gradient in
-    the current log-probabilities."""
+    the current log-probabilities, in float64."""
     objective, _ = method(name).build(TinyHead(vocab_size=8), 7, max_new_tokens=8, **settings)
 
     def term(policy, old, advantage, mask, segments, weights):
+        wide = {name: jnp.asarray(value, jnp.float64) for name, value in
+                (("old", old), ("advantage", advantage), ("mask", mask), ("weights", weights))}
+
         def value(current):
-            terms = _Terms(current, jnp.asarray(old), jnp.asarray(old), jnp.asarray(advantage),
-                           jnp.asarray(mask), jnp.asarray(segments), jnp.asarray(weights), proximal=False,
-                           qk_stats=None, routing=None)
-            ratio, *_ = objective.policy_ratio(terms, jnp.asarray(mask), jnp.ones_like(jnp.asarray(mask)))
+            terms = _Terms(current, wide["old"], wide["old"], wide["advantage"], wide["mask"],
+                           jnp.asarray(segments), wide["weights"], proximal=False, qk_stats=None,
+                           routing=None)
+            ratio, *_ = objective.policy_ratio(terms, wide["mask"], jnp.ones_like(wide["mask"]))
             return ratio.total / ratio.mass
-        current = jnp.asarray(policy)
-        return value(current), jax.grad(value)(current)
+        current = jnp.asarray(policy, jnp.float64)
+        return jax.device_get((value(current), jax.grad(value)(current)))
     return term
 
 
-def paper(objective, dtype):
-    """A paper's objective `objective(per-session arrays) -> loss` and its gradient in `dtype`, by
-    autodiff of the formula written over each session's tokens alone: in float32 the reference, in
-    float64 the truth."""
+def paper(objective):
+    """A paper's objective `objective(per-session arrays) -> loss` and its gradient in float64, by
+    autodiff of the formula written over each session's tokens alone."""
     def term(policy, old, advantage, mask, segments, weights):
         spans = sessions_of(np.asarray(mask), np.asarray(segments))
-        with jax.enable_x64(new_val=True):
-            def value(current):
-                return objective([(current[row, columns], jnp.asarray(old, dtype)[row, columns],
-                                   jnp.asarray(np.asarray(advantage)[row, columns[0]], dtype))
-                                  for row, columns in spans])
-            current = jnp.asarray(policy, dtype)
-            return jax.device_get((value(current), jax.grad(value)(current)))
-    return as_given(term)
+
+        def value(current):
+            return objective([(current[row, columns], jnp.asarray(old, jnp.float64)[row, columns],
+                               jnp.asarray(np.asarray(advantage)[row, columns[0]], jnp.float64))
+                              for row, columns in spans])
+        current = jnp.asarray(policy, jnp.float64)
+        return jax.device_get((value(current), jax.grad(value)(current)))
+    return term
 
 
 def clipped(ratio, advantage, low, high):
@@ -135,9 +142,14 @@ def rloo(sessions):
     ("rloo", rloo, {})], ids=lambda value: value if isinstance(value, str) else "")
 def test_each_method_is_its_papers_objective(name, formula, settings):
     """The method's policy term and its gradient in each token's log-probability are its paper's
-    objective's (check 1, the paper's form in float64 the truth)."""
-    assert_as_exact(dew_term(name, **settings), paper(formula, jnp.float32), draw, name, seeds=SEEDS,
-                    truth_fn=paper(formula, jnp.float64))
+    objective's, within float64 rounding of it over every draw."""
+    with jax.enable_x64(new_val=True):
+        for seed in range(DRAWS):
+            drawn = draw(seed)
+            found, expected = dew_term(name, **settings)(*drawn), paper(formula)(*drawn)
+            for leaf, (ours, theirs) in enumerate(zip(found, expected, strict=True)):
+                assert_computes_the_oracle(np.asarray(ours), np.asarray(theirs),
+                                           f"{name}[{leaf}] draw {seed}", roundings=ROUNDINGS)
 
 
 def test_a_method_fixes_its_composition_and_refuses_what_it_lacks():
