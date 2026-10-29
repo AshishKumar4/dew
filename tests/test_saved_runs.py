@@ -27,6 +27,10 @@ SAVED = [(recorded.name, kind) for recorded in sorted(CORPUS.iterdir()) if recor
          for kind in json.loads((recorded / "source.json").read_text())["kinds"]]
 """Each saved run: the main that recorded it, by its abbreviated commit, and its kind."""
 
+CROSSES_NO_REVISION = {"decision"}
+"""The kinds whose chain reads per-share, whose plan resumes only under the Dew revision that saved it
+(`dew.data.plan.Plan.check`): ledger 2382, whose fix resumes them here, and empties this."""
+
 
 def called(task) -> None:
     """One call of a loaded task, the one its kind's runs make: a language model continues one prompt by
@@ -38,7 +42,8 @@ def called(task) -> None:
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=[f"{recorded}-{kind}" for recorded, kind in SAVED])
 def test_a_run_an_earlier_main_saved_loads_answers_and_resumes(tmp_path, monkeypatch, recorded, kind):
     """A kind's run saved at an earlier main rebuilds from its record, pins its last checkpoint, loads as
-    its saved task and answers a call, and resumes from that checkpoint to a step past it."""
+    its saved task and answers a call, and resumes from that checkpoint to a step past it, but a kind
+    whose plan crosses no revision (`CROSSES_NO_REVISION`)."""
     runs = tmp_path / "runs"
     stored = recording(f"tests/fixtures/saved_runs/{recorded}/{kind}.npz")["run"]
     with tarfile.open(fileobj=io.BytesIO(stored.tobytes()), mode="r:xz") as packed:
@@ -53,6 +58,8 @@ def test_a_run_an_earlier_main_saved_loads_answers_and_resumes(tmp_path, monkeyp
         assert saved.step == last
         called(saved.objective.saved_task.from_run(str(run)))
     recorded_run = RunConfig.load(str(run))
+    if kind in CROSSES_NO_REVISION:
+        return
     here = KINDS[kind](tmp_path, drawn=False)
     # A source the repo holds is recorded by its path in the repo (a decision run's backbone), read from
     # the checkout's root as the run that wrote it read it.
