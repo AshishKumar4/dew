@@ -18,6 +18,7 @@ from reference_error import (
     assert_as_exact_as_the_reference,
     assert_fp32_reduction_bound,
 )
+from whole_suite import timed
 
 from dew.nn.attention import attention_case, scaled_dot_product_attention
 from dew.nn.attention_masks import with_key_lengths
@@ -166,11 +167,21 @@ def grouped_draw(dtype):
     return draw
 
 
-@pytest.mark.parametrize("splits", decode_attention.SPLITS)
-@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
-@pytest.mark.parametrize("hooks", [{"sinks": True}, {"softcap": True}, {"sinks": True, "softcap": True}],
-                         ids=["sinks", "softcap", "both"])
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+DECODE_HOOKS = {"sinks": {"sinks": True}, "softcap": {"softcap": True},
+                "both": {"sinks": True, "softcap": True}}
+"""The hooked decode cases' hooks by name: sinks, a softcap, both."""
+SINK_CASES = [(dtype, hooks, natural, splits) for dtype in ("bfloat16", "float32") for hooks in DECODE_HOOKS
+              for natural in ("fold", "natural") for splits in decode_attention.SPLITS]
+"""The hooked decode cases, `(dtype, hooks, form, slice count)`, by name."""
+PAST_TARGET = {"sinks and softcap": {("float32", "both", "natural", 32): 137,
+                                     ("float32", "both", "fold", 32): 126}}
+"""The cases past a group's 120 s target, each its seconds on armada in a verdict on main 7f03fae28: the
+whole suite's run holds them (`whole_suite.timed`), every other case runs each train."""
+
+
+@pytest.mark.parametrize(("dtype", "hooks", "natural", "splits"),
+                         timed(PAST_TARGET, "sinks and softcap", SINK_CASES),
+                         ids=["-".join(map(str, case)) for case in SINK_CASES])
 def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, hooks, natural, splits):
     """Sinks (one value-free logit a query head in each row's softmax) and a logit softcap
     (`cap · tanh(logit / cap)`) inside the decode kernel, over query heads grouped on their key heads:
@@ -185,6 +196,7 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
     from dew.nn.attention_kernels import decodes
     from dew.nn.kernels import tuning
 
+    dtype, hooks, natural = jnp.dtype(dtype), DECODE_HOOKS[hooks], natural == "natural"
     arrays = grouped_case(dtype)
     query, key, value, lengths = arrays
     sinks = jnp.asarray(SINKS, jnp.float32) if hooks.get("sinks") else None
