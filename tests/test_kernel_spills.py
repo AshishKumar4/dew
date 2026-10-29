@@ -80,10 +80,12 @@ def nonce() -> float:
 
 
 def spilled(tmp_path, script: str, *arguments: str) -> dict:
-    """`script`'s last printed JSON, run by a fresh interpreter over a compilation cache of its own: a
-    process keeps each Mosaic kernel it compiled (jaxlib's `KernelHash` cache), which runs ptxas again
-    for none, so a spill is reported at a kernel's first compile in a process alone."""
-    return fresh(script, *arguments, cache_dir=tmp_path / "cache", flags=os.environ.get("XLA_FLAGS", ""))
+    """`script`'s last printed JSON, run by a fresh interpreter over a compilation cache of its own,
+    apart from every other process's: a process keeps each Mosaic kernel it compiled (jaxlib's
+    `KernelHash` cache), and a cache each executable it compiled, either of which runs ptxas again for
+    none, so a spill is reported at a kernel's first compile in a process with an empty cache alone."""
+    cache = tmp_path / f"cache-{len(list(tmp_path.glob('cache-*')))}"
+    return fresh(script, *arguments, cache_dir=cache, flags=os.environ.get("XLA_FLAGS", ""))
 
 
 AHEAD = """
@@ -188,3 +190,23 @@ def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
             expected = jax.jit(attend)(query)
         for output in outputs:
             np.testing.assert_array_equal(output, expected)
+
+
+def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():
+    """Within `jax.grad`, `jax.vmap` or an enclosing jit a program is its jit, traced into theirs; called
+    alone, it keys a static argument by its type as its value, as jit does (True and 1 are two programs),
+    and keeps dynamic an argument its jit, given both its static positions and names, takes as one."""
+    squared = program(lambda x: x * x)
+    assert jax.grad(squared)(3.0) == 6.0
+    np.testing.assert_array_equal(jax.vmap(squared)(jnp.arange(3.0)), jnp.arange(3.0) ** 2)
+    assert jax.jit(lambda x: squared(x) + 1)(2.0) == 5.0
+
+    def scaled(x, flag):
+        return x * 2 if type(flag) is bool else x * 3
+
+    keyed = program(scaled, static_argnums=1)
+    named = program(scaled, static_argnums=(), static_argnames="flag")
+    x, flag = jnp.ones(2), True
+    np.testing.assert_array_equal(keyed(x, flag), x * 2)
+    np.testing.assert_array_equal(keyed(x, 1), x * 3)
+    np.testing.assert_array_equal(named(x, 2.0), x * 3)
