@@ -114,6 +114,13 @@ def folded(variables):
     return {**variables, "params": unflatten_dict(flat)}
 
 
+def traced_wide(tree):
+    """`tree`'s floating leaves in float64 inside a traced function, where `widened`'s numpy cannot read
+    them."""
+    return jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                        else leaf, tree)
+
+
 def loads(trains: str = "all"):
     """The source and the source with DEX on layer 0's heads 1 and 3 (`HEADS`), each loaded in float32."""
     extension = DifferentialExtension(((0, HEADS),), anneal_steps=10, trains=trains)
@@ -185,7 +192,7 @@ def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
                     seeds=SEEDS["dex at the anneal's start"],
                     truth_fn=jax.jit(lambda variables, ids, _: wide.apply(widened(source.variables), ids)))
     through = jax.jit(lambda variables, ids, _: source.model.apply(folded(variables), ids))
-    wide_through = jax.jit(lambda variables, ids, _: wide.apply(folded(widened(variables)), ids))
+    wide_through = jax.jit(lambda variables, ids, _: wide.apply(folded(traced_wide(variables)), ids))
     for updates in (10, None):
         assert_as_exact(stepped(updates), through, draw, "dex through the decoder",
                         seeds=SEEDS["dex through the decoder"], truth_fn=wide_through)
@@ -210,7 +217,7 @@ def test_dex_trains_through_the_decoder_as_its_folded_output_projection():
         def run(variables, ids, cotangent):
             # The float64 route differentiates its widened weights, its gradients float64 too.
             if wide:
-                variables, cotangent = widened(variables), widened(cotangent)
+                variables, cotangent = traced_wide(variables), traced_wide(cotangent)
 
             def loss(params):
                 return jnp.sum(forward({**variables, "params": params}, ids) * cotangent)
