@@ -41,12 +41,15 @@ if "coordzero" in variant:
     def coordinate_asm(result_type, operands, asm, constraints, **kwargs):
         if "cp.async.bulk.tensor.5d" in asm and "shared::cta.global" in asm:
             operands = list(operands)
+            replaced = 0
             for index in range(4, len(operands)):
-                if is_zero(operands[index]):
+                if index == 4 or is_zero(operands[index]):
                     operands[index] = original_asm(
                         operands[index].type, [],
                         "mov.u32 $0, %tid.x; and.b32 $0, $0, 127;", "=r",
                         has_side_effects=True, asm_dialect=0)
+                    replaced += 1
+            print("COORDZERO replaced", replaced, flush=True)
         return original_asm(result_type, operands, asm, constraints, **kwargs)
     llvm.inline_asm = coordinate_asm
 
