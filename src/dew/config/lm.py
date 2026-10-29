@@ -168,8 +168,11 @@ class LMRunConfig(DecoderRunConfig):
                              f"written with {written}")
         kind = objectives.label(self.objective.name)
         samples = None if kind == "block_diffusion" else self.samples()
-        context = (tokens.seq_len + 1 if samples is None else
-                   max(tokens.seq_len, len(samples.prompt) + samples.max_new_tokens))
+        # The model reaches as far as its longest generation: a preview's, and a rollout's whole budget past
+        # a full-width prompt, one token past the windows it learns on.
+        generated = max(0 if samples is None else len(samples.prompt) + samples.max_new_tokens,
+                        0 if self.rollout is None else tokens.seq_len + 1)
+        context = tokens.seq_len + 1 if samples is None else max(tokens.seq_len, generated)
         run, source = self, None
         if self.pretrained is None:
             self.built_fresh()

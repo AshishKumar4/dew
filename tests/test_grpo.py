@@ -249,9 +249,10 @@ def test_a_synchronous_collection_refuses_a_ratio_read_at_another_temperature():
 
 def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
     """An LM run that names GRPO records its rollout as a field (`LMRunConfig.rollout`, `--rollout.reward`):
-    over a prompts chain it trains on the completions its policy draws, scored by the reward its import
-    path names, its context a prompt and its completion, and the run it records loads with that
-    rollout. GRPO with no rollout, and a rollout under another objective, are refused."""
+    over a prompts chain whose prompts fill its width it trains on the completions its policy draws,
+    scored by the reward its import path names, its context a full-width prompt and its whole
+    completion budget, and the run it records loads with that rollout. GRPO with no rollout, and a
+    rollout under another objective, are refused."""
     import dataclasses
 
     import rl_support
@@ -262,7 +263,8 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
     from dew.registry import ModelConfig
 
     tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
-    rows = [{"prompt": "hi", "data_source": "rule", "ground_truth": "a"}] * 8
+    # Longer than the width: each prompt keeps its last 8 ids (the preset's `long='truncate'`).
+    rows = [{"prompt": "hi there " * 8, "data_source": "rule", "ground_truth": "a"}] * 8
     rollout = PromptRollout(reward=f"{rl_support.__name__}:completion_length", groups=2, max_new_tokens=4)
     model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
                                                "dtype": "float32"})
