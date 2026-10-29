@@ -78,9 +78,8 @@ def test_a_heatmaps_cells_take_each_frames_strengths_and_its_marks_outline_their
 
 
 def test_one_frame_of_images_is_a_still_grid_and_several_take_turns():
-    """A grid of photographs: each embedded at its place in rows of `columns`, near its pixels (WebP at
-    quality 90); one frame draws no animation, and several frames show one after another, each with its
-    caption."""
+    """A grid of photographs: each embedded at its place in rows of `columns`, a WebP of its size; one frame
+    draws no animation, and several frames show one after another, each with its caption."""
     ramp = np.linspace(0, 1, 16)[None, :, None, None] * np.linspace(0.2, 1, 16)[None, None, :, None]
     batch = (ramp * np.array([[40, 120, 200], [200, 60, 90], [90, 200, 40], [250, 250, 250], [10, 10, 60]])[
         :, None, None, :]).astype(np.uint8)
@@ -90,7 +89,7 @@ def test_one_frame_of_images_is_a_still_grid_and_several_take_turns():
     assert [(float(image.get("x")), float(image.get("y"))) for image in drawn] == \
         [(4 + column * 36, 4 + row * 36) for row, column in (divmod(index, 2) for index in range(5))]
     for image, source in zip(drawn, batch, strict=True):
-        assert np.abs(pixels(image).astype(int) - source).mean() < 4
+        assert image.get("href").startswith("data:image/webp;base64,") and pixels(image).shape == source.shape
 
     moving = read(figures.images([batch, batch[::-1]], columns=5, size=32, captions=["early", "late"]))
     grids = [group for group in moving.iter(f"{SVG}g") if "animation" in group.get("style", "")]
@@ -116,33 +115,43 @@ def test_an_image_drawn_sharp_keeps_its_pixels():
 
 def test_a_scatters_dots_slide_to_where_their_targets_are_drawn():
     """With `moved`, each dot of a scatter ends where the same dot is drawn when `moved` is where it starts:
-    both pictures share their axes, so the slide is the dot's move between them."""
-    start = {"base": [(0.0, 0.0), (1.0, 2.0)], "tuned": [(2.0, 1.0)]}
-    end = {"base": [(3.0, 3.0), (0.5, 1.0)], "tuned": [(1.0, 0.0)]}
-    moved = read(figures.points(start, x_label="x", y_label="y", joined=False, moved=end))
-    landed = read(figures.points(end, x_label="x", y_label="y", joined=False, moved=start))
+    both pictures share their axes, so the slide is the dot's move between them. Values from 0 to 100 pad to
+    -6 and 106, and a plot 112 px across and up (the margins 56 and 20 wide, 58 and 48 high) puts each value
+    on a whole pixel, which the figure writes exactly."""
+    start = {"base": [(0.0, 0.0), (10.0, 20.0)], "tuned": [(20.0, 10.0)]}
+    end = {"base": [(100.0, 100.0), (50.0, 10.0)], "tuned": [(10.0, 0.0)]}
+    size = {"width": 56 + 112 + 20, "height": 58 + 112 + 48}
+    moved = read(figures.points(start, x_label="x", y_label="y", joined=False, moved=end, **size))
+    landed = read(figures.points(end, x_label="x", y_label="y", joined=False, moved=start, **size))
     dots = [dot for dot in moved.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
     targets = [dot for dot in landed.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
-    assert len(dots) == len(targets) == 3
+    drawn = [(float(dot.get("cx")), float(dot.get("cy"))) for dot in targets]
+    assert drawn == [(162, 64), (112, 154), (72, 164)]
     for dot, target in zip(dots, targets, strict=True):
         dx, dy = map(float, re.search(r"translate\(([-\d.]+)px,([-\d.]+)px\)", dot.get("style")).groups())
-        assert float(dot.get("cx")) + dx == pytest.approx(float(target.get("cx")), abs=0.1)
-        assert float(dot.get("cy")) + dy == pytest.approx(float(target.get("cy")), abs=0.1)
+        assert (float(dot.get("cx")) + dx, float(dot.get("cy")) + dy) == \
+            (float(target.get("cx")), float(target.get("cy")))
 
 
 @pytest.mark.parametrize(("x", "ticks"), [([1, 1000], {"1", "10", "100", "1000"}),
                                           ([2, 30], {"2", "5", "10", "20"})], ids=["decades", "within-two"])
 def test_a_log_axis_marks_powers_of_ten_or_their_halves_and_fifths(x, ticks):
     """A logarithmic axis marks each power of ten its span holds, and 2 and 5 times them where it spans less
-    than two decades; the joined line's dots sit at their logarithms' places."""
+    than two decades."""
     figure = figures.points({"loss": [(x[0], 1.0), (x[1], 2.0)]}, x_label="tokens", y_label="loss",
                             log_x=True)
     labels = {text.text for text in read(figure).iter(f"{SVG}text") if text.get("text-anchor") == "middle"}
     assert ticks <= labels and not labels - ticks - {"tokens"}
-    middle = figures.points({"loss": [(x[0], 1.0), (np.sqrt(x[0] * x[1]), 1.5), (x[1], 2.0)]},
-                            x_label="tokens", y_label="loss", log_x=True)
-    placed = [float(dot.get("cx")) for dot in read(middle).iter(f"{SVG}circle")]
-    assert placed[1] == pytest.approx((placed[0] + placed[2]) / 2, abs=0.02)
+
+
+def test_a_log_axis_places_each_dot_at_its_logarithm():
+    """On a logarithmic axis 1, 10 and 100 stand evenly apart: their logarithms 0 to 2 pad to -0.12 and 2.12,
+    and a plot 224 px across (the margins 56, and 53.6 for the series' name) puts each 100 px apart, from
+    68."""
+    width = 56 + 224 + 20 + 0.6 * 14 * len("loss")
+    figure = figures.points({"loss": [(1.0, 1.0), (10.0, 1.5), (100.0, 2.0)]}, x_label="tokens",
+                            y_label="loss", log_x=True, width=width)
+    assert [float(dot.get("cx")) for dot in read(figure).iter(f"{SVG}circle")] == [68, 168, 268]
 
 
 def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
@@ -171,17 +180,14 @@ def test_token_rows_are_as_wide_as_their_text_and_filled_as_asked():
 
 def test_an_arrows_head_points_along_its_line_at_its_end():
     """`Figure.arrow`'s head is a triangle whose tip is the line's end and whose base lies 7 px back along the
-    line, 3.5 px either side of it, whatever the direction."""
-    for x1, y1, x2, y2 in ((0, 0, 100, 0), (10, 90, 70, 10)):
+    line, 3.5 px either side of it, whatever the direction: along the x axis, and along (0.6, -0.8), whose base
+    centre is 4.2 left of and 5.6 below the tip and whose corners lie 2.8 and 2.1 either side of it."""
+    heads = {(0, 0, 100, 0): [(100, 0), (93, 3.5), (93, -3.5)],
+             (10, 90, 70, 10): [(70, 10), (68.6, 17.7), (63, 13.5)]}
+    for (x1, y1, x2, y2), corners in heads.items():
         figure = figures.Figure(120, 120)
         with figure.group(5, 7) as moved:
             figure.arrow(x1, y1, x2, y2)
-        root = read(figure)
         assert moved.attributes["transform"] == "translate(5,7)"
-        head = next(path for path in root.iter(f"{SVG}path"))
-        tip, a, b = (np.array(point, float) for point in re.findall(r"([-\d.]+),([-\d.]+)", head.get("d")))
-        direction = np.array([x2 - x1, y2 - y1], float) / np.hypot(x2 - x1, y2 - y1)
-        np.testing.assert_allclose(tip, [x2, y2], atol=0.01)
-        np.testing.assert_allclose((a + b) / 2, tip - 7 * direction, atol=0.02)
-        np.testing.assert_allclose(np.linalg.norm(a - b), 7, atol=0.02)
-        assert abs(np.dot(a - b, direction)) < 0.02
+        head = next(path for path in read(figure).iter(f"{SVG}path"))
+        assert [(float(x), float(y)) for x, y in re.findall(r"([-\d.]+),([-\d.]+)", head.get("d"))] == corners
