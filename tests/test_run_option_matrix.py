@@ -288,15 +288,16 @@ def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_t
 @pytest.mark.mesh(devices=1)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_measures_its_kernel_launches_as_set(kind, tmp_path):
-    """A run that measures its step's launches on this GPU (`tune_kernels`) keeps what it picked
-    beside its compilation cache (`dew.cache.kernel_picks_path`), where a later run reads them."""
+    """A run whose attention takes Triton's kernel, a launch of configs to measure, that measures its
+    step's launches on this GPU (`tune_kernels`) keeps what it picked beside its compilation cache
+    (`dew.cache.kernel_picks_path`), where a later run reads them."""
     import jax
 
     cache, compiling = tmp_path / "cache", jax.config.jax_compilation_cache_dir
     try:
         trained(kind, tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
                                               "trainer.compilation_cache_dir": str(cache),
-                                              "trainer.mesh": {}})
+                                              "trainer.mesh": {}, "model.attention_impl": "triton"})
     finally:
         jax.config.update("jax_compilation_cache_dir", compiling)
     (picks,) = cache.rglob("kernels/*.json")
