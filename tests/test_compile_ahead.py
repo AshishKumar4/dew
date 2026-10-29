@@ -17,21 +17,99 @@ from model_support import TINY_DECODER
 from token_support import token_rows
 
 from dew._records import listed, record
+from dew.nn.sharding import Link
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
 from dew.registry import models
+from dew.telemetry.instrumentation import Compiles
 from dew.training import Layout, MeshSpec, Trainer
 
 VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False):
+def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
-              **({"attention_impl": "xla"} if xla else {})}
+              **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), split=1, ahead=ahead)
+                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead)
+
+
+def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
+    """A compile-only GPU with stated memory takes the run's own fit search, whose one fitting
+    program is the saved executable, not another compile outside the report. The report records
+    that compile's time and memory, and planning creates no device state or runner to execute."""
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
+    original_state_mesh = trainer.state_mesh
+    with Compiles("step") as compiles:
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30)
+    assert tuple(trainer.device_mesh.devices.flat) == compile_only_gpus("sm90", 1, 2**30)
+    assert trainer.state_mesh is trainer.device_mesh and trainer.state_mesh is not original_state_mesh
+    assert compiles.count == 1
+    plan = record(ahead.plan, "plan")
+    (probe,) = listed(plan["probes"], "probes", read=record, what="probes")
+    assert probe["fits"] is True and probe["temp"] == ahead.temp_bytes
+    assert probe["argument"] == ahead.argument_bytes
+    assert ahead.capacity == 2**30
+    from dew.training.memory import device_memory
+
+    stated = device_memory(trainer.device_mesh.devices.flat[0], ahead.capacity, ahead.argument_bytes)
+    assert stated["pool_bytes"] == ahead.capacity
+    assert stated["largest_free_block_bytes"] == ahead.capacity - ahead.argument_bytes
+    seconds = probe["compile_seconds"]
+    assert isinstance(seconds, float) and ahead.planned_seconds is not None
+    assert ahead.planned_seconds >= seconds > 0
+    destination = tmp_path / "planned.dew-aot"
+    ahead.save(destination)
+    saved = AheadOfTime.load(destination)
+    assert saved.plan == ahead.plan and saved.program == ahead.program
+
+
+def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_path, monkeypatch):
+    """An absent GPU with less memory than even the arguments gets no executable to run. Its
+    refusal keeps every candidate's compile evidence, so the offline gate can check refusals too. The
+    step starts at its ladder's last remat rung and its split is pinned, so the refusal comes after the
+    few rungs left rather than after every policy's compile."""
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.planning import PlanRefused
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), remat=REMAT_POLICIES["full"])
+    with pytest.raises(PlanRefused) as refused:
+        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=1024)
+    probes = refused.value.probes
+    assert probes and all(not probe.fits for probe in probes)
+    assert all(probe.compile_seconds > 0 for probe in probes)
+    assert any(probe.headroom is not None and probe.headroom < 0 for probe in probes)
+
+
+def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, monkeypatch):
+    """On a compile-only GPU of stated memory, a step read in two microbatches, whose first call builds
+    its window's gradient sum, needs room for that sum once: the stated pool holds the step's arguments,
+    the sum among them, and beside them the outputs that alias none, the temporaries and the batches
+    prefetched next to the step (the 2113 review: the sum was counted among the arguments and again
+    beside them, so an offline plan could refuse a step that fits)."""
+    from dew.distributed.batches import batch_shardings, prefetched_bytes
+    from dew.training.ahead import compile_ahead, compile_only_gpus, step_batch
+    from dew.training.memory import temporaries_factor
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    capacity = 2**30
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=2)
+    rows = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    ahead = compile_ahead(trainer, rows, capacity=capacity)
+    (probe,) = listed(record(ahead.plan, "plan")["probes"], "probes", read=record, what="probes")
+    batch = step_batch(trainer, rows)
+    prefetched = prefetched_bytes(batch, batch_shardings(trainer.device_mesh, batch))
+    temporaries = ahead.temp_bytes * temporaries_factor(trainer.device_mesh, capacity)
+    assert probe["fits"] is True
+    assert probe["headroom"] == (capacity - ahead.argument_bytes - (ahead.output_bytes - ahead.alias_bytes)
+                                 - prefetched - temporaries)
 
 
 @pytest.mark.mesh(devices=8)
@@ -45,7 +123,8 @@ def test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_e
     from dew.training.ahead import compile_ahead, compile_only_gpus, step_batch
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    ahead = compile_ahead(fine_tune(spec.build(compile_only_gpus("sm90", 8))), batch)
+    absent = fine_tune(spec.build(compile_only_gpus("sm90", 8)))
+    ahead = compile_ahead(absent, batch)
     run = fine_tune(spec.build())
     state, _, _ = run.place()
     run.compile(state, step_batch(run, batch))
@@ -121,13 +200,15 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert isinstance(default, LMRunConfig)
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
                            "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
-                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)],
+                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
+                           "--trainer.compile-ahead.capacity-gib", "1"],
                           default=default)
     with pytest.raises(CompiledAhead) as ended:
         run.run()
     assert ended.value.code == 0
     saved = AheadOfTime.load(path)
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
+    assert saved.capacity == 2**30 and saved.plan is not None
     assert not runs.exists()
 
 
@@ -248,3 +329,84 @@ def test_a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path
     assert int(state.step) == 2 and first["ahead"] is True
     assert any(not np.array_equal(np.asarray(new), np.asarray(old))
                for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))
+
+
+FAST = {"tensor": Link(1e18, 1e9)}
+"""A tensor axis whose link moves a projection's bytes in no time beside its FLOPs: any projection
+spreads over it, as over a measured NVLink one may."""
+
+
+def latent(mesh, *, ahead=None, links=None, checkpoints=None):
+    """A decoder of latent attention, whose down projection a tensor axis's link may spread
+    (`dew.nn.sharding.down_projection`), trained over `mesh`."""
+    from dew.nn.mla import MLAMixer
+
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, attention_impl="xla",
+                         mixer=MLAMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4,
+                                        qk_rope_head_dim=4, v_head_dim=4))
+    return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
+                   layout=Layout(min_shard=TINY_SHARD), ahead=ahead, links=links, checkpoints=checkpoints)
+
+
+def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
+    """A latent-attention step compiled ahead over a tensor axis of two compile-only GPUs, which no
+    process holds to measure, spreads no projection over it and records that link
+    (`AheadOfTime.links`); the same step over a link that spreads one is another program, which a run
+    on GPUs that measure such a link would lower in its place (row 2229)."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    target = MeshSpec(tensor=2).build(compile_only_gpus("sm90", 2))
+    saved = compile_ahead(latent(target), batch)
+    assert saved.links == {"tensor": None}
+    assert compile_ahead(latent(target, links=FAST), batch).program != saved.program
+
+
+@pytest.mark.gpu(reason="loads a step compiled ahead over a tensor axis onto two GPUs")
+@pytest.mark.mesh(devices=2)
+def test_a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_with(tmp_path):
+    """A run on two GPUs whose link would spread a projection (`FAST`), handed a step compiled ahead
+    over compile-only GPUs that spread none, traces with the link the step records and trains from it,
+    rather than lowering another program and refusing it; resumed from its checkpoint without the step,
+    it traces with that link again, not one it measures (row 2229)."""
+    from dew.checkpoints import Checkpoints
+    from dew.nn.kernels.generation import chosen, device_generation
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    spec, path = MeshSpec(tensor=2), tmp_path / "step.dew-aot"
+    here = spec.build(jax.devices()[:2])
+    with chosen(narrow_copies="off"):
+        target = spec.build(compile_only_gpus(device_generation(), 2))
+        compile_ahead(latent(target), batch).save(path)
+        saved = str(tmp_path / "run")
+        run = latent(here, ahead=AheadOfTime.load(path), links=FAST, checkpoints=Checkpoints(saved))
+        state = run.fit(batch, steps=2, log_every=1)
+        resumed = latent(here, checkpoints=Checkpoints(saved))
+        again = resumed.fit(batch, steps=3, log_every=1)
+    first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
+    assert int(state.step) == 2 and first["ahead"] is True
+    assert int(again.step) == 3 and resumed.links["tensor"].bytes_per_second is None
+
+
+@pytest.mark.gpu(reason="loads a selected split executable onto its target GPU")
+def test_a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
+    """An offline plan for two microbatches is handed to a live run with its split unpinned. The
+    live planner takes the saved split before lowering, so the artifact's program is reused and its
+    two donated microbatch calls produce one committed update, not a mismatch or a recompile."""
+    from dew.nn.kernels.generation import chosen, device_generation
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    with chosen(narrow_copies="off"):
+        target = MeshSpec().build(compile_only_gpus(device_generation(), 1))
+        saved = compile_ahead(fine_tune(target, xla=True, split=2), batch)
+        path = tmp_path / "split.dew-aot"
+        saved.save(path)
+        here = MeshSpec().build(jax.devices()[:1])
+        run = fine_tune(here, ahead=AheadOfTime.load(path), xla=True, split=None)
+        state = run.fit(batch, steps=1, log_every=1)
+    plan = record(run.plan, "plan")
+    first, *_ = listed(plan["probes"], "probes", read=record, what="probes")
+    assert int(state.step) == 1 and int(state.updates) == 1
+    assert plan["split"] == 2 and first["ahead"] is True
