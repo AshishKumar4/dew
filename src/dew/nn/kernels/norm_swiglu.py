@@ -94,7 +94,7 @@ from .generation import INHERENT, device_generation
 from .selection import Kernel, Op, Requirement, select
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
-DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
+DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 ROW_ELEMENTS = 2048
 """The heuristic forward's and reverse's register tile, in elements a program holds of a step's rows."""
 ROW_BLOCKS = 12
@@ -228,10 +228,6 @@ def _selected[C](op: Op[C], case: C, implementation: str) -> str:
     return select(op, case, None if implementation == 'auto' else implementation, insist=False).kernel
 
 
-QUALIFY_FP16 = 'ledger 823'
-"""The row that tracks qualifying the fused norm and SwiGLU kernels on fp16 operands."""
-
-
 def _within_fp32(dtype) -> bool:
     """Whether a dtype's accuracy is no finer than fp32's, which the kernels compute in; a dtype that
     is no float falls to the `dtype` requirement."""
@@ -247,16 +243,14 @@ class _Typed(Protocol):
 
 def _dtype_requirements[C: _Typed](name: str, case_type: type[C]) -> tuple[Requirement[C], ...]:
     """What the norm and SwiGLU kernels need of every dtype a call of `case_type` reads and writes (its
-    `dtypes`): none wider than fp32, whose accuracy the kernels compute at; none fp16, which they are
-    not yet qualified on (ledger 823); and none but fp32, bf16 and fp16, the floats they compute."""
+    `dtypes`): none wider than fp32, whose accuracy the kernels compute at, and none but fp32, bf16 and
+    fp16, the floats they compute (widening each load to fp32 and rounding each store)."""
     return (
         Requirement[C]('precision', lambda case: all(_within_fp32(dtype) for dtype in case.dtypes),
                     lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
                                  "computes in fp32, which a wider dtype's accuracy needs more than",
                     row=INHERENT),
-        Requirement[C]('fp16', lambda case: jnp.float16 not in case.dtypes,
-                    f"{name}'s kernel is not yet qualified on float16 operands", row=QUALIFY_FP16),
-        Requirement[C]('dtype', lambda case: all(dtype in (*DTYPES, jnp.float16) for dtype in case.dtypes),
+        Requirement[C]('dtype', lambda case: all(dtype in DTYPES for dtype in case.dtypes),
                     lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
                                  "computes float32, bfloat16 and float16 alone", row=INHERENT),
     )
@@ -498,7 +492,8 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean
     # The gate multiplies the weighted norm in fp32, before the one cast.
     y = rms_weighted(x, _rounded_inverse(inverse, inverse_rounded, y_ref.dtype, interpret)[:, None],
                      weight=weight, gate=gate, activation=activation,
-                     rounded=functools.partial(_round, dtype=y_ref.dtype, interpret=interpret) if after_cast
+                     rounded=functools.partial(_round, dtype=y_ref.dtype, interpret=interpret)
+                     if after_cast and weight is not None
                      else None)
     plgpu.store(y_ref.at[at], y.astype(y_ref.dtype), mask=mask)
     plgpu.store(mean_square_ref.at[row], mean_square, mask=row < rows)
