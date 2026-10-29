@@ -199,13 +199,18 @@ def _dew(case, **kw):
     return run
 
 
+def _rounded_through(array, dtype):
+    """`array` rounded to `dtype` in value, its gradient passed straight through: a truth's operand rounded
+    as the law rounds it (the compute dtype's), nothing else."""
+    return array + jax.lax.stop_gradient(array.astype(dtype).astype(array.dtype) - array)
+
+
 def _plain(case, *, truth: bool = False):
     """The program the template stands for: the prologue rounded to the rows' dtype, each group's rows
     times its matrix rounded alike, summed wide, the epilogue, each output rounded once. As `truth`, on
     float64 inputs: the operands rounded as the program rounds them (forward only), nothing else."""
     def operand(array, dtype):
-        rounded = array.astype(dtype).astype(array.dtype)
-        return array + jax.lax.stop_gradient(rounded - array) if truth else rounded
+        return _rounded_through(array, dtype) if truth else array.astype(dtype).astype(array.dtype)
 
     def run(x, w, ms, nw, b, u, s):
         drawn, h = (x, w, ms, nw, b, u, s), x
@@ -1698,7 +1703,10 @@ def test_a_paired_products_epilogue_reads_its_fp32_accumulators_in_every_mode(ge
         return lambda x, gate, up, direction: jax.jvp(f, (x, gate, up),
                                                       (direction[:, :depth], gate, up))[1]
 
-    truth = functools.partial(plain, dtype=jnp.float64)
+    def truth(x, gate, up):
+        # The law's operands rounded to the compute dtype, everything after them exact.
+        return plain(*(_rounded_through(array, jnp.bfloat16) for array in (x, gate, up)), dtype=jnp.float64)
+
     with generation.assumed(generation_name):
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"paired epilogue's gradients ({generation_name})", seeds=SEEDS,
@@ -1732,10 +1740,14 @@ def test_a_paired_product_at_a_named_compute_dtype_holds_check_1(generation_name
         return tuple(grouped_matmul.portable_projection(x, matrix, sizes, dtype, None)
                      for matrix in (gate, up))
 
+    def truth(x, gate, up):
+        # The law's operands rounded to the compute dtype, everything after them exact.
+        return plain(*(_rounded_through(array, jnp.bfloat16) for array in (x, gate, up)), dtype=jnp.float64)
+
     with generation.assumed(generation_name):
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"paired product at a named compute dtype ({generation_name})", seeds=SEEDS,
-                        truth_fn=with_gradients(functools.partial(plain, dtype=jnp.float64)))
+                        truth_fn=with_gradients(truth))
 
 
 @pytest.mark.parametrize(("generation_name", "out"), [pytest.param("sm90", jnp.bfloat16, marks=runs("sm90")),

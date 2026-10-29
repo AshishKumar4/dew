@@ -51,8 +51,10 @@ from dew.nn.kernels.chunked_launch import (
     spanned,
     write_rows,
 )
+from dew.nn.precision import compensated_difference
 
 RCP_LN2 = 1 / math.log(2)
+LN2 = math.log(2)
 """1 / ln 2, fla's RCP_LN2 (whose 1.4426950216 rounds to the same fp32): its kernels take the cumulated
 decay in base 2 and exponentiate with exp2; the prefix converts in float64 (`recurrence.cumulated`)."""
 
@@ -67,9 +69,30 @@ than the 128-wide pick). fp32 keys take at most WIDEST: at 256 an A100's fp32 fo
 shared bytes at its narrowest tile (CPU compile)."""
 
 
-def _pairs(rows, columns):
-    """The decay's exponent from each column position to each row position, `[R, C]`: `g_r - g_c`."""
-    return rows[:, None] - columns[None, :]
+def _pairs(rows, columns, rows_lo=None, columns_lo=None):
+    """The decay's exponent from each column position to each row position, `[R, C]`: `g_r - g_c`, of both
+    halves of a compensated prefix where its remainders are given (`algebra.apart`)."""
+    if rows_lo is None:
+        return rows[:, None] - columns[None, :]
+    return algebra.apart(rows, rows_lo, columns, columns_lo)
+
+
+def _range(last, gate, last_lo=None, gate_lo=None):
+    """The decay's exponent from each position to the chunk's last, `g_last - g`, of both halves where the
+    remainders are given (`precision.compensated_difference`): a steep token's rounding of the rounded prefix
+    took every mild one after it (ledger 2098, 1328)."""
+    if last_lo is None:
+        return last - gate
+    return compensated_difference((last, last_lo), (gate, gate_lo))
+
+
+def _raised(gate, gate_lo=None):
+    """`exp2(g)`, of both halves where the remainder is given: `exp2(hi) (1 + lo ln 2)`, the remainder's
+    factor to its first order, whose next term lies below fp32's resolution wherever `exp2(hi)` is a normal
+    fp32 (|lo| at most 2^-17 there); one product beside the hardware's exponential, where a second
+    exponential, or `algebra.raised`'s exact power of two, cost a KDA tile 4 and 15 times its launch on an
+    A100."""
+    return jnp.exp2(gate) if gate_lo is None else jnp.exp2(gate) * (1.0 + gate_lo * LN2)
 
 
 def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, bv: int, exact: bool,
@@ -122,23 +145,25 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
 
 
-def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, beta_ref, a_ref, *, chunk: int, aligned: bool,
-                      sub: int, bk: int, exact: bool):
+def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, beta_ref, *refs, chunk: int, aligned: bool,
+                      sub: int, bk: int, exact: bool, compensated: bool = False):
     """fla's `chunk_gated_delta_rule_fwd_kkt_solve_kernel` (fla/ops/gated_delta_rule/chunk_fwd.py:40-
     321) for one chunk of one head: `(I + A)^-1` for `A = tril(beta_s (k_s . k_t) exp2(g_s - g_t), -1)`,
     in `sub`-row blocks (fla's BC = 16 of BT = 64). Every lower block of `k k^T` accumulates over the
     key columns `bk` at a time; the gate and beta scale them; forward substitution inverts each
     diagonal block; and neighbouring inverses merge as `-X_i A_ij X_j`, the merge's products at
-    the call's solve precision (`_dot`'s `solve`)."""
+    the call's solve precision (`_dot`'s `solve`). Where `compensated`, the pairs' decays take the
+    prefix's remainder too (`_pairs`)."""
+    gl_ref, (a_ref,) = (refs[0], refs[1:]) if compensated else (None, refs)
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
     def _():
-        _kkt_solve_chunk(k_ref, g_ref, beta_ref, a_ref, start, taken, chunk=chunk, sub=sub, bk=bk,
+        _kkt_solve_chunk(k_ref, g_ref, gl_ref, beta_ref, a_ref, start, taken, chunk=chunk, sub=sub, bk=bk,
                          exact=exact)
 
 
-def _kkt_solve_chunk(k_ref, g_ref, beta_ref, a_ref, start, taken, *, chunk: int, sub: int, bk: int,
+def _kkt_solve_chunk(k_ref, g_ref, gl_ref, beta_ref, a_ref, start, taken, *, chunk: int, sub: int, bk: int,
                      exact: bool):
     # Triton lowers no slice of a loaded value, so every block is loaded from its ref.
     width = k_ref.shape[-1]
@@ -148,6 +173,7 @@ def _kkt_solve_chunk(k_ref, g_ref, beta_ref, a_ref, start, taken, *, chunk: int,
         return read_rows(_rows(ref, start + i * sub, sub, *rest), taken - i * sub)
 
     gates = [_gates(g_ref, start, taken, sub, i * sub) for i in range(count)]
+    lows = [None if gl_ref is None else _gates(gl_ref, start, taken, sub, i * sub) for i in range(count)]
     betas = [part(beta_ref, i).astype(jnp.float32) for i in range(count)]
 
     def keys(i, c):
@@ -157,8 +183,8 @@ def _kkt_solve_chunk(k_ref, g_ref, beta_ref, a_ref, start, taken, *, chunk: int,
         # The keys' products at the call's precision, the merges at its solve precision (`_dot`).
         return _dot(a, b, exact=exact, solve=k_ref.dtype if name == "merge" else None)
 
-    blocks = algebra.system(keys, lambda i, j: jnp.exp2(_pairs(gates[i], gates[j])), betas, count,
-                            width // bk, issue)
+    blocks = algebra.system(keys, lambda i, j: jnp.exp2(_pairs(gates[i], gates[j], lows[i], lows[j])), betas,
+                            count, width // bk, issue)
     inverse = algebra.inverted(blocks, issue)
     # fla zero-fills A before its kernel stores the lower blocks; here the blocks above are stored as zeros.
     for i in range(count):
@@ -175,8 +201,9 @@ class KktSolve(_Launch):
     KEYS, VALUES = 'k', None
     PICKS = _picks(Tiles(64, 0, 1, 3))
 
-    def _fwd(self, k: jax.Array, g: jax.Array, beta: jax.Array, chunk_spans: jax.Array,
-             sequence_spans: jax.Array, *, chunk: int, sub: int, interpret: bool, config: Tiles,
+    def _fwd(self, k: jax.Array, g: jax.Array, g_lo: jax.Array | None, beta: jax.Array,
+             chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, sub: int, interpret: bool,
+             config: Tiles,
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
@@ -188,38 +215,40 @@ class KktSolve(_Launch):
         tokens = batch * length
         aligned = _aligned(spans, batch, length, chunk)
         gated = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
+        compensated = g_lo is not None
         solved = pl.pallas_call(
             functools.partial(_kkt_solve_kernel, chunk=chunk, aligned=aligned, sub=sub, bk=min(bk, width),
-                              exact=interpret),
+                              exact=interpret, compensated=compensated),
             grid=(spans.chunks.shape[0], value_heads),
             in_specs=[_CHUNK, pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0)), gated,
-                      gated],
+                      gated, *([gated] if compensated else [])],
             out_specs=pl.BlockSpec((tokens, None, chunk), lambda i_t, h: (0, h, 0)),
             out_shape=jax.ShapeDtypeStruct((tokens, value_heads, chunk), k.dtype),
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_kkt_solve",
-        )(spans.chunks, *_flat(k, g, beta))
+        )(spans.chunks, *_flat(k, g, beta, *([g_lo] if compensated else [])))
         return (solved.reshape(batch, length, value_heads, chunk)), None
 
 
 _KKT_SOLVE = KktSolve()
 
 
-def kkt_solve(k, g, beta, *, chunk: int = 64, sub: int = 16, spans: Sequences | None = None,
+def kkt_solve(k, g, beta, *, g_lo=None, chunk: int = 64, sub: int = 16, spans: Sequences | None = None,
               interpret: bool = False):
     """`(I + A)^-1` per chunk, `[B, T, HV, BT]` in `k`'s dtype and zero above the diagonal: fla's
     fused kkt and solve for 64-token chunks (chunk_fwd.py:367-396). `k` `[B, T, H, K]`, `g`
     the base-2 cumulated decay (`recurrence.cumulated`) and `beta` `[B, T, HV]`. fla autotunes
-    `BK` over 32 and 64 and warps over 1, 2 and 4."""
-    return spanned(_KKT_SOLVE, k, g, beta, chunk=chunk, spans=spans, sub=sub, interpret=interpret)
+    `BK` over 32 and 64 and warps over 1, 2 and 4. `g_lo` the prefix's remainder where compensated."""
+    return spanned(_KKT_SOLVE, k, g, g_lo, beta, chunk=chunk, spans=spans, sub=sub, interpret=interpret)
 
 
-def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *, chunk: int,
-                aligned: bool, bk: int,
-                bv: int, exact: bool):
+def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, *refs, chunk: int, aligned: bool, bk: int,
+                bv: int, exact: bool, compensated: bool = False):
     """fla's `recompute_w_u_fwd_kernel` (fla/ops/gated_delta_rule/wy_fast.py:39-103) for one chunk
     of one head: `u = A (v * beta)` and `w = A (k * beta * exp2(g))`, each operand rounded to its
-    input dtype before the product and `A`'s product with `v` at IEEE fp32 (`allow_tf32=False`)."""
+    input dtype before the product and `A`'s product with `v` at IEEE fp32 (`allow_tf32=False`);
+    `exp2(g)` of both prefix halves where `compensated` (`_raised`)."""
+    gl_ref, (w_ref, u_ref) = (refs[0], refs[1:]) if compensated else (None, refs)
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
@@ -231,7 +260,8 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *
         inverse = read(a_ref)
         _weighted_values(v_ref, u_ref, beta, inverse, start, taken, chunk=chunk, bv=bv, exact=exact,
                          ieee=True)
-        decay = jnp.exp2(_gates(g_ref, start, taken, chunk))
+        decay = _raised(_gates(g_ref, start, taken, chunk),
+                        None if gl_ref is None else _gates(gl_ref, start, taken, chunk))
         for block in range(k_ref.shape[-1] // bk):
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
@@ -249,8 +279,8 @@ class RecomputeWU(_Launch):
     PICKS = _picks(Tiles(64, 64, 2, 4))
 
     def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, a: jax.Array, g: jax.Array,
-             chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, interpret: bool,
-             config: Tiles, return_residuals: bool = False):
+             g_lo: jax.Array | None, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         bk, bv, warps, stages = config.bk, config.bv, config.warps, config.stages
@@ -262,31 +292,31 @@ class RecomputeWU(_Launch):
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
         w, u = pl.pallas_call(
             functools.partial(_w_u_kernel, chunk=chunk, aligned=aligned, bk=min(bk, width),
-                              bv=min(bv, columns), exact=interpret),
+                              bv=min(bv, columns), exact=interpret, compensated=g_lo is not None),
             grid=(spans.chunks.shape[0], value_heads),
             in_specs=[_CHUNK, pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0)),
-                      headed(columns), gate, headed(chunk), gate],
+                      headed(columns), gate, headed(chunk), gate, *([gate] if g_lo is not None else [])],
             out_specs=[headed(width), headed(columns)],
             out_shape=[jax.ShapeDtypeStruct((tokens, value_heads, width), k.dtype),
                        jax.ShapeDtypeStruct((tokens, value_heads, columns), v.dtype)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_recompute_w_u",
-        )(spans.chunks, *_flat(k, v, beta, a, g))
+        )(spans.chunks, *_flat(k, v, beta, a, g, *([] if g_lo is None else [g_lo])))
         return (w.reshape(batch, length, value_heads, width), u.reshape(v.shape)), None
 
 
 _RECOMPUTE_W_U = RecomputeWU()
 
 
-def recompute_w_u(k, v, beta, a, g, *, chunk: int = 64, spans: Sequences | None = None,
+def recompute_w_u(k, v, beta, a, g, *, g_lo=None, chunk: int = 64, spans: Sequences | None = None,
                   interpret: bool = False):
     """`(w, u)`, in `k`'s and `v`'s dtypes: fla's `recompute_w_u_fwd` (wy_fast.py:247-296).
 
     `k` `[B, T, H, K]`, `v` `[B, T, HV, V]`, `beta` `[B, T, HV]` in the inputs' dtype, `a` the
     inverse `(I + beta K K^T)^-1` per chunk `[B, T, HV, BT]` (fla's `A`, rows by token), `g` the
     base-2 cumulated decay `[B, T, HV]` fp32. fla fixes `BK = BV = 64` and autotunes warps over
-    2, 4, 8 and stages over 2, 3, 4."""
-    return spanned(_RECOMPUTE_W_U, k, v, beta, a, g, chunk=chunk, spans=spans, interpret=interpret)
+    2, 4, 8 and stages over 2, 3, 4. `g_lo` the prefix's remainder where compensated."""
+    return spanned(_RECOMPUTE_W_U, k, v, beta, a, g, g_lo, chunk=chunk, spans=spans, interpret=interpret)
 
 
 def _stored(ref, row, memory) -> None:
@@ -294,8 +324,8 @@ def _stored(ref, row, memory) -> None:
     for i, block in enumerate(memory):
         ref[row, pl.ds(i * 64, 64), :] = block.astype(ref.dtype)
 
-def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, *,
-              chunk: int, aligned: bool, length: int, exact: bool, per_key: bool = False):
+def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, *refs, chunk: int, aligned: bool, length: int,
+              exact: bool, per_key: bool = False, compensated: bool = False):
     """fla's `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` (fla/ops/common/chunk_delta_h.py:50-
     343) for one sequence's head and `BV` value columns, its chunks in order. The memory is fp32 in
     64-key slices; each chunk stores the memory it enters in `h`'s dtype at its slot (`Sequences`),
@@ -307,6 +337,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
+    gl_ref, (h_ref, corrected_ref, ht_ref) = (refs[0], refs[1:]) if compensated else (None, refs)
     start, count, base, entered, _, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
 
@@ -335,12 +366,19 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
                 return _dot(read(k_ref, pl.ds(i * 64, 64)).T, values.astype(k_ref.dtype), exact=exact)
 
             if per_key:
-                return [state[i] * jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
-                        + written(i, corrected) for i in range(slices)]
-            last = _row(g_ref, final)
-            gate = _gates(g_ref, begin, taken, chunk)
-            gated = corrected * jnp.exp2(last - gate)[:, None]
-            return [state[i] * jnp.exp2(last) + written(i, gated) for i in range(slices)]
+                def rows(i):
+                    """The memory's key rows' decays over the chunk, `exp2(g_last)`, of both halves where
+                    compensated."""
+                    keys = pl.ds(i * 64, 64)
+                    return _raised(g_ref[final, keys].astype(jnp.float32),
+                                   None if gl_ref is None else gl_ref[final, keys].astype(jnp.float32))
+
+                return [state[i] * rows(i)[:, None] + written(i, corrected) for i in range(slices)]
+            last, gate = _row(g_ref, final), _gates(g_ref, begin, taken, chunk)
+            last_lo, gate_lo = ((None, None) if gl_ref is None
+                                else (_row(gl_ref, final), _gates(gl_ref, begin, taken, chunk)))
+            gated = corrected * jnp.exp2(_range(last, gate, last_lo, gate_lo))[:, None]
+            return [state[i] * _raised(last, last_lo) + written(i, gated) for i in range(slices)]
 
         state = jax.lax.fori_loop(0, -(-count // chunk), step, state)
 
@@ -357,12 +395,13 @@ class ChunkFwdH(_Launch):
     PICKS = _picks(Tiles(0, 32, 4, 3), small=Tiles(0, 32, 2, 2), wide_fp32=Tiles(0, 64, 4, 2),
                    small_fp32=Tiles(0, 64, 2, 1))
 
-    def _fwd(self, k: jax.Array, w: jax.Array, u: jax.Array, g: jax.Array, h0: jax.Array,
-             chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, interpret: bool,
+    def _fwd(self, k: jax.Array, w: jax.Array, u: jax.Array, g: jax.Array, g_lo: jax.Array | None,
+             h0: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, interpret: bool,
              config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         bv, warps, stages = config.bv, config.warps, config.stages
+        compensated = g_lo is not None
         spans, batch, length, _, width, value_heads, columns, group, tokens, aligned = laid(
             k, u, chunk_spans, sequence_spans, chunk)
 
@@ -376,13 +415,13 @@ class ChunkFwdH(_Launch):
         held = slots(spans, batch, length, chunk)
         h, corrected, final = pl.pallas_call(
             functools.partial(_h_kernel, chunk=chunk, aligned=aligned, length=length, exact=interpret,
-                              **({"per_key": True} if per_key else {})),
+                              compensated=compensated, **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
             in_specs=[pl.BlockSpec((None, 5), lambda i_v, sh: (sh // value_heads, 0)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh) // group, 0)),
                       pl.BlockSpec((tokens, None, bv), lambda i_v, sh: (0, head(i_v, sh), i_v)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
-                      gated, rows],
+                      gated, rows, *([gated] if compensated else [])],
             out_specs=[pl.BlockSpec((held, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v)),
                        pl.BlockSpec((tokens, None, bv), lambda i_v, sh: (0, head(i_v, sh), i_v)),
                        rows],
@@ -391,14 +430,14 @@ class ChunkFwdH(_Launch):
                        jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_fwd_h",
-        )(spans.spans, *_flat(k, u, w, g), h0)
+        )(spans.spans, *_flat(k, u, w, g), h0, *(_flat(g_lo) if compensated else ()))
         return (h, corrected.reshape(u.shape), final), None
 
 
 _CHUNK_FWD_H = ChunkFwdH()
 
 
-def chunk_fwd_h(k, w, u, g, h0, *, chunk: int = 64, spans: Sequences | None = None,
+def chunk_fwd_h(k, w, u, g, h0, *, g_lo=None, chunk: int = 64, spans: Sequences | None = None,
                 interpret: bool = False):
     """`(h, corrected, final)`: the memory each chunk enters at its slot `[slots, HV, K, V]`
     (`Sequences`) in `k`'s dtype, the corrected values `[B, T, HV, V]` in `u`'s and each row's final
@@ -407,13 +446,13 @@ def chunk_fwd_h(k, w, u, g, h0, *, chunk: int = 64, spans: Sequences | None = No
     the base-2 cumulated decay (`recurrence.cumulated`) `[B, T, HV]`, or per key dimension `[B,
     T, HV, K]` (fla's `gk`, Kimi's delta attention), `h0` `[B, HV, K, V]` fp32, each row's. `K` a
     multiple of 64 (fla's blockdim64 kernel takes up to 256). On an A100 fla's autotuner chose BV 32,
-    4 warps, 3 stages (c53)."""
-    return spanned(_CHUNK_FWD_H, k, w, u, g, h0, chunk=chunk, spans=spans, interpret=interpret)
+    4 warps, 3 stages (c53). `g_lo` the prefix's remainder where compensated, which the decays take too."""
+    return spanned(_CHUNK_FWD_H, k, w, u, g, g_lo, h0, chunk=chunk, spans=spans, interpret=interpret)
 
 
-def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, dh_ref, dh0_ref,
-                dv2_ref, *, chunk: int, aligned: bool, length: int, scale: float, exact: bool,
-                per_key: bool = False):
+def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, *refs, chunk: int,
+                aligned: bool, length: int, scale: float, exact: bool, per_key: bool = False,
+                compensated: bool = False):
     """fla's `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` (chunk_delta_h.py:359-669) for one
     sequence's head and `BV` value columns, chunks in reverse. Each stores the gradient of the memory
     it leaves into, `dh`, at that memory's slot (`Sequences`), then
@@ -425,6 +464,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
     and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
     stays in q's dtype. A row's last sequence starts from the final
     memory's gradient and its first stores the initial memory's."""
+    gl_ref, (dh_ref, dh0_ref, dv2_ref) = (refs[0], refs[1:]) if compensated else (None, refs)
     start, count, base, _, left, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
     chunks = -(-count // chunk)
@@ -469,17 +509,20 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
             last_first = reversed_rows(out_grad)
             if per_key:
                 dv = dv + read(dv_ref).astype(jnp.float32)
-                kept = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
-                        for i in range(slices)]
+                def last_row(ref, i):
+                    return None if ref is None else ref[final, pl.ds(i * 64, 64)].astype(jnp.float32)
+
+                kept = [_raised(last_row(g_ref, i), last_row(gl_ref, i))[:, None] for i in range(slices)]
                 read_out = [_dot(reversed_rows(query).astype(query.dtype).T, last_first.astype(query.dtype),
                                  exact=exact) for query in queries]
             else:
-                gate = _gates(g_ref, begin, taken, chunk)
-                last = _row(g_ref, final)
-                dv = (dv * jnp.exp2(last - gate)[:, None]
+                gate, last = _gates(g_ref, begin, taken, chunk), _row(g_ref, final)
+                gate_lo, last_lo = ((None, None) if gl_ref is None
+                                    else (_gates(gl_ref, begin, taken, chunk), _row(gl_ref, final)))
+                dv = (dv * jnp.exp2(_range(last, gate, last_lo, gate_lo))[:, None]
                       + read(dv_ref).astype(jnp.float32))
-                decay = jnp.exp2(gate)[:, None]
-                kept = [jnp.exp2(last)] * slices
+                decay = _raised(gate, gate_lo)[:, None]
+                kept = [_raised(last, last_lo)] * slices
                 read_out = [_split_dot(reversed_rows(query.astype(jnp.float32) * decay).T,
                                        last_first.astype(out_grad.dtype), exact=exact)
                             for query in queries]
@@ -519,9 +562,10 @@ class ChunkBwdDhu(_Launch):
             return self._tiles(ba, self.WIDE_KEYS_PICK)
         return super()._get_heuristics_config(ba)
 
-    def _fwd(self, q: jax.Array, k: jax.Array, w: jax.Array, g: jax.Array, dht: jax.Array,
-             do: jax.Array, dv: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float,
-             chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, q: jax.Array, k: jax.Array, w: jax.Array, g: jax.Array, g_lo: jax.Array | None,
+             dht: jax.Array, do: jax.Array, dv: jax.Array, chunk_spans: jax.Array,
+             sequence_spans: jax.Array, *, scale: float, chunk: int, interpret: bool, config: Tiles,
+             return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         bv, warps, stages = config.bv, config.warps, config.stages
@@ -540,12 +584,12 @@ class ChunkBwdDhu(_Launch):
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
         dh, dh0, dv2 = pl.pallas_call(
             functools.partial(_dhu_kernel, chunk=chunk, aligned=aligned, length=length, scale=scale,
-                              exact=interpret,
+                              exact=interpret, compensated=g_lo is not None,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
             in_specs=[pl.BlockSpec((None, 5), lambda i_v, sh: (sh // value_heads, 0)), keys, keys,
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
-                      gated, rows, values, values],
+                      gated, rows, values, values, *([gated] if g_lo is not None else [])],
             out_specs=[pl.BlockSpec((held, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v)),
                        rows,
                        values],
@@ -554,14 +598,14 @@ class ChunkBwdDhu(_Launch):
                        jax.ShapeDtypeStruct((tokens, value_heads, columns), dv.dtype)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_bwd_dhu",
-        )(spans.spans, *_flat(q, k, w, g), dht, *_flat(do, dv))
+        )(spans.spans, *_flat(q, k, w, g), dht, *_flat(do, dv, *([] if g_lo is None else [g_lo])))
         return (dh, dh0, dv2.reshape(dv.shape)), None
 
 
 _CHUNK_BWD_DHU = ChunkBwdDhu()
 
 
-def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64,
+def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, g_lo=None, chunk: int = 64,
                   spans: Sequences | None = None, interpret: bool = False):
     """`(dh, dh0, dv2)`: the gradient of the memory each chunk leaves into at its slot `[slots, HV, K,
     V]` (`Sequences`) in `q`'s dtype, of each row's initial memory `[B, HV, K, V]` fp32, and the
@@ -570,17 +614,19 @@ def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64,
     row's final memory's gradient and `dv` the corrected values' from the output alone
     (`chunk_bwd_dv_local`); `g` the cumulated decay `[B, T, HV]`, or `[B, T, HV,
     K]` per key dimension (fla's `gk`). fla's
-    A100 choice: BV 32, 4 warps, 3 stages (c53)."""
-    return spanned(_CHUNK_BWD_DHU, q, k, w, g, dht, do, dv, chunk=chunk, spans=spans,
+    A100 choice: BV 32, 4 warps, 3 stages (c53). `g_lo` the prefix's remainder where compensated, which the
+    decays take too."""
+    return spanned(_CHUNK_BWD_DHU, q, k, w, g, g_lo, dht, do, dv, chunk=chunk, spans=spans,
                    scale=scale, interpret=interpret)
 
 
-def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, dv_ref, *, chunk: int, aligned: bool,
-                     scale: float, bk: int,
-                     bv: int, exact: bool):
+def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, *refs, chunk: int, aligned: bool,
+                     scale: float, bk: int, bv: int, exact: bool, compensated: bool = False):
     """fla's `chunk_bwd_kernel_dv_local` (fla/ops/common/chunk_o.py:452-526) for one chunk of one
     head: the corrected values' gradient from the chunk's own output, `dv = A do` with
-    `A[s, t] = scale (k_s . q_t) exp2(g_t - g_s)` for `s <= t`, cast to `do`'s dtype for the product."""
+    `A[s, t] = scale (k_s . q_t) exp2(g_t - g_s)` for `s <= t`, cast to `do`'s dtype for the product; its
+    pairs' decays of both prefix halves where `compensated`."""
+    gl_ref, (dv_ref,) = (refs[0], refs[1:]) if compensated else (None, refs)
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
     @pl.when(taken > 0)
@@ -593,7 +639,8 @@ def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, dv_ref, *, chunk: i
             columns = pl.ds(block * bk, bk)
             scores += _dot(read(k_ref, columns), read(q_ref, columns).T, exact=exact) * scale
         gate = _gates(g_ref, start, taken, chunk)
-        scores = scores * jnp.exp2(-_pairs(gate, gate))
+        low = None if gl_ref is None else _gates(gl_ref, start, taken, chunk)
+        scores = scores * jnp.exp2(-_pairs(gate, gate, low, low))
         index = jnp.arange(chunk)
         scores = jnp.where(index[:, None] <= index[None, :], scores, 0.0).astype(do_ref.dtype)
         for block in range(do_ref.shape[-1] // bv):
@@ -610,7 +657,7 @@ class ChunkBwdDvLocal(_Launch):
     KEYS, VALUES = 'k', 'do'
     PICKS = _picks(Tiles(64, 64, 2, 3))
 
-    def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, do: jax.Array,
+    def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, g_lo: jax.Array | None, do: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float, chunk: int, interpret: bool,
              config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
@@ -623,26 +670,28 @@ class ChunkBwdDvLocal(_Launch):
         dv = pl.pallas_call(
             functools.partial(_dv_local_kernel, chunk=chunk, aligned=aligned, scale=scale, bk=min(bk, width),
                               bv=min(bv, columns),
-                              exact=interpret),
+                              exact=interpret, compensated=g_lo is not None),
             grid=(spans.chunks.shape[0], value_heads),
-            in_specs=[_CHUNK, keys, keys, pl.BlockSpec((tokens, None), lambda i_t, h: (0, h)), values],
+            in_specs=[_CHUNK, keys, keys, pl.BlockSpec((tokens, None), lambda i_t, h: (0, h)), values,
+                      *([pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))] if g_lo is not None else [])],
             out_specs=values,
             out_shape=jax.ShapeDtypeStruct((tokens, value_heads, columns), do.dtype),
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_bwd_dv_local",
-        )(spans.chunks, *_flat(q, k, g, do))
+        )(spans.chunks, *_flat(q, k, g, do, *([] if g_lo is None else [g_lo])))
         return dv.reshape(do.shape), None
 
 
 _CHUNK_BWD_DV_LOCAL = ChunkBwdDvLocal()
 
 
-def chunk_bwd_dv_local(q, k, g, do, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
-                       interpret: bool = False):
+def chunk_bwd_dv_local(q, k, g, do, *, scale: float, g_lo=None, chunk: int = 64,
+                       spans: Sequences | None = None, interpret: bool = False):
     """The corrected values' gradient from each chunk's own output, `[B, T, HV, V]` in `do`'s dtype:
     fla's `chunk_bwd_dv_local` (chunk_o.py:640-676). fla tiles `BK` and `BV` at 64 on an A100
-    (its CONST_TILING for ampere and ada shared memory) and chose 2 warps, 3 stages there (c53)."""
-    return spanned(_CHUNK_BWD_DV_LOCAL, q, k, g, do, chunk=chunk, spans=spans,
+    (its CONST_TILING for ampere and ada shared memory) and chose 2 warps, 3 stages there (c53). `g_lo` the
+    prefix's remainder where compensated."""
+    return spanned(_CHUNK_BWD_DV_LOCAL, q, k, g, g_lo, do, chunk=chunk, spans=spans,
                    scale=scale, interpret=interpret)
 
 
@@ -668,19 +717,23 @@ def _state_inner_product(memory, memory_grad):
     return jnp.sum((memory * memory_grad).astype(jnp.float32))
 
 
-def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, dv_ref, dq_ref,
-                  dk_ref, dw_ref, dg_ref, *, chunk: int, aligned: bool, scale: float, bv: int, exact: bool):
+def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, dv_ref, *refs, chunk: int,
+                  aligned: bool, scale: float, bv: int, exact: bool, compensated: bool = False):
     """fla's `chunk_bwd_kernel_dqkwg` (fla/ops/common/chunk_o.py:159-331) for one chunk of one key
     head and `BK` key columns, over the value heads it serves in turn: over the value columns `bv` at
     a time, `ds = do v^T`, `dq = do h^T`, `dk = v dh^T`, `dw = -dv h^T` and `sum(h dh)`; then the
-    gates, `ds`'s causal mask, `dq += ds k` and `dk += ds^T q`. The decay's gradient is each token's
-    own (`_summed_back`): the scores' terms `ds (q k^T)` through the ranges between their tokens, the
-    keys' terms into the memory the chunk leaves through the ranges to its end, and the queries'
-    reads of the memory it enters and that memory's decay through the ranges from its start, where
-    fla gives each cumulated decay's and sums them back. The value heads' `dq` and `dk` sum in fp32
+    gates, `ds`'s causal mask, `dq += ds k` and `dk += ds^T q`. The decay's gradient leaves as its
+    terms (`dp`, `dg`): the pairs, the scores' `ds (q k^T)` through the ranges between their tokens and
+    the keys' terms into the memory the chunk leaves through the ranges to its end, and each token's
+    terms through the range from the chunk's start, the queries' reads of the memory it enters and
+    that memory's decay. `prepare_wy_repr_bwd` adds them to its own pair by pair and sums each token's
+    once (`_summed_back`): summed apart, the two kernels' sums cancelled to 8 to 10 times the
+    token-by-token recurrence's error from float64 under decays near zero, where fla gives each
+    cumulated decay's and sums them back. The value heads' `dq` and `dk` sum in fp32
     and round to their dtype once, where fla rounds each value head's and sums them after. The heads
     are a loop, not unrolled, so a program holds one head's accumulators at a time. The memory the
     chunk enters and its gradient where it leaves are read at their slots (`Sequences`)."""
+    gl_ref, (dq_ref, dk_ref, dw_ref, dp_ref, dg_ref) = (refs[0], refs[1:]) if compensated else (None, refs)
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     entered, left = chunk_ref[2], chunk_ref[3]
 
@@ -714,19 +767,22 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
                 dk += _dot(value, memory_grad.T.astype(value.dtype), exact=exact)
                 dw += _dot(local.astype(value.dtype), memory.T.astype(value.dtype), exact=exact)
             write_rows(_rows(dw_ref, start, chunk, head), taken, -dw)
-            gate = _gates(g_ref, start, taken, chunk, 0, head)
-            last = _row(g_ref, (start + taken - 1, head))
-            dq = dq * jnp.exp2(gate)[:, None] * scale
-            dk = dk * jnp.exp2(last - gate)[:, None]
-            ds = jnp.where(causal, ds * jnp.exp2(_pairs(gate, gate)), 0.0) * scale
+            gate, last = _gates(g_ref, start, taken, chunk, 0, head), _row(g_ref, (start + taken - 1, head))
+            gate_lo, last_lo = ((None, None) if gl_ref is None else
+                                (_gates(gl_ref, start, taken, chunk, 0, head),
+                                 _row(gl_ref, (start + taken - 1, head))))
+            dq = dq * _raised(gate, gate_lo)[:, None] * scale
+            dk = dk * jnp.exp2(_range(last, gate, last_lo, gate_lo))[:, None]
+            ds = jnp.where(causal, ds * jnp.exp2(_pairs(gate, gate, gate_lo, gate_lo)), 0.0) * scale
             # The keys' writes into the memory the chunk leaves run through (s, end]: the last row's pairs.
             leaving = jnp.sum(dk * keys.astype(jnp.float32), axis=1)
             pairs = (jnp.where(strict, ds * scores, 0.0)
                      + jnp.where(last_row[:, None] & strict, leaving[None, :], 0.0))
             # The queries' reads of the memory the chunk enters, and that memory's own decay to its end.
             after = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
-                     + jnp.where(last_row, dg_last * jnp.exp2(last), 0.0))
-            write_rows(_rows(dg_ref, start, chunk, head), taken, _summed_back(index, pairs, after))
+                     + jnp.where(last_row, dg_last * _raised(last, last_lo), 0.0))
+            write_rows(_rows(dp_ref, start, chunk, head), taken, pairs)
+            write_rows(_rows(dg_ref, start, chunk, head), taken, after)
             ds = ds.astype(keys.dtype)
             dq += _dot(ds, keys, exact=exact)
             dk += _dot(ds.T, queries, exact=exact)
@@ -750,10 +806,10 @@ class ChunkBwdDqkwg(_Launch):
     # 2.65, best 128/64/8/1 1.19) and 0.65 on an H100 (64/64/4/1 0.52, 128/64/8/1 1.02).
     PICKS = _picks(Tiles(64, 64, 4, 1), wide_bf16=Tiles(128, 128, 8, 1))
 
-    def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, w: jax.Array, g: jax.Array, h: jax.Array,
-             dv: jax.Array, do: jax.Array, dh: jax.Array, chunk_spans: jax.Array,
-             sequence_spans: jax.Array, *, scale: float, chunk: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, w: jax.Array, g: jax.Array,
+             g_lo: jax.Array | None, h: jax.Array, dv: jax.Array, do: jax.Array, dh: jax.Array,
+             chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float, chunk: int, interpret: bool,
+             config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         bk, bv, warps, stages = config.bk, config.bv, config.warps, config.stages
@@ -762,40 +818,45 @@ class ChunkBwdDqkwg(_Launch):
         keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_h, i_t: (0, i_h, i_k))
         values = pl.BlockSpec((tokens, group, columns), lambda i_k, i_h, i_t: (0, i_h, 0))
         memory = pl.BlockSpec((h.shape[0], group, bk, columns), lambda i_k, i_h, i_t: (0, i_h, i_k, 0))
-        dq, dk, dw, dg = pl.pallas_call(
+        dq, dk, dw, dp, dg = pl.pallas_call(
             functools.partial(_dqkwg_kernel, chunk=chunk, aligned=aligned, scale=scale, bv=bv,
-                              exact=interpret),
+                              exact=interpret, compensated=g_lo is not None),
             grid=(width // bk, key_heads, spans.chunks.shape[0]),
             in_specs=[pl.BlockSpec((None, 4), lambda i_k, i_h, i_t: (i_t, 0)), keys, keys, values,
                       pl.BlockSpec((tokens, group), lambda i_k, i_h, i_t: (0, i_h)), memory, values, memory,
-                      values],
+                      values, *([pl.BlockSpec((tokens, group), lambda i_k, i_h, i_t: (0, i_h))]
+                                if g_lo is not None else [])],
             out_specs=[keys, keys, pl.BlockSpec((tokens, group, bk), lambda i_k, i_h, i_t: (0, i_h, i_k)),
+                       pl.BlockSpec((None, tokens, group, chunk), lambda i_k, i_h, i_t: (i_k, 0, i_h, 0)),
                        pl.BlockSpec((None, tokens, group), lambda i_k, i_h, i_t: (i_k, 0, i_h))],
             out_shape=[jax.ShapeDtypeStruct((tokens, key_heads, width), q.dtype),
                        jax.ShapeDtypeStruct((tokens, key_heads, width), k.dtype),
                        jax.ShapeDtypeStruct((tokens, value_heads, width), w.dtype),
+                       jax.ShapeDtypeStruct((width // bk, tokens, value_heads, chunk), jnp.float32),
                        jax.ShapeDtypeStruct((width // bk, tokens, value_heads), jnp.float32)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_bwd_dqkwg",
-        )(spans.chunks, *_flat(q, k, v, g), h, *_flat(do), dh, *_flat(dv))
-        grads = dq.reshape(q.shape), dk.reshape(k.shape), dw.reshape(w.shape), dg.sum(0).reshape(g.shape)
-        return grads, None
+        )(spans.chunks, *_flat(q, k, v, g), h, *_flat(do), dh, *_flat(dv, *([] if g_lo is None else [g_lo])))
+        terms = dp.sum(0).reshape(*g.shape, chunk), dg.sum(0).reshape(g.shape)
+        return (dq.reshape(q.shape), dk.reshape(k.shape), dw.reshape(w.shape), terms), None
 
 
 _CHUNK_BWD_DQKWG = ChunkBwdDqkwg()
 
 
-def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 64,
+def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, g_lo=None, chunk: int = 64,
                     spans: Sequences | None = None, interpret: bool = False):
-    """`(dq, dk, dw, dg)`: fla's `chunk_bwd_dqkwg` (chunk_o.py:696-743). `q`, `k` `[B, T, H, K]`, `v`
+    """`(dq, dk, dw, (pairs, after))`: fla's `chunk_bwd_dqkwg` (chunk_o.py:696-743). `q`, `k` `[B, T, H,
+    K]`, `v`
     the corrected values and `do` `[B, T, HV, V]`, `w` `[B, T, HV, K]` (its shape and dtype for `dw`),
     `g` the base-2 cumulated decay, `h` and `dh` the memories and their gradients at their slots
     `[slots, HV, K, V]` (`chunk_fwd_h`, `chunk_bwd_dhu`), `dv` the corrected values' full gradient. One
     program per key head sums its value heads' `dq` and `dk` in fp32 and stores them once, `[B, T,
-    H, K]` in `q`'s and `k`'s dtypes; `dw` per value
-    head, and `dg` per key block, summed, as fla does. fla tiles `BK`, `BV` at 64 on an A100 and chose
-    4 warps, 2 stages (c53)."""
-    return spanned(_CHUNK_BWD_DQKWG, q, k, v, w, g, h, dv, do, dh, chunk=chunk, spans=spans,
+    H, K]` in `q`'s and `k`'s dtypes; `dw` per value head; and the decay's gradient's terms, its pairs
+    `[B, T, HV, BT]` and each token's from its chunk's start `[B, T, HV]`, per key block summed, which
+    `prepare_wy_repr_bwd` sums with its own once (`_dqkwg_kernel`). fla tiles `BK`, `BV` at 64 on an
+    A100 and chose 4 warps, 2 stages (c53). `g_lo` the prefix's remainder where compensated."""
+    return spanned(_CHUNK_BWD_DQKWG, q, k, v, w, g, g_lo, h, dv, do, dh, chunk=chunk, spans=spans,
                    scale=scale, interpret=interpret)
 
 
@@ -814,9 +875,9 @@ def _summed_back(index, pairs, after):
     return jnp.sum(jnp.where(index[:, None] >= index[None, :], through + after[:, None], 0.0), axis=0)
 
 
-def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, *refs, chunk: int,
-                   aligned: bool,
-                   bk: int, bv: int, group: int | None, exact: bool):
+def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, dp_ref, da_ref, *refs,
+                   chunk: int, aligned: bool, bk: int, bv: int, group: int | None, exact: bool,
+                   compensated: bool = False):
     """fla's `prepare_wy_repr_bwd_kernel` (fla/ops/gated_delta_rule/wy_fast.py:119-243) for one
     chunk of one head. With `X = (I + L)^-1` (fla's `A`), `w = X (k beta exp2(g))` and
     `u = X (v beta)`: their gradients through `X^T`, `dX = dw (k beta exp2 g)^T + du (v beta)^T`, then
@@ -828,8 +889,14 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
     query-side kernel's) is an operand: it joins the sum before that store in the first value head
     of each key head's group, where fla adds the two stored gradients in a pass of their own
     (chunk.py:244). A group of more than one stores each head's part in fp32 (`dk_ref`'s dtype),
-    which the caller sums and rounds once."""
-    earlier_ref, (dk_ref, dv_ref, db_ref, dg_ref) = (refs[0], refs[1:]) if group else (None, refs)
+    which the caller sums and rounds once. The decay's gradient is each token's own, summed once
+    (`_summed_back`) of this kernel's pair terms and the query side's (`dp_ref`, `da_ref`,
+    `chunk_bwd_dqkwg`'s), added pair by pair. Where `compensated`, the decays take the prefix's remainder
+    (the input after it) too."""
+    given = bool(group) + compensated
+    earlier_ref = refs[0] if group else None
+    gl_ref = refs[given - 1] if compensated else None
+    dk_ref, dv_ref, db_ref, dg_ref = refs[given:]
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     first_of_group = pl.program_id(1) % (group or 1) == 0
 
@@ -841,7 +908,8 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
         inverse_t = read(a_ref).T
         beta = read(beta_ref)
         gate = _gates(g_ref, start, taken, chunk)
-        decay = jnp.exp2(gate)
+        low = None if gl_ref is None else _gates(gl_ref, start, taken, chunk)
+        decay = _raised(gate, low)
         width = k_ref.shape[-1]
 
         # Each block loop is a loop, not unrolled, so Triton pipelines its loads and holds one block's
@@ -876,7 +944,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
         d_x = jnp.where(strict, d_x, 0.0)
         d_x = _dot(d_x.astype(inverse_t.dtype), inverse_t, exact=exact)
         d_x = _dot(inverse_t, d_x.astype(inverse_t.dtype), exact=exact)
-        d_x = d_x * jnp.exp2(_pairs(gate, gate))
+        d_x = d_x * jnp.exp2(_pairs(gate, gate, low, low))
         d_l = jnp.where(strict, -d_x, 0.0).astype(k_ref.dtype)
         def keys_grad(block, carry):
             products, d_beta = carry
@@ -899,8 +967,8 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
         products, d_beta = jax.lax.fori_loop(0, width // bk, keys_grad,
                                              (jnp.zeros((chunk, chunk), jnp.float32), d_beta))
         write_rows(_rows(db_ref, start, chunk), taken, d_beta)
-        weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
-        write_rows(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate))
+        weighted = d_l.astype(jnp.float32) * (products * beta[:, None]) + read(dp_ref)
+        write_rows(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate + read(da_ref)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -914,10 +982,10 @@ class PrepareWyReprBwd(_Launch):
     # (sm89).
     PICKS = _picks(Tiles(64, 64, 4, 2), wide_fp32=Tiles(64, 64, 8, 2), small_fp32=Tiles(64, 64, 8, 1))
 
-    def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, g: jax.Array, a: jax.Array,
-             dw: jax.Array, du: jax.Array, dk: jax.Array | None, chunk_spans: jax.Array,
-             sequence_spans: jax.Array, *, chunk: int, interpret: bool, config: Tiles,
-             return_residuals: bool = False):
+    def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, g: jax.Array, g_lo: jax.Array | None,
+             a: jax.Array, dw: jax.Array, du: jax.Array, dk: jax.Array | None, pairs: jax.Array,
+             after: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         bk, bv, warps, stages = config.bk, config.bv, config.warps, config.stages
@@ -931,11 +999,12 @@ class PrepareWyReprBwd(_Launch):
         earlier = () if dk is None else (dk,)
         parts, dv, db, dg = pl.pallas_call(
             functools.partial(_wy_bwd_kernel, chunk=chunk, aligned=aligned, bk=min(bk, width),
-                              bv=min(bv, columns), group=group if earlier else None, exact=interpret),
+                              bv=min(bv, columns), group=group if earlier else None, exact=interpret,
+                              compensated=g_lo is not None),
             grid=(spans.chunks.shape[0], value_heads),
             in_specs=[_CHUNK, keys, headed(columns), gate, gate, headed(chunk), headed(width),
-                      headed(columns),
-                      *(keys for _ in earlier)],
+                      headed(columns), headed(chunk), gate, *(keys for _ in earlier),
+                      *([gate] if g_lo is not None else [])],
             out_specs=[headed(width), headed(columns), gate, gate],
             # A group's parts stay fp32 until their sum rounds once.
             out_shape=[jax.ShapeDtypeStruct((tokens, value_heads, width),
@@ -945,7 +1014,8 @@ class PrepareWyReprBwd(_Launch):
                        jax.ShapeDtypeStruct((tokens, value_heads), g.dtype)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_prepare_wy_repr_bwd",
-        )(spans.chunks, *_flat(k, v, beta, g, a, dw, du, *earlier))
+        )(spans.chunks, *_flat(k, v, beta, g, a, dw, du, pairs, after, *earlier,
+                               *([] if g_lo is None else [g_lo])))
         dk = parts.reshape(batch, length, key_heads, group, width).sum(3).astype(k.dtype) if group > 1 else \
             parts.reshape(k.shape)
         return (dk, dv.reshape(v.shape), db.reshape(beta.shape), dg.reshape(g.shape)), None
@@ -954,7 +1024,7 @@ class PrepareWyReprBwd(_Launch):
 _PREPARE_WY_REPR_BWD = PrepareWyReprBwd()
 
 
-def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, chunk: int = 64,
+def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, terms=None, g_lo=None, chunk: int = 64,
                         spans: Sequences | None = None, interpret: bool = False):
     """`(dk, dv, db, dg)` through the WY representation: fla's `prepare_wy_repr_bwd` (wy_fast.py:
     296-343). `k` `[B, T, H, K]`, `v` `[B, T, HV, V]`, `beta`, `g` (the cumulated
@@ -962,13 +1032,18 @@ def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, chunk: int = 64,
     per chunk `[B, T, HV, BT]`, `dw` and `du` the gradients of `w` and `u`, and `dk` `[B, T, H, K]`
     the keys' gradient so far, which the returned one includes, added in fp32 before its one
     rounding; without it, fla's call. `dk` is summed over each key head's group. fla tiles `BK`,
-    `BV` at 64 on an A100 and chose 4 warps, 2 stages (c53)."""
-    return spanned(_PREPARE_WY_REPR_BWD, k, v, beta, g, a, dw, du, dk, chunk=chunk, spans=spans,
-                   interpret=interpret)
+    `BV` at 64 on an A100 and chose 4 warps, 2 stages (c53). `terms` the query side's decay terms, its
+    pairs `[B, T, HV, BT]` and each token's `[B, T, HV]` (`chunk_bwd_dqkwg`'s), which the returned decay
+    gradient sums with this kernel's once (none where None); `g_lo` the prefix's remainder where
+    compensated."""
+    if terms is None:
+        terms = jnp.zeros((*g.shape, chunk), jnp.float32), jnp.zeros(g.shape, jnp.float32)
+    return spanned(_PREPARE_WY_REPR_BWD, k, v, beta, g, g_lo, a, dw, du, dk, *terms, chunk=chunk,
+                   spans=spans, interpret=interpret)
 
 
-def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int, aligned: bool,
-              scale: float, bk: int, exact: bool):
+def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, *refs, chunk: int, aligned: bool,
+              scale: float, bk: int, exact: bool, compensated: bool = False):
     """fla's `chunk_fwd_kernel_o` (fla/ops/common/chunk_o.py:43-147) for one chunk of one head and
     `BV` value columns: `o = scale * ((q h) exp2(g) + tril((q k^T) exp2(g_s - g_t)) v)`, the key
     columns walked `bk` at a time into fp32 accumulators, `A` cast to the values' dtype for its
@@ -976,6 +1051,7 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int
     BF16x6: the output reads them directly, and at TF32x3, the others' products before, a Qwen3.5
     hybrid's fp32 scores on an H100 sat 2.03 times their fp32 reference's distance from float64, 1.17
     at IEEE. The memory the chunk enters is read at its slot (`Sequences`)."""
+    gl_ref, (o_ref,) = (refs[0], refs[1:]) if compensated else (None, refs)
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     entered = chunk_ref[2]
 
@@ -992,8 +1068,9 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int
             out += _dot(query, h_ref[entered, columns, :], exact=exact, ieee=True)
             scores += _dot(query, read(k_ref, columns).T, exact=exact, ieee=True)
         gate = _gates(g_ref, start, taken, chunk)
-        out = out * jnp.exp2(gate)[:, None]
-        scores = scores * jnp.exp2(_pairs(gate, gate))
+        low = None if gl_ref is None else _gates(gl_ref, start, taken, chunk)
+        out = out * _raised(gate, low)[:, None]
+        scores = scores * jnp.exp2(_pairs(gate, gate, low, low))
         index = jnp.arange(chunk)
         scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
         value = read(v_ref)
@@ -1010,8 +1087,8 @@ class ChunkFwdO(_Launch):
     PICKS = _picks(Tiles(128, 128, 8, 3))
 
     def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, h: jax.Array, g: jax.Array,
-             chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float, chunk: int,
-             interpret: bool, config: Tiles, wide: bool = False, return_residuals: bool = False):
+             g_lo: jax.Array | None, chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float,
+             chunk: int, interpret: bool, config: Tiles, wide: bool = False, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -1023,25 +1100,27 @@ class ChunkFwdO(_Launch):
         aligned = _aligned(spans, batch, length, chunk)
         keyed = pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h // group, 0))
         valued = pl.BlockSpec((tokens, None, bv), lambda i_v, i_t, i_h: (0, i_h, i_v))
+        gated = pl.BlockSpec((tokens, None), lambda i_v, i_t, i_h: (0, i_h))
+        compensated = g_lo is not None
         out = pl.pallas_call(
             functools.partial(_o_kernel, chunk=chunk, aligned=aligned, scale=scale, bk=min(bk, width),
-                              exact=interpret),
+                              exact=interpret, compensated=compensated),
             grid=(columns // bv, spans.chunks.shape[0], value_heads),
             in_specs=[pl.BlockSpec((None, 4), lambda i_v, i_t, i_h: (i_t, 0)), keyed, keyed, valued,
                       pl.BlockSpec((h.shape[0], None, width, bv), lambda i_v, i_t, i_h: (0, i_h, 0, i_v)),
-                      pl.BlockSpec((tokens, None), lambda i_v, i_t, i_h: (0, i_h))],
+                      gated, *([gated] if compensated else [])],
             out_specs=valued,
             out_shape=jax.ShapeDtypeStruct((tokens, value_heads, columns), jnp.float32 if wide else v.dtype),
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_fwd_o",
-        )(spans.chunks, *_flat(q, k, v), h, *_flat(g))
+        )(spans.chunks, *_flat(q, k, v), h, *_flat(g, *([g_lo] if compensated else [])))
         return out.reshape(v.shape), None
 
 
 _CHUNK_FWD_O = ChunkFwdO()
 
 
-def chunk_fwd_o(q, k, v, h, g, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
+def chunk_fwd_o(q, k, v, h, g, *, scale: float, g_lo=None, chunk: int = 64, spans: Sequences | None = None,
                 interpret: bool = False, wide: bool = False):
     """Each chunk's output, `[B, T, HV, V]` in `v`'s dtype, fp32 where `wide`, the readout unrounded for
     an epilogue after it: fla's `chunk_fwd_o` (chunk_o.py:529-575).
@@ -1050,8 +1129,9 @@ def chunk_fwd_o(q, k, v, h, g, *, scale: float, chunk: int = 64, spans: Sequence
     enter at their slots `[slots, HV, K, V]` (`chunk_fwd_h`), `g` the base-2 log decay cumulated within each
     chunk (`recurrence.cumulated`) `[B, T, HV]` fp32. Grouped queries: value head `i` reads
     key head `i // (HV // H)`. `T` is a whole number of chunks; `bk`, `bv`, `warps` and `stages` are
-    one of fla's configs (`BK, BV` 128/128 at 8 warps, 64/64 at 4, 32/32 at 2, all 3 stages)."""
-    return spanned(_CHUNK_FWD_O, q, k, v, h, g, chunk=chunk, spans=spans,
+    one of fla's configs (`BK, BV` 128/128 at 8 warps, 64/64 at 4, 32/32 at 2, all 3 stages). `g_lo` the
+    prefix's remainder where compensated, which the decays take too."""
+    return spanned(_CHUNK_FWD_O, q, k, v, h, g, g_lo, chunk=chunk, spans=spans,
                    scale=scale, interpret=interpret, wide=wide)
 
 
@@ -1069,7 +1149,8 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
     recomputes in its backward from the initial memory, as the rule does without `keep` (a remat rung
     recomputing 'delta_memory', `dew.nn.backbones.decoder_block.RematPolicy.recompute`). Each is
     named for a block's remat policy, which keeps or recomputes it."""
-    return prefixed_fwd(cumulated_fwd, q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret, keep, wide)
+    return prefixed_fwd(cumulated_fwd, q, k, v, g, beta, h0, cu_seqlens, scale, chunk, interpret, keep, wide,
+                        compensated=True)
 
 
 def prefixed_fwd(cumulated, q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool,
@@ -1087,18 +1168,21 @@ def prefixed_fwd(cumulated, q, k, v, g, beta, h0, cu_seqlens, scale: float, chun
 
 def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: int, interpret: bool,
                   keep: bool = True, wide: bool = False):
-    """`_rule_fwd` from the decay cumulated in base 2 within each chunk (`recurrence.cumulated`), which is
-    all the rest of the rule reads of it: the inverse, `w` and `u`, the memory across chunks, then the
-    output, and what the backward saves. The prefix is a value the port rounds and holds, a node of
-    its graph (the accuracy gate's source-aware check, `assert_graph_as_exact`), and this the port's
-    arithmetic on it."""
+    """`_rule_fwd` from the decay cumulated in base 2 within each chunk (`recurrence.cumulated`), its `(hi,
+    lo)` halves `g`, which is all the rest of the rule reads of it: the inverse, `w` and `u`, the memory
+    across chunks, then the output, and what the backward saves. The decays over two positions take both
+    halves (`_pairs`, `_range`): from the rounded prefix alone a steep token's rounding took every mild one
+    after it, the output 1530 times the portable math's distance from float64 (ledger 2098). The prefix is a
+    value the port rounds and holds, a node of its graph (the accuracy gate's source-aware check,
+    `assert_graph_as_exact`), and this the port's arithmetic on it."""
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
-    a = checkpoint_name(kkt_solve(k, g, beta, **kernels), 'delta_inverse')
-    w, u = recompute_w_u(k, v, beta, a, g, **kernels)
-    h, corrected, final = chunk_fwd_h(k, w, u, g, h0, **kernels)
-    o = chunk_fwd_o(q, k, corrected, h, g, scale=scale, wide=wide, **kernels)
+    prefix, (g, g_lo) = g, g
+    a = checkpoint_name(kkt_solve(k, g, beta, g_lo=g_lo, **kernels), 'delta_inverse')
+    w, u = recompute_w_u(k, v, beta, a, g, g_lo=g_lo, **kernels)
+    h, corrected, final = chunk_fwd_h(k, w, u, g, h0, g_lo=g_lo, **kernels)
+    o = chunk_fwd_o(q, k, corrected, h, g, scale=scale, g_lo=g_lo, wide=wide, **kernels)
     memory = checkpoint_name((w, h, corrected), 'delta_memory') if keep else None
-    return (o, final), (q, k, v, g, beta, a, h0, memory, spans)
+    return (o, final), (q, k, v, prefix, beta, a, h0, memory, spans)
 
 
 def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool, residual, cotangent):
@@ -1108,20 +1192,22 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
     gradient, each token's summed over the terms through it (`_summed_back`), which a sequence's first
     token with no memory before it takes as exactly zero. A `wide` output's cotangent is taken in the
     values' dtype, as the kernels take an output's."""
-    q, k, v, g, beta, a, h0, memory, spans = residual
+    q, k, v, (g, g_lo), beta, a, h0, memory, spans = residual
     do, dht = cotangent
     do = do.astype(v.dtype) if wide else do
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     if keep:
         w, h, corrected = memory
     else:
-        w, u = recompute_w_u(k, v, beta, a, g, **kernels)
-        h, corrected, _ = chunk_fwd_h(k, w, u, g, h0, **kernels)
-    dv = chunk_bwd_dv_local(q, k, g, do, scale=scale, **kernels)
-    dh, dh0, dv = chunk_bwd_dhu(q, k, w, g, dht.astype(jnp.float32), do, dv, scale=scale, **kernels)
-    dq, dk, dw, dg = chunk_bwd_dqkwg(q, k, corrected, w, g, h, dv, do, dh, scale=scale, **kernels)
-    dk, dv, db, dg2 = prepare_wy_repr_bwd(k, v, beta, g, a, dw, dv, dk, **kernels)
-    return dq, dk, dv, (dg + dg2).astype(jnp.float32), db, dh0, None
+        w, u = recompute_w_u(k, v, beta, a, g, g_lo=g_lo, **kernels)
+        h, corrected, _ = chunk_fwd_h(k, w, u, g, h0, g_lo=g_lo, **kernels)
+    dv = chunk_bwd_dv_local(q, k, g, do, scale=scale, g_lo=g_lo, **kernels)
+    dh, dh0, dv = chunk_bwd_dhu(q, k, w, g, dht.astype(jnp.float32), do, dv, scale=scale, g_lo=g_lo,
+                                **kernels)
+    dq, dk, dw, terms = chunk_bwd_dqkwg(q, k, corrected, w, g, h, dv, do, dh, scale=scale, g_lo=g_lo,
+                                        **kernels)
+    dk, dv, db, dg = prepare_wy_repr_bwd(k, v, beta, g, a, dw, dv, dk, terms=terms, g_lo=g_lo, **kernels)
+    return dq, dk, dv, dg.astype(jnp.float32), db, dh0, None
 
 
 chunk_gated_delta_rule = jax.custom_vjp(_rule, nondiff_argnums=(7, 8, 9, 10, 11))

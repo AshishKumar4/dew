@@ -19,7 +19,6 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
-import inspect
 from typing import Any, ClassVar
 
 import jax
@@ -555,20 +554,6 @@ COLUMNS = Launch(32, 8)
 """The launch over value columns: 32 a program, 16 to 64 measured within 3% on an RTX 4080."""
 
 
-def _operands_named(fwd):
-    """`fwd` (`StepLaunch._fwd`) with its operands, `Step`'s fields (`OPERANDS`), named in its signature as
-    keyword arguments, which a launch's arguments bind to by name (`tuning`'s keys and stored launches), each
-    an array or None as tokamax serializes a launch it describes."""
-    parameter = inspect.Parameter
-    given = inspect.signature(fwd).parameters.values()
-    fwd.__signature__ = inspect.Signature([
-        *(each for each in given if each.kind is parameter.POSITIONAL_OR_KEYWORD),
-        *(parameter(name, parameter.KEYWORD_ONLY, default=None, annotation=jax.Array | None)
-          for name in OPERANDS),
-        *(each for each in given if each.kind is parameter.KEYWORD_ONLY)])
-    return fwd
-
-
 @dataclasses.dataclass(frozen=True)
 class StepLaunch(tuning.KernelOp):
     """A decode token in one launch over rows and value heads (`_kernel`), its `hooks` inlined. Off a GPU
@@ -584,12 +569,20 @@ class StepLaunch(tuning.KernelOp):
         return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
                 for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
 
-    @_operands_named
-    def _fwd(self, active: jax.Array, *, hooks: Hooks, dtype: str, interpret: bool, config: Launch,
-             return_residuals: bool = False, **operands):
+    def _fwd(self, active: jax.Array, *, state: jax.Array, query: jax.Array | None = None,
+             key: jax.Array | None = None, value: jax.Array | None = None, token: jax.Array | None = None,
+             held: jax.Array | None = None, taps: jax.Array | None = None, log_decay: jax.Array | None = None,
+             gate: jax.Array | None = None, beta: jax.Array | None = None, log_a: jax.Array | None = None,
+             bias: jax.Array | None = None, skip: jax.Array | None = None, z: jax.Array | None = None,
+             weight: jax.Array | None = None, rate: jax.Array | None = None, hooks: Hooks, dtype: str,
+             interpret: bool, config: Launch, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        given = {name: operands[name] for name in _names(hooks)}
+        # The operands as the token's `Step`, whose fields name them (`OPERANDS`).
+        operands = Step(state=state, query=query, key=key, value=value, token=token, held=held, taps=taps,
+                        log_decay=log_decay, gate=gate, beta=beta, log_a=log_a, bias=bias, skip=skip, z=z,
+                        weight=weight, rate=rate)
+        given = {name: getattr(operands, name) for name in _names(hooks)}
         rows, value_heads, key_width, value_width = given['state'].shape
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
                      if hooks.conv is not None else given['query'].shape[1])
