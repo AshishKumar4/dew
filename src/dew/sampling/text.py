@@ -38,13 +38,6 @@ from dew.batch import Variables, prefix_sum, real_slots, token_positions, valid_
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
-from dew.nn.kv_cache import (
-    gather_cache_rows,
-    refuse_unassigned,
-    with_rounding_keys,
-    with_rounding_keys_of,
-    write_cache,
-)
 from dew.nn.protocols import (
     BlockDenoiser,
     BlockDrafting,
@@ -375,6 +368,8 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     row's stochastic-rounding key data (`rounding_keys`), which the cache then holds for every later
     call (`dew.nn.kv_cache.with_rounding_keys`); None leaves the cache's.
     """
+    from dew.nn.kv_cache import with_rounding_keys, write_cache
+
     batch, width = inputs.tokens.shape
     held = _empty_cache(model, params, batch, ops) if cache is None else cache
     if rounding is not None:
@@ -519,6 +514,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
 
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
+        from dew.nn.kv_cache import write_cache
+
         width = tokens.shape[1]
         positions = ({} if state.positions is None else
                      {"positions": state.positions[:, None] + jnp.arange(width)[None, :]})
@@ -547,6 +544,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 32. Rebuilding the prefix retains the prompt's information.
                 https://github.com/huggingface/transformers/issues/49334
                 """
+                from dew.nn.kv_cache import with_rounding_keys_of
+
                 empty = with_rounding_keys_of(
                     model.apply(params, tokens.shape[0], method='init_cache', mutable=['cache'])[1]['cache'],
                     state.cache)
@@ -587,6 +586,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     def reindex(state: DecoderState, rows: jax.Array) -> DecoderState:
         # The whole carry moves, the prediction states with it; a leaf left
         # behind would hand a reparented row another row's history.
+        from dew.nn.kv_cache import gather_cache_rows
+
         return dataclasses.replace(
             jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0),
                          dataclasses.replace(state, cache={})),
@@ -946,6 +947,8 @@ def generate(model: nn.Module, params: Variables,
     prompt with fewer real tokens than an int ``prefix`` is refused there, by
     every process of a pool together.
     """
+    from dew.nn.kv_cache import refuse_unassigned
+
     if sampling.stop:
         raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
                          "have; generate through a TextGeneration with a processor, or pass "

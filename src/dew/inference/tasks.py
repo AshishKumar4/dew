@@ -33,7 +33,6 @@ from dew.batch import PARAMETER_ROOTS, Variables, thaw
 from dew.cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
-from dew.inference.projections import packed_owned
 from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
@@ -706,6 +705,8 @@ class _NativeTextTask(SavedRunTask):
         as its objective restores them, its task settings, and its host processor. The task owns
         the weights it restored: their projections pack here, once, as a source's do at its load
         (`dew.pipeline`), so every route reads the same packed weights."""
+        from dew.inference.projections import packed_owned
+
         config = saved_model(run.record, dtype)
         held = saved_settings(run.record, settings)
         model = config.build()

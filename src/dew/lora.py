@@ -43,7 +43,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path as FilePath
-from typing import ClassVar, NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, NotRequired, Protocol, TypedDict, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -58,8 +58,6 @@ from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, s
 from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
-from dew.nn.backbones.layer_plan import group_layers
-from dew.nn.dense import _contractions, _linear_site
 from dew.nn.dropout import Dropout
 from dew.nn.flops import (
     MissingFlopsCount,
@@ -87,14 +85,10 @@ from dew.nn.protocols import (
     CountedVideo,
 )
 from dew.nn.sharding import LOW_RANK_FACTORS
-from dew.quantization import (
-    FROZEN_FP8,
-    QUANTIZATION,
-    InputQuantization,
-    decoded_frozen_fp8,
-    measured_fp8_sites,
-)
 from dew.registry import Wrapper, rebuilt, wrapper_layers
+
+if TYPE_CHECKING:
+    from dew.quantization import InputQuantization
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -207,6 +201,7 @@ class LoRA:
         time: its codes take two bytes a parameter, as bf16's do, and multiply as
         bf16 values (`dew.quantization.frozen_fp8_product`).
         """
+
         from dew.nn.inputs import request_key
 
         _refuse_unadaptable(model)
@@ -278,6 +273,8 @@ class LoRA:
         measurement holds the GPU; a run records its result, so a rerun
         reproduces the choice without measuring.
         """
+        from dew.quantization import measured_fp8_sites
+
         bound = _named(bound_layouts(model, thaw(variables), layouts or {}),
                        self.modules if modules is None else tuple(modules))
         sites = tuple("/".join(layout.paths[0][1:-1]) for layout in bound.values())
@@ -508,6 +505,8 @@ class Adapter:
         the codes go, since a model under the record would multiply them in the merged
         kernel's place. The result is one `params` collection.
         """
+        from dew.quantization import decoded_frozen_fp8
+
         variables = decoded_frozen_fp8(thaw(variables))
         merged: dict = {}
         for path, target in self.targets.items():
@@ -585,6 +584,8 @@ def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax
 def _targets_under(targets: Mapping[Path, Target], path: Path) -> bool:
     """Whether a target lies at or under the module `path`, a scanned run standing for each layer it
     runs (`_target_at`)."""
+    from dew.nn.backbones.layer_plan import group_layers
+
     paths = [path]
     for depth, name in enumerate(path):
         layers = group_layers(name)
@@ -599,6 +600,8 @@ def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
     it: a scanned run's module `layers_3_7` stands for layers 3 through 7,
     whose targets must agree, since the run's kernels share one stacked
     factor pair."""
+    from dew.nn.backbones.layer_plan import group_layers
+
     if path in targets:
         return targets[path]
     for depth, name in enumerate(path):
@@ -652,6 +655,8 @@ class _Branch:
         return self.bound.dropout
 
     def __call__(self, next_fun, args, kwargs, context):
+        from dew.nn.dense import _contractions, _linear_site
+
         module = context.module
         root = self.root
         if context.method_name == "nonlinear_input":
@@ -825,6 +830,8 @@ def _fp8_packed(model: nn.Module, variables: Variables) -> dict:
     only kernels an adapter never trains, in place of those kernels: the
     product never reads them (`frozen_fp8_dense`), and a merge decodes them
     (`frozen_fp8_kernel`)."""
+    from dew.quantization import QUANTIZATION, InputQuantization
+
     records = [layer._dew_wrapper() for layer in wrapper_layers(type(model))[1]]
     record = next((wrapper for wrapper in records if isinstance(wrapper, InputQuantization)), None)
     if record is None or not record.frozen_fp8:
@@ -945,6 +952,8 @@ def _record(bound: _Bound) -> AdapterRecord:
 def _site_codes(variables: Variables, path: Path) -> Mapping | None:
     """A frozen FP8 site's packed leaves for the module at `path` (under
     `params`), or None where the module holds its own kernel."""
+    from dew.quantization import FROZEN_FP8, QUANTIZATION
+
     leaves = variables.get(QUANTIZATION, {})
     for name in path[1:]:
         leaves = leaves.get(name, {})
@@ -954,6 +963,8 @@ def _site_codes(variables: Variables, path: Path) -> Mapping | None:
 def _kernel_shape(variables: Variables, path: Path) -> tuple[int, ...]:
     """The shape of the kernel of the module at `path`, its own or a frozen FP8 site's as its codes
     decode (`decoded_frozen_fp8`), read without decoding them."""
+    from dew.quantization import FROZEN_FP8
+
     codes = _site_codes(variables, path)
     return tuple(np.shape(_node(variables, path)["kernel"] if codes is None else codes[FROZEN_FP8[0]].T))
 
