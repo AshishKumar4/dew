@@ -26,12 +26,18 @@ class Cell:
 
 
 class CellsFailed(AssertionError):
-    """Every failed cell of a flow, each by its label beside its error's own report."""
+    """Every failed cell of a flow, each by its label beside its error's own report; `labels` the failed
+    cells' in order."""
+
+    def __init__(self, failed: list[tuple[str, str]]):
+        super().__init__("\n\n".join(f"{label}:\n{report}" for label, report in failed))
+        self.labels = [label for label, _ in failed]
 
 
-def run_cells(cells: Iterable[Cell]) -> None:
+def run_cells(cells: Iterable[Cell]) -> list[str]:
     """Run every cell in order (`Cell`): each label printed first; every failure kept and raised together
-    after the last; the cells this device cannot run, or that skip themselves, reported skipped."""
+    after the last; the cells this device cannot run, or that skip themselves, reported skipped, their
+    labels returned."""
     failed, skipped, passed = [], [], 0
     for cell in cells:
         if cell.generation is not None and not runnable(cell.generation):
@@ -50,6 +56,7 @@ def run_cells(cells: Iterable[Cell]) -> None:
             passed += 1
     print(f"cells: {passed} passed, {len(failed)} failed, {len(skipped)} skipped on this device", flush=True)
     if failed:
-        raise CellsFailed("\n\n".join(f"{label}:\n{report}" for label, report in failed))
+        raise CellsFailed(failed)
     if not passed:
         pytest.skip(f"no cell runs on this device ({len(skipped)} skipped)")
+    return skipped
