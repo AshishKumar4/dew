@@ -20,9 +20,18 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from certified import native_dot_holds, promoted_step_holds, tf32_operand
+from certified import (
+    assert_refused,
+    native_dot_ends,
+    native_dot_holds,
+    promoted_step_ends,
+    promoted_step_holds,
+    separated,
+    tf32_operand,
+    truncating_step_ends,
+)
 from generation_support import generations, runs
-from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, truncated
+from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, rounded, truncated
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import template
@@ -43,6 +52,24 @@ FALL = 2.0 ** -12
 partial a few thousandths of the accumulator, so the exact-sums witness of its add, whose partial's
 allowance (γ of a step's 64 products at 2^-23, of their magnitudes) falls below the accumulator's last
 place, decides the add's rounding."""
+
+
+LOST_SHARE = 0.9
+"""The least share of the elements a lost block of sixteen rows or depth columns reaches whose interval on
+the call's products is separated from that on the products the kernel was given (`assert_refused`)."""
+MOVED_SHARE = 0.9
+"""The same of the elements a row read under its neighbour group reaches."""
+NARROW_SHARE = 0.75
+"""The same of an fp32 forward's elements where a partial sum over half the depth is rounded to bf16 before
+the rest is added, on Gaussian draws, whose partials sometimes cancel to a bf16 value's neighbourhood."""
+TRUNCATED_SHARE = 0.4
+"""The same of a kernel gradient's elements past each group's first depth step, on a falling draw of one sign
+(`FALL`), where its default launch adds each step's products by truncating adds and exact sums are
+declared."""
+TF32_SHARES = {True: (0.9, 0.9, 0.8), False: (0.9, 0.9, 0.95)}
+"""The same, on Gaussian draws and on draws of one sign, of an fp32 forward's elements where its operands'
+bf16 values are multiplied and TF32 is declared, its TF32 values where bf16 is, and its truncated TF32 values
+where they are rounded."""
 
 
 def cells(*pairs) -> list:
@@ -122,6 +149,19 @@ def rows_products(x, dy) -> np.ndarray:
 def kernel_gradient_products(x, dy, sizes) -> list[np.ndarray]:
     """Each group's kernel gradient's exact products (`rows_products` of its rows)."""
     return [rows_products(x[start:end], dy[start:end]) for start, end in spans(sizes)]
+
+
+def kernel_gradient_ends(products: list) -> tuple[np.ndarray, np.ndarray]:
+    """`[groups, depth, width]`: the least and the greatest fp32 value of each element of a kernel gradient
+    its groups' exact `products` admit (`native_dot_ends`)."""
+    ends = [native_dot_ends(group, FLOAT32, flushes=False) for group in products]
+    return np.stack([low for low, _ in ends]), np.stack([high for _, high in ends])
+
+
+def products_apart(declared, given, out) -> np.ndarray:
+    """Where the native-dot intervals in `out` (`native_dot_ends`) of a call's `declared` products and of the
+    products a kernel run around a defect was `given` are separated (`separated`)."""
+    return separated(*(native_dot_ends(products, out, flushes=False) for products in (declared, given)))
 
 
 def kernel_gradient_holds(native, products: list, out) -> np.ndarray:
@@ -223,14 +263,14 @@ def steps_of(sizes, width: int, aligned: bool) -> list[list[slice]]:
             if end > start else [] for start, end in spans(sizes)]
 
 
-def gradient_steps(kernel: str, sizes=SIZES) -> list[list[slice]]:
-    """Each group's depth steps (`steps_of`) of the exact-sums kernel gradient `kernel` launches on
-    `sizes`."""
+def gradient_steps(kernel: str, precision="highest") -> list[list[slice]]:
+    """Each group's depth steps (`steps_of`) of the fp32 kernel gradient `kernel` launches on `SIZES` at
+    `precision` (above the default, of exact sums)."""
     def rows(width):
         return jax.ShapeDtypeStruct((ROWS, width), jnp.bfloat16)
 
-    exact = kernel_gradient(sizes, jnp.float32, precision="highest")
-    return steps_of(sizes, *depth_step(GRADIENTS[kernel], exact, rows(DEPTH), rows(WIDTH)))
+    gradient = kernel_gradient(SIZES, jnp.float32, precision=precision)
+    return steps_of(SIZES, *depth_step(GRADIENTS[kernel], gradient, rows(DEPTH), rows(WIDTH)))
 
 
 def scaled(x, steps, first: int, factor: float) -> np.ndarray:
@@ -252,24 +292,42 @@ def states_of(run, x, steps) -> list[np.ndarray]:
     return [np.zeros_like(outputs[-1]), *outputs]
 
 
-def witnessed(states, steps, products_of) -> list[list[np.ndarray]]:
-    """[group][step]: whether each element of the native output after the group's depth step is the IEEE sum
-    of the one before it and the step's own partial (`promoted_step_holds`), `states[j][group]` the output
-    after j steps (`states_of`) and `products_of(group, step)` the step's exact products."""
-    return [[promoted_step_holds(states[j][group], states[j + 1][group], products_of(group, step),
-                                 flushes=False)
-             for j, step in enumerate(taken)] for group, taken in enumerate(steps)]
-
-
-def kernel_gradient_witnessed(x, dy, steps, *, ran=None, sizes=SIZES, precision="highest") -> list:
-    """The step witness (`witnessed`) of the native fp32 kernel gradient launched on `ran` (a fault's
-    operand; `x` itself by default) and `dy`, `sizes` and `precision`, against the exact products of `x`'s
-    and `dy`'s rows in each of `SIZES`' groups' `steps`."""
+def kernel_gradient_states(x, dy, steps, *, sizes=SIZES, precision="highest") -> list[np.ndarray]:
+    """The native fp32 kernel gradient of `x` and `dy` launched on `sizes` at `precision` after each depth
+    step of `steps` (`states_of`)."""
     def run(rows):
         return kernel_gradient_of(rows, dy, sizes, jnp.float32, precision=precision)
 
-    states = states_of(run, x if ran is None else ran, steps)
-    return witnessed(states, steps, lambda group, rows: rows_products(x[rows], dy[rows]))
+    return states_of(run, x, steps)
+
+
+def stepped_products(x, dy):
+    """A kernel gradient's depth step's exact products, of the rows of `x` and `dy` it sums
+    (`rows_products`), by the step's group and rows."""
+    return lambda _, rows: rows_products(x[rows], dy[rows])
+
+
+def stepwise(states, steps, contract) -> list[list[np.ndarray]]:
+    """[group][step]: `contract(before, after, group, j, step)` at each group's depth step j,
+    `states[j][group]` the output after its first j steps (`states_of`)."""
+    return [[contract(states[j][group], states[j + 1][group], group, j, step) for j, step in enumerate(taken)]
+            for group, taken in enumerate(steps)]
+
+
+def witnessed(states, steps, products_of) -> list[list[np.ndarray]]:
+    """[group][step]: whether each element of the native output after the group's depth step is the IEEE sum
+    of the one before it and the step's own partial (`promoted_step_holds`), `products_of(group, step)` the
+    step's exact products."""
+    return stepwise(states, steps, lambda before, after, group, _, step: promoted_step_holds(
+        before, after, products_of(group, step), flushes=False))
+
+
+def apart_from(states, steps, products_of, fault_ends) -> list[list[np.ndarray]]:
+    """[group][step]: where the step witness's interval on the call's products (`products_of(group, step)`,
+    `promoted_step_ends`) is separated from a fault's, `fault_ends(before, group, j, step)` (`separated`)."""
+    return stepwise(states, steps, lambda before, _, group, j, step: separated(
+        promoted_step_ends(before, before, products_of(group, step), flushes=False),
+        fault_ends(before, group, j, step)))
 
 
 def forward_witnessed(x, w, steps) -> list:
@@ -280,6 +338,11 @@ def forward_witnessed(x, w, steps) -> list:
 
     return witnessed(states_of(run, x, steps), steps,
                      lambda _, step: forward_products(x[step], w[:, step[1]], SIZES))
+
+
+def flat(lists, first: int = 0) -> np.ndarray:
+    """[group][step] arrays as one, each group's from its step `first` on."""
+    return np.concatenate([step.ravel() for taken in lists for step in taken[first:]])
 
 
 def everywhere(held, but=()) -> bool:
@@ -341,7 +404,8 @@ def test_the_kernel_gradients_exact_sums_certify_natively_a_step_at_a_time(kerne
         for seed in range(SEEDS):
             x, _, dy = draw(seed, signed)
             for rows in (x, scaled(x, steps, 1, FALL)):
-                assert everywhere(kernel_gradient_witnessed(rows, dy, steps)), seed
+                held = witnessed(kernel_gradient_states(rows, dy, steps), steps, stepped_products(rows, dy))
+                assert everywhere(held), seed
 
 
 @pytest.mark.parametrize("kernel, generation_name", TRITON)
@@ -366,74 +430,106 @@ def test_the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time(kernel,
 @pytest.mark.parametrize("kernel, generation_name", PLAIN)
 def test_the_kernel_gradients_certificate_refuses_a_lost_block_and_a_misrouted_row(kernel, generation_name):
     """The kernel gradient's faults, in an fp32 output, whose grid shows them, each the native kernel run
-    around a defect and certified against the true operands: a lost block of sixteen of group 3's rows,
-    refused at that group's gradient alone, and a row read under its neighbour group, refused at both groups'
-    alone."""
+    around a defect, certified against the true operands and refused where it lands (`assert_refused`): a
+    lost block of sixteen of group 3's rows, at more than `LOST_SHARE` of that group's gradient, and a row
+    read under its neighbour group, at more than `MOVED_SHARE` of both groups' gradients; every other group's
+    holds."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         x, _, dy = draw(0, signed=True)
         products = kernel_gradient_products(x, dy, SIZES)
-        lost = scaled(x, [[LOST]], 0, 0.0)
-        held = kernel_gradient_holds(kernel_gradient_of(lost, dy, SIZES, jnp.float32), products, FLOAT32)
-        assert np.mean(held[3]) < 0.05 and np.all(np.delete(held, 3, axis=0))
-        held = kernel_gradient_holds(kernel_gradient_of(x, dy, SHIFTED, jnp.float32), products, FLOAT32)
-        assert np.mean(held[1:3]) < 0.05 and np.all(np.delete(held, (1, 2), axis=0))
+        for ran, sizes, faulty, share in ((scaled(x, [[LOST]], 0, 0.0), SIZES, [3], LOST_SHARE),
+                                          (x, SHIFTED, [1, 2], MOVED_SHARE)):
+            held = kernel_gradient_holds(kernel_gradient_of(ran, dy, sizes, jnp.float32), products, FLOAT32)
+            apart = separated(kernel_gradient_ends(products),
+                              kernel_gradient_ends(kernel_gradient_products(ran, dy, sizes)))
+            assert_refused(held[faulty], apart[faulty], share)
+            assert np.all(np.delete(held, faulty, axis=0))
 
 
 @pytest.mark.parametrize("kernel, generation_name", EXACT)
 def test_the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_row(kernel, generation_name):
-    """The exact-sums witness's faults, each the native kernel gradient run around a defect and witnessed a
-    step at a time against the true operands: the default launch, whose tensor cores add each step's products
-    into the accumulator by truncating adds, where exact sums are declared, refused at most of the elements
-    past each group's first step of a falling draw of one sign (`FALL`), where the witness decides the add's
-    rounding and every truncation errs one way (at 87% of them on Triton's launch, 99% on Mosaic GPU's); a
-    lost block of sixteen of group 3's rows, refused at the step that loses them and nowhere else; and a row
-    read under its neighbour group, refused at both groups' first steps and nowhere past those groups."""
+    """The exact-sums witness's faults, each the native kernel gradient run around a defect, witnessed a step
+    at a time against the true operands and refused where it lands (`assert_refused`): the default launch,
+    whose tensor cores add each step's products into the accumulator itself by truncating adds
+    (`truncating_step_ends`), where exact sums are declared, on a falling draw of one sign (`FALL`), at more
+    than `TRUNCATED_SHARE` of the elements past each group's first step, about those whose exact sum lies
+    past the midpoint between two fp32 values, which a truncation leaves below and a rounding above; a lost
+    block of sixteen of group 3's rows, at more than `LOST_SHARE` of the step that loses them, and nowhere
+    else; and a row read under its neighbour group, at more than `MOVED_SHARE` of both groups' first steps
+    (its groups each summing their own rows, in whatever steps, within the native-dot contract, exact sums'
+    adds within its truncating ones), and nowhere past those groups."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         steps = gradient_steps(kernel)
+        # The default launch takes the same steps, so its outputs a step at a time are its accumulator's.
+        assert gradient_steps(kernel, precision=None) == steps
         x, _, dy = draw(0, signed=False)
-        held = kernel_gradient_witnessed(scaled(x, steps, 1, FALL), dy, steps, precision=None)
-        assert np.mean(np.concatenate([step.ravel() for taken in held for step in taken[1:]])) < 0.25
+        falling = scaled(x, steps, 1, FALL)
+        products_of = stepped_products(falling, dy)
+        states = kernel_gradient_states(falling, dy, steps, precision=None)
+        held = witnessed(states, steps, products_of)
+        apart = apart_from(states, steps, products_of, lambda before, group, _, step: truncating_step_ends(
+            before, products_of(group, step), flushes=False))
+        assert not np.any(flat(held) & flat(apart))
+        assert_refused(flat(held, 1), flat(apart, 1), TRUNCATED_SHARE)
         x, _, dy = draw(0, signed=True)
+        products_of, lost = stepped_products(x, dy), scaled(x, [[LOST]], 0, 0.0)
+        states = kernel_gradient_states(lost, dy, steps)
+        held = witnessed(states, steps, products_of)
+        apart = apart_from(states, steps, products_of, lambda before, group, _, step: promoted_step_ends(
+            before, before, stepped_products(lost, dy)(group, step), flushes=False))
         [losing] = [j for j, step in enumerate(steps[3])
                     if step.start <= LOST.start and LOST.stop <= step.stop]
-        held = kernel_gradient_witnessed(x, dy, steps, ran=scaled(x, [[LOST]], 0, 0.0))
-        assert np.mean(held[3][losing]) < 0.05 and everywhere(held, but={(3, losing)})
-        held = kernel_gradient_witnessed(x, dy, steps, sizes=SHIFTED)
-        assert max(np.mean(held[1][0]), np.mean(held[2][0])) < 0.05 and everywhere(held[3:])
+        assert_refused(held[3][losing], apart[3][losing], LOST_SHARE)
+        assert everywhere(held, but={(3, losing)})
+        states = kernel_gradient_states(x, dy, steps, sizes=SHIFTED)
+        held = witnessed(states, steps, products_of)
+        kept = [kernel_gradient_products(scaled(x, steps, j, 0.0), dy, SHIFTED)
+                for j in range(1, len(states))]
+        apart = apart_from(states, steps, products_of, lambda _, group, j, __: native_dot_ends(
+            kept[j][group], FLOAT32, flushes=False))
+        assert not np.any(flat(held) & flat(apart))
+        assert_refused(np.stack([held[1][0], held[2][0]]), np.stack([apart[1][0], apart[2][0]]), MOVED_SHARE)
+        assert everywhere(held[3:])
 
 
 @pytest.mark.parametrize("kernel, generation_name", TRITON)
+@pytest.mark.parametrize("signed", [True, False], ids=["gaussian", "same sign"])
 def test_the_tf32_certificate_refuses_bf16_products_tf32_where_bf16_is_declared_and_a_truncated_read(
-        kernel, generation_name):
+        kernel, generation_name, signed):
     """The TF32 contract's faults, each the native forward of fp32 operands certified against products the
-    call does not take, on draws of one sign: the operands rounded to bf16 first (bf16 products where TF32 is
-    declared) and the operands themselves (TF32 products) against their bf16 values' products, which a bf16
-    product declares (`gemm`'s `compute`, the MoE projection's), each refused at more than nine elements in
-    ten (bf16 moves a product by up to 2^-8 of it, either way, where the allowance is γ_128 at 2^-23 of the
-    products' magnitudes); and the operands truncated to TF32 first, where the tensor cores round them to
-    nearest, refused at nearly every element (a truncation moves each product toward zero by up to 2^-10 of
-    it, every product the same way)."""
+    call does not take and refused where it lands (`assert_refused`, `TF32_SHARES`): the operands rounded to
+    bf16 first (bf16 products where TF32 is declared); the operands themselves (TF32 products) against their
+    bf16 values' products, which a bf16 product declares (`gemm`'s `compute`, the MoE projection's); and the
+    operands truncated to TF32 first, where the tensor cores round them to nearest. bf16 moves a product by
+    up to 2^-8 of it, either way, and a truncation by up to 2^-10 of it toward zero, where the allowance is
+    γ_128 at 2^-23 of the products' magnitudes: on draws of one sign, whose errors all go one way, the
+    truncation is refused nearly everywhere."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
-        x, w, _ = draw(0, signed=False, dtype=np.float32)
+        x, w, _ = draw(0, signed, np.float32)
 
         def forward(*operands):
             return forward_of(*operands, SIZES, jnp.float32, dtype=jnp.float32)
 
-        tf32 = forward_products(tf32_operand(x), tf32_operand(w), SIZES)
-        for native, products, most in ((forward(bf16(x), bf16(w)), tf32, 0.1),
-                                       (forward(x, w), forward_products(bf16(x), bf16(w), SIZES), 0.1),
-                                       (forward(truncated(x, TFLOAT32), truncated(w, TFLOAT32)), tf32, 0.05)):
-            assert np.mean(native_dot_holds(native, products, FLOAT32, flushes=False)) < most
+        def read(left, right):
+            """The products the kernel takes of operands it is given: of their TF32 values."""
+            return forward_products(tf32_operand(left), tf32_operand(right), SIZES)
+
+        tf32, wide = read(x, w), forward_products(bf16(x), bf16(w), SIZES)
+        cases = (((bf16(x), bf16(w)), tf32), ((x, w), wide),
+                 ((truncated(x, TFLOAT32), truncated(w, TFLOAT32)), tf32))
+        for (operands, declared), share in zip(cases, TF32_SHARES[signed], strict=True):
+            held = native_dot_holds(forward(*operands), declared, FLOAT32, flushes=False)
+            assert_refused(held, products_apart(declared, read(*operands), FLOAT32), share)
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narrow_partial(generation_name):
-    """The rule's faults, each the native kernel run around a defect and certified against the true
-    operands: a lost block of sixteen products (one MMA's depth) in one group's rows, refused at those
-    rows and nowhere else; a row read under its neighbour group's matrix, refused at that row alone; and,
-    in an fp32 output, whose grid shows it, a partial sum over half the depth rounded to bf16 before the
-    rest is added, refused wherever that rounding outweighs the sum's own (about six elements in seven on
-    Gaussian draws)."""
+    """The rule's faults, each the native kernel run around a defect, certified against the true operands
+    and refused where it lands (`assert_refused`): a lost block of sixteen products (one MMA's depth) in one
+    group's rows, at more than `LOST_SHARE` of those rows, every other row holding; a row read under its
+    neighbour group's matrix, at more than `MOVED_SHARE` of that row alone; and, in an fp32 output, whose
+    grid shows it, a partial sum over half the depth rounded to bf16 before the rest is added, at more than
+    `NARROW_SHARE` of the elements of Gaussian draws, wherever that rounding outweighs the sum's own."""
     # The Mosaic template itself, refusing rather than falling back to another route.
     with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
         x, w, _ = draw(0, signed=True)
@@ -442,12 +538,22 @@ def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narro
         lost = x.copy()
         lost[np.ix_(rows, np.arange(32, 48))] = 0
         held = native_dot_holds(forward_of(lost, w, SIZES), products, BFLOAT16, flushes=False)
-        assert np.mean(held[rows]) < 0.05 and np.all(held[~rows])
+        assert_refused(held[rows], products_apart(products, forward_products(lost, w, SIZES), BFLOAT16)[rows],
+                       LOST_SHARE)
+        assert np.all(held[~rows])
         held = native_dot_holds(forward_of(x, w, SHIFTED), products, BFLOAT16, flushes=False)
         moved = groups(SIZES) != groups(SHIFTED)
-        assert moved.sum() == 1 and np.mean(held[moved]) < 0.05 and np.all(held[~moved])
-        halves = (np.concatenate([x[:, :64] * keep, x[:, 64:] * (1 - keep)], axis=1) for keep in (1.0, 0.0))
+        apart = products_apart(products, forward_products(x, w, SHIFTED), BFLOAT16)
+        assert moved.sum() == 1 and np.all(held[~moved])
+        assert_refused(held[moved], apart[moved], MOVED_SHARE)
+        halves = tuple(np.concatenate([x[:, :64] * keep, x[:, 64:] * (1 - keep)], axis=1)
+                       for keep in (1.0, 0.0))
         first, rest = (forward_of(half, w, SIZES, jnp.float32) for half in halves)
         narrow = np.asarray(np.float32(bf16(first)) + np.float32(rest), np.float64)
         held = native_dot_holds(narrow, products, FLOAT32, flushes=False)
-        assert np.mean(held) < 0.25
+        # The first half's bf16 value lies between its ends' bf16 values; the IEEE add is monotone in both.
+        halved = native_dot_ends(forward_products(halves[0], w, SIZES), FLOAT32, flushes=False)
+        narrowed = promoted_step_ends(*(rounded(end, np.zeros_like(end), BFLOAT16) for end in halved),
+                                      forward_products(halves[1], w, SIZES), flushes=False)
+        truth = native_dot_ends(products, FLOAT32, flushes=False)
+        assert_refused(held, separated(truth, narrowed), NARROW_SHARE)

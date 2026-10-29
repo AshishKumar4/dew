@@ -22,6 +22,7 @@ from op_certificates import (
     magnitude_sum,
     rounded,
     rounded_away,
+    truncated,
     two_sum,
 )
 
@@ -332,7 +333,7 @@ up to a whole unit in the last place, twice round to nearest's (src/dew/nn/kerne
 the unit roundoff of a format one bit narrower."""
 
 
-def _native_dot_ends(products, out: Format, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
+def native_dot_ends(products, out: Format, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
     """The least and the greatest value of `out` a native GEMM's output takes on its exact `products`
     (`native_dot_holds`): the nearest `out` values of the allowance's two ends; +0 for an empty sum."""
     count = products.shape[-1]
@@ -356,9 +357,28 @@ def native_dot_holds(native, products, out: Format, flushes: bool) -> np.ndarray
     plus what underflow loses past that (as `_terms_hold`), then rounded once to nearest in `out`, the
     output's format. Rounding is monotone, so the output lies between the nearest `out` values of the
     allowance's two ends."""
-    low, high = _native_dot_ends(products, out, flushes)
+    low, high = native_dot_ends(products, out, flushes)
     native = np.asarray(native, np.float64)
     return np.isfinite(native) & (native >= low) & (native <= high)
+
+
+def separated(ends, others) -> np.ndarray:
+    """Whether each element's two intervals (each its least and greatest values, as `native_dot_ends` gives
+    them) share no value. A kernel run around a defect computes, at each element, a value within the
+    interval of the products it was given (the contract's null); wherever that interval is separated from
+    the interval of the call's own products, the contract refuses it, whatever order or tile the kernel
+    sums in. So a fault's refusals are derived from its products, not counted from one run."""
+    (low, high), (other_low, other_high) = ends, others
+    return (high < other_low) | (other_high < low)
+
+
+def assert_refused(held, apart, share: float) -> None:
+    """A fault refused where it lands, as a native contract's validation holds it (row 2084): every element
+    whose interval on the call's products is separated from that on the products a kernel run around the
+    defect was given (`apart`, `separated`) is refused (`held` false), and those are more than `share` of
+    the elements, a share of the draw's products, which no order or tile the kernel legally takes moves."""
+    held, apart = np.asarray(held), np.asarray(apart)
+    assert not np.any(held & apart) and np.mean(apart) > share, np.mean(apart)
 
 
 def tf32_operand(values) -> np.ndarray:
@@ -372,6 +392,37 @@ def tf32_operand(values) -> np.ndarray:
     return rounded_away(values, TFLOAT32)
 
 
+def promoted_step_ends(low, high, products, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
+    """The least and the greatest fp32 value an IEEE add, rounded to nearest, takes of an accumulator
+    between `low` and `high` (fp32 values as float64, the same where it is known) and a depth step's partial,
+    an fp32 value its exact `products` admit as a tensor core sums them from zero (`native_dot_ends`):
+    rounding to nearest is monotone in both, so the sums' roundings at their ends."""
+    accumulator = FORMATS["float32"]
+    least, most = native_dot_ends(products, accumulator, flushes)
+    return (_rounded_on_lane(*two_sum(np.asarray(low, np.float64), least), accumulator, flushes),
+            _rounded_on_lane(*two_sum(np.asarray(high, np.float64), most), accumulator, flushes))
+
+
+def truncating_step_ends(before, products, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
+    """The least and the greatest fp32 value a tensor core's accumulator `before` (fp32 values as float64)
+    takes once a depth step's exact `products` are added into it by the MMA's own adds, which truncate
+    (`TRUNCATING`), as a launch without exact sums adds them: the native-dot contract's ends with the
+    accumulator one more term (`native_dot_ends`), and, where the accumulator and every product share a sign,
+    no further from zero than the exact sum, since each value an add of such terms makes is rounded toward
+    zero (Fasi, Higham, Mikaitis and Pranesh, Numerical behavior of NVIDIA tensor cores, PeerJ Computer
+    Science 7:e330, 2021: the products aligned and the sum normalized by truncation)."""
+    accumulator = FORMATS["float32"]
+    before = np.asarray(before, np.float64)
+    terms = np.concatenate([before[..., None], products], -1)
+    low, high = native_dot_ends(terms, accumulator, flushes)
+    # The float64 sum is within half its unit of the exact one, so a unit further from zero bounds it.
+    total = exact_sum(terms, -1)
+    bound = truncated(np.nextafter(total, np.copysign(np.inf, total)), accumulator)
+    positive = (before >= 0) & np.all(products >= 0, -1)
+    negative = (before <= 0) & np.all(products <= 0, -1)
+    return np.where(negative, np.maximum(low, bound), low), np.where(positive, np.minimum(high, bound), high)
+
+
 def promoted_step_holds(before, after, products, flushes: bool) -> np.ndarray:
     """Whether each native fp32 accumulator after one depth step of exact sums (`after`) is the IEEE sum,
     rounded to nearest, of the accumulator before the step (`before`) and the step's own partial: an fp32
@@ -379,11 +430,8 @@ def promoted_step_holds(before, after, products, flushes: bool) -> np.ndarray:
     fp32). So a product declared above the default precision into an fp32 output adds each depth step's
     partial apart (src/dew/nn/kernels/templates/product.py's `promoted`; row 2084, link 2). Rounding to
     nearest is monotone in the partial, so `after` lies between the sums' roundings at its two ends."""
-    accumulator = FORMATS["float32"]
-    low, high = _native_dot_ends(products, accumulator, flushes)
-    before, after = np.asarray(before, np.float64), np.asarray(after, np.float64)
-    least = _rounded_on_lane(*two_sum(before, low), accumulator, flushes)
-    most = _rounded_on_lane(*two_sum(before, high), accumulator, flushes)
+    least, most = promoted_step_ends(before, before, products, flushes)
+    after = np.asarray(after, np.float64)
     return np.isfinite(after) & (after >= least) & (after <= most)
 
 

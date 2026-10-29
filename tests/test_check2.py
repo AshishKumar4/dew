@@ -530,6 +530,18 @@ def _steps_held(states: list, products: np.ndarray, width: int) -> list[np.ndarr
             for j, (before, after) in enumerate(itertools.pairwise(states))]
 
 
+def _steps_apart(states: list, products: np.ndarray, width: int, fault_ends) -> list[np.ndarray]:
+    """Each depth step's separation (`separated`) of the witness's interval on the true `products`
+    (`promoted_step_ends`) from a fault's, `fault_ends(before, step)` of the accumulator before the step and
+    the step's slice of the depth."""
+    def apart(j, before):
+        step = slice(j * width, (j + 1) * width)
+        return ct.separated(ct.promoted_step_ends(before, before, products[..., step], flushes=False),
+                            fault_ends(before, step))
+
+    return [apart(j, before) for j, before in enumerate(states[:-1])]
+
+
 def test_the_truncating_model_keeps_the_low_part_of_an_add():
     """1 less 2^-80, both exact bf16 products, truncates to fp32's value below one, which a float64 add
     of them, rounding to one, would hide."""
@@ -548,10 +560,11 @@ def test_a_native_dot_holds_products_that_truncate_away_below_the_normal_range()
 def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_product_or_a_narrow_partial():
     """The native-dot contract (row 2084's link 1): a GEMM's output summed from its exact bf16 products in
     fp32 by truncating adds in any order, then rounded once to bf16 (or kept in fp32), holds at every
-    element, same-sign products included, whose truncations all err one way; the same sums with their
-    largest product lost break it at nearly every element, and with the first half's partial rounded to
-    bf16 wherever that rounding outweighs the sum's own (about six elements in seven on Gaussian draws,
-    whose partials sometimes cancel to a bf16 value's neighbourhood; nearly all of one sign)."""
+    element, same-sign products included, whose truncations all err one way. Each fault is refused where it
+    lands (`assert_refused`): the same sums with their largest product lost, at more than 95% of the
+    elements; and the first half's partial rounded to bf16 before an IEEE add of the rest's, as the native
+    fault adds them, wherever that rounding outweighs the sum's own: at more than NARROW of Gaussian draws,
+    whose partials sometimes cancel to a bf16 value's neighbourhood, and more than NARROW of one sign."""
     rng = np.random.default_rng(3)
     for signed in (True, False):
         left, right = (np.asarray(ml_dtypes.bfloat16(rng.normal(size=shape) if signed else
@@ -559,36 +572,52 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
                        for shape in ((16, 128), (4, 128)))
         products = left[:, None, :] * right[None, :, :]
         summed = _truncating_sums(products, rng)
-        flat = products.reshape(-1, 128)
         for out, native in ((oc.FLOAT32, summed), (oc.BFLOAT16, summed.astype(ml_dtypes.bfloat16))):
             held = ct.native_dot_holds(np.asarray(native, np.float64), products, out, flushes=False)
             assert np.all(held), (signed, out.name)
-        lost = np.asarray([_truncating_sum(np.delete(row, np.argmax(np.abs(row)))) for row in flat])
-        narrow = np.asarray([_truncating_sum(np.concatenate([
-            [np.float32(ml_dtypes.bfloat16(_truncating_sum(row[:64])))], row[64:]])) for row in flat])
-        for faulty, most in ((lost, 0.05), (narrow, 0.25 if signed else 0.05)):
-            held = ct.native_dot_holds(faulty.reshape(products.shape[:2]).astype(np.float64), products,
-                                       oc.FLOAT32, flushes=False)
-            assert np.mean(held) < most, (signed, np.mean(held))
+        lost = products.copy()
+        np.put_along_axis(lost, np.argmax(np.abs(lost), -1)[..., None], 0.0, -1)
+        first, rest = (_truncating_sums(half, rng) for half in (products[..., :64], products[..., 64:]))
+        narrow = np.float32(first.astype(ml_dtypes.bfloat16)) + np.float32(rest)
+        # The first half's bf16 value lies between its ends' bf16 values; the IEEE add is monotone in both.
+        halved = ct.native_dot_ends(products[..., :64], oc.FLOAT32, flushes=False)
+        narrowed = ct.promoted_step_ends(*(oc.rounded(end, np.zeros_like(end), oc.BFLOAT16)
+                                           for end in halved), products[..., 64:], flushes=False)
+        truth = ct.native_dot_ends(products, oc.FLOAT32, flushes=False)
+        fault_lost = ct.native_dot_ends(lost, oc.FLOAT32, flushes=False)
+        for faulty, fault, share in ((_truncating_sums(lost, rng), fault_lost, 0.95),
+                                     (narrow, narrowed, 0.75 if signed else 0.95)):
+            held = ct.native_dot_holds(np.asarray(faulty, np.float64), products, oc.FLOAT32, flushes=False)
+            ct.assert_refused(held, ct.separated(truth, fault), share)
 
 
 def test_a_tf32_operand_rounds_to_nearest_a_tie_away_from_zero():
-    """TF32 keeps 11 of fp32's 24 bits: 1 + 2^-11, a tie, reads as 1 + 2^-10 (away from zero, where to even
-    it is 1) and its negative as its negative; a value just below the tie reads as 1, 1 + 3 2^-11, a tie at an
-    odd last bit, as 1 + 2^-9 (to even too), and a value TF32 holds as itself."""
-    values = [1 + 2 ** -11, -1 - 2 ** -11, 1 + 2 ** -11 - 2 ** -23, 1 + 3 * 2 ** -11, 1 + 2 ** -10]
-    expected = [1 + 2 ** -10, -1 - 2 ** -10, 1.0, 1 + 2 ** -9, 1 + 2 ** -10]
-    assert ct.tf32_operand(np.float32(values)).tolist() == expected
+    """TF32 keeps 11 of fp32's 24 bits, each value read here of either sign: 1 + 2^-11, a tie, reads as
+    1 + 2^-10 (away from zero, where to even it is 1); a value just below the tie as 1; 1 + 3 2^-11, a tie at
+    an odd last bit, as 1 + 2^-9 (to even too); and a value TF32 holds as itself. At its edges: the subnormal
+    tie 2^-137 as TF32's least subnormal 2^-136, and an fp32 step below it as zero; 2^-126 - 2^-137, the tie
+    below the least normal, as 2^-126; the binade's tie 2 - 2^-11 as 2; TF32's largest value, 2^128 - 2^117,
+    as itself; and the tie past it, 2^128 - 2^116, as infinity, where an fp32 step below it reads as the
+    largest."""
+    largest, past = 2.0 ** 128 - 2.0 ** 117, 2.0 ** 128 - 2.0 ** 116
+    cases = [(1 + 2 ** -11, 1 + 2 ** -10), (1 + 2 ** -11 - 2 ** -23, 1.0), (1 + 3 * 2 ** -11, 1 + 2 ** -9),
+             (1 + 2 ** -10, 1 + 2 ** -10), (2.0 ** -137, 2.0 ** -136), (2.0 ** -137 - 2.0 ** -149, 0.0),
+             (2.0 ** -126 - 2.0 ** -137, 2.0 ** -126), (2 - 2.0 ** -11, 2.0), (largest, largest),
+             (past, np.inf), (past - 2.0 ** 104, largest)]
+    values, expected = (np.asarray([[sign * case[side] for case in cases] for sign in (1.0, -1.0)])
+                        for side in (0, 1))
+    read = ct.tf32_operand(np.float32(values))
+    assert np.array_equal(read, expected) and np.array_equal(np.signbit(read), np.signbit(expected))
 
 
 def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf16_and_a_truncation():
     """The TF32 contract (row 2084's link 2): a GEMM of fp32 operands at the default precision, its products
     of their TF32 values (`tf32_operand`) summed in fp32 by truncating adds in any order, holds at every
     element; the products of its operands' bf16 values where TF32 is declared, its TF32 products where bf16
-    ones are, and the products of its operands truncated to TF32 where the tensor cores round them each break
-    it: the first two at more than nine elements in ten, the truncation at more than four in five of Gaussian
-    draws, whose products' errors partly cancel, and at nearly every one of draws of one sign, whose products
-    all err toward zero."""
+    ones are, and the products of its operands truncated to TF32 where the tensor cores round them are each
+    refused where they land (`assert_refused`): the first two at more than SWAP of the elements, the
+    truncation at more than CUT of Gaussian draws, whose products' errors partly cancel, and at more than CUT
+    of draws of one sign, whose products all err toward zero."""
     rng = np.random.default_rng(5)
 
     def bf16(value):
@@ -601,20 +630,24 @@ def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf
             ct.tf32_operand, bf16, lambda value: oc.truncated(value, oc.TFLOAT32)))
         native = _truncating_sums(tf32, rng)
         assert np.all(ct.native_dot_holds(native, tf32, oc.FLOAT32, flushes=False)), signed
-        for faulty, products, most in ((_truncating_sums(wide, rng), tf32, 0.1), (native, wide, 0.1),
-                                       (_truncating_sums(truncated, rng), tf32, 0.2 if signed else 0.05)):
-            held = ct.native_dot_holds(faulty, products, oc.FLOAT32, flushes=False)
-            assert np.mean(held) < most, (signed, np.mean(held))
+        cut = 0.8 if signed else 0.95
+        for faulty, declared, given, share in ((_truncating_sums(wide, rng), tf32, wide, 0.9),
+                                               (native, wide, tf32, 0.9),
+                                               (_truncating_sums(truncated, rng), tf32, truncated, cut)):
+            held = ct.native_dot_holds(faulty, declared, oc.FLOAT32, flushes=False)
+            ct.assert_refused(held, ct.separated(*(ct.native_dot_ends(products, oc.FLOAT32, flushes=False)
+                                                   for products in (declared, given))), share)
 
 
 def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_add_or_a_lost_product():
     """The exact-sums witness (row 2084's link 2): an fp32 accumulator to which each depth step's partial,
     summed from zero by truncating adds in any order, is added by an IEEE add holds at every step, on draws at
-    one scale and falling 2^-12 past the first step; the same steps' products added into the accumulator by
-    truncating adds, as the tensor cores add without exact sums, break it at nearly every later step's element
-    of a falling draw, where it decides the add's rounding (each of a step's sixteen adds truncating at the
-    accumulator's last place); and a step with its largest product lost breaks it at nearly every element of
-    that step and nowhere else."""
+    one scale and falling 2^-12 past the first step. Each fault is refused where it lands (`assert_refused`):
+    a step with its largest product lost, at more than 95% of that step's elements, and nowhere else; and,
+    on a falling draw of one sign, the same steps' products added into the accumulator by truncating adds,
+    as the tensor cores add without exact sums (`truncating_step_ends`), at more than TRUNC of the later
+    steps' elements, about those whose exact sum lies past the midpoint between two fp32 values, which a
+    truncation leaves below and a rounding above."""
     rng = np.random.default_rng(7)
     width = 16
     for signed in (True, False):
@@ -625,10 +658,20 @@ def test_a_promoted_step_holds_each_partials_ieee_add_and_refuses_a_truncating_a
             products = (left * np.where(np.arange(64) < width, 1.0, fall))[:, None, :] * right[None, :, :]
             held = _steps_held(_stepped_sums(products, width, rng, exact=True), products, width)
             assert all(np.all(step) for step in held), (signed, fall)
-        truncating = _steps_held(_stepped_sums(products, width, rng, exact=False), products, width)
-        assert np.mean(truncating[1:]) < 0.05, (signed, np.mean(truncating[1:]))
         lost = products.copy()
         step = lost[..., 2 * width:3 * width]
         np.put_along_axis(step, np.argmax(np.abs(step), -1)[..., None], 0.0, -1)
-        held = _steps_held(_stepped_sums(lost, width, rng, exact=True), products, width)
-        assert np.mean(held[2]) < 0.05 and all(np.all(held[j]) for j in (0, 1, 3)), signed
+        states = _stepped_sums(lost, width, rng, exact=True)
+        held = _steps_held(states, products, width)
+        apart = _steps_apart(states, products, width, lambda before, step, lost=lost: ct.promoted_step_ends(
+            before, before, lost[..., step], flushes=False))
+        ct.assert_refused(held[2], apart[2], 0.95)
+        assert all(np.all(held[j]) for j in (0, 1, 3)), signed
+        if not signed:
+            # A truncation's bound toward zero holds where the accumulator and every product share a sign.
+            states = _stepped_sums(products, width, rng, exact=False)
+            held = _steps_held(states, products, width)
+            apart = _steps_apart(states, products, width, lambda before, step, terms=products: (
+                ct.truncating_step_ends(before, terms[..., step], flushes=False)))
+            assert not np.any(np.stack(held) & np.stack(apart))
+            ct.assert_refused(np.stack(held[1:]), np.stack(apart[1:]), 0.4)
