@@ -148,11 +148,6 @@ _FINAL = "final_residual"
     # square kernel takes the shape heuristic the way the other indexed
     # projections do.
 })
-def _unnormed(x):
-    """A trunk's final states as they are, where it ends in no norm (`CausalTransformer.final_norm`)."""
-    return x
-
-
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
@@ -448,6 +443,16 @@ class CausalTransformer(nn.Module):
     layout either way."""
 
     def __post_init__(self):
+        if self.embedding_features is not None:
+            # The projections sit between the stream and an embedding of its own width at the trunk's
+            # two ends alone; what else reads the embedding or the head at the stream's width is refused.
+            beside = [name for name, held in (
+                ("head_transform", self.head_transform), ("continuum", self.continuum),
+                ("num_nextn_predict_layers", self.num_nextn_predict_layers),
+                ("cross_attention", self.cross_attention)) if held]
+            if beside:
+                raise ValueError(f"embedding_features projects the embedding in and out of the stream, "
+                                 f"which {', '.join(beside)} would read at the stream's width")
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
         object.__setattr__(self, "embedding_zero_ids", tuple(self.embedding_zero_ids))
@@ -758,7 +763,8 @@ class CausalTransformer(nn.Module):
     def _root_flops(self, lengths, depth_counter) -> float:
         maps = self.projections()
         count = sum(projection_flops(lengths, *shape) for name, shape in maps.items()
-                     if name.startswith(('altup_projections_', 'altup_unembed_projections_')))
+                     if name.startswith(('altup_projections_', 'altup_unembed_projections_'))
+                     or name == 'project_in')
         if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
             count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
         if self.attention_residuals is not None:
@@ -838,10 +844,12 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
         """The vocabulary matrix and optional prediction transform. A tied head
-        reads the embedding table, `vocab_size` rows of `emb_features`."""
+        reads the embedding table, `vocab_size` rows of the embedding's width, which `project_out`
+        reaches from the stream's where the two differ."""
         projections = self.projections()
-        count = projection_flops(lengths, *projections.get('lm_head', (self.emb_features, self.vocab_size)))
-        for site in ('head_dense', 'continuum_down', 'continuum_up'):
+        tied = (self.embedding_features or self.emb_features, self.vocab_size)
+        count = projection_flops(lengths, *projections.get('lm_head', tied))
+        for site in ('head_dense', 'continuum_down', 'continuum_up', 'project_out'):
             if site in projections:
                 count += projection_flops(lengths, *projections[site])
         return count
@@ -899,7 +907,7 @@ class CausalTransformer(nn.Module):
         if not relative:
             raise MissingFlopsCount("CausalTransformer adapter matrix has no native scope")
         # The continuum level stands before the head, which every head read takes it through.
-        head = relative[0] in ('lm_head', 'head_dense', 'continuum')
+        head = relative[0] in ('lm_head', 'head_dense', 'continuum', 'project_out')
         if head != logits or relative[0].startswith(('mtp_', 'dspark_')):
             return np.zeros(np.shape(lengths), np.int64)
         passes = 1
@@ -1360,8 +1368,12 @@ class CausalTransformer(nn.Module):
         the bound model: a table's product and a bias, with no transform, logit softcap, nGPT gains or
         quantizer of the head's own input (`SteppedInContext`); a checkpoint's quantizer of the trunk's
         modules alone leaves it affine, and a tied head reads its table with none."""
-        quantized = (isinstance(self, QuantizesInputs) and not self.tie_embeddings
-                     and self.input_quantizer(self.lm_head) is not None)
+        quantizes = isinstance(self, QuantizesInputs)
+        # The head's own input is the final states (`lm_head`'s) and, past an embedding's own width,
+        # `project_out`'s before them.
+        heads = ([] if self.tie_embeddings else [self.lm_head]) + (
+            [] if self.embedding_features is None else [self.project_out])
+        quantized = quantizes and any(self.input_quantizer(head) is not None for head in heads)
         return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
                 and not quantized)
 
@@ -1725,7 +1737,9 @@ class CausalTransformer(nn.Module):
         # replacements in place, which token ids cannot rebuild. Sowing costs
         # nothing unless a caller opens the collection; init leaves it out.
         if not self.is_initializing():
-            prepared = self._prepared(self.token_embeddings(tokens), input_embeddings)
+            looked = self.token_embeddings(tokens)
+            looked = looked if self.embedding_features is None else self.project_in(looked)
+            prepared = self._prepared(looked, input_embeddings)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self._layer_inputs(tokens, x, routed_experts, routed)
@@ -1742,7 +1756,7 @@ class CausalTransformer(nn.Module):
             # nothing unless a caller opens the collection.
             self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = constrain(x if self.ngpt is not None else self.norm(x), RESIDUAL)
+        hidden = constrain(x if self.ngpt is not None or not self.final_norm else self.norm(x), RESIDUAL)
         self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in at least fp32 scores
@@ -2190,9 +2204,13 @@ class CausalTransformer(nn.Module):
 
     def vocabulary_rows(self) -> jax.Array:
         """Each vocabulary token's `[features]` row of the head (`OutputTable.rows`) where no exact
-        table is: past a `head_transform` the matrix's, which the transformed states meet, and with
-        an adapter on the head its rows as the adapter updates them (`applied_kernel`)."""
-        return self._head_table().rows()
+        table is: past a `head_transform` the matrix's, which the transformed states meet, with an
+        adapter on the head its rows as the adapter updates them (`applied_kernel`), and past an
+        embedding's own width its rows in the stream's coordinates, through `project_out` as applied."""
+        rows = self._head_table().rows()
+        if self.embedding_features is None:
+            return rows
+        return rows @ self.applied_kernel("project_out").T.astype(rows.dtype)
 
     def _head_table(self) -> OutputTable:
         """The head's matrix, as `lm_head`'s call multiplies by it (`applied_kernel`) or the tied
@@ -2231,8 +2249,6 @@ class CausalTransformer(nn.Module):
             self.norm = l2norm
             self.logit_scale = self.param('logit_scale', nn.initializers.constant(self.ngpt.start),
                                           (self.vocab_size,), jnp.float32)
-        elif not self.final_norm:
-            self.norm = _unnormed
         else:
             self.norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
