@@ -70,8 +70,8 @@ def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     reference, truth = transformers_arms(narrow, lambda model, ids: model(ids, use_cache=False).logits,
                                          source=source)
     assert_as_exact(lambda ids: pretrained.model.apply(pretrained.variables, ids).astype(jnp.float32),
-                    reference, fixture_ids(directory), f"{name} {dtype}", seeds=DECODER_SEEDS[dtype].get(name, 8),
-                    truth_fn=truth)
+                    reference, fixture_ids(directory), f"{name} {dtype}",
+                    seeds=DECODER_SEEDS[dtype].get(name, 8), truth_fn=truth)
 
 
 BIAS_SEEDS = {"qwen2-tiny": 64, "llama-tiny": 32}
