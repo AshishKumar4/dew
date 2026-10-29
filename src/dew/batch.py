@@ -309,9 +309,9 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
 def token_coordinates(shape: tuple[int, int], given: Coordinates | None = None, *, segments=None,
                       valid=None, positions=None, right_padded: bool = False) -> Coordinates | None:
     """A call's token layout as one `Coordinates`, the one conversion of its fields: `given` as it is,
-    else built from the flat `segments` (`segment_ids`), `valid` (the validity field) and `positions`
-    (`coordinates`), None where the call gives none. A call giving both is refused: its coordinates
-    would silently drop its fields (ledger 1122)."""
+    else built (`coordinates`) from the flat fields `segment_ids` (`segments`), `attention_mask`
+    (`valid`) and `positions`, None where the call gives none. A call giving both is refused: its
+    `Coordinates` would silently drop its flat fields (ledger 1122)."""
     fields = (("segment_ids", segments), (VALIDITY_FIELD, valid), ("positions", positions))
     flat = [name for name, value in fields if value is not None] + (["right_padded"] if right_padded else [])
     if given is not None:

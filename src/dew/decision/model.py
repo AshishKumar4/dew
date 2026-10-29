@@ -104,8 +104,11 @@ class DecisionModel(HeadedModel):
             if inputs.slots is not None:
                 raise ValueError("a row of option positions holds no images")
             def read_media(module, rows, given):
-                # The images' own conditioning beside the context's, one mapping the backbone reads.
-                kwargs = dict(given.kwargs())
+                # The images' own conditioning beside the context's, one mapping the backbone reads;
+                # the rows' layout is the decision's coordinates alone, the processor's flat fields
+                # left out (`token_coordinates`).
+                kwargs = {name: value for name, value in given.kwargs().items()
+                          if name not in ("positions", "attention_mask", "segment_ids")}
                 if conditioning is not None:
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)
