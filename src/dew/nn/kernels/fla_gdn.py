@@ -107,13 +107,20 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
       float64 on an H100; one TF32, fla's, in a 16-bit call, whose operands' rounding it stays under
       and where an fp32 product's three-part form cost Kimi Linear's bf16 layer 17% on an H100 and 19%
       on an A100.
-    - interpreted: no precision, the CPU's fp32."""
+    - interpreted (`exact`): an fp32 product summed in float64 and rounded once, as the interpreted
+      template's (`product.interpreted`) and the portable math's on a CPU (`precision.accumulated`), where
+      XLA's CPU dot picks its fp32 accumulation by shape: it put 20 of the stability suite's port arms 1.5 to
+      2.7 times the portable math's distance from float64 (row 2321); a narrow one's exact products summed
+      in fp32."""
     if jnp.dtype(a.dtype) != jnp.dtype(b.dtype):
         raise TypeError(f"Pallas dot operands must have the same dtype, got {a.dtype} and {b.dtype}")
     wide = jnp.dtype(a.dtype) == jnp.float32
+    if exact and wide:
+        with jax.enable_x64(new_val=True):
+            return jnp.dot(a.astype(jnp.float64), b.astype(jnp.float64)).astype(jnp.float32)
     if exact:
         a, b = a.astype(jnp.float32), b.astype(jnp.float32)
-        precision = jax.lax.Precision.HIGHEST if ieee and wide else None
+        precision = None
     elif wide:
         narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
         precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
