@@ -62,8 +62,8 @@ def draw(seed):
     return policy, old, reference, advantage, mask, segments, weights
 
 
-SPANS = [(row, np.arange(start, start + length)) for row, lengths in enumerate(LENGTHS)
-         for start, length in zip(np.cumsum((0, *lengths[:-1])), lengths, strict=True)]
+SPANS = [(row, slice(start, start + length)) for row, lengths in enumerate(LENGTHS)
+         for start, length in zip(np.cumsum((0, *lengths[:-1])).tolist(), lengths, strict=True)]
 """Each session's token positions, `(row, columns)`, the same in every draw."""
 
 
@@ -97,7 +97,7 @@ def paper(objective):
     def term(policy, old, reference, advantage, mask, segments, weights):
         def value(current):
             return objective([(current[row, columns], old[row, columns], reference[row, columns],
-                               advantage[row, columns[0]]) for row, columns in SPANS])
+                               advantage[row, columns.start]) for row, columns in SPANS])
         return value(policy), jax.grad(value)(policy)
     return term
 
