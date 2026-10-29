@@ -540,8 +540,7 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     else:
         k_pos = k_first + (family.iota(shape, key_axis) if columns is None else columns)
     if spans is None:
-        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, q_rows=_query_rows(
-            family, first, shape, draw, keys_first))
+        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first)
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
     of_queries, of_keys = ((family.columns_of, family.rows_of) if keys_first
                            else (family.rows_of, family.columns_of))
@@ -555,15 +554,7 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     ids = None
     if spans.query_ids is not None and spans.key_ids is not None:
         ids = of_queries(spans.query_ids.at[row, rows]), of_keys(spans.key_ids.at[row, keys])
-    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first,
-                          q_rows=_query_rows(family, first, shape, draw, keys_first))
-
-
-def _query_rows(family: mosaic.Family, first, shape: tuple[int, int], draw: Draw | None,
-                keys_first: bool) -> jax.Array | None:
-    """A query-rows tile's queries' places as a row's vector, where a dropping call's anchor draws at them
-    (`algebra.Coords.query_places`); None elsewhere."""
-    return None if draw is None or keys_first else first + family.iota((shape[0],), 0)
+    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first)
 
 
 def _rows(family: mosaic.Family, ref, row, head, first, count: int):

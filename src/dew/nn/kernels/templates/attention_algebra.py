@@ -196,8 +196,7 @@ class Coords(NamedTuple):
     first and past-last keys `[bq]` (`intervals`), with documents the queries' and keys' ids `ids`,
     `[bq]` and `[bk]`, and with dropout its entries' draw `drop` (`Draw`). A tile whose rows are its keys
     (`keys_first`: `[bk, bq]`, a program's `K Qᵀ`) holds them so too, `q_pos` `[1, bq]` and `k_pos`
-    `[bk, 1]`; its queries' and keys' vectors broadcast along its own axes (`queries`, `keys`). `q_rows`
-    holds its queries' places as a vector (`[bq]`) where the mainloop forms them so (`query_places`)."""
+    `[bk, 1]`; its queries' and keys' vectors broadcast along its own axes (`queries`, `keys`)."""
 
     q_pos: jax.Array
     k_pos: jax.Array
@@ -205,7 +204,6 @@ class Coords(NamedTuple):
     ids: tuple[jax.Array, jax.Array] | None = None
     drop: Draw | None = None
     keys_first: bool = False
-    q_rows: jax.Array | None = None
 
     def queries(self, x: jax.Array, like: jax.Array) -> jax.Array:
         """A per-query `x` (`[bq]`) broadcast over the tile `like`."""
@@ -216,9 +214,9 @@ class Coords(NamedTuple):
         return expand(x, like) if self.keys_first else across(x, like)
 
     def query_places(self) -> jax.Array:
-        """The tile's queries' places, one a query (`[bq]`): `q_rows` where the mainloop holds them so, else
-        a column of `q_pos`."""
-        return self.q_pos[:, 0] if self.q_rows is None else self.q_rows
+        """The tile's queries' places, one a query (`[bq]`): each row's of `q_pos`, by a reduction along it
+        (exact: a row holds one place), which every mainloop's layouts take, a slice of a column not."""
+        return jnp.max(jnp.broadcast_to(self.q_pos, (self.q_pos.shape[0], self.k_pos.shape[-1])), axis=-1)
 
     def key_count(self, like: jax.Array) -> int:
         """The keys the tile `like` holds."""
