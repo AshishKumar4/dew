@@ -1081,8 +1081,15 @@ class RunConfig:
         """Read back what `to_dict` wrote, for subclasses too. A field the
         record lacks takes its default; an unknown field raises. A chain
         recorded as unrecorded, or a recipe's record written before runs
-        recorded chains, is refused by name."""
+        recorded chains, is refused by name. A model recorded with an earlier
+        main's fields reads as its checkpoint's record does."""
+        from dew.inference.tasks import earlier_model
+
         rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        # A model recorded before its components' fields changed reads as today's, as its checkpoint's
+        # record does (`earlier_model`, ledger 2423).
+        if isinstance(rest.get("model"), Mapping):
+            rest["model"] = earlier_model({"model": rest["model"]})["model"]
         chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 
