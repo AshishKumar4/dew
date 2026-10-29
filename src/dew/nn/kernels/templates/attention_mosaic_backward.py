@@ -797,7 +797,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     written keys first). A key or tile gradient is written by the one program that holds its keys; the
     tiles its walk does not read are zeros. Its dK and dV are its `shares` of their columns (`(first, count)`
     each); a later share's program writes no hook gradient."""
-    batch, queries, heads, width = query.shape
+    _, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
     program, consumers, kinds = walk.program, walk.consumers, walk.kinds
     family = program.family
@@ -858,14 +858,10 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[holder], v_smem.at[holder]
-            stage = _logits_stage(logits_stages, index)
-            adds = None
-            if walk.fused:
-                parts_stage, dq_stages = fused_stages
-                adds = (parts_stage.at[index],
-                        functools.partial(_dq_added, walk, dq_ref, dq_stages, (row, head), index))
+            adds = None if not walk.fused else (fused_stages[0].at[index], functools.partial(
+                _dq_added, walk, dq_ref, fused_stages[1], (row, head), index))
             step = functools.partial(_dkv_step, walk, resident, rows_of, coords_of, params_of, store_tiles,
-                                     shares, part, stage, adds)
+                                     shares, part, _logits_stage(logits_stages, index), adds)
             # Its consumers' own loads of its query stream where they feed it (`Family.fed`).
             fed = (family.fed(streams, views, lo, hi, index)
                    if isinstance(family, mosaic.ConsumerFed) else streams)
@@ -904,11 +900,18 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
 
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
+    return _dkv_launched(walk, launch, operands, graded)
+
+
+def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind]) -> tuple[jax.Array, ...]:
+    """The dK/dV launch `launch` over `operands`: dK, dV and the hook's key and tile gradients in kind order;
+    a fused one's dQ before them, added into zeros in place, one copy, or each consumer's own interpreted
+    (`Family.added`)."""
     if not walk.fused:
         dk, dv, *grads = launch(*operands)
         return dk, dv, *_keys_last(grads, graded)
-    # dQ added into zeros in place: one copy, or each consumer's own interpreted (`Family.added`).
-    copies = consumers if walk.interpret else 1
+    batch, queries, heads, width = operands[0].shape
+    copies = walk.consumers if walk.interpret else 1
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
     dk, dv = launch(*operands, dq)
     return jax.freeze(dq).sum(axis=0), dk, dv
