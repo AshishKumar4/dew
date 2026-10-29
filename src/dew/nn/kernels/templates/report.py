@@ -270,8 +270,8 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     program `relower`ed once and compiled; `relower` traces afresh, so each refused launch's derivation
     takes the next config by its own rule. A kernel spilling again is recorded, neither refused nor stepped
     again, so every process derives the program this compile keeps; a relowering whose derivations find no
-    config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. A program loaded from the persistent compilation cache runs no ptxas
-    and reports nothing."""
+    config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. A program loaded
+    from the persistent compilation cache runs no ptxas and reports nothing."""
     executable, spilling = _compiled_reported(lowered, options)
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
