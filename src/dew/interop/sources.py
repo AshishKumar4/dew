@@ -314,21 +314,23 @@ def snapshot(name_or_dir: str, revision: str | None, *,
         from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
 
         selected = list(weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX))
-        if not selected:
-            raise FileNotFoundError(missing_weights(f"{name_or_dir} at {directory.name}", files))
         # The conversion a lookup found is recorded (`hub_answer`), so the same
         # load offline reads the conversion it cached rather than pickles it
-        # never fetched; a lookup the Hub refuses, or offline one never made,
-        # finds none.
-        try:
-            conversion = hub_answer(("conversion", name_or_dir, directory.name),
-                                    lambda: _conversion_revision(name_or_dir, directory.name)).value
-        except (HfHubHTTPError, OfflineModeIsEnabled):
-            conversion = None
+        # never fetched, which its commit's local listing then lacks; a lookup
+        # the Hub refuses, or offline one never made, finds none.
+        question = ("conversion", name_or_dir, directory.name)
+        conversion = None
+        if selected or recorded_hub_answer(question) is not None:
+            try:
+                conversion = hub_answer(question, lambda: _conversion_revision(name_or_dir, directory.name)).value
+            except (HfHubHTTPError, OfflineModeIsEnabled):
+                conversion = None
         if conversion is not None:
             _log.warning("%s at %s ships PyTorch pickles; loading SFconvertbot's safetensors conversion of "
                          "that commit at revision %s", name_or_dir, directory.name, conversion)
             return snapshot(name_or_dir, conversion)
+        if not selected:
+            raise FileNotFoundError(missing_weights(f"{name_or_dir} at {directory.name}", files))
     if selected:
         snapshot_download(name_or_dir, revision=directory.name, allow_patterns=selected)
     return directory
