@@ -444,10 +444,10 @@ class CausalTransformer(nn.Module):
 
     def __post_init__(self):
         if self.embedding_features is not None:
-            # The projections sit between the stream and an embedding of its own width at the trunk's
-            # two ends alone; what else reads the embedding or the head at the stream's width is refused.
+            # The projections sit between the stream and an embedding of its own width; a head transform
+            # and a continuum level read the stream before `project_out`, and what reads the token
+            # embedding itself at the stream's width (a prediction depth, an encoded context) is refused.
             beside = [name for name, held in (
-                ("head_transform", self.head_transform), ("continuum", self.continuum),
                 ("num_nextn_predict_layers", self.num_nextn_predict_layers),
                 ("cross_attention", self.cross_attention)) if held]
             if beside:
@@ -1397,10 +1397,12 @@ class CausalTransformer(nn.Module):
     def head_logits(self, x):
         """The fp32 head over states the continuum level already read (`continuum_states`), or a
         model without one's final states: `_logits` past the level."""
-        if self.embedding_features is not None:
-            x = self.project_out(x)
+        # A stream-width transform reads the final states before `project_out` takes them to the
+        # embedding's own width, which the vocabulary matrix meets.
         if self.head_transform is not None:
             x = self.head_norm(ungated_activation(self.head_transform, self.head_dense(x)))
+        if self.embedding_features is not None:
+            x = self.project_out(x)
         # fp32 logits whose product follows the compute dtype
         # (`dew.nn.precision.head_product`, the chunked loss's arithmetic).
         if self.tie_embeddings:

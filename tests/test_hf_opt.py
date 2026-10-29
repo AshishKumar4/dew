@@ -75,8 +75,8 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
     """Past an embedding's own width the head's vocabulary rows are given in the stream's coordinates,
     through `project_out`: the final states times those rows are the logits, bit for bit in float64 on
     integer-valued weights. A decoder that ends in no final norm still norms its loop's passes, so its
-    passes differ from a loop that norms none, and what reads the embedding or the head at the stream's
-    width is refused."""
+    passes differ from a loop that norms none, and a prediction depth, which reads the token embedding
+    at the stream's width, is refused."""
     import jax
     import jax.numpy as jnp
 
@@ -103,6 +103,5 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
     plain = base.clone(**{**looped, "loop": Loop(2, layers=(0, 2), step_norm=False)})
     params = normed.init(jax.random.key(1), ids)
     assert not np.array_equal(np.asarray(normed.apply(params, ids)), np.asarray(plain.apply(params, ids)))
-    for beside in ({"head_transform": "gelu"}, {"num_nextn_predict_layers": 1}):
-        with pytest.raises(ValueError):
-            base.clone(embedding_features=4, **beside)
+    with pytest.raises(ValueError):
+        base.clone(embedding_features=4, num_nextn_predict_layers=1)
