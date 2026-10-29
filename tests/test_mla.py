@@ -1017,6 +1017,14 @@ def test_a_mla_model_reads_key_runs_as_their_pairwise_mask():
     np.testing.assert_array_equal(np.asarray(by_runs), np.asarray(by_mask))
 
 
+def masked_losses(model, variables, tokens, keep, counted):
+    """`model`'s next-token losses over `tokens` under the pairwise mask `keep`, each scored where
+    `counted`: the reference a prefix run's own scores are held to."""
+    logits = model.apply(variables, tokens[:, :-1], attention_pairwise_mask=keep)
+    lost = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
+    return lost, jnp.asarray(counted, lost.dtype)
+
+
 def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
     """A prefix run needs a layer that reads its blocks whole (`MixerBase.reads_blocks`): a decoder on
     the mla kind that reads them takes one, and its trained per-token losses are on par with its losses
@@ -1044,11 +1052,7 @@ def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
         return init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1]), tokens
 
     def masked(model):
-        def losses(params, tokens):
-            logits = model.apply(params, tokens[:, :-1], attention_pairwise_mask=keep)
-            lost = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
-            return lost, jnp.asarray(counted, lost.dtype)
-        return losses
+        return lambda params, tokens: masked_losses(model, params, tokens, keep, counted)
 
     def dew(params, tokens):
         scores = objective.token_scores(params, batch_text({TEXT_KEY: tokens, "text_block_groups": blocks}))
@@ -1135,11 +1139,7 @@ def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_pr
         return (jax.random.randint(jax.random.fold_in(jax.random.key(7), seed), (2, seq + 1), 1, vocabulary),)
 
     def masked(model, variables):
-        def losses(tokens):
-            logits = model.apply(variables, tokens[:, :-1], attention_pairwise_mask=keep)
-            lost = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
-            return lost, jnp.asarray(counted, lost.dtype)
-        return losses
+        return lambda tokens: masked_losses(model, variables, tokens, keep, counted)
 
     def dew(tokens):
         scores = objective.token_scores(restored.variables,

@@ -34,7 +34,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
-from dew.registry import from_record, record_fields
+from dew.registry import from_record, to_record
 
 # The KV cache is allocated at the full decode length, so a 128k-context
 # checkpoint would allocate one of those whether the caller asked or not.
@@ -980,18 +980,20 @@ def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used
         specified = kind.get("mixer", config.get("mixer"))
         if mode == "causal" and specified is None:
             continue
-        # The family's own mixer, in place before the overrides read it (its translate_config ran): any that
-        # reads blocks whole takes the override, a latent attention's as attention's.
-        mixer = AttentionMixer() if specified is None else from_record(MixerBase, specified)
-        if "bidirectional_blocks" not in {field.name for field in dataclasses.fields(mixer)}:
+        # The family's own mixer, in place before the overrides read it (its translate_config ran, as a
+        # record or a built mixer), as its whole record, every field stated: any that reads blocks whole
+        # takes the override, a latent attention's as attention's.
+        built = (AttentionMixer() if specified is None else specified if isinstance(specified, MixerBase)
+                 else from_record(MixerBase, specified))
+        whole = _records.record(to_record(built, MixerBase), "mixer")
+        fields = dict(_records.record(whole["fields"], "mixer.fields"))
+        if "bidirectional_blocks" not in fields:
             if mode != "causal":
                 refuse(f"block-bidirectional {name}", "its mixer reads no block whole; a recurrent kind "
                        "remains causal")
             continue
-        fields = record_fields(mixer, type(mixer))
         fields["bidirectional_blocks"] = mode == "block_bidirectional"
-        kind["mixer"] = {"class": "attention" if specified is None
-                         else _records.record(specified, "mixer")["class"], "fields": fields}
+        kind["mixer"] = {"class": _records.text(whole["class"], "mixer.class"), "fields": fields}
         kinds[name] = kind
 
 
