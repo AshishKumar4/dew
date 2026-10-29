@@ -1269,27 +1269,50 @@ def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, m
     assert run() == [1, 2]
 
 
-def test_a_fixture_added_or_removed_reruns_every_file(ci, tmp_path, monkeypatch, cache_worker):
-    """A fixture's arrival or removal is every file's input, as a test may ask whether one exists
-    (`Path.exists`, a collection by presence) without opening it, which no record sees; its contents stay
-    its openers' alone (train 253's review: a test asserting a fixture's absence was reused green once the
-    fixture came)."""
-    (tmp_path / "tests/fixtures").mkdir(parents=True)
-    (tmp_path / "tests/fixtures/present.json").write_text("{}\n")
-    (tmp_path / "tests/test_absent.py").write_text(
-        "from pathlib import Path\n"
-        "def test_absent():\n"
-        "    with Path('runs-absent').open('a') as runs: runs.write('x')\n"
-        "    assert not Path('tests/fixtures/unexpected.json').exists()\n")
-    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
-    base = commit(tmp_path, "base")
-    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
-    assert [row["exitCode"] for row in rows] == [0]
-    (tmp_path / "tests/fixtures/unexpected.json").write_text("{}\n")
-    git(tmp_path, "add", "tests/fixtures/unexpected.json")
-    commit(tmp_path, "a fixture arrives")
-    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
-    assert [row["exitCode"] for row in rows] != [0] and len((tmp_path / "runs-absent").read_text()) == 2
+def test_a_fixture_reruns_only_the_files_that_opened_listed_or_probed_it(ci, tmp_path, monkeypatch,
+                                                                         cache_worker):
+    """A fixture's arrival reruns the files whose runs opened it, listed its directory, or asked whether it
+    exists (`Path.is_file`, `os.path.exists`: recorded as a read, in a test, at collection or in a child it
+    started), and no other: an existence probe is a read the record keeps, so a fixture's name is no other
+    file's input (Main, 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures; train 253's
+    review: a test asserting a fixture's absence must not be reused once it comes)."""
+    fixtures = tmp_path / "tests/fixtures"
+    (fixtures / "model").mkdir(parents=True)
+    (fixtures / "model/config.json").write_text("{}\n")
+    (fixtures / "other").mkdir()
+    (fixtures / "other/data.json").write_text("{}\n")
+    probe = "import os; os.path.exists('tests/fixtures/model/tokenizer.json')"
+    sources = {
+        "opens": "    Path('tests/fixtures/model/config.json').read_text()\n",
+        "probes": "    Path('tests/fixtures/model/weights.bin').is_file()\n",
+        "collects": "",
+        "child": "    import subprocess, sys\n"
+                 f"    subprocess.run([sys.executable, '-c', {probe!r}], check=True)\n",
+        "lists": "    [entry.name for entry in Path('tests/fixtures').iterdir()]\n",
+        "other": "    Path('tests/fixtures/other/data.json').read_text()\n"}
+    for name, body in sources.items():
+        found = "[name for name in ('weights.bin',) if Path('tests/fixtures/model', name).exists()]"
+        cases = f"{found} or ['none']" if name == "collects" else "['one']"
+        (tmp_path / f"tests/test_{name}.py").write_text(
+            f"import pytest\nfrom pathlib import Path\n@pytest.mark.parametrize('case', {cases})\n"
+            f"def test_{name}(case):\n    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
+            + body)
+    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, tuple(sources))
+    commit(tmp_path, "base")
+    assert run() == [1] * 6
+    assert run() == [1] * 6
+    (fixtures / "model/weights.bin").write_text("w\n")
+    (fixtures / "model/tokenizer.json").write_text("{}\n")
+    git(tmp_path, "add", "tests/fixtures")
+    commit(tmp_path, "fixtures arrive beside a model's config")
+    # Its probers rerun, at their test, their collection and their child; opener, lister and other do not.
+    assert run() == [1, 2, 2, 2, 1, 1]
+    (fixtures / "later").mkdir()
+    (fixtures / "later/config.json").write_text("{}\n")
+    git(tmp_path, "add", "tests/fixtures")
+    commit(tmp_path, "a model's fixtures arrive")
+    # A new model's directory reruns what listed the directory it arrived in, and nothing else.
+    assert run() == [1, 2, 2, 2, 2, 1]
 
 
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
