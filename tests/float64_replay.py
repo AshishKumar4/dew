@@ -144,7 +144,7 @@ def _replayed_equation(equation, values, used):
         body = params["jaxpr"]
         # The constants and carries the step reads first, by count or by their trees' leaves (`ft_in`).
         consts, carries = ((params["num_consts"], params["num_carry"]) if "num_carry" in params
-                           else (len(params["ft_in"][0]), len(params["ft_in"][1])))
+                           else (len(params["ft_in"][0] or ()), len(params["ft_in"][1] or ())))
         reading = _carried(body.jaxpr, consts, carries, used)
 
         def step(*operands):
