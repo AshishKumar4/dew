@@ -8,9 +8,9 @@ import numpy as np
 from reference_error import _floating, as_given, equations
 
 REPLAYED = frozenset({
-    "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "exp", "expm1", "log", "erf", "erf_inv",
-    "broadcast_in_dim", "convert_element_type", "gather", "iota", "reshape", "slice", "squeeze",
-    "stack", "stop_gradient", "transpose",
+    "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "square", "exp", "expm1", "log", "erf",
+    "erf_inv", "sin", "cos", "ne", "broadcast_in_dim", "convert_element_type", "gather", "iota", "reshape",
+    "slice", "squeeze", "stack", "stop_gradient", "transpose",
 })
 """The float operations `float64_replay` evaluates in float64: those an initializer's parameters
 depend on (the parallelism matrix's models', surveyed). Any other operation on a float refuses."""
@@ -25,7 +25,8 @@ def float64_replay(fn):
     names a format. Operations on integers, bits and keys run as traced, so a draw's random bits
     and the uniform built from them are the program's own (`FORMATTED`); a float literal or constant
     is the program's value widened. The program's calls (`jit`), custom derivatives' calls and
-    scans are replayed inside, each equation under the context it was traced in; a float
+    scans are replayed inside, as are a rematerialized call's (`checkpoint`, a remat module's init) and
+    the branch a conditional takes, each equation under the context it was traced in; a float
     operation outside `REPLAYED`, a complex one, and any other call of a program refuse by name.
     Only what the results read is replayed: an initializer's forward pass, which a module's init
     traces and whose outputs it drops, never runs (`_read`).
@@ -97,6 +98,12 @@ def _replayed_equation(equation, values, used):
         return _replayed(params["jaxpr"].jaxpr, params["jaxpr"].consts, values, used)
     if name in ("custom_jvp_call", "custom_vjp_call"):
         return _replayed(params["call_jaxpr"].jaxpr, params["call_jaxpr"].consts, values, used)
+    if name == "checkpoint":
+        return _replayed(params["jaxpr"], (), values, used)
+    if name == "cond":
+        # Replayed eagerly, the branch index is concrete: the branch the program takes, alone.
+        branch = params["branches"][int(values[0])]
+        return _replayed(branch.jaxpr, branch.consts, values[1:], used)
     if name == "scan":
         # The body, replayed in float64 for its operands' widened dtypes, as the scan's own.
         body = params["jaxpr"]

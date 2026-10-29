@@ -156,11 +156,11 @@ def test_what_a_programs_results_do_not_read_is_not_replayed():
 
 
 REFUSED = {
-    "float": lambda x: jnp.cos(x),
+    "float": lambda x: jnp.tan(x),
     "complex": lambda x: jnp.cos(x.astype(jnp.complex64)).real,
     # A call whose integer boundary hides float arithmetic inside.
-    "hidden": lambda x: jax.lax.cond(x[0] > 0, lambda x: jnp.cos(x).astype(jnp.int32),
-                                     lambda x: x.astype(jnp.int32), x),
+    "hidden": lambda x: jax.lax.while_loop(lambda carry: carry[0] < 2, lambda carry: (
+        carry[0] + 1, carry[1] + jnp.tan(x).astype(jnp.int32)), (0, x.astype(jnp.int32)))[1],
 }
 
 
