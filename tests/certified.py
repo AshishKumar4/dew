@@ -1111,29 +1111,15 @@ def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
 
 
 def _scanned(params, operands, findings, where: str) -> list:
-    """A scan run a step at a time (`_run` of its body), its carry threaded from step to step and its
-    outputs stacked, every step's equations held to their contracts as the program's are, each by its
-    step's path."""
-    import jax.numpy as jnp
+    """A scan run a step at a time (`reference_error.scanned_steps`, `_run` of its body), every step's
+    equations held to their contracts as the program's are, each by its step's path."""
+    from reference_error import scanned_steps
 
     body = params["jaxpr"]
-    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(operands))).unpack())
-    consts, carry, xs = (operands[:constants], operands[constants:constants + carries],
-                         operands[constants + carries:])
-    ys = []
-    steps = range(params["length"])
-    for step in reversed(steps) if params["reverse"] else steps:
-        outputs = _run(body.jaxpr, body.consts, [*consts, *carry, *(x[step] for x in xs)], findings,
-                       f"{where}{step}/")
-        carry = outputs[:carries]
-        ys.append(outputs[carries:])
-    if params["reverse"]:
-        ys.reverse()
-    if ys:
-        stacked = [jnp.stack(column) for column in zip(*ys, strict=True)]
-    else:
-        stacked = [jnp.zeros((0, *var.aval.shape), var.aval.dtype) for var in body.jaxpr.outvars[carries:]]
-    return [*carry, *stacked]
+    walked = scanned_steps(params, [(value,) for value in operands], lambda step, inputs: [
+        (value,) for value in _run(body.jaxpr, body.consts, [value for (value,) in inputs], findings,
+                                   f"{where}{step}/")])
+    return [value for (value,) in walked]
 
 
 def _held(eqn, operands, results, findings, at) -> None:
