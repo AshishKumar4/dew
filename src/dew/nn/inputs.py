@@ -587,6 +587,11 @@ class AttentionMetadata:
     blocks: jax.Array | None = None
     context: CrossContext | None = None
     routing_block: int | None = struct.field(pytree_node=False, default=None)
+    whole_blocks: bool = struct.field(pytree_node=False, default=False)
+    """Whether each block of `block_groups` is its document's whole run of real tokens, as its producer
+    states it (a decision row read whole, `QuestionLayout.split` 'whole'): a layer that reads blocks
+    whole then reads each document both ways, which is non-causal attention by documents, and takes it so
+    (`CausalSelfAttention._masking`), its blocks unread."""
 
     @property
     def valid(self) -> jax.Array | None:
