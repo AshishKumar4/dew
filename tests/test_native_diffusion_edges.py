@@ -17,8 +17,9 @@ def edges(tmp_path_factory):
 
 
 @pytest.mark.parametrize(
-    "case", ["ddim-linspace", "pndm-linspace", "ddim-clip", "euler-zero-snr", "dpm-karras", "norm", "odd",
-             "dropped"]
+    "case", [pytest.param(case, marks=pytest.mark.whole_suite) if case in ("dpm-karras", "pndm-linspace")
+             else case for case in ("ddim-linspace", "pndm-linspace", "ddim-clip", "euler-zero-snr",
+                                    "dpm-karras", "norm", "odd", "dropped")]
 )
 def test_native_source_control_and_gradient_parity(edges, case):
     result = subprocess.run(
