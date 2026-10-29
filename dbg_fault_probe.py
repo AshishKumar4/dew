@@ -1,5 +1,11 @@
 """Diagnostic only: independent-process H100 forward variants."""
+import os
 import sys
+
+if "nograph" in sys.argv[1]:
+    os.environ["XLA_FLAGS"] = os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_command_buffer="
+if "fullcore" in sys.argv[1]:
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +25,7 @@ stages = int(variant[-1]) if variant.startswith("stages") else 2
 residuals = variant != "noresiduals"
 causal = variant == "causal"
 
-if variant in ("nosetmax", "initfence_nosetmax"):
+if "nosetmax" in variant:
     def roles(wg, consumers, consumer, producer):
         pl.when(wg < consumers)(lambda: consumer(wg))
         pl.when(wg == consumers)(producer)
