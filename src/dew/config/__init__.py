@@ -1322,7 +1322,7 @@ class RunConfig:
 
         trainer = self.trainer
         prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
-        prepared = self.pinned_adapter().prepare()
+        prepared = self.prepare()
         stated = prepared.run.objective
         name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"
                                 f"{_chain_label(prepared.run.data)}/date-{run_timestamp()}")
@@ -1330,7 +1330,7 @@ class RunConfig:
 
     def pinned_adapter(self) -> Self:
         """This run with its imported adapter's Hub source named at its commit (`LoRA.resolved`), so the
-        record names the factors the run started from."""
+        record names the factors the run started from: every kind's `prepare` trains this run."""
         return self if self.lora is None else dataclasses.replace(self, lora=self.lora.resolved())
 
     def profile(self, directory: str | None = None, *, warmup: int = 20, steps: int = 10,
@@ -1368,7 +1368,7 @@ class RunConfig:
         trainer = dataclasses.replace(trainer, checkpoint_dir=directory, profile=captured)
         profiled = dataclasses.replace(self, validation=None, val_metrics=None, val_summaries=(),
                                        trainer=trainer)
-        profiled.pinned_adapter().prepare().train(name)
+        profiled.prepare().train(name)
         if jax.process_index() != 0:
             return None
         report = ProfileReport.read(Path(directory), name, Path(window), warmup=warmup, steps=steps)

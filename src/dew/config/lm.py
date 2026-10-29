@@ -132,6 +132,7 @@ class LMRunConfig(DecoderRunConfig):
             model, fields = source.model, dict(source.model_config)
         if source is None:
             run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))
+        run = run.pinned_adapter()
         variables = None if source is None else source.variables
         if self.lora is not None:
             if source is None:

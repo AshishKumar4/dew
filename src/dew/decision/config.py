@@ -292,8 +292,9 @@ class DecisionRunConfig(DecoderRunConfig):
 
         metrics = self.validation_metrics(validates=bool(held))
         after = calibrate if self.calibrate and held else None
-        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
-                                                      summary=summary, after=after, validation=held))
+        run = self.pinned_adapter()
+        return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
+                                                    summary=summary, after=after, validation=held))
 
     def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> Mapping[str, object]:
         """The head a fresh backbone `start` reads and its rows' layout: the joint schema head, the

@@ -98,8 +98,9 @@ class JepaRunConfig(RunConfig):
         objective = self.objective.build(encoder=encoder, predictor=predictor, mask=mask, sample=sample,
                                          **ramp, **adapted)
         probes = self.validation_metrics(validates=bool(held))
-        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,
-                                                      validation=held))
+        run = self.pinned_adapter()
+        return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=probes,
+                                                    validation=held))
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """A linear and a k-nearest-neighbour probe of the frozen encoder, where `probe_classes` names

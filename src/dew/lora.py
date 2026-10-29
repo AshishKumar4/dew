@@ -229,7 +229,8 @@ class LoRA:
         """The adapter `source` holds over `variables` (`load`), bound to `base` where the bundle names
         one, refused unless it binds the projections `modules` selects at this spec's rank, alpha,
         rslora and dropout."""
-        adapter = LoRA.load(model, variables, _adapter_files(source), layouts=layouts, base=base)
+        # The commit the run records (`resolved`), so what it loads is what it names.
+        adapter = LoRA.load(model, variables, _adapter_files(_pinned(source)), layouts=layouts, base=base)
         wanted = set(_named(bound_layouts(model, thaw(variables), layouts or {}), self.modules))
         stated = {"targets": sorted(wanted), "rank": self.rank, "alpha": scaling, "rslora": self.rslora,
                   "dropout": self.dropout}
@@ -249,18 +250,7 @@ class LoRA:
         """This spec with a Hub `source` named at the commit the Hub resolves it to, as a run records
         it, the answer recorded so the same run resolves it offline (`hub_answer`); a local source, a
         source named at a commit, or none, as it is."""
-        if self.source is None or FilePath(self.source).exists():
-            return self
-        repo, _, revision = self.source.partition("@")
-        if re.fullmatch(r"[0-9a-f]{40}", revision):
-            return self
-        from huggingface_hub import HfApi
-
-        from dew.cache import hub_answer
-
-        commit = hub_answer(("adapter commit", repo, revision),
-                            lambda: HfApi().model_info(repo, revision=revision or None).sha).value
-        return dataclasses.replace(self, source=f"{repo}@{commit}")
+        return self if self.source is None else dataclasses.replace(self, source=_pinned(self.source))
 
     def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
                  modules: Sequence[str] | None = None,
@@ -309,6 +299,22 @@ class LoRA:
         tensors, metadata = read_file(file)
         configs = _diffusers_configs(tensors, metadata.get(DIFFUSERS_METADATA), str(file))
         return _place(model, bound, variables, _entries(_components(bound), tensors, configs, ""), base)
+
+
+def _pinned(source: str) -> str:
+    """`source` as a run records it: a Hub repo at the commit its revision resolves to, the answer
+    recorded so an offline run resolves it alike (`hub_answer`); a local path, or a repo named at a
+    commit, as it is."""
+    repo, _, revision = source.partition("@")
+    if FilePath(source).exists() or re.fullmatch(r"[0-9a-f]{40}", revision):
+        return source
+    from huggingface_hub import HfApi
+
+    from dew.cache import hub_answer
+
+    commit = hub_answer(("adapter commit", repo, revision),
+                        lambda: HfApi().model_info(repo, revision=revision or None).sha).value
+    return f"{repo}@{commit}"
 
 
 def _adapter_files(source: str) -> FilePath:
@@ -1231,8 +1237,11 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
     (rslora, dropout), = settings
     # A pipeline file's components each name their own base, as the tool that wrote it bound each
     # (Diffusers writes each component's config apart).
-    bases = {_component(components, entry.module)[0]: base or entry.config.base for entry in entries
-             if (base or entry.config.base) is not None}
+    bases: dict[str, AdapterBase] = {}
+    for entry in entries:
+        named = base or entry.config.base
+        if named is not None:
+            bases[_component(components, entry.module)[0]] = named
     targets: dict[Path, Target] = {}
     bound: dict[str, WeightLayout] = {}
     leaves: dict = {}
