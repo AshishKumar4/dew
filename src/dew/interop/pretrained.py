@@ -14,7 +14,7 @@ import copy
 import dataclasses
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -1788,14 +1788,17 @@ class _Routed(NamedTuple):
 
 def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: sources.SourceReference | None,
             text_only: bool, overrides: Mapping[str, object] | None,
-            prediction_depths: int | None = None) -> _Routed:
+            prediction_depths: int | None = None,
+            inventory: Callable[[], Collection[str] | None] = lambda: None) -> _Routed:
     """A native source's config, its route and, where `text_only` takes a wrapper's language model
     alone, that model's wrapper fields, decided before any weight downloads, on the config alone: a
     format the codec cannot read, a family's refusal, an unregistered decoder checked against
     transformers (tiers 2 and 3). The language model reads as its text family's checkpoint
     (`decoders.language_model_config`); a route that reads no `overrides` refuses them. `remote` and
     `pinned` are `source_route`'s. Where `prediction_depths` is given, the config is the checkpoint's
-    of that many depths (`_kept_depths`), which the load reads and saves."""
+    of that many depths (`_kept_depths`), which the load reads and saves. `inventory` gives the
+    checkpoint's tensor names from their headers, which a quantized wrapper's selection patterns are
+    resolved over (`decoders.language_model_quantization`), None where none can be read so early."""
     if prediction_depths is not None:
         config = _kept_depths(config, prediction_depths)
     route = source_route(config, remote=remote, pinned=pinned)
@@ -1807,8 +1810,8 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
         if decoders.bundles(config):
             config = decoders.bundle_text_config(config)
         elif source_quantization(config) is not None:
-            config = {**decoders.language_model_config(config),
-                      "quantization_config": decoders.language_model_quantization(config, language)}
+            quantization = decoders.language_model_quantization(config, language, inventory)
+            config = {**decoders.language_model_config(config), "quantization_config": quantization}
         else:
             config = decoders.language_model_config(config)
         route = source_route(config, remote=remote, pinned=pinned)
@@ -1987,8 +1990,14 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     config = _native_config(config, overrides)
     family = config.get("model_type")
     if routed is None:
+        listed = tensors
+
+        def inventory() -> Collection[str] | None:
+            held = listed if listed is not None else sources.stored_tensors(source, root)
+            return None if held is None else held.keys()
+
         routed = _routed(config, remote=remote, pinned=pinned, text_only=text_only, overrides=overrides,
-                         prediction_depths=prediction_depths)
+                         prediction_depths=prediction_depths, inventory=inventory)
     config, route, language = routed
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
