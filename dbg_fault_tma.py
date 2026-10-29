@@ -12,6 +12,17 @@ from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates import mosaic_sm90
 
 mode = sys.argv[1]
+if mode == "badcoord":
+    from jaxlib.mlir.dialects import llvm
+    original_asm = llvm.inline_asm
+    def bad_coordinate(result_type, operands, asm, constraints, **kwargs):
+        if "cp.async.bulk.tensor.5d" in asm and "shared::cta.global" in asm:
+            operands = list(operands)
+            operands[4] = original_asm(
+                operands[4].type, [], "mov.u32 $0, 1;", "=r",
+                has_side_effects=True, asm_dialect=0)
+        return original_asm(result_type, operands, asm, constraints, **kwargs)
+    llvm.inline_asm = bad_coordinate
 width = 128
 x = jnp.asarray(np.random.default_rng(0).standard_normal((2, 4096, 8, width)),
                 jnp.bfloat16)
