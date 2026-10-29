@@ -186,6 +186,43 @@ def test_a_small_budget_splits_passes_without_moving_a_logit(decide):
                                          "budgeted logits")
 
 
+PACKED_SEEDS = 16
+"""Check 1's declared seeds for a packed pass against its rows alone."""
+
+
+def every_case_row(task: Decide) -> list:
+    """Every case's rows as `task` lays them out, a row a question."""
+    return [row for request in CASES.values()
+            for row in task._encoded(request["state"], {name: Question.from_wire(wire)
+                                                        for name, wire in request["questions"].items()})]
+
+
+def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
+    """A pass packs its rows first-fit into windows, as a run's windows hold them (`Decide.packing`),
+    several a window and each attending its own tokens alone: each row's logits on par with the row
+    scored alone, a pass of its own, from the float64 task alone (check 1), over weights drawn about the
+    task's, and the pass a few windows where a row a window would take one each."""
+    rows = every_case_row(decide)
+    shape = decide._shape(rows)
+    placed = decide._placed(rows, shape)
+    assert placed is not None and len(set(placed)) < len(rows) and shape.rows < len(rows)
+    wide = Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla")
+
+    def draw(seed):
+        key = jax.random.key(seed)
+        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
+                             decide.variables),)
+
+    def packed(variables) -> np.ndarray:
+        return np.concatenate([logits.ravel() for logits in decide.scored(rows, variables)])
+
+    def alone(task: Decide):
+        return lambda variables: np.concatenate([task.scored([row], variables)[0].ravel() for row in rows])
+
+    assert_as_exact(as_given(packed), as_given(alone(decide)), draw, "packed pass", seeds=PACKED_SEEDS,
+                    truth_fn=alone(wide))
+
+
 def test_a_tournament_takes_each_group_winner_to_the_final(decide):
     """Fourteen options in groups of at most four: four groups, their
     winners the final's options, and each winner its group's own answer."""

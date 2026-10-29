@@ -213,9 +213,9 @@ def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(
                 if record.getMessage().startswith("Compiling jit(logits)")]
 
     with jax.log_compiles():
-        cold = replace(decide, budget=Budget(questions=5, options=16))
+        cold = replace(decide, budget=Budget(options=16))
         assert compiled_while_serving(ScoringServer(*cold.scoring(), rows=64))
-        declared = replace(decide, budget=Budget(questions=4, options=16))
+        declared = replace(decide, budget=Budget(options=16))
         server = ScoringServer.from_task(*declared.scoring())
         assert server.programs == declared.pass_shapes
         assert len(set(server.programs)) == len(server.programs) <= 16

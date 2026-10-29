@@ -148,8 +148,7 @@ class Encoding:
                 raise ValueError(f"a question of {count} options outgrows the encoding's {self.width} slots")
         questions = len(encoded.questions)
         row: Batch = {
-            "tokens": np.asarray(encoded.tokens, np.int32),
-            **question_fields(encoded, questions, self.width, labelled_rows([encoded])),
+            **model_row(encoded, self.width, self.context_length),
             **{field.name: field.empty(questions, self.width) for field in TRAINING_FIELDS
                if field.when == "trained"},
         }
@@ -169,17 +168,28 @@ class Encoding:
                 row["targets"][slot, :count] = shown
                 row["labels"][slot] = int(np.argmax(shown))
                 row["scored"][slot] = True
-        if encoded.positions is not None and encoded.slots is not None:
-            row["positions"] = np.asarray(encoded.positions, np.int32)
-            row["slots"] = np.asarray(encoded.slots, np.int32)
-        if encoded.blocks is not None:
-            row["blocks"] = np.asarray(encoded.blocks, np.int32)
-        if self.context_length is not None:
-            row["context"] = np.asarray(encoded.context or (), np.int32)
-            if self.grouped:
-                # A row of its own is a unit of one row, its context that row's (`_unit_row`).
-                row["context_row"] = np.zeros(len(row["context"]), np.int32)
+        if self.context_length is not None and self.grouped:
+            # A row of its own is a unit of one row, its context that row's (`_unit_row`).
+            row["context_row"] = np.zeros(len(row["context"]), np.int32)
         return row
+
+
+def model_row(encoded: Encoded, width: int, context_length: int | None = None) -> Batch:
+    """The fields of a laid-out row a model reads, as a window packs them (`packing`): its tokens, its
+    questions in `width` option slots each (`question_fields`), its tokens' positions and option slots
+    in the parallel layout, their blocks where it reads them in blocks, and with a `context_length` its
+    context's tokens. A training row (`Encoding`) is this and its gold; a scored row is this alone
+    (`dew.decision.task.Decide`)."""
+    row: Batch = {"tokens": np.asarray(encoded.tokens, np.int32),
+                  **question_fields(encoded, len(encoded.questions), width, labelled_rows([encoded]))}
+    if encoded.positions is not None and encoded.slots is not None:
+        row["positions"] = np.asarray(encoded.positions, np.int32)
+        row["slots"] = np.asarray(encoded.slots, np.int32)
+    if encoded.blocks is not None:
+        row["blocks"] = np.asarray(encoded.blocks, np.int32)
+    if context_length is not None:
+        row["context"] = np.asarray(encoded.context or (), np.int32)
+    return row
 
 
 
