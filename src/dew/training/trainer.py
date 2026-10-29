@@ -225,7 +225,7 @@ class CompiledStep(Protocol):
     step's microbatches were accepted, and the transaction's commit telemetry (None for a custom step);
     `sampled`, the commit telemetry also summarizes what the run inspects (`Committed.inspected`)."""
 
-    def __call__(self, state: TrainState, batch: Batch, sampled: bool = False) -> tuple[
+    def __call__(self, state: TrainState, batch: Batch, /, sampled: bool = False) -> tuple[
             TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array, Committed | None]: ...
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)

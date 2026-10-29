@@ -13,7 +13,7 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, SupportsFloat
 
 import jax
 import jax.numpy as jnp
@@ -94,7 +94,7 @@ def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[s
     return found
 
 
-def logged(inspected: Mapping[str, jax.typing.ArrayLike]) -> dict[str, float]:
+def logged(inspected: Mapping[str, SupportsFloat]) -> dict[str, float]:
     """A sample's scalars as a run logs them, under `inspect/`."""
     return {f"inspect/{name}": float(value) for name, value in inspected.items()}
 

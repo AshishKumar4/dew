@@ -8,29 +8,27 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import test_run_budgets
 from reference_error import assert_as_exact_as_the_reference
 from test_run_options import lm, scalars
 
 from dew.cli.main import main
 from dew.data.dataset import Loader
-from dew.objectives.base import Aux, Objective
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Inspection, Trainer, inspected
 
-FEATURES, BATCH, RATE = 4, 8, 0.25
+BATCH, RATE = 8, 0.25
+FEATURES = test_run_budgets.FEATURES
 ROWS = np.random.default_rng(0).normal(size=(BATCH, FEATURES)).astype(np.float32)
 STATISTICS = ("mean", "rms", "abs_max")
 
 
-class Pulled(Objective):
-    """A weight pulled toward the batch's rows: the mean over them and their coordinates of (w - x)^2,
-    whose gradient is 2 (w - the rows' mean) / FEATURES."""
+class Pulled(test_run_budgets.Pulled):
+    """`test_run_budgets`' weight pulled toward the batch's rows, whose gradient is 2 (w - the rows' mean)
+    / FEATURES, starting at 1, 2, ... FEATURES, where no entry is zero."""
 
     def fresh_variables(self, key, held):
         return {"params": {"w": jnp.arange(1, FEATURES + 1, dtype=jnp.float32)}}
-
-    def loss(self, variables, batch, step):
-        return self.row_mean(jnp.square(variables["params"]["w"] - batch["x"]), batch), Aux({})
 
 
 class Kept:
