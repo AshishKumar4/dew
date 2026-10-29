@@ -470,13 +470,13 @@ def drained(batch: Batch, consumed: int, bound: int) -> Batch:
 
 
 def refuse_unclocked(state: TrainState, resume: int, examples: int | None) -> None:
-    """Refuse to resume a run on the examples clock (`examples`) from a checkpoint written before runs
-    kept the examples they consumed (`TrainState.consumed`), whose schedule counted steps ahead."""
+    """Refuse to resume a run on the examples clock (`examples`) from a checkpoint of a run on another
+    clock, which kept no examples consumed (`TrainState.consumed`) for its schedule to read on from."""
     if examples is not None and state.consumed is None:
         raise ValueError(
-            f"step {resume}'s checkpoint was written before a run bounded in examples kept the examples "
-            "it consumed, so its schedule was counted in steps ahead of the run, which this Dew no "
-            "longer counts: resume it with the Dew that wrote it, or start a fresh run from its weights")
+            f"step {resume}'s checkpoint is of a run counted in steps or tokens, which kept no examples "
+            "consumed, and this run reads its schedule off them: resume it on the clock it was written "
+            "on, or start a fresh run from its weights")
 
 
 def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:

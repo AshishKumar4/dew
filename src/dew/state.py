@@ -125,9 +125,6 @@ CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
 """The train-state fields a checkpoint holds, by their names; a field its
 declaration marks `checkpointed=False` is rebuilt on resume."""
 
-ADDED = ("consumed",)
-"""The checkpointed train-state fields a checkpoint written before them lacks, which its restore leaves
-None (`dew.checkpoints`) for the trainer to fill as the run reads them."""
 
 MODEL_STATE = ("step", "microstep", "updates", "variables", "ema")
 """The train-state fields that say which model a step holds, its counters, variables and EMA:

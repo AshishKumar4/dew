@@ -447,10 +447,12 @@ class Trainer(Generic[Loss, Effects]):
                 self._key = request_key(self._given_key)
         return self._key
 
-    def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH) -> None:
-        """Take `loader`'s device steps, which the step runs on each batch it reads, and the batches to
-        prefetch, as `fit` does before it compiles, and a step compiled ahead (`dew.training.ahead`)."""
+    def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
+        """Take `loader`'s device steps, the batches to prefetch and the run's clock (`clocked`), as `fit`
+        does before it compiles, and a step compiled ahead (`dew.training.ahead`)."""
         self._device, self._prefetch = loader.device, prefetch
+        self._examples = clocked(examples, steps, custom=self.step is not None,
+                                 rollout=self.rollout is not None, bound_ends=loader.bound_ends)
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -1342,9 +1344,7 @@ class Trainer(Generic[Loss, Effects]):
         loader, held, tokens, steps = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
             examples=examples, accumulation=self.accumulation, startup=self._startup)
-        self.reading(loader, device_prefetch)
-        self._examples = clocked(examples, steps, custom=self.step is not None,
-                                 rollout=self.rollout is not None, bound_ends=loader.bound_ends)
+        self.reading(loader, device_prefetch, examples=examples, steps=steps)
         self._schedule(None if steps is None else steps // self.accumulation)
         plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
                           written=(log_every, eval_every, checkpoint_every),
