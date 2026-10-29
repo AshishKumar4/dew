@@ -204,7 +204,7 @@ _KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
 """The shape and dtype of a default key's data, read without a device."""
 
 
-def _seed(key: int | jax.Array | None) -> int | jax.Array:
+def _seed(key: int | jax.Array) -> int | jax.Array:
     """A request's key as a row holds it: an integer seed as given, for
     `_row_keys` to make into a key, or a key's data. `_row_keys` makes and
     reads every row's key with the default PRNG implementation, so a key of
@@ -778,7 +778,7 @@ class Server:
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: int | jax.Array | None = None) -> Ticket:
+               key: int | jax.Array) -> Ticket:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
@@ -964,7 +964,7 @@ class Server:
         prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
         max_new_tokens: int | None = None,
         *,
-        key: int | jax.Array | None = None,
+        key: int | jax.Array,
     ) -> list[Generation]:
         """Submit a batch, run it through, and return its generations in order.
 

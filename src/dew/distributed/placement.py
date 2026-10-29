@@ -773,7 +773,7 @@ def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> 
     activations on (collective-permute). How the experts on the expert axis meet their tokens, an
     all-to-all or a gather by the layer's dispatch (`dew.nn.moe`), and the attention's exchange
     over the sequence axis, an all-to-all or a gather by its heads and lengths
-    (`dew.nn.attention.sequence_parallel_attention`), are the model's choice, not the
+    (`dew.nn.attention_parallel.sequence_parallel_attention`), are the model's choice, not the
     placement's, and are not named."""
     implied = {}
     for axis, size in mesh.shape.items():

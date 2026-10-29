@@ -31,14 +31,15 @@ def scored_draw(task: str, sample: int, call: Call, text: str, record: PromptRec
     """One draw's one-call session: COMPLETED where its call stopped, TRUNCATED where it ran out,
     scored by `reward(text, record)` on its decoded `text`. A reward whose external boundary failed
     (`INFRASTRUCTURE`: a sandbox, a service) leaves an INFRA_ERROR session
-    naming it, which a scheduler retries; a non-finite score is refused."""
+    naming it, which a scheduler retries; a non-finite score is refused. Either names the record's
+    `data_source`, the source its rewards and statuses report under (`source_metrics`)."""
     try:
         score = reward(text, record)
     except INFRASTRUCTURE as error:
         return Session(task, "", sample, 0, (call,), Status.INFRA_ERROR, None, {},
-                       f"reward: {type(error).__name__}: {error}")
+                       f"reward: {type(error).__name__}: {error}", record.data_source)
     status = Status.COMPLETED if call.terminated else Status.TRUNCATED
-    return Session(task, "", sample, 0, (call,), status, finite_reward(score))
+    return Session(task, "", sample, 0, (call,), status, finite_reward(score), source=record.data_source)
 
 
 def prompt_rows(batch) -> tuple[np.ndarray, np.ndarray, list[PromptRecord]]:

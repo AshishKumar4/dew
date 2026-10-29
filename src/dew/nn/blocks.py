@@ -15,10 +15,10 @@ from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.dropout import Dropout
 
 from . import activations
-from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
 from .kernels.generation import linear_tangent
+from .norms import GroupNorm, RMSNorm
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .rope import sinusoid_frequencies, sinusoids
 from .sharding import constrain, explicit_spec, rows_taken, whole_spec

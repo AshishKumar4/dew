@@ -202,7 +202,7 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     The reverse pass's compensated sums and their rounded assembly must lower
     too; interpreting on CPU cannot expose broken multi-result GPU assembly.
     """
-    from dew.nn.attention import rms_normalized
+    from dew.nn.norms import rms_normalized
 
     def forward_backward(x, scale, seed):
         def norm(x, scale):

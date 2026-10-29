@@ -844,7 +844,7 @@ def _normed_truth(sizes, x, w, weight):
 
 def dew_rms_norm(x, weight):
     """Dew's own RMS norm (its XLA body, checkpointed), as a model's block calls it."""
-    from dew.nn.attention import rms_normalized
+    from dew.nn.norms import rms_normalized
     return rms_normalized(x, weight, 1e-6, x.dtype, scale_offset=False, scale_after_cast=False,
                           fp32_statistics=True, implementation="xla")
 
