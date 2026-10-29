@@ -20,9 +20,10 @@ from dew.nn.kernels.templates import attention_algebra as algebra
 from dew.nn.kernels.templates.attention import prescaled, whole
 from dew.nn.kernels.templates.attention_mosaic_program import _coords, _views_of, layouts
 
-DECODE_COLUMNS = 8
-"""The narrowest tile a key head's query heads take: wgmma's least N, the group's heads first, the rest
-seeing no key."""
+DECODE_COLUMNS = 16
+"""The narrowest tile a key head's query heads take, the group's heads first, the rest seeing no key: the
+weights staged `[bk, N]` for `Vᵀ Pᵀ` take Mosaic GPU's 16-bit tiling (8, 16), so 16 columns, past wgmma's
+least N of 8."""
 
 
 class _Bounds(NamedTuple):
