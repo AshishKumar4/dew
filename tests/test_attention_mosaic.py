@@ -1121,8 +1121,9 @@ def test_the_backward_compiles_spill_free_as_its_model_decides_for_an_h100(width
     with generation.assumed("sm90"):
         op, args = attention_mosaic._backward_call(jnp.zeros(query.shape, query.dtype), jnp.zeros(key.shape),
                                                   jnp.zeros(key.shape), spans, None, jnp.zeros(query.shape),
-                                                  _residuals(query.shape), accurate=accurate)
-        ba = op.bind(*args)
+                                                  _residuals(query.shape), accurate=accurate, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, interpret=False)
         target = generation.gpu_target()
         config = op.derived(ba, target)
         assert config is not None
