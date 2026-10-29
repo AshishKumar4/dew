@@ -1,16 +1,17 @@
-"""Each named RL method (dew.objectives.rl.methods) against its paper's objective, written apart from Dew
-in float64: each method's loss term, its reference penalty in the loss included, and its gradient in each
-token's log-probability, over drawn sessions packed two to a row, on par with the paper's form by check 1
-(tests/reference_error.py). Through a scheduler's call over scripted sessions, the returns the estimators
-compare: DAPO's overlong punishment and dynamic sampling, RLOO's reference penalty in the reward, and the
-global estimator's whitening over a batch split into data shares."""
+"""Each named RL method (dew.objectives.rl.methods) against its paper's objective, written apart from Dew:
+each method's loss term, its reference penalty in the loss included, and its gradient in each token's
+log-probability, over drawn sessions packed two to a row, run in float64 computing the paper's form in
+float64 (`assert_computes_the_oracle`), and its gradient in float32 on par with the paper's form's by
+check 1 (tests/reference_error.py). Through a scheduler's call over scripted sessions, the returns the
+estimators compare: DAPO's overlong punishment and dynamic sampling, RLOO's reference penalty in the
+reward, and the global estimator's whitening over a batch split into data shares."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from rl_support import TinyHead
 
 from dew.objectives.rl import RolloutScheduler, Synchronous
@@ -37,7 +38,10 @@ LENGTHS = ((3, 5), (4, 2), (6, 4), (2, 7)) * 8
 """Each row's two sessions' trained token counts: enough sessions that a loss's rounding is a sum of many
 terms', which check 1 resolves over its seeds."""
 WIDTH = 12
-SEEDS = dict.fromkeys(("grpo", "dapo", "dr_grpo", "gspo", "cispo", "gmpo", "reinforce_pp", "rloo"), 16)
+SEEDS = 16
+"""The draws check 1 holds each method's float32 gradient over."""
+ORACLE_DRAWS = 4
+"""The draws each method's float64 term is held to its paper's form on."""
 
 
 def draw(seed):
@@ -170,8 +174,21 @@ def rloo(sessions):
     ids=lambda value: value if isinstance(value, str) else "")
 def test_each_method_is_its_papers_objective(name, formula, settings):
     """The method's loss term, its reference penalty in the loss included, and its gradient in each
-    token's log-probability are its paper's objective's (check 1, the paper's form in float64 the truth)."""
-    assert_as_exact(dew_term(name, **settings), paper(formula), draw, name, seeds=SEEDS[name])
+    token's log-probability compute its paper's objective: run in float64, within the float64 rounding of
+    their own arithmetic of the paper's form in float64. In float32 the gradient it trains on is on par
+    with the paper's form's (check 1, the paper's form in float64 the truth); a loss is one value a draw,
+    whose float32 rounding check 1 cannot resolve over the draws a site runs."""
+    term, written = dew_term(name, **settings), paper(formula)
+    for seed in range(ORACLE_DRAWS):
+        with jax.enable_x64(new_val=True):
+            inputs = widened(draw(seed))
+            found, expected = term(*inputs), written(*inputs)
+            roundings = chain_roundings(jax.make_jaxpr(term)(*inputs))
+        for kind, mine, theirs in zip(("loss", "gradient"), found, expected, strict=True):
+            assert_computes_the_oracle(np.asarray(mine), np.asarray(theirs), f"{name} {kind} at draw {seed}",
+                                       roundings=roundings)
+    assert_as_exact(lambda *inputs: term(*inputs)[1], lambda *inputs: written(*inputs)[1], draw,
+                    f"{name} gradient", seeds=SEEDS)
 
 
 def test_a_method_fixes_its_composition_and_refuses_what_it_lacks():
