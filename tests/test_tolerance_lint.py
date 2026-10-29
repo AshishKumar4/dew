@@ -173,6 +173,14 @@ COMPARISONS = {
     "a method that happens to be named within or approx": ("assert method.within(family)\n"
                                                            "assert rows.approx(3)", 0),
     "an ordering of two values, no error taken": ("assert loss < first_loss", 0),
+    # The gate's one-draw rules, each call a comparison until it judges through check 1 (row 2089).
+    "the one-draw rule": ("from reference_error import assert_as_exact_as_the_reference\n"
+                          "assert_as_exact_as_the_reference(mine, theirs, truth, 'a site')", 1),
+    "the one-draw rule over leaves": ("import reference_error\n"
+                                      "reference_error.assert_leaves_as_exact(mine, theirs, truth)\n"
+                                      "reference_error.assert_no_less_exact(mine, theirs, truth, 'a site')", 2),
+    "check 1 over drawn seeds": ("from reference_error import assert_as_exact\n"
+                                 "assert_as_exact(dew, reference, draw, 'a site', seeds=8)", 0),
 }
 
 
