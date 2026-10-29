@@ -53,7 +53,12 @@ def main() -> None:
             # The run keeps its last step alone: a later main pins and resumes from the latest.
             trainer = TrainerConfig(checkpoint_dir=str(root / "runs"), steps=2, log_every=1, eval_every=None,
                                     checkpoint_every=None, multi_host=False, compilation_cache_dir=None)
-            dataclasses.replace(build(root, drawn=False), trainer=trainer).prepare().train(kind)
+            run = dataclasses.replace(build(root, drawn=False), trainer=trainer)
+            # A source the repo holds is recorded by its path in the repo, which a later checkout reads
+            # where it sits; a resume refuses another source (`RunConfig.check_resume`).
+            if getattr(run, "pretrained", None) is not None:
+                run = dataclasses.replace(run, pretrained=Path(run.pretrained).relative_to(ROOT).as_posix())
+            run.prepare().train(kind)
             packed = io.BytesIO()
             with tarfile.open(fileobj=packed, mode="w:xz") as archive:
                 archive.add(root / "runs" / kind, arcname=kind)

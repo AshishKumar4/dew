@@ -36,7 +36,7 @@ def called(task) -> None:
 
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=[f"{recorded}-{kind}" for recorded, kind in SAVED])
-def test_a_run_an_earlier_main_saved_loads_answers_and_resumes(tmp_path, recorded, kind):
+def test_a_run_an_earlier_main_saved_loads_answers_and_resumes(tmp_path, monkeypatch, recorded, kind):
     """A kind's run saved at an earlier main rebuilds from its record, pins its last checkpoint, loads as
     its saved task and answers a call, and resumes from that checkpoint to a step past it."""
     runs = tmp_path / "runs"
@@ -54,8 +54,10 @@ def test_a_run_an_earlier_main_saved_loads_answers_and_resumes(tmp_path, recorde
         called(saved.objective.saved_task.from_run(str(run)))
     recorded_run = RunConfig.load(str(run))
     here = KINDS[kind](tmp_path, drawn=False)
-    sources = {name: getattr(here, name) for name in ("data", "validation", "pretrained")
-               if hasattr(here, name)}
+    # A source the repo holds is recorded by its path in the repo (a decision run's backbone), read from
+    # the checkout's root as the run that wrote it read it.
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    sources = {"data": here.data, "validation": here.validation}
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(runs), steps=last + 1,
                                   compilation_cache_dir=None, multi_host=False)
     state = dataclasses.replace(recorded_run, trainer=trainer, **sources).prepare().train(kind)
