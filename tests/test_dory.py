@@ -25,6 +25,7 @@ from reference_error import (
     float64_forward,
     indexed_recording,
     recording,
+    seeds_for,
     widened,
 )
 from tool_support import load as load_tool
@@ -505,24 +506,34 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
 
     config, peft = json.loads((TINY / 'config.json').read_text()), peft_merged(TINY, tmp_path / 'adapter')
     assert {name for name in peft if not np.array_equal(peft[name], original[name])} == projections
-    assert_as_exact_as_the_reference(logits, TOOL.DoryReference(config, peft, torch.float32).forward(ids),
-                                     TOOL.DoryReference(config, peft, torch.float64).forward(ids),
-                                     'the adapter as PEFT merges it')
-    adapted.save(tmp_path / 'merged', variables=resumed)
-    merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
-    # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
-    # model's logits are on par with the adapted model's over drawn ids, both from the adapted
-    # model's float64 forward (check 1).
     vocabulary = adapted.model.vocab_size
 
     def draw(seed):
         return (np.random.default_rng([0xD0E, seed]).integers(0, vocabulary, ids.shape, dtype=np.int32),)
 
-    def merged_logits(drawn):
-        return merged.model.apply(merged.variables, drawn)
+    # The adapter as PEFT merges it, its consumer: the transcription over PEFT's merge computes the
+    # adapted model's logits on par with its own fp32 run from its float64 one (check 1).
+    merged_by_peft = {dtype: TOOL.DoryReference(config, peft, dtype)
+                      for dtype in (torch.float32, torch.float64)}
+
+    def peft_logits(dtype):
+        return as_given(lambda drawn: merged_by_peft[dtype].forward(np.asarray(drawn)))
 
     def adapted_logits(drawn):
         return adapted.model.apply(resumed, drawn)
+
+    seeds = seeds_for(peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
+                      truth_fn=peft_logits(torch.float64))
+    assert_as_exact(adapted_logits, peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
+                    seeds=seeds, truth_fn=peft_logits(torch.float64))
+    adapted.save(tmp_path / 'merged', variables=resumed)
+    merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
+    # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
+    # model's logits are on par with the adapted model's over drawn ids, both from the adapted
+    # model's float64 forward (check 1).
+
+    def merged_logits(drawn):
+        return merged.model.apply(merged.variables, drawn)
 
     assert_as_exact(merged_logits, adapted_logits, draw, 'merged adapter logits', seeds=MERGED_SEEDS,
                     truth_fn=as_given(lambda drawn: float64_forward(adapted.model, resumed, drawn)[0]))
@@ -776,21 +787,19 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
             for prompt, tokens, prompt_rows in parts.values()])}
 
     def dew(index, order):
-        ordered = jax.device_put(symmetric(weights, config, order))
-        found = jax.tree.map(np.asarray, rows(programs, ordered))
-        jax.tree.map(lambda leaf: leaf.delete(), ordered)
-        return found
+        # Each order's weights placed alone, and gone from the device when the call returns.
+        return jax.tree.map(np.asarray, rows(programs, jax.device_put(symmetric(weights, config, order))))
 
     # The float64 arm on the default device, a GPU's float64 units where one runs the test, its kernels
-    # chosen as a CPU's, the portable math.
+    # chosen as a CPU's, the portable math: its weights kept on the host and placed for a call alone, so
+    # the device never holds them beside an order's.
     with jax.enable_x64(new_val=True), generation.assumed('cpu'):
-        wide = model.clone(dtype=jnp.float64)
-        held = jax.device_put(widened(weights))
-        wide_programs = decoding(wide)
+        wide_programs = decoding(model.clone(dtype=jnp.float64))
+    held = widened(weights)
 
     def truth(order):
         with jax.enable_x64(new_val=True), generation.assumed('cpu'):
-            return rows(wide_programs, held)
+            return rows(wide_programs, jax.device_put(held))
 
     truth.dew_programs = True
     seeds = int(stored[f'{site}.seeds'])
@@ -884,12 +893,8 @@ def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loo
     config = json.loads((RELEASED / 'config.json').read_text())
     parts = {part: (stored[f'{site}.prompt.{part}'], stored[f'{site}.continued.{part}'], prompt_rows)
              for part, _, prompt_rows in recorder.PARTS}
-    loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype)
     # The weights live on the host, each order's copy alone on the device: the 4B's weights twice over,
     # with its compiled step and cache, do not fit a 40 GB GPU.
-    weights = jax.device_get(loaded.variables)
-    for leaf in jax.tree.leaves(loaded.variables):
-        if isinstance(leaf, jax.Array):
-            leaf.delete()
+    loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype, on_host=True)
     model = with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(recorder.CONTEXT)
-    assert_decodes_as_recorded(stored, site, model, weights, config, parts, f'Dory 4B {site}')
+    assert_decodes_as_recorded(stored, site, model, loaded.variables, config, parts, f'Dory 4B {site}')
