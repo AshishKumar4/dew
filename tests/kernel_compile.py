@@ -456,7 +456,7 @@ def mosaic_failures(found: list[dict]) -> list[str]:
     it does, or another count of programs a multiprocessor (owner, 10-27: neither spills nor wastes
     occupancy; docs/design/kernel-templates.md), or whose scratch is not the bytes its planner sized it by
     (the model's `shared`, `resources.scratch_bytes`, where it states them). Every modelled kernel's
-    evidence is recorded (`compile_evidence`)."""
+    evidence is held to ptxas's decision (`compile_evidence`)."""
     failed = failures(found)
     evidence = []
     for record in found:
@@ -482,8 +482,7 @@ def mosaic_failures(found: list[dict]) -> list[str]:
                               f"bytes of scratch, the kernel asks for {found_kernel.shared}")
             if model is not None:
                 evidence.append(_evidence(record, found_kernel, model, kernel.get("need")))
-    failed += [f"{record}" for record in compile_evidence.disagreements(evidence)]
-    compile_evidence.write(evidence, "mosaic-" + "-".join(sorted({each.facts.target for each in evidence})))
+    failed += compile_evidence.disagreements(evidence)
     return failed
 
 

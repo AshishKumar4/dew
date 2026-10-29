@@ -8,7 +8,9 @@ import dataclasses
 import datetime
 import math
 import types
-from typing import Literal
+from typing import Annotated, Literal
+
+import tyro
 
 from dew._records import JSON, is_share, recorded_duration, share
 from dew.data.dataset import Loader
@@ -61,8 +63,11 @@ def run_tokens(loader: Loader, tokens: int | None, *, counts_tokens: bool) -> in
 @dataclasses.dataclass(frozen=True)
 class Plateau:
     """Stops training after `evals` eligible evaluations without an improvement larger than `min_delta`. A
-    `Summary` is eligible at the evaluations that form it, those that scored every split it weighs."""
-    metric: Metric | TrainingScalar | Summary | types.MethodType
+    `Summary` is eligible at the evaluations that form it, those that scored every split it weighs. The
+    metric is the object fit scores, or its recorded name, as `Best` takes one (`val/loss`)."""
+    # A command line names the metric (`--trainer.stop.metric val/loss`).
+    metric: Annotated[Metric | TrainingScalar | Summary | types.MethodType | str,
+                      tyro.conf.arg(constructor=str)]
     evals: int = 5
     min_delta: float = 0.0
     mode: Literal['min', 'max'] | None = None

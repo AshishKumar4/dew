@@ -218,6 +218,30 @@ def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
         adapter._loglikelihood_tokens([(None, [1], [2])], override_bs=1)
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_harness_loads_a_run_sharded_and_stored_narrower(run):
+    """A harness loads a run over a mesh, by a layout, and stores its weights in the dtype `param_dtype`
+    names, as `TextGeneration.from_run` does (row 2244): `--model_args` names the mesh by its sizes,
+    `fsdp=2,param_dtype=bfloat16` placing bfloat16 weights on a mesh of two fsdp shards that scores a
+    request, and `DewLM.from_run`'s layout splits the largest of them over those shards."""
+    import math
+
+    import jax
+    import jax.numpy as jnp
+
+    from dew.training import Layout, MeshSpec
+
+    narrow = DewLM.create_from_arg_string(f"run={run},fsdp=2,param_dtype=bfloat16")
+    leaves = jax.tree.leaves(narrow.task.variables["params"])
+    assert {leaf.dtype for leaf in leaves} == {jnp.dtype(jnp.bfloat16)}
+    assert {leaf.sharding.mesh.shape["fsdp"] for leaf in leaves} == {2}
+    ((score, _),) = narrow.loglikelihood([instance("the ", "quick")])
+    assert math.isfinite(score)
+    split = DewLM.from_run(str(run), mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1))
+    largest = max(jax.tree.leaves(split.task.variables["params"]), key=lambda leaf: leaf.size)
+    assert not largest.sharding.is_fully_replicated
+
+
 def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
     """On the same weights, a request that samples under `top_k=1` draws what
     lm-eval's own model draws there and what greedy decoding draws; a total

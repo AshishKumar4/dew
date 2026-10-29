@@ -539,6 +539,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         prices such a vector (a hook's, a template's per-row statistics) states it."""
         raise NotImplementedError(f"{self.name}'s register model takes no column vector")
 
+    def row_registers(self, rows: int, dtype) -> int:
+        """The registers a consumer thread holds for a vector of `rows` entries of `dtype` in the
+        accumulator's row layout (`row`), broadcast over its columns: a family whose register model prices
+        such a vector (a template's per-row statistics) states it."""
+        raise NotImplementedError(f"{self.name}'s register model takes no row vector")
+
     def narrowest_columns(self, dtype) -> int:
         """The fewest columns a staged operand block of `dtype` takes: a row of the narrowest swizzle
         (`NARROWEST_SWIZZLE_BYTES`), 16 bf16 columns, which both families' products read (wgmma's N in
@@ -889,12 +895,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         del views
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
 
-    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *, first: jax.Array | int = 0,
+    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
             refills: bool = True) -> "dict[str, Ring] | Feed":
-        """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`), the walk taking the same
-        `first`: on a layout with a producer, the rings, which its producer loads from `views` (`stream`);
-        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`."""
-        del views, lo, hi, wg, first, refills
+        """What a consumer's walk of steps `lo` to `hi` reads (`walk`'s `streams`), the walk's `first` its
+        `lo`: on a layout with a producer, the rings, which its producer loads from `views` (`stream`);
+        on one whose consumers feed them (`ConsumerFed.fed`), a `Feed`. Its rings fresh, one walk's a scope:
+        a second walk on them counts its steps from its own first against barriers already past them."""
+        del views, lo, hi, wg, refills
         return streams
 
     def stream(self, streams, views: dict, lo, hi) -> None:
@@ -1193,11 +1200,11 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         raise NotImplementedError(f"{self.name}'s consumers each walk every step of their rings (`fed`)")
 
-    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *, first: jax.Array | int = 0,
+    def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
             refills: bool = True) -> "dict[str, Ring] | Feed":
-        """`RingFamily.fed`: a `Feed` of steps `lo` to `hi` from `views`, at the walk's `first`, its first
-        steps primed by the loading consumer, drained at its walk's end."""
-        feed = Feed(streams, views, lo, hi, wg == self.loader, first=first, refills=refills, drains=True)
+        """`RingFamily.fed`: a `Feed` of steps `lo` to `hi` from `views`, its ring counters from `lo` (the
+        walk's `first`), its first steps primed by the loading consumer, drained at its walk's end."""
+        feed = Feed(streams, views, lo, hi, wg == self.loader, first=lo, refills=refills, drains=True)
         feed.primed()
         return feed
 
@@ -1206,10 +1213,8 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
                 ) -> tuple[C, tuple[jax.Array, ...]]:
         if not isinstance(streams, Feed):
             raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
-        # The feed loads each step at the ring counter the walk reads it at, both `index - first`.
-        first = streams.first if isinstance(first, int) and first == 0 else first
-        if first is not streams.first:
-            raise ValueError(f"{self.name}'s fed walk takes the `first` its feed was made with (`fed`)")
+        # The walk reads each step at the ring counter its feed loads it at, both from the feed's `lo`.
+        first = streams.first
         if in_flight and len(segments) > 1:
             # A segment's last step's release waits for the walk's end, which the feed's next segment, its
             # loads behind that release, would never reach.

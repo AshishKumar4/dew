@@ -110,6 +110,8 @@ Checkpointable data must supply the consumed iterator position. A failed scaled 
 
 An `OptimConfig` is built by `fit` over the run's optimizer updates. If you need `initial_state`, `place` or `compile` before `fit`, pass `OptimConfig(...).build(steps)` to `Trainer` instead, where `steps` is the run's length in optimizer updates.
 
+`OptimConfig.optimizer` names one of Dew's optimizers (`adam`, `adamw`, `lamb`, `muon`, `muonclip`) or any Optax optimizer factory by its import path, `OptimConfig(optimizer="optax:sgd", optimizer_opts={"momentum": 0.9})`, built as `factory(learning_rate, **optimizer_opts)` with the config's `b1`, `b2` and `weight_decay` where set, so a recorded run (`--optim.optimizer optax:sgd`) trains on the transformation an experiment ran.
+
 <!-- api: dew.training.Trainer.initial_state dew.training.Trainer.place dew.training.Trainer.compile dew.training.trainer.CompiledStep -->
 
 `compile` returns a callable whose type is `CompiledStep`. The scaler is part of `TrainState`. `loss_finite` and `accepted` are separate, because a finite scalar loss can come with a nonfinite gradient that is rejected. The final value carries transaction commit telemetry, or `None` for a custom step. The callable consumes the state it is given (`donate_argnums=0`), and the returned state takes over its buffers, so write `new = compiled(old, batch)` and keep no reference to the old state. The batch is not donated, because the loader still owns it.
