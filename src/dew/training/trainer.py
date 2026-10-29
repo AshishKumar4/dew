@@ -134,7 +134,7 @@ from dew.training._fit import (
     unrecorded_parts,
     waited_read,
 )
-from dew.training._lowering import Lowered, Routed, routed
+from dew.training._lowering import KernelReport, Lowered, Routed, routed
 from dew.training.budget import Pause, Plateau
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -1033,10 +1033,10 @@ class Trainer(Generic[Loss, Effects]):
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
 
-        def lower(split: int, narrow: bool) -> Candidate:
+        def lower(split: int, narrow: bool, lowering: bool = True) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
             return self._candidate(state, batch, schedule, placement, replicated, split, narrow,
-                                   recorded_launches(recorded, rung))
+                                   recorded_launches(recorded, rung), lowering=lowering)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1054,7 +1054,7 @@ class Trainer(Generic[Loss, Effects]):
                                                   candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow,
             None if self._base_rung is None else self._base_rung[1], resumed, ahead=self._ahead,
-            capacity=capacity)
+            capacity=capacity, derive=lambda split, narrow: lower(split, narrow, lowering=False).footprint)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
@@ -1073,20 +1073,20 @@ class Trainer(Generic[Loss, Effects]):
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
-        self.plan = settled(planned, probes)
+        self.plan = settled(planned, probes, search.derived)
         search.told(planned)
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
-                   split: int, narrow: bool | None, launches: str | None, *,
+                   split: int, narrow: bool | None, launches: str | None, lowering: bool = True, *,
                    mesh: Mesh | None = None, platforms: tuple[str, ...] | None = None) -> Candidate:
-        """The step reading `batch` in `split` microbatches, lowered at the
-        objective's current rung, with what the fit check holds beside it.
-        `launches` are its kernel launches where a record holds them, which settle their configs before
-        it lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records
-        them (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`_lowered_for`)."""
+        """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
+        alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
+        `launches` are its kernel launches where a record holds them, which settle their configs before it
+        lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records them
+        (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`_lowered_for`)."""
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation, narrow)
         shardings = self.shardings(prepared)
@@ -1109,15 +1109,15 @@ class Trainer(Generic[Loss, Effects]):
         lower = Routed(functools.partial(
             lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
             *apart(prepared), placed_shapes(batch, placement) if mesh is not None else batch, part))
-        if self.tune_kernels and platforms is None:
+        if self.tune_kernels and lowering and platforms is None:
             lowered, launches = tuning.tune(lower, measure=True)
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-            lowered, launches = lower(), launches or "[]"
+            lowered, launches = lower() if lowering else None, launches or "[]"
         footprint = None if self.step is not None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
-                         lower.report(), footprint)
+                         lower.report() if lowering else KernelReport((), ()), footprint)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
                   narrow: bool | None = None):
