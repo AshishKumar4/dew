@@ -34,7 +34,16 @@ from typing_extensions import TypeVar
 
 from dew._hashing import array_fingerprint
 from dew._records import finite
-from dew.batch import Variables, prefix_sum, real_slots, token_positions, valid_order, with_validity
+from dew.batch import (
+    POSITIONS_FIELD,
+    VALIDITY_FIELD,
+    Variables,
+    prefix_sum,
+    real_slots,
+    token_positions,
+    valid_order,
+    with_validity,
+)
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
@@ -521,7 +530,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
         positions = ({} if state.positions is None else
-                     {"positions": state.positions[:, None] + jnp.arange(width)[None, :]})
+                     {POSITIONS_FIELD: state.positions[:, None] + jnp.arange(width)[None, :]})
         def append():
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
@@ -608,7 +617,7 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
         # Multi-axis rotary metadata is not a scalar position, and a depth
         # takes it under its own name.
         placed = ({"rotary_positions": positions} if positions.ndim == 3
-                  else {"positions": positions})
+                  else {POSITIONS_FIELD: positions})
         (logits, states), updated = model.apply(
             {**params, "cache": state.cache}, hidden, ids, depth=depth, attention_mask=valid,
             input_embeddings=embeds, decode=True, mutable=["cache"], rngs=None,
@@ -694,7 +703,7 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
         raise ValueError("max_new_tokens must be a non-negative integer")
     if type(n) is not int or n < 1:
         raise ValueError("n must be a positive integer number of continuations")
-    mask = fields.get("attention_mask")
+    mask = fields.get(VALIDITY_FIELD)
     if mask is not None and (mask.shape != ids.shape or not np.all((mask == 0) | (mask == 1))):
         raise ValueError("attention_mask must be binary [B, P] aligned with token ids")
     valid = real_slots(fields, ids.shape, xp=np)

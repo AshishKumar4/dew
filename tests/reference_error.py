@@ -353,8 +353,24 @@ def _arms(dew_fn, reference_fn):
     fusions (`jax.jit`). A site passes plain functions; the gate compiles them, so no site can compile
     one arm otherwise than its other. One function as both arms compiles once."""
     compile = jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn
+    _refuse_owned_policies(compile, dew_fn, reference_fn)
     reference = _compiled(reference_fn, compile)
     return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile)), reference
+
+
+def _refuse_owned_policies(compile, *arms) -> None:
+    """Refuse an arm compiled with a policy the gate does not own (row 2287): a `without_ynn` program,
+    which `_compiled` runs as it is, beside an arm run `as_given`, where the gate compiles Dew's arm as
+    its users run it, with the fusions (`jax.jit`) — it would run without them, unseen. A plain
+    `jax.jit` arm the gate's own compile nests, which applies the gate's options; a jit with compiler
+    options of its own refuses that nesting itself (`compiler_options` only at top level). Pass the
+    function plain and the gate compiles it as the pairing asks."""
+    for fn in arms:
+        inner = fn.fn if isinstance(fn, _Windowed) else fn
+        if compile is jax.jit and getattr(inner, "without_ynn", False) and not _given(inner):
+            raise TypeError(f"{getattr(inner, '__qualname__', repr(inner))} is compiled without YNNPACK's "
+                            f"fusions, beside an arm run as given, where the gate compiles Dew's arm with "
+                            f"them: pass it plain, and the gate compiles it as the pairing asks")
 
 
 def with_gradients(fn, *, has_aux: bool = False):

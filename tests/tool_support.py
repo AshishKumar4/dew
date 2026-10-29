@@ -43,3 +43,15 @@ def git(root: Path, *arguments: str) -> str:
     return subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True, text=True,
                           env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}).stdout
+
+
+def lint_codes(lint: ModuleType, root: Path, parts: tuple[str, ...], body: str) -> list[str]:
+    """The codes `lint` (tools/lint_slop.py) reports for `body` written at `parts` under `root`, a checkout
+    of that one file."""
+    import textwrap
+
+    path = root.joinpath(*parts)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(body))
+    [module] = lint.collect(["/".join(parts)], root, "dew")
+    return [finding.code for finding in lint.check(module)]

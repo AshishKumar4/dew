@@ -2,10 +2,8 @@
 constructor computed rounded to float32 (ledger 1601); a truth's twin is built inside
 tools/torch_precision.py's `float64` (ledger 1619)."""
 
-import textwrap
-
 import pytest
-from tool_support import load
+from tool_support import lint_codes, load
 
 
 @pytest.fixture(scope="module")
@@ -139,22 +137,14 @@ PROMOTIONS = {
 }
 
 
-def _codes(lint, tmp_path, parts, body):
-    path = tmp_path.joinpath(*parts)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(textwrap.dedent(body))
-    [module] = lint.collect(["/".join(parts)], tmp_path, "dew")
-    return [finding.code for finding in lint.check(module)]
-
-
 @pytest.mark.parametrize("case", list(PROMOTIONS))
 def test_a_module_promoted_to_float64_after_its_construction_is_reported(lint, case, tmp_path):
     body, count = PROMOTIONS[case]
-    assert _codes(lint, tmp_path, ("tests", "test_case.py"), body).count("SLOP022") == count
+    assert lint_codes(lint, tmp_path, ("tests", "test_case.py"), body).count("SLOP022") == count
 
 
 def test_the_library_holds_no_torch_truth_so_the_rule_reads_none_of_it(lint, tmp_path):
-    assert "SLOP022" not in _codes(lint, tmp_path, ("src", "dew", "case.py"), LINEAR + "model.double()")
+    assert "SLOP022" not in lint_codes(lint, tmp_path, ("src", "dew", "case.py"), LINEAR + "model.double()")
 
 
 def test_a_float64_context_is_read_by_its_bare_name_in_the_file_that_defines_it(lint, tmp_path):
@@ -162,5 +152,5 @@ def test_a_float64_context_is_read_by_its_bare_name_in_the_file_that_defines_it(
     it is where imported; a function of that name in another file is not."""
     body = ("import torch\ndef oracle_precision():\n    pass\nwith oracle_precision():\n"
             "    model = torch.nn.Linear(4, 4)\n    model.double()")
-    assert "SLOP022" not in _codes(lint, tmp_path, ("tools", "block_override_reference.py"), body)
-    assert _codes(lint, tmp_path, ("tools", "other_reference.py"), body).count("SLOP022") == 1
+    assert "SLOP022" not in lint_codes(lint, tmp_path, ("tools", "block_override_reference.py"), body)
+    assert lint_codes(lint, tmp_path, ("tools", "other_reference.py"), body).count("SLOP022") == 1
