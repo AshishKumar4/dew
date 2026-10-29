@@ -1551,9 +1551,9 @@ imports the Hub client: the decoder, the adapter's source and its weight name, a
 
 def test_an_adapter_named_by_its_folder_fetches_the_files_it_reads_alone(decoder, tmp_path):
     """An adapter inside a checkpoint folder (`--lora.weight-name checkpoint-10`) beside the trainer's
-    own state loads from a local directory and from a Hub repo alike, computing the same logits, bit for
-    bit, as `LoRA.load` of that folder; from the Hub only its PEFT pair is fetched, the optimizer state
-    and the root's other files left there."""
+    own state loads from a local directory, through a link to that folder, and from a Hub repo alike,
+    computing the same logits, bit for bit, as `LoRA.load` of that folder; from the Hub only its PEFT
+    pair is fetched, the optimizer state and the root's other files left there."""
     import subprocess
     import sys
 
@@ -1570,8 +1570,12 @@ def test_an_adapter_named_by_its_folder_fetches_the_files_it_reads_alone(decoder
     logits = np.asarray(expected.model.apply(expected.variables, ids))
     spec = LoRA(rank=2, modules=("q_proj", "v_proj"), alpha=4.0, source=str(tmp_path / "local"),
                 weight_name="checkpoint-10")
-    local = decoder.adapt(spec, key=1)
-    np.testing.assert_array_equal(np.asarray(local.model.apply(local.variables, ids)), logits)
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "checkpoint-10").symlink_to(checkpoint, target_is_directory=True)
+    for source in (tmp_path / "local", linked):
+        local = decoder.adapt(dataclasses.replace(spec, source=str(source)), key=1)
+        np.testing.assert_array_equal(np.asarray(local.model.apply(local.variables, ids)), logits)
     served = {path.relative_to(tmp_path / "local").as_posix(): path
               for path in (tmp_path / "local").rglob("*") if path.is_file()}
     with LocalHub({"local/checkpoints": served}) as hub:

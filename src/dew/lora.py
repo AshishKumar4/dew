@@ -344,11 +344,13 @@ def _adapter_files(source: str, weight_name: str | None) -> FilePath:
     commit, chosen alike from either's files (`_adapter_selection`); a Hub repo's selected files alone
     are fetched."""
     local = FilePath(source)
-    if local.is_file():
-        return local
     if local.exists():
-        listed = [path.relative_to(local).as_posix() for path in local.rglob("*") if path.is_file()]
-        return local / _adapter_selection(listed, weight_name)[0]
+        # The folder itself is listed, through a link to it too.
+        folder = local if weight_name is None else local / weight_name
+        if folder.is_file():
+            return folder
+        held = [path.name for path in folder.iterdir() if path.is_file()]
+        return folder / _adapter_selection(held, None)[0]
     from dew.interop.sources import SourceReference, repo_files
 
     reference = SourceReference.parse(source)
