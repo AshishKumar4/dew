@@ -40,10 +40,10 @@ attention norms no query or key where its attention is the layer's, its input no
 feed-forward's gate zero (`tied`)."""
 UNNORMED = MODEL.clone(qk_norm=False)
 
-SHARED_SEEDS = {"shared fresh": 8, "shared idefics": 64, "shared decode": 8, "shared scan": 8,
-                "alternating scan": 16}
+SHARED_SEEDS = {"shared fresh": 8, "shared idefics": 8, "shared decode": 8, "shared scan": 8,
+                "alternating scan": 8}
 """Check 1's declared seeds for each site of the file, sized paired by `seeds_for` on armada at
-edf94b090 (job IGXSIZE)."""
+edf94b090 (job IGXSIZE) and, for the IDEFICS read and the alternating scan, at db0cc076a (IGXSIZE3)."""
 
 
 def test_a_fresh_shared_read_computes_the_decoder_it_was_attached_to():
