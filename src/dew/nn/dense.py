@@ -18,6 +18,7 @@ then sums, and offer no step to widen it.
 """
 
 import functools
+import importlib.util
 import inspect
 from collections.abc import Callable, Iterable
 
@@ -34,21 +35,22 @@ from dew.cache import INTERCEPTED
 from .kernels.templates.gemm import template
 from .precision import accumulated, biased, float32_dot_general
 
-
-def _direct_qwix_interception() -> bool:
-    """Direct Qwix calls expose no public running-provider query. Keep their active ancestor check
-    here until Flax or Qwix exposes it; lifted transforms retain this stack when parents change.
-    A quantized child may run below an ordinary parent, so every active ancestor matters."""
-    from flax.linen.module import _context
-
-    return any("_unquantized_type" in vars(layer) for module in _context.module_stack if module is not None
-               for layer in type(module).__mro__)
+QWIX = importlib.util.find_spec("qwix") is not None
+"""Whether Qwix is installed (`dew.quantization`'s extra), whose rules a layer's product may fall under."""
 
 
 def intercepted() -> bool:
-    """A Dew interception scope (quantization, LoRA), or a direct Qwix scope outside Dew's wrapper entry
-    points: a wrapper that owns the layers' products, which reach it as `jax.lax.dot_general` calls."""
-    return INTERCEPTED.value or _direct_qwix_interception()
+    """Whether a wrapper owns the layer's product, which reaches it as a `jax.lax.dot_general` call: a Dew
+    interception scope (`dew.quantization`, `dew.lora`: `dew.cache.INTERCEPTED`), or a Qwix rule matching
+    the op at this module under a direct `qwix.quantize_model` call (`qwix.pallas.get_current_rule`, Qwix's
+    public query for code that runs its own kernels, which every active provider answers)."""
+    if INTERCEPTED.value:
+        return True
+    if not QWIX:
+        return False
+    from qwix import pallas as qwix_pallas
+
+    return qwix_pallas.get_current_rule("dot_general") is not None
 
 
 def _product(layer: nn.Dense | nn.DenseGeneral):
@@ -130,6 +132,11 @@ class _LinearEnvelope(nn.Module):
 
 class Dense(_LinearEnvelope, nn.Dense):
     """Flax's Dense, its bias added by `biased` (the module docstring)."""
+
+    def product_owned(self) -> bool:
+        """Whether a wrapper owns this layer's product (`intercepted`), asked within its own scope, so a
+        Qwix rule over its module path answers: what a parent joining it with others reads (`joined`)."""
+        return intercepted()
 
     def _linear(self, inputs: Array) -> jax.Array:
         width = jnp.shape(inputs)[-1]

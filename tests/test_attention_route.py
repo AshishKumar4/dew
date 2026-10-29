@@ -236,11 +236,10 @@ def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_he
     arm = None if shards is None else jax.jit(shares_on_one_device(routed, heads, kv_heads, shards))
 
     with nn.logical_axis_rules(rules):
+        # With `shards`, the one split run of each draw compared with both arms (row 2156).
         assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, label, seeds=MESH_SEEDS,
-                              truth_fn=truth, moves=moves, arm=arm)
-        if shards is not None:
-            assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, f"{label}, the reference path",
-                                  seeds=MESH_SEEDS, truth_fn=truth, moves=moves, arm=jax.jit(truth))
+                              truth_fn=truth, moves=moves, arm=arm,
+                              also=None if shards is None else ("the reference path", jax.jit(truth)))
 
 
 @pytest.mark.mesh(devices=8)

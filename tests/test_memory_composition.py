@@ -61,6 +61,7 @@ def decoder(memory: InContextMemory | None = None, **fields):
                                 "kinds": {"memory": LayerKind(mixer=InContextMemoryMixer(memory))}, **fields})
 
 
+@pytest.mark.whole_suite
 def test_a_memory_decoder_trains_scans_remats_and_decodes():
     """A decoder whose first two layers are memories, which its scanned stack scans as one group, from
     the plain loop's tree: the scanned stack's logits and gradient, and both under a remat policy that

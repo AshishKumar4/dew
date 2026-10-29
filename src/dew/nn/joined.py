@@ -66,14 +66,17 @@ own calls (`selection.Requirement`)."""
 
 
 def join_case(projections: Sequence[nn.Module]) -> JoinCase:
-    """The `JoinCase` of `projections`."""
+    """The `JoinCase` of `projections`: whether a wrapper owns their products each asks within its own
+    scope (`Dense.product_owned`), a rule over its module path matching it there."""
+    dense = all(_plain_dense(projection) for projection in projections)
     return JoinCase(
-        dense=all(_plain_dense(projection) for projection in projections),
+        dense=dense,
         dot_general=all(projection.dot_general in (None, float32_dot_general)
                         and projection.dot_general_cls is None for projection in projections),
         uniform=len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
                       projection.promote_dtype) for projection in projections}) == 1,
-        intercepted=intercepted(),
+        intercepted=(any(projection.product_owned() for projection in projections) if dense
+                     else intercepted()),
         held=all(projection.has_variable('params', 'kernel') for projection in projections))
 
 

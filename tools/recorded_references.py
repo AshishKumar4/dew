@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
@@ -36,10 +37,11 @@ from reference_error import (
     seeds_for,
     seeds_resolving,
     truth_sketch,
+    widened,
 )
 
-__all__ = ["merge_shards", "provenance", "record_case", "record_reference", "record_shard", "save",
-           "with_pilots"]
+__all__ = ["merge_shards", "provenance", "record_case", "record_logits", "record_reference", "record_shard",
+           "save", "with_pilots"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
@@ -146,6 +148,77 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
+
+
+def record_logits(directory: Path, model, wide, command: str, *, reference: str, revision: str, license: str,
+                  draw=None, padded: Mapping[str, np.ndarray] | None = None, planned: bool = True,
+                  **details) -> Path:
+    """The tiny decoder at `directory`'s reference recorded over check 1's seeds, which its test reads in
+    the reference's place (a release's remote code or a release apart from the suite's, which the test
+    cannot run; hf_reference.py `write_logits_recording`'s): each seed's ids, `draw(seed)` (`{"input_ids":
+    ids}`, by default tests/interop_support.py `fixture_ids`' in the fixture's shape), the torch causal LM
+    `model`'s fp32 eager logits on the CPU and `wide`'s, its float64 twin's
+    (`torch_precision.float64_twin`), inside `torch_precision.float64`, as the leaf `logits`; and with
+    `padded`, the fields the reference's padded rows take
+    (`attention_mask` and its `position_ids`), the leaf `padded_logits` too: its logits over the ids
+    padded with 0 where the mask is false, at the mask's valid places. The count is planned on Dew's own
+    load of the fixture, its padded rows under the mask alone, or, not `planned`, where Dew cannot load
+    beside the reference's release (Ouro's transformers 4.56.2 pins a huggingface_hub older than Dew's
+    interop imports), on the reference alone (`record_case`), and confirmed on the reference; the
+    reference's evidence alone is kept with its truth's sketch (`record_case`'s summary), which the
+    test's float64 run of Dew's model is held to, saved as recorded_logits.npz beside the fixture with
+    its provenance, `reference` at `revision` under `license`, and `details`. Returns the file written."""
+    import torch
+    from interop_support import fixture_ids
+    from torch_precision import float64
+
+    mask = None if padded is None else np.asarray(padded["attention_mask"], bool)
+    fields = {name: torch.from_numpy(np.asarray(value, np.int64 if name == "position_ids" else bool))
+              for name, value in (padded or {}).items()}
+    if draw is None:
+        ids_of = fixture_ids(directory)
+
+        def draw(seed):
+            return {"input_ids": ids_of(seed)[0]}
+
+    def logits(network, ids):
+        tokens = torch.from_numpy(ids.astype(np.int64))
+        with torch.no_grad():
+            out = {"logits": network(input_ids=tokens, use_cache=False).logits.numpy()}
+            if mask is not None:
+                rows = torch.from_numpy(np.where(mask, ids, 0).astype(np.int64))
+                out["padded_logits"] = network(input_ids=rows, **fields, use_cache=False).logits.numpy()[mask]
+        return out
+
+    def evaluate(inputs):
+        with float64():
+            truth = logits(wide, inputs["input_ids"])
+        return logits(model, inputs["input_ids"]), truth
+
+    def ours(network, variables):
+        def run(inputs):
+            ids = inputs["input_ids"]
+            out = {"logits": network.apply(variables, ids)}
+            if mask is not None:
+                rows = network.apply(variables, jnp.where(mask, ids, 0), attention_mask=mask)
+                out["padded_logits"] = rows[mask]
+            return out
+        return run
+
+    proxy = truth_proxy = None
+    if planned:
+        from dew.interop import Pretrained
+
+        native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+        proxy = ours(native.model, native.variables)
+        truth_proxy = ours(native.model.clone(dtype=jnp.float64), widened(native.variables))
+    with jax.enable_x64(new_val=True):
+        recording = record_case("logits", draw, evaluate, proxy, truth_proxy=truth_proxy, store_inputs=False,
+                                summary=True)
+    record = provenance(reference, revision, "cpu", command, torch=torch.__version__, dtype="float32",
+                        attention="eager", **details)
+    return save(directory / "recorded_logits.npz", {**recording, "logits.provenance": record},
+                reference=reference, license=license)
 
 
 def record_shard(label: str, draw, evaluate, seeds: range) -> dict[str, np.ndarray]:

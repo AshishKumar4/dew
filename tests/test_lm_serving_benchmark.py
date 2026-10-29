@@ -41,6 +41,7 @@ def served(model: Path, out: Path, *options: str) -> dict:
     return json.loads(out.read_text())
 
 
+@pytest.mark.whole_suite
 def test_the_benchmark_serves_weights_a_mesh_splits(tmp_path):
     """`--mesh` places the weights on that mesh before the server is built: the record names the
     mesh and the axis that splits them, which the default placement over the same two devices

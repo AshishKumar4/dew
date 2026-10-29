@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchmark_cases import DIT_B, FORWARD, LM_DENSE, LM_MOE
+from benchmark_cases import DIT_B, FORWARD, LM_DENSE, LM_HYBRID, LM_MOE
 from environments import CACHE, Unlocked, environment, machine_lock
 
 FLOOR = 0.02
@@ -64,6 +64,8 @@ STEP_CASES = {
                              "batch_size": 4, "seq_len": 1024},
     "step lm-moe 4x1024": {"architecture": "causal_transformer", "config": LM_MOE, "dtype": "bfloat16",
                            "batch_size": 4, "seq_len": 1024},
+    "step lm-hybrid 4x1024": {"architecture": "causal_transformer", "config": LM_HYBRID, "dtype": "bfloat16",
+                              "batch_size": 4, "seq_len": 1024},
     "step simple-dit-b 32x64px": {"architecture": "simple_dit", "config": DIT_B, "dtype": "bfloat16",
                                   "batch_size": 32, "image_size": 64},
     "step simple-mmdit-b 32x64px": {"architecture": "simple_mmdit", "config": DIT_B, "dtype": "bfloat16",

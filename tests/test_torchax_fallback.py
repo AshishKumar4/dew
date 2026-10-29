@@ -31,14 +31,7 @@ import torch
 import transformers
 from interop_support import token_draw
 from jax.sharding import PartitionSpec as P
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    equations,
-    torch_with_gradients,
-    with_gradients,
-)
+from reference_error import as_given, assert_as_exact, equations, torch_with_gradients, with_gradients
 
 from dew.batch import coordinates
 from dew.data.dataset import Loader
@@ -758,27 +751,49 @@ def test_a_float64_forwards_logits_are_as_wide_as_its_output_tables(tokens, tmp_
     assert direct.dtype == table.dtype == jnp.float64
 
 
+TORCHAX_SEEDS = 8
+"""The float32 torchax model's declared draws of token ids against torch's forward (check 1), sized by
+`seeds_for` paired with the model on an A100."""
+
+
 @pytest.mark.gpu(reason="TF32 is a GPU's default float32 product")
-def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tokens, tmp_path):
+def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_path):
     """On a GPU, a float32 torchax model's own logits and its output table's over the same
-    states are each as exact as torch's float32 forward, from torch's in float64, under JAX's own
-    default precision (the test lane sets 'highest' for every product that states none)."""
+    states are each on par with torch's float32 forward from torch's in float64 over drawn token
+    ids (check 1), under JAX's own default precision (the test lane sets 'highest' for every
+    product that states none)."""
     loaded = tied_float32(tmp_path)
-    ids = tokens[:, :SEQ]
     model = head_model("tied")
-    with jax.default_matmul_precision(None):
-        direct = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)), np.float64)
-        hidden = loaded.model.apply(loaded.variables, jnp.asarray(ids), method="hidden_states")
-        table = np.asarray(loaded.model.apply(loaded.variables, method="output_table").logits(hidden),
-                           np.float64)
-    reference = torch_logits(model, ids).astype(np.float64)
-    with float64(), torch.no_grad():
+    with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
-        wide.load_state_dict(model.state_dict())
-        truth = wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
-    assert_as_exact_as_the_reference(direct, reference, truth, "the forward's logits")
-    assert_as_exact_as_the_reference(table, reference, truth, "the output table's logits")
+    wide.load_state_dict(model.state_dict())
+
+    def draw(seed):
+        return (np.random.RandomState(seed).randint(0, TINY["vocab_size"], (ROWS, SEQ)).astype(np.int32),)
+
+    @as_given
+    def ours(ids):
+        # Run as the model runs, eagerly, at JAX's default precision.
+        with jax.default_matmul_precision(None):
+            direct = loaded.model.apply(loaded.variables, jnp.asarray(ids))
+            hidden = loaded.model.apply(loaded.variables, jnp.asarray(ids), method="hidden_states")
+            table = loaded.model.apply(loaded.variables, method="output_table").logits(hidden)
+        return {"forward": np.asarray(direct), "output table": np.asarray(table)}
+
+    def torch_twice(run):
+        """Torch's logits for both of Dew's leaves."""
+        def both(ids):
+            logits = run(np.asarray(ids))
+            return {"forward": logits, "output table": logits}
+        return as_given(both)
+
+    def truth(ids):
+        with float64(), torch.no_grad():
+            return wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
+
+    assert_as_exact(ours, torch_twice(lambda ids: torch_logits(model, ids).astype(np.float64)), draw,
+                    "a float32 torchax model's logits", seeds=TORCHAX_SEEDS, truth_fn=torch_twice(truth))
 
 
 STATES_SEEDS = {"cohere": 8, "cohere runs": 8, "cohere2": 8, "cohere2 keyed": 8}
@@ -926,6 +941,7 @@ def slot_request(seed):
                                                    "criteria": dict.fromkeys(options)}}}
 
 
+@pytest.mark.whole_suite
 def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers_states(tmp_path):
     """A slot release whose backbone no registered family computes loads it as tier 3 and decides
     over it: each option's score is the release's law (`SlotReadout`: `<slot_i, h> + <q h, k m_i> /

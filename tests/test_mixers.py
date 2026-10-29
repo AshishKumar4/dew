@@ -262,7 +262,8 @@ one chunk); the scan's packed resets within a chunk stay held by tests/test_mamb
 tests/test_mamba_ssd.py at their own geometries."""
 
 
-@pytest.mark.parametrize("kind", sorted(mixers.paths))
+@pytest.mark.parametrize("kind", [pytest.param(kind, marks=pytest.mark.whole_suite) if kind == "memory"
+                                  else kind for kind in sorted(mixers.paths)])
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """Every mixer in the registry: a row packing documents (segment ids, positions restarting),
     one across a chunk of the chunked rules, gives each document's logits and the parameters' gradients

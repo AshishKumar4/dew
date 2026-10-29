@@ -13,6 +13,7 @@ import numpy as np
 from op_certificates import (
     EXP_RANGE,
     FORMATS,
+    TFLOAT32,
     Format,
     exact_sum,
     gamma,
@@ -20,6 +21,8 @@ from op_certificates import (
     interval_precision,
     magnitude_sum,
     rounded,
+    rounded_away,
+    truncated,
     two_sum,
 )
 
@@ -252,6 +255,33 @@ def _erfinv_special(value):
     return expected, ~(np.abs(value) < 1) | (value == 0)
 
 
+def _logistic_interval(values, bits):
+    """logistic's outward enclosure, 1 / (1 + exp(-x)), at each finite value, taken at EXP_RANGE's nearer
+    end beyond it: below it every logistic is under exp(-110), between +0 and the least subnormal of a
+    format no wider than fp32, and above it within exp(-90) of one, between one and the largest value
+    below it, the verdicts of the ends'."""
+    return _interval(lambda iv, x: 1 / (1 + iv.exp(-x)))(np.clip(values, *EXP_RANGE), bits)
+
+
+def _logistic_special(value):
+    """logistic's limits at the infinities and its one exact value, logistic(±0) = 1/2, named."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.select([value == np.inf, value == -np.inf, value == 0], [1.0, 0.0, 0.5], np.nan), named
+
+
+def _rsqrt_special(value):
+    """rsqrt's pole at zero, of the zero's sign, its zero at infinity, NaN below zero, and its exact
+    values, at the powers of four (2^(2k), whose root's reciprocal 2^-k is on every grid; at no other
+    value is it), named."""
+    mantissa, exponent = np.frexp(np.where(np.isfinite(value) & (value > 0), value, 1.0))
+    four = np.isfinite(value) & (value > 0) & (mantissa == 0.5) & ((exponent - 1) % 2 == 0)
+    named = np.isnan(value) | (value <= 0) | (value == np.inf) | four
+    expected = np.select([value < 0, value == 0, value == np.inf, four],
+                         [np.nan, np.copysign(np.inf, value), 0.0, np.ldexp(1.0, -(exponent - 1) // 2)],
+                         np.nan)
+    return expected, named
+
+
 def _transcendental(enclose, special):
     """A transcendental's levels (`LEVELS`): where `special(value)` names an exact result (a limit, a
     pole, outside the domain), 0 at that result and UNREACHED elsewhere; at every other value at least
@@ -294,6 +324,115 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool) -> np.ndarray:
     allowance = (gamma(count, fmt) + 2.0 ** -52) * magnitude + count * underflow
     error = np.abs(native - exact_sum(terms, -1))
     return np.isfinite(error) & (error <= np.nextafter(allowance, np.inf))
+
+
+TRUNCATING = {name: dataclasses.replace(fmt, name=f"{name}, truncating adds", precision=fmt.precision - 1)
+              for name, fmt in FORMATS.items()}
+"""Each format's sums as a GPU's tensor cores carry an MMA step's: each add truncated, not rounded, an error
+up to a whole unit in the last place, twice round to nearest's (src/dew/nn/kernels/templates/product.py),
+the unit roundoff of a format one bit narrower."""
+
+
+def native_dot_ends(products, out: Format, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
+    """The least and the greatest value of `out` a native GEMM's output takes on its exact `products`
+    (`native_dot_holds`): the nearest `out` values of the allowance's two ends; +0 for an empty sum."""
+    count = products.shape[-1]
+    if count == 0:
+        return np.zeros(products.shape[:-1]), np.zeros(products.shape[:-1])
+    exact = exact_sum(products, -1)
+    accumulator = FORMATS["float32"]
+    # A truncating add below the normal range loses up to a whole subnormal unit, not half of one.
+    underflow = 2.0 ** accumulator.emin if flushes else 2.0 ** (accumulator.emin - accumulator.precision + 1)
+    allowance = (gamma(count, TRUNCATING["float32"]) + 2.0 ** -52) * magnitude_sum(products, -1) + \
+        count * underflow
+    zero = np.zeros_like(exact)
+    return (rounded(np.nextafter(exact - allowance, -np.inf), zero, out),
+            rounded(np.nextafter(exact + allowance, np.inf), zero, out))
+
+
+def native_dot_holds(native, products, out: Format, flushes: bool) -> np.ndarray:
+    """Whether each element of a native GEMM's output is a value its exact `products` (float64, summed along
+    the last axis) admit, as check 2 holds a fused template GEMM natively (row 2084, link 1): accumulated in
+    fp32 in any order by adds that truncate (`TRUNCATING`), within γ_n of their magnitudes of the exact sum
+    plus what underflow loses past that (as `_terms_hold`), then rounded once to nearest in `out`, the
+    output's format. Rounding is monotone, so the output lies between the nearest `out` values of the
+    allowance's two ends."""
+    low, high = native_dot_ends(products, out, flushes)
+    native = np.asarray(native, np.float64)
+    return np.isfinite(native) & (native >= low) & (native <= high)
+
+
+def separated(ends, others) -> np.ndarray:
+    """Whether each element's two intervals (each its least and greatest values, as `native_dot_ends` gives
+    them) share no value. A kernel run around a defect computes, at each element, a value within the
+    interval of the products it was given (the contract's null); wherever that interval is separated from
+    the interval of the call's own products, the contract refuses it, whatever order or tile the kernel
+    sums in. So a fault's refusals are derived from its products, not counted from one run."""
+    (low, high), (other_low, other_high) = ends, others
+    return (high < other_low) | (other_high < low)
+
+
+def assert_refused(held, apart, share: float) -> None:
+    """A fault refused where it lands, as a native contract's validation holds it (row 2084): every element
+    whose interval on the call's products is separated from that on the products a kernel run around the
+    defect was given (`apart`, `separated`) is refused (`held` false), and those are more than `share` of
+    the elements, a share of the draw's products, which no order or tile the kernel legally takes moves."""
+    held, apart = np.asarray(held), np.asarray(apart)
+    assert not np.any(held & apart) and np.mean(apart) > share, np.mean(apart)
+
+
+def tf32_operand(values) -> np.ndarray:
+    """fp32 operands' values (as float64) as a tensor core multiplies them in a TF32 product (an fp32 product
+    at the default precision, src/dew/nn/kernels/templates/product.py): rounded to TF32 to nearest, a tie away
+    from zero (PTX's cvt.rna.tf32.f32), as the GEMM template's Triton launches read both operands of the
+    forward's, the input gradient's and the kernel gradient's products on an A100 and an H100 (row 2084, link
+    2: each of 38,400 values of each operand, 30% of them ties, read so, where 85% were their round to
+    nearest even and 35% their truncation). A product of two is exact in float64 (22 bits), as
+    `native_dot_holds` takes."""
+    return rounded_away(values, TFLOAT32)
+
+
+def promoted_step_ends(low, high, products, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
+    """The least and the greatest fp32 value an IEEE add, rounded to nearest, takes of an accumulator
+    between `low` and `high` (fp32 values as float64, the same where it is known) and a depth step's partial,
+    an fp32 value its exact `products` admit as a tensor core sums them from zero (`native_dot_ends`):
+    rounding to nearest is monotone in both, so the sums' roundings at their ends."""
+    accumulator = FORMATS["float32"]
+    least, most = native_dot_ends(products, accumulator, flushes)
+    return (_rounded_on_lane(*two_sum(np.asarray(low, np.float64), least), accumulator, flushes),
+            _rounded_on_lane(*two_sum(np.asarray(high, np.float64), most), accumulator, flushes))
+
+
+def truncating_step_ends(before, products, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
+    """The least and the greatest fp32 value a tensor core's accumulator `before` (fp32 values as float64)
+    takes once a depth step's exact `products` are added into it by the MMA's own adds, which truncate
+    (`TRUNCATING`), as a launch without exact sums adds them: the native-dot contract's ends with the
+    accumulator one more term (`native_dot_ends`), and, where the accumulator and every product share a sign,
+    no further from zero than the exact sum, since each value an add of such terms makes is rounded toward
+    zero (Fasi, Higham, Mikaitis and Pranesh, Numerical behavior of NVIDIA tensor cores, PeerJ Computer
+    Science 7:e330, 2021: the products aligned and the sum normalized by truncation)."""
+    accumulator = FORMATS["float32"]
+    before = np.asarray(before, np.float64)
+    terms = np.concatenate([before[..., None], products], -1)
+    low, high = native_dot_ends(terms, accumulator, flushes)
+    # The float64 sum is within half its unit of the exact one, so a unit further from zero bounds it.
+    total = exact_sum(terms, -1)
+    bound = truncated(np.nextafter(total, np.copysign(np.inf, total)), accumulator)
+    positive = (before >= 0) & np.all(products >= 0, -1)
+    negative = (before <= 0) & np.all(products <= 0, -1)
+    return np.where(negative, np.maximum(low, bound), low), np.where(positive, np.minimum(high, bound), high)
+
+
+def promoted_step_holds(before, after, products, flushes: bool) -> np.ndarray:
+    """Whether each native fp32 accumulator after one depth step of exact sums (`after`) is the IEEE sum,
+    rounded to nearest, of the accumulator before the step (`before`) and the step's own partial: an fp32
+    value the step's exact `products` admit as a tensor core sums them from zero (`native_dot_holds`, into
+    fp32). So a product declared above the default precision into an fp32 output adds each depth step's
+    partial apart (src/dew/nn/kernels/templates/product.py's `promoted`; row 2084, link 2). Rounding to
+    nearest is monotone in the partial, so `after` lies between the sums' roundings at its two ends."""
+    least, most = promoted_step_ends(before, before, products, flushes)
+    after = np.asarray(after, np.float64)
+    return np.isfinite(after) & (after >= least) & (after <= most)
 
 
 def _floats(operands, flushes: bool):
@@ -399,6 +538,27 @@ def _reduced_sum(params, operands, result, fmt):
     kept = moved.shape[:moved.ndim - len(axes)]
     count = int(np.prod(moved.shape[len(kept):], dtype=np.int64))
     return _terms_hold(result, moved.reshape(*kept, count), fmt, flushes)
+
+
+def _cumulative(params, operands, result, fmt):
+    """A cumulative sum along `axis`, forward or reversed: each prefix's (or suffix's) sum of its terms
+    within its bound in any order (`_terms_hold`, every prefix taken as one of the axis's length, which
+    bounds each shorter one); for integers, each wrapped to the result's width."""
+    (terms,) = operands
+    axis, reverse = params["axis"], params["reverse"]
+    if fmt is None:
+        summed = _wrapping(lambda t: np.flip(np.cumsum(np.flip(t, axis), axis=axis, dtype=np.uint64), axis)
+                           if reverse else np.cumsum(t, axis=axis, dtype=np.uint64))
+        return _bits(result) == _bits(summed(result, terms))
+    flushes = lane().flushes
+    moved = np.moveaxis(_read(terms, flushes), axis, -1)
+    count = moved.shape[-1]
+    taken = np.arange(count)[None, :] >= np.arange(count)[:, None] if reverse else \
+        np.arange(count)[None, :] <= np.arange(count)[:, None]
+    # [..., k, j]: the j-th term where the k-th prefix (or suffix) takes it, zero elsewhere.
+    prefixes = np.where(taken, moved[..., None, :], 0.0)
+    held = _terms_hold(np.moveaxis(np.asarray(result), axis, -1), prefixes, fmt, flushes)
+    return np.moveaxis(held, -1, axis)
 
 
 def _dot(params, operands, result, fmt):
@@ -522,6 +682,89 @@ def _reshaped(params, value):
     return np.reshape(value, params["new_sizes"])
 
 
+def _padded(params, value, fill):
+    """lax.pad's result: each axis dilated by its interior padding, then given its low and high padding,
+    a negative one cropping."""
+    for axis, (low, high, interior) in enumerate(params["padding_config"]):
+        low, high, interior = int(low), int(high), int(interior)
+        if interior and value.shape[axis] > 1:
+            size = value.shape[axis] + (value.shape[axis] - 1) * interior
+            dilated = np.full((*value.shape[:axis], size, *value.shape[axis + 1:]), fill, value.dtype)
+            index = [slice(None)] * value.ndim
+            index[axis] = slice(None, None, interior + 1)
+            dilated[tuple(index)] = value
+            value = dilated
+        widths = [(0, 0)] * value.ndim
+        widths[axis] = (max(low, 0), max(high, 0))
+        value = np.pad(value, widths, constant_values=fill)
+        index = [slice(None)] * value.ndim
+        index[axis] = slice(max(-low, 0), value.shape[axis] - max(-high, 0))
+        value = value[tuple(index)]
+    return value
+
+
+def _iota(params):
+    shape, axis = tuple(params["shape"]), params["dimension"]
+    counted = np.arange(shape[axis], dtype=np.dtype(params["dtype"]))
+    return np.broadcast_to(counted.reshape([shape[axis] if dim == axis else 1 for dim in range(len(shape))]),
+                           shape)
+
+
+def _gathered(params, operand, indices):
+    """lax.gather's result, by XLA's semantics: each output index's batch coordinates pick a start vector
+    from `indices` (its last axis the index vector), placed on the operand's `start_index_map` axes and
+    its batching axes, clamped so the slice fits (the clip and promise-in-bounds modes) or the whole slice
+    the fill value where it does not (fill-or-drop), then offset by the output's offset coordinates on the
+    operand's axes a slice keeps."""
+    import jax
+
+    numbers = params["dimension_numbers"]
+    sizes, mode = tuple(params["slice_sizes"]), params["mode"]
+    fill = jax.lax.GatherScatterMode.FILL_OR_DROP
+    shape = operand.shape
+    out_rank = len(numbers.offset_dims) + indices.ndim - 1
+    offset_axes = [axis for axis in range(operand.ndim)
+                   if axis not in numbers.collapsed_slice_dims and axis not in numbers.operand_batching_dims]
+    batch_dims = [dim for dim in range(out_rank) if dim not in numbers.offset_dims]
+    kept = [size for axis, size in enumerate(sizes) if axis in offset_axes]
+    out_shape = [0] * out_rank
+    for dim, size in zip(numbers.offset_dims, kept, strict=True):
+        out_shape[dim] = size
+    for dim, size in zip(batch_dims, indices.shape[:-1], strict=True):
+        out_shape[dim] = size
+    result = np.empty(out_shape, operand.dtype)
+    filler = None
+    if mode == fill:
+        if params.get("fill_value") is not None:
+            filler = params["fill_value"]
+        elif jax.dtypes.issubdtype(operand.dtype, np.inexact):
+            filler = np.nan
+        elif operand.dtype == np.bool_:
+            filler = True
+        else:
+            filler = np.iinfo(operand.dtype).min if np.issubdtype(operand.dtype, np.signedinteger) else \
+                np.iinfo(operand.dtype).max
+    for out in np.ndindex(*out_shape):
+        batch = tuple(out[dim] for dim in batch_dims)
+        vector = indices[batch]
+        start = [0] * operand.ndim
+        for position, axis in enumerate(numbers.start_index_map):
+            start[axis] = int(vector[position])
+        for axis, batch_axis in zip(numbers.operand_batching_dims, numbers.start_indices_batching_dims,
+                                    strict=True):
+            start[axis] = batch[batch_axis]
+        if mode == fill and any(start[axis] < 0 or start[axis] + sizes[axis] > shape[axis]
+                                for axis in range(operand.ndim)):
+            result[out] = filler
+            continue
+        start = [min(max(begin, 0), shape[axis] - sizes[axis]) for axis, begin in enumerate(start)]
+        offsets = [out[dim] for dim in numbers.offset_dims]
+        for axis, offset in zip(offset_axes, offsets, strict=True):
+            start[axis] += offset
+        result[out] = operand[tuple(start)]
+    return result
+
+
 def _bitcast(params, value):
     """lax.bitcast_convert_type's shapes: a narrower type adds a trailing axis of the width ratio, a
     wider one takes the trailing axis away."""
@@ -581,6 +824,8 @@ LEVELS = {
     "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     "exp": _transcendental(_exp_interval, _exp_special),
     "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
+    "rsqrt": _transcendental(_interval(lambda iv, x: 1 / iv.sqrt(x)), _rsqrt_special),
+    "logistic": _transcendental(_logistic_interval, _logistic_special),
 }
 """Each rounding primitive's measure, `levels(operands, result, fmt, flushes) -> level`, element by
 element, on a lane that flushes or not: 0 where the result is its exact value rounded to nearest (an
@@ -601,8 +846,10 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     from about 2^-140 (subnormal on a lane that keeps subnormals) to 2^126; roots of every binade,
     subnormals included; logarithms of every binade and a quarter near one; exponentials across fp32's
     range and a quarter near zero; inverse error functions across (-1, 1) and a quarter near its poles;
-    and each transcendental at its exact value (exp(0), log(1), erf_inv(0)), which a lane must return
-    exactly. One fixed draw per primitive and format."""
+    reciprocal roots of every binade, a quarter at the powers of four where they are exact; logistics
+    across fp32's range and a quarter near zero; and each transcendental at its exact value (exp(0),
+    log(1), erf_inv(0), logistic(0)), which a lane must return exactly. One fixed draw per primitive and
+    format."""
     rng = np.random.default_rng([*name.encode(), fmt.precision])
     quarter = PROBES // 4
 
@@ -626,10 +873,14 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         value[:quarter] = 1 + rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[0] = 1.0
         drawn = [value]
-    elif name == "exp":
+    elif name in ("exp", "logistic"):
         value = rng.uniform(-104, 89, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[0] = 0.0
+        drawn = [value]
+    elif name == "rsqrt":
+        value = np.abs(scaled(-149, 127))
+        value[:quarter] = 4.0 ** rng.integers(-74, 64, quarter)
         drawn = [value]
     else:
         value = rng.uniform(-1, 1, PROBES)
@@ -666,6 +917,8 @@ def lane() -> Lane:
 
 CONTRACTS = {
     "add": _rounding("add", _wrapping(np.add)),
+    # A cotangents' sum, the add its transpose emits, lowered as `add` is: held at add's reach.
+    "add_any": _rounding("add", _wrapping(np.add)),
     "sub": _rounding("sub", _wrapping(np.subtract)),
     "mul": _rounding("mul", _wrapping(np.multiply)),
     "square": _rounding("square", _wrapping(lambda a: a * a)),
@@ -679,7 +932,10 @@ CONTRACTS = {
     "log": _rounding("log", None),
     "exp": _rounding("exp", None),
     "erf_inv": _rounding("erf_inv", None),
+    "rsqrt": _rounding("rsqrt", None),
+    "logistic": _rounding("logistic", None),
     "reduce_sum": _reduced_sum,
+    "cumsum": _cumulative,
     "dot_general": _dot,
     "eq": _compared(lambda params, a, b: np.equal(a, b)),
     "ne": _compared(lambda params, a, b: np.not_equal(a, b)),
@@ -708,6 +964,14 @@ CONTRACTS = {
     "concatenate": _moved(lambda params, *parts: np.concatenate(parts, axis=params["dimension"])),
     "copy": _moved(lambda params, a: a),
     "copy_p": _moved(lambda params, a: a),
+    "optimization_barrier": _moved(lambda params, a: a),
+    "name": _moved(lambda params, a: a),
+    "rev": _moved(lambda params, a: np.flip(a, tuple(params["dimensions"]))),
+    "split": _moved(lambda params, a: a),
+    "pad": _moved(_padded),
+    "iota": _moved(_iota),
+    "gather": _moved(_gathered),
+    "stack": _moved(lambda params, *parts: np.stack(parts, axis=params["axis"])),
     "random_bits": _random_bits,
     "random_wrap": _wrapped,
     "random_unwrap": _unwrapped,
@@ -720,6 +984,20 @@ operation wrapped to its width; or a result with no rounding at all, bit for bit
 sign operation, a comparison), every operand read as the lane reads it (`Lane.flushes`). A primitive
 missing here cannot be certified, which fails the site's coverage, as does an integer result of a
 primitive with no integer form (`div`, `sqrt`, a transcendental)."""
+def _piece(params, value, index):
+    """lax.split's `index`-th result: its operand's run of `sizes[index]` along `axis`, after the earlier
+    sizes'."""
+    start = sum(params["sizes"][:index])
+    return np.take(value, np.arange(start, start + params["sizes"][index]), axis=params["axis"])
+
+
+RESULT_OPERANDS = {
+    "optimization_barrier": lambda params, operands, index: [operands[index]],
+    "split": lambda params, operands, index: [_piece(params, operands[0], index)],
+}
+"""The primitives of several results whose each result is a move of a part of their operands of its own
+position, `parts(params, operands, index)`, which its contract reads alone (`_held`): an optimization
+barrier's i-th operand, a split's i-th piece."""
 
 
 def certified(fn, *arguments) -> tuple:
@@ -757,6 +1035,8 @@ def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
             if eqn.primitive.name == "cond":
                 branch = eqn.params["branches"][int(np.asarray(operands[0]))]
                 results = _run(branch.jaxpr, branch.consts, operands[1:], findings, at + "/")
+            elif eqn.primitive.name == "scan":
+                results = _scanned(eqn.params, operands, findings, at + "/")
             elif body is not None:
                 results = _run(*body, operands, findings, at + "/")
             else:
@@ -765,6 +1045,32 @@ def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
                 _held(eqn, operands, results, findings, at)
         env.update(zip(eqn.outvars, results, strict=True))
     return [read(var) for var in jaxpr.outvars]
+
+
+def _scanned(params, operands, findings, where: str) -> list:
+    """A scan run a step at a time (`_run` of its body), its carry threaded from step to step and its
+    outputs stacked, every step's equations held to their contracts as the program's are, each by its
+    step's path."""
+    import jax.numpy as jnp
+
+    body = params["jaxpr"]
+    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(operands))).unpack())
+    consts, carry, xs = (operands[:constants], operands[constants:constants + carries],
+                         operands[constants + carries:])
+    ys = []
+    steps = range(params["length"])
+    for step in reversed(steps) if params["reverse"] else steps:
+        outputs = _run(body.jaxpr, body.consts, [*consts, *carry, *(x[step] for x in xs)], findings,
+                       f"{where}{step}/")
+        carry = outputs[:carries]
+        ys.append(outputs[carries:])
+    if params["reverse"]:
+        ys.reverse()
+    if ys:
+        stacked = [jnp.stack(column) for column in zip(*ys, strict=True)]
+    else:
+        stacked = [jnp.zeros((0, *var.aval.shape), var.aval.dtype) for var in body.jaxpr.outvars[carries:]]
+    return [*carry, *stacked]
 
 
 def _held(eqn, operands, results, findings, at) -> None:
@@ -781,10 +1087,12 @@ def _held(eqn, operands, results, findings, at) -> None:
         if dtype is not None and not keyed and _inexact(dtype) and _format(dtype) is None:
             findings.append(f"{at}: uncertifiable, no format for {dtype}")
             return
-    for result in results:
+    for index, result in enumerate(results):
         fmt = _format(getattr(_host(result), "dtype", np.float32))
+        # A result of its own position reads its own part of the operands alone (a barrier's, a split's).
+        given = RESULT_OPERANDS[name](eqn.params, hosted, index) if name in RESULT_OPERANDS else hosted
         try:
-            ok = np.asarray(CONTRACTS[name](eqn.params, hosted, _host(result), fmt))
+            ok = np.asarray(CONTRACTS[name](eqn.params, given, _host(result), fmt))
         except TypeError:
             findings.append(f"{at}: uncertifiable, {name} of these operands has no contract")
             return

@@ -63,7 +63,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
@@ -77,32 +77,6 @@ from dew.nn.sharding import logical_axes, sequence_shards
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
 chunked and the recurrent form agree at any size."""
-
-def _entering_state(decay, write, axis: str):
-    """The state entering this shard of a sequence the mesh axis `axis`
-    splits, inside a `shard_map` that holds it manual.
-
-    Shard r's span is affine in its entering state: it leaves `exp(A_r) h +
-    B_r`, with `decay` `A_r` `[B, H]` and `write` `B_r` `[B, H, P, N]`. Spans
-    compose as `(A_1 + A_2, exp(A_2) B_1 + B_2)`, associative with identity
-    `(0, 0)`, what `ppermute` hands a shard with no source. So the prefix is a
-    Kogge-Stone scan, shifts 1, 2, 4, ... for `ceil(log2 n)` rounds and one more
-    to make it exclusive (zero on the first shard), one pair per shard per
-    round where lm-engine's `_SerialPrefixScan` gathers all n. Autodiff
-    transposes each `ppermute`."""
-    shards = jax.lax.axis_size(axis)
-
-    def shifted(value, shift: int):
-        return jax.lax.ppermute(value, axis, [(r, r + shift) for r in range(shards - shift)])
-
-    shift = 1
-    while shift < shards:
-        earlier_decay, earlier_write = shifted(decay, shift), shifted(write, shift)
-        write = jnp.exp(decay)[..., None, None] * earlier_write + write
-        decay = earlier_decay + decay
-        shift *= 2
-    return shifted(write, 1)
-
 
 def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, starts=None):
     """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357), as the recurrence
@@ -206,7 +180,7 @@ class Mamba2(nn.Module):
     Under a mesh sequence axis above one, training and scoring run the conv and
     scan in a `shard_map` (`_sequence_mix`): the conv reads the previous shard's
     last `K-1` tokens by `ppermute` and the scan adds the earlier shards' state
-    (`_entering_state`); decoding and padded rows are refused there.
+    (`recurrence_algebra.entering`); decoding and padded rows are refused there.
     """
 
     reads: ClassVar[frozenset[str]] = frozenset()
@@ -344,8 +318,11 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
 
     Under `axis` the scan runs from zero and the output gains `C_t . exp(acs_t)
     h` for the state `h` the earlier shards leave, `acs_t` the inclusive sum of
-    this shard's `A dt` (a `RESET_DECAY` in it zeroes the term). The zero-start
-    final state is the shard's write `B_r` (`_entering_state`)."""
+    this shard's `A dt` (a `RESET_DECAY` in it zeroes the term). The shard's span
+    is affine in the state entering it, `exp(A_r) h + B_r` (`recurrence_algebra.Span`):
+    `A_r` its summed log decay `[B, H]`, a decay never expanded to a matrix, and
+    `B_r` its zero-start final state, whose exclusive prefix over the shards
+    (`recurrence_algebra.entering`) is the state each enters."""
     dt_bias, A, D = heads
     batch, length, _ = convolved.shape
     intermediate = num_heads * head_dim
@@ -365,7 +342,8 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
         log_decay = A * step                                # [B, S, H]
         if starts is not None:
             log_decay = jnp.where(starts[..., None], RESET_DECAY, log_decay)
-        entering = _entering_state(jnp.sum(log_decay, axis=1), final, axis)
+        span = recurrence_algebra.Span(jnp.sum(log_decay, axis=1), final)
+        entering = recurrence_algebra.entering(span, axis)
         entering = entering.reshape(batch, n_groups, num_heads // n_groups, head_dim, state_size)
         decayed = jnp.exp(jnp.cumsum(log_decay, axis=1)).reshape(
             batch, length, n_groups, num_heads // n_groups)
