@@ -224,8 +224,8 @@ class OuterProgram:
         leaves, structure = jax.tree.flatten((dynamic, named))
         # A static value keys by its type too, as jit's do: True and 1 are two programs.
         statics = (tuple((number, type(args[number]), args[number]) for number in sorted(numbers)),
-                   tuple(sorted((name, type(value).__qualname__, value) for name, value in kwargs.items()
-                                if name in self.names)))
+                   tuple(sorted(((name, type(value), value) for name, value in kwargs.items()
+                                 if name in self.names), key=lambda static: static[0])))
         return (len(args), statics, structure, tuple(map(_signature, leaves)),
                 jax_config.trace_context()), dynamic, named
 
