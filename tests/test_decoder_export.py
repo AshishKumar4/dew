@@ -138,7 +138,7 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
 
 WHOLE_SUITE = {"gradients": ("deepseek_v4", "glm5_next"), "trips": ("glm5_next",), "indexed": ("glm5_next",),
-               "glm5": ("released",)}
+               "balanced": ("glm5_next",), "glm5": ("released",)}
 """The cases past a group's 120 s on armada, run by the whole suite alone (`whole_suite`, ledger 2182):
 DeepSeek V4's and GLM-5 Next's gradients against their references (162 s and 147 s), every case reading
 GLM-5 Next's round trip (its training and export, 123 s of setup the first one pays) and GLM-5's released
@@ -386,7 +386,7 @@ def test_the_gradients_match_the_reference_implementation(name, trips):
         f"dew's largest deviation is on {worst}")
 
 
-@pytest.mark.parametrize("name", BALANCED, ids=BALANCED)
+@pytest.mark.parametrize("name", whole_suite(BALANCED, "balanced"))
 def test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export(name, trips):
     """The routers' balancing bias is state the step moves, not a
     parameter. It is a sign step of the balance rate, so every entry of
