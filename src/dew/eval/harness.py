@@ -60,7 +60,8 @@ def _scored(model: nn.Module, variables, rows: ModelInputs) -> tuple[jax.Array, 
     the language-model losses share scores them (`TokenScorer.token_scores`), through its tiled
     head, which holds a tile of the vocabulary at a time rather than every row's whole logits;
     compiled with the model's XLA options (`program`), one program for each model and row width,
-    whichever harness asks.
+    whichever harness asks: the model is its static argument, hashed by its fields, as a decode step
+    takes it (`dew.inference.serving_kernel`), so harnesses over a run's checkpoints share it.
 
     `rows` is `[B, T]` of token ids, with their fields (`_scoring_inputs`); both results are
     `[B, T - 1]`, entry `i` belonging to `rows[:, i + 1]`. Rows are right-padded by the caller, which
