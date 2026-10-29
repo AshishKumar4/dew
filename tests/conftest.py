@@ -79,15 +79,14 @@ def pytest_runtest_makereport(item, call):
     # Only a test that loaded the gate can raise its GateFailure: a skip or another failure loads none, so
     # the files whose tests skip are not keyed on the gate's every change in the test cache.
     gate = sys.modules.get("reference_error")
-    if call.excinfo is not None and gate is not None:
-        if isinstance(call.excinfo.value, gate.GateFailure):
-            found = ("gate_findings", json.dumps([{"leaf": finding.leaf, "rule": finding.rule,
-                                                   "measure": finding.measure, "phase": call.when}
-                                                  for finding in call.excinfo.value.findings]))
-            # This phase's report, and the item's, which its teardown's report copies and the JUnit
-            # report reads a test's properties from where only one phase fails.
-            outcome.get_result().user_properties.append(found)
-            item.user_properties.append(found)
+    if call.excinfo is not None and gate is not None and isinstance(call.excinfo.value, gate.GateFailure):
+        found = ("gate_findings", json.dumps([{"leaf": finding.leaf, "rule": finding.rule,
+                                               "measure": finding.measure, "phase": call.when}
+                                              for finding in call.excinfo.value.findings]))
+        # This phase's report, and the item's, which its teardown's report copies and the JUnit
+        # report reads a test's properties from where only one phase fails.
+        outcome.get_result().user_properties.append(found)
+        item.user_properties.append(found)
 
 
 def pytest_sessionfinish(session, exitstatus):
