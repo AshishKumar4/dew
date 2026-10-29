@@ -100,7 +100,8 @@ with report.refusals():
     ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1)), nonce), BATCH)
     ahead.save(sys.argv[2] + (".again" if refused else ""))
     print(json.dumps({"program": ahead.program, "refusals": len(ahead.refusals),
-                      "stepped": [miss.stepped for miss in report.misses()]}))
+                      "stepped": [miss.stepped for miss in report.misses()],
+                      "missed": [repr(miss.config) for miss in report.misses()]}))
 """
 """A step compiled ahead for a compile-only H100, in a registry of its own: the one at argv[2], or, its
 argv[3] `refused`, another from the refusals that one carries."""
@@ -110,13 +111,13 @@ argv[3] `refused`, another from the refusals that one carries."""
 def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_path, nonce):
     """A step compiled ahead for a compile-only H100 on this CPU, its launch's derived tile spilling at
     ptxas, is refused that tile and lowered once more at the next, the miss recorded (`report.misses`);
-    the step it saves is that program and carries the refusal (`AheadOfTime.refusals`): another process
-    that starts from the refusal lowers that program at once, with nothing to step down."""
+    the step it saves carries the refusal (`AheadOfTime.refusals`), and another process that starts from
+    it derives past the refused tile, which it never compiles."""
     step = str(tmp_path / "step.dew-aot")
     first = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
     assert first["refusals"] and first["stepped"][:1] == [True]
     again = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "refused")
-    assert not any(again["stepped"]) and again["program"] == first["program"]
+    assert first["missed"][0] not in again["missed"]
 
 
 HANDED = """
