@@ -9,7 +9,8 @@ from reference_error import _floating, as_given, equations
 
 REPLAYED = frozenset({
     "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "square", "exp", "expm1", "log", "erf",
-    "erf_inv", "sin", "cos", "ne", "reduce_sum", "dot_general", "conv_general_dilated", "broadcast_in_dim",
+    "erf_inv", "sin", "cos", "rsqrt", "integer_pow", "logistic", "ne", "is_finite", "reduce_sum",
+    "dot_general", "conv_general_dilated", "broadcast_in_dim",
     "concatenate", "convert_element_type", "gather", "iota", "reshape", "select_n", "slice", "squeeze",
     "stack", "stop_gradient", "transpose",
 })
@@ -141,7 +142,8 @@ def _replayed_equation(equation, values, used):
         # The body, replayed in float64 for its operands' widened dtypes, as the scan's own: of its
         # results those the scan's used results read through every step (`_carried`), the rest zeros.
         body = params["jaxpr"]
-        reading = _carried(body.jaxpr, params["num_consts"], params["num_carry"], used)
+        # A scan whose body closes over its constants passes none in (no `num_consts`).
+        reading = _carried(body.jaxpr, params.get("num_consts", 0), params["num_carry"], used)
 
         def step(*operands):
             outputs = _replayed(body.jaxpr, body.consts, list(operands), reading)
