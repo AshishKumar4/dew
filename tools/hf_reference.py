@@ -337,15 +337,14 @@ def tiny_phi3() -> Phi3ForCausalLM:
 
 
 def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
-    """Same-weight fp32/float64 logits, the left-padding mask the tests pad drawn ids under, and the
-    greedy continuation; the tests run transformers over drawn ids themselves (check 1).
+    """Same-weight fp32 logits, the left-padding mask the tests pad drawn ids under, and the greedy
+    continuation; the tests run transformers over drawn ids themselves (check 1), its float64 twin
+    their truth.
 
     Phi-3's crossing oracle is its uncached full-prefix forward. Its pinned
     generate drops the prefix at that crossing (transformers issue #49334),
     so that output is recorded separately from the intended continuation.
     """
-    from torch_precision import float64, float64_twin
-
     write_tiny(name, model)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
@@ -363,13 +362,6 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
                 score = model(torch.from_numpy(generated).long(), use_cache=False).logits[:, -1].numpy()
                 generated = np.concatenate((generated, score.argmax(-1)[:, None]), axis=1)
     np.save(directory / 'generated.npy', generated)
-    # Its float64 twin (`float64_twin`): frequency and sinusoidal buffers built in float64 rather than
-    # widened from a rounded fp32 table, the checkpoint's values loaded into it.
-    truth_model = float64_twin(model, lambda: AutoModelForCausalLM.from_config(
-        model.config, dtype=torch.float64, attn_implementation='eager'))
-    with float64(), torch.no_grad():
-        truth = truth_model(torch.from_numpy(ids).long(), use_cache=False).logits.double().numpy()
-    np.save(directory / 'logits_f64.npy', truth)
 
 
 MINIMAX_M2_CONFIGS = (
@@ -492,7 +484,7 @@ def write_qwen2_moe() -> None:
         max_position_embeddings=64, rope_theta=1000000.0, tie_word_embeddings=False))
     model.set_experts_implementation('eager')
     write_tiny('qwen2-moe-tiny', model, padded=True)
-    directory = write_float64_logits('qwen2-moe-tiny', model)
+    directory = FIXTURES / 'qwen2-moe-tiny'
     (directory / 'model.safetensors').chmod(0o644)
     write_released_config('qwen1.5-moe-a2.7b', 'Qwen/Qwen1.5-MoE-A2.7B',
                           '1a758c50ecb6350748b9ce0a99d2352fd9fc11c9')
@@ -512,7 +504,7 @@ def write_granitemoe() -> None:
         attention_multiplier=0.015625, tie_word_embeddings=True, bos_token_id=0, eos_token_id=0))
     model.set_experts_implementation('eager')
     write_tiny('granitemoe-tiny', model, padded=True)
-    directory = write_float64_logits('granitemoe-tiny', model)
+    directory = FIXTURES / 'granitemoe-tiny'
     weights = {}
     for name, value in model.float().state_dict().items():
         name = name.replace('.block_sparse_moe.experts.gate_up_proj', '.block_sparse_moe.input_linear.weight')
@@ -617,7 +609,7 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
         config._experts_implementation = "eager"
     model = NemotronHForCausalLM(config)
     write_tiny(name, model, seed=2024)
-    directory = write_float64_logits(name, model)
+    directory = FIXTURES / name
     write_provenance(directory, seed=2024)
     (directory / "model.safetensors").chmod(0o644)
 
@@ -1492,19 +1484,6 @@ def write_diffusion_window_tiny() -> None:
             if hasattr(module, "experts") and hasattr(module.experts, "config"):
                 module.experts.config._experts_implementation = "eager"
         np.save(directory / "logits_f64.npy", logits(twin).double().numpy())
-
-
-def write_float64_logits(name: str, model: PreTrainedModel) -> Path:
-    """The fixture `name`'s float64 logits, `logits_f64.npy`: `model`'s float64 truth (`float64_twin`) on
-    the fixture's ids, run inside `torch_precision.float64`. Returns the fixture's directory."""
-    from torch_precision import float64, float64_twin
-
-    directory = FIXTURES / name
-    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
-    with float64(), torch.no_grad():
-        truth = float64_twin(model)(input_ids=ids, use_cache=False).logits.numpy()
-    np.save(directory / 'logits_f64.npy', truth)
-    return directory
 
 
 def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False,

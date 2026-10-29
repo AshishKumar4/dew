@@ -7,9 +7,8 @@
 tests/fixtures/hf/mamba-tiny/ is a random `MambaForCausalLM` in the HF
 layout: two selective-scan layers of 16 inner channels over a width of 8, a
 state of 4 per channel from a rank-2 step, the conv biased, and an untied
-head, with tools/hf_reference.py's fp32 and float64
-logits, the left-padding mask and cached greedy continuation
-(`write_classic_tiny`). The projections are bias-free, as every released
+head, with tools/hf_reference.py's fp32 logits, the left-padding mask
+and cached greedy continuation (`write_classic_tiny`). The projections are bias-free, as every released
 Mamba's are: the reference zeroes a padded slot's input before `in_proj`,
 so a biased one feeds its bias into the first real tokens' conv window,
 which an unpadded row never reads. mamba-130m-hf/ pins the released config.

@@ -29,25 +29,6 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/phi3-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gpt2-tiny/logits_f64.npy": {
-   "tool": "tools/classic_gpt_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
-   "note": "--float64 gpt2-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
-  },
-  "hf/gpt-neox-tiny/logits_f64.npy": {
-   "tool": "tools/classic_gpt_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
-   "note": "--float64 gpt-neox-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
-  },
-  "hf/opt-tiny/logits_f64.npy": {
-   "tool": "tools/classic_gpt_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
-   "note": "--float64 opt-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
-  },
   "hf/phi3-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -60,19 +41,11 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/bloom-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/bloom-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/gpt-neo-tiny/logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gpt-neo-tiny/logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -84,19 +57,11 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/phi-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/phi-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/falcon-tiny/logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/falcon-tiny/logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -108,19 +73,11 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/falcon-mha-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/falcon-mha-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/gptj-tiny/logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gptj-tiny/logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -960,16 +917,6 @@
     }
    ]
   },
-  "hf/deepseek-v3-tiny/numerics.npz": {
-   "tool": "tools/numerics_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ]
-  },
   "hf/deepseek-v32-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [
@@ -1273,16 +1220,6 @@
   },
   "hf/gemma3-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ]
-  },
-  "hf/gemma3-tiny/numerics.npz": {
-   "tool": "tools/numerics_reference.py",
    "sources": [
     {
      "repo": "huggingface/transformers",
@@ -2141,17 +2078,6 @@
    ],
    "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
   },
-  "hf/llama-tiny/numerics.npz": {
-   "tool": "tools/numerics_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
-  },
   "hf/llama-tiny/stopping.npz": {
    "tool": "tools/stopping_reference.py",
    "sources": [
@@ -2299,17 +2225,6 @@
    ],
    "note": "source.json also records Transformers commit 93c8b7b485963a10800c91f55304db6be211c2bd."
   },
-  "hf/mamba2-tiny/numerics.npz": {
-   "tool": "tools/numerics_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
-  },
   "hf/mistral-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [
@@ -2326,20 +2241,10 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
    "note": "--nemotron-h-only; ungated ReLU² experts, grouped sigmoid top-k with nonzero selection bias, and an ungated shared expert. Seed 2024."
   },
-  "hf/nemotron-h-moe-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
-   "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
-  },
   "hf/nemotron-h-moe-latent-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
    "note": "--nemotron-h-only; latent routed experts with unnormalized sigmoid weights and a full-width shared branch. Seed 2024."
-  },
-  "hf/nemotron-h-moe-latent-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
-   "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
   },
   "hf/nemotron-h-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
@@ -2351,17 +2256,6 @@
     }
    ],
    "note": "--nemotron-h-only; grouped SSD, positionless GQA and ReLU² MLP. source.json pins commit 93c8b7b485963a10800c91f55304db6be211c2bd and seed 2024."
-  },
-  "hf/nemotron-h-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.17.0",
-     "runs": "transformers"
-    }
-   ],
-   "note": "--nemotron-h-only; the same fp32 checkpoint widened through the reference's SSD, norm, softmax and head casts."
   },
   "hf/mixtral-tiny/generate.npz": {
    "tool": "tools/numerics_reference.py",
@@ -2384,17 +2278,6 @@
     }
    ],
    "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
-  },
-  "hf/mixtral-tiny/numerics.npz": {
-   "tool": "tools/numerics_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
   },
   "hf/olmo3-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
@@ -2548,17 +2431,6 @@
     }
    ],
    "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
-  },
-  "hf/qwen3-tiny/numerics.npz": {
-   "tool": "tools/numerics_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "Actual Transformers float64 and bf16 forwards over the committed checkpoint."
   },
   "hf/qwen3-tiny/stopping.npz": {
    "tool": "tools/stopping_reference.py",
@@ -3852,19 +3724,11 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/gpt-bigcode-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/gpt-bigcode-mha-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/gpt-bigcode-mha-tiny/logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/gpt-bigcode-mha-tiny/logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
@@ -3876,10 +3740,6 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/starcoder2-tiny/logits_f64.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/mamba-tiny/generated.npy": {
    "tool": "tools/mamba_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -3888,19 +3748,11 @@
    "tool": "tools/mamba_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
-  "hf/mamba-tiny/logits_f64.npy": {
-   "tool": "tools/mamba_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "hf/mimo-v2-flash-tiny/generated.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/mimo-v2-flash-tiny/logits.npy": {
-   "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
-  "hf/mimo-v2-flash-tiny/logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },

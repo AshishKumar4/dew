@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Write the float64 and bfloat16 reference fixtures and the transformers
-`generate` fixtures that tests/test_bf16_reference.py,
-tests/test_generate_reference.py and tests/test_block_diffusion.py check
-against.
+`generate` fixtures that tests/test_generate_reference.py and
+tests/test_block_diffusion.py check against.
 
 Everything runs under torch and transformers 5.16.1 on CPU, against the
 checkpoints already committed under tests/fixtures/hf, so no fixture weight
@@ -19,20 +18,15 @@ beside JAX: the artifact check is the gate's (tests/reference_error.py
 
 What lands, beside each fixture's own files:
 
-- numerics.npz in llama-tiny, qwen3-tiny, gemma3-tiny, mixtral-tiny,
-  deepseek-v3-tiny and mamba2-tiny: `f64` and `bf16`, the reference forward
-  on the committed `input_ids.npy` with weights and activations in float64
-  and in bfloat16 (stored as float32, which holds every bfloat16 exactly).
-  The float64 run is the truth both precisions are measured from, with every
-  float32 pin of the model widened (`torch_precision.float64`):
-  its norms', rotary tables' and attention softmax's casts, which otherwise
-  round the truth at float32 where Gemma-family models pin them (the
-  diffusion-gemma truth moved 1.7e-7 to 2.4e-7 RMS, about half the fp32
-  run's own distance, when widened).
-- numerics.npz in diffusion-gemma-workflow: the same pair for the three
-  denoiser forwards in its reference.npz (`bare`, `conditioned`,
+- numerics.npz in diffusion-gemma-workflow: `<forward>_f64` and
+  `<forward>_bf16`, the reference with weights and activations in float64
+  and in bfloat16 (stored as float32, which holds every bfloat16 exactly), for
+  the three denoiser forwards in its reference.npz (`bare`, `conditioned`,
   `image_logits`), and in diffusion-gemma-denoise-tiny for `ref_bare` and
-  `ref_conditioned`.
+  `ref_conditioned`. The float64 run is the truth both precisions are
+  measured from, with every float32 pin of the model widened
+  (`torch_precision.float64`). tests/test_bf16_reference.py runs the
+  denoiser's bfloat16 reference in the test.
 - tests/fixtures/attention_bf16.npz: one head of 512 queries over 512 keys
   of width 64, logits of standard deviation 0.5, through transformers'
   `eager_attention_forward` (the fp32 softmax every decoder's eager path
@@ -67,8 +61,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 from reference_error import assert_same_artifact
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
-DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny",
-            "mamba2-tiny")
 GENERATORS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny")
 PROMPT_LENGTHS = (4, 7, 5)
 NEW_TOKENS = 10
@@ -94,18 +86,6 @@ def logits(model, ids: np.ndarray) -> np.ndarray:
     with torch.no_grad():
         out = model(input_ids=torch.from_numpy(ids).long(), use_cache=False).logits
     return out.to(torch.float64).numpy()
-
-
-def write_decoder(name: str) -> None:
-    directory = FIXTURES / name
-    ids = np.load(directory / "input_ids.npy")
-    with float64():
-        f64 = logits(decoder(name, torch.float64), ids)
-    assert_same_artifact(logits(decoder(name, torch.float32), ids).astype(np.float32),
-                         np.load(directory / "logits.npy"), f64, name)
-    bf16 = logits(decoder(name, torch.bfloat16), ids).astype(np.float32)
-    np.savez(directory / "numerics.npz", f64=f64, bf16=bf16)
-    report(name, np.load(directory / "logits.npy"), bf16, f64)
 
 
 def report(name: str, fp32: np.ndarray, bf16: np.ndarray, f64: np.ndarray) -> None:
@@ -330,8 +310,6 @@ def main() -> None:
     from reference_releases import require
 
     require("transformers")
-    for name in DECODERS:
-        write_decoder(name)
     write_workflow()
     write_denoiser()
     for name in GENERATORS:
