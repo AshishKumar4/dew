@@ -1,7 +1,8 @@
 """The rest of the common run layer's options, each set on `dew train` for every kind of run and
 observed where it acts, in the steps, checkpoints, scalars and records the run writes (row 1901):
 a pause, a split, a ranking, a cooldown, the final save, the run's length in epochs, examples and
-tokens, a batch ramp, a lowering for a GPU, and the options a kind's data or mesh refuses. The
+tokens, a batch ramp, a lowering for a GPU, a step compiled ahead and one handed to the run, and the
+options a kind's data or mesh refuses. The
 options each kind takes from Python and the rest of the command line are tests/test_run_options.py's.
 Nothing here reads a config's fields back."""
 
@@ -141,6 +142,23 @@ def test_a_kinds_run_lowered_for_a_gpu_lowers_its_step_and_trains_nothing(kind, 
         trained(kind, tmp_path, "lowered", **{"trainer.steps": 2, "trainer.lower_for": "sm80"})
     assert lowered.value.code == 0 and lowered.value.generation == "sm80"
     assert not any(path.name.isdigit() for path in (tmp_path / "runs" / "lowered").iterdir())
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_a_kinds_run_handed_a_step_compiled_ahead_for_other_devices_refuses_it(kind, tmp_path):
+    """A kind's run compiled ahead for eight A100s it lacks (`compile_ahead`) writes its first step and
+    ends with status 0; the same run handed that step (`ahead`) on this host's CPUs lowers another
+    program, which it refuses before it trains, saving and stepping nothing (train 286's review)."""
+    from dew.training.ahead import CompiledAhead
+
+    step = tmp_path / "step.dew-aot"
+    target = {"generation": "sm80", "devices": 8, "path": str(step)}
+    with pytest.raises(CompiledAhead) as ended:
+        trained(kind, tmp_path, "ahead", **{"trainer.steps": 2, "trainer.compile_ahead": target})
+    assert ended.value.code == 0 and step.exists()
+    with pytest.raises(ValueError):
+        trained(kind, tmp_path, "handed", **{"trainer.steps": 2, "trainer.ahead": str(step)})
+    assert not any(path.name.isdigit() for path in (tmp_path / "runs" / "handed").iterdir())
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
