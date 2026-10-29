@@ -29,11 +29,6 @@ up to a whole unit in the last place, twice round to nearest's (src/dew/nn/kerne
 the unit roundoff of a format one bit narrower."""
 
 
-SUBNORMAL_REACH = 4.0
-"""Below it a product may come from a subnormal operand of a 16-bit format or of TF32: a subnormal times the
-format's largest finite value is under 2^-126 2^128 = 4 (bf16, TF32), and under 2^-14 65504 < 4 (fp16)."""
-
-
 def aligned(values, fmt: Format) -> np.ndarray:
     """Each operand's magnitude as a tensor core aligns its products by: its own, but a subnormal of `fmt` at
     `fmt`'s least normal, the exponent its field holds (`SUBNORMAL_CASE`, where the products' own magnitudes'
@@ -77,21 +72,17 @@ def terms(build, *operands, fmt: Format) -> Terms:
 
 
 def _terms_of(products) -> Terms:
-    """`products` as `Terms`: given so, or exact products none of which a subnormal operand may have made
-    (none nonzero below `SUBNORMAL_REACH`), whose magnitudes are their own; a subnormal operand must never
-    take the tight bound unseen, so any other raises."""
-    if isinstance(products, Terms):
-        return products
-    products = np.asarray(products, np.float64)
-    if np.any((products != 0) & (np.abs(products) < SUBNORMAL_REACH)):
-        raise ValueError("a product under 4 may come from a subnormal 16-bit operand, which the tensor cores "
-                         "align at its format's least normal: pass its operands' `Terms` (`terms`)")
-    return Terms(products, np.abs(products))
+    """`products` as the native-dot contract takes them: `Terms`, each exact product beside its magnitude as
+    the tensor cores align it (`terms`), so a subnormal operand can never take the tight bound unseen."""
+    if not isinstance(products, Terms):
+        raise TypeError("a native dot's products are its operands' `Terms` (`terms`): their magnitudes as "
+                        "the tensor cores align them, a subnormal operand's at its format's least normal")
+    return products
 
 
 def native_dot_ends(products, out: Format, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
     """The least and the greatest value of `out` a native GEMM's output takes on its exact `products`
-    (`native_dot_holds`; `Terms`, or exact products `_terms_of` admits bare): the nearest `out` values of the
+    (`native_dot_holds`; their `Terms`): the nearest `out` values of the
     allowance's two ends; +0 for an empty sum."""
     products = _terms_of(products)
     count = products.shape[-1]

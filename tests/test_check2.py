@@ -553,17 +553,16 @@ def test_a_native_dot_holds_products_that_truncate_away_below_the_normal_range()
 def test_a_native_dot_aligns_a_subnormal_operand_at_its_least_normal_and_no_bare_product_of_one():
     """The native-dot contract's magnitudes (row 2084, link 3): the tensor cores' sum of `SUBNORMAL_CASE`'s
     five fp16 products, one of the subnormal 2^-24, holds where that operand counts at fp16's least normal
-    (`nc.aligned`) and is refused at the products' own magnitudes; bare products a subnormal operand
-    may have made, any under `SUBNORMAL_REACH`, raise rather than take the tight bound, where products of 4
-    and more pass bare."""
+    (`nc.aligned`) and is refused at the products' own magnitudes; bare products, which a subnormal operand
+    may have made, are refused rather than take the tight bound."""
     left, right, native = nc.SUBNORMAL_CASE
     products = nc.terms(np.multiply, np.asarray([left]), np.asarray([right]), fmt=rw.FLOAT16)
     assert nc.native_dot_holds([native], products, oc.FLOAT32, flushes=False).tolist() == [True]
     tight = nc.Terms(products.exact, np.abs(products.exact))
     assert nc.native_dot_holds([native], tight, oc.FLOAT32, flushes=False).tolist() == [False]
-    with pytest.raises(ValueError):
-        nc.native_dot_ends(products.exact, oc.FLOAT32, flushes=False)
-    assert nc.native_dot_holds([16.0], np.full((1, 4), 4.0), oc.FLOAT32, flushes=False).tolist() == [True]
+    for bare in (products.exact, np.full((1, 4), 4.0)):
+        with pytest.raises(TypeError):
+            nc.native_dot_ends(bare, oc.FLOAT32, flushes=False)
 
 
 def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_product_or_a_narrow_partial():
