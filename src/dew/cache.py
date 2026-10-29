@@ -288,7 +288,9 @@ def hub_commit(repo: str, revision: str | None, *, repo_type: str = "model") -> 
     offline the cache's ref, whichever tool wrote it, else the answer recorded online, both `recorded`."""
     from huggingface_hub import HfApi, constants
     from huggingface_hub.errors import OfflineModeIsEnabled
-    from huggingface_hub.file_download import _cache_commit_hash_for_specific_revision, repo_folder_name
+    from huggingface_hub.file_download import repo_folder_name
+
+    from dew.files import write_atomically
 
     storage = Path(constants.HF_HUB_CACHE) / repo_folder_name(repo_id=repo, repo_type=repo_type)
     branch = revision or constants.DEFAULT_REVISION
@@ -312,6 +314,8 @@ def hub_commit(repo: str, revision: str | None, *, repo_type: str = "model") -> 
     if answer.recorded and ref.is_file():
         # Offline the cache's ref stands over an answer recorded before another tool moved it.
         return HubAnswer(ref.read_text().strip(), recorded=True)
-    if not answer.recorded:
-        _cache_commit_hash_for_specific_revision(str(storage), branch, answer.value)
+    if not answer.recorded and branch != answer.value and (
+            not ref.is_file() or ref.read_text().strip() != answer.value):
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(ref, answer.value)
     return answer
