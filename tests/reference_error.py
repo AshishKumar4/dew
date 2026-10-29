@@ -284,17 +284,70 @@ def _refuse_numpy_arms(draw, *arms) -> None:
                             f"values unconverted")
 
 
-def _compiled(fn, compile):
+def _compiled(fn, compile, pairing=None):
     """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program
     already (another jit around it would nest its compiler options), or compiled by `compile`, a
-    window loop's arm within it (`over_windows`)."""
+    window loop's arm within it (`over_windows`); compiled without YNNPACK's fusions, paired with its
+    check's other arms by `pairing` (`_Paired`)."""
     if _given(fn) or getattr(fn, "without_ynn", False):
         return fn
     if getattr(fn, "dew_programs", False):
-        return fn if compile is jax.jit else _with_ynn_off(fn)
+        return fn if compile is jax.jit else _Paired(pairing, _with_ynn_off(fn), fn)
     if isinstance(fn, _Windowed):
-        return _Windowed(_compiled(fn.fn, compile))
-    return compile(fn)
+        return _Windowed(_compiled(fn.fn, compile, pairing))
+    return compile(fn) if compile is jax.jit else _Paired(pairing, compile(fn), jax.jit(fn))
+
+
+YNN_REFUSED = "Dot with multiple contracting dimensions is not implemented"
+"""XLA:CPU's refusal, without YNNPACK's fusions, of a dot of other than one contracting dimension: its
+algebraic simplifier forms one with none from a contraction of length one (attention's XLA backward
+over a single key), which only YNNPACK's fusion runs (`_Paired`)."""
+
+
+@dataclasses.dataclass(eq=False)
+class _Pairing:
+    """Whether a check's paired arms (`_Paired`) run with YNNPACK's fusions: not until XLA:CPU refuses to
+    compile one of them without (`_turned_over`)."""
+
+    with_ynn: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _Paired:
+    """An arm of a check between two Dew paths (`_arms`): `without`, the arm without YNNPACK's fusions,
+    until its `pairing` turns over, then `plain`, the arm as Dew's users compile it. Where XLA:CPU
+    cannot compile an arm of the check without the fusions (`YNN_REFUSED`), every arm of it turns over
+    at once (`_turned_over`), so the two still run the same kind of code, here the kind whose
+    microkernels the host picks."""
+
+    pairing: _Pairing
+    without: Callable
+    plain: Callable
+
+    @property
+    def without_ynn(self) -> bool:
+        """Whether the arm runs without YNNPACK's fusions (`without_ynn`'s mark): until it turns over."""
+        return not self.pairing.with_ynn
+
+    def __call__(self, *inputs, **options):
+        return (self.plain if self.pairing.with_ynn else self.without)(*inputs, **options)
+
+
+def _turned_over(arms, run):
+    """`run()`, one draw of a check over `arms`; where XLA:CPU refuses to compile one of them without
+    YNNPACK's fusions (`YNN_REFUSED`), every paired arm among them turned over to the fusions
+    (`_Paired`) and the draw run again from its start, so no arm's value of it comes from the other
+    kind of code."""
+    try:
+        return run()
+    except jax.errors.JaxRuntimeError as error:
+        pairings = {arm.pairing for arm in (arm.fn if isinstance(arm, _Windowed) else arm for arm in arms)
+                    if isinstance(arm, _Paired)}
+        if YNN_REFUSED not in str(error) or all(pairing.with_ynn for pairing in pairings):
+            raise
+        for pairing in pairings:
+            pairing.with_ynn = True
+        return run()
 
 
 class _Truth:
@@ -351,11 +404,12 @@ def _arms(dew_fn, reference_fn):
     them compiled so through Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a
     recording, a host loop over programs of its own), the other as Dew's users run it, with the
     fusions (`jax.jit`). A site passes plain functions; the gate compiles them, so no site can compile
-    one arm otherwise than its other. One function as both arms compiles once."""
-    compile = jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn
+    one arm otherwise than its other. One function as both arms compiles once. A program XLA:CPU cannot
+    compile without the fusions (`YNN_REFUSED`) turns both arms over to them (`_Paired`)."""
+    compile, pairing = (jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn), _Pairing()
     _refuse_owned_policies(compile, dew_fn, reference_fn)
-    reference = _compiled(reference_fn, compile)
-    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile)), reference
+    reference = _compiled(reference_fn, compile, pairing)
+    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile, pairing)), reference
 
 
 def _refuse_owned_policies(compile, *arms) -> None:
@@ -1081,7 +1135,9 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with jax.enable_x64(new_val=True):
             return float64_terms(terms_fn, *widened(inputs))
 
-    for at, seed in enumerate(seeds):
+    def rows_at(at, seed):
+        """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
+        nonlocal names, widths
         inputs = draw(seed)
         truth, terms = truth_and_terms(inputs)
         if reference_seeds is None:
@@ -1116,6 +1172,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                     (first[0], first[1], float(np.fmax(first[2], later[2])),
                      float(np.fmax(first[3], later[3])), first[4], first[5] and later[5])
                     for first, later in zip(rows[at_arm], evidence, strict=True)]
+        return rows
+
+    for at, seed in enumerate(seeds):
+        rows = _turned_over([dew_fn, *arms], functools.partial(rows_at, at, seed))
         mine.append([entry[0] for entry in rows[0]])
         for at_arm, row in enumerate(rows):
             theirs[at_arm].append([entry[1] for entry in row])

@@ -52,6 +52,50 @@ def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_of
             np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
 
 
+def one_key_draw(seed):
+    """bf16 queries [2, 5, 4, 32] over a single key and value of two heads."""
+    rng = np.random.default_rng([1698, 1, seed])
+    return tuple(jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
+                 for shape in ((2, 5, 4, 32), (2, 1, 2, 32), (2, 1, 2, 32)))
+
+
+def pulled_by_itself(attention):
+    """`attention`'s output and the gradients of its inputs under that output as the cotangent."""
+    def run(query, key, value):
+        out, pull = jax.vjp(attention, query, key, value)
+        return out, *pull(out)
+    return run
+
+
+def xla_attention(query, key, value):
+    """Dew's attention on jax.nn's XLA implementation."""
+    from dew.nn.attention import scaled_dot_product_attention
+
+    return scaled_dot_product_attention(query, key, value, implementation="xla")
+
+
+def written_attention(query, key, value):
+    """The same attention written out: grouped heads, fp32 logits, a softmax in fp32 rounded to bf16."""
+    group = query.shape[2] // key.shape[2]
+    keys, values = jnp.repeat(key, group, axis=2), jnp.repeat(value, group, axis=2)
+    logits = jnp.einsum("btnh,bsnh->bnts", query, keys, preferred_element_type=jnp.float32)
+    weights = jax.nn.softmax(logits / np.sqrt(query.shape[-1]), axis=-1).astype(query.dtype)
+    return jnp.einsum("bnts,bsnh->btnh", weights, values)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them():
+    """XLA:CPU refuses attention's XLA backward over a single key without YNNPACK's fusions
+    (`YNN_REFUSED`); check 1 turns both arms over to the fusions there (`_Paired`), the two still of one
+    kind, and judges them."""
+    from reference_error import YNN_REFUSED, without_ynn
+
+    with pytest.raises(jax.errors.JaxRuntimeError, match=YNN_REFUSED):
+        without_ynn(pulled_by_itself(xla_attention))(*one_key_draw(0))
+    assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention), one_key_draw,
+                    "attention over one key", seeds=16)
+
+
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
 def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
     """A caller who asks for YNNPACK's dot fusion gets the dot the default XLA:CPU computes, bit for
