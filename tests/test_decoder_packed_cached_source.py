@@ -22,11 +22,11 @@ from dew.interop.pretrained import Pretrained
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
-PACKED_SEEDS = 0
+PACKED_SEEDS = 8
 """Each family's declared draws of packed rows against transformers' packed forward (check 1), sized by
 `seeds_for` paired with Dew's packed logits on the CPU."""
 
-CACHED_SEEDS = 0
+CACHED_SEEDS = 8
 """Each family's declared draws of decoded rows against transformers' cached steps (check 1), sized by
 `seeds_for` paired with Dew's cached steps on the CPU."""
 

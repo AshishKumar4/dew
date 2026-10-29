@@ -84,7 +84,7 @@ def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, wi
                     truth_fn=jax.jit(run(recurrence)))
 
 
-STEEP_SEEDS = 8
+STEEP_SEEDS = 64
 """The keys' gradient under a steep first decay's declared draws against the portable math (check 1), sized
 by `seeds_for` paired on armada."""
 

@@ -206,8 +206,9 @@ def test_triton_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-LARGE_LOGIT_SEEDS = 16
-"""The seeds of the triton route's large-logit site, sized by `seeds_for` (paired) on an A100."""
+LARGE_LOGIT_SEEDS = 32
+"""The seeds of the triton route's large-logit site, sized by `seeds_for` (paired) on an A100 (32) and an
+H100 (16), the larger."""
 
 
 def _large_logits(spread: bool):
@@ -316,7 +317,12 @@ FLASH_SEEDS = {"dense twin": 8, "packed twin": 8, "centred window": 8, "cross se
                **{f"{kernel} {width}": 8 for kernel in ("flash", "cudnn") for width in (128, 256)},
                **{f"window {case}": 8 for case in ("64 64 2 True None True", "64 64 2 True 128 True",
                                                    "192 128 2 True 128 True", "64 64 8 False 65 False")},
-               **{f"packed rows {window}": 8 for window in (None, 128)}}
+               **{f"packed rows {window}": 8 for window in (None, 128)},
+               # Sized past 8 (the A100's paired sizing; the H100's at most it): sinks and windows.
+               "packed documents 128 True True": 16, "packed documents 128 False True": 256,
+               "packed documents 256 False True": 64, "window 64 64 2 True None True": 128,
+               "window 64 64 2 True 128 True": 256, "window 192 128 2 True 128 True": 256,
+               "packed rows 128": 128}
 """Each GPU kernel site's declared draws against the xla kernel (check 1), by its case: sized by `seeds_for`
 paired on an A100 and an H100, the larger of the two."""
 
