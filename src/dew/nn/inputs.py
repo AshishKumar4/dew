@@ -124,9 +124,9 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
             value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)
         ):
             raise ValueError(f"token field {name!r} must align with the token rows")
-        if name == "attention_mask" and any(np.any((row != 0) & (row != 1)) for row in aligned):
-            raise ValueError("attention_mask must contain only zero or one")
-        dtype = bool if name == "attention_mask" else np.result_type(*(row.dtype for row in aligned))
+        if name == VALIDITY_FIELD and any(np.any((row != 0) & (row != 1)) for row in aligned):
+            raise ValueError(f"{VALIDITY_FIELD} must contain only zero or one")
+        dtype = bool if name == VALIDITY_FIELD else np.result_type(*(row.dtype for row in aligned))
         value = np.zeros(tokens.shape, dtype=dtype)
         for index, (row, slot) in enumerate(zip(aligned, slots, strict=True)):
             value[index, slot] = row
