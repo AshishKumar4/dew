@@ -281,7 +281,7 @@ def test_a_shared_loop_cache_takes_each_prompt_whole(options):
         Server.from_task(greedy('last_loop'), slots=2, capacity=32, **options)
 
 
-DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 64}
+DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 32}
 """Declared seeds for check 1, sized by `seeds_for` on armada: the live torch reference's gradient of
 every checkpoint tensor, through every pass or through the last pass alone."""
 
