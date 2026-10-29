@@ -203,8 +203,12 @@ def test_a_saved_run_is_served_scored_and_loaded_in_the_form_it_trained_in(tmp_p
     assert forms(lambda: loaded("ab", max_new_tokens=1, key=0)) == {"accurate"}
     assert forms(lambda: dew.pipeline(accurate)("ab", max_new_tokens=1, key=0)) == {"accurate"}
     assert forms(lambda: DewLM(loaded).loglikelihood([instance("a", "b")])) == {"accurate"}
-    server = Server.from_task(loaded, slots=1, capacity=64)
-    assert forms(lambda: (server.submit("ab", max_new_tokens=1, key=0), server.run())) == {"accurate"}
+    def served():
+        server = Server.from_task(loaded, slots=8, capacity=64, admission=8)
+        drawn = server.submit("ab", max_new_tokens=1, key=0)
+        while not drawn.done():
+            server.step()
+    assert forms(served) == {"accurate"}
     assert forms(lambda: TextGeneration.from_run(fast)("ab", max_new_tokens=1, key=0)) == {"fast"}
     # A task built from a model in the run, as its previews are, traces in the form chosen around it.
     with generation.chosen(attention_form="accurate"):
@@ -214,8 +218,9 @@ def test_a_saved_run_is_served_scored_and_loaded_in_the_form_it_trained_in(tmp_p
 
 @pytest.fixture
 def attention_forms(monkeypatch):
-    """The attention forms the calls of a block trace in: `forms(call)` runs `call` and returns the form
-    of each attention call it traced (`attention_case`), on whichever thread traced it."""
+    """The attention forms the calls of a block trace in: `forms(call)` runs `call`, its programs traced
+    afresh, and returns the form of each attention call it traced (`attention_case`), on whichever
+    thread traced it."""
     from dew.nn import attention
 
     seen: list[str] = []
@@ -229,6 +234,10 @@ def attention_forms(monkeypatch):
     monkeypatch.setattr(attention, "attention_case", observed)
 
     def forms(call) -> set[str]:
+        import jax
+
+        # A program traced before is not traced again: each call here traces its own afresh.
+        jax.clear_caches()
         seen.clear()
         call()
         return set(seen)
