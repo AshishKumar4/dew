@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, equations, float64_terms, with_gradients
+from reference_error import assert_as_exact, equations, widened, with_gradients
 
 from dew.nn.dense import Dense
 from dew.nn.joined import joined_dense
@@ -29,22 +29,38 @@ def dots(function, *args) -> int:
     return sum(equation.primitive.name == "dot_general" for equation in equations(graph, platform="cuda"))
 
 
-def assert_joined_as_exact(choice: str, run, arguments, wide_run):
-    """`run(*arguments)` with `choice` joined, every leaf within tests/reference_error.py's rule of
-    the run with it apart, both measured from `wide_run`, the apart run in float64, each entry sized
-    by its float64 terms: a weight's gradient sums every token's product, which cancel."""
-    with row_joins(choice, joins=False):
-        apart = jax.jit(lambda *operands: run(*operands))(*arguments)
-    with row_joins(choice):
-        together = jax.jit(lambda *operands: run(*operands))(*arguments)
-    with row_joins(choice, joins=False), jax.enable_x64(new_val=True):
-        truth, terms = float64_terms(wide_run, *jax.tree.map(
-            lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), arguments))
-    for (path, mine), theirs, want, size in zip(jax.tree_util.tree_leaves_with_path(together),
-                                                jax.tree.leaves(apart), jax.tree.leaves(truth),
-                                                jax.tree.leaves(terms), strict=True):
-        assert mine.dtype == theirs.dtype
-        assert_as_exact_as_the_reference(mine, theirs, want, jax.tree_util.keystr(path), terms=size)
+JOINED_SEEDS = {("gate_up", jnp.float32, False): 8, ("gate_up", jnp.float32, True): 8,
+                ("gate_up", jnp.bfloat16, False): 8, ("gate_up", jnp.bfloat16, True): 8,
+                ("delta_gates", jnp.float32): 8, ("delta_gates", jnp.bfloat16): 8, "promoted bias": 8}
+"""Each joined row's declared draws against its projections apart (check 1), sized by `seeds_for` paired
+with the joined row on the CPU and an A100."""
+
+
+def drawing(params, shape, dtype):
+    """A joined row's draw: `params` beside an input and its output's cotangent of `shape` in `dtype`, from
+    the seed's key."""
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed))
+        return (params, *(jax.random.normal(drawn, shape).astype(dtype) for drawn in keys))
+    return draw
+
+
+def assert_joined_as_exact(choice: str, run, draw, wide_run, label: str, *, seeds: int):
+    """`run` with `choice` joined, every leaf of the same dtype as the run with it apart and on par with
+    it from `wide_run`, the apart run in float64, over `draw`'s inputs (check 1)."""
+    def under(joins):
+        def arm(*operands):
+            with row_joins(choice, joins=joins):
+                return run(*operands)
+        return arm
+
+    def truth(*operands):
+        with row_joins(choice, joins=False):
+            return wide_run(*operands)
+
+    together, apart = (jax.tree.leaves(jax.jit(under(joins))(*draw(0))) for joins in (True, False))
+    assert [leaf.dtype for leaf in together] == [leaf.dtype for leaf in apart]
+    assert_as_exact(under(joins=True), under(joins=False), draw, label, seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -53,19 +69,22 @@ def test_gate_and_up_joined_are_as_exact_as_apart_from_float64(dtype, bias):
     """A GatedMLP whose row joins gate and up computes both in one GEMM, two
     dots where it ran three, and its output and the gradients of its input
     and every parameter lie within tests/reference_error.py's rule of the
-    layer's with them apart, both measured from float64."""
-    x = jax.random.normal(jax.random.key(3), (2, 33, 64)).astype(dtype)
-    cotangent = jax.random.normal(jax.random.key(5), (2, 33, 64)).astype(dtype)
+    layer's with them apart, on par from float64 over drawn inputs (check 1)."""
     layer = GatedMLP(hidden_features=96, out_features=64, use_bias=bias, dtype=dtype)
     # Drawn biases too, which init leaves at zero.
     params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
-                          layer.init(jax.random.key(4), x))
+                          layer.init(jax.random.key(4), jnp.zeros((2, 33, 64), dtype)))
+
+    draw = drawing(params, (2, 33, 64), dtype)
+
+    x = draw(0)[1]
     with row_joins("gate_up", joins=False):
         assert dots(layer.apply, params, x) == 3
     with row_joins("gate_up"):
         assert dots(layer.apply, params, x) == 2
-    assert_joined_as_exact("gate_up", with_gradients(layer.apply), (params, x, cotangent),
-                           with_gradients(layer.clone(dtype=jnp.float64).apply))
+    assert_joined_as_exact("gate_up", with_gradients(layer.apply), draw,
+                           with_gradients(layer.clone(dtype=jnp.float64).apply), "gate and up joined",
+                           seeds=JOINED_SEEDS["gate_up", dtype, bias])
 
 
 def test_joined_projections_keep_the_dtype_their_promotion_gives_a_wider_bias():
@@ -89,15 +108,17 @@ def test_joined_projections_keep_the_dtype_their_promotion_gives_a_wider_bias():
             apart = jnp.stack([projection(x) for projection in projections], axis=-2)
             return apart, joined_dense(x, projections, axis=-2)
 
-    x = jax.random.normal(jax.random.key(10), (2, 33, 64)).astype(jnp.bfloat16)
     params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(12), leaf.shape),
-                          Pair().init(jax.random.key(13), x))
-    apart, joined = Pair().apply(params, x)
+                          Pair().init(jax.random.key(13), jnp.zeros((2, 33, 64), jnp.bfloat16)))
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.key(seed), (2, 33, 64)).astype(jnp.bfloat16),)
+
+    apart, joined = Pair().apply(params, *draw(0))
     assert joined.dtype == apart.dtype == jnp.float32
-    with jax.enable_x64(new_val=True):
-        truth = Pair(wide=True).apply(jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params),
-                                      jnp.asarray(x, jnp.float64))
-    assert_as_exact_as_the_reference(np.asarray(joined), np.asarray(apart), np.asarray(truth), "joined")
+    assert_as_exact(lambda x: Pair().apply(params, x)[1], lambda x: Pair().apply(params, x)[0], draw,
+                    "joined", seeds=JOINED_SEEDS["promoted bias"],
+                    truth_fn=lambda x: Pair(wide=True).apply(widened(params), x))
 
 
 @pytest.mark.parametrize("wrapped", ["direct", "nested", "dew", "input", "input_lora"])
@@ -202,15 +223,18 @@ def test_direct_qwix_preserves_projection_sites_in_plain_and_scanned_decoders(sc
 def test_a_delta_nets_gates_joined_are_as_exact_as_apart_from_float64(dtype):
     """A gated delta net whose row joins its b and a projections ('delta_gates') runs them as one
     GEMM, one dot fewer, and its output and the gradients of its input and every parameter lie within
-    tests/reference_error.py's rule of the layer's with them apart, both measured from float64."""
-    x = jax.random.normal(jax.random.key(7), (2, 40, 64)).astype(dtype)
-    cotangent = jax.random.normal(jax.random.key(8), (2, 40, 64)).astype(dtype)
+    the layer's with them apart, on par from float64 over drawn inputs (check 1)."""
     layer = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=16, head_v_dim=16,
                           dtype=dtype)
-    params = layer.init(jax.random.key(9), x)
+    params = layer.init(jax.random.key(9), jnp.zeros((2, 40, 64), dtype))
+
+    draw = drawing(params, (2, 40, 64), dtype)
+
+    x = draw(0)[1]
     with row_joins("delta_gates", joins=False):
         apart = dots(layer.apply, params, x)
     with row_joins("delta_gates"):
         assert dots(layer.apply, params, x) == apart - 1
-    assert_joined_as_exact("delta_gates", with_gradients(layer.apply), (params, x, cotangent),
-                           with_gradients(layer.clone(dtype=jnp.float64).apply))
+    assert_joined_as_exact("delta_gates", with_gradients(layer.apply), draw,
+                           with_gradients(layer.clone(dtype=jnp.float64).apply),
+                           "the delta net's gates joined", seeds=JOINED_SEEDS["delta_gates", dtype])
