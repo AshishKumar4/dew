@@ -591,7 +591,7 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
         narrowed = nc.narrow_partial_ends(products[..., :64], products[..., 64:], flushes=False)
         truth = nc.native_dot_ends(products, oc.FLOAT32, flushes=False)
         fault_lost = nc.native_dot_ends(lost, oc.FLOAT32, flushes=False)
-        # One sign's partials never cancel to a bf16 value's neighbourhood: the emulation's claim there is 0.9.
+        # One sign's partials never cancel near a bf16 value: the emulation's claim there is 0.9.
         for faulty, fault, share in ((_truncating_sums(lost.exact, rng), fault_lost, nc.LOST_SHARE),
                                      (narrow, narrowed, nc.NARROW_SHARE if signed else 0.9)):
             held = nc.native_dot_holds(np.asarray(faulty, np.float64), products, oc.FLOAT32, flushes=False)
