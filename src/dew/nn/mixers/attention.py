@@ -632,11 +632,13 @@ class CausalSelfAttention(nn.Module):
         return group_fields(self.ctx.causal, images=self.bidirectional_images,
                             blocks=self.bidirectional_blocks)
 
-    def _reads_whole_blocks(self, metadata: AttentionMetadata | None) -> bool:
-        """Whether the layer reads blocks each its document's whole (`AttentionMetadata.whole_blocks`): the
-        blocks read both ways are the documents, the non-causal call by documents, which every kernel that
-        takes one (FlashAttention's, cuDNN's) runs; its blocks go unread (`_key_groups`)."""
-        return self.bidirectional_blocks and metadata is not None and metadata.whole_blocks
+    def _reads_whole_blocks(self, metadata: AttentionMetadata | None, *, uncached: bool) -> bool:
+        """Whether an `uncached` call of the layer reads blocks each its document's whole
+        (`AttentionMetadata.whole_blocks`): the blocks read both ways are the documents (the rows where the
+        call names none), the non-causal call by documents, which every kernel that takes one
+        (FlashAttention's, cuDNN's) runs. A block's keys are past the window, so it bounds none, and its
+        blocks go unread. A cached call reads its cache's groups as before."""
+        return uncached and self.bidirectional_blocks and metadata is not None and metadata.whole_blocks
 
     def _key_groups(self, metadata: AttentionMetadata | None, history: dict[str, jax.Array], decode: bool,
                     length: int) -> _Groups:
@@ -646,10 +648,7 @@ class CausalSelfAttention(nn.Module):
         block's earlier keys. A single decode step of `length` 1 reads them through its first key instead
         (`_decode_masks`), since its block's later keys are not yet there."""
         read = {}
-        whole = self._reads_whole_blocks(metadata) and not decode
         for name in self._group_fields() if not (decode and length == 1) else ():
-            if whole and name == "block_groups":
-                continue  # read as the call's documents instead (`AttentionMetadata.whole_blocks`)
             groups = None if metadata is None else getattr(metadata, name)
             if groups is not None:
                 read[name] = history[name] if decode else jnp.asarray(groups, jnp.int32)
@@ -662,7 +661,7 @@ class CausalSelfAttention(nn.Module):
         return {name: append.groups(name, None if metadata is None else getattr(metadata, name))
                 for name in self._group_fields()}
 
-    def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
+    def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool, causal: bool) -> bool:
         """Whether metadata narrows who sees whom, so the mask has to be built.
 
         Key validity does; rotary positions, block groups and an explicit pairwise
@@ -671,14 +670,14 @@ class CausalSelfAttention(nn.Module):
         the call to the xla kernel (docs/performance.md). A validity array is
         opaque at trace time, so a host that knows a row is unpadded passes none,
         and one that right-pads its rows says so (`AttentionMetadata.right_padded`):
-        causality alone keeps a real query off the padding after it, whose block
+        a `causal` call alone keeps a real query off the padding after it, whose block
         groups are -1. A decode step's mask carries the cache's validity.
         """
         if decode:
             return metadata is not None
         # QK-Clip's logit maxima are taken under the mask (`_attended`), so a
         # layer that sows them keeps it.
-        implied = (metadata is not None and metadata.right_padded and self.ctx.causal
+        implied = (metadata is not None and metadata.right_padded and causal
                    and not (not self.is_initializing() and self.is_mutable_collection("qk")))
         return metadata is not None and metadata.valid is not None and not implied
 
@@ -1028,15 +1027,17 @@ class CausalSelfAttention(nn.Module):
             # them per block, and every other kernel builds the document mask
             # from them (`attention_kernel`).
             documents = segment_ids
-            causal = causal and not self._reads_whole_blocks(attention_metadata)
         groups = _Groups() if prefix is not None else self._key_groups(attention_metadata, history, decode, S)
+        uncached = prefix is None and append is None and not decode
+        if self._reads_whole_blocks(attention_metadata, uncached=uncached):
+            causal, window, groups = False, None, groups._replace(block_groups=None)
         # Over the keys the call reads, the cache's or the prefix's joined.
         masked = self._mask_kernel(query, key, decode)
         cached = isinstance(documents, CrossDocuments)
         if (cached or groups != _Groups()) and self.ctx.attention_impl != 'auto':
             implementation = masked  # a named kernel's handoff (`_mask_kernel`)
         valid = None
-        if prefix is None and self._restricts_visibility(attention_metadata, decode) and not cached:
+        if prefix is None and self._restricts_visibility(attention_metadata, decode, causal) and not cached:
             # A decode step's mask and a cache call's documents hold the rows' validity; an uncached
             # call's real keys reach the kernel beside the rest, its window counting real tokens.
             valid = None if decode or attention_metadata is None else attention_metadata.valid

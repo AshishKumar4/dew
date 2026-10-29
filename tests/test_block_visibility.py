@@ -339,14 +339,47 @@ def test_a_blocks_bounds_are_its_runs_first_token_and_one_past_its_last():
 
 WHOLE = np.asarray([[0, 0, 0, 1, 1, 1, 1, -1], [2, 2, 2, 2, 3, 3, 3, 3]], np.int32)
 """`SEGMENTS`' documents each one whole block, its padding in none."""
+PADDED = np.asarray([[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 0]], bool)
+"""Right-padded rows, each one document."""
+WHOLE_CASES = {
+    "documents": ({"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}},
+                  {"segment_ids": SEGMENTS, "block_groups": WHOLE}),
+    "documents-past-a-window": ({"sliding_attention": {"window": 2,
+                                                       "mixer": AttentionMixer(bidirectional_blocks=True)}},
+                                {"segment_ids": SEGMENTS, "block_groups": WHOLE}),
+    "right-padded-rows": ({"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}},
+                          {"attention_mask": PADDED, "right_padded": True,
+                           "block_groups": np.where(PADDED, 0, -1).astype(np.int32)}),
+}
+"""Calls whose blocks are each a document's whole real tokens: packed documents, read under a window of two
+the blocks pass, and rows of one document each, right-padded, named by no segment ids."""
 
 
-def test_whole_blocks_read_as_the_non_causal_call_by_documents():
+@pytest.mark.parametrize("case", WHOLE_CASES.values(), ids=list(WHOLE_CASES))
+def test_whole_blocks_read_as_their_block_causal_reading(case):
     """Where its producer states each block is its document's whole (`AttentionMetadata.whole_blocks`, a
-    decision row read whole), a block layer takes the non-causal call by documents its blocks describe:
-    its states are bitwise those of the layer's block-causal reading of the same blocks, and of a
-    non-causal decoder over the documents, and its call routes as that decoder's does on an H100 (the
-    kernels that run a non-causal call by documents, which block groups' spans refuse)."""
+    decision row read whole), a block layer takes the non-causal call over the documents its blocks are:
+    its states and its QK-Clip maxima are bitwise those of its block-causal reading of the same blocks,
+    under a window the blocks pass and over padding the rows name by validity alike."""
+    kinds, fields = case
+    decoder = model(**kinds).clone(attention_impl="xla")
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), ids)
+    given = {name: jnp.asarray(value) if isinstance(value, np.ndarray) else value
+             for name, value in fields.items()}
+
+    def states(**whole):
+        return decoder.apply(params, ids, method=CausalTransformer.hidden_states, mutable=["qk"], **given,
+                             **whole)
+
+    whole, blocked = (jax.tree.map(np.asarray, states(**read)) for read in ({"whole_blocks": True}, {}))
+    np.testing.assert_equal(whole, blocked)
+
+
+def test_whole_blocks_route_as_the_non_causal_call_by_documents():
+    """A block layer reading whole blocks (`AttentionMetadata.whole_blocks`) computes bitwise what a
+    non-causal decoder computes over the documents, and its call routes as that decoder's does on an
+    H100 (the kernels that run a non-causal call by documents, which block groups' spans refuse)."""
     kinds = {"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}}
     decoder = model(**kinds).clone(attention_impl="xla")
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
@@ -357,9 +390,8 @@ def test_whole_blocks_read_as_the_non_causal_call_by_documents():
         return np.asarray(decoder.apply(params, ids, segment_ids=segments,
                                         method=CausalTransformer.hidden_states, **fields))
 
-    whole = states(decoder, block_groups=blocks, whole_blocks=True)
-    np.testing.assert_array_equal(whole, states(decoder, block_groups=blocks))
-    np.testing.assert_array_equal(whole, states(decoder.clone(causal=False)))
+    np.testing.assert_array_equal(states(decoder, block_groups=blocks, whole_blocks=True),
+                                  states(decoder.clone(causal=False)))
 
     def routes(decoder, **fields):
         bf16 = decoder.clone(attention_impl="auto", dtype="bfloat16", head_dim=64)

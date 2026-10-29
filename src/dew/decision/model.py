@@ -85,8 +85,9 @@ class DecisionModel(HeadedModel):
         laid = inputs.coordinates()
         # A row in blocks is read by the backbone's attention whole within each block, on the kinds
         # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
-        blocked: dict[str, object] = {} if inputs.blocks is None else {"block_groups": inputs.blocks,
-                                                                       "whole_blocks": inputs.whole_blocks}
+        blocked: dict[str, object] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
+        if inputs.whole_blocks:
+            blocked["whole_blocks"] = True
         spanned = conditioning = None
         if inputs.context is not None:
             if self.context_length is None:
