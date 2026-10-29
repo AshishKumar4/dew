@@ -5,6 +5,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A request names its key: `TextGeneration`, `BlockGeneration` and `MaskedGeneration` calls and
+  `Server.submit` and `Server.__call__` take `key=` as a required keyword, as every native sampler does,
+  where a call without one raised `ValueError` at run time; it now raises `TypeError` at the call.
+- RL rollout metrics report each data source's status shares and mean trained reward
+  (`source/<source>/status/<name>`, `source/<source>/reward/mean`) where a step's prompts come from two or
+  more (`Session.source`, the prompt's `PromptRecord.data_source`).
 - A decoder whose family runs remote code (`LFM3`) saves with its release's code beside its config: the
   modules its `auto_map` names and every module they import, at the release's pinned revision, so the
   export opens through transformers' `trust_remote_code` as the release does.

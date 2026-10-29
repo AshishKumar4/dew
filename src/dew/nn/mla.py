@@ -26,15 +26,8 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
-from dew.nn.attention import (
-    LayerNorm,
-    RMSNorm,
-    causal_attention_mask,
-    chunk_mask,
-    kernel_for_materialized_mask,
-    max_attention_logits,
-    scaled_dot_product_attention,
-)
+from dew.nn.attention import AttentionImpl, kernel_for_materialized_mask, scaled_dot_product_attention
+from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
@@ -53,6 +46,7 @@ from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.mixers.attention import call_visibility, dense_visibility, group_fields
+from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import (
     at_least_fp32,
     compensated_add,
@@ -377,7 +371,7 @@ class MultiHeadLatentAttention(nn.Module):
     kv_store_key: str | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
     """The decode cache's storage layout (`dew.nn.kv_cache`), paged or quantized, over the latents
     or, under the sparse layout, the expanded keys."""
