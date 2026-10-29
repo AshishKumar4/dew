@@ -118,10 +118,10 @@ def test_an_image_drawn_sharp_keeps_its_pixels():
 
 
 def test_a_scatters_dots_slide_by_their_moves_and_land_where_their_targets_are_drawn():
-    """With `moved`, each dot of a scatter slides by its own move, scaled alike for every dot: two dots that move
-    by the same amount slide alike, one that does not move stays, one that moves right alone slides right alone.
-    Where it ends is where the same dot is drawn when `moved` is where it starts: there, a dot at an axis's tick
-    sits on the tick's label."""
+    """With `moved`, each dot of a scatter slides by its own move, scaled alike for every dot: two dots that
+    move by the same amount slide alike, one that does not move stays, one that moves right alone slides right
+    alone. Where it ends is where the same dot is drawn when `moved` is where it starts: there, a dot at an
+    axis's tick sits on the tick's label."""
     start = {"base": [(0.0, 0.0), (5.0, 5.0)], "tuned": [(20.0, 20.0), (0.0, 20.0)]}
     end = {"base": [(10.0, 20.0), (15.0, 25.0)], "tuned": [(20.0, 20.0), (10.0, 20.0)]}
     moved = read(figures.points(start, x_label="x", y_label="y", joined=False, moved=end))
@@ -132,7 +132,8 @@ def test_a_scatters_dots_slide_by_their_moves_and_land_where_their_targets_are_d
     landed = read(figures.points(end, x_label="x", y_label="y", joined=False, moved=start))
     ticks = {text.text: float(text.get("x")) for text in landed.iter(f"{SVG}text")
              if text.get("text-anchor") == "middle"}
-    drawn = [float(dot.get("cx")) for dot in landed.iter(f"{SVG}circle") if "animation" in dot.get("style", "")]
+    drawn = [float(dot.get("cx")) for dot in landed.iter(f"{SVG}circle")
+             if "animation" in dot.get("style", "")]
     assert drawn[0] == ticks["10"] and drawn[2] == ticks["20"]
 
 
