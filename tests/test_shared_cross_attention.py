@@ -209,8 +209,10 @@ def test_the_gates_train_alone_over_a_frozen_source():
 def test_a_context_reads_logits_enter_the_layers_qk_clip_maxima():
     """The QK-Clip bounds the logits of a layer's own projections wherever they run: a layer that reads
     a context through them sows one maximum a head, its own sequence's or the context's, whichever is
-    larger, so a context scaled up raises a reading layer's and leaves the rest at the base decoder's."""
-    variables, ids, context, lengths = model_draw(SHARED_UNNORMED)(2)
+    larger. At zero gates the reads leave every layer's own sequence as the base decoder's, so each
+    layer's maxima are the base's or more, the base's alike where it reads none, and a context scaled up
+    raises a reading layer's past them."""
+    variables, ids, context, lengths = model_draw(SHARED_UNNORMED, gated=False)(2)
     base = dataclasses.replace(SHARED_UNNORMED, cross_attention=None)
 
     def maxima(model, variables, conditioning=None):
@@ -224,9 +226,13 @@ def test_a_context_reads_logits_enter_the_layers_qk_clip_maxima():
                      for scale in (1.0, 100.0))
     assert own and set(plain) == set(scaled) == set(own)
     for path, leaf in scaled.items():
-        assert np.all(leaf >= own[path]) and np.all(plain[path] >= own[path])
         reads = any(f"['layers_{index}']" in path for index in SHARED.layer_ids)
-        assert bool(np.any(leaf > own[path])) == reads, path
+        assert np.all(plain[path] >= own[path]) and np.all(leaf >= plain[path]), path
+        if reads:
+            assert np.any(leaf > own[path]), path
+        else:
+            np.testing.assert_array_equal(leaf, own[path], err_msg=path)
+            np.testing.assert_array_equal(plain[path], own[path], err_msg=path)
 
 
 @dataclasses.dataclass(frozen=True)
