@@ -26,7 +26,7 @@ from dew.mesh import logical_spec
 from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
 from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
-from dew.nn.kernels.options import Option, Program, compiler_options
+from dew.nn.kernels.options import Option, OuterProgram, compiler_options
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import (
     POOLED,
@@ -477,7 +477,7 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
 
 def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
-              options: Mapping[str, Option] | None = None) -> Program:
+              options: Mapping[str, Option] | None = None) -> OuterProgram:
     """Compile the step program over a state split into resident and carried halves.
 
     The matrix half is donated so XLA updates the cache in place instead of
@@ -488,7 +488,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
     change the backend's defaults. See docs/performance.md for
     the measurements.
     """
-    return Program(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
+    return OuterProgram(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
                    in_shardings=(None, resident, carried, rows, None, None, None),
                    out_shardings=(None, (resident, carried, None)),
                    compiler_options=None if options is None else dict(options))
@@ -608,7 +608,7 @@ def opened_in(formats: Formats) -> jax.stages.Wrapped:
 
 
 _PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, Option], ...]],
-                tuple[Program, Program]] = {}
+                tuple[OuterProgram, OuterProgram]] = {}
 """One pair of step programs per resident layout; see `decode_programs`."""
 
 ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}
@@ -620,7 +620,7 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 
 
 def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, Option]
-                    ) -> tuple[Program, Program]:
+                    ) -> tuple[OuterProgram, OuterProgram]:
     """`_compiled` over `formats`, once per layout and model `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
     the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
@@ -630,7 +630,7 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
     (`resident_formats`). The formats tree holds the cache mapping and is
     not hashable itself, so its leaves and its structure's text key the
     programs. Each compiles through the kernel templates' reports as every
-    outer program does (`dew.nn.kernels.options.Program`), but they stay
+    outer program does (`dew.nn.kernels.options.OuterProgram`), but they stay
     apart from `dew.nn.kernels.options.program`: they donate the cache they
     step and take its formats as placements, neither of which that seam's
     arguments carry."""

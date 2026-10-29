@@ -1001,10 +1001,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         kept = (*holds, *modules)
         if held is None or len(held[0]) != len(kept) or any(
                 now is not was for now, was in zip(kept, held[0], strict=True)):
-            from dew.nn.kernels.options import Program
+            from dew.nn.kernels.options import OuterProgram
 
             # A program jits a fresh callable, so JAX traces it afresh even for the same bound method.
-            held = (kept, Program(function, static_argnames=static_argnames, compiler_options=options))
+            held = (kept, OuterProgram(function, static_argnames=static_argnames, compiler_options=options))
             cached[1][key] = held
         return held[1]
 

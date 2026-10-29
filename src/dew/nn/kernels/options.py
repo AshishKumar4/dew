@@ -150,7 +150,7 @@ class JitArguments(TypedDict, total=False):
     out_shardings: Placements
 
 
-class Program[**P, R]:
+class OuterProgram:
     """`function` jitted (`jax.jit`, under `arguments`), every compile of it read through the kernel
     templates' reports (`dew.nn.kernels.templates.report.compiled`): where a launch's kernel spills, its
     config is refused and the function traced afresh, by a new jit of a new callable past JAX's trace
@@ -159,7 +159,7 @@ class Program[**P, R]:
     the others' structure, shapes, dtypes and placements, and the trace context; `lower` and `trace`
     are its jit's."""
 
-    def __init__(self, function: Callable[P, R], **arguments):
+    def __init__(self, function: Callable, **arguments):
         self.function, self.arguments = function, arguments
         self.jitted = self._jitted()
         self.numbers, self.names = _statics(function, arguments.get("static_argnums"),
@@ -173,7 +173,7 @@ class Program[**P, R]:
             return self.function(*args, **kwargs)
         return jax.jit(traced, **self.arguments)
 
-    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+    def __call__(self, *args, **kwargs):
         key, dynamic, named = self._keyed(args, kwargs)
         executable = self._executables.get(key)
         if executable is None:
@@ -182,7 +182,7 @@ class Program[**P, R]:
                 self._executables[key] = executable
         return executable(*dynamic, **named)
 
-    def compiled(self, *args: P.args, **kwargs: P.kwargs) -> jax.stages.Compiled:
+    def compiled(self, *args, **kwargs) -> jax.stages.Compiled:
         """The program over these arguments compiled through the kernel templates' reports, lowered
         afresh where a kernel spills."""
         from dew.nn.kernels.templates import report
@@ -190,10 +190,10 @@ class Program[**P, R]:
         return report.compiled(self.jitted.lower(*args, **kwargs),
                                relower=lambda: self._jitted().lower(*args, **kwargs))
 
-    def lower(self, *args: P.args, **kwargs: P.kwargs) -> jax.stages.Lowered:
+    def lower(self, *args, **kwargs) -> jax.stages.Lowered:
         return self.jitted.lower(*args, **kwargs)
 
-    def trace(self, *args: P.args, **kwargs: P.kwargs) -> jax.stages.Traced:
+    def trace(self, *args, **kwargs) -> jax.stages.Traced:
         return self.jitted.trace(*args, **kwargs)
 
     def _keyed(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
@@ -241,11 +241,11 @@ def _signature(leaf) -> Hashable:
 
 def program[**P, R](function: Callable[P, R], *models: Held,
                     step: Mapping[str, Option] | None = None,
-                    **arguments: Unpack[JitArguments]) -> Program[P, R]:
+                    **arguments: Unpack[JitArguments]) -> OuterProgram:
     """`function` jitted with the XLA options a program over `models` compiles with
     (`compiler_options`), and, where it is part of a training step, the step's own beside them
     (`step`, `dew.training.memory.step_compiler_options`), with the rest of `jax.jit`'s `arguments`
-    (its static arguments, its shardings), compiled through the kernel templates' reports (`Program`):
+    (its static arguments, its shardings), compiled through the kernel templates' reports (`OuterProgram`):
     one program for each function, options and arguments,
     which every call with the same reuses, so a quantized model and another never share one. Every
     outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's or a load's,
@@ -285,7 +285,7 @@ def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option]
                      static_argnums: int | tuple[int, ...] | None = None,
                      static_argnames: str | tuple[str, ...] | None = None,
                      in_shardings: _Placed | None = None, out_shardings: _Placed | None = None
-                     ) -> Program[P, R]:
+                     ) -> OuterProgram:
     # Each argument `program`'s caller left out is left to jit (an explicit placement of None is a
     # `_Placed`): jit reads static positions from static names only where it is given no positions.
     arguments: JitArguments = {}
@@ -297,4 +297,4 @@ def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option]
         arguments["in_shardings"] = in_shardings.tree()
     if out_shardings is not None:
         arguments["out_shardings"] = out_shardings.tree()
-    return Program(function, compiler_options=dict(options), **arguments)
+    return OuterProgram(function, compiler_options=dict(options), **arguments)
