@@ -24,6 +24,8 @@ from pathlib import Path
 import jax
 import tokamax
 
+from dew import cache
+
 DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
 """The settings that turn Mosaic GPU's reports on, written under `MOSAIC_GPU_DUMP_TO`."""
 DUMPING = threading.RLock()
@@ -82,10 +84,7 @@ def records() -> Path | None:
     the cache shares them and derives the configs it holds (a training pool's, an eval's, a server's):
     DEW_REFUSAL_RECORDS when set, else `dew-refusals.jsonl` in JAX's compilation cache directory, or nowhere
     when the process keeps no cache."""
-    if path := os.environ.get("DEW_REFUSAL_RECORDS"):
-        return Path(path)
-    cache = jax.config.jax_compilation_cache_dir
-    return None if not cache else Path(cache) / "dew-refusals.jsonl"
+    return cache.beside_compilation_cache("DEW_REFUSAL_RECORDS", "dew-refusals.jsonl")
 
 
 def _registry() -> _Registry:

@@ -501,9 +501,10 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
     computed them (`how`)."""
     logits, slopes = algebra.tile_logits(score_mod, kernel_dot(query, key.T, interpret), seen, q_pos, k_pos,
                                          params, scale=scale if how.factor is None else 1.0, slopes=True)
-    exponentials, weights = algebra.normalized(logits, peak, total, how)
+    inverse_total = algebra.inverse(total)
+    exponentials, weights = algebra.normalized(logits, peak, inverse_total, how)
     cotangents = algebra.grad_scores(exponentials, kernel_dot(dout, value.T, interpret), anchor, delta, seen,
-                                     k_pos == key_index[:, None], algebra.inverse(total))
+                                     k_pos == key_index[:, None], inverse_total)
     return exponentials, weights, cotangents, slopes
 
 
