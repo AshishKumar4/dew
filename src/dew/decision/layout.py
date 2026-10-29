@@ -433,15 +433,29 @@ class Layout:
         counted as unfit, and a task refuses it."""
         return len(row.tokens) <= self.max_len
 
-    def refusal(self, row: Encoded) -> str | None:
-        """Why training leaves `row` out, or None where it trains: `unfit`, past `max_len` (`fits`),
-        or `options_alike`, where a declared cut left two options the same tokens, which no reading
-        tells apart. Training counts it under the reason (`dew.data.mixing.CorpusCounts`); a server
-        refuses an unfit request under the same reason, and answers one whose options its release's
-        budgets cut alike as the release does, the cut in its usage."""
-        if not self.fits(row):
+    def refusal(self, row: Encoded, context_length: int | None = None) -> str | None:
+        """Why training leaves `row` out, or None where it trains: `unfit`, past `max_len` (`fits`), or,
+        where its questions are its context's (`Encoded.spans_in_context`), past the `context_length`
+        tokens its backbone's cross-attention reads (`with_context`); or `options_alike`, where a
+        declared cut left two options the same tokens, which no reading tells apart. Training counts it
+        under the reason (`dew.data.mixing.CorpusCounts`); a server refuses an unfit request under the
+        same reason, and answers one whose options its release's budgets cut alike as the release does,
+        the cut in its usage."""
+        if not self.fits(row) or (row.spans_in_context and context_length is not None
+                                  and len(row.context or ()) > context_length):
             return "unfit"
         return "options_alike" if row.options_alike else None
+
+    def row_questions(self, questions: int) -> int:
+        """The most questions a row of this layout holds where an example asks `questions`: all of them,
+        a row an example."""
+        return questions
+
+    @property
+    def spans_in_context(self) -> bool:
+        """Whether its rows write their questions to their contexts, which their cross-attention reads,
+        their spans the contexts' (`Encoded.spans_in_context`)."""
+        return False
 
     def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None,
                segments: int | None = None, context_window: int | None = None) -> Bounds:
@@ -677,6 +691,18 @@ class QuestionLayout(Layout):
                              "none of")
         if self.blocks and self.parallel:
             raise ValueError("blocks and parallel options each say what a row's tokens read; a row takes one")
+        streams = {segment.stream for segment in self.written
+                   if isinstance(segment, (Instructions, OptionLines))}
+        if len(streams) > 1:
+            raise ValueError("a question's instructions and its option lines are read in one stream, the "
+                             "row's or its context's")
+        if self.spans_in_context and (self.parallel or any(
+                isinstance(segment, OptionLines) and segment.marker != "none" for segment in self.written)):
+            raise ValueError("options read at their positions or markers stand in the row's tokens, which a "
+                             "question written to the context leaves; read them under labels")
+        if self.spans_in_context and self.blocks and self.split != "whole":
+            raise ValueError("a row whose question is its context splits at no question; read it whole "
+                             "(split='whole')")
         if self.split is not None and not self.blocks:
             raise ValueError(f"split={self.split!r} says where a row in blocks splits; this layout's rows "
                              "are read in order, as a backbone whose attention reads no blocks reads them "
@@ -705,6 +731,16 @@ class QuestionLayout(Layout):
         """Return the state's tokens, which every question of a request shares."""
         text = render(state).replace(specials.marker_text, " ")
         return tuple(encoder.encode(text, add_special_tokens=False))
+
+    def row_questions(self, questions: int) -> int:
+        """One: a question layout writes a row a question."""
+        return 1
+
+    @property
+    def spans_in_context(self) -> bool:
+        """Whether its row writes its question to its context (`Instructions.stream`)."""
+        return any(isinstance(segment, (Instructions, OptionLines)) and segment.stream == "context"
+                   for segment in self.written)
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
@@ -753,30 +789,17 @@ class QuestionLayout(Layout):
             isinstance(segment, State) for segment in parts)
         opening = (("suffix", 0),) if self.blocks and split == "part" else ()
         chunks: list[Chunk | State] = []
-        head_at, cue_at, line_at, labelled = None, None, [], []
-        for segment in segments:
-            if isinstance(segment, Text):
-                chunks.append(Chunk(segment.text))
-            elif isinstance(segment, Special):
-                ids = tuple(_begin(specials) if segment.token == "begin" else (specials.separator,))
-                # A begin token the tokenizer has none of writes nothing, so text around it reads as one.
-                if ids:
-                    chunks.append(Chunk(ids=ids))
-            elif isinstance(segment, State):
-                chunks.append(segment)
-            elif isinstance(segment, Instructions):
-                # The question's header opens the second part, where it follows the state.
-                head_at = _instruction_chunks(chunks, segment, question, specials,
-                                              opening if not question_first else ())
-            elif isinstance(segment, OptionLines):
-                line_at, labelled = self._option_chunks(chunks, segment, question, described, slots, names,
-                                                        texts, specials)
-            elif isinstance(segment, AnswerCue):
-                template = segment.template if len(names) <= segment.at else segment.many
-                cue_at = len(chunks)
-                chunks.append(Chunk(template.format(labels=segment.join.join(names))))
-        instructions_cut, options_cut, alike = self._question_cut(encoder, chunks, head_at, line_at, cue_at,
-                                                                  labelled)
+        # A question written to the row's context (`Instructions.stream`) is its own chunks, which the
+        # row's cross-attention reads, its spans the context's.
+        context: list[Chunk | State] = []
+        head_at, cue_at, line_at, labelled = self._chunked(chunks, context, question, specials, described,
+                                                           slots, names, texts,
+                                                           opening if not question_first else ())
+        in_context = self.spans_in_context
+        # A question in the context shares no budget with the row's cue.
+        instructions_cut, options_cut, alike = self._question_cut(
+            encoder, context if in_context else chunks, head_at, line_at, None if in_context else cue_at,
+            labelled)
         copies = [_kept_by(segment, conversation) for segment in segments if isinstance(segment, State)]
         # A copy rendered as the layout renders its state reads the request's precomputed tokens where it
         # gives them, under pieces; any other renders the state's text.
@@ -821,20 +844,26 @@ class QuestionLayout(Layout):
             whole = len(tokens)
             held = [(whole, 0)]
         row_tokens = laid.tokens
-        spans = [laid.marks[("option", index)] for index in range(len(slots))]
-        row = Laid(name, kind_of(question), laid.marks["question"], tuple(spans), tuple(slots),
+        # The question's spans are those of the stream it is written to; the readout is the row's last
+        # token, its cue.
+        # A question's context holds its own segments' chunks, never a state's placeholder.
+        written = [chunk for chunk in context if isinstance(chunk, Chunk)]
+        assert len(written) == len(context), "a question's context holds no state"
+        asked = (rendered_chunks(written, _Pieces(encoder) if unit == "pieces" else encoder, unit)
+                 if in_context else laid)
+        spans = [asked.marks[("option", index)] for index in range(len(slots))]
+        row = Laid(name, kind_of(question), asked.marks["question"], tuple(spans), tuple(slots),
                    readout=len(row_tokens) - 1 if labels is not None else None,
                    label_ids=labels.ids(encoder, len(slots)) if labels is not None else None)
-        groups = [laid.points[("group", index)] for index in range(len(slots))]
-        positions, option_slots = (_parallel(list(zip(groups, [*groups[1:], laid.points["options_end"]],
-                                                      strict=True)), len(row_tokens))
+        positions, option_slots = (_parallel(_option_groups(laid, len(slots)), len(row_tokens))
                                    if self.parallel else (None, None))
         # A cut of a row encoded whole is its characters (`_cut`); of a row of pieces, its own tokens.
         retokenized = unit == "whole" and bool(copies)
         encoded = Encoded(row_tokens, (row,), positions, option_slots, whole, state_kept,
                           state_cut=0 if retokenized else sum(own - kept for own, kept in held),
                           state_characters_cut=characters, instructions_cut=instructions_cut,
-                          options_cut=options_cut, options_alike=alike)
+                          options_cut=options_cut, options_alike=alike,
+                          context=asked.tokens if in_context else None, spans_in_context=in_context)
         if not self.blocks:
             return encoded
         # The prefix is the tokens that end at or before the suffix's first character (serve.patch
@@ -842,6 +871,39 @@ class QuestionLayout(Layout):
         boundary = (laid.points["suffix"] if split == "part" else row.span[0] if split == "question"
                     else len(row_tokens))
         return _blocked(encoded, boundary)
+
+    def _chunked(self, chunks: "list[Chunk | State]", context: "list[Chunk | State]", question: Question,
+                 specials: Specials, described: Sequence[tuple[str, JSON]], slots: Sequence[int],
+                 names: Sequence[str], texts: Sequence[str], opening: Sequence[Point]
+                 ) -> tuple[int | None, int | None, list[int], list[tuple[str, str]]]:
+        """Append the row's segments' chunks to `chunks`, its question's to `context` where they stream
+        there (`Instructions.stream`), each state a placeholder: where its instructions, answer cue and
+        option lines stand in the list they went to, and each line's label text (`_option_chunks`), the
+        question's header opening at `opening`."""
+        head_at, cue_at, line_at, labelled = None, None, [], []
+        for segment in self.written:
+            if isinstance(segment, Text):
+                chunks.append(Chunk(segment.text))
+            elif isinstance(segment, Special):
+                ids = tuple(_begin(specials) if segment.token == "begin" else (specials.separator,))
+                # A begin token the tokenizer has none of writes nothing, so text around it reads as one.
+                if ids:
+                    chunks.append(Chunk(ids=ids))
+            elif isinstance(segment, State):
+                chunks.append(segment)
+            elif isinstance(segment, Instructions):
+                # The question's header opens the second part, where it follows the state.
+                head_at = _instruction_chunks(context if segment.stream == "context" else chunks, segment,
+                                              question, specials, opening)
+            elif isinstance(segment, OptionLines):
+                line_at, labelled = self._option_chunks(context if segment.stream == "context" else chunks,
+                                                        segment, question, described, slots, names, texts,
+                                                        specials)
+            elif isinstance(segment, AnswerCue):
+                template = segment.template if len(names) <= segment.at else segment.many
+                cue_at = len(chunks)
+                chunks.append(Chunk(template.format(labels=segment.join.join(names))))
+        return head_at, cue_at, line_at, labelled
 
     @staticmethod
     def _option_chunks(chunks: "list[Chunk | State]", segment: "OptionLines", question: Question,
@@ -1316,6 +1378,13 @@ def _trimmed(chunks: Sequence[Chunk], leading: int, trailing: int) -> list[Chunk
     return trimmed
 
 
+def _option_groups(laid: Rendered, count: int) -> list[tuple[int, int]]:
+    """Each of a row's `count` option groups in its tokens, from its opening to the next's, the last's
+    to where the options end (`QuestionLayout._option_chunks`)."""
+    groups = [laid.points[("group", index)] for index in range(count)]
+    return list(zip(groups, [*groups[1:], laid.points["options_end"]], strict=True))
+
+
 def _label_text(line: str, fields: Mapping[str, str]) -> tuple[str, str]:
     """The text an option's `line` writes before its label, and through it: its template up to
     `{label}`, and on to the field after it without that field's leading space (the built-in row's
@@ -1402,12 +1471,16 @@ class Instructions:
     instructions), rendered by `render` (`rendered`); `defaults` are a kind's instructions where its
     question's render empty, as instructions of whitespace alone do under a release's `entry`. The
     question's span is its instructions' (`span="instructions"`), or the header and its instructions
-    written as one piece (`span="header"`, the built-in rows' `"{kind} question: {instructions}"`)."""
+    written as one piece (`span="header"`, the built-in rows' `"{kind} question: {instructions}"`).
+    `stream` is where they are read: in the row (`"row"`), or as the row's context (`"context"`), which
+    its cross-attention reads, the question's spans the context's (`Encoded.spans_in_context`), its
+    options' lines streaming with it."""
 
     headers: Mapping[str, str]
     render: Render = "question"
     defaults: Mapping[str, str] = dataclasses.field(default_factory=dict)
     span: Literal["instructions", "header"] = "instructions"
+    stream: Literal["row", "context"] = "row"
 
 
 @dataclass(frozen=True)
@@ -1421,7 +1494,8 @@ class OptionLines:
 
     `marker` writes the layout's marker token before or after each line, where the option is read at
     its marker (Laya's markers before, a causal row's after) and its span is the marker's; `none` reads
-    the options under labels at the answer cue."""
+    the options under labels at the answer cue. `stream` is where they are read, as their question's
+    instructions are (`Instructions.stream`)."""
 
     line: str = "{label}. {name}: {text}"
     bare: str = "{label}. {name}"
@@ -1432,6 +1506,7 @@ class OptionLines:
     criteria: Mapping[str, str] = dataclasses.field(default_factory=dict)
     marker: Literal["none", "before", "after"] = "none"
     noul_first: Literal["true", "false"] = "true"
+    stream: Literal["row", "context"] = "row"
 
 
 @dataclass(frozen=True)
@@ -1526,6 +1601,11 @@ class JointLayout(Layout):
     def schema_in_context(self) -> bool:
         """Whether the row's schema is its context (`Schema.stream`), its spans the context's."""
         return any(isinstance(segment, Schema) and segment.stream == "context" for segment in self.segments)
+
+    @property
+    def spans_in_context(self) -> bool:
+        """Whether the row's schema is its context (`schema_in_context`)."""
+        return self.schema_in_context
     images: ClassVar[bool] = True
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:

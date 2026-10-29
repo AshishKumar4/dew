@@ -124,6 +124,7 @@ from dew.data.pipeline import (
     Workers,
     children,
     record_stage,
+    runs,
     with_children,
     with_stores,
 )
@@ -910,9 +911,17 @@ def _compiled(
         statistics=statistics,
         batch_tokens=staged.batch_tokens,
         device=device,
+        widths=_bound_widths(original),
         tail=_tail(train, build),
         order_records=order_records,
     )
+
+
+def _bound_widths(pipeline: Pipeline) -> Mapping[str, object]:
+    """The run's static widths `pipeline`'s run-scoped configured steps bound (`Bound`, `run_widths`)."""
+    bound = (ran.configured for ran in map(runs, _steps(pipeline))
+             if ran is not None and ran.configured is not None and ran.configured.step.scope == "run")
+    return {name: value for binding in bound for name, value in binding.values.items()}
 
 
 def _batch_steps(pipeline: Pipeline) -> tuple[tuple[HostStep, ...], tuple[DeviceStep, ...]]:
@@ -1078,7 +1087,8 @@ def _compile_phases(
 
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
     return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
-                               token_ends=source.ends if tokens else None)
+                               token_ends=source.ends if tokens else None,
+                               widths=merge_facts(loaded.widths for loaded, _ in built))
 
 
 def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
@@ -1633,14 +1643,11 @@ def validation(
     widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched."""
     read = read or _preferred_read((pipeline,), provision=provision)
 
-    def batched(branch: Pipeline) -> Pipeline:
-        if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in branch.stages):
-            return branch
-        return branch.batch(batch, drop_remainder=False)
-
-    pipeline = batched(pipeline)
+    # One pass reads every record, in the chain's own batches or `batch`'s (`_held_batched`).
+    pipeline = _held_batched(pipeline, batch)
     if measured is not None:
-        measured = dataclasses.replace(measured, branches=tuple(map(batched, measured.branches)))
+        measured = dataclasses.replace(measured, branches=tuple(
+            _held_batched(branch, batch) for branch in measured.branches))
     prepared = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},),
                          widths=widths, measured=measured)
     (pipeline,) = _made(prepared, read, ({},), training=False)

@@ -90,10 +90,13 @@ class Encoding:
                                 tokens=None if tokens is None else tokens.tolist())
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
-                 tokens: np.ndarray | None = None, group_of: "GroupOf | None" = None) -> Batch:
+                 tokens: np.ndarray | None = None, group_of: "GroupOf | None" = None,
+                 admitted: Mapping[str, int] | None = None) -> Batch:
         """The row of `example`'s questions `names` as this read lays it out: a "none of the above" this
-        read draws stands where its row is one a run trains on (`Layout.refusal`), and a draw that
-        would leave its row unfit, or its options alike, lays the questions out as Fit admitted them."""
+        read draws stands where its row is one a run trains on (`Layout.refusal`) and cuts no more of its
+        state than Fit admitted it with (`admitted`, `FittedRow.cuts`), the cuts its data report counted;
+        a draw that would leave its row unfit, its options alike or its state cut further lays the
+        questions out as Fit admitted them (`drawn_refusal`)."""
         labels = example.labels()
         if rng is not None and self.shuffle and self.layout.joint:
             names = [names[int(index)] for index in rng.permutation(len(names))]
@@ -121,9 +124,11 @@ class Encoding:
             if gold is not None:
                 golds[name] = gold
         rows = self._rows(example, asked, rng, tokens)
-        if dropped and any(self.layout.refusal(row) is not None for row in rows):
+        if dropped and any(drawn_refusal(self.layout, row, self.context_length, admitted) is not None
+                           for row in rows):
             # The added option made a row no run trains on (`Layout.refusal`: unfit, or options a
-            # declared budget left alike): this read lays the questions out as Fit admitted them.
+            # declared budget left alike), or one whose state it cut further than its count says: this
+            # read lays the questions out as Fit admitted them.
             asked = {name: example.questions[name] for name in names}
             golds = {name: example.distribution(name) for name in names if name in labels}
             dropped = {}
@@ -259,12 +264,27 @@ class FittedRow:
     cuts: Mapping[str, int] = field(default_factory=dict)
     """The tokens each cut removed from the row, by what it cut (`Encoded.cuts`)."""
     declined: str | None = None
-    """Why the layout refuses the row with a "none of the above" beside each of its answered choices
-    (`Layout.refusal`), so a training read that draws the option for it lays it out as it was
-    admitted (`Encoding`); None where the layout admits it or no read draws one (`Fit._declined`)."""
+    """Why a training read declines the row's "none of the above" beside each of its answered choices
+    (`drawn_refusal`: the layout refuses it, or it would cut the state further), so a read that draws
+    the option for it lays it out as it was admitted (`Encoding`); None where the row takes it or no
+    read draws one (`Fit._declined`)."""
     context: int = 0
     """The context tokens the row reads beside its own: its example's, or its schema where the schema is
     its context (`Encoded.spans_in_context`)."""
+
+
+def drawn_refusal(layout: Layout, row: Encoded, context_length: int | None,
+                  admitted: Mapping[str, int] | None) -> str | None:
+    """Why a training read declines the "none of the above" it drew for `row`: the layout refuses the row
+    (`Layout.refusal`), or the option's line cuts more of the state than the row was `admitted` with
+    (`state_cut`), which its data report counted (`FittedRow.cuts`); None where the row stands as drawn.
+    The option's own line under a declared question budget is the budget's (`options_alike` where it
+    leaves two alike)."""
+    refused = layout.refusal(row, context_length)
+    if refused is not None or admitted is None:
+        return refused
+    deeper = any(row.cuts.get(kind, 0) > admitted.get(kind, 0) for kind in ("state", "state_characters"))
+    return "state_cut" if deeper else None
 
 
 def _cuts(rows: Iterable[FittedRow]) -> dict[str, tuple[int, int]]:
@@ -360,7 +380,7 @@ class Fit(pygrain.MapTransform):
         laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
         # Counted under its reason, as a server counts the request it refuses (`Layout.refusal`); a
         # scored row whose options a declared cut left alike is answered as a server answers it.
-        refusals = [self.layout.refusal(row) for row in laid]
+        refusals = [self.layout.refusal(row, self.context_length) for row in laid]
         refused = next((reason for reason in refusals
                         if reason is not None and not (self.scored and reason == "options_alike")), None)
         if refused is not None:
@@ -382,10 +402,11 @@ class Fit(pygrain.MapTransform):
                      for row, context in zip(laid, contexts, strict=True))
 
     def _declined(self, example: Example, row: Encoded, state: Sequence[int]) -> str | None:
-        """Why the layout refuses `row` with a "none of the above" beside each of its answered choices,
-        the longest a training read's draw makes it (`Encoding`; in place of a right option, the
-        option shortens it), which the read then declines (`FittedRow.declined`); None where the
-        layout admits it, where no read draws one, or where its questions take none."""
+        """Why a training read declines `row`'s "none of the above" beside each of its answered choices,
+        the longest its draw makes it (`Encoding`; in place of a right option, the option shortens
+        it): the layout refuses it, or it cuts more of the state than `row` (`drawn_refusal`), which the
+        read then declines (`FittedRow.declined`); None where the row takes it, where no read draws
+        one, or where its questions take none."""
         if not self.none_of_the_above or self.scored:
             return None
         labels = example.labels()
@@ -398,7 +419,7 @@ class Fit(pygrain.MapTransform):
         if all(asked[laid.name].options == example.questions[laid.name].options for laid in row.questions):
             return None
         [augmented] = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
-        return self.layout.refusal(augmented)
+        return drawn_refusal(self.layout, augmented, self.context_length, row.cuts)
 
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
         """Grouped examples' labelled rows, each as an example of its own lays it out (`QuestionRows`
@@ -522,7 +543,7 @@ def _encoded_unit(encoding: "Encoding", unit: FittedUnit, rng: np.random.Generat
     """A unit's rows encoded each as `encoding` encodes a row, its groups numbered in the unit."""
     def group_of(index: int) -> GroupOf:
         return lambda name: unit.grouped.group_of(index, name)
-    return _unit_row([encoding(row.example, row.names, rng, row.tokens, group_of(index))
+    return _unit_row([encoding(row.example, row.names, rng, row.tokens, group_of(index), admitted=row.cuts)
                       for index, row in unit.rows])
 
 
@@ -562,7 +583,7 @@ class LayoutRows(pygrain.RandomMapTransform):
         if "decision_unit" in element:
             return _encoded_unit(self.encoding, element["decision_unit"], rng)
         fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, rng, fitted.tokens)
+        return self.encoding(fitted.example, fitted.names, rng, fitted.tokens, admitted=fitted.cuts)
 
 
 @dataclass(frozen=True)
@@ -588,13 +609,18 @@ class ConfigureLayout:
     grouped: bool = False
 
     def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:
-        slots = record(metadata["slots"], "decision slots")
-        width = integer(slots.get("options"), "slots.options") + int(self.none_of_the_above > 0)
+        width = option_width(record(metadata["slots"], "decision slots"), self.none_of_the_above)
         if width < 1:
             raise ValueError("decision source slot maxima must be positive")
         encoding = Encoding(self.layout, self.tokenizer, self.specials, width, self.shuffle,
                             self.none_of_the_above, self.context_length, self.grouped)
         return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
+
+
+def option_width(slots: Mapping[str, object], none_of_the_above: float) -> int:
+    """The option slots a question of a run's rows takes: the most options a question of its data asks
+    (`slots`), and one more where a training read draws "none of the above" beside them."""
+    return integer(slots.get("options"), "slots.options") + int(none_of_the_above > 0)
 
 
 TRAINING_FIELDS = (QuestionField("labels", (), np.int32, when="trained"),
@@ -716,6 +742,14 @@ def _window_groups(element: Batch, owners: np.ndarray, options: np.ndarray
     return numbered, canonical.astype(np.int32)
 
 
+def _row_starts(along: np.ndarray, owners: np.ndarray) -> np.ndarray:
+    """Where the row each question of `owners` belongs to starts along a stream whose rows `along`
+    numbers in the order they stand (0 for padding), each padding question's 0."""
+    counts = np.bincount(along, minlength=int(owners.max(initial=0)) + 1)
+    starts = np.concatenate([[0], np.cumsum(counts[1:])]).astype(np.int32)
+    return np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
+
+
 @dataclass(frozen=True)
 class PackedRows(pygrain.MapTransform):
     """A window of packed rows (`packing`) as `DecisionInputs` reads it: each
@@ -737,9 +771,7 @@ class PackedRows(pygrain.MapTransform):
         contexts = self._context_rows(element, units) if "context" in element else None
         # A row's spans count from where it starts along the stream they index: its tokens, or its context.
         along = contexts if self.spans_in_context and contexts is not None else segments
-        counts = np.bincount(along, minlength=int(owners.max(initial=0)) + 1)
-        starts = np.concatenate([[0], np.cumsum(counts[1:])]).astype(np.int32)
-        moved = np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
+        moved = _row_starts(along, owners)
         options = np.asarray(element["options"])
         laid = {name: element[name] for name in ("tokens", *_along_fields(element))} | {
             "segments": segments,
@@ -749,8 +781,10 @@ class PackedRows(pygrain.MapTransform):
             "option_spans": element["option_spans"] + (moved[:, None] * options)[..., None],
         }
         if "readout" in element:
-            # A question's answer cue moves with its row in the window, as its spans do.
-            laid["readout"] = element["readout"] + moved
+            # A question's answer cue moves with its row's tokens in the window, whichever stream its
+            # spans index.
+            row_moved = moved if along is segments else _row_starts(segments, owners)
+            laid["readout"] = element["readout"] + row_moved
         if "groups" in element:
             # A group is its unit's: the packer's documents, before they are cut into their rows.
             laid["groups"], laid["canonical"] = _window_groups(element, owned, options)

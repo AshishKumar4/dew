@@ -702,9 +702,9 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     assert scores["accuracy"] == alone["accuracy"]
 
 
-def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str]:
+def trained_runs(decide, tmp_path, count: int, *, name: str = "run", examples=None) -> list[str]:
     """`count` runs of the task trained apart, one more step each, from one head (the task's own, held):
-    each a checkpoint of its own, as averaging reads them."""
+    each a checkpoint of its own, as averaging reads them, over `examples`, every case's where None."""
     import optax
 
     from dew.checkpoints import Checkpoints
@@ -714,7 +714,8 @@ def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str
     runs = []
     for index in range(count):
         objective = DecisionObjective(decide)
-        data = decision_rows(answered() * 2, 8, answered(), objective=objective.data())
+        rows = answered() if examples is None else examples
+        data = decision_rows(rows * 2, 8, rows, objective=objective.data())
         directory = str(tmp_path / f"{name}{index}")
         checkpoints = Checkpoints(directory, keep=1)
         Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
@@ -754,6 +755,19 @@ def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refi
     calibrated = Decide.averaged(runs, calibrate_on=held_out)
     assert calibrated.calibration != Calibration()
     assert calibrated.calibration == two.calibrated(held_out).calibration
+
+
+def test_runs_whose_data_hold_other_widths_average_padded_to_the_widest(decide, tmp_path):
+    """The widths a pass pads to are no part of a run's weights (`DecideSettings.questions`): runs whose
+    data hold other widths average, the average padding each pass to the widest either recorded."""
+    narrow = [Example("a short state", {"q": Choice("Which?", ["one", "two"])}, {"q": "one"})] * 4
+    runs = (trained_runs(decide, tmp_path, 1)
+            + trained_runs(decide, tmp_path, 1, name="narrow", examples=narrow))
+    budgets = [Decide.from_run(run).budget for run in runs]
+    assert budgets[0].options is not None and budgets[1].options == 2 < budgets[0].options
+    average = Decide.averaged(runs).budget
+    assert (average.questions, average.options) == (max(budget.questions for budget in budgets),
+                                                    budgets[0].options)
 
 
 def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):

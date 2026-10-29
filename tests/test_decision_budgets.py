@@ -160,13 +160,13 @@ def test_a_context_no_cross_attention_reads_counts_as_a_cut_of_it():
 
 def _drawn(layout, example, draws: int) -> list[dict]:
     """`draws` training reads of `example`, each adding a "none of the above" (rate 1), its row as Fit
-    admitted it."""
+    admitted it (`LayoutRows`)."""
     from dew.decision.rows import Encoding
 
     [fitted] = Fit(layout, BYTES, BYTE_SPECIALS, DecisionHead(64)).map({"example": example})["decision_rows"]
     encoding = Encoding(layout, BYTES, BYTE_SPECIALS, width=4, none_of_the_above=1.0, shuffle=False)
     rng = np.random.default_rng(0)
-    return [encoding(example, ["q"], rng, fitted.tokens) for _ in range(draws)]
+    return [encoding(example, ["q"], rng, fitted.tokens, admitted=fitted.cuts) for _ in range(draws)]
 
 
 def _options(row: dict) -> list[tuple[int, ...]]:
@@ -188,9 +188,12 @@ def test_a_none_of_the_above_draw_never_leaves_a_row_unfit():
     from dew.data.pipeline import ObjectiveData
 
     question = Choice("Which?", ["abca", "abcb", "abcc"])
-    # The question with the option added takes 95 tokens with no state, with it in place of "abca" 89.
-    layout = MarkerLayout(max_len=90)
     example = Example("short", {"q": question}, {"q": "abca"})
+    # The question with the option added takes 95 tokens with no state, with it in place of "abca" 89: the
+    # window holds the latter with its state whole, which no draw may cut further than Fit admitted it.
+    replaced, _ = _none_of_the_above(question, 0, drop=True)
+    [whole] = MarkerLayout(max_len=256).rows(BYTES, BYTE_SPECIALS, example.state, {"q": replaced})
+    layout = MarkerLayout(max_len=len(whole.tokens))
     [admitted] = layout.rows(BYTES, BYTE_SPECIALS, example.state, example.questions)
     added, _ = _none_of_the_above(question, 0, drop=False)
     [augmented] = layout.rows(BYTES, BYTE_SPECIALS, example.state, {"q": added})
@@ -225,6 +228,31 @@ def test_a_none_of_the_above_draw_never_leaves_the_options_alike():
     assert any(not np.array_equal(row["tokens"], admitted.tokens) for row in rows)
     fit = Fit(layout, BYTES, BYTE_SPECIALS, DecisionHead(64), none_of_the_above=1.0)
     assert fit.map({"example": example})["_dew_declined"] == {"options_alike": 1}
+
+
+def test_a_none_of_the_above_draw_never_cuts_the_state_further_than_its_count_says():
+    """A "none of the above" whose line would cut more of the state than Fit admitted the row with, and so
+    more than the run's data report counts, lays the question out as Fit admitted it, the state whole, and
+    is counted as a draw the read declines (`state_cut`); one in place of the right option, shorter than it,
+    stands (the control) (row 2006: nothing is cut silently)."""
+    right = "the first option, whose line is longer than any none of the above with its description"
+    question = Choice("Which?", [right, "the second option", "the third one"])
+    example = Example("the account was charged twice on the same day, " * 4, {"q": question}, {"q": right})
+    [whole] = MarkerLayout(max_len=1024).rows(BYTES, BYTE_SPECIALS, example.state, example.questions)
+    assert not whole.cuts
+    layout = MarkerLayout(max_len=len(whole.tokens))
+    [admitted] = layout.rows(BYTES, BYTE_SPECIALS, example.state, example.questions)
+    added, _ = _none_of_the_above(question, 0, drop=False)
+    [augmented] = layout.rows(BYTES, BYTE_SPECIALS, example.state, {"q": added})
+    assert not admitted.cuts and augmented.cuts.get("state", 0) > 0 and layout.refusal(augmented) is None
+    state = BYTES.encode(example.state)
+    rows = _drawn(layout, example, 16)
+    assert all(any(list(row["tokens"][at:at + len(state)]) == list(state) for at in range(len(row["tokens"])))
+               for row in rows)
+    assert any(np.array_equal(row["tokens"], admitted.tokens) for row in rows)
+    assert any(not np.array_equal(row["tokens"], admitted.tokens) for row in rows)
+    fit = Fit(layout, BYTES, BYTE_SPECIALS, DecisionHead(64), none_of_the_above=1.0)
+    assert fit.map({"example": example})["_dew_declined"] == {"state_cut": 1}
 
 
 def test_a_grouped_example_counts_the_members_it_leaves_out():

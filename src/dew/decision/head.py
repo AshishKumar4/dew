@@ -65,6 +65,11 @@ class Head(nn.Module):
     draws_from_rows: ClassVar[bool] = False
     """Whether the head draws its parameters from the backbone's vocabulary rows (`VocabularyRows`),
     its `table` when it is drawn, and reads no table after."""
+    pools_spans: ClassVar[bool] = False
+    """Whether the head pools states over the questions' spans (`DecisionInputs.spans`, `option_spans`),
+    from the pass that holds them: the context's states (`spanned`) where the spans are the row's
+    context's (`DecisionInputs.spans_in_context`), its pooling then counted over the context's tokens
+    (`decision_flops(pooled=)`)."""
     one_question: ClassVar[bool] = False
     """Whether the head reads one question a row, refusing a joint row's several
     questions at the host boundary (`validate_rows`)."""
@@ -135,10 +140,8 @@ class DecisionHead(Head):
     attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
-    def decision_flops(self, lengths, questions, options, *, pooled=None) -> float:
+    def decision_flops(self, lengths, questions, options) -> float:
         """Full-row encoder layers and the scorer at real option markers; it pools no spans."""
-        if pooled is not None:
-            raise TypeError("Laya's head scores options at their markers in the row, and pools no context")
         matching_lengths(lengths, questions, options)
         per_layer = (12 * projection_flops(lengths, self.features, self.features)
                      + attention_flops(lengths, 1, self.features, self.features, causal=False))
@@ -329,6 +332,7 @@ class JointSchemaHead(Head):
     precision: PrecisionLike = None
     attention_impl: AttentionImpl = "auto"
     reads_table: ClassVar[bool] = True
+    pools_spans: ClassVar[bool] = True
     width_field: ClassVar[str] = "hidden_size"
 
     @nn.nowrap
@@ -576,6 +580,7 @@ class SlotReadout(Head):
     dtype: Dtype | None = None
     reads_labels: ClassVar[bool] = True
     draws_from_rows: ClassVar[bool] = True
+    pools_spans: ClassVar[bool] = True
 
     @nn.nowrap
     def validate_rows(self, rows: Sequence[Encoded]) -> None:
@@ -584,17 +589,25 @@ class SlotReadout(Head):
         _refuse_other_labels(rows, tuple((label,) for label in self.label_ids))
 
     @nn.nowrap
-    def decision_flops(self, lengths, questions, options) -> float:
+    def decision_flops(self, lengths, questions, options, *, pooled=None) -> float:
         """Each real option's slot product and key, its affinity with its question's query, and its
-        line's pooling over the row; each question's query."""
+        line's pooling over the row, or over `pooled` tokens a row where the lines are a context's; each
+        question's query."""
         widths, _, counted = matching_lengths(lengths, questions, options)
+        spanned = widths if pooled is None else real_lengths(pooled)
         return (projection_flops(questions, self.features, self.head_dim)
                 + projection_flops(options, self.features, 1 + self.head_dim)
-                + 2 * np.sum(counted) * self.head_dim + 2 * np.sum(counted * widths) * self.features)
+                + 2 * np.sum(counted) * self.head_dim + 2 * np.sum(counted * spanned) * self.features)
 
     @nn.compact
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table=None, train: bool = False, *,
-                 tied: jax.Array | None = None) -> jax.Array:
+                 tied: jax.Array | None = None, spanned: jax.Array | None = None) -> jax.Array:
+        """The `[B, Q, K]` scores of each question's labels, its answer state read in the row's `states`
+        and its option lines pooled there, or in `spanned`, the context's states, where the lines are
+        the row's context's (`DecisionInputs.spans_in_context`)."""
+        if inputs.spans_in_context != (spanned is not None):
+            raise ValueError("option lines read as the row's context come with the context's states, and "
+                             "only then")
         width = inputs.options.shape[-1]
         labels = len(self.label_ids)
         held = labels if self.slot_rows is None else self.slot_rows
@@ -617,7 +630,8 @@ class SlotReadout(Head):
         k = self.param("k", nn.initializers.zeros, (self.head_dim, self.features), drawn_dtype)
         states = states.astype(_wide(jnp.result_type(states, slots), self.dtype))
         answers = _answers(states, inputs)
-        pooled = span_means(states, inputs.option_spans[:, :, :real])
+        lines = states if spanned is None else spanned.astype(states.dtype)
+        pooled = span_means(lines, inputs.option_spans[:, :, :real])
         highest = jax.lax.Precision.HIGHEST
         score = jnp.einsum("bqd,kd->bqk", answers, slots[:real], precision=highest)
         query = jnp.einsum("bqd,hd->bqh", answers, q, precision=highest)

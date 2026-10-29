@@ -78,19 +78,31 @@ def test_finite_token_budget_keeps_its_geometry_and_every_real_row(entry, read):
         reader.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Counted:
+    """An objective's evaluation batch step, as a diffusion objective's caption encoding is one: each
+    batch's rows counted into a column, which only a step after the batch sees whole."""
+
+    def __call__(self, batch):
+        return {**batch, "rows": np.full(len(batch["id"]), len(batch["id"]), np.int32)}
+
+
 def test_an_unbatched_validation_beside_a_token_budget_reads_in_its_training_batch():
     """Training batched by a token budget states its rows only as it compiles, so a validation set that
     states no batch is measured before it (`fitted`) and batched as it is read: in training's rows, every
-    record once and the short last batch filled and marked, not one row a batch (row 2085)."""
+    record once and the short last batch filled and marked, not one row a batch, the objective's
+    evaluation batch steps after that batch (rows 2085, 2178)."""
     rows = [{"id": np.int32(index + 1), "length": np.int32(4)} for index in range(6)]
     train = Memory(rows).map(Tokens()).batch(tokens=64).read("memory")
     held = Memory([{"id": np.int32(index + 1), "length": np.int32(3)} for index in range(6)]).map(Tokens())
-    data, readers = fitted(train, held, objective=ObjectiveData())
+    data, readers = fitted(train, held, objective=ObjectiveData(evaluate_batch=(Counted(),)))
     assert data.batch == 4
     reader = readers["val"](DataPartition())
     try:
         batches = list(reader)
         assert [batch["id"].shape for batch in batches] == [(4,), (4,)]
+        # The step read each batch whole: its batch's rows, a short last one's included.
+        assert all(np.all(batch["rows"] == len(batch["id"])) for batch in batches)
         assert sorted(int(value) for batch in batches
                       for value in batch["id"][batch.get(VALID_ROWS, np.ones(4, bool))]) == list(range(1, 7))
     finally:

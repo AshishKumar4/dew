@@ -1,12 +1,18 @@
 # Decision inputs: layouts as segments, conditioning as streams
 
-Design record, 2026-10-23, approved (Main); seams agreed with ImperialGorilla.
+Design record, 2026-10-23.
 
 Built so far: the joint row's user turn as segments (`JointLayout.segments`: `Text`, `Media`, `State`,
 `Schema`); layouts and heads recorded by import path; and the schema's stream (`Schema.stream`): the
 schema read as the row's context, in a backbone pass of its own over the same weights, which the
-cross-attention reads and the head pools its questions and options from (§2, §3). Next: a stream for
-the other segments, and the per-question layouts as segment configurations. Owner: Training (`dew.decision`); cross-attention and `dew.inputs`' encoders: Models (ImperialGorilla).
+cross-attention reads and the head pools its questions and options from (§2, §3); and a lettered
+question row's question as its context (`Instructions.stream`, `OptionLines.stream`, both "context"
+together): the row holds the state and the answer cue, whose state reads the letters
+(`Labels`), the context the question and its lettered options, which the cross-attention reads and a
+head that pools option lines (`SlotReadout`) pools from; a label readout (`LabelReadout`) pools nothing.
+A question longer than the context its backbone reads is counted unfit, and a "none of the above" a
+read draws that would pass it is declined, as one past `max_len` is. Several such rows pack a window,
+each reading its own context. Next: a stream for the other segments. Owner: Training (`dew.decision`); cross-attention and `dew.inputs`' encoders: Models.
 
 ## Today
 

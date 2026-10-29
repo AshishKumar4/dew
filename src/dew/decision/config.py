@@ -32,8 +32,10 @@ from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.laya import LAYA
 from dew.decision.layout import (
     Framing,
+    Instructions,
     Labels,
     Layout,
+    OptionLines,
     QuestionLayout,
     RowOrder,
     RowSegment,
@@ -205,10 +207,11 @@ class DecisionRunConfig(DecoderRunConfig):
                    "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
                    "framing": self.framing, "segments": self.segments, "order": self.order,
                    "split": self.split}
-        in_context = any(isinstance(segment, Schema) and segment.stream == "context"
-                         for segment in self.segments or ())
+        # A schema, or a question's instructions and options, read as the row's context.
+        in_context = any(isinstance(segment, (Schema, Instructions, OptionLines))
+                         and segment.stream == "context" for segment in self.segments or ())
         if in_context and self.context_layers is None:
-            raise ValueError("a schema read as the row's context is read by context layers; set "
+            raise ValueError("a row whose questions are read as its context is read by context layers; set "
                              "--context-layers")
         if self.context_encoder != "table" and self.context_layers is None:
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")

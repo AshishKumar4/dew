@@ -513,9 +513,9 @@ class Plan:
             environment = {name: value for name, value in environment.items() if name != "modules"}
             saved_environment = {name: value for name, value in saved_environment.items()
                                  if name != "modules"}
+        # The plan's steps state what they compute (`Manifest.semantic`), so a resume of an unchanged plan
+        # and topology reads on under another Dew, a global order's or a share's, the change reported.
         changes = _changed(saved_environment, environment)
-        if changes and self.lowering == "per-share":
-            raise ValueError(f"saved per-share data environment changed: {', '.join(changes)}")
         if changes:
             _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
         if self.volatile:
