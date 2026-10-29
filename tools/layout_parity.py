@@ -1324,7 +1324,8 @@ def _floor_reference(model: str, case, reference, dtype: str, devices: int | Non
     reference past `rounding_limit` refuses, as does a floor past it (`widest_floor`)."""
     import benchmark_models as bench
 
-    key = (model, dtype, devices)
+    # The case as resolved, its mixture and objective among it, as `_initial` keys a reference.
+    key = (model, dtype, devices, repr(case))
     if key not in _floor_held:
         batch = bench.global_batch(case)
         ref_losses, ref_gradient, compiled = trained(reference, {}, batch, steps=1, one_device=True)
