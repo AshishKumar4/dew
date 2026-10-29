@@ -16,6 +16,7 @@ from fla_gdn_support import CONV_SHAPES
 from reference_error import (
     FACTOR,
     assert_as_exact,
+    assert_as_exact_as_the_reference,
     assert_rounds_where_the_reference_does,
     chain_roundings,
     distance,
