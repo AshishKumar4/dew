@@ -128,12 +128,13 @@ def placed(name: str, root: str) -> str | None:
     return relative
 
 
-PROBES = ((os, ("stat", "lstat", "access")), (os.path, ("exists", "lexists", "isfile", "isdir", "getsize")),
+PROBES = ((os, ("stat", "lstat", "access")),
+          (os.path, ("exists", "lexists", "isfile", "isdir", "getsize")),
           (pathlib.Path, ("exists", "is_file", "is_dir", "stat")))
 """The existence and size probes a run's record keeps as reads (`opening`), which raise no audit event:
-`os`'s stat calls, `os.path`'s (getmtime and islink among them, through os.stat) and `pathlib.Path`'s, which
-every test, collection, conftest, loader and followed child calls. A glob's wildcard parts list the directories
-they walk (`read`), so a file arriving where a glob looks changes a listing it keyed."""
+`os`'s stat calls, `os.path`'s (getmtime and islink among them, through os.stat) and `pathlib.Path`'s,
+which every test, collection, conftest, loader and followed child calls. A glob's wildcard parts list the
+directories they walk (`read`), so a file arriving where a glob looks changes a listing it keyed."""
 PROBED = "probe:"
 """What a probed path's name is recorded under: a probe's answer is whether the path is there and of
 what kind, and a file's size, so ci.py's `contents` keys a probed directory by its kind, not by the

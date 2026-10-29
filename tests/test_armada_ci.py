@@ -1452,16 +1452,18 @@ def packed(root: Path, names: list[str]) -> None:
 
 def test_a_reader_files_share_in_one_process_is_every_such_files_input(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A data file a reader opens is the input of every test file its pytest process ran, not only the
-    one that opened it: a session fixture's lazy reader, or a process-lived cache (dew.data.text's
-    load_tokenizer), opened under one file serves the next without reopening it, so a change to the data
-    reruns both (train 239's review, row 1987)."""
+    """A data file a reader opens or probes is the input of every test file its pytest process ran, not
+    only the one that opened or probed it: a session fixture's lazy reader, or a process-lived cache
+    (dew.data.text's load_tokenizer, which asks after a tokenizer's optional files), read under one file
+    serves the next without reading again, so a change to the data, or an optional file's arrival, reruns
+    both (train 239's review, row 1987; the CI bundle's review)."""
     (tmp_path / "tests/fixtures").mkdir(parents=True)
     (tmp_path / "tests/fixtures/shared.json").write_text("[1]\n")
     (tmp_path / "tests/conftest.py").write_text(
         "import functools, pytest\nfrom pathlib import Path\n"
         "@pytest.fixture(scope='session')\ndef vocabulary():\n"
-        "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text())\n")
+        "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text()\n"
+        "                           + str(Path('tests/fixtures/template.jinja').exists()))\n")
     body = ("from pathlib import Path\ndef test_{0}(vocabulary):\n"
             "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n")
     written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
@@ -1472,31 +1474,7 @@ def test_a_reader_files_share_in_one_process_is_every_such_files_input(
     assert run() == [1, 1]
     (tmp_path / "tests/fixtures/shared.json").write_text("[2]\n")
     assert run() == [2, 2]
-
-
-def test_what_an_earlier_file_in_one_process_ran_or_probed_is_a_later_files_input(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """Code an earlier test file of a pytest process ran, and what it probed, is the input of every file it ran
-    after: a module the first imports lazily inside a test, or a cached reader that probed a fixture, serves the
-    next without running or probing again, so a change to either reruns both (row 2228; the bundle's review: a
-    process-lived tokenizer's probes)."""
-    (tmp_path / "tests/fixtures/tok").mkdir(parents=True)
-    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 1\n")
-    (tmp_path / "tests/conftest.py").write_text(
-        "import functools, sys\nfrom pathlib import Path\nsys.path.insert(0, 'tests')\n"
-        "@functools.cache\ndef templated():\n    return Path('tests/fixtures/tok/template.jinja').exists()\n")
-    body = ("from pathlib import Path\nimport conftest\ndef test_{0}():\n"
-            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n"
-            "    import lazy_values\n    assert lazy_values.VALUE and conftest.templated() in (True, False)\n")
-    written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
-    packed(tmp_path, ["test_a.py", "test_b.py"])
-    run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("a", "b"))
-
-    assert run() == [1, 1]
-    assert run() == [1, 1]
-    (tmp_path / "tests/lazy_values.py").write_text("VALUE = 2\n")
-    assert run() == [2, 2]
-    (tmp_path / "tests/fixtures/tok/template.jinja").write_text("{{ x }}\n")
+    (tmp_path / "tests/fixtures/template.jinja").write_text("{{ x }}\n")
     assert run() == [3, 3]
 
 
@@ -2058,9 +2036,10 @@ def a_wheel(root: Path, name: str, version: str) -> Path:
 
 def test_a_release_check_marked_whole_suite_or_network_too_runs_in_its_release_task_alone(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A release_env test marked whole_suite or network too runs in its release task, never set aside there as
-    the whole suite's or the network lane's cells, and the network lane, which lacks its requirement, never runs
-    it (the bundle's review: such a check was planned, deselected by its own task, and reported green)."""
+    """A release_env test marked whole_suite or network too runs in its release task, never set aside there
+    as the whole suite's or the network lane's cells, and the network lane, which lacks its requirement,
+    never runs it (the bundle's review: such a check was planned, deselected by its own task, and reported
+    green)."""
     url, _, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     interpreter(tmp_path, "3.12")

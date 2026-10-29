@@ -818,6 +818,15 @@ def pytest_command(run: list[str], tests: list[str], split: str, release: str) -
             *command[1:]] if release else command
 
 
+def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool) -> list[dict]:
+    """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), said."""
+    rows = [found for name in tests if (found := reused(python, name, group, common, network))]
+    if rows:
+        print(f"{len(rows)} files ran green on these inputs on {device_class(network)}; "
+              "their rows are reused")
+    return rows
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "") -> int:
@@ -826,12 +835,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's."""
     began = time.monotonic()
     group = split or (f"{RELEASE}{release}" if release else "")
-    rows = [found for name in tests
-            if cache != "off" and not release and (found := reused(python, name, group, common, network))]
+    rows = [] if cache == "off" or release else reused_rows(python, tests, group, common, network)
     tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
-    if rows:
-        print(f"{len(rows)} files ran green on these inputs on {device_class(network)}; "
-              "their rows are reused")
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
@@ -1082,8 +1087,8 @@ def selected(command: list[str], network: bool, whole: bool = False, release: bo
     the whole suite's own run (`whole`: DEW_WHOLE_SUITE, every fifth publish's ci/full-whole-*), whatever
     the cache's policy: a policy-off train runs every file, never a whole-suite cell (Main, 2026-10-28:
     train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks
-    run in their own tasks alone (`release`), every one whatever else marks it, under a requirement the suite's
-    environment lacks (`release_plan`), and on no other run, the network lane's among them."""
+    run in their own tasks alone (`release`), every one whatever else marks it, under a requirement the
+    suite's environment lacks (`release_plan`), and on no other run, the network lane's among them."""
     at = command.index(session.SELECTION[1])
     if release:
         chosen = "release_env"
