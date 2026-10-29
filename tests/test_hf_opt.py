@@ -182,8 +182,9 @@ def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream
 
             def loss(shared):
                 logits, depth = outputs(shared)
-                return jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-                               + optax.softmax_cross_entropy_with_integer_labels(depth, targets))
+                # The depth scores one token fewer: each position's next but one.
+                return (jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
+                        + jnp.sum(optax.softmax_cross_entropy_with_integer_labels(depth, targets[:, 1:])))
             return outputs(shared), jax.grad(loss)(shared)
 
         def held(*inputs):
