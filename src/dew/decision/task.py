@@ -186,7 +186,6 @@ class DecideSettings:
     the choice existed embedded it by its token table."""
 
 
-@dataclass(frozen=True)
 def _calibrated(directory: str) -> tuple[Mapping[str, object], Weights] | None:
     """The calibration `Decide.save` wrote into the run in `directory` (`TASK_FILE`) and the weights it
     was fitted on; None where it wrote none."""
@@ -199,6 +198,7 @@ def _calibrated(directory: str) -> tuple[Mapping[str, object], Weights] | None:
     return settings, from_record(Weights, _records.json_value(settings["weights"], "weights"))
 
 
+@dataclass(frozen=True)
 class Decide(SavedRunTask):
     """Answers typed questions about a state, with one forward pass per batch.
 
