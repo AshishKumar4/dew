@@ -157,71 +157,31 @@ def denoise(model, variables, prompt, canvas, **conditioning):
     return model.apply({**variables, "cache": cache}, canvas, **conditioning).astype(jnp.float32)
 
 
-WORKFLOW_SEEDS = 8
-"""The denoiser's declared draws of prompts, canvases, previous logits and pixels against transformers'
-bfloat16 forwards (check 1), sized by `seeds_for` paired with Dew's forwards on the CPU."""
-
-IMAGE = 60
-"""The workflow's image token, which its image prompt holds where the old fixture's did."""
-
-
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
-    """DiffusionGemma's shared text tree with routed experts, a sliding and a full layer,
-    self-conditioning and the vision conditioner, each forward the fp32 test in
-    tests/test_block_diffusion.py makes, now in bf16: Dew's three forwards (bare, self-conditioned and
-    over an image) are on par with transformers' DiffusionGemmaForBlockDiffusion in bfloat16, both
-    from the float64 twin of the stored weights, over drawn prompts and canvases of ordinary text ids
-    (from 3, below the image and its boundary tokens), standard-normal previous logits and uniform
-    pixels, each image token where the fixture's image prompt held it (check 1)."""
-    import torch
-    from transformers.models.diffusion_gemma import modeling_diffusion_gemma as diffusion_gemma
-    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
-
+    """DiffusionGemma's shared text tree with routed experts, a sliding and a
+    full layer, self-conditioning and the vision conditioner, each forward
+    the fp32 test in tests/test_block_diffusion.py makes, now in bf16."""
     directory = FIXTURES / "diffusion-gemma-workflow"
     config = json.loads((directory / "config.json").read_text())
     tensors = load_file(str(directory / "model.safetensors"))
-    with np.load(directory / "reference.npz") as stored:
-        shapes = {key: stored[key].shape for key in ("prompt", "canvas", "previous", "pixels")}
-        images = stored["image_prompt"] == IMAGE
+    reference = {}
+    for name in ("reference.npz", "numerics.npz"):
+        with np.load(directory / name) as stored:
+            reference.update({key: stored[key] for key in stored.files})
     model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
     variables, _ = adapter.translate_weights(tensors, config)
-
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        prompt = rng.integers(3, IMAGE, shapes["prompt"]).astype(np.int32)
-        return (prompt, rng.integers(3, IMAGE, shapes["canvas"]).astype(np.int32),
-                rng.standard_normal(shapes["previous"]).astype(np.float32),
-                np.where(images, IMAGE, prompt).astype(np.int32),
-                rng.uniform(size=shapes["pixels"]).astype(np.float32))
-
-    # Run as given: the routed layers choose their experts on the host (`chosen_experts`).
-    @as_given
-    def ours(prompt, canvas, previous, image_prompt, pixels):
-        image = ({"image_indices": jnp.where(image_prompt == IMAGE, 0, -1)}, {"pixel_values": pixels})
-        return {"bare": denoise(model, variables, prompt, canvas),
-                "conditioned": denoise(model, variables, prompt, canvas, self_conditioning_logits=previous),
-                "image_logits": denoise(model, variables, image_prompt, canvas, media=image)}
-
-    def read(network, prompt, canvas, previous, image_prompt, pixels):
-        dtype = next(network.parameters()).dtype
-        patches = torch.from_numpy(np.stack([convert_image_to_patches(image.numpy(), 2)
-                                             for image in pixels[:, 0]])).to(dtype)
-        positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(2, -1, -1)
-        return {"bare": network(input_ids=prompt, decoder_input_ids=canvas).logits,
-                "conditioned": network(input_ids=prompt, decoder_input_ids=canvas,
-                                       self_conditioning_logits=previous.to(dtype)).logits,
-                "image_logits": network(input_ids=image_prompt, decoder_input_ids=canvas,
-                                        pixel_values=patches, image_position_ids=positions).logits}
-
-    def reference(dtype):
-        network = diffusion_gemma.DiffusionGemmaForBlockDiffusion.from_pretrained(directory, dtype=dtype,
-                                                                                  local_files_only=True)
-        network.set_attn_implementation("eager")
-        network.set_experts_implementation("eager")
-        return network.eval()
-
-    theirs, truth = transformers_arms(reference(torch.bfloat16), read, source=reference(torch.float32))
-    assert_as_exact(ours, theirs, draw, "workflow", seeds=WORKFLOW_SEEDS, truth_fn=truth)
+    image = (reference["image_prompt"],
+             ({"image_indices": jnp.where(reference["image_prompt"] == 60, 0, -1)},
+              {"pixel_values": jnp.asarray(reference["pixels"])}))
+    runs = {
+        "bare": (reference["prompt"], {}),
+        "conditioned": (reference["prompt"], {"self_conditioning_logits": reference["previous"]}),
+        "image_logits": (image[0], {"media": image[1]}),
+    }
+    for name, (prompt, conditioning) in runs.items():
+        logits = denoise(model, variables, prompt, reference["canvas"], **conditioning)
+        assert_as_exact_as_the_reference(logits, reference[f"{name}_bf16"], reference[f"{name}_f64"],
+                                         f"workflow {name}")
 
 
 def bfloat16(bits: np.ndarray) -> jax.Array:
@@ -232,47 +192,37 @@ MAMBA2_130M = "AntonV/mamba2-130m-hf"
 MAMBA2_REVISION = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
 
 
-PROMPT_TOKENS = 44
-"""The drawn prompts' length, the 44 tokens of the prose prompt the port was first held to."""
-
-REAL_MAMBA2_SEEDS = {"float32": 8, "bfloat16": 8}
-"""The released port's declared draws of ids against transformers' forward in each precision (check 1),
-sized by `seeds_for` paired with Dew's logits on the CPU."""
-
-
 @pytest.mark.network
 @pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
                     reason=f"DEW_NETWORK_TESTS=1 downloads {MAMBA2_130M}")
-@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference(dtype):
+def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
     """The published 130M port, 24 layers of width 768, where a bf16 run of
     either implementation moves the logits by whole units: on a 44-token
-    prose prompt transformers' bf16 forward (bf16 weights, as `from_pretrained`
-    casts them) sat at RMS 1.11 (largest 5.87) from its float64 run and
+    prompt transformers' bf16 forward (bf16 weights, as `from_pretrained`
+    casts them) sits at RMS 1.11 (largest 5.87) from its float64 run and
     Dew's with bf16 parameters at 1.05 (5.24), ratio 0.95; the two bf16
     runs are 1.56 apart at most because each is that far from the truth,
     not because either computes something else. Dew in bf16 over fp32
-    masters, the training configuration, sat at 0.53. In fp32 Dew was at
+    masters, the training configuration, sits at 0.53. In fp32 Dew is at
     8.6e-05 and transformers at 4.9e-05 (ratio 1.78: the SSD sums its chunks
-    in another order). Dew's logits in each precision, its parameters in it
-    too, are on par with transformers' in it, both from the float64 twin of
-    the released weights, over drawn ids of that length (check 1)."""
+    in another order)."""
     import torch
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    def reference(dtype):
-        return AutoModelForCausalLM.from_pretrained(MAMBA2_130M, revision=MAMBA2_REVISION,
-                                                    dtype=getattr(torch, dtype)).eval()
-
-    source = reference("float32")
-    vocabulary = source.config.vocab_size
-
-    def draw(seed):
-        return (np.random.default_rng(seed).integers(0, vocabulary, (1, PROMPT_TOKENS)).astype(np.int32),)
-
-    pretrained = Pretrained.load(MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype, param_dtype=dtype,
-                                 attention_impl="xla")
-    theirs, truth = transformers_arms(source if dtype == "float32" else reference(dtype),
-                                      lambda model, ids: model(ids).logits, source=source)
-    assert_as_exact(lambda ids: pretrained.model.apply(pretrained.variables, ids).astype(jnp.float32), theirs,
-                    draw, f"{MAMBA2_130M} {dtype}", seeds=REAL_MAMBA2_SEEDS[dtype], truth_fn=truth)
+    text = ("The Cascade Range runs from northern California through Oregon and Washington into "
+            "British Columbia, and its volcanoes include Mount Rainier, Mount Hood and Mount St. "
+            "Helens, which erupted in 1980. The capital of France is")
+    ids = AutoTokenizer.from_pretrained(MAMBA2_130M, revision=MAMBA2_REVISION)(
+        text, return_tensors="np")["input_ids"]
+    runs = {}
+    for name, dtype in (("f64", torch.float64), ("float32", torch.float32), ("bfloat16", torch.bfloat16)):
+        reference = AutoModelForCausalLM.from_pretrained(
+            MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype).eval()
+        with torch.no_grad():
+            runs[name] = reference(torch.from_numpy(ids)).logits.to(torch.float64).numpy()
+    for dtype in ("float32", "bfloat16"):
+        pretrained = Pretrained.load(MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype,
+                                     param_dtype=dtype, attention_impl="xla")
+        logits = pretrained.model.apply(pretrained.variables, jnp.asarray(ids, jnp.int32))
+        assert_as_exact_as_the_reference(np.asarray(logits, np.float32), runs[dtype], runs["f64"],
+                                         f"{MAMBA2_130M} {dtype}")

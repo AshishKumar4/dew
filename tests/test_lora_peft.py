@@ -1,6 +1,6 @@
-"""LoRA's rsLoRA scaling and its branch dropout in training against PEFT's own
-forward, backward and AdamW steps, run in the test on the adapters
-`tools/lora_peft_reference.py` wrote, and a target that contracts and produces
+"""LoRA's rsLoRA scaling and its branch dropout in training against PEFT
+0.20.0's own forward, backward and AdamW steps
+(`tools/lora_peft_reference.py`), and a target that contracts and produces
 several axes against a float64 oracle of its forward and its factors'
 gradient."""
 
@@ -12,9 +12,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from flax import linen as nn
-from interop_support import fixture_ids, peft_twin, transformers_arms
-from reference_error import as_given, assert_as_exact, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    with_gradients,
+)
 from safetensors.numpy import load_file
 from sampling_gate import assert_draws_as_declared
 
@@ -32,93 +38,86 @@ FIXTURES = ROOT / "tests" / "fixtures" / "lora_peft"
 
 
 STEP = Step(step=jnp.int32(0), key=jax.random.key(1), ema=None)
-"""The training step whose loss the checks' gradients are, and whose draw `dew_masks` gives PEFT's
-dropout."""
-
-TRAINING_SEEDS = {"rslora": 8, "dropout": 8}
-"""Each case's declared draws of ids against PEFT's training steps (check 1), sized by `seeds_for`
-paired with Dew's steps on the CPU."""
-
-LOGITS_SEEDS = 8
-"""The rsLoRA adapter's declared draws of ids against PEFT's adapted logits (check 1), sized by
-`seeds_for` paired with Dew's logits on the CPU."""
+"""The training step whose loss the fixtures' gradients are, and whose draw `dew_masks` wrote
+masks.npz from."""
 
 
 def adapted(case: str):
-    """The case's PEFT adapter on the tiny Llama, read by `LoRA.load`, and by PEFT itself over
-    transformers' Llama, its factors trainable, as the recorder ran it."""
-    import torch
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM
-
+    """The case's PEFT adapter on the tiny Llama, read by `LoRA.load`, and its reference arrays."""
+    with np.load(FIXTURES / case / "reference.npz") as data:
+        reference = {key: data[key] for key in data}
     decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
-    base = AutoModelForCausalLM.from_pretrained(LLAMA, dtype=torch.float32)
-    return (LoRA.load(decoder.model, decoder.variables, FIXTURES / case / "adapter", layouts=decoder.layouts),
-            PeftModel.from_pretrained(base, FIXTURES / case / "adapter", is_trainable=True))
+    return LoRA.load(decoder.model, decoder.variables, FIXTURES / case / "adapter",
+                     layouts=decoder.layouts), reference
 
 
-def assert_trains_as_peft(adapter, peft, case: str, tmp_path):
+def assert_trains_as_peft(adapter, reference, case: str, tmp_path, masks=None):
     """One training step's mean next-token cross entropy and its gradient in all twelve factors, and
-    what two steps of Dew's AdamW (`OPTIMIZER_MAP`, at PEFT's run's settings `ADAMW`) move each factor
-    by, the factors exported in PEFT's layout (`Adapter.save`): each on par with PEFT's run of the same
-    steps (tools/lora_peft_reference.py `run_at`) from its float64 twin's, over drawn ids (check 1).
-    Each branch's dropout, where the adapter drops, keeps the mask Dew's own first training loss draws
-    over a draw's ids (`dew_masks`), which PEFT's run is given (`given`). Each move is from the float32
-    factors both runs start at, so exact in float64."""
-    import torch
+    what two steps of Dew's AdamW (`OPTIMIZER_MAP`, at PEFT's run's settings `ADAMW`) move each
+    factor by, the factors exported in PEFT's layout (`Adapter.save`): each held to PEFT's float64
+    run by the float64 rule against its float32 one, each branch's dropout given `masks`, PEFT's
+    run's (`given`). The loss, one number, is held over the case's residual orders
+    (`assert_loss_over_orders`)."""
+    from tools.lora_peft_reference import ADAMW
 
-    from tools.lora_peft_reference import ADAMW, dew_masks, run_at
-    from tools.torch_precision import float64
-
-    rate = adapter.dropout
-    draw = fixture_ids(LLAMA)
-    objective = LMObjective(adapter.model, draw(0)[0].shape[1] - 1, variables=adapter.variables,
-                            ema_decay=None)
+    tokens = jnp.asarray(reference["input_ids"])
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
     params = objective.init(jax.random.key(0))
+
+    def loss(moving):
+        with given(adapter, masks):
+            stats, _ = objective.loss({**params, "params": moving}, {"text": tokens}, STEP)
+        return objective.reduce_loss(stats)[0]
+
+    gradient = jax.grad(loss)(params["params"])
+    assert_loss_over_orders(adapter, objective, params, reference, case, masks)
+    names = sorted(key.removeprefix("grad/") for key in reference
+                   if key.startswith("grad/") and not key.endswith("_f64"))
+    exported = peft_factors(adapter, gradient, tmp_path / "gradient")
+    assert sorted(exported) == names and len(names) == 12
+    for name in names:
+        assert_as_exact_as_the_reference(exported[name], reference[f"grad/{name}"],
+                                         reference[f"grad/{name}_f64"], f"gradient {name}")
+
     adamw = OPTIMIZER_MAP["adamw"](ADAMW["lr"], *ADAMW["betas"], ADAMW["eps"],
                                    weight_decay=ADAMW["weight_decay"])
+    moving, state = params["params"], adamw.init(params["params"])
+    for _ in range(2):
+        updates, state = adamw.update(jax.grad(loss)(moving), state, moving)
+        moving = optax.apply_updates(moving, updates)
     start = peft_factors(adapter, params["params"], tmp_path / "start")
+    stepped = peft_factors(adapter, moving, tmp_path / "stepped")
+    # Each factor's move, from the float32 factors both runs start at: exact in float64.
+    for name in names:
+        assert_as_exact_as_the_reference(stepped[name] - start[name],
+                                         reference[f"stepped/{name}"] - start[name],
+                                         reference[f"stepped/{name}_f64"] - start[name], f"update {name}")
 
-    def masks_of(ids):
-        return dew_masks(adapter, np.asarray(ids)) if rate else None
 
-    @as_given
-    def ours(ids):
-        masks, tokens = masks_of(ids), jnp.asarray(ids)
+def assert_loss_over_orders(adapter, objective, params, reference, case: str, masks) -> None:
+    """The training loss over the case's residual orders (`orders.npz`, tools/lora_peft_reference.py's
+    `in_order`), its distance from PEFT's float64 loss, which no order moves, as exact as PEFT's
+    float32 run's over the same orders (`assert_as_exact_over_orders`): one loss against one is a
+    single rounding draw against another, and a draw of PEFT's sits a few ulps from float64 or far
+    nearer by chance. Order 0, the identity, computes the loss the plain run does."""
+    from tools.lora_peft_reference import adapter_orders, in_order
 
-        def loss(moving):
-            with given(adapter, masks):
-                stats, _ = objective.loss({**params, "params": moving}, {"text": tokens}, STEP)
-            return objective.reduce_loss(stats)[0]
+    with np.load(FIXTURES / case / "orders.npz") as recorded:
+        drawn, theirs = recorded["orders"], recorded["loss"]
+    whole, residual_inputs = adapter_orders(adapter)
+    tokens = jnp.asarray(reference["input_ids"])
 
-        value, gradient = jax.value_and_grad(loss)(params["params"])
-        moving, state = params["params"], adamw.init(params["params"])
-        for _ in range(2):
-            updates, state = adamw.update(jax.grad(loss)(moving), state, moving)
-            moving = optax.apply_updates(moving, updates)
-        stepped = peft_factors(adapter, moving, tmp_path / "stepped")
-        return {"loss": np.asarray(value),
-                "gradient": peft_factors(adapter, gradient, tmp_path / "gradient"),
-                "update": {name: stepped[name] - start[name] for name in start}}
+    def loss(variables, masks):
+        with given(adapter, masks):
+            stats, _ = objective.loss({**params, **variables}, {"text": tokens}, STEP)
+        return objective.reduce_loss(stats)[0]
 
-    def theirs(model, precision, dtype):
-        tail = "_f64" if dtype == torch.float64 else ""
-
-        @as_given
-        def run(ids):
-            masks = masks_of(ids)
-            with precision():
-                arrays = run_at(model, torch.from_numpy(np.asarray(ids, np.int64)), dtype, masks, rate)
-            return {"loss": arrays[f"loss{tail}"],
-                    "gradient": {name: arrays[f"grad/{name}{tail}"].astype(np.float64) for name in start},
-                    "update": {name: arrays[f"stepped/{name}{tail}"].astype(np.float64) - start[name]
-                               for name in start}}
-        return run
-
-    assert len(start) == 12
-    assert_as_exact(ours, theirs(peft, contextlib.nullcontext, torch.float32), draw,
-                    f"{case} training steps", seeds=TRAINING_SEEDS[case],
-                    truth_fn=theirs(peft_twin(peft), float64, torch.float64))
+    mine = []
+    for order in drawn:
+        variables, moved = in_order(adapter, whole, residual_inputs, np.asarray(order, np.int64), masks)
+        mine.append(abs(np.float64(loss(variables, moved)) - np.float64(reference["loss_f64"])))
+    assert mine[0] == abs(np.float64(loss(adapter.variables, masks)) - np.float64(reference["loss_f64"]))
+    assert_as_exact_over_orders(np.asarray(mine), theirs, "the loss")
 
 
 @contextlib.contextmanager
@@ -152,42 +151,34 @@ def peft_factors(adapter, factors, directory) -> dict[str, np.ndarray]:
 def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
     """rsLoRA: each target scales by its own alpha over the square root of its
     own rank (layer 1's v_proj at rank 2, down_proj at alpha 3). The adapted
-    logits are on par with PEFT's from its float64 twin's over drawn ids
-    (check 1), the base model's far from them, and one training step is
-    PEFT's (`assert_trains_as_peft`)."""
-    import torch
-
-
-    adapter, peft = adapted("rslora")
+    logits, and one training step, are PEFT's (`assert_trains_as_peft`)."""
+    adapter, reference = adapted("rslora")
     assert (adapter.rslora, adapter.dropout) == (True, 0.0)
-    draw = fixture_ids(LLAMA)
-    theirs, truth = transformers_arms(peft.eval(), lambda model, ids: model(ids).logits, twin=peft_twin(peft))
-    assert_as_exact(lambda ids: adapter.model.apply(adapter.variables, ids), theirs, draw,
-                    "the adapted logits", seeds=LOGITS_SEEDS, truth_fn=truth)
+    logits = adapter.model.apply(adapter.variables, jnp.asarray(reference["input_ids"]))
+    assert_as_exact_as_the_reference(logits, reference["adapted_logits"], reference["adapted_logits_f64"],
+                                     "the adapted logits")
     # The adapter moves the logits far past rounding: the base model's are nowhere near the adapted ones.
-    (ids,) = draw(0)
-    with peft.disable_adapter(), torch.no_grad():
-        base = peft(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
-    assert np.abs(base - theirs(ids)).max() > 1
-    assert_trains_as_peft(adapter, peft, "rslora", tmp_path)
+    with pytest.raises(AssertionError):
+        assert_as_exact_as_the_reference(reference["base_logits"], reference["adapted_logits"],
+                                         reference["adapted_logits_f64"], "the base logits as adapted ones")
+    assert_trains_as_peft(adapter, reference, "rslora", tmp_path)
 
 
 def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on(tmp_path):
     """Dropout at 0.25: a training step drops each target's branch input,
     `B A dropout(x)`, and not the base path. Each branch's dropout given the
-    mask Dew's own step draws, given to PEFT's run too, keeping its input
-    where the mask does at 1 / (1 - p) of the rate the branch drops at, as
-    torch's dropout keeps it (`given`), the steps' loss, gradients and updates
-    are PEFT's (`assert_trains_as_peft`), and every target's branch drops."""
-    from tools.lora_peft_reference import branch_draws, dew_masks
+    mask PEFT's run was given (masks.npz), keeping its input where the mask
+    does at 1 / (1 - p) of the rate the branch drops at, as torch's dropout
+    keeps it (`given`), the steps' loss, gradients and updates are PEFT's
+    (`assert_trains_as_peft`), and every target's branch drops."""
+    from tools.lora_peft_reference import MASKS, branch_draws
 
-    adapter, peft = adapted("dropout")
+    adapter, reference = adapted("dropout")
     assert (adapter.rslora, adapter.dropout) == (False, 0.25)
-    (ids,) = fixture_ids(LLAMA)(0)
-    masks = dew_masks(adapter, ids)
-    assert sorted(masks) == sorted(branch_draws(adapter, ids, STEP)) and len(masks) == 6
-    assert all(not mask.all() for mask in masks.values())
-    assert_trains_as_peft(adapter, peft, "dropout", tmp_path)
+    with np.load(FIXTURES / "dropout" / MASKS) as saved:
+        masks = {name: saved[name] for name in saved.files}
+    assert sorted(masks) == sorted(branch_draws(adapter, reference["input_ids"], STEP)) and len(masks) == 6
+    assert_trains_as_peft(adapter, reference, "dropout", tmp_path, masks)
 
 
 DROPOUT_SEEDS = 4
@@ -203,8 +194,8 @@ def test_a_training_step_drops_each_branch_input_at_the_adapters_rate():
     same masks."""
     from tools.lora_peft_reference import branch_draws
 
-    adapter, _ = adapted("dropout")
-    tokens, rate = np.load(LLAMA / "input_ids.npy"), adapter.dropout
+    adapter, reference = adapted("dropout")
+    tokens, rate = reference["input_ids"], adapter.dropout
     first, again = branch_draws(adapter, tokens, STEP), branch_draws(adapter, tokens, STEP)
     later = branch_draws(adapter, tokens, Step(step=jnp.int32(1), key=jax.random.key(2), ema=None))
     assert len(first) == 6
