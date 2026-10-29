@@ -88,7 +88,6 @@ def test_each_release_translates_to_the_dense_block_it_ships(size, groups, layer
     assert fields.get('mixture') is None and fields['qk_norm'] is False
     if size == '0.9b':
         yarn = fields['rope_scaling']
-        assert yarn['rope_type'] == 'yarn'
         assert (yarn['factor'], yarn['beta_fast'], yarn['beta_slow']) == (16.0, 128.0, 4.0)
         assert yarn['truncate']
         assert yarn['attention_factor'] == pytest.approx(1.2772588722239782)

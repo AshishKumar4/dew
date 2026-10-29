@@ -233,6 +233,13 @@ class MixerBase:
         (`dew.nn.protocols.Generating`): by default nothing refuses it."""
         return None
 
+    @property
+    def reads_blocks(self) -> bool:
+        """Whether the mixer this kind builds reads each block of a call's `block_groups` whole
+        (`dew.nn.protocols.BlockReading`): a prefix run's or a batch's blocks train only through such a
+        layer. By default it reads none."""
+        return False
+
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         """The block's mixer factory for this value at this layer's geometry."""
         raise NotImplementedError(

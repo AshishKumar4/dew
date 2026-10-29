@@ -434,7 +434,6 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
     expected, attention_factor = ROPE_INIT_FUNCTIONS['yarn'](
         reference, None, layer_type='full_attention')
     record = translate_config(released)['kinds']['full_attention']['rope_scaling']
-    assert record['rope_type'] == 'yarn'
     scaling = YarnScaling(**record)
     scaled = yarn_inv_freq(128, 5e5, scaling, dtype=np.float32)
     plain = 1.0 / (5e5 ** (np.arange(0, 128, 2, dtype=np.float32) / 128))

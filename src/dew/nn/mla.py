@@ -34,18 +34,25 @@ from dew.nn.attention import (
     kernel_for_materialized_mask,
     max_attention_logits,
     scaled_dot_product_attention,
-    visibility_mask,
 )
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
-from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, document_reach
+from dew.nn.inputs import (
+    PLAIN_CALL,
+    MixerCall,
+    PredictionPhase,
+    coordinates_of,
+    counted_places,
+    document_reach,
+)
 from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mixers.attention import call_visibility, dense_visibility, group_fields
 from dew.nn.precision import (
     at_least_fp32,
     compensated_add,
@@ -354,8 +361,11 @@ class MultiHeadLatentAttention(nn.Module):
     index_shared: bool = False
     sliding_window: int | None = None
     """A dense layer's window: each query sees the keys within this many of its place, itself included,
-    counting its document's real tokens (`dew.nn.attention.visibility_mask`). An indexed layer's
-    candidates take no window."""
+    counting its document's real tokens (`dew.nn.attention.visibility_mask`); a non-causal layer windows
+    only under `bidirectional_window`. An indexed layer's candidates take no window."""
+    bidirectional_window: bool = False
+    """Whether a non-causal layer keeps its window on both sides of a query (the layer context's flag of
+    the name); otherwise it reads its whole row."""
     attention_chunk: int | None = None
     """A dense layer's chunk: each query sees the keys in its own chunk of this many places
     (`dew.nn.attention.chunk_mask`), as Llama 4's chunked layers do."""
@@ -595,7 +605,7 @@ class MultiHeadLatentAttention(nn.Module):
         # since the widths add up exactly.
         q_pass, q_rot = jnp.split(
             queries, [self.qk_nope_head_dim], axis=-1)
-        query_basis = None
+        query_basis, own = None, False
         if decode:
             q_rot, key, value, mask, query_basis = self._decode_step(
                 x, q_rot, rot, latent, q_resid, logical_positions, valid, call, prediction_phase)
@@ -609,8 +619,12 @@ class MultiHeadLatentAttention(nn.Module):
             reach = (document_reach(segment_ids, valid, positions)
                      if isinstance(self.rope_scaling, LongRopeScaling) and segment_ids is not None else None)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions, reach)
-            visible = self._dense_visibility(attention_metadata, positions, segment_ids, valid, causal,
-                                             batch, length)
+            # Windows, chunks and groups count each document's real tokens from its first place
+            # (`counted_places`); rotation reads the places as given.
+            counted = (jnp.broadcast_to(positions, (batch, length)) if logical_positions is None
+                       else counted_places(segment_ids, valid, logical_positions))
+            visible, own = self._dense_visibility(attention_metadata, positions, counted, segment_ids, valid,
+                                                  causal, batch, length)
             if visible is not None:
                 mask, causal = visible, False
             elif segment_ids is not None:
@@ -652,7 +666,8 @@ class MultiHeadLatentAttention(nn.Module):
                         and self.is_mutable_collection(INDEXER_COLLECTION)):
                     objective = (index_scores, keep)
             key, value = self._expand(latent, rot)
-        if valid is not None:
+        if valid is not None and not own:
+            # A call's own pairwise mask or key runs replace its validity, as the shared core's do.
             queries_valid = jnp.asarray(valid, bool)[:, None, :, None]
             mask = queries_valid if mask is None else mask & queries_valid
             if not decode:
@@ -678,36 +693,30 @@ class MultiHeadLatentAttention(nn.Module):
         return self._attend(query, key, value, x, mask, implementation, causal=causal, bias=bias,
                             unselected=unselected, force_fp32_for_softmax=self.force_fp32_for_softmax)
 
-    def _dense_visibility(self, metadata, positions, segment_ids, valid, causal: bool, batch: int,
-                          length: int) -> jax.Array | None:
-        """An uncached dense call's visibility `[B, 1, Q, K]` as the shared attention core reads it
-        (`AttentionMixer._masking`), None where its causality and documents alone give it: its own
-        pairwise mask, else its key runs, replace its causality, documents, groups and validity, a
-        windowed layer windowing them over the key positions the call gives (the runs' queries read at
-        them too, the call's own tokens); else its documents, causality, groups and real keys, within
-        its window over its tokens' places `positions`. Its chunk keeps each query, at its own place, to
-        the keys of its chunk."""
-        pairwise, runs, key_positions = ((None,) * 3 if metadata is None else
-                                         (metadata.pairwise_mask, metadata.key_runs, metadata.key_positions))
+    def _dense_visibility(self, metadata, positions, places, segment_ids, valid, causal: bool, batch: int,
+                          length: int) -> tuple[jax.Array | None, bool]:
+        """An uncached dense call's visibility `[B, 1, Q, K]` as the shared attention core resolves it
+        (`call_visibility`, `dense_visibility`), None where its causality and documents alone give it, and
+        whether the call's own pairwise mask or key runs replaced its causality, documents, groups and
+        validity. `positions` are its tokens' rotary places, which a call's own visibility reads, and
+        `places` their places counted over their documents' real tokens, which the window, the chunk and
+        the groups read."""
+        own = None if metadata is None else call_visibility(
+            metadata, positions, batch=batch, queries=length, keys=length, key_places=places,
+            sliding_window=self.sliding_window)
         groups = {name: jnp.asarray(getattr(metadata, name), jnp.int32) for name in self._group_fields()
                   if metadata is not None and getattr(metadata, name) is not None}
-        own = pairwise is not None or runs is not None
-        if not (own or groups or self.sliding_window is not None or self.attention_chunk is not None):
-            return None
-        places = jnp.broadcast_to(positions, (batch, length))
-        key_places = places if not own or key_positions is None else jnp.asarray(key_positions)
-        runs = None if pairwise is not None or runs is None else jnp.asarray(runs)
-        mask = visibility_mask(
-            length, length, causal and not own,
-            self.sliding_window if not own or key_positions is not None else None,
-            None if pairwise is None else jnp.asarray(pairwise, bool)[:, None],
-            None if own else segment_ids, key_valid=None if own else valid,
-            block_groups=None if own else groups.get("block_groups"),
-            image_groups=None if own else groups.get("image_groups"), key_runs=runs,
-            places=(key_places if runs is not None else places, key_places))
-        if self.attention_chunk is not None:
-            mask = mask & chunk_mask(places, key_places, self.attention_chunk)
-        return mask
+        window = self.sliding_window if causal or self.bidirectional_window else None
+        if own is None and not (groups or window is not None or self.attention_chunk is not None):
+            return None, False
+        if own is not None:
+            mask, runs, window, key_places = own
+            causal, segment_ids, groups, valid = False, None, {}, None
+        else:
+            mask = runs = None
+            key_places = places
+        return dense_visibility(mask, segment_ids, causal, window, valid, runs, places, key_places, length,
+                                length, self.attention_chunk, **groups), own is not None
 
     def _check_call(self, call: MixerCall, batch: int, length: int) -> None:
         metadata = call.metadata
@@ -733,11 +742,8 @@ class MultiHeadLatentAttention(nn.Module):
                              "the call's own")
 
     def _group_fields(self) -> tuple[str, ...]:
-        """The `AttentionMetadata` group fields a causal layer reads whole (the standard attention's
-        `_group_fields`)."""
-        return tuple(name for name, reads in (("image_groups", self.bidirectional_images),
-                                              ("block_groups", self.bidirectional_blocks))
-                     if reads and self.causal)
+        """The `AttentionMetadata` group fields the layer reads whole (`group_fields`)."""
+        return group_fields(self.causal, images=self.bidirectional_images, blocks=self.bidirectional_blocks)
 
     def _index_keys(self, x, valid):
         return self.indexer.keys(x)
@@ -978,6 +984,10 @@ class MLAMixer(MixerBase):
         return self.index_n_heads is not None
 
     @property
+    def reads_blocks(self) -> bool:
+        return self.bidirectional_blocks
+
+    @property
     def sparse(self) -> bool:
         """Whether the indexer selects the keys each query attends."""
         return self.index_topk is not None
@@ -1015,6 +1025,7 @@ class MLAMixer(MixerBase):
             index_rope_interleave=self.index_rope_interleave,
             index_shared=ctx.kv_shared,
             sliding_window=ctx.sliding_window,
+            bidirectional_window=ctx.bidirectional_window,
             attention_chunk=ctx.attention_chunk,
             bidirectional_blocks=self.bidirectional_blocks,
             bidirectional_images=self.bidirectional_images,
