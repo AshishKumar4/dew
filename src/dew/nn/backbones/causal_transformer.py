@@ -1385,7 +1385,7 @@ class CausalTransformer(nn.Module):
                                         positions=positions)
         documents, given, given_valid = ((None, None, None) if coordinates is None else
                                          (coordinates.segments, coordinates.positions, coordinates.valid))
-        embeds = self._prepared(self.token_embeddings(tokens), input_embeddings)
+        embeds = self._prepared(self.stream_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
         # and no validity says that: an all-true array would make the depth
@@ -1442,7 +1442,7 @@ class CausalTransformer(nn.Module):
             raise ValueError("prediction_phase must be ordinary, extend or draft")
         if depth < 0 or depth >= len(self.mtp):
             raise ValueError("prediction depth is outside the model's configured depths")
-        embeds = self.token_embeddings(tokens) if input_embeddings is None else input_embeddings
+        embeds = self.stream_embeddings(tokens) if input_embeddings is None else input_embeddings
         state, prediction = self.mtp[depth].states(
             hidden, embeds, decode=decode,
             prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
@@ -1462,6 +1462,14 @@ class CausalTransformer(nn.Module):
         for token_id in self.embedding_zero_ids:
             lookup = jnp.where(tokens == token_id, 0, lookup)
         return self.embed_tokens(lookup)
+
+    def stream_embeddings(self, tokens):
+        """Each token's row of the table at the stream's width, unscaled and without positions: the
+        embeddings a prediction depth pairs with `tokens` and a context's tokens as a cross-attention
+        reads them by the table (`encode_context`), `token_embeddings` through `project_in` where the
+        embedding has a width of its own (`embedding_features`)."""
+        looked = self.token_embeddings(tokens)
+        return looked if self.embedding_features is None else self.project_in(looked)
 
     def scaled_embeddings(self, x):
         """Return the token embeddings `x` scaled the way the first layer reads them.
@@ -1681,9 +1689,7 @@ class CausalTransformer(nn.Module):
         # replacements in place, which token ids cannot rebuild. Sowing costs
         # nothing unless a caller opens the collection; init leaves it out.
         if not self.is_initializing():
-            looked = self.token_embeddings(tokens)
-            looked = looked if self.embedding_features is None else self.project_in(looked)
-            prepared = self._prepared(looked, input_embeddings)
+            prepared = self._prepared(self.stream_embeddings(tokens), input_embeddings)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self._layer_inputs(tokens, x, routed_experts, routed)

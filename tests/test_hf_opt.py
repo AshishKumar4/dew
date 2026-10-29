@@ -93,8 +93,7 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
     """Past an embedding's own width the head's vocabulary rows are given in the stream's coordinates,
     through `project_out`: the final states times those rows are the logits, bit for bit in float64 on
     integer-valued weights. A decoder that ends in no final norm still norms its loop's passes, so its
-    passes differ from a loop that norms none, and a prediction depth, which reads the token embedding
-    at the stream's width, is refused."""
+    passes differ from a loop that norms none."""
     import jax
     import jax.numpy as jnp
 
@@ -121,5 +120,82 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
     plain = base.clone(**{**looped, "loop": Loop(2, layers=(0, 2), step_norm=False)})
     params = normed.init(jax.random.key(1), ids)
     assert not np.array_equal(np.asarray(normed.apply(params, ids)), np.asarray(plain.apply(params, ids)))
-    with pytest.raises(ValueError):
-        base.clone(embedding_features=4, num_nextn_predict_layers=1).init(jax.random.key(1), ids)
+
+
+PROJECTED_TWIN_SEEDS = 16
+"""The draws a projected decoder's depth and context are held to its stream-width twin over (check 1)."""
+
+
+def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream_embedding():
+    """A decoder whose embedding has a width of its own (`embedding_features`), with a prediction depth and
+    a cross-attention layer reading a context by the table, pairs its depth with and encodes its context
+    by the token embedding at the stream's width (`stream_embeddings`, through `project_in`): its trunk's
+    and its depth's logits over a context, and their loss's gradient in its layers', depth's and
+    cross-attention's parameters, are on par with those of its twin at the stream's width, whose table is
+    the projected one and whose untied head is `project_out` and the table together (check 1, the twin
+    in float64 the truth)."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from reference_error import as_given
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.cross_attention import CrossAttention, encode_context
+
+    shape = {"vocab_size": 61, "emb_features": 16, "num_layers": 2, "num_heads": 2, "mlp_features": 32,
+             "max_seq_len": 8, "attention_impl": "reference", "num_nextn_predict_layers": 1,
+             "cross_attention": CrossAttention((1,), 4)}
+    projected = CausalTransformer(**shape, embedding_features=8)
+    twin = CausalTransformer(**shape, tie_embeddings=False)
+    stream = ("embed_tokens", "project_in", "project_out")
+
+    def twinned(params):
+        table = params["embed_tokens"]["embedding"]
+        held = {name: value for name, value in params.items() if name not in stream}
+        return {**held, "embed_tokens": {"embedding": table @ params["project_in"]["kernel"]},
+                "lm_head": {"kernel": params["project_out"]["kernel"] @ table.T}}
+
+    def draw(seed):
+        rng = np.random.default_rng([2409, seed])
+        ids = rng.integers(0, 61, (2, 6)).astype(np.int32)
+        params = projected.init(jax.random.key(seed), ids)["params"]
+        # The gates drawn away from zero, so the context reaches the states.
+        params = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (rng.uniform(-1, 1, leaf.shape).astype(np.float32)
+                                if path[-1].key.startswith("alpha_") else leaf), params)
+        return params, ids, rng.integers(0, 61, (2, 4)).astype(np.int32), rng.integers(0, 61, (2, 6))
+
+    def scored(model, convert):
+        def run(params, ids, context, targets):
+            whole = convert(params)
+            shared = {name: value for name, value in whole.items() if name not in (*stream, "lm_head")}
+
+            def outputs(shared):
+                variables = {"params": {**whole, **shared}}
+                conditioning = encode_context(model, variables, context, jnp.full((2,), 4, jnp.int32),
+                                              encoder="table")
+                hidden, prediction = model.apply(variables, ids, conditioning=conditioning,
+                                                 method="hidden_and_mtp_inputs")
+                (depth,) = model.apply(variables, prediction, ids, conditioning=conditioning,
+                                       method="mtp_logits")
+                return model.apply(variables, hidden, method="logits_from_hidden"), depth
+
+            def loss(shared):
+                logits, depth = outputs(shared)
+                return jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+                               + optax.softmax_cross_entropy_with_integer_labels(depth, targets))
+            return outputs(shared), jax.grad(loss)(shared)
+
+        def held(*inputs):
+            with jax.default_matmul_precision("highest"):
+                return run(*inputs)
+        return held
+
+    @as_given
+    def truth(params, ids, context, targets):
+        with jax.enable_x64(new_val=True):
+            wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
+            return jax.device_get(scored(twin.clone(dtype=jnp.float64), twinned)(wide, ids, context, targets))
+
+    assert_as_exact(jax.jit(scored(projected, lambda params: params)), jax.jit(scored(twin, twinned)), draw,
+                    "projected depth and context", seeds=PROJECTED_TWIN_SEEDS, truth_fn=truth)

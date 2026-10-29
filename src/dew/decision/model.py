@@ -72,7 +72,7 @@ class DecisionModel(HeadedModel):
         `media` are the backbone's own inputs for images a request's one row
         holds (`Images.inputs`), with which it reads them. Rows that carry a
         context (`DecisionInputs.context`) hand the backbone's cross-attention
-        each row's context, embedded by the backbone's own table (`token_embeddings`),
+        each row's context, embedded by the backbone's own table (`stream_embeddings`),
         or, where the context holds the schema (`DecisionInputs.spans_in_context`),
         the backbone's own final states over it (`encode_context`).
         """

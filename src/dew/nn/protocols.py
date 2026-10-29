@@ -652,9 +652,10 @@ class CrossAttending(Protocol):
         of `context_lengths` tokens."""
         ...
 
-    def token_embeddings(self, tokens: jax.Array) -> jax.Array:
-        """Each token's row of the model's own table, unscaled and without positions: a context's
-        tokens as a cross-attention reads them by the table (`dew.nn.cross_attention.encode_context`)."""
+    def stream_embeddings(self, tokens: jax.Array) -> jax.Array:
+        """Each token's row of the model's own table at its stream's width, unscaled and without
+        positions: a context's tokens as a cross-attention reads them by the table
+        (`dew.nn.cross_attention.encode_context`)."""
         ...
 
     def with_cross_attention(self, cross: CrossBlocks | None) -> Self: ...
