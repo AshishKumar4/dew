@@ -119,19 +119,28 @@ LMRunConfig.cli(["--pretrained", "local/llama", "--tokenizer", "local/llama", "-
 """A recorded LM run from a Hub backbone, through the command line, in a process of its own, which reads
 `HF_ENDPOINT` as it imports the Hub client: the token files and the runs' root."""
 
-PINNED_DECISION = """
+TRAIN_DECISION = """
+import sys
+from dew.data import Files, Loading
+from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
 
-print(DecisionRunConfig(pretrained="local/llama").pinned().revision)
+table, root = sys.argv[1:3]
+rows = Files(table, format="csv").pipe(decisions, question="team").read("memory").batch(4)
+DecisionRunConfig.cli(["--pretrained", "local/chat", "--trainer.name", "run",
+                       "--trainer.checkpoint-dir", root, "--trainer.steps", "1", "--trainer.compilation-cache-dir", "None",
+                       "--trainer.multi-host", "False", "--trainer.eval-every", "None",
+                       "--trainer.checkpoint-every", "1", "--model.dtype", "float32", "--calibrate", "False"],
+                      default=DecisionRunConfig(data=rows.loading(Loading(workers=0)))).run()
 """
-"""A decision run's pinned backbone revision, in a process of its own."""
+"""A recorded decision run over a Hub backbone, through the command line, in a process of its own: the
+rows' table and the runs' root."""
 
 
 def test_a_run_records_its_hub_backbone_at_its_commit_online_and_from_the_cache_offline(tmp_path):
     """An LM run whose `--pretrained` names a Hub repo alone, run from the command line, writes the
     commit the Hub serves into its run.json; with the Hub gone and none of Dew's recorded answers, the
-    same command reads the Hub cache's ref the online run wrote and records the same commit. A decision
-    run pins its backbone's revision to that commit alike."""
+    same command reads the Hub cache's ref the online run wrote and records the same commit."""
     import json
 
     from token_support import write_token_corpus
@@ -151,8 +160,44 @@ def test_a_run_records_its_hub_backbone_at_its_commit_online_and_from_the_cache_
     with LocalHub({"local/llama": files}) as hub:
         commit = hub.commit("local/llama")
         assert ran("online", hub_environment(hub, tmp_path)) == f"local/llama@{commit}"
-        decided = subprocess.run([sys.executable, "-c", PINNED_DECISION], env=hub_environment(hub, tmp_path),
-                                 capture_output=True, text=True, check=False)
-    assert decided.stdout.strip().splitlines()[-1] == commit
     gone = {**hub_environment(None, tmp_path, offline=True), "DEW_HUB_ANSWERS": str(tmp_path / "no-answers")}
     assert ran("offline", gone) == f"local/llama@{commit}"
+
+
+def test_a_decision_run_records_its_hub_backbone_at_its_commit_online_and_from_the_cache_offline(tmp_path):
+    """A decision run whose `--pretrained` names a Hub repo alone (a chat backbone and its tokenizer), run
+    from the command line, writes the commit the Hub serves into its run.json as its backbone's
+    `revision`; with the Hub gone and none of Dew's recorded answers, the same command records the
+    same commit from the Hub cache's ref the online run wrote."""
+    import csv
+    import json
+    import shutil
+
+    import transformers
+
+    config = json.loads((FIXTURE / "config.json").read_text())
+    tokenizer = Path(__file__).parent / "fixtures" / "tokenizers" / "tiny-chat"
+    # The tokenizer's 286 ids and its own end token over a backbone of that vocabulary.
+    backbone = transformers.LlamaForCausalLM(transformers.LlamaConfig(**{
+        **config, "vocab_size": 288, "eos_token_id": 0, "bos_token_id": None, "pad_token_id": None}))
+    backbone.save_pretrained(tmp_path / "chat", safe_serialization=True)
+    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        shutil.copy(tokenizer / name, tmp_path / "chat" / name)
+    files = {path.name: path for path in (tmp_path / "chat").iterdir() if path.is_file()}
+    table = tmp_path / "tickets.csv"
+    with table.open("w", newline="") as file:
+        csv.writer(file).writerows([("text", "label"), *[("charged twice", "billing"),
+                                                         ("the site is down", "technical")] * 4])
+
+    def ran(name, environment):
+        root = tmp_path / name
+        done = subprocess.run([sys.executable, "-c", TRAIN_DECISION, str(table), str(root)],
+                              env=environment, capture_output=True, text=True, check=False)
+        assert done.returncode == 0, done.stderr[-3000:]
+        return json.loads((root / "run" / "run.json").read_text())["fields"]["revision"]
+
+    with LocalHub({"local/chat": files}) as hub:
+        commit = hub.commit("local/chat")
+        assert ran("online", hub_environment(hub, tmp_path)) == commit
+    gone = {**hub_environment(None, tmp_path, offline=True), "DEW_HUB_ANSWERS": str(tmp_path / "no-answers")}
+    assert ran("offline", gone) == commit
