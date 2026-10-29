@@ -689,6 +689,10 @@ def plan(target: float, timings: dict) -> list[dict]:
     return entries
 
 
+MARKED = ("whole_suite", "release_env")
+"""The marks a file's row names its tests by, as pytest resolved them (executed.py): its whole_suite
+cells, which `slow` reports as the whole suite's alone, and its release checks, which `release_plan`
+plans."""
 RELEASE = "release:"
 """A release check's row, beside its file's own: `row`'s group, its requirement after it."""
 
@@ -918,8 +922,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
-                     **{key: cells for key, cells in counts.get(name, {}).items()
-                        if key in ("whole_suite", "release_env")},
+                     **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:

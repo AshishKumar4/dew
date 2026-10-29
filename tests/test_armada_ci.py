@@ -2031,6 +2031,7 @@ def test_a_release_check_runs_in_the_whole_suites_second_job_under_its_requireme
         ("3.12:tests/test_release.py", 0, {str(pinned): ["tests/test_release.py::test_under_the_release"]})]
     verdict = tmp_path / "verdict.json"
     verdict.write_text(json.dumps({"rows": rows}))
+    capsys.readouterr()
     monkeypatch.setattr(sys, "argv", ["ci.py", "release-plan", str(verdict)])
     assert ci.main() == 0
     [item] = json.loads(capsys.readouterr().out)
