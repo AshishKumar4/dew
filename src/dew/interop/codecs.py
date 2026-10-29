@@ -1530,6 +1530,11 @@ def compressed_tensors(quantization: Mapping[str, object],
 MODELOPT_PARTS = ('.weight_scale', '.weight_scale_2', '.input_scale')
 """ModelOpt's E4M3 block scales, fp32 global weight multiplier and fp32 input multiplier."""
 
+SIDECARS = tuple(sorted({*PACKED_SUFFIXES, '.weight' + SCALE_SUFFIX, '.weight' + STORE_SCALE_SUFFIX,
+                         *MODELOPT_PARTS, *GPTQ_SUFFIXES}, key=len, reverse=True))
+"""Every codec's tensors beside a weight it stores, by suffix, longest first: they belong to the
+module whose `.weight` they code (`hf_decoders.wrapper_route`)."""
+
 MODELOPT_ALGOS = ('NVFP4', 'W4A16_NVFP4', 'FP8')
 """The per-layer algorithms ModelOpt's published mixed table dispatches."""
 

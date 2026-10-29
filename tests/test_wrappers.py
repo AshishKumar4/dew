@@ -489,3 +489,119 @@ def test_a_wrapper_missing_a_tensor_of_a_component_it_builds_is_refused(tmp_path
     save_file(kept, target / "model.safetensors", metadata={"format": "pt"})
     with pytest.raises(ValueError):
         Pretrained.load(target, dtype="float32", attention_impl="reference")
+
+
+def quantized_fp8(directory, prefix: str, modules_to_not_convert: list[str]):
+    """The checkpoint at `directory` with every 2-D weight under `prefix` whose sides divide 16 stored
+    in FP8 blocks of 16 (`quantize_fp8_blocks`, DeepSeek's `weight_scale_inv` partners), its
+    quantization_config naming `modules_to_not_convert`."""
+    from dew.interop.codecs import SCALE_SUFFIX, quantize_fp8_blocks
+    from dew.interop.safetensors_io import read_file, write_file
+
+    tensors, _ = read_file(directory / "model.safetensors")
+    stored = dict(tensors)
+    for name, tensor in tensors.items():
+        if (name.startswith(prefix) and name.endswith(".weight") and np.ndim(tensor) == 2
+                and not any(name.startswith(f"{module}.") for module in modules_to_not_convert)
+                and tensor.shape[0] % 16 == 0 and tensor.shape[1] % 16 == 0):
+            stored[name], stored[name + SCALE_SUFFIX] = quantize_fp8_blocks(np.asarray(tensor, np.float32),
+                                                                            (16, 16))
+    write_file(stored, directory / "model.safetensors", {"format": "pt"})
+    config = json.loads((directory / "config.json").read_text())
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+                                     "weight_block_size": [16, 16],
+                                     "modules_to_not_convert": modules_to_not_convert}
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
+def test_a_quantized_wrapper_loads_text_only_as_its_quantized_text_checkpoint(tmp_path):
+    """A Qwen3.5 wrapper whose language model is stored in FP8 blocks, one projection and the tower left
+    unconverted by name, loads `text_only` as the quantized text checkpoint does: its module selection
+    renamed with its tensors, the tower's dropped, its variables that checkpoint's leaf for leaf."""
+    import shutil
+
+    from dew.interop import Pretrained
+
+    source = FIXTURES / "qwen35-native-tiny"
+    kept = "model.language_model.layers.0.mlp.down_proj"
+    wrapper = quantized_fp8(Path(shutil.copytree(source, tmp_path / "wrapper")), "model.language_model.",
+                            [kept, "model.visual"])
+    plain = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
+    plain.save(tmp_path / "text")
+    text = quantized_fp8(tmp_path / "text", "model.", ["model.layers.0.mlp.down_proj"])
+    taken = Pretrained.load(wrapper, dtype="float32", attention_impl="reference", text_only=True)
+    expected = Pretrained.load(text, dtype="float32", attention_impl="reference")
+    assert taken.model == expected.model
+    jax.tree.map(np.testing.assert_array_equal, taken.variables, expected.variables)
+
+
+def modelopt_fp8(directory, layers: list[str]):
+    """The checkpoint at `directory` with the weight of each module of `layers` stored as ModelOpt's FP8
+    exporter writes it (E4M3 codes under one float32 `weight_scale`, beside a static `input_scale`), as
+    a MIXED_PRECISION table naming those modules."""
+    import ml_dtypes
+
+    from dew.interop.safetensors_io import read_file, write_file
+
+    tensors, _ = read_file(directory / "model.safetensors")
+    stored = dict(tensors)
+    for module in layers:
+        weight = np.asarray(tensors[f"{module}.weight"], np.float32)
+        scale = np.float32(np.abs(weight).max() / 448)
+        stored[f"{module}.weight"] = (weight / scale).astype(ml_dtypes.float8_e4m3fn)
+        stored[f"{module}.weight_scale"] = np.asarray(scale, np.float32)
+        stored[f"{module}.input_scale"] = np.asarray(0.05, np.float32)
+    write_file(stored, directory / "model.safetensors", {"format": "pt"})
+    config = json.loads((directory / "config.json").read_text())
+    producer = {"name": "modelopt", "version": "0.47.0"}
+    config["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
+                                     "kv_cache_quant_algo": None, "producer": producer,
+                                     "quantized_layers": {module: {"quant_algo": "FP8"} for module in layers}}
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
+def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_and_all(tmp_path):
+    """A Qwen3.5 wrapper whose ModelOpt per-layer table names a projection, the head and a tower's layer
+    in FP8 loads `text_only` as the text checkpoint quantized alike does: the table keyed by the text
+    family's names, the tower's entry dropped, the head's scales read beside it, its variables that
+    checkpoint's leaf for leaf and its logits that checkpoint's."""
+    import shutil
+
+    from dew.interop import Pretrained
+
+    source = FIXTURES / "qwen35-native-tiny"
+    wrapper = modelopt_fp8(Path(shutil.copytree(source, tmp_path / "wrapper")), [
+        "model.language_model.layers.0.mlp.down_proj", "lm_head", "model.visual.blocks.0.attn.qkv"])
+    plain = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
+    plain.save(tmp_path / "text")
+    text = modelopt_fp8(tmp_path / "text", ["model.layers.0.mlp.down_proj", "lm_head"])
+    load = {"dtype": "float32", "attention_impl": "reference"}
+    taken, expected = Pretrained.load(wrapper, text_only=True, **load), Pretrained.load(text, **load)
+    assert taken.model == expected.model
+    jax.tree.map(np.testing.assert_array_equal, taken.variables, expected.variables)
+    ids = np.load(source / "input_ids.npy")[:1]
+    np.testing.assert_array_equal(np.asarray(taken.model.apply(taken.variables, ids)),
+                                  np.asarray(expected.model.apply(expected.variables, ids)))
+
+
+def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_path):
+    """A wrapper's compressed-tensors groups and ignore list, by name and by a pattern over the wrapper's
+    own modules (`re:`), read `text_only` under its text checkpoint's names: a pattern resolved into the
+    language model's modules it matches, the tower's matches dropped, a class target kept as it is."""
+    from dew.interop.hf_decoders import language_model_quantization, translate_wrapper_config
+    from dew.interop.safetensors_io import read_file
+
+    source = FIXTURES / "qwen35-native-tiny"
+    config = json.loads((source / "config.json").read_text())
+    names, _ = read_file(source / "model.safetensors")
+    quantization = {"quant_method": "compressed-tensors", "format": "float-quantized",
+                    "config_groups": {"fp8": {
+                        "targets": ["Linear", "re:.*layers\\.0\\.mlp\\.(up|down)_proj$"]}},
+                    "ignore": ["lm_head", "re:.*visual\\.blocks\\.0\\..*", "model.language_model.layers.1"]}
+    projected = language_model_quantization({**config, "quantization_config": quantization},
+                                            translate_wrapper_config(config), lambda: names.keys())
+    assert projected["config_groups"]["fp8"]["targets"] == [
+        "Linear", "model.layers.0.mlp.down_proj", "model.layers.0.mlp.up_proj"]
+    assert projected["ignore"] == ["lm_head", "model.layers.1"]
