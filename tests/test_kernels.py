@@ -513,6 +513,7 @@ def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementatio
     (64, 64, 2, True, None, True),        # gpt-oss-20b's full layers
     (64, 64, 2, True, 128, True),         # and its sliding ones
     (192, 128, 2, True, 128, True),       # MiMo-V2-Flash's sliding layers
+    (192, 128, 2, True, 128, False),      # and their narrow values on flash itself
     (64, 64, 8, False, 65, False),        # ModernBERT's local layers, both sides
 ])
 def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
