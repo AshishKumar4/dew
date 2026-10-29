@@ -11,9 +11,7 @@ the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 import contextlib
 import dataclasses
 import functools
-import os
 
-import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -60,12 +58,13 @@ output gate, and all at once; each `(score hooks, gate)`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
               "bfloat16-natural": (jnp.bfloat16, True), "float16-natural": (jnp.float16, True)}
 """The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
-BACKWARD_FORMS = {"default": (False, attention_mosaic.BackwardTiles(64, 64, 2, 1)),
-                  "fused": (False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)),
-                  "accurate": (True, attention_mosaic.BackwardTiles(64, 64, 2, 1))}
-"""The backward's forms and schedules, `(accurate, config)`: the fast form in two launches and in one (the
-dK/dV program adding dQ), and the accurate form, each one consumer's: two consumers beside a producer hold
-168 registers a thread, which no 64 x 64 backward's live set fits (`MosaicBackward.register_budget`)."""
+FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
+"""The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
+slot's queries (`attention_mosaic_backward.split_queries`), as the derivation takes it."""
+BACKWARD_FORMS = {"default": (False, attention_mosaic.BackwardTiles(64, 64, 2, 1, **FED)),
+                  "accurate": (True, attention_mosaic.BackwardTiles(64, 64, 2, 1, **FED))}
+"""The backward's forms and schedules, `(accurate, config)`: the fast and the accurate form, each its dQ
+launch one consumer's beside a producer and its dK/dV launch two consumers sharing a key block (`FED`)."""
 FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
@@ -498,23 +497,6 @@ def _backward_call(shape, width: int, accurate: bool):
     return op, _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
 
 
-@pytest.mark.parametrize("call, fused", [("fast", True), ("accurate", False), ("deterministic", False)])
-def test_the_fast_forms_backward_is_one_launch_and_deterministic_mode_two(call, fused, monkeypatch):
-    """The backward derived on an H100 is one launch, the dK/dV program adding each tile's dQ atomically, for
-    a hookless fast-form call (FUSEDFORM-h100's speed, FUSEDSTAB-h100's check 1 and finiteness); the accurate
-    form and deterministic mode take two, the dQ launch then the dK/dV one, in a fixed order."""
-    flags = lane_environment.without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
-    if call == "deterministic":
-        flags = f"{flags} --xla_gpu_deterministic_ops=true"
-    monkeypatch.setenv("XLA_FLAGS", flags)
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        op, ba = _backward_call((2, 4096, 32, 8), 128, accurate=call == "accurate")
-        derived = op.derived(ba, target)
-        assert derived is not None and derived.fused == fused
-        assert op.legal(ba, derived, target)
-
-
 def _softcapped(s, q_pos, k_pos):
     """A score hook a tuning run keys by what it computes (`AttentionLaunch.HOOKS`)."""
     del q_pos, k_pos
@@ -729,8 +711,7 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
     """A causal call of 64 queries over 256 keys, whose last key tiles no query sees: the fast form's
     programs each take a key block, the last ones wholly past the queries' diagonal, and walk no query tile,
     the producer loading none for them."""
-    for form in ("default", "fused"):
-        _check_backward("causal", (1, 64, 2, 1), form=form, interpret=True, keys=256)
+    _check_backward("causal", (1, 64, 2, 1), form="default", interpret=True, keys=256)
 
 
 HOPPER_HOOK_SITES = ("alibi", "resumed", "softcap-sinks-alibi")
@@ -988,8 +969,7 @@ def test_a_call_over_runs_is_on_par_on_an_h100(case, form):
 def test_a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
     """A causal call of 64 queries over 256 keys compiled on an H100, where a consumer waiting for a load
     the producer never issues hangs (the interpreted test's case)."""
-    for form in ("default", "fused"):
-        _check_backward("causal", (2, 64, 4, 2), form=form, interpret=False, keys=256)
+    _check_backward("causal", (2, 64, 4, 2), form="default", interpret=False, keys=256)
 
 
 @ON_HOPPER
