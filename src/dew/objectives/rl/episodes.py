@@ -80,6 +80,10 @@ class Observation:
     chat messages, as JSON, the environment's context holds that it added
     here (a tool's result, a user's turn), which each later call's
     `Transcript` lists; the context's ids stay what the model reads.
+    `compacted` marks a context the harness compacted: it replaces the
+    history before it, so a later call's transcript lists this
+    observation's messages and none before them, and its ids start a chain
+    of their own (`sessions.pack`), the lineage the record keeps.
     """
 
     context: tuple[int, ...]
@@ -87,6 +91,7 @@ class Observation:
     detail: str = ""
     reward: float | None = None
     messages: tuple[Mapping[str, object], ...] = ()
+    compacted: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, EpisodeStatus):
@@ -102,11 +107,18 @@ class Observation:
 
 @dataclass(frozen=True)
 class Transition:
-    """One model call of an episode, the `Draw` its environment acted on, and the observation that
-    followed it."""
+    """One model call of an episode, the `Draw` its environment acted on, the structured assistant
+    message the harness parsed from it (`request`: its tool calls, as JSON, which the call's
+    transcript gives as its response), and the observation that followed it."""
 
     action: Draw
     observation: Observation
+    request: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if self.request is not None:
+            (request,) = json_objects((self.request,), "a transition's request")
+            object.__setattr__(self, "request", request)
 
 
 @dataclass(frozen=True)
@@ -679,7 +691,8 @@ def session_of(episode: Episode, *, group: str) -> Session:
 
     Each transition's draw becomes one call (`Call.of`), its reward the step
     reward the observation after it carries and its transcript the messages
-    the observations before it carried (none where they carried none). An
+    the observations before it carried since the last compacted one (none
+    where they carried none), its response the call's parsed request. An
     error the environment reports becomes `INFRA_ERROR`, because the
     verifier's reward, not the status, says how well the agent did.
     """
@@ -693,8 +706,10 @@ def session_of(episode: Episode, *, group: str) -> Session:
     calls = []
     for turn in episode.transitions:
         calls.append(Call.of(turn.action, reward=turn.observation.reward,
-                             transcript=Transcript(tuple(said)) if said else None))
-        said.extend(turn.observation.messages)
+                             transcript=Transcript(tuple(said), turn.request)
+                             if said or turn.request is not None else None))
+        # A compacted context replaces the history: the transcript restarts from its messages.
+        said = [*([] if turn.observation.compacted else said), *turn.observation.messages]
     identity = episode.identity
     return Session(str(identity.task), group, identity.sample, identity.attempt, tuple(calls), status,
                    episode.reward, detail=episode.detail)

@@ -29,7 +29,7 @@ def observation_record(value: Mapping[str, object]) -> Observation:
     return Observation(integers(record["context"], "context"),
                        EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"),
                        None if reward is None else finite(reward, "reward"),
-                       messages(record["messages"], "messages"))
+                       messages(record["messages"], "messages"), bool(record.get("compacted", False)))
 
 
 messages = functools.partial(listed, read=section, what="a list of chat messages")
@@ -66,7 +66,8 @@ def episode_from_record(value: Mapping[str, object]) -> Episode:
     sampling = sampling_record(section(record["sampling"], "sampling"))
     transitions = tuple(
         Transition(draw_record(section(turn["action"], "action"), sampling),
-                   observation_record(section(turn["observation"], "observation")))
+                   observation_record(section(turn["observation"], "observation")),
+                   None if turn.get("request") is None else section(turn["request"], "request"))
         for turn in listed(record["transitions"], "transitions", read=section, what="a list of transitions"))
     branch = identity.get("branch")
     return Episode(EpisodeId(integer(identity["task"], "task"), integer(identity["attempt"], "attempt"),
