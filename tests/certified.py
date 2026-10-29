@@ -254,13 +254,11 @@ def _exp_special(value):
 
 
 def _exp2_special(value):
-    """exp2's limits at the infinities and its exact values, 2^n at the integers whose power is a normal
-    value of every format no wider than fp32 (-126 to 127), named."""
-    integer = np.isfinite(value) & (value == np.rint(value)) & (value >= -126) & (value <= 127)
-    named = ~np.isfinite(value) | integer
-    expected = np.select([value == np.inf, value == -np.inf, integer],
-                         [np.inf, 0.0, np.exp2(np.where(integer, value, 0.0))], np.nan)
-    return expected, named
+    """exp2's limits at the infinities and its one exact value a lane must keep, exp2(±0) = 1, named; its
+    other powers of two are exact only correctly rounded, which a lane computing exp(x ln 2) is not (CPU
+    XLA's exp2(71) is a step off 2^71), so they are held by their enclosure as every other value is."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.select([value == np.inf, value == -np.inf, value == 0], [np.inf, 0.0, 1.0], np.nan), named
 
 
 def _erfinv_special(value):
@@ -795,7 +793,8 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         value[0] = 0.0
         drawn = [value]
     elif name == "exp2":
-        # Across fp32's range, a quarter near zero and a quarter at the integers, its exact values.
+        # Across fp32's range, a quarter near zero and a quarter at the integers, where a lane's power of
+        # two may be a step off.
         value = rng.uniform(-150, 128, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[quarter:2 * quarter] = rng.integers(-126, 128, quarter)
