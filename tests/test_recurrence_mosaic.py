@@ -30,7 +30,7 @@ from test_recurrence_chunk import (
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, mosaic_rule
-from dew.nn.kernels.templates import bundles, mosaic, product, resources
+from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import mainloop, template
 
@@ -496,6 +496,33 @@ def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_toke
 RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True)}
 """The scoreboard's delta-rule geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`):
 key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
+
+
+@pytest.mark.parametrize('kernel', ['recurrence_states', 'recurrence_reverse'], ids=['forward', 'backward'])
+def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
+    """A compile that refused the 27B gated delta net's joined tiles on an H100 (`report.spilled`: a kernel
+    spilled), the training call's and the forward's apart (`Tiles.forward`): the derivation gives the call a
+    narrower training block, which it takes (`fits`), and the forward's too where a forward launch spilled,
+    which runs at both; a refusal of the joined tiles once matched none of the rules' candidates, and the
+    call found none (`Unfitted`)."""
+    key_heads, value_heads, key_width, value_width, _ = RESOURCE_SHAPES['qwen3.5-27b-gdn']
+    rows, length = 1, 4096
+    keys = jax.ShapeDtypeStruct((rows, length, key_heads, key_width), jnp.bfloat16)
+    shapes = (((rows, length, value_heads, value_width), jnp.bfloat16),
+              ((rows, length, value_heads), jnp.float32), ((rows, length, value_heads), jnp.bfloat16),
+              ((rows, value_heads, key_width, value_width), jnp.float32))
+    args = [keys, keys, *(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in shapes)]
+    bound = template.MOSAIC.bind(*args, None)
+    with report.refusals(), generation.assumed('sm90'):
+        target = template.Mosaic.launched()
+        first = template.MOSAIC.derived(bound, target)
+        report.refuse([(report._identity(template.MOSAIC, bound), first, {kernel})])
+        stepped = template.MOSAIC.derived(bound, target)
+        taken = template.MOSAIC.fits(bound, target)
+    assert first.forward is not None and stepped is not None and taken == (stepped,)
+    assert stepped.block_v < first.block_v
+    narrower = (stepped.forward or stepped).block_v < first.forward.block_v
+    assert narrower == (kernel == 'recurrence_states')
 
 
 def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.RegisterModel:

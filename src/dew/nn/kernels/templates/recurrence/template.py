@@ -14,6 +14,7 @@ launches' seconds.
 
 import dataclasses
 import functools
+from collections.abc import Set
 from typing import ClassVar
 
 import jax
@@ -21,7 +22,7 @@ import jax.numpy as jnp
 import tokamax
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, bundles, cost, mosaic, resources
+from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
 from dew.nn.kernels.templates.recurrence import mainloop
 
 INTERPRETED_GENERATION = "sm90"
@@ -185,16 +186,31 @@ class Mosaic(base.Template[mainloop.Tiles]):
           they differ): on an H100 the 27B gated delta net's forward took 0.513 ms at the training call's
           32-wide block, its states launch's 192 programs two waves, and 0.433 at 64 wide, one wave of 96,
           where fla's port took 0.440 (JS-fwdtiles2-h100-a7ec9a134).
-        None where no block is legal: the launch refuses the call."""
-        trained = self._derive(ba, target, training=True)
-        if trained is None:
-            return None
-        alone = self._derive(ba, target, training=False)
-        return trained if alone in (None, trained) else dataclasses.replace(trained, forward=alone)
+        None where no block is legal: the launch refuses the call.
 
-    def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, *, training: bool
-                ) -> mainloop.Tiles | None:
-        """`derived`'s rules, the fast backward's with them where `training`."""
+        A compile that refused the joined tiles (`report.spilled`: kernels of the launch spilled) steps the
+        tiles the spilling kernels ran at down to their next narrower value block: the training call's where
+        they are the fast backward's alone, else both, a forward launch running at the training call's tiles
+        and, where they differ, at the forward's (`Tiles.forward`)."""
+        refused: dict[bool, set[int]] = {True: set(), False: set()}
+        while True:
+            trained = self._derive(ba, target, training=True, refused=refused[True])
+            if trained is None:
+                return None
+            alone = self._derive(ba, target, training=False, refused=refused[False])
+            joined = trained if alone in (None, trained) else dataclasses.replace(trained, forward=alone)
+            spilled = report.spilled(self, ba, joined)
+            if not spilled:
+                return joined
+            refused[True].add(trained.block_v)
+            forward = {launch.name for launch in self._launches(ba, joined, target, backward=False)}
+            if alone is not None and any(kernel.startswith(name) for kernel in spilled for name in forward):
+                refused[False].add(alone.block_v)
+
+    def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, *, training: bool,
+                refused: Set[int] = frozenset()) -> mainloop.Tiles | None:
+        """`derived`'s rules, the fast backward's with them where `training`, past the value blocks a compile
+        `refused`."""
         family = bundle(target, _dtype(ba))
         if family is None:
             return None
@@ -204,7 +220,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         # tiles staged as a rule first reads them: the widest legal, then the widest at which the fast
         # backward holds where it holds at any narrower, then the narrowest still running the states
         # launch in one wave.
-        staged = functools.cache(lambda index: self._staged(ba, blocks[index], target))
+        staged = functools.cache(lambda index: None if blocks[index] in refused
+                                 else self._staged(ba, blocks[index], target))
         start = next((index for index in range(len(blocks)) if staged(index) is not None), None)
         if start is None:
             return None

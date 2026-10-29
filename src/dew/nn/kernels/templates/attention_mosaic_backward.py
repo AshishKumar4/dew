@@ -592,6 +592,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, dk_ref, dv_ref, k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
+        fed = isinstance(family, mosaic.ConsumerFed)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
         streams = family.opened(streams, views)
@@ -608,17 +609,26 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             family.loaded(((k_ref.at[keys_view], k_smem.at[index], k_loaded.at[index]),
                            (v_ref.at[keys_view], v_smem.at[index], v_loaded.at[index])))
             lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
-            # The tiles before this block's first reader its partner reads.
-            family.passed(streams, streamed[0], lo, first=streamed[0])
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first,
                                           shape=(block_q, block_k))
             adds = functools.partial(_dq_added, walk, dq_ref, out_smem, (row, head), index)
             step = functools.partial(_fused_step, walk, (k_smem.at[index], v_smem.at[index]), rows_of,
                                      staged.at[index], coords_of, whole, adds)
-            _, (dk, dv) = family.walk(streams, ((step, lo, hi),), (), ((block_k, width), (block_k, width)),
-                                      walk.interpret, first=streamed[0])
-            # The tiles past this block's last reader its partner reads.
-            family.passed(streams, hi, streamed[1], first=streamed[0])
+            shapes = ((block_k, width), (block_k, width))
+            if fed:
+                # Its consumers feed the program's query stream themselves (`ConsumerFed`), every consumer
+                # walking the tiles any of its keys' readers reads (`Family.fed`): a tile none of a
+                # consumer's own keys sees is masked whole, its weights and its dQ zero (FlashAttention 3's
+                # two warpgroups a CTA, each its own keys over one query stream).
+                walked = family.fed(streams, views, *streamed, index)
+                _, (dk, dv) = family.walk(walked, ((step, *streamed),), (), shapes, walk.interpret,
+                                          first=streamed[0])
+            else:
+                # The tiles before this block's first reader its partner reads, and those past its last.
+                family.passed(streams, streamed[0], lo, first=streamed[0])
+                _, (dk, dv) = family.walk(streams, ((step, lo, hi),), (), shapes, walk.interpret,
+                                          first=streamed[0])
+                family.passed(streams, hi, streamed[1], first=streamed[0])
             out = (row, pl.ds(k_first, block_k), head)
             family.stored((dk, dv), (dk_ref.at[out], dv_ref.at[out]),
                           smem=out_smem.at[index, pl.ds(0, block_k)])
