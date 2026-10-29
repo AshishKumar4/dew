@@ -588,10 +588,7 @@ def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_prod
         lost = _without(products, np.argmax(np.abs(products.exact), -1))
         first, rest = (_truncating_sums(half.exact, rng) for half in (products[..., :64], products[..., 64:]))
         narrow = np.float32(first.astype(ml_dtypes.bfloat16)) + np.float32(rest)
-        # The first half's bf16 value lies between its ends' bf16 values; the IEEE add is monotone in both.
-        halved = nc.native_dot_ends(products[..., :64], oc.FLOAT32, flushes=False)
-        narrowed = nc.promoted_step_ends(*(oc.rounded(end, np.zeros_like(end), oc.BFLOAT16)
-                                           for end in halved), products[..., 64:], flushes=False)
+        narrowed = nc.narrow_partial_ends(products[..., :64], products[..., 64:], flushes=False)
         truth = nc.native_dot_ends(products, oc.FLOAT32, flushes=False)
         fault_lost = nc.native_dot_ends(lost, oc.FLOAT32, flushes=False)
         for faulty, fault, share in ((_truncating_sums(lost.exact, rng), fault_lost, 0.95),

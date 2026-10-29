@@ -191,3 +191,13 @@ def promoted_step_holds(before, after, products, flushes: bool) -> np.ndarray:
     least, most = promoted_step_ends(before, before, products, flushes)
     after = np.asarray(after, np.float64)
     return np.isfinite(after) & (after >= least) & (after <= most)
+
+
+def narrow_partial_ends(first, rest, flushes: bool) -> tuple[np.ndarray, np.ndarray]:
+    """The fault interval of a partial rounded to bf16 mid-depth (a defect a native GEMM's certificate
+    refuses): the first half's products (`first`, `Terms`) summed and rounded to bf16, then the rest's
+    (`rest`) added in fp32. The first half's bf16 value lies between its ends' bf16 values, and the IEEE add
+    is monotone in both (`promoted_step_ends`)."""
+    halved = native_dot_ends(first, FORMATS["float32"], flushes)
+    return promoted_step_ends(*(rounded(end, np.zeros_like(end), FORMATS["bfloat16"]) for end in halved),
+                              rest, flushes)

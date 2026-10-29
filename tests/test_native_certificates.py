@@ -33,6 +33,7 @@ from native_certificates import (
     SUBNORMAL_CASE,
     Terms,
     assert_refused,
+    narrow_partial_ends,
     native_dot_ends,
     native_dot_holds,
     promoted_step_ends,
@@ -42,7 +43,7 @@ from native_certificates import (
     tf32_operand,
     truncating_step_ends,
 )
-from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, Format, rounded, truncated
+from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, Format, truncated
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import template
@@ -568,10 +569,7 @@ def test_the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narro
         first, rest = (forward_of(half, w, SIZES, jnp.float32) for half in halves)
         narrow = np.asarray(np.float32(bf16(first)) + np.float32(rest), np.float64)
         held = native_dot_holds(narrow, products, FLOAT32, flushes=False)
-        # The first half's bf16 value lies between its ends' bf16 values; the IEEE add is monotone in both.
-        halved = native_dot_ends(forward_products(halves[0], w, SIZES), FLOAT32, flushes=False)
-        narrowed = promoted_step_ends(*(rounded(end, np.zeros_like(end), BFLOAT16) for end in halved),
-                                      forward_products(halves[1], w, SIZES), flushes=False)
+        narrowed = narrow_partial_ends(*(forward_products(half, w, SIZES) for half in halves), flushes=False)
         truth = native_dot_ends(products, FLOAT32, flushes=False)
         assert_refused(held, separated(truth, narrowed), NARROW_SHARE)
 
