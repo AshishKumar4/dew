@@ -27,7 +27,6 @@ from collections.abc import Mapping
 from functools import partial
 
 from dew import _records
-from dew.interop import release_pins
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
@@ -37,7 +36,6 @@ from dew.interop.decoder_parts import (
     Ramp,
     Renames,
     Ropes,
-    SourceCode,
     base_config,
     decoder_kinds,
     grouped_qkv,
@@ -353,6 +351,4 @@ def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
 MIMO_V2 = DecoderFamily(
     ('mimo_v2',), _mimo_v2_config, lambda fields: False, 'mimo_v2', 'MiMoV2ForCausalLM',
     lambda model: {}, weight_path=_mimo_v2_path, packed=_FUSED_QKV, preserve_source_layout=True,
-    # Transformers holds no MiMo-V2: an export opens through the release's own code (ledger 2173).
-    release_code=SourceCode(*release_pins.MIMO_V2),
 )

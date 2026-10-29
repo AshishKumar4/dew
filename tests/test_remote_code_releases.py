@@ -42,9 +42,13 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
 
 OPENED = {"lfm3-tiny": "transformers==5.18.0", "lfm3-biased-tiny": "transformers==5.18.0",
           "mimo-v2-tiny": "transformers==5.1.0"}
-"""Each fixture whose Dew export carries its release's code (`DecoderFamily.release_code`), by the
-transformers its release's code runs under, which the whole suite's run overlays on the suite's own for
-its check alone (`release_env`)."""
+"""Each fixture whose export opens through its release's code, by the transformers that code runs under,
+which the whole suite's run overlays on the suite's own for its check alone (`release_env`): LFM3's
+native export carries it (`DecoderFamily.release_code`); MiMo-V2's, which transformers holds no class
+for, is a released source Dew loads and saves, which keeps the code its config names (`Pretrained.code`)."""
+
+SAVED = ("mimo-v2-tiny",)
+"""The fixtures exported as a released source's save: their release's code and `auto_map` beside them."""
 
 
 @pytest.mark.parametrize("name", [pytest.param(name, marks=pytest.mark.release_env(requirement))
@@ -54,8 +58,9 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
     release's own transformers loader, under the transformers its code needs, as the release itself opens:
     the same class, every weight matched, the same state tensor for tensor and the same logits bit for
     bit over the fixture's ids (`remote_code_reference.opens`, the release's files vendored into the
-    fetched store; ledgers 2038, 2173). The export reads its release's code from the hub's cache, seeded
-    at the commit Dew holds it to from the same vendored files."""
+    fetched store; ledgers 2038, 2173). A native export reads its release's code from the hub's cache,
+    seeded at the commit Dew holds it to from the same vendored files; a saved source keeps the code
+    beside it (`SAVED`)."""
     import shutil
 
     import huggingface_hub.constants
@@ -71,8 +76,19 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
         for file in files:
             shutil.copy(reference.release_file(name, file), snapshot / file)
         monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
-        loaded = Pretrained.load(FIXTURES / name)
-        PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "export")
+        if name in SAVED:
+            # The fixture as its release ships: the code its config names beside it.
+            source = tmp_path / "source"
+            shutil.copytree(FIXTURES / name, source)
+            for file in files:
+                shutil.copy(reference.release_file(name, file), source / file)
+            released = json.loads(reference.release_file(name, "config.json").read_text())
+            config = json.loads((source / "config.json").read_text())
+            (source / "config.json").write_text(json.dumps({**config, "auto_map": released["auto_map"]}))
+            Pretrained.load(source).save(tmp_path / "export")
+        else:
+            loaded = Pretrained.load(FIXTURES / name)
+            PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / "export")
         (tmp_path / "scratch").mkdir()
         checks = reference.opens(name, tmp_path / "export", tmp_path / "scratch")
     assert all(checks.values()), checks
