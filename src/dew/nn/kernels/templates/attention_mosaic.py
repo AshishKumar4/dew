@@ -470,11 +470,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
         dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
         fused = fused and not fed
-        # Pinned until the register model counts it: a share sliced from a slot wider than 128 costs its dK
-        # product ~40 registers more than a whole slot (a bisect, A05 head 6a0ee2cc28), so past 128 the
-        # shares are 64 wide, which ptxas holds spill-free (fed256c4: 208 needed at 256 in 4 shares; in 2
-        # shares 176 bytes spilled).
-        for columns in (1, 2, 4) if query.shape[-1] <= 128 else (4,):
+        for columns in (1, 2, 4):
             def tiles(rows: int, walked: int, consumers: int, columns=columns) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=fused and columns == 1,
                                      family=family.name, columns=columns, **dkv)
