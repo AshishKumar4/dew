@@ -1353,27 +1353,38 @@ def _floor_reference(model: str, case, reference, dtype: str, devices: int | Non
     return _floor_held[key]
 
 
-def floored(model: str, layout: str, *, dtype: str, devices: int | None = None,
-            mixture: dict[str, Any] | None = None, objective: dict[str, Any] | None = None) -> dict[str, Any]:
+def floored(model: str, layouts: Sequence[str], *, dtype: str, devices: int | None = None,
+            mixture: dict[str, Any] | None = None, objective: dict[str, Any] | None = None,
+            out: Path = Path("out/layout-parity-orders"),
+            speak: Callable[[str], None] = lambda line: None) -> list[dict[str, Any]]:
+    """Each of `layouts`' first step on `model` held to the one-device reference by the floor judge
+    (`_floored`), a row each; a model with residual orders judged over them once for all its layouts
+    instead (`run_orders`, its files under `out`), as `run` judges it. `mixture` and `objective` are
+    merged into the model's as `run` merges them."""
+    import jax
+
+    mixture, objective = mixture or {}, objective or {}
+    if zoo()[model].orders:
+        with jax.enable_x64(new_val=True):
+            return run_orders([model], tuple(layouts), dtype=dtype, devices=devices, mixture=mixture,
+                              objective=objective, out=out, speak=speak)
+    return [_floored(model, layout, dtype=dtype, devices=devices, mixture=mixture, objective=objective)
+            for layout in layouts]
+
+
+def _floored(model: str, layout: str, *, dtype: str, devices: int | None, mixture: dict[str, Any],
+             objective: dict[str, Any]) -> dict[str, Any]:
     """`layout`'s first step on `model` held to the one-device reference by the floor judge: each
     gradient leaf and the loss within FLOOR_FACTOR of the reference's floors (`_floor_reference`),
-    and its devices' FLOPs to an even split (`flops_bound`), REDUNDANT past it. A model with
-    residual orders is judged over them instead (`run_orders`), as `run` judges it. A layout Dew
-    refuses by design is a refused row, and a failing layout, or a reference no layout can be
-    judged by, an error row, as `run` reports them. `mixture` and `objective` are merged into the
-    model's as `run` merges them."""
+    and its devices' FLOPs to an even split (`flops_bound`), REDUNDANT past it. A layout Dew refuses
+    by design is a refused row, and a failing layout, or a reference no layout can be judged by, an
+    error row, as `run` reports them."""
     import jax
 
     from dew._coordination import agreed
     from dew.mesh import LayoutRefused
 
-    mixture, objective = mixture or {}, objective or {}
     case, reference = model_case(model, dtype, mixture, objective)
-    if case.orders:
-        with jax.enable_x64(new_val=True):
-            return run_orders(
-                [model], (layout,), dtype=dtype, devices=devices, mixture=mixture, objective=objective,
-                out=Path("out/layout-parity-orders"), speak=lambda line: None)[0]
     try:
         batch, ref_losses, ref_gradient, floors, loss_floor, reference_flops = agreed(
             f"reference of {model}",
@@ -1956,13 +1967,8 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
             raise SystemExit("--prepare, --references and --window are check 1's draws; give --seeds")
         rows: list[dict[str, Any]] = []
         for model in models:
-            if zoo()[model].orders:
-                rows += run_orders([model], layouts, dtype=dtype, devices=devices, mixture=mixed,
-                                   objective=aimed, out=orders_out,
-                                   speak=lambda line: print(line, flush=True) if speaker else None)
-            else:
-                rows += [floored(model, layout, dtype=dtype, devices=devices, mixture=mixed, objective=aimed)
-                         for layout in layouts]
+            rows += floored(model, layouts, dtype=dtype, devices=devices, mixture=mixed, objective=aimed,
+                            out=orders_out, speak=lambda line: print(line, flush=True) if speaker else None)
             keep(rows)
         if speaker:
             print("\n".join(summary(rows)), flush=True)
