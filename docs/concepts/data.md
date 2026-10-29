@@ -167,14 +167,23 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 ### A pinned text, code and chat mixture
 
-[recipes/lm/mixture.py](https://github.com/AshishKumar4/dew/blob/main/recipes/lm/mixture.py) mixes three public sources, each pinned to a Hub commit and streamed from its own Parquet shards: English Wikipedia's 2023-11-01 dump, The Stack v1's filtered Python functions and UltraChat 200k's SFT conversations. Text and code are tokenized, a conversation is rendered through the tokenizer's chat template (SmolLM2's, pinned), and the three are mixed at 70/20/10 by valid target tokens, then packed:
+[recipes/lm/mixture.py](https://github.com/AshishKumar4/dew/blob/main/recipes/lm/mixture.py) mixes three public sources, each pinned to a Hub commit and streamed from its own Parquet shards: English Wikipedia's 2023-11-01 dump, The Stack v1's filtered Python functions and UltraChat 200k's SFT conversations. Text and code are tokenized, a conversation is rendered through the tokenizer's chat template (SmolLM2's, pinned), and the three are mixed at 70/20/10 by valid target tokens, then packed (the recipe pins each to a commit):
 
+<!-- not run: streams three datasets from the Hub -->
 ```python
-parts = {"web": web.read("streamed").map(text.tokenize(tok, eos=True)),
-         "code": code.read("streamed").map(text.tokenize(tok, field="content", eos=True)),
-         "chat": conversations.read("streamed").map(chat.template(tok)).select_columns("text")}
-data = mix([parts["web"], parts["code"], parts["chat"]], [0.7, 0.2, 0.1], by="tokens")
-trainer.fit(data.pack(seq_len=2049).shuffle(seed=0, window=10_000).batch(64), tokens=...)
+from transformers import AutoTokenizer
+
+from dew.data import Hub, chat, mix, text
+
+tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-360M-Instruct")
+web = Hub("wikimedia/wikipedia", name="20231101.en", columns=("text",))
+code = Hub("bigcode/python-stack-v1-functions-filtered", columns=("content",))
+conversations = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft", columns=("messages",))
+data = mix([web.read("streamed").map(text.tokenize(tok, eos=True)),
+            code.read("streamed").map(text.tokenize(tok, field="content", eos=True)),
+            conversations.read("streamed").map(chat.template(tok)).select_columns("text")],
+           [0.7, 0.2, 0.1], by="tokens")
+batches = data.pack(seq_len=2049).shuffle(seed=0, window=10_000).batch(64)
 ```
 
 `python recipes/lm/mixture.py --show 2000` reads the first 2,000 mixed documents and prints each source's share of their tokens. On 2026-10-29 it read 906 Wikipedia articles, 1,027 functions and 67 conversations, 796,398 tokens in all, at 0.700, 0.200 and 0.100 of them.
