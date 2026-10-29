@@ -291,20 +291,22 @@ def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_t
 @pytest.mark.usefixtures("without_deterministic_ops")
 def test_an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
     """An LM run whose attention takes Triton's kernel, a launch of configs to measure, that measures its
-    step's launches on this GPU (`tune_kernels`) keeps what it picked beside its compilation cache
-    (`dew.cache.kernel_picks_path`), where a later run reads them. Every kind's trainer is built through
-    the one `RunConfig.built`, which hands it the option; the other kinds' tiny models launch nothing
-    Triton takes (a decision backbone's sliding window, heads narrower than its kernel computes). The
-    suite's GPUs run deterministic ops, under which no process keeps picks (`dew.cache.keeps_picks`);
-    the run here does not."""
+    step's launches on this GPU (`tune_kernels`) adds what it picked to the picks of this GPU's kind
+    beside the compilation cache (`dew.cache.kernel_picks_path`), where a later run reads them. Every
+    kind's trainer is built through the one `RunConfig.built`, which hands it the option; the other
+    kinds' tiny models launch nothing Triton takes (a decision backbone's sliding window, heads narrower
+    than its kernel computes). The suite's GPUs run deterministic ops, under which no process keeps
+    picks (`dew.cache.keeps_picks`); the run here does not."""
     import jax
 
-    cache, compiling = tmp_path / "cache", jax.config.jax_compilation_cache_dir
-    try:
-        trained("lm", tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
-                                              "trainer.compilation_cache_dir": str(cache), "trainer.mesh": {},
-                                              "model.attention_impl": "triton", "model.head_dim": 16})
-    finally:
-        jax.config.update("jax_compilation_cache_dir", compiling)
-    (picks,) = cache.rglob("kernels/*.json")
-    assert json.loads(picks.read_text())["data"]
+    from dew.cache import kernel_picks_path
+
+    picks = Path(kernel_picks_path(jax.devices()[0].device_kind))
+
+    def stored() -> list:
+        return json.loads(picks.read_text())["data"] if picks.exists() else []
+    before = stored()
+    trained("lm", tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
+                                          "trainer.mesh": {}, "model.attention_impl": "triton",
+                                          "model.head_dim": 16})
+    assert [pick for pick in stored() if pick not in before]
