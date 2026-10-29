@@ -1,9 +1,9 @@
 {
- "bytes": 8262630,
+ "bytes": 8348528,
  "license": "MIT",
- "path": "recordings/e1469523e4044f0abb58103ae121d00a4b1e81bb7b67245c531c466468f92827.npz",
+ "path": "recordings/bd9e67f93e53cb8869282350877ab51c6dedf9ebb9091bc87610d7247e5234fb.npz",
  "reference": "Dew 7f03fae28e2a, tools/saved_runs_reference.py",
  "repo": "dewml/fixtures",
- "revision": "41d24fe26d6bd03e538be5788ddb6bb481bf43e8",
- "sha256": "e1469523e4044f0abb58103ae121d00a4b1e81bb7b67245c531c466468f92827"
+ "revision": "024da6704cf312505c319284a3da231ee4738d35",
+ "sha256": "bd9e67f93e53cb8869282350877ab51c6dedf9ebb9091bc87610d7247e5234fb"
 }

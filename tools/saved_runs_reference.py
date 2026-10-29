@@ -34,6 +34,13 @@ CORPUS = "tests/fixtures/saved_runs"
 
 
 def main() -> None:
+    import os
+
+    from lane_environment import configure_lane
+
+    # The runs are written under the suite's environment, its simulated devices among it, which a
+    # per-share read resumes on alone.
+    configure_lane(os.environ)
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout the corpus is written into")
     args = parser.parse_args()
