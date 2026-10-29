@@ -18,10 +18,12 @@ wrote, which decide the vocabulary.
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar, NamedTuple
+from collections.abc import Mapping
+from typing import Annotated, ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import tyro
 
 from dew._records import integer, text
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
@@ -41,9 +43,53 @@ class Tokens(NamedTuple):
 
 
 @dataclasses.dataclass(frozen=True)
+class PromptRollout:
+    """GRPO's synchronous rollout over a run's prompts (`RolloutScheduler.sampled`): `groups`
+    completions of each prompt the policy draws under `sampling`, each at most `max_new_tokens`, each
+    scored by `reward` against its prompt's record, their advantages by `estimator`, and a completion
+    that runs out of its budget trained as `truncation` says.
+
+    `reward` names it by its import path: a function of a completion's text and its prompt's record
+    (`dew.objectives.rl.Reward`), or a class whose instance at its defaults is one
+    (`dew.rl.sandbox:MathReward`). A reward outside Dew is imported before the run loads, as any
+    class a run names is (`dew.registry.imported`)."""
+
+    reward: str
+    groups: int = 4
+    max_new_tokens: int = 32
+    estimator: str = "group"
+    truncation: str = "score"
+    sampling: Sampling = dataclasses.field(default_factory=lambda: Sampling(temperature=1.0))
+
+    def __post_init__(self) -> None:
+        from dew.objectives.rl.sessions import check_estimator, check_truncation
+
+        if ":" not in self.reward:
+            raise ValueError(f"reward names a reward by its import path, `module:name`, not {self.reward!r}")
+        if type(self.groups) is not int or self.groups < 2:
+            raise ValueError("groups is the completions drawn of each prompt, at least two for an advantage")
+        if type(self.max_new_tokens) is not int or self.max_new_tokens < 1:
+            raise ValueError("max_new_tokens is a positive budget of completion tokens")
+        check_estimator(self.estimator)
+        check_truncation(self.truncation)
+
+    def build(self, objective, decode):
+        """The scheduler drawing over `objective`'s policy, decoding completions with `decode`."""
+        from dew.objectives.rl import RolloutScheduler
+        from dew.registry import imported
+
+        reward = imported(self.reward)
+        return RolloutScheduler.sampled(objective, reward() if isinstance(reward, type) else reward,
+                                        decode=decode, groups=self.groups, max_new_tokens=self.max_new_tokens,
+                                        estimator=self.estimator, truncation=self.truncation,
+                                        sampling=self.sampling)
+
+
+@dataclasses.dataclass(frozen=True)
 class LMRunConfig(DecoderRunConfig):
     """A decoder's run (`DecoderRunConfig`) plus the settings specific to language models."""
 
+    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**DecoderRunConfig._FLAG_SELECTED, "rollout": "rollout"}
     RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "prompt", "max_new_tokens",
                                             "sampling")
 
@@ -78,6 +124,10 @@ class LMRunConfig(DecoderRunConfig):
     --model.max-seq-len alone may be set."""
     pretrained_param_dtype: DtypeName = "float32"
     """The dtype `pretrained`'s parameters are stored and trained in."""
+    rollout: Annotated[PromptRollout, tyro.conf.subcommand("rollout")] | None = None
+    """The rollout a GRPO run trains on (`--rollout.reward`), over its chain's prompts
+    (`dew.data.presets.prompts`): GRPO needs one, and another objective takes none. The model's
+    context is a prompt and its completion."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -89,6 +139,9 @@ class LMRunConfig(DecoderRunConfig):
                              "states its loop in --model")
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")
+        if (self.rollout is None) == (self.objective.name == objectives.paths["grpo"]):
+            raise ValueError("a GRPO run trains on the completions its rollout draws (--rollout.reward), "
+                             "and another objective on its data alone, with no rollout")
 
     def prepare(self) -> Prepared:
         """The objective this run names over its token files.
@@ -154,8 +207,10 @@ class LMRunConfig(DecoderRunConfig):
         loaded, held = self.compiled(objective.data(), self.chain(), self.validation)
         scored = self.trainer.eval_interval(loaded) is not None and bool(held)
         validation = run.validation_metrics(validates=scored)
+        decode = tokenizer_for(written).decode
+        rollout = None if self.rollout is None else self.rollout.build(objective, decode)
         return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation,
-                                                     validation=held))
+                                                     validation=held, rollout=rollout))
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """Perplexity, where the run evaluates a validation split it holds."""
@@ -166,12 +221,30 @@ class LMRunConfig(DecoderRunConfig):
         tokenizer, vocabulary and length. Raises ValueError for a chain that states none, which an LM
         run cannot size its model for."""
         facts = self.chain().facts()
+        if self.rollout is not None:
+            return self._prompted(facts, self.rollout)
         missing = [name for name in ("tokenizer", "vocab_size", "seq_len") if facts.get(name) is None]
         if missing:
             raise ValueError(f"an LM run trains on token windows (dew.data.presets.lm, sft or "
                              f"token_windows); this chain states no {', '.join(missing)}")
         return Tokens(text(facts["tokenizer"], "tokenizer"), integer(facts["vocab_size"], "vocab_size"),
                       integer(facts["seq_len"], "seq_len"), bool(facts.get("packed", False)))
+
+    @staticmethod
+    def _prompted(facts, rollout: PromptRollout) -> Tokens:
+        """A rollout run's tokens: its prompts' tokenizer and vocabulary, and a context of a prompt
+        (`dew.data.presets.prompts`'s width) and its completion, less the last token, which no
+        position predicts from."""
+        from dew.data.prompts import PROMPT_KEY
+
+        shape = facts.get("fields", {}).get(PROMPT_KEY) if isinstance(facts.get("fields"), dict) else None
+        if facts.get("tokenizer") is None or not shape:
+            raise ValueError("a rollout run trains on rendered prompts (dew.data.presets.prompts); this "
+                             "chain states no prompt width or tokenizer")
+        tokenizer = text(facts["tokenizer"], "tokenizer")
+        width = integer(shape[-1], "prompt width")
+        return Tokens(tokenizer, tokenizer_for(tokenizer).vocab_size, width + rollout.max_new_tokens - 1,
+                      packed=False)
 
     def processor(self):
         """The run's tokenizer as its checkpoints record it for every loader."""

@@ -245,3 +245,38 @@ def test_a_synchronous_collection_refuses_a_ratio_read_at_another_temperature():
         collected(GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1,
                                 sampling_temperature=0.7))
     collected(GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1))
+
+
+def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
+    """An LM run that names GRPO records its rollout as a field (`LMRunConfig.rollout`, `--rollout.reward`):
+    over a prompts chain it trains on the completions its policy draws, scored by the reward its import
+    path names, its context a prompt and its completion, and the run it records loads with that
+    rollout. GRPO with no rollout, and a rollout under another objective, are refused."""
+    import dataclasses
+
+    import rl_support
+
+    from dew.config import ObjectiveConfig
+    from dew.config.lm import LMRunConfig, PromptRollout
+    from dew.data import Memory, presets
+    from dew.registry import ModelConfig
+
+    tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
+    rows = [{"prompt": "hi", "data_source": "rule", "ground_truth": "a"}] * 8
+    rollout = PromptRollout(reward=f"{rl_support.__name__}:completion_length", groups=2, max_new_tokens=4)
+    model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
+                                               "dtype": "float32"})
+    default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=4),
+                          tokenizer=tokenizer, objective=ObjectiveConfig("grpo"), rollout=rollout,
+                          model=model, max_new_tokens=0)
+    config = LMRunConfig.cli(["--trainer.steps", "1", "--trainer.name", "grpo", "--trainer.checkpoint-dir",
+                              str(tmp_path), "--trainer.compilation-cache-dir", "None",
+                              "--trainer.multi-host", "False", "--trainer.log-every", "1"], default=default)
+    assert config.tokens().seq_len == 8 + 4 - 1
+    state = config.run()
+    assert int(state.step) == 1
+    assert LMRunConfig.load(str(tmp_path / "grpo")).rollout == rollout
+    with pytest.raises(ValueError):
+        dataclasses.replace(config, rollout=None)
+    with pytest.raises(ValueError):
+        dataclasses.replace(config, objective=ObjectiveConfig("lm"))
