@@ -581,8 +581,7 @@ class Decide(SavedRunTask):
         `Images.joined` takes them (`seen_together`)."""
         assert self.processor is not None, "a row of images was laid out with the processor"
         encoded = [row for row, _ in rows]
-        inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length,
-                                        attention=self.layout.attention)
+        inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length)
         held = self.variables if variables is None else variables
         scores = np.asarray(self._forward(held, inputs, media=Images.joined(self.processor, rows)))
         return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
@@ -657,16 +656,14 @@ class Decide(SavedRunTask):
         slots = (None if shape.questions is None or shape.options is None
                  else -(-questions * options // OPTION_TILE) * OPTION_TILE)
         inputs = DecisionInputs.collate(rows, self.specials.pad, questions=questions, options=options,
-                                        option_slots=slots, context_length=self.context_length,
-                                        attention=self.layout.attention)
+                                        option_slots=slots, context_length=self.context_length)
         length = shape.length
         inputs = replace(
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
             segments=_widened(inputs.segments, length),
             positions=None if inputs.positions is None else _widened(inputs.positions, length),
             slots=None if inputs.slots is None else _widened(inputs.slots, length),
-            blocks=None if inputs.blocks is None else _widened(inputs.blocks, length, -1),
-            streams=None if inputs.streams is None else _widened(inputs.streams, length, -1))
+            blocks=None if inputs.blocks is None else _widened(inputs.blocks, length, -1))
         count = shape.rows
         padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
@@ -790,8 +787,7 @@ class Decide(SavedRunTask):
         scored = []
         segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context,
-                              attention=self.layout.attention)
+            inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -1051,12 +1047,11 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False,
-             attention: tuple[tuple[tuple[int, ...], ...], int] | None = None) -> DecisionInputs:
+def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False
+             ) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
     holding at most `max_segments` rows, the questions' spans in each row's context where
-    `spans_in_context` (`JointLayout.schema_in_context`), its rows read in their streams as their
-    layout's `attention` says (`Layout.attention`)."""
+    `spans_in_context` (`JointLayout.schema_in_context`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -1070,9 +1065,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
                           context_segments=given("context_segments"), question_rows=given("question_rows"),
-                          blocks=given("blocks"), streams=given("streams"),
-                          reads=None if attention is None else attention[0],
-                          fragments=1 if attention is None else attention[1], max_segments=max_segments,
+                          blocks=given("blocks"), max_segments=max_segments,
                           spans_in_context=spans_in_context)
 
 

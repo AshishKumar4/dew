@@ -356,8 +356,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                                   self.context_window)
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
-                          attention=self.layout.attention)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         logits = self.model.logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training)
         )
@@ -389,14 +388,12 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                 Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
-        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
-                          attention=self.layout.attention)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
                            ) -> tuple[Ratio | Weighted, Decisions]:
-        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
-                          attention=self.layout.attention)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         logits = self.model.logits(params, inputs)
         return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
 
