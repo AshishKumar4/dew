@@ -3,7 +3,8 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
 
 - The Mosaic mainloop's forward and gradient on par from float64 with their references at the cases the
   CPU leaves to a GPU (test_recurrence_mosaic's `native`, test_recurrence_mosaic_gradient), every hook
-  it takes token by token, and a two-role walk's training on an H100.
+  it takes token by token, its fast backward bitwise the same each run, and a two-role walk's training on
+  an H100.
 - The template finite and on par where chunked forms break, every form, regime and product
   (test_recurrence_template_stability).
 - The portable backward as a GPU compiles it, and the SSD port's forward and gradient, finite and on par
@@ -52,6 +53,8 @@ def test_the_recurrences_run_on_this_gpu():
         *(Cell(f"the Mosaic gradient is as exact as its reference: {name}",
                functools.partial(gradient.test_the_mosaic_gradient_is_as_exact_as_its_reference, *values))
           for name, values in forward.native(gradient.GRADIENT_GRID, gradient.INTERPRETED_GRADIENT)),
+        Cell("the fast backward is bitwise the same each run",
+             gradient.the_fast_backward_is_bitwise_the_same_each_run),
         *(Cell(f"a walk of two roles is as exact as its reference: {name}",
                functools.partial(gradient.test_a_walk_of_two_roles_is_as_exact_as_its_reference, *values),
                "sm90")

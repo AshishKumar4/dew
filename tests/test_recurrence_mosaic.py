@@ -66,11 +66,6 @@ chunks, the last ragged, the packed documents' starts still on and off the chunk
 in Mosaic GPU's interpreter within a test's ten minutes, which the full geometry is not."""
 
 
-NATIVE = pytest.mark.gpu(reason="checked natively: interpreted, its draws take a CPU task's share alone, "
-                                "and each mainloop it runs is checked interpreted at a case beside it")
-"""A case the GPU tier checks alone: the CPU's interpreted check 1 of every mainloop takes the cases
-`INTERPRETED_FORWARD` names, and `test_recurrence_mosaic_gradient.INTERPRETED_GRADIENT`."""
-
 DTYPES = {'bf16': jnp.bfloat16, 'fp32': jnp.float32}
 
 INTERPRETED_FORWARD = {('one sequence', 'fp32'), ('a ragged length', 'bf16'), ('packed documents', 'bf16'),

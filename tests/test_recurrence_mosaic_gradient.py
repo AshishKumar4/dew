@@ -17,7 +17,6 @@ from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
-    NATIVE,
     PACKED_DOCUMENTS,
     SEEDS,
     SHAPES,
@@ -127,8 +126,7 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
                     f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
 
 
-@NATIVE
-def test_the_fast_backward_is_bitwise_the_same_each_run():
+def the_fast_backward_is_bitwise_the_same_each_run():
     """The template's fast backward gives the same bits each run over packed documents (row 1298): each
     queries' and keys' gradient tile has one program, which stores its key head's first value head's and
     adds the rest's in order, a step's adds done before the next (`_gradient_stored`); no add's order varies

@@ -10,11 +10,11 @@ fading memories, steep then mild decays), held as test_recurrence_stability hold
 - check 1 (`assert_as_exact`): on par from float64 with its reference arm, the fla port where it runs the
   form (the delta rule with a decay), else the portable math, in the call's 16-bit dtype.
 
-Natively on a GPU of a family the mainloop claims (`NATIVE`: interpreted, one case's check 1 outran the CPU
-tier's hour); off one, the CPU interprets each form's forward on the regimes that grow its tiles most for
-finiteness, and its fast backward's decay gradient under decays near zero. A form or gradient the template
-refuses (`Mosaic.eligible`, `Mosaic.trains`) is checked refused and skipped, a refusal and not numerical
-coverage (row 1968: the suite held only the portable arms)."""
+Natively on a GPU of a family the mainloop claims, in its GPU flow (tests/test_gpu_recurrence.py: interpreted,
+one case's check 1 outran the CPU tier's hour); off one, the CPU interprets each form's forward on the regimes
+that grow its tiles most for finiteness, and its fast backward's decay gradient under decays near zero. A form
+or gradient the template refuses (`Mosaic.eligible`, `Mosaic.trains`) is checked refused and skipped, a
+refusal and not numerical coverage (row 1968: the suite held only the portable arms)."""
 
 import dataclasses
 import functools
