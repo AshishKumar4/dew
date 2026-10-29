@@ -653,9 +653,11 @@ def test_an_explicit_momentum_count_keeps_its_law_and_none_reads_the_runs_progre
 
     held = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=0).ema
     assert not held.progressed and at(held, 0, 1, 100) == [0.9] * 3
+    # A ramp computes in float32, from the first momentum as float32 holds it.
+    first = float(np.float32(0.9))
     counted = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=10).ema
     start, middle, end, past = at(counted, 0, 5, 10, 1000)
-    assert not counted.progressed and start == 0.9 and end == past and start < middle < end
+    assert not counted.progressed and start == first and end == past and start < middle < end
     progressed = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=None).ema
     start, middle, end, past = at(progressed, 0.0, 0.5, 1.0, 2.0)
-    assert progressed.progressed and start == 0.9 and end == past and start < middle < end
+    assert progressed.progressed and start == first and end == past and start < middle < end
