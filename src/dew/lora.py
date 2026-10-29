@@ -353,8 +353,10 @@ def _adapter_files(source: str, weight_name: str | None) -> FilePath:
         return folder / _adapter_selection(held, None)[0]
     from dew.interop.sources import SourceReference, repo_files
 
-    reference = SourceReference.parse(source)
-    root = reference.metadata()
+    # The commit's own files alone are read: a cache holding the adapter's and none of the repo's other
+    # files serves it offline.
+    reference = SourceReference.parse(source).pinned()
+    root = reference.cached()
     loaded, read = _adapter_selection(repo_files(reference.name, root), weight_name)
     for name in read:
         reference.file(root, name)
