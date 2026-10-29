@@ -250,8 +250,9 @@ raises for a connection or server error on an uncached file)."""
 @dataclass(frozen=True)
 class Load:
     """One model's load without its weights: `outcome` is "loads" (with its `parameters`), "refused"
-    (Dew raised, `reason` the exception) or "hub" (the Hub refused the repo, `reason` its error or
-    why the census read no config)."""
+    (Dew raised, `reason` the exception), "hub" (the Hub refused the repo, `reason` its error or
+    why the census read no config) or "killed" (a signal ended the load's process before it answered,
+    `reason` the signal: the machine's, not Dew's nor the Hub's)."""
 
     id: str
     commit: str | None
@@ -262,14 +263,17 @@ class Load:
 
 def loaded(repo: str, commit: str, env: dict[str, str] | None = None) -> Load:
     """`repo` at `commit` loaded without its weights in a process of its own (`_LOAD`) under `env`
-    (this process's by default): the Hub's error where it refused the repo, else Dew's refusal, the
-    exception the process ended on (`ended_on`)."""
+    (this process's by default), classified by how the process exited: its parameter count where it
+    loaded, the Hub's error where it refused the repo (`HUB_EXIT`), the signal where one ended it, else
+    Dew's refusal, an exception's exit, its text the exception the process ended on (`ended_on`)."""
     done = subprocess.run([sys.executable, "-c", _LOAD, repo, commit], env=env, capture_output=True,
                           text=True, check=False)
     if done.returncode == 0:
         return Load(repo, commit, "loads", parameters=int(done.stdout.split()[-1]))
     if done.returncode == HUB_EXIT:
         return Load(repo, commit, "hub", reason=done.stdout.strip().splitlines()[-1])
+    if done.returncode < 0:
+        return Load(repo, commit, "killed", reason=f"signal {-done.returncode}")
     return Load(repo, commit, "refused", reason=ended_on(done.stderr) or f"exit {done.returncode}")
 
 
@@ -300,11 +304,13 @@ def loads(out: Path, jobs: int = 2, env: dict[str, str] | None = None) -> list[L
 
 
 def table(results: Sequence[Load]) -> str:
-    """`results` as Markdown: each refusal a row, then the Hub's, then the models that load."""
-    order = {"refused": 0, "hub": 1, "loads": 2}
+    """`results` as Markdown: each refusal a row, then the loads a signal ended, then the Hub's, then
+    the models that load."""
+    order = {"refused": 0, "killed": 1, "hub": 2, "loads": 3}
     counts = {outcome: sum(result.outcome == outcome for result in results) for outcome in order}
     lines = [f"# Hub models without their weights: {counts['loads']} load, {counts['refused']} refused, "
-             f"{counts['hub']} the Hub refuses", "", "| model | commit | outcome | parameters or reason |",
+             f"{counts['killed']} killed, {counts['hub']} the Hub refuses", "",
+             "| model | commit | outcome | parameters or reason |",
              "|---|---|---|---|"]
     for result in sorted(results, key=lambda result: (order[result.outcome], result.id)):
         detail = (f"{result.parameters:,}" if result.parameters is not None

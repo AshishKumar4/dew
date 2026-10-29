@@ -32,7 +32,7 @@ from dew._records import integer, record as named_fields, strings, text as named
 from dew.batch import PARAMETER_ROOTS, Variables, thaw
 from dew.cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
-from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
+from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
 from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
@@ -535,21 +535,25 @@ class TextSettings(TaskSettings):
 @dataclass(frozen=True, kw_only=True)
 class MaskedSettings(TaskSettings):
     """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process,
-    the unmasking solver and its step count, and the end-of-sequence ids a response stops at,
-    beside the common ones."""
+    the unmasking solver (`Unmask`, or `Confident` for a release's blockwise walk) and its step
+    count, the places a blockwise walk unmasks together (`block`; None walks the whole response),
+    and the end-of-sequence ids a response stops at, beside the common ones."""
 
     process: DiscreteProcess
     solver: Solver
     sampling_steps: int
     eos_token_ids: tuple[int, ...] = ()
+    block: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer(self.sampling_steps, "sampling_steps")
         if len(self.eos_token_ids):
             object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
-        if not isinstance(self.solver, Unmask):
-            raise ValueError("a masked run's task unmasks with an Unmask solver")
+        if not isinstance(self.solver, Unmask | Confident):
+            raise ValueError("a masked run's task unmasks with an Unmask or a Confident solver")
+        if self.block is not None:
+            integer(self.block, "block")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -933,22 +937,24 @@ class BlockGeneration(_NativeTextTask):
 
 @dataclass(frozen=True)
 class MaskedGeneration(_NativeTextTask):
-    """Samples a whole response with native MDLM, holding the prompt fixed.
+    """Samples a response with native MDLM, holding the prompt fixed: the whole response at once
+    (`Unmask`), or a block of `block` places at a time as LLaDA2's releases walk
+    (`DiscreteProcess.generate`'s `block`, `Confident`'s reveal).
 
-    It does not reproduce the source-specific remasking recipes of LLaDA or
-    Dream. EOS trims the finished response after the bidirectional
-    denoising, and does not end that denoising early. Results hold
-    refinement counts and no autoregressive action likelihoods. When a call
-    passes none, it uses the task's `steps`, its `max_new_tokens` response
-    length and its `n` continuations per prompt.
+    It does not reproduce LLaDA's or Dream's own remasking recipes. A whole-response walk's EOS
+    trims the finished response and does not end its denoising early; a blockwise walk stops a
+    row after the block that revealed its end. Results hold refinement counts and no
+    autoregressive action likelihoods. When a call passes none, it uses the task's `steps`, its
+    `max_new_tokens` response length and its `n` continuations per prompt.
     """
 
     model: nn.Module
     variables: Variables
     process: DiscreteProcess
     processor: Processor | None = None
-    solver: Unmask = dataclasses.field(default_factory=Unmask)
+    solver: Unmask | Confident = dataclasses.field(default_factory=Unmask)
     steps: int = MDLM_STEPS
+    block: int | None = None
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
     max_new_tokens: int | None = None
@@ -994,9 +1000,9 @@ class MaskedGeneration(_NativeTextTask):
         `processor`: their process, solver, step count, end-of-sequence ids and response budget. A
         live objective (`MaskedDiffusionObjective.build_task`) and a saved run (`from_saved`) build it
         alike."""
-        assert isinstance(settings.solver, Unmask)
+        assert isinstance(settings.solver, Unmask | Confident)
         return cls(model, variables, settings.process, processor, solver=settings.solver,
-                   steps=settings.sampling_steps, eos_token_ids=settings.eos_token_ids,
+                   steps=settings.sampling_steps, block=settings.block, eos_token_ids=settings.eos_token_ids,
                    max_new_tokens=settings.max_new_tokens or None)
 
 
@@ -1011,7 +1017,7 @@ class MaskedGeneration(_NativeTextTask):
             generated = self.process.generate(self.model, self.placed, inputs, budget, key=random_key,
                 solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
-                eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+                eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id, block=self.block)
             return self._decoded(generated)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:

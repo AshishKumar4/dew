@@ -6,6 +6,7 @@ are the verdict, runs none of them: the file carries no `kernel` mark."""
 import dataclasses
 import functools
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -398,36 +399,66 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
     return {form for form in forms if takes(form)}
 
 
+GATE_PARTS = 6
+"""The parts each generation's compile gate runs in apart (`test_each_gemm_mainloop_compiles_at_its_picks`),
+each within a CI group's time: sm90's 85 distinct kernels at about 4.7 s each (GATEPROF1, GATECOUNT1)."""
+
+
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
-def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, shape):
-    """Every GEMM Mosaic GPU launch form a generation emits at a real projection (`_gemm_mainloop_cases`),
-    at the tile its launch derives from the generation's facts and at each tile the derivation refused for
-    its registers, compiled by Mosaic for a compile-only device of the generation on this CPU through
-    ptxas: within the block's shared memory, spilling nothing, and its register model deciding as ptxas's
-    least spill-free need does (`kernel_compile.mosaic_failures`). A GPU whose family has no bundle
-    (`bundles.of`: a B200's tcgen05, consumer Blackwell's TMA-fed mma.sync) runs none."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
+def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
+    """Every GEMM Mosaic GPU launch form a generation's family emits (`_emitted_forms`) derives a tile at
+    every real projection (`_gemm_mainloop_cases`): an eligibility regression fails here rather than leaving
+    the compile gate fewer cases. A GPU whose family has no bundle (`bundles.of`: a B200's tcgen05, consumer
+    Blackwell's TMA-fed mma.sync) emits none."""
     cases = _gemm_mainloop_cases(generation_name, shape)
-    # Every form the generation's family emits derives a tile at every shape: an eligibility regression
-    # fails here rather than leaving the gate fewer cases.
     forms = _emitted_forms(bundles.of(generation_name, jnp.bfloat16), shape)
     assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
+
+
+def _gate_cases(generation_name: str) -> list:
+    """Every projection's cases (`_gemm_mainloop_cases`), each distinct kernel once: a form at a tile is
+    one kernel at every projection that derives it, its band (`Tiles.grid_block_n`, the order its tiles
+    are walked) apart, its shared memory and registers the tile's."""
+    found = {}
+    for shape in GEMM_SHAPES:
+        for case in _gemm_mainloop_cases(generation_name, shape):
+            kernel = re.sub(r"grid_block_n=\d+, ", "", case.name)
+            found.setdefault(kernel, case)
+    return list(found.values())
+
+
+@pytest.mark.parametrize("part", range(GATE_PARTS))
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
+def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, part):
+    """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), at the
+    tile its launch derives from the generation's facts and at each tile the derivation refused for its
+    registers, compiled by Mosaic for a compile-only device of the generation on this CPU through ptxas, in
+    `GATE_PARTS` parts: within the block's shared memory, spilling nothing, and its register model deciding
+    as ptxas does (`kernel_compile.mosaic_failures`)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    cases = _gate_cases(generation_name)[part::GATE_PARTS]
     found = compile_mosaic_kernels(cases, generation_name)
     failed = mosaic_failures(found)
     assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
+FAMILY_PARTS = 3
+"""The parts the family contract compiles in apart, each within a CI group's time (sm90's whole, 294 s,
+train 270's CI)."""
+
+
+@pytest.mark.parametrize("part", range(FAMILY_PARTS))
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
-def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
+def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, part):
     """The whole contract a Mosaic GPU Family bundle offers its templates, compiled through ptxas for a
     compile-only GPU of the generation on this CPU with the JAX this checkout pins, before any consumer
     adopts a Family head: every launch form it emits (`_emitted_forms`: plain and transposed right
     operands, 16-bit and fp32 stores, fixed and streamed side vectors and tiles, several outputs, the
     running sum) at one consumer and at the family's most (`_gemm_mainloop_cases(every_consumer_count=
-    True)`). Every form and count must be present and lower, within the block, spilling nothing. No version
-    guard skips it: a JAX that breaks the contract fails here."""
+    True)`). Every form and count must be present, and each lower, within the block, spilling nothing, in
+    `FAMILY_PARTS` parts. No version guard skips it: a JAX that breaks the contract fails here."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     family = bundles.of(generation_name, jnp.bfloat16)
@@ -437,6 +468,7 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
+    cases = cases[part::FAMILY_PARTS]
     found = compile_mosaic_kernels(cases, generation_name)
     failed = mosaic_failures(found)
     assert len(found) == len(cases) and not failed, "\n".join(failed)

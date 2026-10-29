@@ -1887,6 +1887,19 @@ class SourceCode:
 
 
 @dataclass(frozen=True)
+class MaskedWalk:
+    """How a masked diffusion release generates, its own recipe: a response walked `block` places at a
+    time over `steps` each, drawing at `temperature` and revealing the draws past `threshold` of their
+    distribution, else a quota's most confident (`dew.diffusion.discrete.Confident`), as LLaDA2.0's
+    `generate` defaults do (modeling_llada2_moe.py's block_length, steps, threshold and temperature)."""
+
+    block: int
+    steps: int
+    threshold: float
+    temperature: float
+
+
+@dataclass(frozen=True)
 class DecoderFamily:
     """Holds one family's config, tensor paths and export vocabulary.
 
@@ -1975,6 +1988,10 @@ class DecoderFamily:
     """Config fields whose explicit null disables a component. Other null export fields remove
     a generic field the family does not read; these survive as JSON null instead of taking the
     source config class's default."""
+    masked_walk: Callable[[Mapping[str, object]], MaskedWalk | None] | None = None
+    """The release's own generation recipe for a masked diffusion source that walks in blocks, by its
+    config (`MaskedWalk`), which its task runs (`PretrainedMaskedDecoder.masked_recipe`); None, or a
+    config it maps to None, unmasks the whole response with Dew's MDLM."""
     padding_idx: bool = False
     """Whether the source builds its token embeddings with padding_idx=config.pad_token_id
     (nn.Embedding's, or Gemma's scaled word embedding over it), so the pad row takes no gradient
