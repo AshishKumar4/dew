@@ -64,42 +64,67 @@ def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
     assert jnp.array_equal(generated, argmax_walk(model, params, prompt, 2))
 
 
+DRAWN_SEEDS = 16
+"""The drawn tokens' log probabilities' declared draws of prompts against a full forward (check 1), sized
+by `seeds_for` paired with the decode on the CPU."""
+
+
 def test_drawn_tokens_continue_the_prompts_positions_as_its_response_does(rng):
     """The cache continues a prompt's logical positions by the rule its
     response does (`ModelInputs.extended`): from its last real token's, which
     a document reset lowered below an earlier one in the first two rows, and
     past a left-padded row's offset ones and a plain row's. The greedy decode
     is then the walk of a full forward over the request extended token by
-    token, and each drawn token's log probability is as exact as that
-    forward's (tests/reference_error.py)."""
-    from reference_error import assert_as_exact_as_the_reference, widened
+    token, and each drawn token's log probability is on par with that
+    forward's from its float64 run over drawn prompts (check 1)."""
+    from reference_error import as_given, assert_as_exact, widened
 
     from dew.nn.inputs import ModelInputs
 
     model = tiny()
-    prompt = ModelInputs(jax.random.randint(rng, (4, 5), 0, VOCAB), {
+    metadata = {
         "positions": jnp.asarray([[0, 1, 2, 0, 1], [5, 6, 7, 8, 0], [0, 3, 4, 5, 6], [0, 1, 2, 3, 4]],
                                  jnp.int32),
         "attention_mask": jnp.asarray([[1, 1, 1, 1, 1], [1, 1, 1, 1, 1], [0, 1, 1, 1, 1], [1, 1, 1, 1, 1]],
-                                      bool)})
-    params = model.init(rng, prompt.tokens)
-    generated = generate(model, params, prompt, 8, key=jax.random.PRNGKey(0),
-                         sampling=Sampling(temperature=0))
-    walked = prompt
-    for _ in range(8):
-        logits = model.apply(params, walked.tokens, **walked.kwargs())[:, -1]
-        walked = walked.extended(jnp.argmax(logits, axis=-1)[:, None].astype(jnp.int32))
-    np.testing.assert_array_equal(generated.tokens, walked.tokens)
+                                      bool)}
+    params = model.init(rng, jnp.zeros((4, 5), jnp.int32))
+
+    def draw(seed):
+        return (np.asarray(jax.random.randint(jax.random.key(seed), (4, 5), 0, VOCAB)),)
+
+    def walk(tokens):
+        """The request extended token by token by a full forward's greedy choice."""
+        walked = ModelInputs(jnp.asarray(tokens), metadata)
+        for _ in range(8):
+            logits = model.apply(params, walked.tokens, **walked.kwargs())[:, -1]
+            walked = walked.extended(jnp.argmax(logits, axis=-1)[:, None].astype(jnp.int32))
+        return walked
 
     def scored(model, params):
-        """Each drawn token's log probability under a full forward over the walk."""
-        log_probs = jax.nn.log_softmax(model.apply(params, walked.tokens, **walked.kwargs())[:, 4:-1])
-        return jnp.take_along_axis(log_probs, walked.tokens[:, 5:, None], axis=-1)[..., 0]
+        """Each drawn token's log probability under a full forward over the float32 walk."""
+        def run(tokens):
+            walked = walk(np.asarray(tokens))
+            log_probs = jax.nn.log_softmax(model.apply(params, walked.tokens, **walked.kwargs())[:, 4:-1])
+            return np.asarray(jnp.take_along_axis(log_probs, walked.tokens[:, 5:, None], axis=-1)[..., 0])
+        return as_given(run)
 
-    with jax.enable_x64(new_val=True):
-        truth = scored(tiny(dtype=jnp.float64), widened(params))
-    assert_as_exact_as_the_reference(generated.raw_log_probs, scored(model, params), truth,
-                                     "drawn log probabilities")
+    @as_given
+    def drawn(tokens):
+        generated = generate(model, params, ModelInputs(jnp.asarray(tokens), metadata), 8,
+                             key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0))
+        np.testing.assert_array_equal(generated.tokens, walk(np.asarray(tokens)).tokens)
+        return np.asarray(generated.raw_log_probs)
+
+    def truth(tokens):
+        # The float32 walk's tokens, then the float64 forward's log probabilities of them.
+        with jax.enable_x64(new_val=False):
+            walked = walk(np.asarray(tokens))
+        wide, held = tiny(dtype=jnp.float64), widened(params)
+        log_probs = jax.nn.log_softmax(wide.apply(held, walked.tokens, **walked.kwargs())[:, 4:-1])
+        return np.asarray(jnp.take_along_axis(log_probs, walked.tokens[:, 5:, None], axis=-1)[..., 0])
+
+    assert_as_exact(drawn, scored(model, params), draw, "drawn log probabilities", seeds=DRAWN_SEEDS,
+                    truth_fn=as_given(truth))
 
 
 def test_sampling_stays_in_the_vocab_and_reacts_to_the_rng(rng):
