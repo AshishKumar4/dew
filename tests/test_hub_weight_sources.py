@@ -4,7 +4,6 @@ safetensors conversion of that commit where one sits on it, fetching none of its
 pickles where none does (`sources.snapshot`); the same load offline reads what the online one cached. A
 directory holding GGUF files alone, other pickles alone or no weights is refused, naming what loads."""
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,9 +11,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict
-from local_hub import LocalHub, Pull
+from local_hub import LocalHub, Pull, hub_environment
 from safetensors.numpy import load_file
-from tool_support import REPO_ROOT
 
 from dew.interop import Pretrained
 
@@ -64,18 +62,6 @@ def assert_the_fixture(found: dict[str, np.ndarray]) -> None:
         np.testing.assert_array_equal(found[name], leaf, err_msg=name)
 
 
-def environment(hub: LocalHub | None, root: Path, *, offline: bool = False) -> dict:
-    """A load's environment: the hub's endpoint, the Hub cache, the recorded Hub answers and Dew's pickle
-    conversions under `root`, offline where asked."""
-    # The Hub client reads either offline switch.
-    kept = {name: value for name, value in os.environ.items()
-            if name not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_ENDPOINT")}
-    return {**kept, **({} if hub is None else {"HF_ENDPOINT": hub.endpoint}),
-            **({"HF_HUB_OFFLINE": "1"} if offline else {}),
-            "HF_HUB_CACHE": str(root / "hub"), "DEW_HUB_ANSWERS": str(root / "answers"),
-            "XDG_CACHE_HOME": str(root / "cache"), "PYTHONPATH": str(REPO_ROOT / "src")}
-
-
 def test_a_pickle_commit_loads_sfconvertbots_conversion_of_it_and_offline_what_it_cached(tmp_path):
     """A commit holding transformers' pickles alone, with SFconvertbot's open conversion pull request on
     it, loads the conversion's safetensors: llama-tiny leaf for leaf, and not one byte of the pickle
@@ -85,10 +71,10 @@ def test_a_pickle_commit_loads_sfconvertbots_conversion_of_it_and_offline_what_i
     conversion = Pull(CONVERSION, "SFconvertbot",
                       {**files, "model.safetensors": FIXTURE / "model.safetensors"})
     with LocalHub({"local/pickled": files}, {"local/pickled": {1: conversion}}) as hub:
-        assert_the_fixture(loaded("local/pickled", environment(hub, tmp_path), tmp_path / "online.npz"))
+        assert_the_fixture(loaded("local/pickled", hub_environment(hub, tmp_path), tmp_path / "online.npz"))
         assert hub.sent("local/pickled", "pytorch_model.bin") == []
         assert hub.sent("local/pickled", "model.safetensors")
-    offline = environment(None, tmp_path, offline=True)
+    offline = hub_environment(None, tmp_path, offline=True)
     assert_the_fixture(loaded("local/pickled", offline, tmp_path / "offline.npz"))
 
 
@@ -100,7 +86,7 @@ def test_a_pickle_commit_without_a_conversion_converts_its_pickles(pull, tmp_pat
     one of another title) fetches its pickle and loads its conversion: llama-tiny leaf for leaf."""
     files = {"config.json": FIXTURE / "config.json", "pytorch_model.bin": pickled(tmp_path / "pickles")}
     with LocalHub({"local/pickled": files}, None if pull is None else {"local/pickled": {1: pull}}) as hub:
-        assert_the_fixture(loaded("local/pickled", environment(hub, tmp_path), tmp_path / "loaded.npz"))
+        assert_the_fixture(loaded("local/pickled", hub_environment(hub, tmp_path), tmp_path / "loaded.npz"))
         assert hub.sent("local/pickled", "pytorch_model.bin")
 
 
