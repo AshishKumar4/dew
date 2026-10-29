@@ -568,15 +568,17 @@ TEXT_FP8 = ["model.language_model.layers.0.mlp.down_proj", "lm_head"]
 """The wrapper's language-model modules the ModelOpt scenarios store in FP8."""
 
 
-@pytest.mark.parametrize("table", ["modules", "container", "nested", "tower alone"])
+@pytest.mark.parametrize("table", ["modules", "container", "nested head", "nested", "tower alone"])
 def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_and_all(table, tmp_path):
     """A Qwen3.5 wrapper whose ModelOpt per-layer table puts a projection, the head and a tower's layer in
     FP8 loads `text_only` as the text checkpoint quantized alike does: the table keyed by the text
     family's names, the tower's entry dropped, the head's scales read beside it, its variables that
     checkpoint's leaf for leaf and its logits that checkpoint's. So does a table that names a layer's
     projections by their container (`model.language_model.layers.0.mlp`), each a module of the text
-    checkpoint's table, one declared on the wrapper's text_config, and one whose tower's layer alone is
-    quantized, whose language model is the dense text checkpoint."""
+    checkpoint's table, one whose head the wrapper stores under its language model
+    (`model.language_model.lm_head`) beside a longer key under the container, one declared on the
+    wrapper's text_config, and one whose tower's layer alone is quantized, whose language model is the
+    dense text checkpoint."""
     import shutil
 
     from dew.interop import Pretrained
@@ -585,11 +587,19 @@ def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_an
     tower = "model.visual.blocks.0.attn.qkv"
     fp8 = {"quant_algo": "FP8"}
     mlp = [f"model.language_model.layers.0.mlp.{name}_proj" for name in ("gate", "up", "down")]
-    texts = {"modules": TEXT_FP8, "container": [*mlp, "lm_head"], "nested": TEXT_FP8,
-             "tower alone": []}[table]
-    tables = {"container": {"model.language_model.layers.0.mlp": fp8, "lm_head": fp8, tower: fp8}}
+    texts = {"modules": TEXT_FP8, "container": [*mlp, "lm_head"], "nested head": [*mlp, "lm_head"],
+             "nested": TEXT_FP8, "tower alone": []}[table]
+    tables = {"container": {"model.language_model.layers.0.mlp": fp8, "lm_head": fp8, tower: fp8},
+              "nested head": {"model.language_model.layers.0.mlp": fp8, mlp[2]: fp8,
+                              "model.language_model.lm_head": fp8, tower: fp8}}
     wrapper = modelopt_fp8(Path(shutil.copytree(source, tmp_path / "wrapper")), [*texts, tower],
                            table=tables.get(table), nested=table == "nested")
+    if table == "nested head":
+        from dew.interop.safetensors_io import read_file, write_file
+
+        stored, _ = read_file(wrapper / "model.safetensors")
+        write_file({f"model.language_model.{name}" if name.startswith("lm_head.") else name: value
+                    for name, value in stored.items()}, wrapper / "model.safetensors", {"format": "pt"})
     plain = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
     plain.save(tmp_path / "text")
     renamed = [module.replace("model.language_model.", "model.") for module in texts]

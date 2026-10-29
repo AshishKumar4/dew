@@ -569,25 +569,30 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
     `.weight` routes; a pattern (`re:`, matched as compressed-tensors matches it, from a module name's
     start) is resolved over the wrapper's own modules, those of `inventory`'s tensor names, into the
     text names of the language model's it matches; an entry no wrapper module is named by (a class, as
-    `Linear`) applies to either checkpoint alike and stays. A ModelOpt key naming a container, which
-    the codec reads as every module beneath it a longer key does not name (`_modelopt_algo`), names
-    each of the language model's modules it selects so. The record is the wrapper's or its
-    text_config's (`codecs.quantization_record`); None where it is ModelOpt's and no layer of the
-    language model survives, which is a dense text checkpoint."""
+    `Linear`) applies to either checkpoint alike and stays. ModelOpt's table is read per weight of the
+    wrapper's inventory, each taking the longest key naming its module or a container of it, as the
+    codec reads it (`_modelopt_algo`), and keyed by the text name of the language model's. The record
+    is the wrapper's or its text_config's (`codecs.quantization_record`); None where it is ModelOpt's
+    and no layer of the language model survives, which is a dense text checkpoint."""
     from dew.interop.codecs import quantization_record
 
     quantization = dict(_records.record(quantization_record(hf_config), "quantization_config"))
-    modules: list[str] | None = None
+    listed: Collection[str] | None = None
+
+    def names() -> Collection[str]:
+        nonlocal listed
+        if listed is None:
+            listed = inventory()
+            if listed is None:
+                raise ValueError("text_only resolves a quantization selection over the wrapper's tensor "
+                                 "names, which this checkpoint states nowhere before its weights load")
+        return listed
 
     def wrapper_modules() -> list[str]:
-        nonlocal modules
-        if modules is None:
-            names = inventory()
-            if names is None:
-                raise ValueError("text_only resolves a quantization pattern over the wrapper's tensor names, "
-                                 "which this checkpoint states nowhere before its weights load")
-            modules = sorted({name.rsplit(".", 1)[0] for name in names if "." in name})
-        return modules
+        return sorted({name.rsplit(".", 1)[0] for name in names() if "." in name})
+
+    def wrapper_weights() -> list[str]:
+        return sorted(name.removesuffix(".weight") for name in names() if name.endswith(".weight"))
 
     def renamed(module: str) -> str | None:
         component, name = wrapper_route(f"{module}.weight", record)
@@ -617,19 +622,14 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
         layers = {str(module): entry for module, entry in
                   _records.record(quantization["quantized_layers"], "quantized_layers").items()}
 
-        def selecting(module: str) -> str | None:
-            # The longest key naming the module or a container of it, as the codec reads the table.
-            return max((key for key in layers if module == key or module.startswith(key + ".")),
-                       key=len, default=None)
-
+        # Each of the wrapper's weights takes the longest key naming its module or a container of it, as
+        # the codec reads the table (`_modelopt_algo`), keyed by its text name.
         table: dict[str, object] = {}
-        for key, entry in layers.items():
-            try:
-                named = [renamed(key)]
-            except ValueError:  # a container: each module beneath it the key selects
-                named = [renamed(module) for module in wrapper_modules()
-                         if module.startswith(key + ".") and selecting(module) == key]
-            table.update({name: entry for name in named if name is not None})
+        for module in wrapper_weights():
+            key = max((key for key in layers if module == key or module.startswith(key + ".")), key=len,
+                      default=None)
+            if key is not None and (name := renamed(module)) is not None:
+                table[name] = layers[key]
         if not table:
             return None
         quantization["quantized_layers"] = table

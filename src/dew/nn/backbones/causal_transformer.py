@@ -880,7 +880,7 @@ class CausalTransformer(nn.Module):
             copies = (self.mtp_hyper_connections.hc_mult
                       if relative[1] == 'h_proj' and self.mtp_hyper_connections is not None else 1)
             return rows[depth][0] * copies
-        if relative[0] in ('lm_head', 'head_dense', 'continuum'):
+        if relative[0] in ('lm_head', 'head_dense', 'continuum', 'project_out'):
             return np.concatenate([np.empty((0,), np.int64), *(outputs for _, outputs in rows)])
         return np.zeros_like(lengths)
 
@@ -1518,7 +1518,7 @@ class CausalTransformer(nn.Module):
             raise ValueError("this model has no DSpark drafter")
         hc = self.hyper_connections
         assert hc is not None
-        return dspark_draft(self.dspark_stages, self.dspark, self.token_embeddings, self._logits,
+        return dspark_draft(self.dspark_stages, self.dspark, self.stream_embeddings, self._logits,
                             hc, context, tokens, decode=decode, valid=valid, choose=choose)
 
     def reach_drafter(self, tokens, dtype):
