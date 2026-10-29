@@ -63,17 +63,17 @@ import numpy as np
 import torch
 from kimi_k3_reference import (
     LEARNING_RATE,
-    fixture_batch,
+    fixture_on_gpu,
     float64_truth,
     greedy,
     record_orders,
     scatter,
     sgd_step,
     symmetric,
+    write_fixture,
     write_truth,
 )
 from reference_source import config_lookups, hub_modules, record_padding
-from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 REVISION = "e1df551a447157d4658b573f9a695d57658590e9"
@@ -211,15 +211,8 @@ def main() -> None:
     model.config._attn_implementation = "eager"
     scatter(model)
     tensors = {name: parameter.detach().cpu().contiguous().clone() for name, parameter in model.named_parameters()}
-    save_file(tensors, str(DESTINATION / "model.safetensors"))
-    (DESTINATION / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    generation = {"bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0}
-    (DESTINATION / "generation_config.json").write_text(json.dumps(generation, indent=2) + "\n")
-
-    model = model.cuda().eval()
-    ids, mask = fixture_batch()
-    input_ids = torch.tensor(ids, device="cuda")
-    attention_mask = torch.tensor(mask, device="cuda")
+    write_fixture(DESTINATION, tensors, config)
+    model, ids, mask, input_ids, attention_mask = fixture_on_gpu(model)
     logits, loss, updated = sgd_step(model, input_ids, attention_mask, lambda name: True)
     with torch.no_grad():
         for name, parameter in model.named_parameters():

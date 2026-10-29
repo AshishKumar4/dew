@@ -121,6 +121,22 @@ def fixture_batch() -> tuple[np.ndarray, np.ndarray]:
     return ids, mask
 
 
+def write_fixture(destination: Path, tensors: dict[str, torch.Tensor], config: dict) -> None:
+    """The fixture's weights, config and generation config written to `destination`."""
+    save_file(tensors, str(destination / "model.safetensors"))
+    (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    generation = {"bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0}
+    (destination / "generation_config.json").write_text(json.dumps(generation, indent=2) + "\n")
+
+
+def fixture_on_gpu(model: torch.nn.Module):
+    """`model` on the GPU in eval mode, with the fixture's batch (`fixture_batch`), as arrays and on the
+    GPU."""
+    ids, mask = fixture_batch()
+    on_gpu = model.cuda().eval()
+    return on_gpu, ids, mask, torch.tensor(ids, device="cuda"), torch.tensor(mask, device="cuda")
+
+
 def sgd_step(model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor,
              trained: Callable[[str], bool], rate: float = LEARNING_RATE):
     """The logits, the mean next-token loss over targets whose input and
@@ -250,15 +266,8 @@ def main() -> None:
                     parameter.detach().cpu(), (0, width - parameter.numel()))
             else:
                 tensors[name] = parameter.detach().cpu().contiguous().clone()
-    save_file(tensors, str(DESTINATION / "model.safetensors"))
-    (DESTINATION / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    generation = {"bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0}
-    (DESTINATION / "generation_config.json").write_text(json.dumps(generation, indent=2) + "\n")
-
-    model = model.cuda().eval()
-    ids, mask = fixture_batch()
-    input_ids = torch.tensor(ids, device="cuda")
-    attention_mask = torch.tensor(mask, device="cuda")
+    write_fixture(DESTINATION, tensors, config)
+    model, ids, mask, input_ids, attention_mask = fixture_on_gpu(model)
     logits, loss, updated = sgd_step(
         model, input_ids, attention_mask, lambda name: name.startswith("language_model."))
     for name, parameter in model.named_parameters():
@@ -389,7 +398,7 @@ def orders(drawn: Path) -> None:
     """The reference's own rounding draws over the residual orders
     tools/rounding_orders.py wrote under `drawn`, in MXFP4's groups of 32
     (`record_orders`)."""
-    configuration, modeling, linear = released_modules()
+    configuration, modeling, _ = released_modules()
     config = json.loads((DESTINATION / "config.json").read_text())
     model = modeling.KimiK3ForConditionalGeneration(
         configuration.KimiK3Config(**copy.deepcopy(config))).float()

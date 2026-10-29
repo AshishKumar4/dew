@@ -21,10 +21,10 @@ refused, as no truth runs one.
 
 import contextlib
 import importlib
+import itertools
 
 import torch
 import torch.nn.functional as F
-
 from torch_precision import replaced
 
 
@@ -32,8 +32,7 @@ def sequences(cu_seqlens: torch.Tensor | None, tokens: int) -> list[tuple[int, i
     """Each sequence's [start, end) of a call's tokens: `cu_seqlens`'s, else the whole."""
     if cu_seqlens is None:
         return [(0, tokens)]
-    bounds = cu_seqlens.tolist()
-    return list(zip(bounds[:-1], bounds[1:], strict=True))
+    return list(itertools.pairwise(cu_seqlens.tolist()))
 
 
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
