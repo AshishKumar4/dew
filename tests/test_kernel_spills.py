@@ -193,13 +193,17 @@ def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
 
 
 def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():
-    """Within `jax.grad`, `jax.vmap` or an enclosing jit a program is its jit, traced into theirs; called
+    """Within `jax.grad`, `jax.vmap` or an enclosing jit a program is its jit, traced into theirs, its
+    tracers its arguments or ones its function closes over, and under `jax.disable_jit` Python; called
     alone, it keys a static argument by its type as its value, as jit does (True and 1 are two programs),
     and keeps dynamic an argument its jit, given both its static positions and names, takes as one."""
     squared = program(lambda x: x * x)
     assert jax.grad(squared)(3.0) == 6.0
     np.testing.assert_array_equal(jax.vmap(squared)(jnp.arange(3.0)), jnp.arange(3.0) ** 2)
     assert jax.jit(lambda x: squared(x) + 1)(2.0) == 5.0
+    assert jax.jit(lambda x: program(lambda: x * x)())(2.0) == 4.0
+    with jax.disable_jit():
+        assert program(lambda x: x if x > 0 else -x)(-1.0) == 1.0
 
     def scaled(x, flag):
         return x * 2 if type(flag) is bool else x * 3
