@@ -328,8 +328,9 @@ def float64_truth(model: torch.nn.Module, directory: Path,
     steps = fixture["step_logits"].shape[1]
     reached = np.concatenate([valid, np.ones((valid.shape[0], steps), bool)], 1)
     with torch.no_grad():
-        step_logits = np.stack([model(input_ids=torch.tensor(row[seen][:-1])[None]).logits[0, -steps:].numpy()
-                                for row, seen in zip(fixture["generated"], reached, strict=True)])
+        step_logits = np.stack([
+            model(input_ids=torch.tensor(row[seen][:-1])[None], use_cache=False).logits[0, -steps:].numpy()
+            for row, seen in zip(fixture["generated"], reached, strict=True)])
     logits, loss, updated = sgd_step(model, torch.tensor(fixture["input_ids"]),
                                      torch.tensor(fixture["attention_mask"]), trainable,
                                      rate=float(fixture["learning_rate"]))
