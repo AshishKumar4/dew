@@ -203,31 +203,43 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     out_ref, maxima_ref, over_ref = outs
     rows, block_k = TCGEN05.rows, tiles.block_k
     value_width = scratch.acc_tmem.shape[1]
-    q_pos = block.first + plgpu.broadcasted_iota(jnp.int32, (rows, block_k), 0, layout=TMEM)
-    columns = plgpu.broadcasted_iota(jnp.int32, (rows, block_k), 1, layout=TMEM)
+    # A chunk of `CHUNK` columns of a step's tile at a time: the softmax's chains over one row's whole tile
+    # spill (a whole 128-column tile's natural exponential, 7.9 KB a thread at sm100).
+    q_pos = block.first + plgpu.broadcasted_iota(jnp.int32, (rows, CHUNK), 0, layout=TMEM)
+    columns = plgpu.broadcasted_iota(jnp.int32, (rows, CHUNK), 1, layout=TMEM)
+    chunks = block_k // CHUNK
+
+    def logits(read, index, chunk, masked):
+        coords = algebra.Coords(q_pos, index * block_k + chunk * CHUNK + columns)
+        return algebra.logits_of(spec, read(chunk), coords, masked=masked)
 
     def step(index, carry, *, masked):
         m, total = carry
-        s = scratch.scores.read(index, block_k, layout=TMEM)(0)
-        # The next S may overwrite this one once it is read out (`Tensor.release`).
-        scratch.scores.release(index)
-        coords = algebra.Coords(q_pos, index * block_k + columns)
-        logits, products = algebra.logits_of(spec, s, coords, masked=masked)
-        m, alpha = algebra.peak(spec, m, logits, products)
-        weights = algebra.weights(spec, logits, m)
-        total = algebra.denominator_after(total, alpha, weights)
+        read = scratch.scores.read(index, CHUNK, layout=TMEM)
+        # The row's new maximum over the tile's chunks, and the factor the state before takes to it.
+        new = m
+        for chunk in range(chunks):
+            new, _ = algebra.peak(spec, new, *logits(read, index, chunk, masked))
+        m, alpha = algebra.peaked(spec, m, new)
 
         @pl.when(index > 0)
         def _():
-            # The last step's P V is in the accumulator: take it to this step's maximum, a chunk of
-            # columns at a time.
+            # The last step's P V is in the accumulator, its weights read: take the accumulator to this
+            # step's maximum, a chunk of columns at a time, before this step's weights overwrite them.
             plgpu.barrier_wait(scratch.o_done)
             for start in range(0, value_width, CHUNK):
                 chunk = mosaic_sm100.columns(scratch.acc_tmem, start, CHUNK)
                 acc = plgpu.async_load_tmem(chunk, layout=TMEM)
                 plgpu.async_store_tmem(chunk, algebra.rescale(acc, alpha))
 
-        plgpu.async_store_tmem(scratch.p_tmem, algebra.narrow(weights, dtype))
+        for chunk in range(chunks):
+            weights = algebra.weights(spec, logits(read, index, chunk, masked)[0], m)
+            total = (algebra.denominator_after(total, alpha, weights) if chunk == 0
+                     else total + weights.sum(axis=-1))
+            plgpu.async_store_tmem(mosaic_sm100.columns(scratch.p_tmem, chunk * CHUNK, CHUNK),
+                                   algebra.narrow(weights, dtype))
+        # The next S may overwrite this one once it is read out (`Tensor.release`).
+        scratch.scores.release(index)
         plgpu.commit_tmem()
         plgpu.barrier_arrive(scratch.p_full)
         return m, total

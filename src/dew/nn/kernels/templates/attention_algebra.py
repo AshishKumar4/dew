@@ -830,7 +830,13 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array, products: jax.Array | None =
         tile = s.max(axis=-1)
     else:
         tile = (products.max(axis=-1) if spec.factor > 0 else products.min(axis=-1)) * spec.factor
-    new = jnp.maximum(m, tile)
+    return peaked(spec, m, jnp.maximum(m, tile))
+
+
+def peaked(spec: Forward, m: jax.Array, new: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`peak`'s running maximum `new` (at least `m`) and the factor the state before it takes from `m` to
+    it: a mainloop that takes a tile's maximum a part of the tile at a time (`peak` of each) states the
+    tile's whole by it."""
     return new, carried(spec, m, _safe(spec, new))
 
 
