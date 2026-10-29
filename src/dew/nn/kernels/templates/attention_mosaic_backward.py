@@ -339,13 +339,12 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
             step = functools.partial(_dq_step, walk, operands, stats, coords_of, params_of, whole, share)
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
                      nothing + algebra.NO_SHIFT)
-            # The tiles before this block's first its partner reads.
-            family.passed(streams, streamed[0], lo, first=streamed[0])
-            (residual, mass, grads, weighed, keyed_mass, keyed_shift), accumulated = family.walk(
-                streams, ((step, lo, hi),), start, ((block_q, share[1]),) * (2 if walk.accurate else 1),
-                walk.interpret, first=streamed[0])
-            # The tiles past this block's last (a causal block whose diagonal ends first) its partner reads.
-            family.passed(streams, hi, streamed[1], first=streamed[0])
+            # The tiles its partner reads around its own (`Family.walk_own`).
+            (residual, mass, grads, weighed, keyed_mass, keyed_shift), accumulated = family.walk_own(
+                streams, views, (lo, hi), streamed, index,
+                lambda streams, lo, hi, counted: family.walk(
+                    streams, ((step, lo, hi),), start, ((block_q, share[1]),) * (2 if walk.accurate else 1),
+                    walk.interpret, first=counted))
             dq, *keyed = accumulated
             written = [(dq, dq_ref.at[rows])]
             if keyed_ref is not None:
@@ -592,7 +591,6 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, dk_ref, dv_ref, k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
-        fed = isinstance(family, mosaic.ConsumerFed)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
         streams = family.opened(streams, views)
@@ -615,20 +613,14 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             step = functools.partial(_fused_step, walk, (k_smem.at[index], v_smem.at[index]), rows_of,
                                      staged.at[index], coords_of, whole, adds)
             shapes = ((block_k, width), (block_k, width))
-            if fed:
-                # Its consumers feed the program's query stream themselves (`ConsumerFed`), every consumer
-                # walking the tiles any of its keys' readers reads (`Family.fed`): a tile none of a
-                # consumer's own keys sees is masked whole, its weights and its dQ zero (FlashAttention 3's
-                # two warpgroups a CTA, each its own keys over one query stream).
-                walked = family.fed(streams, views, *streamed, index)
-                _, (dk, dv) = family.walk(walked, ((step, *streamed),), (), shapes, walk.interpret,
-                                          first=streamed[0])
-            else:
-                # The tiles before this block's first reader its partner reads, and those past its last.
-                family.passed(streams, streamed[0], lo, first=streamed[0])
-                _, (dk, dv) = family.walk(streams, ((step, lo, hi),), (), shapes, walk.interpret,
-                                          first=streamed[0])
-                family.passed(streams, hi, streamed[1], first=streamed[0])
+            # The tiles its partner reads around its own (`Family.walk_own`); on a layout whose consumers
+            # feed their rings, every tile any of the program's keys' readers reads, a tile none of a
+            # consumer's own keys sees masked whole, its weights and its dQ zero (FlashAttention 3's two
+            # warpgroups a CTA, each its own keys over one query stream).
+            _, (dk, dv) = family.walk_own(
+                streams, views, (lo, hi), streamed, index,
+                lambda streams, lo, hi, counted: family.walk(streams, ((step, lo, hi),), (), shapes,
+                                                             walk.interpret, first=counted))
             out = (row, pl.ds(k_first, block_k), head)
             family.stored((dk, dv), (dk_ref.at[out], dv_ref.at[out]),
                           smem=out_smem.at[index, pl.ds(0, block_k)])
@@ -854,9 +846,6 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                 for ref, piece in zip(tile_refs, pieces, strict=True):
                     ref[row, head, pl.ds(k_first, block_k), pl.ds(first, piece.shape[1])] = piece
 
-            if not split:
-                # The tiles before this block's first reader its partner reads.
-                family.passed(streams, streamed[0], lo, first=streamed[0])
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first, keys_first=True,
                                           draw=None if drop_of is None else drop_of.draw(row, head))
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
@@ -866,19 +855,16 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             stage = _logits_stage(family, consumers, logits_stages, index)
             step = functools.partial(_dkv_step, walk, resident, rows_of, coords_of, params_of, store_tiles,
                                      shares, part, stage, adds)
-            # Its consumers' own loads of its query stream where they feed it (`Family.fed`).
-            fed = (family.fed(streams, views, lo, hi, index)
-                   if isinstance(family, mosaic.ConsumerFed) else streams)
-            key_sums, (dk, dv) = family.walk(fed, ((step, lo, hi),),
-                                             tuple(family.zeros((block_k,)) for _ in key_refs),
-                                             tuple((block_k, share) for _, share in shares), walk.interpret,
-                                             first=lo if split else streamed[0])
+            # The tiles its partner reads around its own, or its consumers' own loads of the query stream
+            # where they feed it, the one key block's readers (`Family.walk_own`).
+            key_sums, (dk, dv) = family.walk_own(
+                streams, views, (lo, hi), streamed, index,
+                lambda streams, lo, hi, counted: family.walk(
+                    streams, ((step, lo, hi),), tuple(family.zeros((block_k,)) for _ in key_refs),
+                    tuple((block_k, share) for _, share in shares), walk.interpret, first=counted))
             if stage is not None:
                 # The read turn's last phase, past the walk's last product, observed.
                 family.turn(stage[2], consumers, arrive=False)
-            if not split:
-                # The tiles past this block's last reader its partner reads.
-                family.passed(streams, hi, streamed[1], first=streamed[0])
             if tile_refs:
                 _unread_tiles(family, store_tiles, len(tile_refs), (block_k, count), (lo, hi), q_steps,
                               block_q, part[0])
@@ -983,14 +969,15 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
                 centred = algebra.centre_step(state, weights, products, seen, coords.k_pos, exponent)
                 return centred, accumulators
 
-            family.passed(streams, streamed[0], lo, first=streamed[0])
             # Every field a row vector of zeros (`algebra.centre_start`), `seen` false, each running sum
             # its leading axis's parts (`precision.added_to`): the layouts hold no unit axis.
             zero = family.zeros((block_q,))
             parts = running_sum((1,), jnp.float32).shape[0]
             start = algebra.Centre(zero, zero > 0, (zero,) * parts, (zero,) * parts)
-            centred, _ = family.walk(streams, ((step, lo, hi),), start, (), walk.interpret, first=streamed[0])
-            family.passed(streams, hi, streamed[1], first=streamed[0])
+            centred, _ = family.walk_own(
+                streams, views, (lo, hi), streamed, index,
+                lambda streams, lo, hi, counted: family.walk(streams, ((step, lo, hi),), start, (),
+                                                             walk.interpret, first=counted))
             rows_of = [part.astype(jnp.float32) for part in jax.tree.leaves(centred)]
             family.stored(tuple(family.as_row(part) for part in rows_of),
                           tuple(centre_ref.at[place, row, head, pl.ds(first, block_q)]

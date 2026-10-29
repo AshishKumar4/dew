@@ -339,10 +339,10 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
 
 
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
-              q_loaded, out_smem, row_smem, streams, turn, streamed: tuple, first, spans: _Spans | None,
-              hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
+              q_loaded, out_smem, row_smem, streams, views: dict, turn, streamed: tuple, first,
+              spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
               residuals: _Residuals | None, anchors: tuple | None = None, interpret: bool,
-              finished: tuple | None = None, fed: bool = False):
+              finished: tuple | None = None):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -378,13 +378,6 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                                 family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,)))
         start = start if live is None else algebra.headroomed(start, live)
     pl.when(consumer == 1)(turn)
-    if fed:
-        # Its consumers feed the stream themselves (`ConsumerFed`, `Family.fed`): every consumer walks the
-        # program's tiles, a tile none of its queries sees masked whole.
-        lo, hi = streamed
-    else:
-        # The slots before this block's first tile its partner reads, the turns it would have taken.
-        family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
 
     def scored(index, slots):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
@@ -418,25 +411,26 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         state = algebra.plain_step(spec, state, keys)
         return (state.m, state.total), (state.acc,)
 
-    trained = None
+    def walked(streams, lo, hi, counted):
+        if residuals is not None:
+            assert anchors is not None
+            known = algebra.Argmax(family.rows_of(anchors[0].at[state_rows]),
+                                   family.rows_of(anchors[1].at[state_rows]))
+            return _trained(spec, family, start, known, scored, value_of, (lo, hi), streams, counted,
+                            interpret=interpret)
+        if guard is not None:
+            return family.walk(streams, ((step, lo, hi),), start, (), interpret, first=counted)[0], None
+        rows, (acc,) = family.walk(streams, ((step, lo, hi),), (start.m, start.total),
+                                   ((tiles.block_q, value_width),), interpret, first=counted,
+                                   initial=(start.acc,))
+        return algebra.Partial(acc, *rows), None
+
+    # The slots its partner reads around its own, the turns it would have taken (`Family.walk_own`).
+    state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
+                                     between=lambda: (turn(), turn()))
     if residuals is not None:
-        assert anchors is not None
-        known = algebra.Argmax(family.rows_of(anchors[0].at[state_rows]),
-                               family.rows_of(anchors[1].at[state_rows]))
-        state, trained = _trained(spec, family, start, known, scored, value_of, (lo, hi), streams,
-                                  streamed[0], interpret=interpret)
         # The split sums as the walk left them, shift 0 (`algebra.split_residuals`' plain walk).
         family.stored((state.acc,), (residuals.others,), smem=out_smem)
-    elif guard is not None:
-        state, _ = family.walk(streams, ((step, lo, hi),), start, (), interpret, first=streamed[0])
-    else:
-        rows, (acc,) = family.walk(streams, ((step, lo, hi),), (start.m, start.total),
-                                   ((tiles.block_q, value_width),), interpret, first=streamed[0],
-                                   initial=(start.acc,))
-        state = algebra.Partial(acc, *rows)
-    if not fed:
-        # The slots past this block's last tile (a causal block whose diagonal ends first) its partner reads.
-        family.passed(streams, hi, streamed[1], first=streamed[0], between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
     overflowed = jnp.where(algebra.overflowed(state.acc), 1.0, 0.0)
     family.stored((family.as_row(state.m), family.as_row(overflowed)), status_views, smem=row_smem)
@@ -499,9 +493,9 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
 
 
 def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, peak_views: tuple, q_smem,
-                   q_loaded, row_smem, keys_smem, streams, turn, streamed: tuple, first,
+                   q_loaded, row_smem, keys_smem, streams, views: dict, turn, streamed: tuple, first,
                    spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks,
-                   interpret: bool, fed: bool = False) -> None:
+                   interpret: bool) -> None:
     """A peak walk's query block (batch row and head `place`): each row's keys' largest logit, in the walk's
     units, and the first key that holds it (`algebra.argmax`, the training walk's anchor, `algebra.anchored`),
     over the key tiles it reads through the family's key stream, the logits under the score hook as the
@@ -513,11 +507,6 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
     pl.when(consumer == 1)(turn)
-    if fed:
-        # Every consumer walks the program's tiles over the stream they feed (`_consumer`'s).
-        lo, hi = streamed
-    else:
-        family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
 
     def step(index, slots, arg, accumulators):
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place, whole,
@@ -529,9 +518,11 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
 
     start = algebra.Argmax(family.full((tiles.block_q,), -jnp.inf),
                            family.full((tiles.block_q,), 0, jnp.int32))
-    arg, _ = family.walk(streams, ((step, lo, hi),), start, (), interpret, first=streamed[0])
-    if not fed:
-        family.passed(streams, hi, streamed[1], first=streamed[0], between=lambda: (turn(), turn()))
+    arg, _ = family.walk_own(
+        streams, views, (lo, hi), streamed, consumer,
+        lambda streams, lo, hi, counted: family.walk(streams, ((step, lo, hi),), start, (), interpret,
+                                                     first=counted),
+        between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
     family.stored((family.as_row(arg.peak),), (peak_views[0],), smem=row_smem)
     family.stored((family.as_row(arg.key),), (peak_views[1],), smem=keys_smem)
@@ -590,14 +581,12 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
         def consumer(index):
             first = pair_first + index * block_q
             rows, state_rows = (row, pl.ds(first, block_q), head), (row, head, pl.ds(first, block_q))
-            fed = isinstance(family, mosaic.ConsumerFed)
-            walked = family.fed(streams, views, *streamed, index) if fed else streams
             if peaks:
                 peak_views = tuple(ref.at[state_rows] for ref in written)
                 _peak_consumer(program, spec, index, q_ref.at[rows], peak_views, q_smem.at[index],
                                q_loaded.at[index], row_smem.at[index], stages[0].at[index],
-                               walked, turn, streamed, first, spans_of, hooked_of, (row, head), hooks=hooks,
-                               interpret=interpret, fed=fed)
+                               streams, views, turn, streamed, first, spans_of, hooked_of, (row, head),
+                               hooks=hooks, interpret=interpret)
                 return
             status_ref, *outputs = written
             status = tuple(status_ref.at[place, *state_rows] for place in range(2))
@@ -612,10 +601,10 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             finished = None if training or not finishes else tuple(outputs[1].at[place, *state_rows]
                                                                         for place in range(2))
             _consumer(program, spec, index, q_ref.at[rows], out_view, status, q_smem.at[index],
-                      q_loaded.at[index], out_smem.at[index], row_smem.at[index], walked, turn, streamed,
-                      first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)), hooks=hooks,
-                      residuals=residuals, anchors=anchors_of, interpret=interpret, finished=finished,
-                      fed=fed)
+                      q_loaded.at[index], out_smem.at[index], row_smem.at[index], streams, views, turn,
+                      streamed, first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)),
+                      hooks=hooks, residuals=residuals, anchors=anchors_of, interpret=interpret,
+                      finished=finished)
 
         def producer():
             family.stream(streams, views, *streamed)
