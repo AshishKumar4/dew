@@ -27,14 +27,10 @@ from model_support import two_documents
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
 from token_support import token_rows
 
-from dew.nn.attention import (
-    NormalAttention,
-    attention_kernel,
-    causal_attention_mask,
-    exchanged_heads_attention,
-    gathered_keys_attention,
-    scaled_dot_product_attention,
-)
+from dew.nn.attention import attention_kernel, scaled_dot_product_attention
+from dew.nn.attention_blocks import NormalAttention
+from dew.nn.attention_masks import causal_attention_mask
+from dew.nn.attention_parallel import exchanged_heads_attention, gathered_keys_attention
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels.templates import attention as template
 from dew.nn.rope import rotary_freqs

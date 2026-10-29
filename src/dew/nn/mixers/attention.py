@@ -20,16 +20,17 @@ from jax.typing import DTypeLike
 
 from dew.batch import Coordinates, prefix_sum
 from dew.nn.attention import (
-    RMSNorm,
+    cudnn_takes_mask,
+    kernel_for_materialized_mask,
+    reference_only,
+    scaled_dot_product_attention,
+)
+from dew.nn.attention_masks import (
     alibi_bias,
     causal_attention_mask,
     chunk_mask,
-    cudnn_takes_mask,
-    kernel_for_materialized_mask,
     key_spans,
     max_attention_logits,
-    reference_only,
-    scaled_dot_product_attention,
     visibility_mask,
 )
 from dew.nn.blocks import normal_kernel
@@ -62,6 +63,7 @@ from dew.nn.kv_cache import (
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate

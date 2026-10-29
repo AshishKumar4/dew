@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 from flax.traverse_util import flatten_dict
@@ -49,6 +50,9 @@ from dew.nn.vision.gemma4 import (
 )
 from dew.registry import from_record, projectors, towers
 
+if TYPE_CHECKING:
+    from dew.nn.attention import AttentionImpl
+
 VISION_PREFIX = "model.encoder.vision_tower."
 PROJECTION_PREFIX = "model.encoder.embed_vision."
 """Where a DiffusionGemma checkpoint keeps its Gemma 4 tower's and embedder's tensors: under its
@@ -77,7 +81,7 @@ def text_config(config: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
-          attention_impl: str = "auto", max_seq_len: int | None = None) -> DiffusionGemma:
+          attention_impl: AttentionImpl = "auto", max_seq_len: int | None = None) -> DiffusionGemma:
     """Build the native `DiffusionGemma` module from a checkpoint's config, without allocating parameters.
 
     `config` is the `diffusion_gemma` wrapper config; any other config, or

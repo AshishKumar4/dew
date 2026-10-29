@@ -20,8 +20,8 @@ from process_support import READ_ONLY, REPO_ROOT, fresh, keeping_picks, run_pool
 from reference_error import equations
 
 from dew.nn.activations import gated_product
-from dew.nn.attention import stream_rms_normalized
 from dew.nn.kernels import generation, norm_swiglu, tuning
+from dew.nn.norms import stream_rms_normalized
 
 
 def seam(x, branch, scale):
