@@ -387,6 +387,14 @@ def record_key(python: str, row_name: str, held: str, inputs: str | None = None)
     return f"{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
 
 
+def green_key(held: str, key: str) -> str:
+    """Where a green row run on class `held` whose inputs hash to `key` (`cache_key`) is kept, apart from the
+    last run's record (`record_key`): every green run of a file on any inputs stays found by its own key, so a
+    run of another commit, which replaces the last record, loses none of them (`green_record`; owner,
+    2026-10-29: a lane's one-line change over a green verdict reran half its suite, its records replaced)."""
+    return f"{CACHE_PREFIX}-green/{held}/{key}"
+
+
 def key_parts(key: str) -> tuple[str, str, str]:
     """A record's key under its Python's prefix (`record_key`'s `<class>/<test file>/<group>`) as its class,
     its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
@@ -452,6 +460,13 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
         found = recorded(record_key(python, row(python, name, split), each, common), token)
         if found is not None and fresh(found, name, common):
             return found
+        # The last run's record is another commit's: its file's inputs, as that run found them, hashed here, name
+        # the green run of exactly these, kept by its key (`green_key`) whatever ran since.
+        if found is not None and found["depends"] is not None:
+            key = cache_key(common, name, parsed_row(found["row"]["name"])[2], found["depends"])
+            kept = recorded(green_key(each, key), token)
+            if kept is not None and kept["key"] == key:
+                return kept
     return None
 
 
@@ -1015,6 +1030,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
         # lane read, only once the first is written, so it is never newer.
         if written(record_key(python, row_["name"], held, common), token, body):
             written(record_key(python, row_["name"], held), token, body)
+            if key is not None:
+                written(green_key(held, key), token, body)
 
 
 def written(key: str, token: str, body: bytes) -> bool:

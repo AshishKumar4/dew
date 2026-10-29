@@ -1839,10 +1839,10 @@ def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
 
 def test_a_row_run_green_on_these_inputs_is_reused_though_another_commits_run_of_its_file_came_after(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A file's row run green on exactly a checkout's inputs is reused there whatever runs of the file on other
-    inputs came after it, as lanes' checks and trains of other commits run it all day: a lane's one-line change
-    over a green verdict reruns only what that line reaches (owner, 2026-10-29: a verdict found 272 of its own 504
-    green files reusable an hour later, the others' records replaced by other commits' runs)."""
+    """A file's row run green on exactly a checkout's inputs is reused there whatever runs of the file on
+    other inputs came after it, as lanes' checks and trains of other commits run it all day: a lane's one-line
+    change over a green verdict reruns only what that line reaches (owner, 2026-10-29: a verdict found 272 of
+    its own 504 green files reusable an hour later, the others' records replaced by other commits' runs)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     armada_task(ci, monkeypatch, verdict)
     test_c = tmp_path / "tests/test_c.py"
