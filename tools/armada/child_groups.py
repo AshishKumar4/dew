@@ -20,22 +20,26 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
 
 LIFELINES: dict[int, tuple[int, subprocess.Popen]] = {}
 """Each group's lifeline (`lifeline`), by its leader: the owner pipe's write end, and its process."""
+HELD = threading.Lock()
+"""`LIFELINES`'s, as CI starts and stops groups from a pool of threads (ci.py's gpu-lane): each entry is taken out
+under it by the one caller that closes its pipe, so no pipe is closed twice, nor another's that took its number."""
 
 
 def start(command: Sequence[str], **options) -> subprocess.Popen:
     """`command` as the leader of a session and process group of its own, `options` as Popen's, with its
     lifeline (`lifeline`) started first, so no instant leaves the group without one. The lifelines of groups
     that ended on their own are let go first, their pipes closed."""
-    for leader, (written, line) in list(LIFELINES.items()):
-        if line.poll() is not None:
-            os.close(written)
-            del LIFELINES[leader]
+    with HELD:
+        ended = [LIFELINES.pop(leader) for leader, (_, line) in list(LIFELINES.items()) if line.poll() is not None]
+    for written, _ in ended:
+        os.close(written)
     read, write = os.pipe2(os.O_CLOEXEC)
     lifeline = subprocess.Popen([sys.executable, __file__, str(read)], pass_fds=(read,),
                                 start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -48,7 +52,8 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
         lifeline.wait()
         raise
     os.write(write, f"{process.pid}\n".encode())
-    LIFELINES[process.pid] = (write, lifeline)
+    with HELD:
+        LIFELINES[process.pid] = (write, lifeline)
     return process
 
 
@@ -88,7 +93,9 @@ def stop(process: subprocess.Popen, *, interrupt: float | None = None, settle: f
     while (running := members(process.pid)) and time.monotonic() < deadline:
         time.sleep(0.01)
     # Its lifeline, told the group is stopped: it kills what is left and ends.
-    if held := LIFELINES.pop(process.pid, None):
+    with HELD:
+        held = LIFELINES.pop(process.pid, None)
+    if held:
         os.close(held[0])
         held[1].wait()
     return running
