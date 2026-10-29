@@ -12,11 +12,14 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator, Mapping
+import inspect
+import threading
+from collections.abc import Callable, Hashable, Iterator, Mapping
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
 import numpy as np
+from jax._src import config as jax_config
 from jax.sharding import Sharding
 
 from dew.devices import xla_flag
@@ -147,13 +150,103 @@ class JitArguments(TypedDict, total=False):
     out_shardings: Placements
 
 
+class Program[**P, R]:
+    """`function` jitted (`jax.jit`, under `arguments`), every compile of it read through the kernel
+    templates' reports (`dew.nn.kernels.templates.report.compiled`): where a launch's kernel spills, its
+    config is refused and the function traced afresh, by a new jit of a new callable past JAX's trace
+    cache, and compiled once more, the launch's derivation taking the next config. Called as its jit
+    is, it runs the executable that what jit keys its own on chooses (`_keyed`): the static arguments,
+    the others' structure, shapes, dtypes and placements, and the trace context; `lower` and `trace`
+    are its jit's."""
+
+    def __init__(self, function: Callable[P, R], **arguments):
+        self.function, self.arguments = function, arguments
+        self.jitted = self._jitted()
+        self.numbers, self.names = _statics(function, arguments.get("static_argnums"),
+                                            arguments.get("static_argnames"))
+        self._executables: dict[Hashable, jax.stages.Compiled] = {}
+        self._compiling = threading.Lock()
+
+    def _jitted(self) -> jax.stages.Wrapped:
+        @functools.wraps(self.function)
+        def traced(*args, **kwargs):
+            return self.function(*args, **kwargs)
+        return jax.jit(traced, **self.arguments)
+
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+        key, dynamic, named = self._keyed(args, kwargs)
+        executable = self._executables.get(key)
+        if executable is None:
+            with self._compiling:
+                executable = self._executables.get(key) or self.compiled(*args, **kwargs)
+                self._executables[key] = executable
+        return executable(*dynamic, **named)
+
+    def compiled(self, *args: P.args, **kwargs: P.kwargs) -> jax.stages.Compiled:
+        """The program over these arguments compiled through the kernel templates' reports, lowered
+        afresh where a kernel spills."""
+        from dew.nn.kernels.templates import report
+
+        return report.compiled(self.jitted.lower(*args, **kwargs),
+                               relower=lambda: self._jitted().lower(*args, **kwargs))
+
+    def lower(self, *args: P.args, **kwargs: P.kwargs) -> jax.stages.Lowered:
+        return self.jitted.lower(*args, **kwargs)
+
+    def trace(self, *args: P.args, **kwargs: P.kwargs) -> jax.stages.Traced:
+        return self.jitted.trace(*args, **kwargs)
+
+    def _keyed(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
+        """The key of the executable a call runs, and the arguments the executable takes, the static
+        ones dropped."""
+        numbers = {number % len(args) for number in self.numbers if -len(args) <= number < len(args)}
+        dynamic = tuple(arg for number, arg in enumerate(args) if number not in numbers)
+        named = {name: value for name, value in kwargs.items() if name not in self.names}
+        leaves, structure = jax.tree.flatten((dynamic, named))
+        statics = (tuple((number, args[number]) for number in sorted(numbers)),
+                   tuple(sorted((name, value) for name, value in kwargs.items() if name in self.names)))
+        return (len(args), statics, structure, tuple(map(_signature, leaves)),
+                jax_config.trace_context()), dynamic, named
+
+
+def _statics(function: Callable, numbers: int | tuple[int, ...] | None,
+             names: str | tuple[str, ...] | None) -> tuple[tuple[int, ...], frozenset[str]]:
+    """The static positions and names of `function` as `jax.jit` reads them: the ones given, and
+    where only one kind is, the other's from its signature."""
+    numbers = () if numbers is None else (numbers,) if isinstance(numbers, int) else tuple(numbers)
+    names = () if names is None else (names,) if isinstance(names, str) else tuple(names)
+    if bool(numbers) == bool(names):
+        return numbers, frozenset(names)
+    try:
+        parameters = list(inspect.signature(function).parameters.values())
+    except (TypeError, ValueError):
+        return numbers, frozenset(names)
+    positional = [parameter.name for parameter in parameters
+                  if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
+    if names:
+        return tuple(positional.index(name) for name in names if name in positional), frozenset(names)
+    named = {parameter.name for parameter in parameters if parameter.kind == parameter.POSITIONAL_OR_KEYWORD}
+    return numbers, frozenset(positional[number] for number in numbers
+                              if -len(positional) <= number < len(positional)
+                              and positional[number] in named)
+
+
+def _signature(leaf) -> Hashable:
+    """What jit keys an argument on: an array's abstract value (shape, dtype, weak type) and
+    placement, another value's type, shape and dtype."""
+    if isinstance(leaf, jax.Array):
+        return leaf.aval, leaf.sharding, leaf.committed
+    return type(leaf), np.shape(leaf), np.result_type(leaf)
+
+
 def program[**P, R](function: Callable[P, R], *models: Held,
                     step: Mapping[str, Option] | None = None,
-                    **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
+                    **arguments: Unpack[JitArguments]) -> Program[P, R]:
     """`function` jitted with the XLA options a program over `models` compiles with
     (`compiler_options`), and, where it is part of a training step, the step's own beside them
     (`step`, `dew.training.memory.step_compiler_options`), with the rest of `jax.jit`'s `arguments`
-    (its static arguments, its shardings): one program for each function, options and arguments,
+    (its static arguments, its shardings), compiled through the kernel templates' reports (`Program`):
+    one program for each function, options and arguments,
     which every call with the same reuses, so a quantized model and another never share one. Every
     outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's or a load's,
     but two that own their programs' lifetime: an objective's (`Objective.program`), which its cache
@@ -192,7 +285,7 @@ def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option]
                      static_argnums: int | tuple[int, ...] | None = None,
                      static_argnames: str | tuple[str, ...] | None = None,
                      in_shardings: _Placed | None = None, out_shardings: _Placed | None = None
-                     ) -> jax.stages.Wrapped:
+                     ) -> Program[P, R]:
     # Each argument `program`'s caller left out is left to jit (an explicit placement of None is a
     # `_Placed`): jit reads static positions from static names only where it is given no positions.
     arguments: JitArguments = {}
@@ -204,4 +297,4 @@ def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option]
         arguments["in_shardings"] = in_shardings.tree()
     if out_shardings is not None:
         arguments["out_shardings"] = out_shardings.tree()
-    return jax.jit(function, compiler_options=dict(options), **arguments)
+    return Program(function, compiler_options=dict(options), **arguments)

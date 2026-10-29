@@ -1001,12 +1001,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         kept = (*holds, *modules)
         if held is None or len(held[0]) != len(kept) or any(
                 now is not was for now, was in zip(kept, held[0], strict=True)):
-            # A fresh callable gives JAX a fresh trace even for the same bound method.
-            @functools.wraps(function)
-            def run(*args, **kwargs):
-                return function(*args, **kwargs)
+            from dew.nn.kernels.options import Program
 
-            held = (kept, jax.jit(run, static_argnames=static_argnames, compiler_options=options))
+            # A program jits a fresh callable, so JAX traces it afresh even for the same bound method.
+            held = (kept, Program(function, static_argnames=static_argnames, compiler_options=options))
             cached[1][key] = held
         return held[1]
 

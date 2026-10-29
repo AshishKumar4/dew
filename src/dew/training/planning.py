@@ -34,6 +34,7 @@ from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.profile import active_profile, capture_options
@@ -133,6 +134,24 @@ class Candidate:
         """The program, which a plan's search and its guided compile read before it is released."""
         assert self.program is not None, "a plan's program is released once the plan is admitted"
         return self.program
+
+
+class Relowered:
+    """What a compile lowered afresh where a kernel spilled (`report.compiled`'s `relower`): each
+    candidate `lower` gives, the last the one the executable compiled from, its lowering and kernel
+    report the executable's."""
+
+    def __init__(self, lower: Callable[[], Candidate]):
+        self.lower, self.last = lower, None
+
+    def __call__(self) -> jax.stages.Lowered:
+        self.last = self.lower()
+        return self.last.lowered
+
+    def candidate(self, compiled: Candidate) -> Candidate:
+        """The candidate the executable compiled from: `compiled`, the one first lowered, where the
+        compile lowered none afresh."""
+        return compiled if self.last is None else self.last
 
 
 @jax.jit
@@ -302,23 +321,28 @@ class Planned:
         """The microbatch index of each of the step's `split` calls, on every device of `mesh`."""
         return [jax.device_put(np.int32(part), NamedSharding(mesh, P())) for part in range(self.split)]
 
-    def guided(self, profile: bytes, runs: int, mesh: Mesh) -> Planned:
+    def guided(self, profile: bytes, runs: int, mesh: Mesh, relower: Callable[[], Candidate]) -> Planned:
         """This plan with its program compiled again under the options its executable compiled under,
         guided by `profile` of `runs` runs (`Trials.profiled`) as JAX's jit guides AutoPGLE's (XLA's
         feedback-directed `fdo_profile`, which JAX shares across a pool's processes under AutoPGLE), and
         held to the fit check the plan passed: a schedule the profile guides may keep more alive at once,
-        and one that no longer fits is refused. An empty profile, of a backend XLA profiles none of, leaves
-        the executable as it is. The plan given up holds the executable it replaces, which goes with it
-        and its program (`released`)."""
+        and one that no longer fits is refused. It compiles through the kernel templates' reports
+        (`report.compiled`), the plan's step lowered afresh where a kernel spills (`relower`, `Relowered`).
+        An empty profile, of a backend XLA profiles none of, leaves the executable as it is. The plan
+        given up holds the executable it replaces, which goes with it and its program (`released`)."""
         if not profile:
             return dataclasses.replace(self, profiled=(runs, 0))
-        executable = self.candidate.lowered.compile({**(self.options or {}), "fdo_profile": profile})
-        fit, headroom = step_fits(executable, mesh, self.candidate.held)
+        relowered = Relowered(relower)
+        executable = report.compiled(self.candidate.lowered, {**(self.options or {}), "fdo_profile": profile},
+                                     relower=relowered)
+        candidate = relowered.candidate(self.candidate)
+        fit, headroom = step_fits(executable, mesh, candidate.held)
         if not fit:
             raise RuntimeError(f"the step guided by its profile (jax_enable_pgle) needs {-(headroom or 0)} "
                                "bytes more than its tightest device has, where unguided it fits; train it "
                                "without AutoPGLE")
-        return dataclasses.replace(self, executable=executable, profiled=(runs, len(profile)))
+        return dataclasses.replace(self, candidate=candidate, executable=executable,
+                                   profiled=(runs, len(profile)))
 
     def released(self) -> Planned:
         """This plan as the run keeps it once admitted: its executable without the program it was lowered
@@ -495,12 +519,15 @@ class FitSearch[LossT, EffectsT]:
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
-    is that program (`AheadOfTime.taken`)."""
+    is that program (`AheadOfTime.taken`): the launch configs its compiles refused are this process's
+    before the search lowers anything (`AheadOfTime.refusals`), so the step lowers as it did."""
     capacity: int | None = None
     """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
     compiled ahead for it states them (`AheadTarget.capacity`)."""
 
     def __post_init__(self):
+        if self.ahead is not None:
+            report.refuse(self.ahead.refusals)
         self.factor = temporaries_factor(self.mesh, self.capacity)
         self.started = self.remat_rung()
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
@@ -544,29 +571,34 @@ class FitSearch[LossT, EffectsT]:
         self.objective.substitute(held)
         return False
 
-    def measured(self, split: int, candidate: Candidate
-                 ) -> tuple[jax.stages.CompilerOptions | None, jax.stages.Compiled | None, Probe]:
+    def measured(self, split: int, candidate: Candidate) -> tuple[
+            jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
         where it fits the devices, or for the search's first compile the step compiled ahead
-        (`ahead`), and the measure of its fit (`Probe`), the search's state else untouched."""
+        (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
+        (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
+        else untouched."""
         options = self.required if self.xla_defaults else self.options(candidate)
         taken = self.ahead is not None
         began = time.perf_counter()
         if self.ahead is not None:
             executable, self.ahead = self.ahead.taken(candidate.lowered), None
         else:
-            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
+            relowered = Relowered(lambda: self.lower(split, self.narrow))
+            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
+            candidate = relowered.candidate(candidate)
         seconds = time.perf_counter() - began
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        return options, executable, dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
+        return options, candidate, executable, probe
 
     def fits_here(self, split: int) -> bool:
         key = (split, self.rung())
         if key not in self.lowered:
             self.lowered[key] = self.lower(split, self.narrow)
-        candidate = self.lowered[key]
-        self.chosen, executable, probe = self.measured(split, candidate)
+        self.chosen, candidate, executable, probe = self.measured(split, self.lowered[key])
+        self.lowered[key] = candidate
         fit, headroom = probe.fits, probe.headroom
         self.probes.append(probe)
         self.forecast.read(self.rung(), split, executable, headroom, self.factor)

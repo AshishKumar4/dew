@@ -12,7 +12,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,7 @@ from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
+from dew.nn.kernels.templates import report
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
@@ -102,18 +103,21 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
 
 
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-                        refusals: list[RuntimeError]) -> jax.stages.Compiled | None:
+                        refusals: list[RuntimeError], *, relower: Callable[[], jax.stages.Lowered]
+                        ) -> jax.stages.Compiled | None:
     """Return `program` compiled under `options`, or None if XLA refuses it for memory (`refused_for_memory`).
 
-    A refusal is appended to `refusals`. XLA:TPU checks a program's temporaries
-    against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
-    returning an executable whose memory `step_fits` could read, so the refusal
-    means the step does not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
+    It compiles through the kernel templates' reports (`report.compiled`): where a launch's kernel
+    spills, its config is refused and the step lowered afresh (`relower`), its derivation taking the
+    next config, and compiled once more. A refusal is appended to `refusals`. XLA:TPU checks a
+    program's temporaries against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
+    returning an executable whose memory `step_fits` could read, so the refusal means the step does
+    not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
     tokens asked for 38.47G of temporaries next to 31.24G of HBM. Any other
     compile error is raised.
     """
     try:
-        return program.compile(options)
+        return report.compiled(program, options, relower=relower)
     except jax.errors.JaxRuntimeError as error:
         if not refused_for_memory(error.error_code_string, str(error)):
             raise

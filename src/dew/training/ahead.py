@@ -42,6 +42,7 @@ from jax.experimental import serialize_executable
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.nn.kernels.generation import assumed, capability, gpu_target
+from dew.nn.kernels.templates import report
 from dew.telemetry.instrumentation import StepFlops, step_flops
 from dew.training.profiling import pgle_runs
 
@@ -145,6 +146,10 @@ class AheadOfTime:
     before its first step on those GPUs."""
     capacity: int | None = None
     """The stated bytes per target GPU, or None where no memory capacity was supplied."""
+    refusals: tuple = ()
+    """The kernel launch configs its compiles found spilling and refused
+    (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
+    lowers (`FitSearch`), so its derivations step down as the compile's did and it lowers this program."""
 
     @property
     def peak_bytes(self) -> int:
@@ -304,4 +309,5 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
-        capacity=capacity, links={axis: link.bytes_per_second for axis, link in trainer.links.items()})
+        capacity=capacity, links={axis: link.bytes_per_second for axis, link in trainer.links.items()},
+        refusals=report.refused_launches())
