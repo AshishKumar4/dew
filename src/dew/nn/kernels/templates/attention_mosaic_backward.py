@@ -1073,7 +1073,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     dkv_walk = dataclasses.replace(walk, program=dataclasses.replace(
         program, family=bundles.named(dkv_tiles.family, query.dtype), tiles=dkv_tiles),
         consumers=dkv_tiles.consumers)
-    if walk.fused and dkv_tiles != tiles:
+    if walk.fused and tiles.dkv_apart:
         # The fused launch keys first on its own layout (`BackwardTiles.dkv`): its consumers' shares of a
         # slot's queries each a warpgroup MMA's rows, dQ added a tile at a time.
         dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,

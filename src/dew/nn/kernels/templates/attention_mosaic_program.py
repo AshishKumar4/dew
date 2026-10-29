@@ -120,6 +120,12 @@ class BackwardTiles:
                                    consumers=self.dkv_consumers or self.consumers, dkv_family=None,
                                    dkv_consumers=None)
 
+    @property
+    def dkv_apart(self) -> bool:
+        """Whether the dK/dV launch runs on a layout or a count of consumers of its own (`dkv`): its tiles
+        other than the config's own, overrides naming the config's own aside."""
+        return self.dkv != dataclasses.replace(self, dkv_family=None, dkv_consumers=None)
+
     def __post_init__(self):
         if self.stages < 2:
             raise ValueError(f"{self}: two stages or more")

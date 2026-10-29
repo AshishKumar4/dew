@@ -457,7 +457,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dkv_family = found.get(config.dkv.family)
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
             return False
-        keys_first = config.dkv != dataclasses.replace(config, dkv_family=None, dkv_consumers=None)
+        keys_first = config.dkv_apart
         if config.fused and (ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1] or (
                 keys_first and not (split_queries(dkv_family)
                                     and (config.block_q // config.dkv.consumers) % dkv_family.rows == 0))
@@ -538,7 +538,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # Each launch on its own layout (`BackwardTiles.dkv`).
         dkv_family = bundle_of(config.dkv, dtype)
         q_stages = min(config.stages, padded_q // config.block_q)
-        if config.fused and config.dkv.family == config.family:
+        if config.fused and not config.dkv_apart:
             launches = [(family, config, _fused_allocations(family, config, width, dtype, q_stages))]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
