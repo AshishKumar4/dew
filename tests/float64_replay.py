@@ -49,8 +49,9 @@ def float64_replay(fn, *, compiled: bool = False):
 
     def run(*arguments):
         leaves, tree = jax.tree.flatten(arguments)
-        signature = (tree, tuple((np.shape(value), str(getattr(value, "dtype", np.result_type(value))))
-                                 for value in leaves))
+        # A key array has a shape and a dtype, but no NumPy dtype.
+        signature = (tree, tuple((jnp.shape(value), str(value.dtype if hasattr(value, "dtype")
+                                                         else np.result_type(value))) for value in leaves))
         if signature not in traced:
             with jax.enable_x64(new_val=False):
                 traced[signature] = jax.make_jaxpr(fn, return_shape=True)(*arguments)
@@ -172,7 +173,9 @@ def _replayed_equation(equation, values, used):
                 for branch in params["branches"])
             return equation.primitive.bind(index, *operands, **{**params, "branches": branches})
         return _replayed(branch.jaxpr, branch.consts, operands, used)
-    if name in ("name", "optimization_barrier"):
+    if name in ("name", "optimization_barrier", "dew_conv_barrier"):
+        # Identities on their values: a name, and barriers to the compiler's rewrites
+        # (`dew.nn.conv`'s, which a traced conditional's every branch may hold).
         return list(values)
     if name == "scan":
         # The body, replayed in float64 for its operands' widened dtypes, as the scan's own: of its
