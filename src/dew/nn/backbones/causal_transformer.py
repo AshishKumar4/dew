@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import flax.core
@@ -55,7 +55,7 @@ from dew.registry import from_record, read_arguments
 from ..activations import GatedActivation, Situ, ungated_activation
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
-from ..cross_attention import CrossBlocks
+from ..cross_attention import CrossBlocks, crossed_flops
 from ..deepseek_v4 import DeepseekV4Mixer
 from ..dex import DifferentialExtension, LayerDex
 from ..dsa_kpool import KPoolSparseAttentionMixer
@@ -1118,24 +1118,13 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
-        """The cross-attention blocks' work over rows of `lengths` tokens reading contexts of
-        `context_lengths` tokens (`CrossBlocks.flops`), each block on every pass of its layer
-        (`layer_passes`), which `model_flops` leaves out: a call without a context runs none of it."""
-        return self._crossed(lambda cross, index: cross.flops(self, index, lengths, context_lengths))
+        """The cross-attention blocks' work, which `model_flops` leaves out (`crossed_flops`)."""
+        return crossed_flops(self, lengths, context_lengths)
 
     @nn.nowrap
     def held_cross_flops(self, lengths, context_lengths) -> float:
-        """The part of `cross_flops` done by the decoder's own matrices (`CrossBlocks.held_flops`),
-        which train as its trunk does."""
-        return self._crossed(lambda cross, index: cross.held_flops(self, index, lengths, context_lengths))
-
-    @nn.nowrap
-    def _crossed(self, counted: Callable[[CrossBlocks, int], float]) -> float:
-        """`counted` work of each cross-attention block, on every pass of its layer (`layer_passes`)."""
-        cross = self.cross_attention
-        if cross is None:
-            return 0.0
-        return sum(self.layer_passes(index) * counted(cross, index) for index in cross.layer_ids)
+        """The part of `cross_flops` its own matrices do, which train as its trunk does (`crossed_flops`)."""
+        return crossed_flops(self, lengths, context_lengths, held=True)
 
     @nn.nowrap
     def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec,

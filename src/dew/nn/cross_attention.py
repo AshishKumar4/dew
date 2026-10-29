@@ -227,6 +227,19 @@ class LayerReads(NamedTuple):
     attention: AttendsContext
 
 
+def crossed_flops(decoder: CausalTransformer, lengths, context_lengths, *, held: bool = False) -> float:
+    """`decoder`'s cross-attention blocks' work over rows of `lengths` tokens reading contexts of
+    `context_lengths` tokens (`CrossBlocks.flops`), or with `held` the part its own matrices do
+    (`CrossBlocks.held_flops`), each block on every pass of its layer (`layer_passes`): none without
+    cross-attention, and a call without a context runs none of it."""
+    cross = decoder.cross_attention
+    if cross is None:
+        return 0.0
+    counted = cross.held_flops if held else cross.flops
+    return sum(decoder.layer_passes(index) * counted(decoder, index, lengths, context_lengths)
+               for index in cross.layer_ids)
+
+
 def named_layers(layer_ids) -> tuple[int, ...]:
     """The layers a cross-attention names as ints, refused unless one or more, each once: every
     `CrossBlocks` configuration's."""
@@ -620,4 +633,4 @@ def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.
 
 __all__ = ["CROSS_CACHE", "CROSS_LENGTHS", "NAME", "AttendsContext", "ContextEncoder", "CrossAttention",
            "CrossBlocks", "GatedCrossAttention", "LayerReads", "SharedCrossAttention",
-           "SharedGatedCrossAttention", "crossing", "encode_context", "gated_join"]
+           "SharedGatedCrossAttention", "crossed_flops", "crossing", "encode_context", "gated_join"]
