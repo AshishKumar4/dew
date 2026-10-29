@@ -61,12 +61,20 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_backward.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = {"default": (False, attention_mosaic.BackwardTiles(64, 64, 2, 1, **FED)),
-                  "accurate": (True, attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2, **FED))}
-"""The backward's forms and schedules, `(accurate, config)`: the fast and the accurate form, each its dQ
-launch one consumer's beside a producer and its dK/dV launch two consumers sharing a key block (`FED`); the
-accurate form's sums in two column halves, as its derivation takes them 128 wide (one whole holds 262
-registers a thread)."""
+BACKWARD_FORMS = ("default", "accurate")
+"""The backward's forms (`_backward_form`): the fast and the accurate."""
+
+
+def _backward_form(form: str, width: int) -> tuple[bool, attention_mosaic.BackwardTiles]:
+    """The backward form `form` names over heads `width` wide, `(accurate, config)`: its dQ launch one
+    consumer's beside a producer and its dK/dV launch two consumers sharing a key block (`FED`), the accurate
+    form's sums past 64 wide in two column halves, as the derivation takes them (one whole at 128 wide holds
+    262 registers a thread)."""
+    accurate = form == "accurate"
+    columns = 2 if accurate and width > 64 else 1
+    return accurate, attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, **FED)
+
+
 FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
@@ -150,7 +158,7 @@ def _dropping(shape) -> template.Hooks:
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None):
-    """The forward, or the backward in the form `form` names (`BACKWARD_FORMS`), over `spans` at `FORM_TILES`
+    """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `FORM_TILES`
     under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
     (rows, queries, query and key heads, four and two under a hook) over the spans' keys in `dtype`, the
@@ -170,7 +178,7 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                                                for value, kind in zip(params, kinds, strict=True)), initial,
                               output.output_mod, output.output_params)
 
-    accurate, config = BACKWARD_FORMS[form]
+    accurate, config = _backward_form(form, 64)
 
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
@@ -231,7 +239,7 @@ and seeds, at full resolution."""
 
 
 def _check_hooked_backward(hooks: str, *, form: str, interpret: bool):
-    """The backward in the form `form` names (`BACKWARD_FORMS`) under the score hook `SCORE_HOOKS[hooks]` over
+    """The backward in the form `form` names (`_backward_form`) under the score hook `SCORE_HOOKS[hooks]` over
     the template core's causal packed documents under a window (`_check_hooks`' site): the gradients of the
     queries, keys, values, of the hook's parameters and of the initial state. Interpreted, at the hook's own
     site (`INTERPRETED_HOOK_SITES`)."""
@@ -260,7 +268,7 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
                     config: attention_mosaic.BackwardTiles | None = None, width: int = 128,
                     value_width: int | None = None, spans: template.KeySpans | None = None,
                     drop: bool = False):
-    """The backward in the form `form` names (`BACKWARD_FORMS`; None, the default form at `config`, else its
+    """The backward in the form `form` names (`_backward_form`; None, the default form at `config`, else its
     derived one) over the call form `call` of `shape` (or `spans` where given; its keys `keys`, its query
     heads `width` wide and its value heads `value_width`) on `target` (`_device`), from the training
     forward's residuals at its pick: this mainloop's, or `residuals_from`'s (another mainloop's `forward`, as
@@ -269,7 +277,7 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call]) if spans is None else spans
     hooks = _dropping(shape) if drop else None
     draw = _drawn(shape, jnp.bfloat16, width, keys=keys, value_width=value_width)
-    accurate, config = (False, config) if form is None else BACKWARD_FORMS[form]
+    accurate, config = (False, config) if form is None else _backward_form(form, width)
     trained = attention_mosaic.forward if residuals_from is None else residuals_from
 
     def ours(query, key, value, dout):
@@ -400,7 +408,7 @@ def test_the_forward_is_on_par_under_every_hook_interpreted(hooks, dtype, natura
 
 PADDED_CALLS = {"one-query-default": (1, "default"), "one-query-accurate": (1, "accurate"),
                 "whole-padding-tile": (64, "default")}
-"""The padded calls' query counts and backward forms (`BACKWARD_FORMS`): one query, its tile mostly padding,
+"""The padded calls' query counts and backward forms (`_backward_form`): one query, its tile mostly padding,
 in both forms; and a tile's worth of queries under two consumers, which pads to a pair of query tiles, its
 second wholly padding (the accurate form's one consumer pads 64 queries to no more)."""
 
@@ -416,7 +424,7 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
     spans = template.spans(queries, queries, 1)
     query, key, value = (jnp.zeros((1, queries, 1, 64), jnp.bfloat16) for _ in range(3))
     dout = jnp.ones((1, queries, 1, 64), jnp.bfloat16)
-    accurate, config = BACKWARD_FORMS[form]
+    accurate, config = _backward_form(form, 64)
 
     def score_mod(s, q_pos, k_pos, temperature, bias):
         del q_pos, k_pos
