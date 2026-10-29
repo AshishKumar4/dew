@@ -70,7 +70,6 @@ from kimi_k3_reference import (
     record_picks,
     scatter,
     sgd_step,
-    symmetric,
     write_fixture,
     write_truth,
 )
@@ -272,9 +271,7 @@ if __name__ == "__main__":
         record_released_padding()
     elif sys.argv[1:2] == ["orders"]:
         orders(Path(sys.argv[2]))
-    elif sys.argv[1:] == ["truth"]:
-        write_truth(DESTINATION, truth)
-    elif sys.argv[1:2] == ["symmetric"]:
-        symmetric(DESTINATION, Path(sys.argv[2]), truth)
+    elif sys.argv[1:2] == ["truth"]:
+        write_truth(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION, truth)
     else:
         main()

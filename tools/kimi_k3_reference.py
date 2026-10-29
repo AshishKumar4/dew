@@ -49,8 +49,8 @@ tests/test_kimi_k3.py measures Dew and the reference from: the logits, the
 loss, the logits after one SGD step at the stored learning rate, and the
 greedy decode's step logits teacher-forced. It runs on a CPU, in the same
 environment with torch 2.8.0's CPU build and triton 3.4.0 (fla imports it).
-`symmetric DRAWN` checks that tools/rounding_orders.py's residual orders are
-a symmetry of that truth.
+`truth DIR` writes it for a residual order's directory that
+tools/rounding_orders.py drew, whose `symmetric` holds it to the fixture's.
 """
 
 import copy
@@ -375,29 +375,6 @@ def write_truth(directory: Path, truth: Callable[[Path], dict[str, np.ndarray]])
     np.savez(directory / "numerics.npz", **arrays, precision="ieee")
 
 
-def symmetric(fixture: Path, drawn: Path, truth: Callable[[Path], dict[str, np.ndarray]]) -> None:
-    """Hold the float64 truth under the second and the last residual order tools/rounding_orders.py wrote
-    under `drawn` (each order's directory as the fixture's: its config, weights and reference.npz) to the
-    fixture's own, within float64 rounding over the computation's longest chain of reductions (each layer's
-    hidden and token sums, then the head's): the orders are a symmetry of the reference's computation, not
-    only of Dew's."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from reference_error import assert_computes_the_oracle
-
-    text = json.loads((fixture / "config.json").read_text())
-    text = text.get("text_config", text)
-    with np.load(fixture / "numerics.npz") as exact, np.load(fixture / "reference.npz") as stored:
-        valid = stored["attention_mask"].astype(bool)
-        roundings = text["num_hidden_layers"] * (text["hidden_size"] + valid.shape[1]) + text["hidden_size"]
-        count = len(np.load(drawn / "orders.npy"))
-        for k in (1, count - 1):
-            arrays = truth(drawn / str(k))
-            for key in ("logits_f64", "updated_logits_f64"):
-                assert_computes_the_oracle(arrays[key][valid], exact[key][valid],
-                                           f"{fixture.name} order {k} {key}", roundings=roundings)
-    print(fixture.name, "orders 1 and", count - 1, "hold the float64 truth")
-
-
 def orders(drawn: Path) -> None:
     """The reference's own rounding draws over the residual orders
     tools/rounding_orders.py wrote under `drawn`, in MXFP4's groups of 32
@@ -495,9 +472,7 @@ if __name__ == "__main__":
         orders(Path(sys.argv[2]))
     elif sys.argv[1:] == ["padding"]:
         record_released_padding()
-    elif sys.argv[1:] == ["truth"]:
-        write_truth(DESTINATION, truth)
-    elif sys.argv[1:2] == ["symmetric"]:
-        symmetric(DESTINATION, Path(sys.argv[2]), truth)
+    elif sys.argv[1:2] == ["truth"]:
+        write_truth(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION, truth)
     else:
         main()

@@ -1988,7 +1988,7 @@
      "runs": "fla"
     }
    ],
-   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders in MXFP4's groups of 32 (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; the recorder's `symmetric` checks they are a symmetry of the float64 truth); per order, the updated logits' RMS distance from float64. Dynamic remote import; fla kernels forced IEEE; compressed-tensors 0.17.1 supplies packed/decompressed weight inputs."
+   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders in MXFP4's groups of 32 (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; `tools/rounding_orders.py symmetric` holds the float64 truth of orders 1 and 51, which the recorder's `truth DIR` writes, to the fixture's); per order, the updated logits' RMS distance from float64. Dynamic remote import; fla kernels forced IEEE; compressed-tensors 0.17.1 supplies packed/decompressed weight inputs."
   },
   "hf/kimi-k3-tiny/reference.npz": {
    "tool": "tools/kimi_k3_reference.py",
@@ -2040,7 +2040,7 @@
      "runs": "fla"
     }
    ],
-   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; the recorder's `symmetric` checks they are a symmetry of the float64 truth); per order, the updated logits' RMS distance from float64. Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
+   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; `tools/rounding_orders.py symmetric` holds the float64 truth of orders 1 and 51, which the recorder's `truth DIR` writes, to the fixture's); per order, the updated logits' RMS distance from float64. Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
   },
   "hf/kimi-linear-tiny/reference.npz": {
    "tool": "tools/kimi_linear_reference.py",
