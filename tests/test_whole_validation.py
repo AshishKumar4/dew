@@ -136,7 +136,8 @@ EVALUATED = sorted(set(objectives) - ROLLOUT)
 """Every registered objective with an evaluation loss."""
 
 POOLED = (("block_diffusion", "distillation", "lm", "mean_flow", "masked_diffusion", "supervised"),
-          ("guidance_distillation",), ("ladd",), ("decision", "shortcut"), ("jepa", "dpo"), ("diffusion", "rcm"))
+          ("guidance_distillation",), ("ladd",), ("decision", "shortcut"), ("jepa", "dpo"),
+          ("diffusion", "rcm"))
 """`EVALUATED` in the parts `tests/test_multiprocess.py` runs its passes on a pool in, so no part passes
 CI's group target on a pool's own seconds, which its two processes' start and compiles dominate: split
 four ways (the second part guidance distillation's Flux alone, about 119 s on one process), the parts
