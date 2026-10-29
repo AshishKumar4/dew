@@ -261,7 +261,11 @@ def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("kv_heads", [6, 8], ids=["six-key-heads", "eight-key-heads"])
+@pytest.mark.parametrize("kv_heads", [
+    # Eight shards' check 1 over six key heads, each shard's at an offset of its part, runs past a group's
+    # target whatever its draws (row 2156: 130 s): the whole suite's run holds it.
+    pytest.param(6, id="six-key-heads", marks=pytest.mark.whole_suite),
+    pytest.param(8, id="eight-key-heads")])
 def test_partly_split_key_heads_keep_the_kernel_contract_on_a_tensor_and_expert_mesh(kv_heads):
     """A named template call with 24 query heads split eight ways over a tensor axis of two and an expert axis
     of four, and key heads split over the tensor axis alone. Each shard holds part of the key heads its query
