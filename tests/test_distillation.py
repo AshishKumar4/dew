@@ -527,11 +527,12 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
         DistillationObjective(student, teacher, divergence="selected", temperature=2.0)
 
 
-def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on():
-    """A teacher whose scores and paired layers' states are NaN at one position (row 0's last) leaves
-    that position out of every distillation term, the soft one and the features': the loss and the
-    student's gradient (its projections' included) equal, bit for bit, those the intact teacher gives
-    with that position's label padded out, and the excluded weight is reported."""
+@pytest.mark.parametrize("scores", [True, False], ids=["scores and states", "states alone"])
+def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on(scores):
+    """A teacher whose paired layers' states, and its scores too or not, are NaN at one position (row
+    0's last) leaves that position out of every distillation term, the soft one and the features': the
+    loss and the student's gradient (its projections' included) equal, bit for bit, those the intact
+    teacher gives with that position's label padded out, and the excluded weight is reported."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, alpha=1.0)
     batch = fixture_batch(arrays)
@@ -544,9 +545,11 @@ def test_a_teacher_position_given_non_finitely_is_counted_and_never_trained_on()
         def failed(value):
             return value.at[0, SEQ - 1].set(jnp.nan)
 
+        hidden = tuple(failed(state) for state in prediction.hidden)
+        if not scores:
+            return statistics, aux, dataclasses.replace(prediction, hidden=hidden)
         return statistics, aux, dataclasses.replace(
-            prediction, logits=failed(prediction.logits), losses=failed(prediction.losses),
-            hidden=tuple(failed(state) for state in prediction.hidden))
+            prediction, logits=failed(prediction.logits), losses=failed(prediction.losses), hidden=hidden)
 
     def distilled(batch):
         def total(trained):

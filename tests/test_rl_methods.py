@@ -193,6 +193,15 @@ def test_each_method_is_its_papers_objective(name, formula, settings):
                     f"{name} gradient", seeds=SEEDS)
 
 
+def test_reinforce_pps_penalty_is_representable_where_its_value_is():
+    """REINFORCE++'s k2 penalty, half a log-ratio's square, at a log-ratio of -2**64: 2**127, which float32
+    holds, though the square alone would not."""
+    objective, _ = METHODS["reinforce_pp"].build(TinyHead(vocab_size=8), 7, max_new_tokens=8, beta=0.1)
+    one = jnp.ones((1, 1), jnp.float32)
+    penalty = objective.reference_penalty(jnp.full((1, 1), -2.0 ** 64, jnp.float32), 0 * one, one, one.sum())
+    assert float(penalty.total) == 2.0 ** 127
+
+
 def test_a_method_fixes_its_composition_and_refuses_what_it_lacks():
     """A method refuses an override of a part it fixes, a reference penalty where it has none (in the
     loss or in the reward), and an unknown name."""

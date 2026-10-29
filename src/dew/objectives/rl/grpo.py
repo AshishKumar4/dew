@@ -247,8 +247,9 @@ class GRPOObjective(TokenScorer):
         """The loss's reference penalty over the current likelihoods `policy` and the reference's, by
         `kl_term` (k3, or k2: half the squared log-ratio), reduced as the policy term is: `weights` and
         `mass` are `policy_ratio`'s, so it is a token, session or constant mean as the method's is."""
-        terms = (k3_kl(policy, reference) if self.kl_term == "k3"
-                 else 0.5 * jnp.square(policy - jax.lax.stop_gradient(reference)))
+        delta = policy - jax.lax.stop_gradient(reference)
+        # Halved before it is squared out: k2 is representable wherever its log-ratio's square halved is.
+        terms = k3_kl(policy, reference) if self.kl_term == "k3" else delta * (0.5 * delta)
         return Ratio(weighted_total(terms, weights)[0], mass)
 
     def packed_log_probs(self, params: Variables, batch) -> jax.Array:
