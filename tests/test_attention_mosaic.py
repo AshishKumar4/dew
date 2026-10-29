@@ -61,8 +61,9 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_backward.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "fused", "accurate")
-"""The backward's forms (`_backward_form`): the fast in two launches and in one, and the accurate."""
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one either way, and the
+accurate."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
@@ -72,9 +73,11 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
     beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
     accurate form's sums in two column halves where it is `accurate-halves` (a width split's,
     `BackwardTiles.columns`); or the fast form's one launch (`fused`), queries first on the dQ launch's
-    layout."""
+    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
+    if form == "fused-keys-first":
+        return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
     columns = 2 if form == "accurate-halves" else 1
     return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, **FED)
 
