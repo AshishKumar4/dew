@@ -1,8 +1,9 @@
 """Write a saved run of each run kind at this checkout, for tests/test_saved_runs.py to read at every
 later main (row 2282).
 
-Each kind's run (tests/test_run_options.py's `KINDS`, its data as there: synthetic tickets, the repo's
-tiny image records and token files, the tiny Laya fixture) trains two steps from Python and keeps its last
+Each kind's run (tests/test_saved_runs.py's `SAVED_KINDS`: tests/test_run_options.py's `KINDS`, its data
+as there, synthetic tickets, the repo's tiny image records and token files, the tiny Laya fixture, and an
+LM run over a tiny multimodal source) trains two steps from Python and keeps its last
 checkpoint; its run directory, the run.json and the checkpoint, is packed as an xz tarball, held as the
 bytes of one recording (`run`) at `<commit>/<kind>.npz` under tests/fixtures/saved_runs
 (`fetched_fixtures.save`: committed where it is small, in the fetched store pinned by its digest where it
@@ -47,14 +48,14 @@ def main() -> None:
 
     import numpy as np
     from fetched_fixtures import save
-    from test_run_options import KINDS
+    from test_saved_runs import SAVED_KINDS
 
     from dew.config import TrainerConfig
 
     commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], check=True, capture_output=True,
                             text=True).stdout.strip()
     written = Path(CORPUS) / commit[:12]
-    for kind, build in KINDS.items():
+    for kind, build in SAVED_KINDS.items():
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
             # The run keeps its last step alone: a later main pins and resumes from the latest.
@@ -71,7 +72,7 @@ def main() -> None:
                 archive.add(root / "runs" / kind, arcname=kind)
             save(written / f"{kind}.npz", {"run": np.frombuffer(packed.getvalue(), np.uint8)},
                  reference=f"Dew {commit[:12]}, tools/saved_runs_reference.py", license="MIT", root=args.root)
-    source = {"commit": commit, "kinds": sorted(KINDS)}
+    source = {"commit": commit, "kinds": sorted(SAVED_KINDS)}
     (args.root / written / "source.json").write_text(json.dumps(source, indent=1) + "\n")
 
 

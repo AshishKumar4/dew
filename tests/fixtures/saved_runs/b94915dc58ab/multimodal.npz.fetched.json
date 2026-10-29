@@ -1,0 +1,9 @@
+{
+ "bytes": 1366916,
+ "license": "MIT",
+ "path": "recordings/d1e50bbdb9b0674e424b73bb3447b79449a5237fbcd93cdf42f7a6c8832d88fa.npz",
+ "reference": "Dew b94915dc58ab, tools/saved_runs_reference.py",
+ "repo": "dewml/fixtures",
+ "revision": "f62bc5d3001774408ae1343b62edfe492c30bd76",
+ "sha256": "d1e50bbdb9b0674e424b73bb3447b79449a5237fbcd93cdf42f7a6c8832d88fa"
+}
