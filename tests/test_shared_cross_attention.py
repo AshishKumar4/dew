@@ -42,17 +42,17 @@ def test_a_fresh_shared_read_computes_the_decoder_it_was_attached_to():
     decoder without the reads (check 1), and its gates are the only weights the form adds."""
     fresh_against_base(SHARED_MODEL, "shared fresh", seeds=SHARED_SEEDS["shared fresh"])
     variables, *_ = model_draw(SHARED_MODEL, gated=False)(0)
-    added = {path for path in flat_tree(variables["params"]) if crossing(tuple(path.split("/")))}
-    assert {path.rsplit("/", 1)[-1] for path in added} == {"alpha_cross_attn"}
+    added = {path for path in flat_tree(variables["params"]) if crossing(tuple(path.split(".")))}
+    assert {path.rsplit(".", 1)[-1] for path in added} == {"alpha_cross_attn"}
     assert len(added) == len(SHARED.layer_ids)
 
 
 TIED_MODEL = MODEL.clone(cross_attention=TIED)
 
-SHARED_LEAVES = {f"cross_attention/{name}/kernel": f"self_attn/{name}/kernel"
+SHARED_LEAVES = {f"cross_attention.{name}.kernel": f"self_attn.{name}.kernel"
                  for name in ("q_proj", "k_proj", "v_proj", "o_proj")} | {
-    "cross_attention/input_layernorm/scale": "input_layernorm/scale",
-    "cross_attention/alpha_cross_attn": "cross_attention/alpha_cross_attn"}
+    "cross_attention.input_layernorm.scale": "input_layernorm.scale",
+    "cross_attention.alpha_cross_attn": "cross_attention.alpha_cross_attn"}
 """Each IDEFICS block leaf (`TIED`) the shared model's own leaf it takes, in the same layer."""
 
 
@@ -68,16 +68,16 @@ def tied(variables):
     def leaf(path, shape):
         if path in own:
             return own[path]
-        layer, _, rest = path.partition("/cross_attention/")
-        name = f"cross_attention/{rest}"
+        layer, _, rest = path.partition(".cross_attention.")
+        name = f"cross_attention.{rest}"
         if name in SHARED_LEAVES:
-            return own[f"{layer}/{SHARED_LEAVES[name]}"]
+            return own[f"{layer}.{SHARED_LEAVES[name]}"]
         filled = jnp.zeros if rest == "alpha_dense" else jnp.ones
         return filled(shape.shape, shape.dtype)
 
     params = {}
     for path, shape in shapes.items():
-        *parents, last = path.split("/")
+        *parents, last = path.split(".")
         node = params
         for part in parents:
             node = node.setdefault(part, {})
