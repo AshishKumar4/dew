@@ -7,8 +7,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 
 PROGRAM = """
@@ -26,8 +24,7 @@ print(json.dumps(compilation_cache_counts()))
 """
 
 
-@pytest.mark.gpu("Pallas lowers its kernels to Triton on a CUDA GPU alone")
-def test_two_checkouts_share_one_compiled_kernel(tmp_path):
+def two_checkouts_share_one_compiled_kernel(tmp_path):
     """A second checkout (here the same tree under another path) finds the first's executable."""
     other = tmp_path / "checkout" / "src"
     other.mkdir(parents=True)

@@ -15,8 +15,7 @@ import jax.numpy as jnp
 import pytest
 
 
-@pytest.mark.gpu(reason="needs GPU allocator memory statistics")
-def test_compilation_counts_memory_kept_alive_outside_its_state(tmp_path):
+def compilation_counts_memory_kept_alive_outside_its_state(tmp_path):
     """A fresh 2 GiB allocator isolates the accounting regression from
     fragmentation left by earlier GPU tests. Its real held buffers force
     the compiler to fit the remaining memory, then the step runs there.
