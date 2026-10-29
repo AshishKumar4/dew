@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Write tests/fixtures/lora_peft: PEFT's rsLoRA and branch-dropout adapters
 on tests/fixtures/hf/llama-tiny, and the PEFT runs tests/test_lora_peft.py
-holds Dew's training steps to in the test (`run_at`).
+holds Dew's training steps to in the test (`run_at`), its float64 twin
+tests/interop_support.py's `peft_twin`.
 
 - `rslora`: a rank 4, alpha 8 adapter on q_proj, v_proj and down_proj with
   `use_rslora=True`, a rank 2 on layer 1's v_proj and alpha 3 on down_proj,
@@ -132,25 +133,6 @@ def dew_masks(adapter, tokens: np.ndarray) -> dict[str, np.ndarray]:
             raise ValueError("a zero in a branch's input hides whether the dropout kept it")
         masks[owner] = output != 0
     return masks
-
-
-def twin(model):
-    """`model`'s float64 twin (`float64_twin`): the same base and adapter built inside `float64`, so
-    every value their constructors compute is float64's (the rotary tables' among them), loaded with
-    `model`'s weights, to run inside `float64`, every float32 pin of transformers' Llama widened: its
-    RMSNorm's cast, its rotary tables' and its attention softmax's."""
-    import copy
-
-    from peft import get_peft_model
-    from torch_precision import float64_twin
-    from transformers import AutoModelForCausalLM
-
-    def build():
-        base = AutoModelForCausalLM.from_config(copy.deepcopy(model.get_base_model().config),
-                                                dtype=torch.float64)
-        return get_peft_model(base, copy.deepcopy(model.peft_config["default"]))
-
-    return float64_twin(model, build)
 
 
 def run_at(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | None, rate: float) -> dict:

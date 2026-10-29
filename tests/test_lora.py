@@ -30,7 +30,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from flax import linen as nn
-from interop_support import extract_fixture, fixture_ids, hub_cache, transformers_arms
+from interop_support import extract_fixture, fixture_ids, hub_cache, peft_twin, transformers_arms
 from model_support import flat_tree
 from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, dew_programs, widened
 from safetensors.numpy import load_file
@@ -1268,7 +1268,6 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
     from transformers import AutoModelForCausalLM
 
     from tools.lora_export_reference import CASES, assert_landed, export_case
-    from tools.lora_peft_reference import twin
     from tools.torch_precision import float64
 
     _, written = export_case(CASES[name], decoder, tmp_path)
@@ -1279,7 +1278,7 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
     base = AutoModelForCausalLM.from_pretrained(LLAMA, dtype=torch.float32, attn_implementation="eager")
     peft = PeftModel.from_pretrained(base, tmp_path).eval()
     assert_landed(peft, load_file(str(tmp_path / "adapter_model.safetensors")))
-    wide = twin(peft)
+    wide = peft_twin(peft)
     with float64():
         merged_wide = copy.deepcopy(wide).merge_and_unload()
     merged = copy.deepcopy(peft).merge_and_unload()

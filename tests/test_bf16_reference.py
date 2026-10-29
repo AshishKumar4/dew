@@ -185,6 +185,8 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
                 np.where(images, IMAGE, prompt).astype(np.int32),
                 rng.uniform(size=shapes["pixels"]).astype(np.float32))
 
+    # Run as given: the routed layers choose their experts on the host (`chosen_experts`).
+    @as_given
     def ours(prompt, canvas, previous, image_prompt, pixels):
         image = ({"image_indices": jnp.where(image_prompt == IMAGE, 0, -1)}, {"pixel_values": pixels})
         return {"bare": denoise(model, variables, prompt, canvas),

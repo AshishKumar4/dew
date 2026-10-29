@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
-from interop_support import fixture_ids, transformers_arms
+from interop_support import fixture_ids, peft_twin, transformers_arms
 from reference_error import as_given, assert_as_exact, with_gradients
 from safetensors.numpy import load_file
 from sampling_gate import assert_draws_as_declared
@@ -67,7 +67,7 @@ def assert_trains_as_peft(adapter, peft, case: str, tmp_path):
     factors both runs start at, so exact in float64."""
     import torch
 
-    from tools.lora_peft_reference import ADAMW, dew_masks, run_at, twin
+    from tools.lora_peft_reference import ADAMW, dew_masks, run_at
     from tools.torch_precision import float64
 
     rate = adapter.dropout
@@ -118,7 +118,7 @@ def assert_trains_as_peft(adapter, peft, case: str, tmp_path):
     assert len(start) == 12
     assert_as_exact(ours, theirs(peft, contextlib.nullcontext, torch.float32), draw,
                     f"{case} training steps", seeds=TRAINING_SEEDS[case],
-                    truth_fn=theirs(twin(peft), float64, torch.float64))
+                    truth_fn=theirs(peft_twin(peft), float64, torch.float64))
 
 
 @contextlib.contextmanager
@@ -157,12 +157,11 @@ def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
     PEFT's (`assert_trains_as_peft`)."""
     import torch
 
-    from tools.lora_peft_reference import twin
 
     adapter, peft = adapted("rslora")
     assert (adapter.rslora, adapter.dropout) == (True, 0.0)
     draw = fixture_ids(LLAMA)
-    theirs, truth = transformers_arms(peft.eval(), lambda model, ids: model(ids).logits, twin=twin(peft))
+    theirs, truth = transformers_arms(peft.eval(), lambda model, ids: model(ids).logits, twin=peft_twin(peft))
     assert_as_exact(lambda ids: adapter.model.apply(adapter.variables, ids), theirs, draw,
                     "the adapted logits", seeds=LOGITS_SEEDS, truth_fn=truth)
     # The adapter moves the logits far past rounding: the base model's are nowhere near the adapted ones.

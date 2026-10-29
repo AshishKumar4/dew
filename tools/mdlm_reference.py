@@ -118,19 +118,33 @@ def uniforms(seed: int) -> dict[str, np.ndarray]:
 
 def drawn_inputs(seed: int) -> dict[str, np.ndarray]:
     """Check 1's draw of the loss: rows of ordinary tokens, the stand-in's two weights, standard normal,
-    from `seed`'s generator, and the objective's uniforms from `jax.random.key(seed)` (`uniforms`), with
-    the seed the objective's key is made from; the same on every run."""
+    from `seed`'s generator; the objective's uniforms from `jax.random.key(seed)` (`uniforms`), with the
+    seed the objective's key is made from; and the rows `MaskedDiffusionObjective`'s process corrupts
+    under that key, which MDLM's loss reads in both precisions (`nelbo`): a uniform within a rounding of
+    its move chance masks or not by which precision compares it, which would part the two losses by a
+    whole token's term. The same on every run."""
+    import jax.numpy as jnp
+
+    from dew.diffusion.discrete import MDLM as Process
+
     generator = np.random.default_rng([0x3D1, seed])
-    return {"seed": np.asarray(seed, np.int64), "tokens": generator.integers(0, MASK, (ROWS, LENGTH)),
+    tokens = generator.integers(0, MASK, (ROWS, LENGTH))
+    process = Process(mask_id=MASK)()
+    time_key, mask_key, _ = jax.random.split(jax.random.key(seed), 3)
+    corrupted, _ = process.corrupt(mask_key, jnp.asarray(tokens), process.sample_t(time_key, ROWS))
+    return {"seed": np.asarray(seed, np.int64), "tokens": tokens,
             "hidden": generator.standard_normal((ROWS, LENGTH, FEATURES)).astype(np.float32),
-            "head": generator.standard_normal((FEATURES, VOCAB)).astype(np.float32), **uniforms(seed)}
+            "head": generator.standard_normal((FEATURES, VOCAB)).astype(np.float32),
+            "corrupted": np.asarray(corrupted), **uniforms(seed)}
 
 
 def nelbo(reference, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
     """MDLM's `_loss` over `inputs` (`drawn_inputs`) at `dtype`: the per-token loss, the batch's mean
-    and its gradient in both weights, its two `torch.rand` draws the inputs' uniforms."""
+    and its gradient in both weights, its two `torch.rand` draws the inputs' uniforms and its `q_xt`
+    the inputs' corrupted rows."""
     backbone = Backbone(inputs["hidden"], inputs["head"], dtype)
     model = stand_in(reference, backbone)
+    model.q_xt = lambda x, move_chance: torch.tensor(inputs["corrupted"])
     tokens = torch.tensor(inputs["tokens"])
     with drawn(torch.tensor(inputs["time_uniform"], dtype=dtype),
                torch.tensor(inputs["mask_uniform"], dtype=dtype)):

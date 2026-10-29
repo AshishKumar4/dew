@@ -66,8 +66,8 @@ RECORDING = Path(__file__).parent / "fixtures" / "mdlm" / "recorded_nelbo.npz"
 
 
 def taped(tokens, seed) -> Step:
-    """The objective's step reading the corruption its key draws from `seed`, MDLM's on the same
-    uniforms (tools/mdlm_reference.py `uniforms`): its times and masks (`Step.tape`)."""
+    """The objective's step reading the corruption its key draws from `seed`: its times and masks
+    (`Step.tape`)."""
     process = MDLM(mask_id=MASK)()
     time_key, mask_key, _ = jax.random.split(jax.random.key(seed), 3)
     t = process.sample_t(time_key, tokens.shape[0])
@@ -94,9 +94,9 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
     """The per-token NELBO terms (zero where a token stayed visible), their mean and its gradient in
     the backbone's weights are on par with MDLM's float32 run from its float64 run (check 1), over
     the recording's seeds of rows, weights and the objective's draws (tools/mdlm_reference.py
-    `--record`, `drawn_inputs`), the objective reading MDLM's corruption of each, its times and masks
-    (`Step.tape`); and the reported masked accuracy and fraction on the fixture's draw are the counts'
-    own float32 divisions."""
+    `--record`, `drawn_inputs`), MDLM's loss reading the objective's corruption of each, which is MDLM's
+    own on the fixture's draw (`test_the_corruption_is_mdlms_on_the_same_draws`); and the reported
+    masked accuracy and fraction on the fixture's draw are the counts' own float32 divisions."""
     from tools.mdlm_reference import drawn_inputs
 
     seeds = declared_seeds(RECORDING)["nelbo"]

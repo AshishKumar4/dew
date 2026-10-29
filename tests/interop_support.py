@@ -137,6 +137,27 @@ def transformers_arms(model, run, *, source=None, twin=None):
     return arm(model, contextlib.nullcontext), arm(twin, float64)
 
 
+def peft_twin(model):
+    """A PEFT model's float64 twin (`tools.torch_precision.float64_twin`): the same base and adapter
+    built inside `float64` by transformers' and PEFT's own builders, so every value their constructors
+    compute is float64's (the rotary tables' among them), loaded with `model`'s weights, to run inside
+    `float64` (`transformers_arms`' `twin`)."""
+    import copy
+
+    import torch
+    from peft import get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    from tools.torch_precision import float64_twin
+
+    def build():
+        config = copy.deepcopy(model.get_base_model().config)
+        base = AutoModelForCausalLM.from_config(config, dtype=torch.float64)
+        return get_peft_model(base, copy.deepcopy(model.peft_config["default"]))
+
+    return float64_twin(model, build)
+
+
 def next_token_losses(model, ids):
     """The torch causal LM `model`'s cross entropy at each next token of `ids` in its logits' precision,
     the per-token losses `LMObjective.token_scores` returns (a `run` of `transformers_arms`)."""

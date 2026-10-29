@@ -244,11 +244,23 @@ def requests(inputs) -> dict:
 
 def record(directory: Path) -> Path:
     """Laya's option logits over check 1's seeds of requests (`drawn_cases`, `record_case`), both
-    layouts, fp32 and float64, its count sized on Laya alone, as recorded_logits.npz in `directory`."""
+    layouts, fp32 and float64, as recorded_logits.npz in `directory`, its count sized paired with
+    Dew's logits (tests/test_decision_laya.py `logits`), as check 1 judges them: a question's few option
+    logits make each arm's error heavy-tailed across draws alike, and Laya against itself on other
+    draws never resolves."""
     import transformers
     from recorded_references import provenance, record_case, save
+    from test_decision_laya import logits
+
+    from dew.decision import Decide
 
     _, run = runs(directory)
+    checkpoint = Decide.from_pretrained(directory, attention_impl="xla")
+
+    def ours(inputs):
+        drawn = requests(inputs)
+        return {key: value for parallel in (False, True)
+                for key, value in logits(checkpoint, parallel=parallel, requests=drawn).items()}
 
     def evaluate(inputs):
         drawn = requests(inputs)
@@ -257,7 +269,7 @@ def record(directory: Path) -> Path:
                 for key, value in run(drawn, parallel, wide=True)[0].items()}
         return fp32, wide
 
-    recorded = record_case("laya", drawn_cases, evaluate, store_inputs=False)
+    recorded = record_case("laya", drawn_cases, evaluate, store_inputs=False, dew=ours)
     made = provenance("NandhaKishorM/laya", LAYA_COMMIT, "cpu",
                       "PYTHONPATH=src:tools python tools/laya_reference.py --record",
                       transformers=transformers.__version__, torch=torch.__version__)
