@@ -717,16 +717,16 @@ def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kern
     weights = jax.ShapeDtypeStruct((8, 2048, 4096), jnp.bfloat16)
     sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
     arguments = launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
-    target = generation.gpu_target("sm90")
+    target = generation.TARGETS["sm90"]
     with report.refusals(), generation.assumed(target):
         tile = launch.derived(arguments, target)
         report.refuse([(report._identity(launch, arguments), tile, {"dew_gmm"})])
         assert report.refused(launch, arguments, tile)
         with generation.assumed(dataclasses.replace(target, clock_hz=1.98e9)):
             assert report.refused(launch, arguments, tile)
-        with generation.assumed(dataclasses.replace(target, multiprocessors=target.multiprocessors // 2)):
+        with generation.assumed(dataclasses.replace(target, multiprocessors=64)):
             assert not report.refused(launch, arguments, tile)
-        with generation.assumed(dataclasses.replace(target, shared_limit=target.shared_limit // 2)):
+        with generation.assumed(dataclasses.replace(target, shared_limit=128 * 1024)):
             assert not report.refused(launch, arguments, tile)
 
 
