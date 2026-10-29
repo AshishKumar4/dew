@@ -39,10 +39,19 @@ def float64_replay(fn):
     however widened its arguments arrive (check 1 hands a truth widened inputs under x64), and
     rounds each argument to its traced dtype before widening it, as the program would read it. It runs
     eagerly, each operation its own float64 dispatch, so its bits are each operation's own (a
-    compiled replay's fusions would move them by ulps), and the gate runs it as given."""
+    compiled replay's fusions would move them by ulps), and the gate runs it as given. `fn` is traced
+    once a signature of its arguments (their tree, shapes and dtypes), its program the same at every
+    call of one signature, as a pure function's is: a draw over many seeds replays one trace."""
+    traced: dict[tuple, tuple] = {}
+
     def run(*arguments):
-        with jax.enable_x64(new_val=False):
-            graph, shapes = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+        leaves, tree = jax.tree.flatten(arguments)
+        signature = (tree, tuple((np.shape(value), str(getattr(value, "dtype", np.result_type(value))))
+                                 for value in leaves))
+        if signature not in traced:
+            with jax.enable_x64(new_val=False):
+                traced[signature] = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+        graph, shapes = traced[signature]
         native = [value if jax.dtypes.issubdtype(aval.dtype, jax.dtypes.extended)
                   else np.asarray(value).astype(aval.dtype)
                   for value, aval in zip(jax.tree.leaves(arguments), graph.in_avals, strict=True)]
