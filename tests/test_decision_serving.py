@@ -9,13 +9,18 @@ from pathlib import Path
 import httpx
 import jax
 import numpy as np
+import optax
 import pytest
+from decision_support import decision_rows
 from starlette.testclient import TestClient
 from tool_support import load
 
-from dew.decision import Decide
+from dew.checkpoints import Checkpoints
+from dew.decision import Choice, Decide, Example
 from dew.decision.calibration import Temperatures
+from dew.decision.objective import DecisionObjective
 from dew.inference import ScoringServer
+from dew.training import Trainer
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "laya"
@@ -182,6 +187,37 @@ def test_the_served_weights_are_restored_in_the_dtype_they_serve_in(example):
     assert dtypes(served) == dtypes(narrow) != dtypes(wide)
     stated = example.loaded(example.Options(model=tiny, dtype="bfloat16", param_dtype="float32"))
     assert dtypes(stated) == dtypes(wide)
+
+
+def test_a_saved_run_records_its_widths_and_a_server_of_it_compiles_its_passes_up_front(decide, tmp_path):
+    """A fit records the most questions a row and options a question its data holds, as its layout steps
+    bound them (`Loader.widths`, `DecisionObjective.bind_widths`), with its checkpoint, over data that
+    states none ahead; the task loaded from the run pads each pass to them (`Budget`), so a scoring server
+    over it compiles its passes' programs up front (ledger 2074). A record written before runs recorded
+    widths loads with none, and its server compiles none ahead."""
+    asked = Example("the card was charged twice", {"q": Choice("Which team?", ["cards", "loans", "fraud"])},
+                    {"q": "cards"})
+    laid = decide.layout.rows(decide.tokenizer, decide.specials, asked.state, asked.questions)
+    widths = (max(len(row.questions) for row in laid), max(len(question.options) for row in laid
+                                                           for question in row.questions))
+    objective = DecisionObjective(decide)
+    assert objective.widths is None
+    checkpoints = Checkpoints(str(tmp_path / "today"), keep=1)
+    state = Trainer(objective, optax.sgd(0.0), key=0, checkpoints=checkpoints).fit(
+        decision_rows([asked] * 8, 8, objective=objective.data()), steps=1, checkpoint_every=1, log_every=100)
+    checkpoints.wait()
+    record = objective.inference_record()
+    assert isinstance(record, dict) and (record["questions"], record["options"]) == widths
+    earlier = {name: value for name, value in record.items() if name not in ("questions", "options")}
+    with Checkpoints(str(tmp_path / "earlier")) as written:
+        written.save(1, state, artifact=earlier)
+        written.wait()
+    today, before = (Decide.from_run(str(tmp_path / name)) for name in ("today", "earlier"))
+    assert (today.budget.questions, today.budget.options) == widths
+    assert (before.budget.questions, before.budget.options) == (None, None)
+    server = ScoringServer.from_task(*today.scoring())
+    assert server.programs and server.programs == today.pass_shapes
+    assert not ScoringServer.from_task(*before.scoring()).programs
 
 
 def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(decide, caplog):
