@@ -370,6 +370,9 @@ class DiffusionRunConfig(RunConfig):
         (`pinned`), on its data, whose captions the objective's conditions
         tokenize. `val_metrics` score each validation, and Flow-GRPO samples
         the batches it trains on (`rollout`)."""
+        if (pinned := self.pinned_adapter()) is not self:
+            # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
+            return pinned.prepare()
         from dew.objectives.rl.flow import FlowGRPOObjective
 
         run = self.pinned()
@@ -386,8 +389,8 @@ class DiffusionRunConfig(RunConfig):
     def pinned(self) -> DiffusionRunConfig:
         """Return this run with its Hub sources pinned to the commits they resolve to now.
 
-        The sources are `pretrained`, the alignment's encoder and an imported adapter
-        (`pinned_adapter`), so the record names the weights the run started from.
+        The sources are `pretrained` and the alignment's encoder, so the record names
+        the weights the run started from.
         """
         from dew.interop import sources
 
@@ -405,7 +408,7 @@ class DiffusionRunConfig(RunConfig):
                 objective = dataclasses.replace(objective, fields={**objective.fields, "alignment": to_record(
                     dataclasses.replace(alignment, source=pin(alignment.source)), Alignment)})
         return dataclasses.replace(self, pretrained=None if self.pretrained is None else pin(self.pretrained),
-                                   objective=objective).pinned_adapter()
+                                   objective=objective)
 
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its

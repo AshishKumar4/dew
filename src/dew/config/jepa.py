@@ -60,6 +60,9 @@ class JepaRunConfig(RunConfig):
         """The encoder, the predictor over its patch grid, the target-block mask
         and the probes, around the objective the run names. The predictor
         computes as the encoder does, its compute dtype and attention kernel."""
+        if (pinned := self.pinned_adapter()) is not self:
+            # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
+            return pinned.prepare()
         # Compiled once, before the objective, whose EMA ramps over the run's length: JEPA reads its
         # batches as the chain makes them, with no stages of its own.
         self.built_fresh()
@@ -98,9 +101,8 @@ class JepaRunConfig(RunConfig):
         objective = self.objective.build(encoder=encoder, predictor=predictor, mask=mask, sample=sample,
                                          **ramp, **adapted)
         probes = self.validation_metrics(validates=bool(held))
-        run = self.pinned_adapter()
-        return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=probes,
-                                                    validation=held))
+        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,
+                                                      validation=held))
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """A linear and a k-nearest-neighbour probe of the frozen encoder, where `probe_classes` names

@@ -183,6 +183,9 @@ class DecisionRunConfig(DecoderRunConfig):
         flags choose only its compute dtype and attention kernel;
         `param_dtype` chooses the loaded checkpoint's storage dtype. `remat`
         chooses its layer recomputation before looping or attaching LoRA."""
+        if (pinned := self.pinned_adapter()) is not self:
+            # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
+            return pinned.prepare()
         from dew.interop import Pretrained
 
         self.sourced_model()
@@ -292,9 +295,8 @@ class DecisionRunConfig(DecoderRunConfig):
 
         metrics = self.validation_metrics(validates=bool(held))
         after = calibrate if self.calibrate and held else None
-        run = self.pinned_adapter()
-        return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
-                                                    summary=summary, after=after, validation=held))
+        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
+                                                      summary=summary, after=after, validation=held))
 
     def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> Mapping[str, object]:
         """The head a fresh backbone `start` reads and its rows' layout: the joint schema head, the

@@ -104,6 +104,9 @@ class LMRunConfig(DecoderRunConfig):
         or a fresh draw from the run's key, so the objective trains its factors
         alone. Each validation pass scores `val_metrics`, perplexity by default.
         """
+        if (pinned := self.pinned_adapter()) is not self:
+            # An imported adapter is loaded at the commit the run records (`pinned_adapter`).
+            return pinned.prepare()
         tokens = self.tokens()
         if objectives.label(self.objective.name) == "block_diffusion" and tokens.packed:
             raise ValueError("block_diffusion trains on spans of the stream, not packed documents")
@@ -132,7 +135,6 @@ class LMRunConfig(DecoderRunConfig):
             model, fields = source.model, dict(source.model_config)
         if source is None:
             run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))
-        run = run.pinned_adapter()
         variables = None if source is None else source.variables
         if self.lora is not None:
             if source is None:

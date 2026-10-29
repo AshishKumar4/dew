@@ -1330,8 +1330,10 @@ class RunConfig:
 
     def pinned_adapter(self) -> Self:
         """This run with its imported adapter's Hub source named at its commit (`LoRA.resolved`), so the
-        record names the factors the run started from: every kind's `prepare` trains this run."""
-        return self if self.lora is None else dataclasses.replace(self, lora=self.lora.resolved())
+        record names the factors the run started from: every kind's `prepare` prepares this run, which
+        loads the factors it records. Itself where nothing is left to pin."""
+        lora = None if self.lora is None else self.lora.resolved()
+        return self if lora == self.lora else dataclasses.replace(self, lora=lora)
 
     def profile(self, directory: str | None = None, *, warmup: int = 20, steps: int = 10,
                 capture: ProfileWindow | None = None) -> ProfileReport | None:
