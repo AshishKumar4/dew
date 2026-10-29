@@ -30,6 +30,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_mosaic_program,
     attention_triton,
+    resources,
 )
 
 pytestmark = pytest.mark.kernel
@@ -1091,3 +1092,64 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
                                     KernelCase("backward", lambda: (backward, (query, key, key, query)))],
                                    "sm90")
     assert not failures(found), "\n".join(failures(found))
+
+
+BACKWARD_GATE = [(width, accurate) for width in (64, 128, 256) for accurate in (False, True)]
+"""The backward resource gate's cases: a causal call's head widths, each form."""
+
+
+@pytest.mark.parametrize(("width", "accurate"), BACKWARD_GATE)
+def test_the_backward_compiles_spill_free_as_its_model_decides_for_an_h100(width, accurate):
+    """The backward at its derived tiles of a causal call `width` wide in the form `accurate` names, lowered
+    and compiled by ptxas for an H100 on this CPU (tests/kernel_compile.py): every launch within its shared
+    memory, spilling nothing, and its register model's decision ptxas's (`mosaic_failures`, each launch's
+    model `resources.register_model` at its own layout and consumers, `MosaicBackward._launch_registers`)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
+
+    def backward(query, key, value, dout):
+        residuals = attention_mosaic.forward(query, key, value, spans, residuals=True)[1:]
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                          accurate=accurate)
+        return grads.query, grads.key, grads.value
+
+    with generation.assumed("sm90"):
+        op, args = attention_mosaic._backward_call(jnp.zeros(query.shape, query.dtype), jnp.zeros(key.shape),
+                                                  jnp.zeros(key.shape), spans, None, jnp.zeros(query.shape),
+                                                  _residuals(query.shape), accurate=accurate)
+        ba = op.bind(*args)
+        target = generation.gpu_target()
+        config = op.derived(ba, target)
+        assert config is not None
+        models = _backward_models(op, ba, config)
+        found = compile_mosaic_kernels(
+            [KernelCase("backward", lambda: (backward, (query, key, key, query)), models)], "sm90")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def _residuals(shape) -> tuple:
+    """A training forward's residuals' shapes for a call of `shape` `[B, Q, H, D]`, zeros (`backward` binds
+    its arguments only)."""
+    batch, queries, heads, width = shape
+    stats = jnp.zeros((batch, heads, queries), jnp.float32)
+    return (stats, stats, jnp.zeros((batch, heads, queries), jnp.int32),
+            template.Split(jnp.zeros((batch, heads, queries, width), jnp.float32), stats, stats, stats))
+
+
+def _backward_models(op, ba, config) -> dict:
+    """Each backward launch's register model by its kernel's name (`attention_dq`, `attention_dkv`, a width
+    share's `_columnsN`), at its own layout and consumers (`BackwardTiles.dkv`)."""
+    dq, dkv = op._launch_registers(ba, config)
+    models = {}
+    for kind, tiles, registers in (("dq", config, dq), ("dkv", config.dkv, dkv)):
+        family = attention_mosaic_program.bundle_of(tiles, jnp.bfloat16)
+        model = resources.register_model(family, tiles.consumers, registers)
+        names = ([f"attention_{kind}"] if config.columns == 1
+                 else [f"attention_{kind}_columns{share}" for share in range(config.columns)])
+        models.update(dict.fromkeys(names, model))
+    return models
