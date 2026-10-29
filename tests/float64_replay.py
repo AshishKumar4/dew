@@ -96,12 +96,29 @@ def _wide(dtype):
     return jnp.float64 if _floating(dtype) else dtype
 
 
+def _scanned(equation) -> tuple[int, int]:
+    """A scan's constants and carries, its step's first operands: by its counts where it states them,
+    else as the operands and results whose shapes the step keeps, a scanned operand or result being
+    the stack of the step's (one dimension more)."""
+    params = equation.params
+    if "num_carry" in params:
+        return params["num_consts"], params["num_carry"]
+    body = params["jaxpr"].jaxpr
+
+    def kept(outer, inner):
+        return next((index for index, (one, other) in enumerate(zip(outer, inner, strict=False))
+                     if one.aval.shape != other.aval.shape), min(len(outer), len(inner)))
+    carries = kept(equation.outvars, body.outvars)
+    return kept(equation.invars, body.invars) - carries, carries
+
+
 def _carried(body, consts: int, carries: int, used):
     """Which of a scan body's results its used results read: a used carry or output, and every carry
     a read result reads back in through the next step, until none is added."""
     reading = list(used)
     while True:
-        read = {variable for equation, _ in _read(body, reading) for variable in equation.invars}
+        read = {variable for equation, _ in _read(body, reading) for variable in equation.invars
+                if not hasattr(variable, "val")}
         read |= {variable for variable, kept in zip(body.outvars, reading, strict=True)
                  if kept and not hasattr(variable, "val")}
         added = [index for index in range(carries)
@@ -142,10 +159,7 @@ def _replayed_equation(equation, values, used):
         # The body, replayed in float64 for its operands' widened dtypes, as the scan's own: of its
         # results those the scan's used results read through every step (`_carried`), the rest zeros.
         body = params["jaxpr"]
-        # The constants and carries the step reads first, by count or by their trees' leaves (`ft_in`).
-        consts, carries = ((params["num_consts"], params["num_carry"]) if "num_carry" in params
-                           else (len(params["ft_in"][0] or ()), len(params["ft_in"][1] or ())))
-        reading = _carried(body.jaxpr, consts, carries, used)
+        reading = _carried(body.jaxpr, *_scanned(equation), used)
 
         def step(*operands):
             outputs = _replayed(body.jaxpr, body.consts, list(operands), reading)
