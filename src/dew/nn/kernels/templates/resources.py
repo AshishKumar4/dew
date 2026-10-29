@@ -31,7 +31,13 @@ cap): a plain mainloop the accumulator and 32 (its step's descriptors too), exac
 16, an epilogue with a column vector the accumulator, the vector and 16."""
 
 PRODUCER_REGISTERS = 40
-"""The registers a thread of a cooperative block's producer warpgroup holds: it only issues loads."""
+"""The registers a thread of a cooperative block's producer warpgroup lowers to (`set_max_registers`): a
+measured bound, not yet the rule. A producer's rule is the least of setmaxnreg's steps of 8 (its floor 24,
+PTX ISA) holding its own issue code's live set, computed per launch once a liveness model prices the
+producer's branch, beside `Family.held_registers` and `CONTROL_REGISTERS`. The live sets vary (PRODFLOOR3,
+whole-program ptxas 12.9 and 13.4 with the raises honored): 24 holds the recurrence's training kernels' and
+the attention forward's and backward's producers at D64 and D128 but the natural training forward's at D128
+under 13.4, whose spill grows from 52 to 60 bytes below 40."""
 
 
 THREADS = 128

@@ -1,15 +1,16 @@
 """The Mosaic GPU Family bundles every template's launches derive their kernels on (`mosaic.Family`), one
 registry keyed by the device's instruction family (`generation.family`): Hopper's warpgroup MMA's
 (`mosaic_sm90.WGMMA`, and its layout without a producer, `mosaic_sm90.FED`) and Ampere's mma.sync's
-(`mosaic_sm80.Mma`); a launch names its bundle by the bundle's `name` (`named`). A device of a family with
-no bundle here (Blackwell's tcgen05, consumer Blackwell's mma.sync fed by TMA, a TPU's) runs no Mosaic GPU
-mainloop: every template's Mosaic launch is ineligible there, and its call takes the next route by
-legality."""
+(`mosaic_sm80.Mma`); a launch names its bundle by the bundle's `name` (`named`). Blackwell's tcgen05, whose
+products accumulate in tensor memory, has its own bundle for the templates' Blackwell mainloops
+(`tensor_memory`, `mosaic_sm100`), outside `of`. A device of a family with no bundle here (consumer
+Blackwell's mma.sync fed by TMA, a TPU's) runs no Mosaic GPU mainloop: every template's Mosaic launch is
+ineligible there, and its call takes the next route by legality."""
 
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100
 
 
 def of(generation_name: str, dtype) -> mosaic.Family | None:
@@ -25,6 +26,16 @@ def of(generation_name: str, dtype) -> mosaic.Family | None:
     if architecture.family == mosaic_sm80.Mma.name and not architecture.tma:
         return mosaic_sm80.Mma(jnp.dtype(dtype))
     return None
+
+
+def tensor_memory(generation_name: str) -> mosaic_sm100.Tcgen05 | None:
+    """The bundle a template's Blackwell mainloop runs on a device of `generation_name` whose products
+    accumulate in tensor memory (`generation.family` tcgen05: a B200's, a B300's; `mosaic_sm100`), apart
+    from `of`'s, whose threads hold their accumulators; None elsewhere."""
+    architecture = generation.architecture(generation_name)
+    if architecture is None or architecture.family != mosaic_sm100.TCGEN05.name:
+        return None
+    return mosaic_sm100.TCGEN05
 
 
 def layouts(generation_name: str, dtype) -> tuple[mosaic.Family, ...]:
