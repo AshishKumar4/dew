@@ -286,18 +286,19 @@ def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_t
 
 @pytest.mark.gpu(reason="measures a run's kernel launches, which only a GPU runs")
 @pytest.mark.mesh(devices=1)
-@pytest.mark.parametrize("kind", list(KINDS))
-def test_a_kinds_run_measures_its_kernel_launches_as_set(kind, tmp_path):
-    """A run whose attention takes Triton's kernel, a launch of configs to measure, that measures its
+def test_an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
+    """An LM run whose attention takes Triton's kernel, a launch of configs to measure, that measures its
     step's launches on this GPU (`tune_kernels`) keeps what it picked beside its compilation cache
-    (`dew.cache.kernel_picks_path`), where a later run reads them."""
+    (`dew.cache.kernel_picks_path`), where a later run reads them. Every kind's trainer is built through
+    the one `RunConfig.built`, which hands it the option; the other kinds' tiny models launch nothing
+    Triton takes (a decision backbone's sliding window, heads narrower than its kernel computes)."""
     import jax
 
     cache, compiling = tmp_path / "cache", jax.config.jax_compilation_cache_dir
     try:
-        trained(kind, tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
-                                              "trainer.compilation_cache_dir": str(cache),
-                                              "trainer.mesh": {}, "model.attention_impl": "triton"})
+        trained("lm", tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
+                                              "trainer.compilation_cache_dir": str(cache), "trainer.mesh": {},
+                                              "model.attention_impl": "triton", "model.head_dim": 16})
     finally:
         jax.config.update("jax_compilation_cache_dir", compiling)
     (picks,) = cache.rglob("kernels/*.json")
