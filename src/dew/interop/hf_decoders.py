@@ -545,35 +545,6 @@ def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, objec
     return text
 
 
-QUANTIZED_MODULE_LISTS = ("modules_to_not_convert", "ignore", "exclude_modules", "ignored_layers")
-"""The quantization_config fields of the module selections the formats Dew reads state."""
-
-
-def language_model_quantization(hf_config: Mapping[str, object], record: WrapperFields) -> dict[str, object]:
-    """A wrapper's quantization_config as its language model's text checkpoint states it: each module
-    selection (`QUANTIZED_MODULE_LISTS`) under the text family's names (`wrapper_route`), a tower's or a
-    projector's modules left out. A pattern (`re:`) that names the wrapper's nesting is refused, since
-    the text checkpoint renames what it matches; one over the modules' own names reads either alike."""
-    quantization = dict(_records.record(hf_config["quantization_config"], "quantization_config"))
-    nestings = ("language_model", "visual", "vision", "audio", "multi_modal_projector", "embed_vision")
-    for field in QUANTIZED_MODULE_LISTS:
-        if not isinstance(quantization.get(field), list):
-            continue
-        projected = []
-        for entry in _records.listed(quantization[field], field, read=_records.text, what="module names"):
-            if entry.startswith("re:"):
-                if any(nesting in entry for nesting in nestings):
-                    raise ValueError(f"text_only cannot rename the pattern {entry!r} of {field}, which names "
-                                     "the wrapper's nesting; state the modules by name")
-                projected.append(entry)
-                continue
-            component, name = wrapper_route(f"{entry}.weight", record)
-            if component == "language_model":
-                projected.append(name.removesuffix(".weight"))
-        quantization[field] = projected
-    return quantization
-
-
 def language_model_names(names: Collection[str], read: Callable[[str], Stored], record: WrapperFields,
                          checked: Checked = NOTHING_CHECKED) -> dict[str, str]:
     """Each tensor name of a wrapper's language model, as its text family reads it, to the wrapper's
