@@ -190,6 +190,22 @@ class DecisionRunConfig(DecoderRunConfig):
         revision = SourceReference(self.pretrained, self.revision, self.subfolder).pinned().revision
         return run if revision == self.revision else dataclasses.replace(run, revision=revision)
 
+    def _refuse_unread_context(self) -> None:
+        """Refuse each context option a run without context layers would read nothing of: a schema read
+        as the row's context, its encoder, its frozen backbone and its block's form."""
+        in_context = any(isinstance(segment, Schema) and segment.stream == "context"
+                         for segment in self.segments or ())
+        if in_context and self.context_layers is None:
+            raise ValueError("a schema read as the row's context is read by context layers; set "
+                             "--context-layers")
+        if self.context_encoder != "table" and self.context_layers is None:
+            raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
+        if not self.context_frozen and self.context_layers is None:
+            raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
+                             "--context-layers")
+        if self.context_form != "idefics" and self.context_layers is None:
+            raise ValueError("--context-form says which block context layers run; set --context-layers")
+
     def build_run(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
@@ -210,18 +226,7 @@ class DecisionRunConfig(DecoderRunConfig):
                    "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
                    "framing": self.framing, "segments": self.segments, "order": self.order,
                    "split": self.split}
-        in_context = any(isinstance(segment, Schema) and segment.stream == "context"
-                         for segment in self.segments or ())
-        if in_context and self.context_layers is None:
-            raise ValueError("a schema read as the row's context is read by context layers; set "
-                             "--context-layers")
-        if self.context_encoder != "table" and self.context_layers is None:
-            raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
-        if not self.context_frozen and self.context_layers is None:
-            raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
-                             "--context-layers")
-        if self.context_form != "idefics" and self.context_layers is None:
-            raise ValueError("--context-form says which block context layers run; set --context-layers")
+        self._refuse_unread_context()
         derived = {}
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder
