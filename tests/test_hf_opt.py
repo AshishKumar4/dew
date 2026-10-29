@@ -89,11 +89,13 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
                                   attention_impl="reference")
         ids = jnp.arange(6, dtype=jnp.int32).reshape(1, 6) % 16
         variables = model.init(jax.random.key(0), ids)
-        # Integer-valued weights: both products are exact in float64, whatever their order.
+        # Integer-valued weights and final states: both products are exact in float64, whatever their
+        # order.
         whole = jax.tree.map(lambda leaf: jnp.round(leaf * 4), variables)
-        hidden = model.apply(whole, ids, method=CausalTransformer.hidden_states)
+        hidden = jnp.asarray(np.random.default_rng(0).integers(-3, 4, (1, 6, 8)), jnp.float64)
         rows = model.apply(whole, method=CausalTransformer.vocabulary_rows)
-        np.testing.assert_array_equal(np.asarray(model.apply(whole, ids)), np.asarray(hidden @ rows.T))
+        logits = model.apply(whole, hidden, method=CausalTransformer.logits_from_hidden)
+        np.testing.assert_array_equal(np.asarray(logits), np.asarray(hidden @ rows.T))
     looped = {"num_layers": 2, "loop": Loop(2, layers=(0, 2), step_norm=True), "final_norm": False}
     base = CausalTransformer(vocab_size=16, emb_features=8, num_heads=2, mlp_features=16, max_seq_len=8,
                              attention_impl="reference")
