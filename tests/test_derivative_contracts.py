@@ -98,8 +98,8 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
                 held &= np.isfinite(plainly)
             broken = held & ~np.isfinite(value)
             if broken.any():
-                raise LessFinite(f"{label}, {name}, leaf {index}: {int(broken.sum())} values not finite where "
-                                 f"float64's are normal float32s, e.g. {value[broken][:3]}")
+                raise LessFinite(f"{label}, {name}, leaf {index}: {int(broken.sum())} values not finite "
+                                 f"where float64's are normal float32s, e.g. {value[broken][:3]}")
 
 
 EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
