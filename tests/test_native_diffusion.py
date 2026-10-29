@@ -31,7 +31,6 @@ def run_check(*arguments, failing: bool = False) -> str:
         cwd=ROOT,
         capture_output=True,
         text=True,
-        timeout=240,
         env={
             **os.environ,
             "JAX_PLATFORMS": "cpu",

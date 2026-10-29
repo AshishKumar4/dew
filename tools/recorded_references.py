@@ -33,7 +33,7 @@ from reference_error import (
     SIZING_FROM,
     as_given,
     input_digest,
-    leaf_summary,
+    leaf_summaries,
     seeds_for,
     seeds_resolving,
     truth_sketch,
@@ -303,13 +303,16 @@ def _joined(label: str, shards: Sequence[Mapping[str, np.ndarray]], first: int) 
 
 def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
     """`records`' evidence, one row a seed of `seeds`, read one record at a time (an iterable of
-    (inputs, reference, truth)): each leaf's `leaf_summary` (its rows of float64 zero joined, with their
-    count a seed) and its truth's sketch, and each seed's input digest."""
+    (inputs, reference, truth)): each leaf's `leaf_summary`, a record's leaves read at once
+    (`leaf_summaries`; its rows of float64 zero joined, with their count a seed), and its truth's sketch,
+    and each seed's input digest."""
     digests, leaves, sketches, shapes = [], {}, {}, {}
     for seed, (inputs, reference, truth) in zip(seeds, records, strict=True):
         digests.append(input_digest(inputs))
-        for name in reference:
-            leaves.setdefault(name, []).append(leaf_summary(reference[name], truth[name]))
+        names = list(reference)
+        summaries = leaf_summaries([reference[name] for name in names], [truth[name] for name in names])
+        for name, summary in zip(names, summaries, strict=True):
+            leaves.setdefault(name, []).append(summary)
             sketches.setdefault(name, []).append(truth_sketch(truth[name], seed))
             shapes.setdefault(name, np.asarray(np.shape(truth[name]), np.int64))
     evidence = {f"{label}.drawn": np.asarray(seeds, np.int64), f"{label}.input_digest": np.asarray(digests)}

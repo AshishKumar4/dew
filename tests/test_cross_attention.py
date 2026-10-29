@@ -24,6 +24,7 @@ import torch
 from model_support import TINY_DECODER, Digits, decoder, flat_tree
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
+from whole_suite import timed
 
 from dew.batch import FROZEN, coordinates, thaw
 from dew.checkpoints import Checkpoints
@@ -148,14 +149,17 @@ def idefics_block(wide: bool):
     return run
 
 
-# The bfloat16 block runs in the whole suite alone (132 s, ledger 2158); every train computes and
-# differentiates it in float32.
-@pytest.mark.parametrize("dtype", [pytest.param(np.float32, id="float32"),
-                                   pytest.param(jnp.bfloat16, id="bfloat16", marks=pytest.mark.whole_suite)])
-def test_the_block_computes_and_differentiates_as_idefics(dtype):
+PAST_TARGET = {"idefics": {"bfloat16": 132}}
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2158):
+the bfloat16 block; every train computes and differentiates it in float32."""
+
+
+@pytest.mark.parametrize("precision", timed(PAST_TARGET, "idefics", ["float32", "bfloat16"]))
+def test_the_block_computes_and_differentiates_as_idefics(precision):
     """Through both gated branches, the output and the gradients into the residual, the context and
     every parameter on par with IDEFICS's in float32 and in bfloat16 (check 1), over contexts of
     every length; the gates' products are at least float32."""
+    dtype = {"float32": np.float32, "bfloat16": jnp.bfloat16}[precision]
     label = f"block {np.dtype(dtype).name}"
     assert_as_exact(dew_block, idefics_block(wide=False), functools.partial(block_draw, dtype=dtype), label,
                     seeds=SEEDS[label], truth_fn=idefics_block(wide=True))

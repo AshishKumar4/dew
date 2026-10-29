@@ -37,6 +37,7 @@ from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, Di
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.moe import ROUTER_COLLECTION
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Lacks, TokenModel
 from dew.objectives.base import OMITTED, Aux, EMASpec, Omitted, Ratio, Shown, Source, Step, ended, model_rngs
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
@@ -201,7 +202,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         tokens, losses, weights, counted, predicted, real, sown = self._token_losses(params, batch, step,
                                                                                    train=train)
         prediction = Ratio(self.row_mean(losses, batch, weights=weights).total,
-                           self.row_mean(real.astype(jnp.float32), batch).total)
+                           self.row_mean(real.astype(at_least_fp32(losses.dtype)), batch).total)
         correct = predicted == tokens
         accuracy, _ = self.accuracy(correct.astype(losses.dtype), batch, counted).mean()
         reported = {
