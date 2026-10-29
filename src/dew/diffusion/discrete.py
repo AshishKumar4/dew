@@ -414,7 +414,10 @@ class Confident:
 
     def init(self, x, times, process, *, key) -> tuple[jax.Array, jax.Array, jax.Array]:
         """The step reached, the walk's step count, and each row's slots the quota spreads (set at the
-        first step, -1 until then)."""
+        first step, -1 until then). A process that masks no tokens is refused, as `Unmask` refuses it."""
+        if not isinstance(process, DiscreteProcess):
+            raise ValueError(f"Confident reveals masked tokens, so it needs a DiscreteProcess and not "
+                             f"{type(process).__name__}")
         return (jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32),
                 jnp.full(x.shape[:1], -1, jnp.int32))
 

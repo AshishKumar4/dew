@@ -867,12 +867,45 @@ def assert_finite(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None
                                     "values not finite where the reference's are")
 
 
-ACCURATE_ARMS = [pytest.param(family, name, marks=pytest.mark.whole_suite) if name == "triton"
-                 else (family, name) for family in TEMPLATE_FAMILIES
-                 for name in _mainloops(FAMILIES[family], ACCURATE)]
+PAST_TARGET = {
+    "accurate": {("a small weight on a large value, bfloat16", "triton"): 325,
+                 ("a small weight on a large value, float32", "triton"): 320,
+                 ("a resumed state of a large denominator", "triton"): 269,
+                 ("a resumed state beside an overflowing column", "triton"): 144,
+                 ("a small column beside an overflowing one", "triton"): 141,
+                 ("a cotangent on a small column beside an overflowing one", "triton"): 139,
+                 ("a column near fp32's least normal beside an overflowing one", "triton"): 135},
+    "frozen default": {("a small column beside an overflowing one",): 181,
+                       ("a cotangent on a small column beside an overflowing one",): 168,
+                       ("a column near fp32's least normal beside an overflowing one",): 137},
+    "frozen rows": {("a small column beside an overflowing one",): 175,
+                    ("a resumed state beside an overflowing column",): 120,
+                    ("a column near fp32's least normal beside an overflowing one",): 119,
+                    ("a cotangent on a small column beside an overflowing one",): 118},
+    "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "natural"): 143}}
+"""The cases past or within 5 s of a group's 120 s target, by test and case, each its seconds on armada in
+train 281's or 283's CI (5861ec46b, 8089624e4; rows 2117, 2193, 2204): the whole suite's run holds them
+(`timed`), every other case of their tests runs each train."""
+
+
+def timed(test: str, cases: list) -> list:
+    """`cases` (a test's arguments, a tuple of several or one value) with those `PAST_TARGET` names under
+    `test` marked to the whole suite's run; a case already marked (`pytest.param`) as it is."""
+    slow = PAST_TARGET[test]
+
+    def one(case):
+        if isinstance(case, type(pytest.param())):
+            return case
+        values = case if isinstance(case, tuple) else (case,)
+        return pytest.param(*values, marks=pytest.mark.whole_suite) if values in slow else case
+
+    return [one(case) for case in cases]
+
+
+ACCURATE_ARMS = timed("accurate", [(family, name) for family in TEMPLATE_FAMILIES
+                                   for name in _mainloops(FAMILIES[family], ACCURATE)])
 """Each template family beside each mainloop that takes it in the accurate form (`_mainloops`): a case of
-its own, so none holds a CPU task past the suite's target (row 1849); the frozen Triton mainloop's,
-interpreted, run past it at fp32's edges (row 2117: 250 to 453 s), so the whole suite's run holds them."""
+its own, so none holds a CPU task past the suite's target (row 1849)."""
 
 
 @pytest.mark.parametrize(("family", "name"), ACCURATE_ARMS)
@@ -943,10 +976,10 @@ GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",)
 256 draws interpreted take past the CPU suite's 240 s target (218-257 s, row 1849)."""
 
 
-@pytest.mark.parametrize("family", [
+@pytest.mark.parametrize("family", timed("frozen default", [
     pytest.param(family, marks=pytest.mark.gpu(reason="256 draws of the Triton mainloop, compiled"))
     if family in GPU_TRITON_FAMILIES else family
-    for family in TEMPLATE_FAMILIES if FAMILIES[family].folded or FAMILIES[family].overflows])
+    for family in TEMPLATE_FAMILIES if FAMILIES[family].folded or FAMILIES[family].overflows]))
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
     """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
     fp32's largest (`_default_is_finite`): it guards its sums' headroom in either form, as the template's
@@ -956,8 +989,8 @@ def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at
     _default_is_finite(family, "triton")
 
 
-@pytest.mark.whole_suite
-@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].overflows])
+@pytest.mark.parametrize("family", timed("frozen rows", [family for family in TEMPLATE_FAMILIES
+                                                        if FAMILIES[family].overflows]))
 def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass(family):
     """The Triton mainloop's default backward asked for its unsplit first pass (`split=False`) over sums that
     pass fp32's largest, finite wherever the reference is: a guarded forward's live rows carry normalized
@@ -1086,9 +1119,11 @@ def test_gradients_at_a_scale_far_below_one_are_on_par(options, name, dtype):
 
 DECODED = [(family, form) for family, form in FAMILY_RUNS
            if FAMILIES[family].draw(0)[0].shape[1] == 1 and FAMILIES[family].draw(0)[0].shape[3] >= 16
-           and not isinstance(FAMILIES[family].draw(0)[3], tuple)]
+           and not isinstance(FAMILIES[family].draw(0)[3], tuple)
+           and not (form == "default" and jnp.dtype(FAMILIES[family].dtype) == jnp.float32)]
 """The families a decode step is: one query a row, a head width the decode kernel takes (16 to 256),
-sinks or none (a resumed state is the template's)."""
+sinks or none (a resumed state is the template's); fp32 operands in the natural form alone, which is the
+decode kernel's default for them (ledger 2151)."""
 
 
 def _cache(array: jax.Array) -> jax.Array:
@@ -1122,7 +1157,8 @@ def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
     return decoded, forward
 
 
-@pytest.mark.parametrize("family, form", DECODED, ids=[f"{family}-{form}" for family, form in DECODED])
+@pytest.mark.parametrize("family, form", timed("decode", DECODED),
+                         ids=[f"{family}-{form}" for family, form in DECODED])
 def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
     """The decode kernel's output, interpreted on a CPU and compiled on a GPU (its guarded launch and merge),
     each row's keys the first `K` of its cache, check 1 over the family's draws."""

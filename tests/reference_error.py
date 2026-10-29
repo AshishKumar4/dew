@@ -66,6 +66,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 import dataclasses
 import functools
 import hashlib
+import itertools
 import math
 from collections.abc import Sequence
 
@@ -942,9 +943,9 @@ class RecordedLeaf:
 
 @dataclasses.dataclass(frozen=True)
 class _TruthRows:
-    """What `leaf_summary` reads of a truth leaf alone, read once a draw for both arms (`_evidence`):
-    each row's own RMS (`_scaled_rms`), its size (the RMS where it is past RESOLUTION of the leaf, else
-    zero: `row_errors`'s), and whether every value is finite."""
+    """What `leaf_summary` reads of a truth leaf alone, where a caller reads it once for both arms
+    (`_LaidTruths` reads a draw's at once): each row's own RMS (`_scaled_rms`), its size (the RMS where
+    it is past RESOLUTION of the leaf, else zero: `row_errors`'s), and whether every value is finite."""
 
     own: np.ndarray
     sizes: np.ndarray
@@ -978,6 +979,124 @@ def leaf_summary(reference, truth, rows_of: _TruthRows | None = None) -> Recorde
                         np.flatnonzero(~sized), rows[~sized],
                         finite=bool(np.isfinite(reference).all()) and held.finite, dtype=dtype,
                         zero_sizes=own[~sized], worst_log=logged)
+
+
+@dataclasses.dataclass(frozen=True)
+class _LaidTruths:
+    """A draw's truth leaves read at once for both arms (`_summaries`), each as `_TruthRows` reads one.
+    Every leaf that is not empty and is C-contiguous in float64 lies end to end with the others, by row
+    width (its last axis's, 0 for a leaf of rank under two) and then size: each run of one width and size
+    is one (leaves, size) matrix, its rows one (rows, width) matrix. Each reduction `leaf_summary` takes
+    over a row or a leaf is then the same reduction of the same values, NumPy's pairwise sum of that row
+    or leaf alone wherever it lies, and each log and exponential the same elementwise, so a draw takes a
+    few passes where it took a pipeline a leaf (ledger 1848: 190 µs a leaf at the gemma3n gradient's
+    tiny leaves). A leaf in another layout is read alone: NumPy sums an F-ordered row in another order.
+    `truths` is every leaf in float64, `laid` the leaves laid in order, `runs` each run's (leaves, size,
+    width), `values` the laid leaves, `own` and `sizes` their rows' own RMS and size, and `finite` each
+    laid leaf's."""
+
+    truths: list
+    laid: list[int]
+    runs: list[tuple[int, int, int]]
+    values: np.ndarray
+    own: np.ndarray
+    sizes: np.ndarray
+    finite: np.ndarray
+
+    @staticmethod
+    def of(truths) -> "_LaidTruths":
+        truths = [np.asarray(truth, np.float64) for truth in truths]
+        keys = sorted((truth.shape[-1] if truth.ndim >= 2 else 0, truth.size, at)
+                      for at, truth in enumerate(truths) if truth.size and truth.flags.c_contiguous)
+        runs = [(len(list(run)), size, width)
+                for (width, size), run in itertools.groupby(keys, lambda key: key[:2])]
+        values = np.concatenate([np.zeros(0), *(truths[at].reshape(-1) for *_, at in keys)])
+        blocks, resolved = _blocks(values, runs), [np.zeros(0)]
+        for (_, size, width), block in zip(runs, blocks, strict=True):
+            if width:
+                # Each leaf's `distance(truth, 0)`, at each of its rows.
+                resolved.append(np.repeat(RESOLUTION * np.sqrt(np.mean(np.square(block - 0.0), axis=1)),
+                                          size // width))
+        own = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(values, runs))])
+        finite = [np.isfinite(block).all(axis=1) for block in blocks]
+        return _LaidTruths(truths, [at for *_, at in keys], runs, values, own,
+                           np.where(own > np.concatenate(resolved), own, 0.0),
+                           np.concatenate([np.zeros(0, bool), *finite]))
+
+
+def _blocks(values: np.ndarray, runs) -> list[np.ndarray]:
+    """`values` laid by `runs` (`_LaidTruths`), each run's leaves a (leaves, size) matrix."""
+    ends = list(itertools.accumulate((leaves * size for leaves, size, _ in runs), initial=0))
+    return [values[start:stop].reshape(leaves, size)
+            for start, stop, (leaves, size, _) in zip(ends[:-1], ends[1:], runs, strict=True)]
+
+
+def _rows(values: np.ndarray, runs) -> list[np.ndarray]:
+    """`values` laid by `runs` (`_LaidTruths`), each width's rows, its runs' together, one (rows, width)
+    matrix."""
+    ends = list(itertools.accumulate((leaves * size for leaves, size, _ in runs), initial=0))
+    spans = {}
+    for start, stop, (_, _, width) in zip(ends[:-1], ends[1:], runs, strict=True):
+        if width:
+            spans[width] = (spans.get(width, (start,))[0], stop)
+    return [values[start:stop].reshape(-1, width) for width, (start, stop) in spans.items()]
+
+
+def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
+    """Each leaf's `leaf_summary` against its truth in `held` (`_LaidTruths.of`), None for a reference of
+    None. Every leaf `held` lays whose reference is C-contiguous in float64 too is read in a few passes
+    over all of them, bit for bit the summary `leaf_summary` reads of it alone; every other leaf is read
+    alone (`leaf_summary`), the order its arithmetic sums in following its layout."""
+    summaries = [None] * len(references)
+    arms = [None if references[at] is None else np.asarray(references[at], np.float64) for at in held.laid]
+    for arm, at in zip(arms, held.laid, strict=True):
+        if arm is not None and arm.shape != held.truths[at].shape:
+            raise AssertionError(f"a leaf {arm.shape} against a truth {held.truths[at].shape}")
+    read = [arm is not None and arm.flags.c_contiguous for arm in arms]
+    if any(read):
+        # An arm read alone or not at all lies as its truth, a zero error never read.
+        values = np.concatenate([np.zeros(0), *((arm if ok else held.truths[at]).reshape(-1)
+                                                for arm, ok, at in zip(arms, read, held.laid, strict=True))])
+        finite = np.concatenate([np.isfinite(block).all(axis=1) for block in _blocks(values, held.runs)])
+        errors = values - held.values
+        mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
+        rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
+        # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
+        counts = np.repeat([size // width if width else 0 for _, size, width in held.runs],
+                           [leaves for leaves, _, _ in held.runs])
+        starts = np.cumsum(counts) - counts
+        sized = held.sizes > 0
+        before = np.concatenate([[0], np.cumsum(sized)])
+        taken = before[starts + counts] - before[starts]
+        logs, over = _log_over(rows[sized], held.sizes[sized]), _over(rows[sized], held.sizes[sized])
+        # The worst sized row of each leaf that has one: the largest of its run of the sized rows.
+        some = taken > 0
+        worst_log, worst = np.full(len(counts), LOG_ZERO), np.zeros(len(counts))
+        if some.any():
+            firsts = (np.cumsum(taken) - taken)[some]
+            worst_log[some] = np.maximum.reduceat(logs, firsts)
+            worst[some] = np.maximum.reduceat(over, firsts)
+        # The rows of float64 zero, each leaf's its span of them.
+        unsized = np.flatnonzero(~sized)
+        zero_rows = unsized - np.repeat(starts, counts - taken)
+        zero_errors, zero_sizes = rows[unsized], held.own[unsized]
+        ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
+        mse, worst, worst_log, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), (
+            finite & held.finite).tolist()
+        names = {}
+        for index, at in enumerate(held.laid):
+            if read[index]:
+                reference, span = references[at], slice(ends[index], ends[index + 1])
+                dtype = reference.dtype if hasattr(reference, "dtype") else np.asarray(reference).dtype
+                if dtype not in names:
+                    names[dtype] = str(jnp.dtype(dtype))
+                summaries[at] = RecordedLeaf(mse[index], worst[index], zero_rows[span], zero_errors[span],
+                                             finite=finite[index], dtype=names[dtype],
+                                             zero_sizes=zero_sizes[span], worst_log=worst_log[index])
+    for at, reference in enumerate(references):
+        if reference is not None and summaries[at] is None:
+            summaries[at] = leaf_summary(reference, held.truths[at])
+    return summaries
 
 
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
@@ -1053,7 +1172,8 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
     """One draw's `_paired` evidence of every leaf of `dew` and `reference` against their truths. The
     trees are held alike first: Dew's, the reference's (a recorded one's leaves `RecordedLeaf`) and
     both truths the same leaves at the same paths, and each leaf the shape of its truth, so no leaf is
-    paired with another's truth or compared through broadcasting."""
+    paired with another's truth or compared through broadcasting. Every leaf's summary is read at once
+    (`_summaries`)."""
     # Every leaf on the host in one transfer a tree, not one a leaf (`leaf_summary` reads them on the host);
     # one truth stays one tree, as the draw gave it.
     shared = their_truth is truth
@@ -1063,35 +1183,39 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
     for name, tree in (("dew", dew), ("the reference", reference), ("the reference's truth", their_truth)):
         if _leaf_paths(tree) != paths:
             raise AssertionError(f"{name}'s leaves are {_leaf_paths(tree)}, the truth's {paths}")
-    row = []
-    for (path, leaf), their_leaf, true, their_true in zip(jax.tree_util.tree_leaves_with_path(dew),
-                                                          jax.tree.leaves(reference), jax.tree.leaves(truth),
-                                                          jax.tree.leaves(their_truth), strict=True):
-        recorded = isinstance(their_leaf, RecordedLeaf)
+    leaves, references, truths, their_truths = (jax.tree.leaves(tree)
+                                                for tree in (dew, reference, truth, their_truth))
+    recorded = [isinstance(their_leaf, RecordedLeaf) for their_leaf in references]
+    for path, leaf, their_leaf, true, their_true, was in zip(paths, leaves, references, truths, their_truths,
+                                                             recorded, strict=True):
         shapes = {"dew": np.shape(leaf), "the reference's truth": np.shape(their_true)}
-        if not recorded:
+        if not was:
             shapes["the reference"] = np.shape(their_leaf)
         for name, shape in shapes.items():
             if shape != np.shape(true):
-                raise AssertionError(f"{jax.tree_util.keystr(path)}: {name}'s shape is {shape}, the truth's "
-                                     f"{np.shape(true)}")
-        # A truth's rows are read once a draw, for both arms where the two truths are the same values.
-        same = their_true is true
-        rows_of = None if not np.size(true) else _TruthRows.of(np.asarray(true, np.float64))
-        their = their_leaf if recorded else leaf_summary(their_leaf, their_true, rows_of if same else None)
+                raise AssertionError(f"{path}: {name}'s shape is {shape}, the truth's {np.shape(true)}")
+    # The truths' rows are read once a draw, for both arms where the two truths are the same values.
+    held = _LaidTruths.of(truths)
+    same = all(their_true is true for their_true, true in zip(their_truths, truths, strict=True))
+    mine = _summaries(leaves, held)
+    theirs = _summaries([None if was else leaf for leaf, was in zip(references, recorded, strict=True)],
+                        held if same else _LaidTruths.of(their_truths))
+    row = []
+    for path, leaf, their_leaf, true, their_true, was, summary, their_summary in zip(
+            paths, leaves, references, truths, their_truths, recorded, mine, theirs, strict=True):
+        their = their_leaf if was else their_summary
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
             # reference's dtype (its shape is held above; the truth's dtype, float64, is its own), it
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
-            assert kept == their.dtype, (jax.tree_util.keystr(path), kept, their.dtype)
+            assert kept == their.dtype, (path, kept, their.dtype)
             row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
-        paired = (recorded or their_truth is truth
+        paired = (was or their_truth is truth
                   or np.array_equal(np.asarray(true), np.asarray(their_true)))
-        mine = leaf_summary(leaf, true, rows_of)
-        row.append(_paired(jax.tree_util.keystr(path), mine, their, paired=paired))
+        row.append(_paired(path, summary, their, paired=paired))
     return row
 
 
@@ -2099,29 +2223,45 @@ def _applied(equation, inputs, given, wanted: bool):
                      for energy, value in zip(made, outputs, strict=True)]
 
 
-def _scanned(params, inputs, given):
-    """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time."""
-    body = params["jaxpr"]
+def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
+    """A scan (lax.scan's equation `params`) over `inputs` a step at a time, as the gate's evaluators
+    walk one (`float64_terms`, check 2's `certified`): each input a tuple of lanes, a value and what an
+    evaluator carries beside it, sliced at each step lane by lane (a lane of None stays None), and
+    `body(step, step_inputs)` the body's outputs for one step, carries first, tuples alike. The carries
+    thread from step to step and each further output stacks over the steps in scan order, a lane where
+    every step has one (else None); an empty scan's from its outvars' avals, its `lanes` - 1 others None."""
+    jaxpr = params["jaxpr"].jaxpr
     constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
     consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
                          inputs[constants + carries:])
-    held, carry_terms, xs_terms = (given[:constants], given[constants:constants + carries],
-                                   given[constants + carries:])
-    ys, ys_terms = [], []
+    ys = []
     steps = range(params["length"])
     for step in reversed(steps) if params["reverse"] else steps:
-        outputs, made = _evaluated(body.jaxpr, body.consts, [*consts, *carry, *(x[step] for x in xs)],
-                                   [*held, *carry_terms, *(None if t is None else t[step] for t in xs_terms)])
-        carry, carry_terms = outputs[:carries], made[:carries]
+        sliced = [tuple(None if lane is None else lane[step] for lane in x) for x in xs]
+        outputs = body(step, [*consts, *carry, *sliced])
+        carry = outputs[:carries]
         ys.append(outputs[carries:])
-        ys_terms.append(made[carries:])
     if params["reverse"]:
         ys.reverse()
-        ys_terms.reverse()
-    stacked = [jnp.stack(column) for column in zip(*ys, strict=True)] if ys else []
-    stacked_terms = [None if any(t is None for t in column) else jnp.stack(column)
-                     for column in zip(*ys_terms, strict=True)] if ys_terms else []
-    return [*carry, *stacked], [*carry_terms, *stacked_terms]
+    if not ys:
+        return [*carry, *((jnp.zeros((0, *var.aval.shape), var.aval.dtype), *(None,) * (lanes - 1))
+                          for var in jaxpr.outvars[carries:])]
+    return [*carry, *(tuple(None if any(entry is None for entry in lane) else jnp.stack(lane)
+                            for lane in zip(*column, strict=True))
+                      for column in zip(*ys, strict=True))]
+
+
+def _scanned(params, inputs, given):
+    """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time."""
+    body = params["jaxpr"]
+
+    def step(_, pairs):
+        outputs, made = _evaluated(body.jaxpr, body.consts, [value for value, _ in pairs],
+                                   [energy for _, energy in pairs])
+        return list(zip(outputs, made, strict=True))
+
+    walked = scanned_steps(params, list(zip(inputs, given, strict=True)), step, lanes=2)
+    return [value for value, _ in walked], [energy for _, energy in walked]
 
 
 def _looped(params, inputs, given):

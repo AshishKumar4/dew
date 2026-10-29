@@ -1384,6 +1384,7 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "tcd": "dew.sampling.solvers.gaussian:TCD",
     "unipc": "dew.sampling.solvers.unipc:UniPC",
     "unmask": "dew.diffusion.discrete:Unmask",
+    "confident": "dew.diffusion.discrete:Confident",
 })
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",

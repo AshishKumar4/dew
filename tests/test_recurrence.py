@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tokamax
 from reference_error import assert_as_exact
 from tuned import each_config, taken
 
@@ -180,6 +181,21 @@ def summed(hooks: recurrence.Hooks):
         with jax.default_matmul_precision(FP32_SUMS):
             return recurrence.step_reference(hooks, operands)
     return run
+
+
+def test_a_decode_launch_is_described_by_its_operands_names():
+    """A decode token's launch as tokamax describes a lowering's launches (`tuning.launches`, which
+    serializes each launch's arguments by its signature): one launch, its arguments every `Step` field the
+    launch takes by name (`recurrence.OPERANDS`) beside `active`, those the hooks read (`_names`) given and
+    the rest None."""
+    hooks = HOOKS[0]
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(jax.jit(functools.partial(recurrence.step, hooks)),
+                                                  operands(hooks))
+    (launch,) = [ba for ba in found if isinstance(ba.op, recurrence.StepLaunch)]
+    read = set(recurrence._names(hooks))
+    assert set(launch.arguments) >= {'active', *recurrence.OPERANDS}
+    assert all((launch.arguments[name] is not None) == (name in read) for name in recurrence.OPERANDS)
 
 
 @pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
