@@ -154,14 +154,9 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0):
         wg = jax.lax.axis_index("wg")
 
         def walked(*, streams):
-<<<<<<< HEAD
-            views = {'p': (p_gmem, lambda j: (0, j)), 'x': (x_gmem, lambda j: (j, 0))}
-            first = jnp.int32(lo)
-=======
             first = jnp.int32(lo)
             # A plain walk's views take its own step indices, as a producer's stream gives them.
             views = {'p': (p_gmem, lambda j: (0, j - first)), 'x': (x_gmem, lambda j: (j - first, 0))}
->>>>>>> 72dbfe8c5d5115f4d100eab088e3d78ee4ea2ec0
             feed = family.fed(family.opened(streams), views, first, first + FED_STEPS, wg, first=first)
 
             def step(at, slots, carry, accumulators):
