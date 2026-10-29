@@ -70,7 +70,8 @@ def restarted(fn, case: str):
     return lambda drawn: fn(dataclasses.replace(drawn, starts=operands.starts))
 
 
-WHOLE_SUITE_INTERPRETED = {('packed documents', 'bf16', 'kept'): 225, ('one sequence', 'bf16', 'kept'): 122}
+WHOLE_SUITE_INTERPRETED = {('packed documents', 'bf16', 'kept'): 225, ('a ragged length', 'bf16', 'kept'): 161,
+                           ('one sequence', 'bf16', 'kept'): 122}
 """The interpreted gradient's cases past a group's two minutes (seconds, train 270's CI on f58abb8a3, ledger
 2127), which the whole suite runs."""
 
