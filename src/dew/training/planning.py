@@ -295,7 +295,7 @@ class Planned:
     profiled: tuple[int, int] | None = None
     sampled: jax.stages.Compiled | None = None
     """The step that also summarizes what the run inspects (`Candidate.sampled`), compiled under the
-    plan's options and held to its fit check (`inspected`); None in a run that inspects nothing."""
+    plan's options and admitted with it (`FitSearch.measured`); None in a run that inspects nothing."""
 
     def record(self) -> dict[str, JSON]:
         record: dict[str, JSON] = {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
@@ -325,20 +325,6 @@ class Planned:
                                "bytes more than its tightest device has, where unguided it fits; train it "
                                "without AutoPGLE")
         return dataclasses.replace(self, executable=executable, profiled=(runs, len(profile)))
-
-    def inspected(self, mesh: Mesh) -> Planned:
-        """This plan with its sampled step compiled beside its own (`Candidate.sampled`), under the options
-        its executable compiled under and held to the fit check the plan passed: summaries that keep more
-        alive at once than fits are refused, rather than met at the first sampled step."""
-        if self.candidate.sampled is None:
-            return self
-        executable = self.candidate.sampled().compile(self.options)
-        fit, headroom = step_fits(executable, mesh, self.candidate.held)
-        if not fit:
-            raise RuntimeError(f"the step that summarizes what the run inspects needs {-(headroom or 0)} "
-                               "bytes more than its tightest device has, where the step alone fits; inspect "
-                               "fewer parameters (`Inspection.paths`)")
-        return dataclasses.replace(self, sampled=executable)
 
     def released(self) -> Planned:
         """This plan as the run keeps it once admitted: its executable without the program it was lowered
@@ -513,6 +499,10 @@ class FitSearch[LossT, EffectsT]:
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
+    sampled: jax.stages.Compiled | None = None
+    """The last measured candidate's sampled step (`measured`)."""
+    fitted_sampled: jax.stages.Compiled | None = None
+    """The fitted plan's sampled step, which summarizes what the run inspects (`Candidate.sampled`)."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`)."""
@@ -568,7 +558,9 @@ class FitSearch[LossT, EffectsT]:
                  ) -> tuple[jax.stages.CompilerOptions | None, jax.stages.Compiled | None, Probe]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
         where it fits the devices, or for the search's first compile the step compiled ahead
-        (`ahead`), and the measure of its fit (`Probe`), the search's state else untouched."""
+        (`ahead`), and the measure of its fit (`Probe`), the search's state else untouched. A run that
+        inspects compiles the candidate's sampled step too (`Candidate.sampled`), which must fit as the
+        step must, so a rung fits only where both do; it is `sampled` until the next measure."""
         options = self.required if self.xla_defaults else self.options(candidate)
         taken = self.ahead is not None
         began = time.perf_counter()
@@ -576,8 +568,12 @@ class FitSearch[LossT, EffectsT]:
             executable, self.ahead = self.ahead.taken(candidate.lowered), None
         else:
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
-        seconds = time.perf_counter() - began
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
+        self.sampled = None
+        if fit and candidate.sampled is not None:
+            self.sampled = compiled_if_it_fits(candidate.sampled(), options, self.refusals)
+            fit, headroom = step_fits(self.sampled, self.mesh, candidate.held, self.capacity, candidate.built)
+        seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
         return options, executable, dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
 
@@ -592,7 +588,7 @@ class FitSearch[LossT, EffectsT]:
         self.forecast.read(self.rung(), split, executable, headroom, self.factor)
         if fit:
             assert executable is not None
-            self.fitted = candidate, executable, self.chosen
+            self.fitted, self.fitted_sampled = (candidate, executable, self.chosen), self.sampled
             return True
         if self.resumed is not None:
             _log.warning("the step does not fit the devices at the rung its checkpoint trained on (%s); from "
@@ -630,4 +626,5 @@ class FitSearch[LossT, EffectsT]:
         assert self.fitted is not None
         modules = tuple(entry.module for entry in self.objective.program_key())
         return Planned(split, *self.fitted, self.xla_defaults, self.narrow, self.current(), modules,
-                       head_tile_of(self.objective), head_fused_of(self.objective))
+                       head_tile_of(self.objective), head_fused_of(self.objective),
+                       sampled=self.fitted_sampled)

@@ -157,7 +157,7 @@ from dew.training.distributed import (
 from dew.training.evaluation import EvalSuite, Evaluation, Summary, admit_split
 from dew.training.footprint import candidate_footprint, traced_loss
 from dew.training.inspection import Inspection
-from dew.training.interval import Interval, Taken, TokenClock, held, logged_scalars
+from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
 from dew.training.memory import (
     climb_to,
     first_run,
@@ -307,6 +307,9 @@ class Trainer(Generic[Loss, Effects]):
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                              "build them with Step(record=True)")
+        if inspection is not None and step is not None:
+            raise ValueError("a custom step commits no update an inspection reads (Trainer(inspection=...)); "
+                             "summarize its arrays in the step's own report")
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
@@ -974,7 +977,6 @@ class Trainer(Generic[Loss, Effects]):
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule:
             planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity)
-            planned = planned.inspected(mesh)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
@@ -1122,7 +1124,7 @@ class Trainer(Generic[Loss, Effects]):
             lowered, launches = lower(), launches or "[]"
         footprint = None if self.step is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
-        sampled = None if self.inspection is None or self.step is not None else functools.partial(
+        sampled = None if self.inspection is None else functools.partial(
             self._jitted(shapes, copies, shardings, placement, replicated, split, sampled=True).lower,
             *apart(prepared), batch, part)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
@@ -2311,7 +2313,8 @@ class Trainer(Generic[Loss, Effects]):
         its peers may never agree and its steps never end."""
         taken, run.taken = run.taken, None
         if taken is not None:
-            run.writer.submit(functools.partial(self._written, run, taken), taken.ready)
+            run.writer.submit(functools.partial(self._read_log, run, taken),
+                              functools.partial(self._written, taken), taken.ready)
         elif not (wait and run.writer.unchecked):
             return
         check = functools.partial(run.writer.raise_failure, wait=wait, ready_only=not agree)
@@ -2321,13 +2324,18 @@ class Trainer(Generic[Loss, Effects]):
             else:
                 check()
 
-    def _written(self, run: FitRun, taken: Taken) -> None:
-        """Read `taken` on the host, its losses checked, and report its interval's scalars
-        (`logged_scalars`) on rank zero, on the run's writer thread (`_read_taken`); every other rank has
-        nothing to report."""
+    def _read_log(self, run: FitRun, taken: Taken) -> tuple[Reading, float]:
+        """`taken` on the host, its losses checked, and its interval's seconds, on the writer's reader
+        thread (`LogWriter`), whose clock it moves."""
         read, elapsed, run.writer.since = taken.read(self._display, run.writer.since)
+        return read, elapsed
+
+    def _written(self, taken: Taken, reading: tuple[Reading, float]) -> None:
+        """Report `taken`'s interval's scalars (`logged_scalars`) on rank zero, on the writer's reporter
+        thread (`_read_taken`); every other rank has nothing to report."""
         if jax.process_index() != 0:
             return
+        read, elapsed = reading
         scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
                                     rollout=self.rollout is not None), **self._startup.scalars()}
         self._display.interval(taken.step, scalars)

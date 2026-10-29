@@ -64,14 +64,12 @@ def _path(path) -> str:
 
 def _leaf_statistics(leaf: jax.Array) -> dict[str, jax.Array]:
     """A leaf's summary, in float32 over its global array: mean, root mean square, largest magnitude,
-    non-finite count and the fraction that is exactly zero."""
+    non-finite count and the fraction that is exactly zero. A non-finite entry makes the first three
+    non-finite, as they are of the values, beside its count."""
     values = leaf.astype(jnp.float32)
-    finite = jnp.isfinite(values)
-    kept = jnp.where(finite, values, 0.0)
-    size = values.size
-    return {"mean": kept.sum() / size, "rms": jnp.sqrt((kept * kept).sum() / size),
-            "abs_max": jnp.abs(kept).max(initial=0.0), "non_finite": (~finite).sum().astype(jnp.float32),
-            "zero_fraction": (values == 0).sum().astype(jnp.float32) / size}
+    return {"mean": values.mean(), "rms": jnp.sqrt(jnp.square(values).mean()),
+            "abs_max": jnp.abs(values).max(), "non_finite": (~jnp.isfinite(values)).sum().astype(jnp.float32),
+            "zero_fraction": (values == 0).mean()}
 
 
 def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[str, jax.Array]:
@@ -101,14 +99,14 @@ def logged(inspected: Mapping[str, float]) -> dict[str, float]:
     return {f"inspect/{name}": float(value) for name, value in inspected.items()}
 
 
-def inspected(trainer: Trainer, batch: Batch) -> dict[str, float]:
+def inspected(trainer: Trainer, batch: Batch, *, steps: int | None = None) -> dict[str, float]:
     """The scalars `trainer`'s inspection logs, of one sampled step over `batch` from the state the
     trainer places, its checkpoints' latest where it has them, else its start: the view a live run
-    logs, for a loaded run on one batch offline. The stepped state is discarded."""
+    logs, for a loaded run on one batch offline. An `OptimConfig` is built over `steps`, the run's
+    length, as `fit(steps=...)` builds it. The stepped state is discarded."""
     if trainer.inspection is None:
         raise ValueError("the trainer names no inspection (Trainer(inspection=...)) to report")
+    trainer._schedule(None if steps is None else steps // trainer.accumulation)
     state, _, _ = trainer.place()
     *_, committed = trainer.compile(state, batch)(state, batch, sampled=True)
-    if committed is None:
-        raise ValueError("a custom step (Trainer(step=...)) commits nothing an inspection reads")
     return logged(jax.device_get(committed.inspected))

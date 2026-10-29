@@ -1283,8 +1283,8 @@ def mode_evaluation_contract(args) -> dict:
 
 def mode_training_log_failure(args) -> dict:
     """Two processes fit one tiny objective, logging every step; rank 0's tracker fails at its second
-    log, written off the step loop (row 2313). Each process reports the error it ended with and the
-    steps it ran, observed on every process alike (`Observe`)."""
+    log, written off the step loop (row 2313). Each process reports the kind of error it ended with
+    and the steps it ran, observed on every process alike (`Observe`)."""
     import jax
     import optax
 
@@ -1311,12 +1311,14 @@ def mode_training_log_failure(args) -> dict:
     observed = Observe(1, lambda state: int(state.step))
     trainer = Trainer(Numerical(), optax.sgd(.01), key=jax.random.key(3),
                       tracker=Failing() if rank == 0 else None)
+    from dew._coordination import PeerFailure
+
     try:
         trainer.fit(Loader(train=lambda partition: rows(), val=None, records=None, batch=8), steps=8,
                     log_every=1, eval_every=None, checkpoint_every=None, observe=observed)
         error = None
-    except (ValueError, RuntimeError) as failure:
-        error = str(failure)
+    except (ValueError, PeerFailure) as failure:
+        error = type(failure).__name__
     return {"error": error, "steps": [step for step, _ in observed.values]}
 
 

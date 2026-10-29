@@ -380,7 +380,8 @@ class Taken(NamedTuple):
         interval's seconds since `since`, the previous log's `done` (the interval's own start for the first),
         and its `done`."""
         read = on_host(self.reading, self.step)
-        done = time.time() if self.done is None else self.done
+        # A log read late is done no earlier than the one read before it.
+        done = max(time.time() if self.done is None else self.done, since or 0.0)
         if read.streak is not None:
             checked_streak(int(read.streak), self.step, display)
         return read, done - (self.counts.last_log_time if since is None else since), done
@@ -431,35 +432,51 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
 
 class LogWriter:
     """A fit's logs written off its step loop (row 2313): each one the loop takes (`Taken`) is read on the
-    host and reported by one daemon thread, in the order taken, while the loop steps on; the copies to
-    the host began at the take (`Interval.take`). A write's failure, a tracker's or a losses' streak, is
-    kept for the loop to raise at a point every process reaches alike (`raise_failure`), where it agrees
-    on it, never on the writer's thread. `since` is the last write's `done`, where the next interval's
-    clock starts."""
+    host by one daemon thread and reported by another, in the order taken, while the loop steps on; the
+    copies to the host began at the take (`Interval.take`). The reader only waits on the devices, so a
+    log's clock (`since`, the last read's `done`) is the devices', whatever a slow tracker holds of the
+    reporter. A write's failure, a tracker's or a losses' streak, is kept for the loop to raise at a
+    point every process reaches alike (`raise_failure`), where it agrees on it, never on these threads."""
 
     def __init__(self) -> None:
-        self._queue: queue.SimpleQueue[tuple[Callable[[], None], Future] | None] = queue.SimpleQueue()
-        self._thread: threading.Thread | None = None
+        self._reads: queue.SimpleQueue[tuple[Callable[[], object], Callable[[object], None], Future] | None]
+        self._reads = queue.SimpleQueue()
+        self._reports: queue.SimpleQueue[tuple[object, Callable[[object], None], Future] | None]
+        self._reports = queue.SimpleQueue()
+        self._threads: tuple[threading.Thread, ...] = ()
         self._writes: collections.deque[tuple[Future, Callable[[], bool]]] = collections.deque()
         self.unchecked = 0
         """Writes handed over since the loop last waited on every one: alike on every process."""
         self.since: float | None = None
 
-    def submit(self, write: Callable[[], None], ready: Callable[[], bool]) -> None:
-        """Hand `write` to the thread; `ready` says whether it can run without waiting on the devices."""
-        if self._thread is None:
-            self._thread = threading.Thread(target=self._serve, name="dew-log-writer", daemon=True)
-            self._thread.start()
+    def submit[ValueT](self, read: Callable[[], ValueT], report: Callable[[ValueT], None],
+                       ready: Callable[[], bool]) -> None:
+        """Hand `read`, then `report` of what it read, to the threads; `ready` says whether the read
+        waits on no device."""
+        if not self._threads:
+            self._threads = (threading.Thread(target=self._read, name="dew-log-reader", daemon=True),
+                             threading.Thread(target=self._report, name="dew-log-reporter", daemon=True))
+            for thread in self._threads:
+                thread.start()
         written: Future = Future()
-        self._queue.put((write, written))
+        self._reads.put((read, report, written))
         self._writes.append((written, ready))
         self.unchecked += 1
 
-    def _serve(self) -> None:
-        while (handed := self._queue.get()) is not None:
-            write, written = handed
+    def _read(self) -> None:
+        while (handed := self._reads.get()) is not None:
+            read, report, written = handed
             try:
-                written.set_result(write())
+                self._reports.put((read(), report, written))
+            except BaseException as error:
+                written.set_exception(error)
+        self._reports.put(None)
+
+    def _report(self) -> None:
+        while (handed := self._reports.get()) is not None:
+            value, report, written = handed
+            try:
+                written.set_result(report(value))
             except BaseException as error:
                 written.set_exception(error)
 
@@ -474,14 +491,15 @@ class LogWriter:
             self.unchecked = 0
 
     def close(self) -> None:
-        """Stop the thread once it has written what it holds, and wait for it: a thread still in JAX's
-        runtime as the interpreter exits aborts the process. A failed run whose writes wait on a step that
-        never ends (its peers gone) leaves the thread, a daemon, rather than wait on it."""
-        if self._thread is None:
+        """Stop the threads once they have written what they hold, and wait for them: a thread still in
+        JAX's runtime as the interpreter exits aborts the process. A failed run whose writes wait on a
+        step that never ends (its peers gone) leaves the threads, daemons, rather than wait on them."""
+        if not self._threads:
             return
-        self._queue.put(None)
+        self._reads.put(None)
         if all(written.done() or ready() for written, ready in self._writes):
-            self._thread.join()
+            for thread in self._threads:
+                thread.join()
 
 
 def on_host[TreeT](counters: TreeT, step: int) -> TreeT:
