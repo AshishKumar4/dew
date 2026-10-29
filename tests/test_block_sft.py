@@ -153,8 +153,14 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     (`as_a_step`). The gradients are compared as they are, not through an update applied to the
     weights, whose rounding at the weights' magnitude would swamp theirs; at each draw the step's
     weights are then sgd(1)'s rule of that trace to the bit, the weights less the trace in float32, so
-    the update applies the gradient it holds. The run's own path, its loader, plan and marked rows,
-    takes the trainer's own update on one device, to the bit: the same program on the same values."""
+    the update applies the gradient it holds. The run's own path takes it too
+    (`assert_the_runs_path_takes_the_trainers_update`)."""
+    assert_the_objectives_gradient(obj, twin, batch, run_key, variables, seeds, batches)
+    assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
+
+
+def assert_the_objectives_gradient(obj, twin, batch, run_key, variables, seeds: int, batches=None):
+    """`assert_updates_as_the_objective`'s check 1, the trainer's gradient against the objective's."""
     drawn = (lambda seed: batch) if batches is None else batches
     stepped, step, trainer = trainer_update(obj, drawn(0), run_key, optax.sgd(1.0, momentum=0.0))
     weights = moved_weights(variables)
@@ -177,6 +183,11 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     assert gradient.as_given
     assert_as_exact(trained, gradient, draw, "trainer update", seeds=seeds,
                     truth_fn=float64_gradient(twin, step))
+
+
+def assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables):
+    """The run's own path, its loader, plan and marked rows, takes the trainer's own update on one
+    device, to the bit: the same program on the same values."""
     taken, _, _ = trainer_update(obj, batch, run_key, optax.sgd(0.001))
     solo = Trainer(obj, optax.sgd(0.001), key=run_key)
     solo.device_mesh = MeshSpec().build(jax.devices()[:1])
@@ -476,15 +487,23 @@ def image_run(inputs):
     return batch, data, jax.random.key(2)
 
 
-def test_an_image_sft_trainers_update_is_the_objectives(image_source):
-    """The image SFT trainer's update is the objective's at the step's draws, the float64 twin of the
-    loaded multimodal fixture the truth (`assert_updates_as_the_objective`)."""
+def test_an_image_sft_trainers_gradient_is_the_objectives(image_source):
+    """The image SFT trainer's gradient is the objective's at the step's draws, the float64 twin of the
+    loaded multimodal fixture the truth (`assert_the_objectives_gradient`)."""
     _, inputs, obj, variables, _ = image_source
-    batch, data, run_key = image_run(inputs)
+    batch, _, run_key = image_run(inputs)
     wide = Pretrained.load(FIXTURE.parent / "diffusion-gemma-workflow", dtype="float64", attention_impl="xla",
                            max_seq_len=32)
     twin = BlockDiffusionObjective(wide.model, prompt_length=8, variables=wide.variables)
-    assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, UPDATE_SEEDS["image"])
+    assert_the_objectives_gradient(obj, twin, batch, run_key, variables, UPDATE_SEEDS["image"])
+
+
+def test_an_image_sft_runs_own_path_takes_the_trainers_update(image_source):
+    """The image SFT run's own path takes the trainer's update to the bit
+    (`assert_the_runs_path_takes_the_trainers_update`)."""
+    _, inputs, obj, variables, _ = image_source
+    batch, data, run_key = image_run(inputs)
+    assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
 
 
 def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
