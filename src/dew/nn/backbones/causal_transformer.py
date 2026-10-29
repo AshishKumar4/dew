@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import flax.core
@@ -55,7 +55,7 @@ from dew.registry import from_record, read_arguments
 from ..activations import GatedActivation, Situ, ungated_activation
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
-from ..cross_attention import CrossAttention, GatedCrossAttention
+from ..cross_attention import CrossBlocks
 from ..deepseek_v4 import DeepseekV4Mixer
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
@@ -390,7 +390,7 @@ class CausalTransformer(nn.Module):
     the `constants` collection. A loaded checkpoint derives it from its
     tokenizer, and a fresh model fills it with each id modulo the compressed
     vocabulary's size."""
-    cross_attention: CrossAttention | None = None
+    cross_attention: CrossBlocks | None = None
     """The layers that read a conditioning sequence through Flamingo's gated
     cross-attention (`dew.nn.cross_attention`), before their own sublayers; None
     for a model without them. A call passes the sequence as its `conditioning`."""
@@ -1082,7 +1082,8 @@ class CausalTransformer(nn.Module):
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
-            cross=self._cross_layer(index) if spec.cross else None,
+            cross=(self.cross_attention.block(self, index)
+                   if spec.cross and self.cross_attention is not None else None),
             prediction_target=spec.prediction_target is not None,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
             attention_norm=spec.attention_norm,
@@ -1108,42 +1109,25 @@ class CausalTransformer(nn.Module):
             name=name)
 
     @nn.nowrap
-    def _cross_layer(self, index: int) -> Callable[..., GatedCrossAttention]:
-        """Layer `index`'s gated cross-attention factory: the model's norms, none under nGPT, a
-        gated MLP of the block's own activation at its width, with nGPT's gains under nGPT, and the
-        model's attention heads, kernel, initializers and dtypes."""
-        cross = self.cross_attention
-        assert cross is not None
-        init_std, output_init_std = self.init_stds
-        return functools.partial(
-            GatedCrossAttention,
-            norm=None if self.ngpt is not None else decoder_norm(
-                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias, scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast, dtype=self.dtype, specs=self.norms),
-            ngpt=self.ngpt is not None,
-            feedforward=functools.partial(
-                GatedMLP, hidden_features=cross.intermediate_size or self.mlp_widths[index],
-                out_features=self.emb_features, activation=cross.activation, ngpt=self.ngpt,
-                init_std=init_std, output_init_std=output_init_std, dtype=self.dtype,
-                precision=self.precision),
-            emb_features=self.emb_features,
-            context_features=self.context_width,
-            context_length=cross.context_length, heads=self.num_heads, kv_heads=self.kv_heads,
-            head_dim=self.features_per_head, dropout_rate=self.dropout_rate,
-            attention_impl=self.attention_impl, force_fp32_for_softmax=self.force_fp32_for_softmax,
-            dtype=self.dtype, precision=self.precision)
+    def mixer_of(self, index: int) -> nn.Module:
+        """Layer `index`'s mixer, unbound: what its kind builds over the layer's context
+        (`mixer_context`), which a cross-attention block that reads through it is sized by
+        (`dew.nn.cross_attention.SharedCrossAttention`)."""
+        types = self.per_layer_types
+        spec = self._layer_specs(types, self.layer_kinds(types), self.layer_mixer)[index]
+        return (spec.kind.mixer or self.layer_mixer).build(
+            self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared))(parent=None)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
         """The cross-attention blocks' work over rows of `lengths` tokens reading contexts of
-        `context_lengths` tokens (`GatedCrossAttention.cross_flops`), each block on every pass of its
-        layer (`layer_passes`), which `model_flops` leaves out: a call without a context runs none
-        of it."""
+        `context_lengths` tokens (`CrossBlocks.flops`), each block on every pass of its layer
+        (`layer_passes`), which `model_flops` leaves out: a call without a context runs none of it."""
         cross = self.cross_attention
         if cross is None:
             return 0.0
-        return sum(self.layer_passes(index) * self._cross_layer(index)(parent=None).cross_flops(
-            lengths, context_lengths) for index in cross.layer_ids)
+        return sum(self.layer_passes(index) * cross.flops(self, index, lengths, context_lengths)
+                   for index in cross.layer_ids)
 
     @nn.nowrap
     def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec,
@@ -2269,7 +2253,7 @@ class CausalTransformer(nn.Module):
         return at_least_fp32(self.dtype)
 
     @nn.nowrap
-    def with_cross_attention(self, cross: CrossAttention | None) -> Self:
+    def with_cross_attention(self, cross: CrossBlocks | None) -> Self:
         """This decoder with `cross` as its cross-attention layers (`CrossAttending`), None for none."""
         return self.clone(cross_attention=cross)
 
