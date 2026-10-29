@@ -891,7 +891,9 @@ class MosaicTgmm(_Mosaic):
         sliced = super().derived(partials, target)
         if sliced is None or (splits := self._splits(partials, sliced, target)) == 1:
             return tile
-        return dataclasses.replace(sliced, splits=splits)
+        split = dataclasses.replace(sliced, splits=splits)
+        # A split a compile of this process found spilling (`report.refused`) gives way to the call's own.
+        return tile if report.refused(self, ba, split) else split
 
     def _balances(self, ba, tile: mosaic_gpu.Tiles, target) -> bool:
         """Whether the call's last wave runs balanced over the programs (`tail.balanced`), which it
