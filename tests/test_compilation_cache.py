@@ -56,3 +56,18 @@ def test_a_run_caches_its_compilations_under_the_users_cache_directory(tmp_path,
     else:
         assert not directory
         assert not (tmp_path / "dew" / "xla").exists()
+
+
+def test_a_tests_child_process_compiles_into_the_suites_cache():
+    """A process a test starts (a checker run as a script, a CLI) compiles into the cache the suite's
+    process keeps, under the same settings, so its programs reach the shared bundles and its next run is
+    warm: tools/check_native_diffusion.py's xl case compiled cold each run, 139.6 s, and warm 43.3 s
+    (2026-10-29: row 2323). Under DEW_TEST_NO_CACHE neither caches."""
+    import jax
+
+    names = ("jax_enable_compilation_cache", "jax_compilation_cache_dir",
+             "jax_persistent_cache_min_compile_time_secs", "jax_persistent_cache_min_entry_size_bytes")
+    read = f"import jax, json; print(json.dumps([getattr(jax.config, name) for name in {list(names)!r}]))"
+    child = json.loads(subprocess.run([sys.executable, "-c", read], capture_output=True, text=True,
+                                      check=True).stdout)
+    assert child == [getattr(jax.config, name) for name in names]
