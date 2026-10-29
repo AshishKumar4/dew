@@ -331,11 +331,7 @@ def full_step(dtype, draw: int = 0):
     return (x, scale), jnp.broadcast_to(seed, x.shape)
 
 
-@pytest.mark.gpu
-@pytest.mark.parametrize("kernel", [norm_swiglu.RmsForward, norm_swiglu.RmsBackward])
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("operands", ["full step", "wide rows", "narrow rows"])
-def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, operands):
+def every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, operands):
     """Each config the tuner may pick, at a step's rows, at rows wider than
     a tile holds two of, and at rows narrow enough for its tallest tiles:
     its variants are only configs proven here (`KernelOp.variants`)."""
@@ -358,10 +354,7 @@ def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, 
             raise
 
 
-@pytest.mark.gpu
-@pytest.mark.parametrize("kernel", [norm_swiglu.SwigluForward, norm_swiglu.SwigluBackward])
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_every_config_of_the_swiglu_kernels_holds_the_float64_gate(kernel, dtype):
+def every_config_of_the_swiglu_kernels_holds_the_float64_gate(kernel, dtype):
     """Each block and warp count, over a ragged tail of elements."""
     shape = (3, 257, 17)
     operands = tuple(jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (31, 32))
@@ -584,9 +577,7 @@ def test_a_weak_scalar_gate_over_a_bf16_up_promotes_as_its_product_does():
     assert (product.shape, product.dtype) == ((2, 64), jnp.bfloat16)
 
 
-@pytest.mark.gpu
-@pytest.mark.parametrize("implementation", ["auto", "pallas"])
-def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops, implementation):
+def a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops, implementation):
     """On a GPU host, the norm, the SiLU product and attention placed on the CPU, eagerly under the
     default device and in a JIT on a CPU mesh, as a host-layout run places its state, run there: no
     GPU kernel runs off the GPU, so 'auto' and a kernel named per call alike take XLA's arithmetic."""

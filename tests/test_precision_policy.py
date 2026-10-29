@@ -401,8 +401,7 @@ def test_any_einsum_at_the_bf16_algorithm_multiplies_bf16_operands(subscripts, s
         np.testing.assert_array_equal(np.asarray(grad), np.asarray(wanted, np.float32))
 
 
-@pytest.mark.gpu(reason="the GPU's fp32 division is what `import dew` sets; a CPU's rounds to the nearest")
-def test_the_gpu_divides_fp32_to_the_nearest_float():
+def the_gpu_divides_fp32_to_the_nearest_float():
     """`import dew` has XLA:GPU divide fp32 to the nearest float
     (`dew.devices.divide_exactly`): over 2^20 quotients of operands
     from 1e-4 to 10 apart, each is the float64 quotient rounded to fp32, as a

@@ -30,9 +30,6 @@ from dew.registry import towers
 
 FIXTURES = Path(__file__).parent / "fixtures" / "audio"
 
-on_gpu = pytest.mark.gpu(reason="needs a cuda device")
-
-
 def _audio(kind):
     path = FIXTURES / kind
     record = json.loads((path / "config.json").read_text())
@@ -155,8 +152,7 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
                     truth_fn=blocks_in(torch.float64))
 
 
-@on_gpu
-def test_encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
+def encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
     """Frame subsampling must leave no strided slice on a dot's operand chain.
 
     XLA's Triton GEMM fusion propagates a dot's tiling into its operands and

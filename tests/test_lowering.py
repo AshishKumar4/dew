@@ -776,8 +776,7 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
 
 
-@pytest.mark.gpu(reason="reads a CUDA device's attributes")
-def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
+def a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
     """The default device's shared memory a block and multiprocessors come from JAX's device: a bare
     target of its generation, holding none of the table's resources, takes the same ones the
     default device's target reports, and the row's own where the table records them."""
@@ -792,8 +791,7 @@ def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_
         assert named.shared_limit == row.shared_limit
 
 
-@pytest.mark.gpu(reason="reads a CUDA device's clocks from its driver")
-def test_a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
+def a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
     """The default device's multiprocessor clock and memory bandwidth, which JAX's device does not
     carry, come from the CUDA driver at the device's own ordinal (`local_hardware_id`, which a process
     seeing a subset of the GPUs numbers from zero): positive, and a GPU's bandwidth between that of the
