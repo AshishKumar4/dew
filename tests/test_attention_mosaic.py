@@ -668,6 +668,10 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
                     seeds=SEEDS)
 
 
+# Each interpreted case runs past a group's target (row 2138: 142 to 148 s); the backward's per-train
+# sibling is `test_the_backward_is_on_par_interpreted` and each call form's the forward's: the whole suite's
+# run holds these.
+@pytest.mark.whole_suite
 @INTERPRETS
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("case", CASES)
@@ -676,6 +680,7 @@ def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
     _check_call_form(case, interpret=True, backward=True, form=form)
 
 
+@pytest.mark.whole_suite
 @INTERPRETS
 @pytest.mark.parametrize("form", ["forward", *BACKWARD_FORMS])
 @pytest.mark.parametrize("case", RUN_CASES)
