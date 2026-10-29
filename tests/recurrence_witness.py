@@ -613,8 +613,9 @@ def shifted(operands: tuple) -> tuple:
 REGIMES = ("mild", "slow", "steep", "decay")
 """Each draw's log decays a token (`draw`): Gated DeltaNet's (`-softplus(N(0, 1) - 1)`, as
 tests/test_recurrence_mosaic.py draws them), a memory kept across chunks (`-U(0, 0.01)`), one forgotten within
-a few tokens (`-U(1, 3)`), and a decay alone (`-0.4 (1 + U(0, 0.1))` and no write, `beta = 0`), whose fp32
-cumulative sums reach 2^4 within a chunk, where they round at 2^-20."""
+a few tokens (`-U(1, 3)`), and a decay alone (-0.4 a token and no write, `beta = 0`), whose fp32 cumulative
+sums within a chunk drift 1.5e-5 from the exact ones by its end (row 2066's defect's), where the decay's
+enclosure is 7e-7 of it wide."""
 
 
 def draw(seed: int, regime: str, *, chunks: int = 3, heads: int = 1, width: int = 64):
@@ -634,7 +635,7 @@ def draw(seed: int, regime: str, *, chunks: int = 3, heads: int = 1, width: int 
     shape = (1, length, heads)
     g = {"mild": lambda: -np.log1p(np.exp(rng.normal(size=shape) - 1.0)),
          "slow": lambda: -0.01 * rng.uniform(size=shape), "steep": lambda: -rng.uniform(1, 3, shape),
-         "decay": lambda: -0.4 * (1 + 0.1 * rng.uniform(size=shape))}[regime]()
+         "decay": lambda: np.full(shape, -0.4)}[regime]()
     beta = 0.0 if regime == "decay" else 1 / (1 + np.exp(-rng.normal(size=shape)))
     h0 = 0.3 * rng.normal(size=(1, heads, width, width))
     return (jnp.asarray(q, jnp.bfloat16), jnp.asarray(k, jnp.bfloat16), jnp.asarray(v, jnp.bfloat16),
