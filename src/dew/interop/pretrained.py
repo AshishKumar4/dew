@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     from dew.lora import Adapter, LoRA
     from dew.nn.attention import AttentionImpl
     from dew.nn.cross_attention import CrossBlocks
+    from dew.nn.dex import DifferentialExtension
 
 
 
@@ -364,7 +365,7 @@ class Pretrained:
              fallback: str | None = None, weights: bool = True, on_host: bool = False,
              modeling_overrides: Mapping[str, object] | None = None,
              trust_remote_code: bool = False, text_only: bool = False,
-             prediction_depths: int | None = None) -> Self:
+             prediction_depths: int | None = None, dex: DifferentialExtension | None = None) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -434,12 +435,12 @@ class Pretrained:
         around (`TrainerConfig.resumes`), as MaxText loads its base parameters only
         for a run with no checkpoint.
 
-        `modeling_overrides` is a record of the form a release's config states under
-        that key, read through the same reader over the release's own, kind by kind:
-        `{"attention": {"full_attention": "block_bidirectional"}}` lets that layer kind's
-        tokens read their whole block (`AttentionMixer.bidirectional_blocks`, a call's
-        `block_groups`) on any decoder or wrapper this loads natively, and "causal"
-        turns a release's back off. A saved model states it in its own config.
+        `modeling_overrides` is a record of the form a release's config states under that key, read
+        through the same reader over the release's own, kind by kind: `{"attention": {"full_attention":
+        "block_bidirectional"}}` lets that layer kind's tokens read their whole block
+        (`AttentionMixer.bidirectional_blocks`, a call's `block_groups`) on any decoder or wrapper this
+        loads natively, and "causal" turns a release's back off. A saved model states it in its own
+        config. `dex` attaches DEX (`with_dex`) drawn from key 0, one extension for each run naming it.
         """
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
@@ -474,7 +475,7 @@ class Pretrained:
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
         published = _published(loaded, name_or_dir,
                                selected=bool(selected) or reference.subfolder is not None or extracted)
-        return _resident(published, weights=weights, streaming=streaming, on_host=on_host)
+        return _extended(_resident(published, weights=weights, streaming=streaming, on_host=on_host), dex)
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -548,6 +549,37 @@ class Pretrained:
 
         variables = merge(self.variables, jax.jit(drawn)(request_key(key)))
         return replace(self, model=model, variables=freeze(variables, crossing) if frozen else variables)
+
+    def with_dex(self, extension: DifferentialExtension, *, key: int | jax.Array) -> Self:
+        """Return this source with DEX's differential on `extension`'s chosen heads (`dew.nn.dex`), its
+        projections drawn from `key` under `params` and its lambdas zero, so the model computes what the
+        source does until they train; the rest trains as the extension's recipe says
+        (`DifferentialExtension.trains`: the paper's, the attention's key, value and output projections
+        beside it and the rest under `FROZEN`, or all of it), a source's frozen weights staying frozen. A
+        source loaded without its weights takes the extension's shapes. The source's own format holds no
+        extension, so `save` and `export` refuse the result; a run's checkpoint keeps it."""
+        from dew.batch import freeze, merge, select, thaw
+        from dew.nn.dex import DEX_PARAMETERS
+        from dew.nn.inputs import request_key
+        from dew.nn.protocols import Differential, Predicting
+
+        if not isinstance(self.model, Differential):
+            raise TypeError(f"a {type(self.model).__name__} takes no differential extension")
+        model = self.model.with_dex(extension)
+        # A token more than the prediction depths a source carries, which each read one further on.
+        length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
+
+        def drawn(draw: jax.Array) -> Variables:
+            # Only the extension leaves the program, so the source's own draws are dead code to XLA.
+            return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
+                          lambda path: path[0] == "params" and path[-1] in DEX_PARAMETERS)
+
+        shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
+        added = jax.eval_shape(drawn, request_key(key)) if shaped else jax.jit(drawn)(request_key(key))
+        variables = merge(self.variables, added)
+        if extension.trains == "attention":
+            variables = freeze(variables, lambda path: extension.trainable(tuple(map(str, path))))
+        return replace(self, model=model, variables=variables)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """Return the tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
@@ -1617,6 +1649,11 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
             export_adapter = partial(_spelled_source_weights, {
                 entry.spelling(name): name for name in tensors if entry.spelling(name) != name})
     return _Built(model, variables, record, built, layouts, retained, export_adapter)
+
+
+def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | None) -> Loaded:
+    """`loaded` with DEX attached where a load names it (`Pretrained.with_dex`), drawn from key 0."""
+    return loaded if dex is None else loaded.with_dex(dex, key=0)
 
 
 def _resident[Loaded: Pretrained](loaded: Loaded, *, weights: bool, streaming: bool, on_host: bool) -> Loaded:

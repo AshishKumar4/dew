@@ -36,6 +36,7 @@ from dew.nn.attention_masks import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
+from dew.nn.dex import annealed, differential
 from dew.nn.documents import CrossDocuments
 from dew.nn.flops import attention_flops, cross_attention_flops, projection_flops
 from dew.nn.inputs import (
@@ -66,6 +67,7 @@ from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
+from dew.nn.progress import progress
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
@@ -388,6 +390,15 @@ class CausalSelfAttention(nn.Module):
                 self.k_norm = norm(name='k_norm')
         if self.ctx.ngpt is not None:
             self._ngpt_gains(self.ctx.ngpt)
+        if self.ctx.dex is not None:
+            # DEX's per-head projections of the chosen heads' outputs and its learned lambda, zero at the
+            # start as the paper's lambda_learn (`dew.nn.dex`).
+            if self.ctx.dex.heads[-1] >= self.ctx.num_heads:
+                raise ValueError(f"DEX names heads {self.ctx.dex.heads} of a layer of {self.ctx.num_heads}")
+            self.dex_projection = self.param(
+                'dex_projection', nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
+                (len(self.ctx.dex.heads), self.value_dim, self.value_dim), jnp.float32)
+            self.dex_lambda = self.param('dex_lambda', nn.initializers.zeros, (), jnp.float32)
         # A head's learned logit beside its keys', which a read of the layer's own sequence and one of
         # a context (`attend_context`) both take.
         self.sinks = (self.param('sinks', nn.initializers.zeros, (self.ctx.num_heads,))
@@ -1301,8 +1312,14 @@ class CausalSelfAttention(nn.Module):
             and all(getattr(metadata, name) is None for name in self._group_fields()))
 
     def _output(self, attention, gate, batch: int, length: int, own_value):
-        """Exclude the own value where the layer does and the call has one (None for a read of
-        another sequence), gate the attended values where it gates, then project them."""
+        """Take the differential on the chosen heads where the layer carries DEX (`dew.nn.dex`), exclude
+        the own value where the layer does and the call has one (None for a read of another sequence),
+        gate the attended values where it gates, then project them."""
+        if self.ctx.dex is not None:
+            # Lambda annealed over the run's updates (`dew.nn.progress`), its learned value outside a run.
+            strength = annealed(progress().updates, self.ctx.dex, self.dex_lambda)
+            attention = differential(attention, self.ctx.dex.heads, self.dex_projection, strength,
+                                     self.ctx.precision)
         if self.exclusive_self_attention and own_value is not None:
             attention = exclusive_self_attention(attention, own_value)
         if gate is not None and self.ctx.ngpt is not None:

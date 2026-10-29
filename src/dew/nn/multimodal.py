@@ -25,6 +25,7 @@ from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
     from dew.nn.cross_attention import CrossBlocks
+    from dew.nn.dex import DifferentialExtension
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
 
@@ -268,6 +269,10 @@ class MultimodalTransformer(DecoderWrapper):
     @nn.nowrap
     def with_cross_attention(self, cross: CrossBlocks | None) -> Self:
         return self._over(self.language_model.with_cross_attention(cross))
+
+    @nn.nowrap
+    def with_dex(self, extension: DifferentialExtension | None) -> Self:
+        return self._over(self.language_model.with_dex(extension))
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
