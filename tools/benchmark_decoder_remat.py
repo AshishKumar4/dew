@@ -15,9 +15,11 @@ and a conv of 4 taps.
 The timed operation is a donated AdamW update on next-token cross entropy.
 Compiler temporary bytes include activation and gradient workspaces. Device
 peak bytes are the allocator high-water mark for this fresh process, including
-initialization; they are not a pure activation-memory counter. Autodiff's
-saved activation bytes exclude input and constant references and count the
-logical residual shapes, before XLA scheduling and buffer reuse.
+initialization; they are not a pure activation-memory counter. The activation
+bytes are the residuals the loss's pullback keeps, each stored once, inputs and
+constants left out (`dew.training.footprint.residual_bytes`, what a run's fit
+search derives), before XLA scheduling and buffer reuse; the table's column
+counted each residual slot of `print_saved_residuals` on its own.
 
 RTX 4080 16 GiB, driver 595.84, JAX/jaxlib 0.11.1, Flax 0.12.9, Optax
 0.2.8: default dimensions with --dtype bfloat16 (FP32 master weights),
@@ -48,17 +50,13 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-# This is the shape analysis behind jax.ad_checkpoint.print_saved_residuals,
-# read directly so the measurement need not parse printed shapes or HLO text.
-from jax._src.ad_checkpoint import saved_residuals
-from jax.core import ShapedArray
-
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, Mixture
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers
 from dew.telemetry.benchmark import carried
+from dew.training.footprint import residual_bytes
 
 
 def main():
@@ -98,19 +96,13 @@ def main():
     optimizer = optax.adamw(1e-4)
 
     def loss(variables, tokens):
-        return objective.scalar_loss({"params": variables}, tokens, info)[0]
+        return objective.scalar_loss({"params": variables}, tokens, info)
 
-    residuals = saved_residuals(loss, shapes, jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), tokens))
-    activation_bytes = 0
-    for aval, origin in residuals:
-        if origin.startswith("output of"):
-            if not isinstance(aval, ShapedArray):
-                raise TypeError(f"Expected an array residual, got {aval}")
-            activation_bytes += int(np.prod(aval.shape)) * np.dtype(aval.dtype).itemsize
+    activation_bytes = residual_bytes(loss, shapes, (jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), tokens),))
 
     def step(params, opt_state, tokens):
-        value, grads = jax.value_and_grad(loss)(params, tokens)
+        (value, _), grads = jax.value_and_grad(loss, has_aux=True)(params, tokens)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), opt_state, value
 

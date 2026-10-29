@@ -395,22 +395,27 @@ def test_the_peeled_transition_carries_the_peeled_memory_and_its_adjoint(packed,
         np.testing.assert_array_equal(np.asarray(found, np.float64), exact[name], err_msg=name)
 
 
-def test_a_scan_traced_for_its_tangent_is_no_reverse_mode_call():
+@pytest.mark.parametrize('traced', ['values', 'queries', 'memory'])
+def test_a_scan_traced_for_its_tangent_is_no_reverse_mode_call(traced):
     """A scan traced by `jax.jvp` asks its selector for a tangent (`scan_case`'s `reverse` False), which no
-    port's custom VJP gives, whether or not `forward_mode_attention` is set: its operands are JVP tracers. A
-    gradient's (`jax.grad`) is a reverse-mode call. `jax.jvp` of a Mamba-2 layer reached the SSD port on an
-    A100, which raised there."""
+    port's custom VJP gives, whether or not `forward_mode_attention` is set, whichever of its operands the
+    tangent traces alone (its values, its queries, its initial memory): they are JVP tracers. A gradient's
+    (`jax.grad`) is a reverse-mode call. `jax.jvp` of a Mamba-2 layer reached the SSD port on an A100,
+    which raised there."""
     x, keys = jnp.ones((1, 8, 2, 16)), jnp.ones((1, 8, 1, 16))
     found = {}
 
-    def traced(name):
-        def run(x):
-            found[name] = recurrence_chunk.scan_case(x, keys, 8).reverse
-            return x.sum()
+    def traced_in(name):
+        def run(operand):
+            values = operand if traced == 'values' else x
+            others = () if traced == 'values' else (operand,)
+            found[name] = recurrence_chunk.scan_case(values, keys, 8, operands=others).reverse
+            return operand.sum()
         return run
 
-    jax.jvp(traced('tangent'), (x,), (x,))
-    jax.grad(traced('gradient'))(x)
+    operand = x if traced == 'values' else jnp.ones((1, 8, 1, 16))
+    jax.jvp(traced_in('tangent'), (operand,), (operand,))
+    jax.grad(traced_in('gradient'))(operand)
     assert found == {'tangent': False, 'gradient': True}
 
 

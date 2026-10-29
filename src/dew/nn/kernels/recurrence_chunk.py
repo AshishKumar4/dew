@@ -761,7 +761,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
-    case = PortCase(reverse=_reverse_mode(query, key, value, g, beta),
+    case = PortCase(reverse=_reverse_mode(query, key, value, g, beta, state),
                     varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
                     family=family, product=product, delta=delta, decayed=decayed)
@@ -1291,16 +1291,18 @@ tangent) and its tiling over the geometry (`ssd_kernel_runs`)."""
 
 
 def scan_case(x, B, chunk_size: int, *, tpu: bool = True, padded: bool = False, call: base.Call | None = None,
-              product: str = 'forward') -> ScanCase:
+              product: str = 'forward', operands: tuple = ()) -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
     `chunk_size` chunks, their widths as the port and the TPU's scan take them where `padded`
     (`_scan_widths`, `_rated_scan`); on a TPU where `tpu` asks, the platform its Pallas scan builds for
-    (`ssd_kernel_platform`); the template's `call` and the `product`."""
+    (`ssd_kernel_platform`); the template's `call` and the `product`. Its reverse mode is every operand's,
+    `x`, `B` and the scan's others (`operands`: its queries, steps, rates and memory), any of which a
+    tangent may trace alone."""
     widths = (x.shape[-1], B.shape[-1], chunk_size)
     if padded:
         widths = (_scan_widths(widths[0]), _scan_widths(widths[1]), chunk_size)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
-    return ScanCase(reverse=_reverse_mode(x, B), varying=bool(jax.typeof(x).mat.varying),
+    return ScanCase(reverse=_reverse_mode(x, B, *operands), varying=bool(jax.typeof(x).mat.varying),
                     dtype=jnp.dtype(x.dtype), widths=widths,
                     tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
                          if tpu and generation.backend() == 'tpu' else None),
@@ -1317,7 +1319,8 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=1.0, delta=False, wide=True)
-    case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
+    case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
+                     operands=(query, g, beta, state))
     return select(SCAN, case).kernel if report else selected(SCAN, case).name
 
 
