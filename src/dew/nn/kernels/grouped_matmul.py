@@ -302,10 +302,9 @@ class _Triton(_GroupedLaunch[Tile]):
 
     def eligible(self, ba, target) -> bool:
         # Every CUDA GPU the template sends the kernels to (`templates.gemm.template`), and
-        # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU;
-        # a paired product's second matrix is Mosaic GPU's alone.
-        return (generation.capability(target.generation) is not None and ba.arguments.get('paired') is None
-                and self.derived(ba, target) is not None)
+        # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU (a
+        # paired product the selector hands on apart: `_takes_pair`).
+        return generation.capability(target.generation) is not None and self.derived(ba, target) is not None
 
     def derived(self, ba, target) -> Tile | None:
         """The one tile the launch runs on `target`, from facts (the ranked set and its cost model deleted,
@@ -1012,7 +1011,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
                 and ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('exact_sums')
-                and ba.arguments.get('paired') is None and not ba.arguments['interpret'])
+                and not ba.arguments['interpret'])
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         return (self.TILE,)
@@ -1088,7 +1087,7 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         return (generation.tpu(target) and target.scoped_vmem is not None
                 and first == second == jnp.bfloat16
                 and self.derived(ba, target) is not None and _hooks_lower(ba, first, rules)
-                and not ba.arguments.get('exact_sums') and ba.arguments.get('paired') is None)
+                and not ba.arguments.get('exact_sums'))
 
     @abc.abstractmethod
     def spans(self, ba) -> tuple[int, int, int]:
@@ -1315,6 +1314,8 @@ class GroupedCase:
     rows: int
     call: base.Call
     kind: str
+    paired: bool = False
+    """Whether it multiplies its rows by a second matrix beside the first (`gmm_call`'s `paired`)."""
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -1346,7 +1347,12 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
     eligibility for the call (`Template.eligible`), then what the targets measured of it (`measured`, which
     a call naming it overrides)."""
     return selection.Kernel(name, (*SUPPORTS, _Need(
-        'launch', lambda case: case.call.eligible(name),
+        'pair', lambda case: not case.paired or _takes_pair(name, case.call.target),
+        lambda case: f"the {name} launches take no paired product on {case.call.target.generation}, whose "
+                     "two products then run apart", row='ledger 2100', kind='handoff'), _Need(
+        # A paired call's capability is the pairing launch's alone: every other hands it on (`pair`).
+        'launch', lambda case: ((case.paired and not _takes_pair(name, case.call.target))
+                                or case.call.eligible(name)),
         lambda case: f"the {name} launches take no call of these dtypes, widths, side operands or hooks on "
                      f"{case.call.target.generation}", row='ledger 1295'), *measured))
 
@@ -1405,8 +1411,27 @@ _NEEDS = {'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}
 """Each old route's requirements beyond its launch's own: CUTLASS on its declared cells alone, Triton off the
 dense products the template's launches cannot run."""
 
+def _takes_pair(name: str, target) -> bool:
+    """Whether the launches `name` take a paired product whole on `target`: Mosaic GPU's on a family whose
+    register model counts the second accumulator (`mosaic.Family.counts_hooks`: warpgroup MMA); every other
+    hands it on (`APART`)."""
+    family = bundles.of(target.generation, jnp.bfloat16)
+    return name == MosaicGmm.name and family is not None and family.counts_hooks
+
+class Apart:
+    """`launched`'s answer for a paired product no launch takes whole: its two products run apart
+    (`templates.gemm.template._apart`), each through the launches that take it, as the unfused program runs
+    them."""
+
+    name = 'apart'
+
+
+APART = Apart()
+
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
     *(_launch_kernel(launch.name, *_NEEDS.get(launch.name, ())) for launch in _GMMS),
+    selection.Kernel[GroupedCase](APART.name, (_Need('single', lambda case: case.paired,
+                                                "the call is one product", row=INHERENT),), generic=True),
     selection.Kernel[GroupedCase]('xla', (), generic=True)), declared=DECLARED)
 """The grouped selector, in a fixed order, the template first (owner, bible da64ae5): Mosaic GPU's launch
 where it takes the call, the TPU's launch on a TPU, Triton's where they refuse, else XLA's program, but a
@@ -1431,18 +1456,20 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
-    return GroupedCase(placed, whole, product, arguments[0].shape[0], call, kind)
+    return GroupedCase(placed, whole, product, arguments[0].shape[0], call, kind,
+                       paired=options.get('hooks', NO_HOOKS).paired)
 
 
 def launched(launches, arguments, options, *, product: Product, whole: bool):
     """The launch of `launches` that runs the call (`arguments`, `options`) as `GROUPED` selects it,
-    ready to call, or None where XLA's program takes it: on the call's target, a CPU process's own (whose
+    ready to call, `APART` where a paired call's products run apart, or None where XLA's program takes it:
+    on the call's target, a CPU process's own (whose
     kernels run nowhere, so XLA's program takes every call and a kernel `generation.chosen` names raises)
     or the GPU it states (`generation.assumed`). Every branch insists on a named kernel."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
     route = selection.select(GROUPED, case)
-    if route.kernel == 'xla':
-        return None
+    if route.kernel in ('xla', APART.name):
+        return None if route.kernel == 'xla' else APART
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
 
 
