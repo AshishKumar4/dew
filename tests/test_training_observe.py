@@ -11,7 +11,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Regression, dataset
-from recording import Preempting
+from recording import preempting
 
 from dew.training import Checkpoints, Layout, Observe, Trainer
 from dew.training.runtime import Preempted
@@ -74,10 +74,9 @@ def test_a_resumed_fit_continues_its_observers_ledger_and_a_complete_run_is_obse
 def test_a_preempted_fit_observes_the_step_it_stopped_at(tmp_path):
     """A preemption stops the run off the cadence, after step 4: that step, the one its
     checkpoint holds, is the run's last and is observed before fit raises."""
-    observe = Observe(10, averaged)
+    observe = preempting(3, every=10, call=averaged)
     with pytest.raises(Preempted):
-        trainer(tmp_path / "run", tracker=Preempting(3)).fit(dataset(), steps=20, log_every=1,
-                                                             observe=observe)
+        trainer(tmp_path / "run").fit(dataset(), steps=20, log_every=1, observe=observe)
     assert [step for step, _ in observe.values] == [4]
     assert Checkpoints(str(tmp_path / "run")).latest == 4
 

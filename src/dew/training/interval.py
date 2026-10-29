@@ -474,10 +474,14 @@ class LogWriter:
             self.unchecked = 0
 
     def close(self) -> None:
-        """Stop the thread once it has written what it holds; a write that waits on a step that never
-        ends holds no process open, the thread being a daemon."""
-        if self._thread is not None:
-            self._queue.put(None)
+        """Stop the thread once it has written what it holds, and wait for it: a thread still in JAX's
+        runtime as the interpreter exits aborts the process. A failed run whose writes wait on a step that
+        never ends (its peers gone) leaves the thread, a daemon, rather than wait on it."""
+        if self._thread is None:
+            return
+        self._queue.put(None)
+        if all(written.done() or ready() for written, ready in self._writes):
+            self._thread.join()
 
 
 def on_host[TreeT](counters: TreeT, step: int) -> TreeT:
