@@ -970,14 +970,24 @@ def leaf_summary(reference, truth, rows_of: _TruthRows | None = None) -> Recorde
     held = rows_of or _TruthRows.of(truth)
     # Each row's own size by the arithmetic its errors take (`_scaled_rms`), so an arm exactly zero on a
     # row is exactly its size from it: `row_errors`' sizes and errors, the truth's read once.
-    sizes, own = held.sizes, held.own
     rows = _rows_rms(reference - truth, truth.shape[-1]) if truth.ndim >= 2 else np.zeros(0)
+    return rows_summary(rows, truth, finite=bool(np.isfinite(reference).all()), dtype=dtype,
+                        mse=float(np.mean(np.square(reference - truth))), rows_of=held)
+
+
+def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = None,
+                 rows_of: _TruthRows | None = None) -> RecordedLeaf:
+    """`leaf_summary` of a leaf from each row's RMS distance from its float64 truth `rows` alone, where the
+    reference ran apart and kept those (a recorder whose outputs are too large to keep, its rows its
+    leaf's every axis but the last): its mean squared error the rows' mean square, every row one width,
+    unless `mse` gives it; `finite` whether the reference's leaf was, and `dtype` its dtype."""
+    held = rows_of or _TruthRows.of(np.asarray(truth, np.float64))
+    sizes, own, rows = held.sizes, held.own, np.asarray(rows, np.float64)
     sized = sizes > 0
     logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
-    return RecordedLeaf(float(np.mean(np.square(reference - truth))),
+    return RecordedLeaf(float(np.mean(np.square(rows))) if mse is None else mse,
                         float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
-                        np.flatnonzero(~sized), rows[~sized],
-                        finite=bool(np.isfinite(reference).all()) and held.finite, dtype=dtype,
+                        np.flatnonzero(~sized), rows[~sized], finite=finite and held.finite, dtype=dtype,
                         zero_sizes=own[~sized], worst_log=logged)
 
 

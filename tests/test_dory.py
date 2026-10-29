@@ -16,16 +16,15 @@ import pytest
 from decision_support import decision_rows
 from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
-    ORDERS,
     as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
-    assert_as_exact_over_orders,
     assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
-    assert_rows_as_exact_over_orders,
     chain_roundings,
     float64_forward,
+    indexed_recording,
+    recording,
     widened,
 )
 from tool_support import load as load_tool
@@ -725,145 +724,172 @@ def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse:
 
 
 def decoding(model: CausalTransformer):
-    """`model`'s empty cache of one row, its call over a cache, prefilling a prompt or decoding a
-    token, and its log-probabilities from logits, each compiled once for every set of weights of its
-    shapes and binding no weights past its call."""
+    """`model`'s empty cache of one row; its call over a cache, a prompt or a token; its prefill of a
+    prompt scored at the prompt's last position alone, the state gathered before the vocabulary
+    (`states_and_logits_at`); and its log-probabilities from logits, each compiled once for every set of
+    weights of its shapes and binding no weights past its call."""
     opened = jax.jit(lambda variables: model.apply(variables, 1, method=CausalTransformer.init_cache,
                                                    mutable=['cache'])[1]['cache'])
     step = jax.jit(lambda variables, cache, ids: model.apply({**variables, 'cache': cache}, ids, decode=True,
                                                              mutable=['cache']))
+    last = jax.jit(lambda variables, cache, ids: model.apply(
+        {**variables, 'cache': cache}, ids, jnp.asarray([ids.shape[1] - 1]), decode=True, mutable=['cache'],
+        method=CausalTransformer.states_and_logits_at))
     scored = jax.jit(lambda logits: jax.nn.log_softmax(logits.astype(jnp.promote_types(logits.dtype,
                                                                                           jnp.float32))))
-    return opened, step, scored
+    return opened, step, last, scored
 
 
-def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> np.ndarray:
+def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Array:
     """Dew's log-probabilities at each position of `prompt` followed by `tokens`, the prompt
     prefilled and each token but the last decoded a step at a time through the cache (`programs`,
-    `decoding`'s), as a run that drew `tokens` computes them: the prompt's rows (its last alone
-    where `prompt_rows` is False), then a row a token."""
-    opened, step, scored = programs
-    logits, written = step(variables, opened(variables), jnp.asarray(prompt[None]))
-    rows = [logits[0] if prompt_rows else logits[0, -1:]]
+    `decoding`'s), as a run that drew `tokens` computes them: the prompt's rows (its last alone, the
+    vocabulary over that state alone, where `prompt_rows` is False), then a row a token."""
+    opened, step, last, scored = programs
+    ids = jnp.asarray(np.asarray(prompt, np.int32)[None])
+    if prompt_rows:
+        logits, written = step(variables, opened(variables), ids)
+        rows = [logits[0]]
+    else:
+        (_, logits), written = last(variables, opened(variables), ids)
+        rows = [logits]
     for token in tokens[:-1]:
-        logits, written = step(variables, written['cache'], jnp.asarray([[token]]))
+        logits, written = step(variables, written['cache'], jnp.asarray([[token]], jnp.int32))
         rows.append(logits[0])
-    return np.asarray(scored(jnp.concatenate(rows)))
+    return scored(jnp.concatenate(rows))
+
+
+def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weights, config: dict,
+                               parts: dict, label: str) -> None:
+    """Check 1 of `model` over `weights` (host arrays) decoding `parts` (each prompt, the tokens drawn
+    after it and whether its own rows are scored) against the reference recorded at `site` as each row's
+    distance from float64 under each of the release recorder's orders (`record_distances`): Dew's rows
+    under a seed's order (`symmetric`), each order's weights placed alone, against Dew's own float64
+    decoding of the same tokens, held to the recorded truth's sketch at every seed. The orders are exact
+    symmetries of the function, so every seed's float64 truth is the identity's."""
+    recorder = load_tool('dory_vllm_reference')
+    programs = decoding(model)
+
+    def rows(programs, variables):
+        return {'log_probabilities': jnp.concatenate([
+            forced(programs, variables, prompt, tokens, prompt_rows=prompt_rows)
+            for prompt, tokens, prompt_rows in parts.values()])}
+
+    def dew(index, order):
+        ordered = jax.device_put(symmetric(weights, config, order))
+        found = jax.tree.map(np.asarray, rows(programs, ordered))
+        jax.tree.map(lambda leaf: leaf.delete(), ordered)
+        return found
+
+    # The float64 arm on the default device, a GPU's float64 units where one runs the test, its kernels
+    # chosen as a CPU's, the portable math.
+    with jax.enable_x64(new_val=True), generation.assumed('cpu'):
+        wide = model.clone(dtype=jnp.float64)
+        held = jax.device_put(widened(weights))
+        wide_programs = decoding(wide)
+
+    def truth(order):
+        with jax.enable_x64(new_val=True), generation.assumed('cpu'):
+            return rows(wide_programs, held)
+
+    truth.dew_programs = True
+    seeds = int(stored[f'{site}.seeds'])
+    drawn, reference, recorded_truth = indexed_recording(
+        stored, site, seeds, inputs_of=lambda seed: recorder.symmetry(config, *divmod(seed, recorder.ORDERS)),
+        truth_fn=truth)
+    assert_as_exact(as_given(dew), reference, drawn, label, seeds=seeds, truth_fn=recorded_truth)
+
+
+def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distances():
+    """The release test's path on the tiny Dory, both caches: the transcription in fp32 under each of the
+    release recorder's orders, kept as each row's distance from its float64 run alone, as the release's
+    recording keeps vLLM's (`record_distances`), and Dew decoding the same tokens held to it by check 1,
+    a sentence's rows and a prompt past the window scored at its last position alone."""
+    import torch
+
+    recorder, recording_of = load_tool('dory_vllm_reference'), load_tool('recorded_references')
+    loaded = load()
+    config = json.loads((TINY / 'config.json').read_text())
+    ids = REFERENCE['input_ids'][0]
+    for mode in ('per_loop', 'last_loop'):
+        tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+        reference = TOOL.DoryReference(config, tensors, torch.float64, mode=mode)
+        # The tiny Dory's window is 5: the second prompt runs past it.
+        prompts = {'sentence': (ids[:4], True), 'window': (ids, False)}
+        parts = {part: (prompt, reference.decode(prompt, 5)[0][len(prompt):], prompt_rows)
+                 for part, (prompt, prompt_rows) in prompts.items()}
+
+        def transcribed(tensors, dtype, parts=parts, mode=mode):
+            ran = TOOL.DoryReference(config, tensors, dtype, mode=mode)
+            logits = np.concatenate([ran.forced(prompt, tokens, prompt_rows)
+                                     for prompt, tokens, prompt_rows in parts.values()])
+            return torch.as_tensor(logits).log_softmax(-1).numpy()
+
+        truth = transcribed(tensors, torch.float64)
+        host = jax.device_get(loaded.variables)
+
+        def order(seed):
+            return recorder.symmetry(config, *divmod(seed, recorder.ORDERS))
+
+        def distances(seed, transcribed=transcribed, truth=truth, host=host):
+            tensors = loaded.export(symmetric(host, config, order(seed)))
+            found = transcribed({key: np.array(value, copy=True) for key, value in tensors.items()},
+                                torch.float32)
+            return np.sqrt(np.mean(np.square(found - truth), axis=1))
+
+        with jax.enable_x64(new_val=True):
+            stored = recording_of.record_distances(
+                mode, order, {'log_probabilities': np.stack([distances(seed) for seed in range(80)])},
+                lambda seed, truth=truth: {'log_probabilities': truth}, {'log_probabilities': 'float32'})
+        model = with_cache(loaded.model, mode).with_cache_capacity(32)
+        assert_decodes_as_recorded(stored, mode, model, host, config, parts, f'tiny Dory, {mode}')
+
+
+RELEASE_RUNS = load_tool('dory_vllm_reference').RUNS
+"""The release recorder's runs: (loop count, cache mode, dtype)."""
 
 
 @pytest.mark.network
 @pytest.mark.gpu(reason='the 4B release, held to vLLM running it on a GPU')
-def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loop_count():
-    """NVIDIA-Nemotron-Labs-Dory1.0-4B at source.json's revision against vLLM's own engine running
-    it (tools/dory_vllm_reference.py, its provenance in source.json, its probe in the dataset that
-    pins), in bf16 at one, two and four loops and in fp32 at two, through each cache: the
-    log-probabilities of a sentence's prompt and of the 256 tokens vLLM drew greedily after it,
-    each decoded a step at a time, and of 64 tokens drawn after 1100 random ids, past the
-    1024-token window, every entry of every row.
+@pytest.mark.parametrize('run', RELEASE_RUNS, ids=['-'.join(map(str, run)) for run in RELEASE_RUNS])
+def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loop_count(run):
+    """NVIDIA-Nemotron-Labs-Dory1.0-4B at source.json's revision against vLLM's own engine running it
+    (tools/dory_vllm_reference.py; its recording tests/fixtures/hf/dory-1.0-4b/recording.npz, its
+    provenance inside), in bf16 at one, two and four loops and in fp32 at two, through each cache: the
+    log-probabilities of a sentence's prompt and of the 256 tokens vLLM drew greedily after it, each
+    decoded a step at a time, and of 64 tokens drawn after 1100 random ids, past the 1024-token window,
+    every entry of every row, by check 1 (`assert_decodes_as_recorded`).
 
-    The float64 truth is vLLM's own model code run in float64 on the same tokens, which the
-    transcription tools/dory_reference.py (the CPU tests' reference) and Dew's own float64 decoding
-    are held to within the float64 rounding of the computation, in RMS. At a few positions of every
-    run, vLLM's too, one rounding moves the continuation's log-probabilities by whole units, so one
-    run against one decides nothing there: each run is held to vLLM's over the first batch of orders
-    vLLM ran under (tests/reference_error.py's over-orders rules), its rows over the whole vocabulary
-    overall (`assert_as_exact_over_orders`, within FACTOR) and row by row
-    (`assert_rows_as_exact_over_orders`, each row sized by the truth row's own RMS, the worst within
-    the gate's ROW_FACTOR: an extreme value of many rows, which equally exact code put at up to 2.42
-    times the reference's), and the same on each row's probe columns. vLLM is an opaque reference no
-    surrogate can witness, so its leaf and row RMS are the end-to-end bar, parity carried at FACTOR
-    by the leaf; this test holds no element alone, which Dory's per-element graph checks do, and the
-    recording's further batches and entry sums are calibration data. On a last-loop run's rows past
-    the window, vLLM's engine parts from its own model code
-    (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659): there the reference
-    is that model code at the engine's precision under the same orders, so the engine's departure
-    widens no bound.
+    A seed is an order of the exact symmetries both engines hold the release under, on the same tokens
+    (tools/dory_vllm_reference.py's `symmetry`: the residual stream's units, each feed-forward's hidden
+    units, each attention's heads and value dimensions), which redraw 90 to 99.5% of the release's summed
+    terms. The rest no order moves on either side, so neither error there is calibrated: the queries' and
+    keys' products over a head's dimensions (RoPE's frequency pairs), the softmax's and the values' sums
+    over the keys (the key order), the queries' and keys' unit norms, and the log-softmax over the
+    vocabulary. The float64 truth is vLLM's own model code run in float64 on the same tokens, recorded as
+    its sketch, which Dew's own float64 decoding is held to at every seed. On a last-loop run's rows
+    past the window, vLLM's engine parts from its own model code
+    (https://github.com/vllm-project/vllm/pull/60149#issuecomment-6270937659): there the reference is
+    that model code at the engine's precision under the same orders.
 
-    The orders are the exact symmetries both engines hold the release under, on the same prompts
-    (tools/dory_vllm_reference.py's `symmetry`): the residual stream's units, each feed-forward's
-    hidden units, each attention's heads and value dimensions. They redraw 90 to 99.5% of the
-    release's summed terms. The rest no order moves on either side, so neither error there is calibrated: the
-    queries' and keys' products over a head's dimensions (RoPE's frequency pairs), the softmax's and
-    the values' sums over the keys (the key order), the queries' and keys' unit norms, and the
-    log-softmax over the vocabulary. A failure that persists there is a finding about those sums, to
-    diagnose, not a draw.
-
-    Each arm's precision: the engine computes a bf16 run in bf16 over fp32 accumulation, and an
-    fp32 run with its linears at "highest" (VLLM_FLOAT32_MATMUL_PRECISION's default) and its
-    Triton attention's products in TF32; the model-code arm takes the same, bf16 throughout or
-    fp32 with TF32 attention products. Dew leaves each product to JAX's default, which on this GPU
-    multiplies a float32 run's linears and attention alike in TF32."""
-    source = json.loads((RELEASED / 'source.json').read_text())
+    Each arm's precision: the engine computes a bf16 run in bf16 over fp32 accumulation, and an fp32 run
+    with its linears at "highest" (VLLM_FLOAT32_MATMUL_PRECISION's default) and its Triton attention's
+    products in TF32; the model-code arm takes the same. Dew leaves each product to JAX's default, which
+    on this GPU multiplies a float32 run's linears and attention alike in TF32."""
     recorder = load_tool('dory_vllm_reference')
-    assert recorder.ORDERS == ORDERS, 'the probe holds batches of other than the rule\'s orders'
-    probe, config = np.load(recorder.fetched('probe.npz')), json.loads((RELEASED / 'config.json').read_text())
-    keys = [recorder.name(*run) for run in recorder.RUNS]
-    truths = {key: np.load(recorder.fetched(f'upstream-{recorder.tag(key)}.npy')) for key in keys}
-
-    def rows(programs, variables, key):
-        """Every row of run `key`, decoded as the run decoded it."""
-        return np.concatenate([forced(programs, variables, probe[part], probe[f'{key}/{part}_generated'],
-                                      prompt_rows=part == 'sentence') for part in ('sentence', 'window')])
-
-    loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype='float32')
-    # The float64 arm on the default device, a GPU's float64 units where one runs the test (IEEE
-    # double, as the host's), its kernels chosen as a CPU's, the portable math: the fp32 weights leave
-    # the device first, so its 32 GB of float64 weights are the only copy on it.
+    loops, mode, dtype = run
+    site = recorder.site(*run)
+    stored = recording(RELEASED / 'recording.npz')
+    source = json.loads((RELEASED / 'source.json').read_text())
+    config = json.loads((RELEASED / 'config.json').read_text())
+    parts = {part: (stored[f'{site}.prompt.{part}'], stored[f'{site}.continued.{part}'], prompt_rows)
+             for part, _, prompt_rows in recorder.PARTS}
+    loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype)
+    # The weights live on the host, each order's copy alone on the device: the 4B's weights twice over,
+    # with its compiled step and cache, do not fit a 40 GB GPU.
     weights = jax.device_get(loaded.variables)
     for leaf in jax.tree.leaves(loaded.variables):
         if isinstance(leaf, jax.Array):
             leaf.delete()
-    with jax.enable_x64(new_val=True), generation.assumed('cpu'):
-        variables = jax.device_put(widened(weights))
-        del weights
-        for loops, mode, run in recorder.RUNS:
-            key = recorder.name(loops, mode, run)
-            wide = with_cache(loaded.model.with_passes(loops), mode).clone(dtype=jnp.float64)
-            length = len(probe['window']) + len(probe[f'{key}/window_generated'])
-            scored = jax.make_jaxpr(lambda held, ids, at=wide: jax.nn.log_softmax(at.apply(held, ids)))
-            roundings = chain_roundings(scored(variables, jnp.zeros((1, length), jnp.int32)))
-            for part in ('', '_full'):
-                assert_computes_the_oracle(probe[f'{key}/truth{part}'], probe[f'{key}/upstream{part}'],
-                                           f'the transcription in float64, {key}{part}', roundings=roundings)
-            mine = rows(decoding(wide.with_cache_capacity(recorder.CONTEXT)), variables, key)
-            assert_computes_the_oracle(mine, truths[key], f'Dew in float64, {key}', roundings=roundings)
-        del variables
-    for dtype in ('bfloat16', 'float32'):
-        loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype=dtype)
-        # The weights live on the host, each order's copy alone on the device (below).
-        host = jax.device_get(loaded.variables)
-        for leaf in jax.tree.leaves(loaded.variables):
-            if isinstance(leaf, jax.Array):
-                leaf.delete()
-        for loops, mode, run in recorder.RUNS:
-            if run != dtype:
-                continue
-            key = recorder.name(loops, mode, run)
-            model = with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(recorder.CONTEXT)
-            programs, columns, truth = decoding(model), recorder.columns_of(probe, key), truths[key]
-            theirs = np.load(recorder.fetched(f'columns-{recorder.tag(key)}-0.npy'))
-            sampled = np.take_along_axis(truth, columns, axis=1)
-            # Each order's distance of each row from float64: over the whole vocabulary, then on the
-            # probe's columns, Dew's and vLLM's.
-            distances = {'whole': np.zeros((ORDERS, len(truth))), 'columns': np.zeros((ORDERS, len(truth))),
-                         'theirs': np.sqrt(np.mean(np.square(theirs - sampled), axis=2))}
-            for order in range(ORDERS):
-                # Each order's weights are reordered on the host and placed alone: the 4B's weights twice
-                # over, with its compiled step and cache, do not fit a 40 GB GPU.
-                ordered = jax.device_put(symmetric(host, config, recorder.symmetry(config, 0, order)))
-                found = rows(programs, ordered, key)
-                del ordered
-                distances['whole'][order] = np.sqrt(np.mean(np.square(found - truth), axis=1))
-                distances['columns'][order] = np.sqrt(np.mean(np.square(
-                    np.take_along_axis(found, columns, axis=1) - sampled), axis=1))
-            for part, mine, reference, sizes in (
-                    ('every entry', distances['whole'], np.load(recorder.fetched(
-                        f'rows-{recorder.tag(key)}-vllm.npy'))[0],
-                     np.load(recorder.fetched(f'sizes-{recorder.tag(key)}.npy'))),
-                    ('its columns', distances['columns'], distances['theirs'],
-                     np.sqrt(np.mean(np.square(sampled), axis=1)))):
-                assert_as_exact_over_orders(np.sqrt(np.mean(np.square(mine), axis=1)),
-                                            np.sqrt(np.mean(np.square(reference), axis=1)),
-                                            f'Dory 4B {key}, {part}')
-                assert_rows_as_exact_over_orders(mine, reference, f'Dory 4B {key}, {part} row by row',
-                                                 sizes=sizes)
+    model = with_cache(loaded.model.with_passes(loops), mode).with_cache_capacity(recorder.CONTEXT)
+    assert_decodes_as_recorded(stored, site, model, weights, config, parts, f'Dory 4B {site}')

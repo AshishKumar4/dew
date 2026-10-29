@@ -923,6 +923,44 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
                                                                             range(cut - 1))])
 
 
+def test_a_recording_kept_as_row_distances_judges_as_the_live_reference_does():
+    """A reference recorded as each row's RMS distance from its float64 truth alone (`record_distances`,
+    for a recorder whose outputs over the seeds are too large to keep): check 1 over that recording
+    passes Dew's same sum in another order and fails Dew's sum with a term lost, as it does against the
+    live reference."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def as_inputs(fn):
+        return lambda inputs: fn(inputs["x"], inputs["w"])
+
+    with jax.enable_x64(new_val=True):
+        def truth_of(seed):
+            return jax.tree.map(np.asarray, _product(*(np.asarray(part, np.float64) for part in _draw(seed))))
+
+        def distances(seed):
+            found = np.asarray(_product(*_draw(seed))["y"], np.float64)
+            return np.sqrt(np.mean(np.square(found - truth_of(seed)["y"]), axis=1))
+
+        kept = {"y": np.stack([distances(seed) for seed in range(160)])}
+        recorded = recorder.record_distances("site", draw, kept, truth_of, {"y": "float32"})
+    seeds = int(recorded["site.seeds"])
+    assert_as_exact(_reordered, _product, _draw, "live", seeds=seeds)
+    drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
+                                                truth_fn=as_inputs(_product))
+    assert_as_exact(lambda index, inputs: as_inputs(_reordered)(inputs), reference, drawn, "reordered",
+                    seeds=seeds, truth_fn=truth)
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(lambda index, inputs: as_inputs(_lost_term)(inputs), reference, drawn, "lost term",
+                        seeds=seeds, truth_fn=truth)
+    assert raised.type is GateFailure
+
+
 def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do():
     """A summarized recording made in shards with a run of pilots from SIZING_FROM (`merge_shards`) keeps
     them apart from its verdict's seeds, and its reference carries them: a paired sizing of it takes those

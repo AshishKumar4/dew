@@ -13,7 +13,8 @@ precision reads the same samples.)
 A summarized recording too slow for one process is made in shards: `record_shard` keeps the evidence of
 a run of seeds, each drawn as one run draws it, and `merge_shards` joins the shards in seed order and
 declares the count their joined evidence resolves (`seeds_resolving`), writing what `record_case`'s
-summary writes.
+summary writes. A reference whose recorder keeps each row's distance from its truth alone, its outputs
+too large to keep over the seeds, is summarized from those by `record_distances`.
 """
 
 import json
@@ -34,14 +35,15 @@ from reference_error import (
     as_given,
     input_digest,
     leaf_summary,
+    rows_summary,
     seeds_for,
     seeds_resolving,
     truth_sketch,
     widened,
 )
 
-__all__ = ["merge_shards", "provenance", "record_case", "record_logits", "record_reference", "record_shard",
-           "save", "with_pilots"]
+__all__ = ["merge_shards", "provenance", "record_case", "record_distances", "record_logits",
+           "record_reference", "record_shard", "save", "with_pilots"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
@@ -134,7 +136,7 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     ensure(kept)
     kept_records = [records[seed] for seed in range(kept)]
     if summary:
-        result = _finished(label, _evidence(label, range(kept), kept_records), confirmed)
+        result = _finished(label, _evidence(label, range(kept), map(_summarized, kept_records)), confirmed)
         print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
         return result
     result = {}
@@ -230,8 +232,35 @@ def record_shard(label: str, draw, evaluate, seeds: range) -> dict[str, np.ndarr
         for seed in seeds:
             inputs = draw(seed)
             reference, truth = evaluate(inputs)
-            yield inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)
+            yield _summarized((inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)))
     return _evidence(label, seeds, records())
+
+
+def record_distances(label: str, draw, distances: Mapping[str, np.ndarray], truth_of,
+                     dtypes: Mapping[str, str]) -> dict[str, np.ndarray]:
+    """`label`'s summarized recording, as `merge_shards` writes it, of a reference that ran apart and kept
+    each row's RMS distance from its float64 truth alone (a recorder whose outputs over the seeds are too
+    large to keep): `distances[name]` `[seeds, rows]` from seed 0 for each leaf, `truth_of(seed)` the seed's
+    float64 truth by leaf, `draw(seed)` its inputs, and `dtypes[name]` the reference's leaf's dtype. The
+    count the evidence resolves is declared (`seeds_resolving`, the reference against itself), and that
+    count's (1 + REDRAW) times kept, each kept seed's evidence read from its rows (`rows_summary`) beside
+    its truth's sketch."""
+    names = list(distances)
+    errors = np.stack([np.mean(np.square(np.asarray(distances[name], np.float64)), axis=1) for name in names],
+                      axis=1)
+    confirmed = seeds_resolving(errors, names, label)
+    kept = (1 + REDRAW) * confirmed
+
+    def records():
+        for seed in range(kept):
+            truth = truth_of(seed)
+            summaries = {name: rows_summary(distances[name][seed], truth[name],
+                                            finite=bool(np.isfinite(distances[name][seed]).all()),
+                                            dtype=dtypes[name]) for name in names}
+            yield draw(seed), summaries, truth
+    result = _finished(label, _evidence(label, range(kept), records()), confirmed)
+    print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
+    return result
 
 
 def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict[str, np.ndarray]:
@@ -301,15 +330,21 @@ def _joined(label: str, shards: Sequence[Mapping[str, np.ndarray]], first: int) 
     return joined
 
 
+def _summarized(record):
+    """A record of (inputs, reference, truth) as `_evidence` reads it: each leaf's `leaf_summary`."""
+    inputs, reference, truth = record
+    return inputs, {name: leaf_summary(reference[name], truth[name]) for name in reference}, truth
+
+
 def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
     """`records`' evidence, one row a seed of `seeds`, read one record at a time (an iterable of
-    (inputs, reference, truth)): each leaf's `leaf_summary` (its rows of float64 zero joined, with their
-    count a seed) and its truth's sketch, and each seed's input digest."""
+    (inputs, each leaf's `RecordedLeaf`, truth)): each leaf's summary (its rows of float64 zero joined,
+    with their count a seed) and its truth's sketch, and each seed's input digest."""
     digests, leaves, sketches, shapes = [], {}, {}, {}
-    for seed, (inputs, reference, truth) in zip(seeds, records, strict=True):
+    for seed, (inputs, summaries, truth) in zip(seeds, records, strict=True):
         digests.append(input_digest(inputs))
-        for name in reference:
-            leaves.setdefault(name, []).append(leaf_summary(reference[name], truth[name]))
+        for name in summaries:
+            leaves.setdefault(name, []).append(summaries[name])
             sketches.setdefault(name, []).append(truth_sketch(truth[name], seed))
             shapes.setdefault(name, np.asarray(np.shape(truth[name]), np.int64))
     evidence = {f"{label}.drawn": np.asarray(seeds, np.int64), f"{label}.input_digest": np.asarray(digests)}
