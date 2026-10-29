@@ -1965,6 +1965,9 @@ class DecoderFamily:
     """Reads a media bundle released under the family's own model_type, which
     keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
+    wrapper_media_suffixes: tuple[str, ...] = ()
+    """Suffixes of a bundle's decoder tensors that serve its media alone, which its language model read
+    as its text checkpoint drops (`hf_decoders.language_model_names`): V4.1's routers' image-span bias."""
     defaults: Mapping[str, object] = field(default_factory=dict)
     """The computational fields the family's config class fills where a file
     omits them, which the shared readers would otherwise default for every
