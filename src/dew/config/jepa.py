@@ -38,7 +38,7 @@ class JepaRunConfig(RunConfig):
     """The JEPA objective and its arguments (`--objective.momentum 0.996 1.0`).
     Its EMA ramps over the whole run unless it names `momentum_steps`."""
     model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig("jepa_encoder", {"precision": "default", "dtype": "bfloat16"}))
+        default_factory=lambda: ModelConfig("jepa_encoder", {"precision": "default"}))
     optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=1e-3))
     predictor: JsonDict = dataclasses.field(default_factory=dict)
     """Predictor kwargs, over the encoder's shared ones."""
@@ -66,7 +66,7 @@ class JepaRunConfig(RunConfig):
         dataset, held = self.compiled(ObjectiveData(), self.chain(), self.validation)
         sample = self.sample()
         video = sample.key == "video"
-        encoder = self.model.build()
+        encoder = self.model.build(**self.numerics_fields())
         if video != (isinstance(encoder, ReadsClips) and encoder.reads_clips):
             raise ValueError("a video dataset and an encoder that reads clips (--model jepa_video_encoder) "
                              "go together")

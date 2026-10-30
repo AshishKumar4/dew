@@ -496,13 +496,16 @@ class TrainerConfig:
     way there is one optimizer update a step, and the compiled step is traced
     once per stage.
     """
-    dynamic_scale: bool = False
     precision: Numerics = dataclasses.field(default_factory=Numerics)
     """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`; `ACCURATE` for
     scientific runs): its dtypes by Lightning's names, its products' precision by JAX's levels and its
     ops' forms, over every program it traces, the step and its evaluations
-    (`dew.nn.kernels.generation.run_precision`). A precision the model states still wins, and a resumed
-    run traces under the numerics it records."""
+    (`dew.nn.kernels.generation.run_precision`). Its compute dtype is the model's where the model's
+    record states none (`RunConfig.numerics_fields`), its parameters' a loaded checkpoint's storage, and
+    a float16 compute scales the loss (`RunConfig.built`). The optimizer's moments are a storage format
+    of their own (`OptimConfig.state_dtype`: float32 under any weights, bfloat16 stochastically rounded,
+    int8 blockwise). A dtype or precision the model states still wins, and a resumed run traces under
+    the numerics it records."""
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
     microbatches: int | None = None
     """Microbatches a pipelined step feeds through the mesh's stages, a
@@ -862,22 +865,44 @@ def _unrecorded(value: Dataset | Mapping[str, Dataset] | None) -> list[str]:
     return [encoded.reason] if isinstance(encoded, records.Unrecorded) else []
 
 
+def takes_dtype(model: ModelConfig) -> bool:
+    """Whether `model`'s class takes a compute `dtype`, as a Flax module does."""
+    from dew.registry import imported, member_fields, models
+
+    owner = models[model.name] if model.name in models.paths else imported(model.name)
+    return isinstance(owner, type) and any(name == "dtype" for name, _, _ in member_fields(owner))
+
+
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record (its run.json, `{"class": ..., "fields": ...}`) with its fields in the shapes
     Dew writes now, every earlier shape of a saved run read here and nowhere else (`RunConfig.load`,
-    `check_resume`): a trainer's `attention_form`, which its precision policy's `forms` hold now
-    (`dew.nn.precision.Numerics`, ledger 2500). A configuration written today that names
-    `attention_form` is refused by name, as any field a trainer does not declare. A record in today's
-    shapes passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    `check_resume`): a trainer's `attention_form`, which its precision policy's `forms` hold now; a
+    loaded checkpoint's `pretrained_param_dtype` and a decision's `param_dtype`, which its `dtypes.params`
+    hold; and a trainer's `dynamic_scale`, which a float16 compute derives (`dew.nn.precision.Numerics`,
+    ledger 2500).
+    A configuration written today that names any of them is refused by name, as any field its class does
+    not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger
+    1552)."""
     fields = record.get("fields")
-    trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
-    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or "attention_form" not in trainer:
+    if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
+        return record
+    trainer, fields = dict(fields["trainer"]), dict(fields)
+    stated = {name: fields.pop(name) for name in ("pretrained_param_dtype", "param_dtype") if name in fields}
+    earlier = {name for name in ("attention_form", "dynamic_scale") if name in trainer} | set(stated)
+    if not earlier:
         return record
     if "precision" in trainer:
-        raise ValueError("a saved run's trainer records attention_form beside precision, which holds it now")
-    held = {name: value for name, value in trainer.items() if name != "attention_form"}
-    policy = {"forms": trainer["attention_form"]}
-    return {**record, "fields": {**fields, "trainer": {**held, "precision": policy}}}
+        raise ValueError(f"a saved run records {sorted(earlier)} beside its trainer's precision, which "
+                         f"holds them now")
+    policy: dict[str, object] = {}
+    if "attention_form" in trainer:
+        policy["forms"] = trainer.pop("attention_form")
+    trainer.pop("dynamic_scale", None)
+    params = next(iter(stated.values()), None)
+    if params is not None:
+        policy["dtypes"] = {"params": params}
+    return {**record, "fields": {**fields, "trainer": {**trainer, "precision": policy}}}
+
 
 
 def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | None:
@@ -1361,7 +1386,7 @@ class RunConfig:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         self.built_fresh()
-        objective = self.objective.build(model=self.model.build())
+        objective = self.objective.build(model=self.model.build(**self.numerics_fields()))
         scored = self.validation_metrics(validates=self.validation is not None)
         return Prepared(self, lambda name: self.train(objective, self.chain(), name=name, metrics=scored,
                                                       validation=self.validation))
@@ -1667,8 +1692,23 @@ class RunConfig:
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
             layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
-            dynamic_scale=trainer.dynamic_scale, rollout=rollout, tune_kernels=trainer.tune_kernels,
-            **resources)
+            dynamic_scale=self.compute_dtype() == "float16", rollout=rollout,
+            tune_kernels=trainer.tune_kernels, **resources)
+
+    def compute_dtype(self) -> str:
+        """The dtype the run's model computes in: the one its record states, else its numerics'
+        (`TrainerConfig.precision`)."""
+        model = getattr(self, "model", None)
+        stated = model.fields.get("dtype") if isinstance(model, ModelConfig) else None
+        return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
+
+    def numerics_fields(self) -> dict[str, str]:
+        """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,
+        where the model takes one and its record states none."""
+        model = getattr(self, "model", None)
+        if not isinstance(model, ModelConfig) or "dtype" in model.fields or not takes_dtype(model):
+            return {}
+        return {"dtype": self.trainer.precision.dtypes.compute}
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
               tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:
