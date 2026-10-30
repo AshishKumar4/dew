@@ -301,30 +301,41 @@ def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound()
     """Two right-padded rows of two packed documents each (segment 0 after them) at the tightest
     bound their coordinates give (`Coordinates.max_segments`, two): each document's output on the
     port (`fla_rule`) on par with the document run alone, a row's first from the row's memory, both
-    measured from the float64 recurrence. A row's padding runs as a sequence of its own, so a bound
-    without it ran the second row's last document on from its first."""
+    measured from the float64 recurrence (check 1). A row's padding runs as a sequence of its own, so a
+    bound without it ran the second row's last document on from its first."""
     from dew.batch import coordinates
 
     segments = jnp.asarray([[1] * 70 + [2] * 50 + [0] * 8, [1] * 50 + [2] * 50 + [0] * 28])
     tokens = coordinates(segments=segments, max_segments=2, right_padded=True)
-    keys = jax.random.split(jax.random.key(31), 5)
-    q, k, v = (0.3 * jax.random.normal(key, (2, 128, 1, 64)) for key in keys[:3])
-    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (2, 128, 1)))
-    beta = jnp.full((2, 128, 1), 0.5)
-    h0 = 0.1 * jax.random.normal(keys[4], (2, 1, 64, 64))
-    packed = jax.jit(lambda *a: fla_rule(*a, starts=tokens.starts, max_segments=tokens.max_segments))
-    out, _ = packed(q, k, v, g, beta, h0)
-    rule = jax.jit(fla_rule)
-    cpu = jax.devices("cpu")[0]
-    for row, cuts in ((0, (0, 70, 120)), (1, (0, 50, 100))):
-        for begin, end in itertools.pairwise(cuts):
-            document = [x[row:row + 1, begin:end] for x in (q, k, v, g, beta)]
-            memory = h0[row:row + 1] if begin == 0 else jnp.zeros_like(h0[row:row + 1])
-            alone, _ = rule(*document, h0[row:row + 1] if begin == 0 else None)
-            with jax.enable_x64(new_val=True), jax.default_device(cpu):
-                truth, _ = recurrence(*(np.asarray(x, np.float64) for x in (*document, memory)))
-            assert_as_exact_as_the_reference(out[row:row + 1, begin:end], alone, truth,
-                                             f"row {row} from {begin}")
+    documents = [(row, begin, end) for row, cuts in ((0, (0, 70, 120)), (1, (0, 50, 100)))
+                 for begin, end in itertools.pairwise(cuts)]
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(31 + seed), 5)
+        q, k, v = (0.3 * jax.random.normal(key, (2, 128, 1, 64)) for key in keys[:3])
+        g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (2, 128, 1)))
+        beta = jnp.full((2, 128, 1), 0.5)
+        return q, k, v, g, beta, 0.1 * jax.random.normal(keys[4], (2, 1, 64, 64))
+
+    def document(operands, row, begin, end):
+        return [x[row:row + 1, begin:end] for x in operands[:5]]
+
+    def packed(*operands):
+        out, _ = fla_rule(*operands, starts=tokens.starts, max_segments=tokens.max_segments)
+        return {f"row {row} from {begin}": out[row:row + 1, begin:end] for row, begin, end in documents}
+
+    def alone(*operands):
+        return {f"row {row} from {begin}": fla_rule(*document(operands, row, begin, end),
+                                                    operands[5][row:row + 1] if begin == 0 else None)[0]
+                for row, begin, end in documents}
+
+    def truth(*operands):
+        return {f"row {row} from {begin}": recurrence(*document(operands, row, begin, end),
+                                                      operands[5][row:row + 1] if begin == 0
+                                                      else jnp.zeros_like(operands[5][row:row + 1]))[0]
+                for row, begin, end in documents}
+
+    assert_as_exact(packed, alone, draw, "packed rows on the port", seeds=8, truth_fn=truth)
 
 
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():

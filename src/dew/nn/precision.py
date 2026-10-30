@@ -125,11 +125,13 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
 def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = True,
                    count: int | None = None) -> tuple[jax.Array, jax.Array]:
     """Mean square and inverse RMS in at least fp32. A padded kernel tile supplies its logical
-    `count` after zeroing padding; an ordinary array uses its reduction dimensions. Callers own
-    when the inverse, normalized values and learned scale round."""
+    `count` after zeroing padding; an ordinary array uses its reduction dimensions. Both means multiply
+    by the reciprocal count, as XLA's mean does. Callers own when the inverse, normalized values and
+    learned scale round."""
     square = jnp.square(x.astype(at_least_fp32(x.dtype)))
     mean = (jnp.mean(square, axis=axis, keepdims=keepdims) if count is None
-            else jnp.sum(square, axis=axis, keepdims=keepdims) / count)
+            else jnp.sum(square, axis=axis, keepdims=keepdims)
+            * jnp.reciprocal(jnp.asarray(count, dtype=square.dtype)))
     return mean, jax.lax.rsqrt(mean + epsilon)
 
 

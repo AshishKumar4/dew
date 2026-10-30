@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import assert_as_exact
 from test_recurrence_chunk import (
     FORMED,
     HOOKS,
@@ -409,59 +409,60 @@ def test_the_solve_holds_a_negative_eigenvalue_rules_inverse():
     negative-eigenvalue delta rule's), declared (`write_bound`): each transition's eigenvalue near -1, the
     chunk's inverse alternating in sign at entries up to two, within fp16's range (`recurrence.Hooks.
     inverse_bound`). The template's 16-bit call on par from float64 with the port's, whose roundings it
-    takes (`recurrence_chunk.fla_rule`), on the draw (the gate's one-draw rule): no transition damps them,
-    and the fp32 portable math stays 14 times nearer."""
+    takes (`recurrence_chunk.fla_rule`), the token recurrence the truth (check 1): no transition damps
+    them, and the fp32 portable math stays 14 times nearer."""
     tokens, width = 64, 64
-    keys = jax.random.split(jax.random.key(53), 4)
-    base = jax.random.normal(keys[0], (1, 1, 1, width))
-    key = base + 1e-3 * jax.random.normal(keys[1], (1, tokens, 1, width))
-    key = (key / jnp.linalg.norm(key, axis=-1, keepdims=True)).astype(jnp.bfloat16)
-    value = jax.random.normal(keys[2], (1, tokens, 1, width)).astype(jnp.bfloat16)
-    beta = (2.0 * jax.nn.sigmoid(6.0 + jax.random.normal(keys[3], (1, tokens, 1)))).astype(jnp.bfloat16)
-    drawn = Chunk(key, key, value, log_decay=jnp.zeros((1, tokens, 1), jnp.float32), beta=beta,
-                  state=jnp.zeros((1, 1, width, width), jnp.float32))
     hooks = recurrence.Hooks(decay='scalar', scale=width ** -0.5, write_bound=2.0)
 
-    def output(rule, operands):
-        found = rule(operands)
-        return np.asarray(found[0] if isinstance(found, tuple) else found, np.float64)
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(53 + seed), 4)
+        base = jax.random.normal(keys[0], (1, 1, 1, width))
+        key = base + 1e-3 * jax.random.normal(keys[1], (1, tokens, 1, width))
+        key = (key / jnp.linalg.norm(key, axis=-1, keepdims=True)).astype(jnp.bfloat16)
+        value = jax.random.normal(keys[2], (1, tokens, 1, width)).astype(jnp.bfloat16)
+        beta = (2.0 * jax.nn.sigmoid(6.0 + jax.random.normal(keys[3], (1, tokens, 1)))).astype(jnp.bfloat16)
+        return key, value, beta
 
-    mine = output(functools.partial(chunk, hooks, mainloop='mosaic'), drawn)
-    theirs = output(functools.partial(chunk_on, 'fla', hooks), drawn)
-    with jax.enable_x64(new_val=True):
-        exact = output(functools.partial(token_by_token, hooks), jax.tree.map(
-            lambda x: np.asarray(x, np.float64), drawn))
-    assert_as_exact_as_the_reference(mine, theirs, exact, "the template's solve under write gates near two")
+    def output(rule):
+        def run(key, value, beta):
+            drawn = Chunk(key, key, value, log_decay=jnp.zeros((1, tokens, 1), key.dtype), beta=beta,
+                          state=jnp.zeros((1, 1, width, width), jnp.promote_types(key.dtype, jnp.float32)))
+            found = rule(drawn)
+            return found[0] if isinstance(found, tuple) else found
+        return run
 
-
-NAMED_SEEDS = 8
-"""A layer named onto the template's declared draws against the portable rule (check 1), sized by
-`seeds_for` paired with the template's launches, interpreted on armada."""
+    assert_as_exact(output(functools.partial(chunk, hooks, mainloop='mosaic')),
+                    output(functools.partial(chunk_on, 'fla', hooks)), draw,
+                    "the template's solve under write gates near two", seeds=SEEDS,
+                    truth_fn=output(functools.partial(token_by_token, hooks)))
 
 
 def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
     """A layer naming the template (`generation.chosen(gated_delta_rule='mosaic_gpu')`): its output on par
-    (check 1) from float64 with the portable rule's, the layer's own float64 forward the truth, over drawn
-    inputs and weights. The layer computes in bf16, the call the template's launches hold on every family
-    (an fp32 call's solve holds more registers than a thread has)."""
+    from float64 with the portable rule's (check 1, the layer's own float64 forward the truth). The layer
+    computes in bf16, the call the template's launches hold on every family (an fp32 call's solve holds
+    more registers than a thread has)."""
     from dew.nn.linear import GatedDeltaNet
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
                           dtype=jnp.bfloat16)
 
     def draw(seed):
-        x = jax.random.normal(jax.random.key(23 + 2 * seed), (1, 72, 64)).astype(jnp.bfloat16)
+        x = jax.random.normal(jax.random.key(23 + seed), (1, 72, 64)).astype(jnp.bfloat16)
         with generation.chosen(gated_delta_rule='xla'):
-            return layer.init(jax.random.key(29 + 2 * seed), x), x
+            return layer.init(jax.random.key(29 + seed), x), x
 
-    def named(rule):
-        def apply(params, x):
-            with generation.chosen(gated_delta_rule=rule):
+    def applied(kernel):
+        def run(params, x):
+            with generation.chosen(gated_delta_rule=kernel):
                 return layer.apply(params, x)
-        return apply
+        return run
 
-    assert_as_exact(named('mosaic_gpu'), named('xla'), draw, 'a layer named onto the template',
-                    seeds=NAMED_SEEDS, truth_fn=layer.clone(dtype=jnp.float64).apply)
+    def truth(params, x):
+        return layer.clone(dtype=jnp.float64).apply(params, x)
+
+    assert_as_exact(applied('mosaic_gpu'), applied('xla'), draw, 'a layer named onto the template',
+                    seeds=SEEDS, truth_fn=truth)
 
 
 def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
