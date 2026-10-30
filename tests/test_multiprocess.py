@@ -72,6 +72,9 @@ CLOCKED = 17
 """The examples a pooled run on the examples clock is bounded to: of ten records, seven read twice, and a
 last global batch of one row, which one share holds and the other does not."""
 
+LOG_WRITER = Path(__file__).with_name("log_writer_worker.py")
+"""The worker of the pool whose tracker fails off the step loop."""
+
 
 def dumped_params(out: Path, suffix: str = ".npz") -> dict:
     """The parameter leaves a worker wrote next to its report, or, at suffix ".update.npz", the
@@ -1608,6 +1611,19 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
             assert "deleted" in report["results"][failure]["error"]
             assert failure in report["closed"]
         assert "gather plan differs between the processes" in report["results"]["mismatched_plan"]["error"]
+
+
+@pytest.mark.distributed
+def test_a_tracker_failing_off_the_step_loop_stops_both_processes_at_one_tick(tmp_path):
+    """Rank 0's tracker fails writing its second log, which its writer does off the step loop (row 2313):
+    both processes end with rank 0's error, the peer through the agreement, having run the same steps,
+    as the loop agrees on each write's outcome at a tick every process reaches alike, never on the
+    writer's threads. Which tick that is depends on when the writer runs, so the steps run are the
+    processes' agreement, not a count."""
+    reports = run_pool("training_log_failure", tmp_path, 2, script=LOG_WRITER)
+    # Rank 0 raises its tracker's own error; its peer, the agreement's report of it.
+    assert [report["error"] for report in reports] == ["ValueError", "PeerFailure"], reports
+    assert reports[0]["steps"] == reports[1]["steps"], reports
 
 
 @pytest.mark.distributed
