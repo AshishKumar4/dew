@@ -8,16 +8,14 @@ import dataclasses
 from pathlib import Path
 
 import jax.numpy as jnp
-import numpy as np
+import test_run_options as run_options
 from test_lm_recipe import SEQ, write_token_files
 from test_run_options import KINDS, decision, lm, read
-from token_support import write_token_corpus
 
-from dew.config import ObjectiveConfig, RunConfig, SourceOptions, TrainerConfig
-from dew.data import Loading, presets
+from dew.config import RunConfig, SourceOptions, TrainerConfig
+from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
-from dew.decision.config import Letters
-from dew.decision.layout import Labels, built_in
+from dew.decision.layout import built_in
 from dew.nn.precision import numerics_of
 from dew.registry import ModelConfig
 from dew.training.budget import Pause
@@ -60,25 +58,15 @@ def segmented(root: Path, drawn: bool) -> RunConfig:
 
 
 def lettered(root: Path, drawn: bool) -> RunConfig:
-    """A decision run of a fresh letter readout (`--head letters`) over a tiny causal source, its rows
-    lettered option lines read at an answer cue."""
-    # The tiny tokenizer spells each letter as one token bare ("{}"), not after a space.
-    return dataclasses.replace(decision(root, drawn), pretrained=QWEN,
-                               head=Letters(labels=Labels(variants=("{}",)), count=4),
-                               source=SourceOptions(text_only=True))
+    """`test_run_options.lettered`'s fresh letter readout, its source by its path in the repo."""
+    return dataclasses.replace(run_options.lettered(root, drawn), pretrained=QWEN)
 
 
 def blockwise(root: Path, drawn: bool) -> RunConfig:
-    """A block-diffusion run over a release whose text decoder its model nests (`DiffusionGemma.text`)."""
-    # Its windows as `test_lm_recipe.gemma_spans` writes them, the tokenizer by its path in the repo.
-    corpus = write_token_corpus(root / "gemma-tokens", np.random.RandomState(160).randint(4, 32, 160),
-                                tokenizer=DIFFUSION_GEMMA, vocab_size=32, eos_id=1)
-    spans = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
-        Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "xla"})
-    return dataclasses.replace(lm(root, drawn), pretrained=DIFFUSION_GEMMA, tokenizer=DIFFUSION_GEMMA,
-                               objective=ObjectiveConfig("block_diffusion", {"prompt_length": 4}),
-                               model=model, data=spans, validation=None, max_new_tokens=0)
+    """`test_run_options.blockwise`'s block-diffusion run over a release whose text decoder its model nests,
+    its release and tokenizer by their path in the repo."""
+    return dataclasses.replace(run_options.blockwise(root, drawn), pretrained=DIFFUSION_GEMMA,
+                               tokenizer=DIFFUSION_GEMMA)
 
 
 def clocked(root: Path, drawn: bool) -> RunConfig:

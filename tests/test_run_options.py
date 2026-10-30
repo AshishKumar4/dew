@@ -31,6 +31,7 @@ import numpy as np
 import pytest
 from objective_data import IMAGES
 from test_lm_recipe import SEQ, write_token_files
+from token_support import write_token_corpus
 
 from dew import registry
 from dew.batch import FROZEN
@@ -43,8 +44,8 @@ from dew.data import TFDS, Files, Loading, images as image_steps, presets
 from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
-from dew.decision.config import DecisionRunConfig
-from dew.decision.layout import QuestionSegment, Reads, built_in
+from dew.decision.config import DecisionRunConfig, Letters
+from dew.decision.layout import Labels, QuestionSegment, Reads, built_in
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.lora import LoRA
@@ -57,6 +58,7 @@ pytestmark = pytest.mark.mesh
 
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
+DIFFUSION_GEMMA = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-sft"
 RATE = 0.0123
 """A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
 
@@ -594,6 +596,29 @@ its own segments (`_budgeted`), here the question layout's own row as segments (
 enough for its conversation's turns; a context's encoder encodes it for context layers, which read a
 row's context."""
 
+def lettered(root: Path, drawn: bool) -> RunConfig:
+    """A decision run of a fresh letter readout (`--head letters`) over a tiny causal source, its rows
+    lettered option lines read at an answer cue, the layout's labels the head's."""
+    # The tiny tokenizer spells each letter as one token bare ("{}"), not after a space.
+    return dataclasses.replace(decision(root, drawn), pretrained=str(QWEN_TINY),
+                               head=Letters(labels=Labels(variants=("{}",)), count=4),
+                               source=SourceOptions(text_only=True))
+
+
+def blockwise(root: Path, drawn: bool) -> RunConfig:
+    """A block-diffusion run over a release whose text decoder its model nests (`DiffusionGemma.text`), its
+    windows token files in the release's own tokenizer."""
+    corpus = write_token_corpus(root / "gemma-tokens", np.random.RandomState(160).randint(4, 32, 160),
+                                tokenizer=str(DIFFUSION_GEMMA), vocab_size=32, eos_id=1)
+    spans = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        Loading(workers=0))
+    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "xla"})
+    return dataclasses.replace(lm(root, drawn), pretrained=str(DIFFUSION_GEMMA),
+                               tokenizer=str(DIFFUSION_GEMMA), model=model, data=spans, validation=None,
+                               objective=ObjectiveConfig("block_diffusion", {"prompt_length": 4}),
+                               max_new_tokens=0)
+
+
 def blocked(root: Path, drawn: bool) -> RunConfig:
     """`decision`'s run as a fresh head over a tiny causal backbone whose full attention reads blocks
     (`--source.attention`), whose rows a split takes, which a release's rows never are."""
@@ -602,10 +627,11 @@ def blocked(root: Path, drawn: bool) -> RunConfig:
 
 
 TASK_RUNS = {"TextSettings": ((prefixed, "lm"),), "MaskedSettings": ((masked, "masked_diffusion"),),
-             "ImageSettings": ((diffusion, "diffusion"),),
-             "DecideSettings": ((decision, "decision"), (blocked, "decision"))}
+             "ImageSettings": ((diffusion, "diffusion"),), "BlockSettings": ((blockwise, "block_diffusion"),),
+             "DecideSettings": ((decision, "decision"), (blocked, "decision"), (lettered, "decision"))}
 """The runs here of an objective that records each saved task's settings, and the objective's name: a
-decision release's, which exports, and a fresh head's over a backbone that reads blocks."""
+decision release's, which exports, a fresh head's over a backbone that reads blocks, and a fresh letter
+readout's, whose labels its layout takes."""
 
 
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:
@@ -618,8 +644,9 @@ def witnessed(settings: type, base=None) -> dict[str, list[object]]:
 
 
 SETTINGS = sorted({cls.settings for cls in (objectives[name] for name in objectives)
-                   if cls.settings is not None and witnessed(cls.settings)},
-                  key=lambda settings: settings.__name__)
+                   if cls.settings is not None}, key=lambda settings: settings.__name__)
+"""Every settings type an objective saves its task with, each one witnessed (`witnessed_on`): one whose
+options a saved value alone declares (a block process's) is collected too, and fails where none is."""
 
 
 def held_by(task, depth: int = 3) -> dict[str, tuple[object, str]]:

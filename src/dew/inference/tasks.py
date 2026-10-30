@@ -688,10 +688,11 @@ class MaskedSettings(TaskSettings):
 
 @dataclass(frozen=True, kw_only=True)
 class BlockSettings(TaskSettings):
-    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process, the
-    pad id and the end-of-sequence ids a response stops at beside the common ones."""
+    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process, the run's
+    over its model's canvas and vocabulary, the pad id and the end-of-sequence ids a response stops at
+    beside the common ones."""
 
-    process: BlockProcess
+    process: BlockProcess = dataclasses.field(metadata={"derived": "model"})
     pad_token_id: int
     eos_token_ids: tuple[int, ...] = ()
 
