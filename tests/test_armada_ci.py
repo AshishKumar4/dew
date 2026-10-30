@@ -1,5 +1,6 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
+import functools
 import itertools
 import json
 import os
@@ -349,28 +350,27 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
                          "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
     # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452);
-    # --evidence prints that tier, each file beside its records' reads.
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
-    capsys.readouterr()
-    assert ci.main() == 0
-    assert capsys.readouterr().out.split() == ["tests/test_marked.py"]
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--evidence"])
-    assert ci.main() == 0
-    assert [line.split("\t")[:2] for line in capsys.readouterr().out.splitlines()] == [
+    # --marked names it for the caller that still passes it (2714); --evidence prints each beside its reads.
+    tier = functools.partial(named_tier, ci, monkeypatch, capsys)
+    assert tier("--shards=2") == tier("--marked") == ["tests/test_marked.py"]
+    assert [line.split("\t")[:2] for line in tier("--evidence", lines=True)] == [
         ["tests/test_marked.py", "1 marked"]]
-    # --marked, which the tier is, names the same files for the caller that still passes it (ledger 2714).
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--marked"])
-    assert ci.main() == 0
-    assert capsys.readouterr().out.split() == ["tests/test_marked.py"]
     # A file gains a GPU test after its record: the checkout's marks choose, not records; a kernel's test is
     # the CPU's, interpreted.
     (tmp_path / "tests/test_plain.py").write_text(
         "import pytest\n@pytest.mark.gpu\ndef test_lowers(): pass\n")
     (tmp_path / "tests/test_new.py").write_text(
         "import pytest\n@pytest.mark.kernel\ndef test_interpreted(): pass\n")
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier"])
+    assert tier() == ["tests/test_marked.py", "tests/test_plain.py"]
+
+
+def named_tier(ci, monkeypatch, capsys, *flags: str, lines: bool = False) -> list:
+    """What `ci.py gpu-tier` with `flags` prints: its files, or its lines where `lines`."""
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *flags])
+    capsys.readouterr()
     assert ci.main() == 0
-    assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
+    out = capsys.readouterr().out
+    return out.splitlines() if lines else out.split()
 
 
 def fetcher(root: Path, *, due: bool = False) -> Path:

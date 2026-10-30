@@ -1745,8 +1745,8 @@ def tier_arguments(choosing: argparse.ArgumentParser) -> None:
                           help="each file of the tier with its marked tests and its records' backend reads")
     choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
     choosing.add_argument("--marked", action="store_true",
-                          help="the gpu-marked files, which the tier is: kept for dew-ops' kernel lab "
-                               "verify, which still passes it (ledger 2714)")
+                          help="the gpu-marked files, which the tier is: kept for dew-ops' GPU verifier "
+                               "(dewops.kernel_lab.verify.tier), which still passes it (ledger 2714)")
 
 
 def main() -> int:
