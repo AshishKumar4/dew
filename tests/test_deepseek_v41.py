@@ -357,7 +357,8 @@ def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     padded = jnp.stack([jnp.pad(context[0], ((0, pad), (0, 0))), jnp.pad(context[1], ((pad, 0), (0, 0)))])
     places = jnp.arange(prompt + pad)
     valid = jnp.stack([places < prompt, places >= pad])
-    _, drafted, _ = plain.apply(loaded.variables, padded, drawn, decode=False, valid=valid, method="draft")
+    _, drafted, _ = plain.apply(loaded.variables, padded, drawn, decode=False,
+                                coordinates=coordinates(valid.shape, valid=valid), method="draft")
     assert distance(drafted, alone) <= 2 * FACTOR * rounding("draft_logits")
 
 
@@ -725,10 +726,11 @@ def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path
     ids = jnp.asarray(reference["input_ids"])
     media = jnp.asarray(reference["token_types"] >= 0)
     language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}
+    laid = coordinates(ids.shape, valid=jnp.ones(ids.shape, bool),
+                       positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape))
     hashed = [np.asarray(loaded.model.language_model.apply(
-        language, ids, jnp.ones(ids.shape, bool), jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape),
-        decode=False, media=mask,
-        method=lambda module, tokens, valid, positions, *, decode, media: module.engram_hashes(
-            tokens, valid, positions, decode=decode, media=media))) for mask in (media, None)]
+        language, ids, laid, decode=False, media=mask,
+        method=lambda module, tokens, laid, *, decode, media: module.engram_hashes(
+            tokens, laid, decode=decode, media=media))) for mask in (media, None)]
     after = int(np.flatnonzero(reference["token_types"][0] >= 0)[-1]) + 1
     assert np.any(hashed[0][:, after] != hashed[1][:, after])

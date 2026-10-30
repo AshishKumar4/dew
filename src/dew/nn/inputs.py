@@ -20,18 +20,20 @@ from dew.batch import (
     COORDINATES_FIELD,
     POSITIONS_FIELD,
     SEGMENTS_FIELD,
+    TOKEN_LAYOUT_FIELDS,
     VALIDITY_FIELD,
     Coordinates,
     coordinates,
     document_firsts,
     document_ranks,
     document_starts,
+    field_coordinates,
+    laid_coordinates,
     padded_rows,
     prefix_max,
     prefix_min,
     prefix_sum,
     real_slots,
-    token_coordinates,
     token_ids,
     token_positions,
     token_validity,
@@ -56,10 +58,10 @@ type Media = np.ndarray | Image | Sequence[Media]
 type InputTree = (ModelInputs | jax.Array | np.ndarray
                   | Sequence[InputTree] | Mapping[str, object] | None)
 
-# A keyword a model call takes past its tokens: a token field or position
-# array, the conditioning mapping (`ModelInputs.kwargs`), a flag, or None for
-# an absent input.
-type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
+# A keyword a model call takes past its tokens: a token field array, the tokens'
+# layout (`Coordinates`), the conditioning mapping (`ModelInputs.kwargs`), a
+# flag, or None for an absent input.
+type ModelKwarg = jax.Array | Mapping[str, jax.Array] | Coordinates | bool | None
 
 # A token field's `[B, W, ...]` response values from its `[B, S, ...]` prompt
 # values, the prompt's `[B, S]` real slots and the width (`ModelInputs.extended`).
@@ -190,6 +192,9 @@ class ModelInputs:
         as a sequence are each read by `token_id`'s law first (`_token_row`), so
         a bool among them is refused rather than promoted into an id.
 
+        Its token layout is one `coordinates` field past here (`laid`): flat `segment_ids`,
+        `attention_mask` and `positions` fields are converted once.
+
         Distributed algorithms call this inside their agreed validation phase.
         It runs no collectives and no model.
         """
@@ -202,7 +207,17 @@ class ModelInputs:
                     if isinstance(value, Sequence) and not isinstance(value, str | bytes) else value)
             prepared = cls(jnp.asarray(host_token_rows(np.asarray(rows))))
         prepared.validate()
-        return prepared
+        return prepared.laid()
+
+    def laid(self) -> ModelInputs:
+        """These inputs with their token layout as one `coordinates` field (`COORDINATES_FIELD`): their
+        `Coordinates` as they are, else built once from their flat `segment_ids`, `attention_mask` and
+        `positions` fields, which it replaces (`field_coordinates`); fields carrying both are refused.
+        Every model method past `__call__` reads a layout only as `Coordinates` (ledger 1122)."""
+        laid = field_coordinates(self.token_fields, self.tokens.shape)
+        rest = {name: value for name, value in self.token_fields.items()
+                if name not in (*TOKEN_LAYOUT_FIELDS, COORDINATES_FIELD)}
+        return replace(self, token_fields=rest if laid is None else {**rest, COORDINATES_FIELD: laid})
 
 
     def validate(self) -> None:
@@ -234,13 +249,8 @@ class ModelInputs:
                     value.firsts.shape[0] != self.tokens.shape[0]):
                 raise ValueError(f"token field {name!r}'s documents' firsts must have batch size "
                                  f"{self.tokens.shape[0]}, got {value.firsts.shape}")
-        # The tokens' layout is their coordinates or their flat fields, one of them (`token_coordinates`).
-        laid = self.token_fields.get(COORDINATES_FIELD)
-        if isinstance(laid, Coordinates):
-            batch, length = self.tokens.shape
-            token_coordinates((batch, length), laid, segments=self.token_fields.get(SEGMENTS_FIELD),
-                              valid=self.token_fields.get(VALIDITY_FIELD),
-                              positions=self.token_fields.get(POSITIONS_FIELD))
+        # The tokens' layout is their coordinates or their flat fields, one of them (`laid_coordinates`).
+        laid_coordinates(self.token_fields)
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")
@@ -288,13 +298,14 @@ class ModelInputs:
         return replace(self, tokens=shift(self.tokens),
                             token_fields={name: shifted(value) for name, value in self.token_fields.items()})
 
-    def kwargs(self) -> dict[str, jax.Array | Mapping[str, jax.Array]]:
-        """Return the keyword arguments for a native model call, without the tokens.
+    def kwargs(self) -> dict[str, jax.Array | Mapping[str, jax.Array] | Coordinates]:
+        """Return the keyword arguments for a model call, without the tokens.
 
-        Each token field is its own keyword, and ``conditioning`` is included
-        only when it is not empty.
+        Each token field is its own keyword, the token layout one `coordinates` keyword (`laid`), and
+        ``conditioning`` is included only when it is not empty.
         """
-        prepared: dict[str, jax.Array | Mapping[str, jax.Array]] = dict(self.token_fields)
+        prepared: dict[str, jax.Array | Mapping[str, jax.Array] | Coordinates] = dict(
+            self.laid().token_fields)
         if self.conditioning:
             prepared["conditioning"] = self.conditioning
         return prepared
@@ -321,7 +332,7 @@ class ModelInputs:
 
         def continued(name: str, value: jax.Array | Coordinates) -> jax.Array | Coordinates:
             if isinstance(value, Coordinates):
-                return _continued_layout(value, valid, width)
+                return _continued_layout(value, valid, width, known)
             return jnp.concatenate([value, known[name](value, valid, width).astype(value.dtype)], axis=1)
 
         return replace(
@@ -743,21 +754,25 @@ def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
     return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
 
 
-def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coordinates:
-    """A request's `Coordinates` continued over its response's `width` slots: each field by its
-    own field's rule (`RESPONSE_FIELDS`), no document starting in the response, and its real
-    tokens no longer all first, since the response follows the prompt's padding."""
-    def continued(field, rule):
+LAID_FIELDS = {"valid": VALIDITY_FIELD, "positions": POSITIONS_FIELD, "segments": SEGMENTS_FIELD}
+"""Each `Coordinates` field a request's flat layout gives, by the flat field that gives it."""
+
+
+def _continued_layout(value: Coordinates, valid: jax.Array, width: int,
+                      rules: Mapping[str, FieldExtension]) -> Coordinates:
+    """A request's `Coordinates` continued over its response's `width` slots: each field by the rule
+    its flat field continues by (`rules`, `LAID_FIELDS`), no document starting in the response, and
+    its real tokens no longer all first, since the response follows the prompt's padding."""
+    def continued(name: str):
+        field = getattr(value, name)
         return None if field is None else jnp.concatenate(
-            [field, rule(field, valid, width).astype(field.dtype)], axis=1)
+            [field, rules[LAID_FIELDS[name]](field, valid, width).astype(field.dtype)], axis=1)
 
     starts = None if value.starts is None else jnp.concatenate(
         [value.starts, jnp.zeros((len(value.starts), width), value.starts.dtype)], axis=1)
     # No document starts in the response: its firsts built again over the longer rows (`document_firsts`).
     firsts = None if starts is None else document_firsts(starts, value.max_segments + 1)
-    return replace(value, valid=continued(value.valid, _response_validity),
-                   positions=continued(value.positions, _response_positions),
-                   segments=continued(value.segments, _response_document), starts=starts, firsts=firsts,
+    return replace(value, **{name: continued(name) for name in LAID_FIELDS}, starts=starts, firsts=firsts,
                    right_padded=False)
 
 

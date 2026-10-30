@@ -180,7 +180,7 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     import jax
     import jax.numpy as jnp
 
-    from dew.batch import COORDINATES_FIELD, coordinates
+    from dew.batch import COORDINATES_FIELD, coordinates, real_slots
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
 
@@ -203,7 +203,7 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
         fields, laid = (step(ModelInputs.from_value(form)) for form in forms)
         expected, actual = (model.apply(params, inputs.tokens, **inputs.kwargs())
                             for inputs in (fields, laid))
-        real = np.asarray(jnp.asarray(fields.token_fields["attention_mask"]))
+        real = np.asarray(real_slots(fields.token_fields, fields.tokens.shape))
         np.testing.assert_array_equal(np.asarray(actual)[real], np.asarray(expected)[real])
 
 

@@ -21,7 +21,7 @@ from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
 from dew import Trainer
-from dew.batch import FROZEN, freeze, select, thaw
+from dew.batch import FROZEN, coordinates, freeze, select, thaw, token_layout
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
@@ -636,8 +636,9 @@ def sown_passes(obj, variables, batch, step):
     model, params = obj.training_model, thaw(variables)
     rngs = model_rngs(step.key, training=step.training)
     cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
-    encoder_kwargs = prepared.kwargs()
-    encoder_kwargs.update(positions=positions, attention_mask=full_valid)
+    _, segments = token_layout(prepared.token_fields)
+    encoder_kwargs = {**prepared.kwargs(), "coordinates": coordinates(
+        tokens.shape[:2], segments=segments, valid=full_valid, positions=positions)}
     encoder_states, encoded = model.apply(
         {**params, "cache": cache}, tokens, **encoder_kwargs, attention_pairwise_mask=encoder_mask,
         attention_key_positions=encoder_keys, method=model.encode, train=step.training, states=True,

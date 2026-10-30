@@ -37,7 +37,7 @@ FIXTURE = Path(__file__).parent / "fixtures/rl/ppo.npz"
 
 class TokenFeatures(nn.Module):
     @nn.compact
-    def hidden_states(self, tokens, train=False, *, segment_ids=None, positions=None):
+    def hidden_states(self, tokens, train=False, *, coordinates=None):
         scale = self.param("scale", nn.initializers.ones, (VOCAB,))
         return jax.nn.one_hot(tokens, VOCAB) * scale
 

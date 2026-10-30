@@ -657,7 +657,8 @@ def test_a_packed_batch_ignores_the_boundary_and_the_padding():
     params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, (doc_a, _) = documents()
 
-    scored_weights = objective.token_scores(params, tokens, segment_ids=segment_ids, positions=positions)[1]
+    laid = coordinates(segments=segment_ids, positions=positions)
+    scored_weights = objective.token_scores(params, tokens, coordinates=laid)[1]
 
     _, weights = (np.asarray(value) for value in counted_losses(objective, params, tokens, segment_ids,
                                                                   positions))
@@ -670,8 +671,8 @@ def test_a_packed_batch_ignores_the_boundary_and_the_padding():
     np.testing.assert_array_equal(np.asarray(scored_weights[0]), weights)
 
     def scored(params, tokens, segment_ids, positions, *_):
-        return weighted_mean(*objective.token_scores(params, tokens, segment_ids=segment_ids,
-                                                     positions=positions)[:2])
+        laid = coordinates(segments=segment_ids, positions=positions)
+        return weighted_mean(*objective.token_scores(params, tokens, coordinates=laid)[:2])
 
     def written(of):
         return lambda params, tokens, segment_ids, positions, *_: weighted_mean(
@@ -692,16 +693,16 @@ def test_a_packed_batch_scores_like_its_documents_alone():
     tokens, segment_ids, positions, (doc_a, doc_b) = documents()
     for document in (doc_a, doc_b):
         alone_tokens, alone_segments, alone_positions = only_document(document)
-        head_weights = objective.token_scores(params, alone_tokens, segment_ids=alone_segments,
-                                              positions=alone_positions)[1]
+        laid = coordinates(segments=alone_segments, positions=alone_positions)
+        head_weights = objective.token_scores(params, alone_tokens, coordinates=laid)[1]
         # Every transition inside the document; its last target is padding.
         assert float(jnp.sum(head_weights)) == len(document) - 1
     _, packed_weights = counted_losses(objective, params, tokens, segment_ids, positions)
     assert float(jnp.sum(packed_weights)) == len(doc_a) + len(doc_b) - 2
 
     def scored(params, tokens, segment_ids, positions, *_):
-        return weighted_mean(*objective.token_scores(params, tokens, segment_ids=segment_ids,
-                                                     positions=positions)[:2])
+        laid = coordinates(segments=segment_ids, positions=positions)
+        return weighted_mean(*objective.token_scores(params, tokens, coordinates=laid)[:2])
 
     def alone(score):
         def mean(params, tokens, segment_ids, positions, *pieces):
@@ -715,7 +716,7 @@ def test_a_packed_batch_scores_like_its_documents_alone():
 
     def chunked(of):
         return alone(lambda params, tokens, segment_ids, positions: of.token_scores(
-            params, tokens, segment_ids=segment_ids, positions=positions)[:2])
+            params, tokens, coordinates=coordinates(segments=segment_ids, positions=positions))[:2])
 
     wide = float64_packed()
     assert_as_exact_over_instances(scored, written(objective), drawn_documents,
@@ -739,8 +740,8 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
 
     def scored(of):
         return lambda params, tokens, segment_ids, positions, *_: weighted_mean(*of.token_scores(
-            params, tokens, train=True, rngs={"dropout": jax.random.key(1)}, segment_ids=segment_ids,
-            positions=positions)[:2])
+            params, tokens, train=True, rngs={"dropout": jax.random.key(1)},
+            coordinates=coordinates(segments=segment_ids, positions=positions))[:2])
 
     assert_as_exact_over_instances(packed, scored(objective), drawn_documents,
                     "a packed batch's loss", seeds=PACKED_SEEDS, truth_fn=scored(float64_packed()))

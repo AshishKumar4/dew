@@ -1312,9 +1312,7 @@ class CausalTransformer(nn.Module):
         """nGPT's fp32 per-token gain on the logits, past the head's product; None without one."""
         return None if self.ngpt is None else gain(self.logit_scale, self.ngpt.logits)
 
-    def mtp_hidden_states(self, hidden, tokens, train: bool = False,
-                          positions=None, segment_ids=None, input_embeddings=None,
-                          attention_mask=None,
+    def mtp_hidden_states(self, hidden, tokens, train: bool = False, input_embeddings=None,
                           image_groups=None, block_groups=None, rotary_positions=None,
                           coordinates: Coordinates | None = None,
                           conditioning: Mapping[str, jax.Array] | None = None):
@@ -1332,8 +1330,6 @@ class CausalTransformer(nn.Module):
         del conditioning
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
-        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
-                                        positions=positions)
         documents, given, given_valid = ((None, None, None) if coordinates is None else
                                          (coordinates.segments, coordinates.positions, coordinates.valid))
         embeds = self._prepared(self.stream_embeddings(tokens), input_embeddings)
@@ -1362,22 +1358,18 @@ class CausalTransformer(nn.Module):
             states.append(hidden)
         return states
 
-    def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
-                   segment_ids=None, input_embeddings=None,
-                   attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
+    def mtp_logits(self, hidden, tokens, train: bool = False, input_embeddings=None,
+                   image_groups=None, block_groups=None, rotary_positions=None,
                    coordinates: Coordinates | None = None,
                    conditioning: Mapping[str, jax.Array] | None = None):
         """Return the shared language head's logits for each prediction depth's hidden states; a
         call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
-        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
-                                        positions=positions)
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates,
             conditioning=conditioning)]
 
-    def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
-                 input_embeddings=None, attention_mask=None, rotary_positions=None,
+    def mtp_step(self, hidden, tokens, *, depth: int = 0, input_embeddings=None, rotary_positions=None,
                  decode: bool = False, prediction_phase: PredictionPhase = "ordinary",
                  coordinates: Coordinates | None = None):
         """Run one unshifted prediction step, optionally appending to the depth's own KV cache.
@@ -1389,7 +1381,7 @@ class CausalTransformer(nn.Module):
         that state in place of the target's. With
         `index_share_for_mtp_iteration`, a cached "extend" step publishes its
         index selections and a "draft" step reuses them, while "ordinary"
-        always recomputes them. Its tokens are laid out by `coordinates` or flat fields (`token_coordinates`).
+        always recomputes them. Its tokens are laid out by their `coordinates`.
         """
         if prediction_phase not in ("ordinary", "extend", "draft"):
             raise ValueError("prediction_phase must be ordinary, extend or draft")
@@ -1399,10 +1391,7 @@ class CausalTransformer(nn.Module):
         state, prediction = self.mtp[depth].states(
             hidden, embeds, decode=decode,
             prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
-            attention_metadata=AttentionMetadata(
-                coordinates=token_coordinates(hidden.shape[:2], coordinates, valid=attention_mask,
-                                              positions=positions),
-                rotary_positions=rotary_positions))
+            attention_metadata=AttentionMetadata(coordinates=coordinates, rotary_positions=rotary_positions))
         return self._logits(state), prediction
 
     def token_embeddings(self, tokens):
@@ -1455,12 +1444,14 @@ class CausalTransformer(nn.Module):
         (`dew.nn.diffusion_gemma.soft_embeddings`)."""
         return (math.sqrt(self.emb_features) if self.embedding_scale else 1.0) * self.embedding_multiplier
 
-    def draft(self, context, tokens, *, decode: bool = True, valid=None, choose=None):
+    def draft(self, context, tokens, *, decode: bool = True, coordinates: Coordinates | None = None,
+              choose=None):
         """Draft a DSpark block after each row's last context position.
 
         `context` `[B, M, targets * D]` comes from `draft_context` (the stream
-        means the target layers sow), `valid` `[B, M]` marks its real
-        positions, and `tokens` `[B]` are the tokens drawn after it. Returns
+        means the target layers sow), its `coordinates` mark its real
+        positions (`valid`, None for every one), and `tokens` `[B]` are the
+        tokens drawn after it. Returns
         `(ids [B, block + 1], logits [B, block, vocab], confidence [B, block])`.
         Tokens are chosen by `choose(index, logits)`, or greedily when `choose`
         is None (`dew.nn.dspark.draft`). For a cached draft, call
@@ -1473,7 +1464,8 @@ class CausalTransformer(nn.Module):
         hc = self.hyper_connections
         assert hc is not None
         return dspark_draft(self.dspark_stages, self.dspark, self.stream_embeddings, self._logits,
-                            hc, context, tokens, decode=decode, valid=valid, choose=choose)
+                            hc, context, tokens, decode=decode,
+                            valid=None if coordinates is None else coordinates.valid, choose=choose)
 
     def reach_drafter(self, tokens, dtype):
         """Create the DSpark drafter's parameters, which no forward pass reaches.
@@ -1560,21 +1552,20 @@ class CausalTransformer(nn.Module):
         return self._logits(hidden)
 
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
-                              positions=None, segment_ids=None,
-                              input_embeddings=None,
-                              attention_mask=None, image_groups=None, block_groups=None,
+                              input_embeddings=None, image_groups=None, block_groups=None,
                               rotary_positions=None, attention_pairwise_mask=None,
                               attention_key_positions=None, attention_key_runs=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
-                              right_padded: bool = False, coordinates: Coordinates | None = None,
+                              coordinates: Coordinates | None = None,
                               conditioning: Mapping[str, jax.Array] | None = None,
                               whole_blocks: bool = False):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
         and the final norm; other depths read the final normalized states.
-        Packed `positions` and `segment_ids` reach the layers as the call's
-        `Coordinates`, the one description of its tokens every layer reads.
+        The tokens' layout is their `coordinates`, the one description of them
+        every layer reads; only `__call__` takes flat layout fields and converts
+        them (`token_coordinates`, ledger 1122).
 
         - `input_embeddings` `[B, S, D]` replace the scaled token embeddings,
           for a caller that fuses in another encoder's output. The token ids
@@ -1599,15 +1590,10 @@ class CausalTransformer(nn.Module):
           selects for them.
         - `admitted` makes a cached call a serving step's mixed call
           (`dew.nn.inputs.Admitted`).
-        - `right_padded` says each row of `attention_mask` holds its real
-          tokens first and its padding after, as a training batch pads them
-          (`dew.nn.inputs.AttentionMetadata.right_padded`). The real tokens'
-          states are the masked call's, the padding's are unspecified, and a
-          causal layer runs as an unpadded call does.
         - `coordinates` are the tokens' documents, validity and positions as
           the batch's builder made them (`dew.batch.coordinates`, with the
-          packer's `max_segments`); where None they are built here from
-          `segment_ids`, `attention_mask`, `positions` and `right_padded`.
+          packer's `max_segments`, and `right_padded` where each row holds its
+          real tokens first); None for one document a row, every token real.
         - `conditioning` carries the sequence the `cross_attention` layers read
           (`dew.nn.inputs.CONTEXT`) and its rows' lengths (`CONTEXT_LENGTHS`).
           A cached call that carries it keeps its keys and values for the
@@ -1615,8 +1601,6 @@ class CausalTransformer(nn.Module):
         - `whole_blocks` states that each of `block_groups`' blocks is its
           document's whole run of real tokens (`AttentionMetadata.whole_blocks`).
         """
-        coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
-                                        valid=attention_mask, positions=positions, right_padded=right_padded)
         attention_metadata = self._attention_metadata(
             tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
             attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
@@ -1713,9 +1697,8 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
                 "call would attend across documents; prefill each document into a row of its own")
-        engram_ids = (None if self.engram is None else self.engram_hashes(
-            tokens, None if coordinates is None else coordinates.valid,
-            None if coordinates is None else coordinates.positions, decode, media_mask))
+        engram_ids = (None if self.engram is None else self.engram_hashes(tokens, coordinates, decode,
+                                                                          media_mask))
         if context is not None and context.segments is not None:
             # A context of several documents is read by the call's tokens of each document alone.
             if coordinates is None or coordinates.segments is None:

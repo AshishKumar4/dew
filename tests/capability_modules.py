@@ -49,9 +49,9 @@ class TokenModel(nn.Module):
         self.widen = nn.Dense(2 * self.features)
         self.out = nn.Dense(self.vocab_size)
 
-    def hidden_states(self, tokens, *, train=False, segment_ids=None, positions=None, **fields):
-        if segment_ids is not None or positions is not None:
-            raise Lacks("packing", "this model reads one document a row; it takes no packed segment_ids "
+    def hidden_states(self, tokens, *, train=False, coordinates=None, **fields):
+        if coordinates is not None and (coordinates.segments, coordinates.positions) != (None, None):
+            raise Lacks("packing", "this model reads one document a row; it takes no packed documents "
                                    "or positions")
         x = self.embed(tokens)
         mask = nn.make_causal_mask(tokens) if self.causal else None
@@ -139,9 +139,9 @@ class NNXLanguageModel(nnx.Module):
         self.mix = nnx.Linear(features, features, rngs=rngs)
         self.head = nnx.Linear(features, vocab_size, rngs=rngs)
 
-    def hidden_states(self, tokens, *, train=False, segment_ids=None, positions=None, **fields):
-        if segment_ids is not None or positions is not None:
-            raise Lacks("packing", "this model reads one document a row; it takes no packed segment_ids "
+    def hidden_states(self, tokens, *, train=False, coordinates=None, **fields):
+        if coordinates is not None and (coordinates.segments, coordinates.positions) != (None, None):
+            raise Lacks("packing", "this model reads one document a row; it takes no packed documents "
                                    "or positions")
         x = jax.nn.gelu(self.mix(self.embed(tokens)))
         return jnp.cumsum(x, axis=1) / jnp.arange(1, tokens.shape[1] + 1)[None, :, None]

@@ -47,6 +47,7 @@ from flax import linen as nn, struct
 from flax.typing import PrecisionLike, VariableDict
 from jax.typing import DTypeLike
 
+from dew.batch import Coordinates
 from dew.nn.inputs import ModelKwarg
 from dew.nn.precision import capped_logits, head_product, scaled_logits
 
@@ -1048,10 +1049,11 @@ class BlockDenoiser(Protocol):
     canvas_length, vocab_size]` logits, self-conditioned on the previous step's
     (`self_conditioning_logits`, a zero signal in rows whose
     `self_conditioning_mask` is false); `max_seq_len` bounds the prompt and
-    its canvases. A canvas is refined and committed at the logical `positions`
-    that continue its prompt's, None where the prompt gives none and the
-    cache's cursor places it. A causal language model scores tokens too, but
-    runs none of these, so it is not one."""
+    its canvases. A canvas is refined at the logical `positions` that continue
+    its prompt's, None where the prompt gives none and the cache's cursor
+    places it, and committed at them laid out as its `coordinates`, the one
+    layout a method past `__call__` reads (ledger 1122). A causal language
+    model scores tokens too, but runs none of these, so it is not one."""
 
     @property
     def canvas_length(self) -> int: ...
@@ -1064,7 +1066,7 @@ class BlockDenoiser(Protocol):
 
     def init_cache(self, batch_size: int) -> None: ...
 
-    def encode(self, tokens: jax.Array, *, positions: jax.Array | None = None) -> jax.Array: ...
+    def encode(self, tokens: jax.Array, *, coordinates: Coordinates | None = None) -> jax.Array: ...
 
     def __call__(self, tokens: jax.Array, *, self_conditioning_logits: jax.Array | None = None,
                  self_conditioning_mask: jax.Array | None = None,

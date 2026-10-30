@@ -35,16 +35,16 @@ from dew._distributions import counted, draw, row_draw, wellformed
 from dew._records import finite
 from dew.batch import (
     COORDINATES_FIELD,
-    POSITIONS_FIELD,
+    TOKEN_LAYOUT_FIELDS,
     Coordinates,
     Variables,
     coordinates,
+    laid_coordinates,
     real_slots,
     token_id,
     token_ids,
     token_layout,
     token_positions,
-    with_validity,
 )
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
@@ -542,7 +542,7 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
     if unruled:
         raise ValueError(f"masked generation cannot extend token fields {unruled}: a response has no "
                          f"rule for their slots (dew.nn.inputs.RESPONSE_FIELDS)")
-    positions = inputs.token_fields.get(POSITIONS_FIELD)
+    positions = token_positions(inputs.token_fields)
     if positions is not None and positions.ndim != 2:
         raise ValueError("positions must be [B, S] logical token positions")
 
@@ -557,19 +557,21 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
     positions are the ones the model reads (`Coordinates.places`): the given
     ones, else each real token's place in its packed document, else its rank
     among its row's real tokens, read from the request's `Coordinates` where
-    it carries them (`token_positions`, `token_layout`) and written back
-    there, else from and to its fields.
+    it carries them or from its fields (`token_positions`, `token_layout`),
+    and written as its layout's `Coordinates` (`ModelInputs.laid`).
     """
     batch, prompt = inputs.tokens.shape
     fields = inputs.token_fields
     valid = real_slots(fields, (batch, prompt))
     _, segments = token_layout(fields)
+    given = laid_coordinates(fields)
     positions = coordinates((batch, prompt), segments=segments, valid=valid,
                             positions=token_positions(fields)).places()
-    laid = fields.get(COORDINATES_FIELD)
-    placed = ({**fields, COORDINATES_FIELD: replace(laid, positions=positions)}
-              if isinstance(laid, Coordinates) else {**fields, POSITIONS_FIELD: positions})
-    extended = replace(inputs, token_fields=with_validity(placed, valid)).extended(
+    laid = coordinates((batch, prompt), segments=segments, valid=valid, positions=positions,
+                       max_segments=None if given is None else given.max_segments)
+    rest = {name: value for name, value in fields.items()
+            if name not in (*TOKEN_LAYOUT_FIELDS, COORDINATES_FIELD)}
+    extended = replace(inputs, token_fields={**rest, COORDINATES_FIELD: laid}).extended(
         jnp.full((batch, width), mask_id, jnp.int32))
     response = jnp.arange(prompt + width) >= prompt
     return extended, real_slots(extended.token_fields, extended.tokens.shape) & response

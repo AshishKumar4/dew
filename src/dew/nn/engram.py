@@ -35,7 +35,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.batch import prefix_sum, real_places, valid_order
+from dew.batch import Coordinates, prefix_sum, real_places, valid_order
 from dew.nn.dense import Dense
 
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
@@ -221,13 +221,15 @@ class EngramHashes(nn.Module):
     vocab_size: int
 
     @nn.compact
-    def __call__(self, tokens, valid, positions, decode: bool, media=None):
+    def __call__(self, tokens, coordinates: Coordinates | None, decode: bool, media=None):
         spec, vocab = self.spec, self.vocab_size
         table = self.variable('constants', 'token_map',
                               lambda: jnp.arange(vocab, dtype=jnp.int32) % spec.compressed_vocab_size).value
         compressed = jnp.take(table, tokens, axis=0)
         if media is not None:
             compressed = jnp.where(media, _DEAD, compressed)
+        # The call's layout (`Coordinates`): its real tokens and their places.
+        valid, positions = (None, None) if coordinates is None else (coordinates.valid, coordinates.positions)
         valid = jnp.ones(tokens.shape, bool) if valid is None else jnp.asarray(valid, bool)
         size = spec.max_ngram_size
         history = held = None

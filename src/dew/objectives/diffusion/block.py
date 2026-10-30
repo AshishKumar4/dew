@@ -24,7 +24,18 @@ from flax import linen as nn, struct
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.artifacts import TokenScores
-from dew.batch import FROZEN, POSITIONS_FIELD, Batch, Variables, real_places, shifted_span, thaw, token_layout
+from dew.batch import (
+    COORDINATES_FIELD,
+    FROZEN,
+    Batch,
+    Variables,
+    coordinates,
+    real_places,
+    shifted_span,
+    thaw,
+    token_layout,
+    token_positions,
+)
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
@@ -438,13 +449,18 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         fields = prepared.token_fields
         positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
             full_valid, selected, self.prompt_length, self.canvas_size,
-            fields.get(POSITIONS_FIELD), fields.get("image_groups"))
+            token_positions(fields), fields.get("image_groups"))
         model = self.training_model
         rngs = model_rngs(step.key, training=train)
         observed = ["qk"] if step.qk_stats else []
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
-        encoder_kwargs = prepared.kwargs()
-        encoder_kwargs.update(positions=positions, attention_mask=full_valid)
+        # The encoder's row laid out once (`Coordinates`): its documents as given, every slot of the full
+        # row real and placed as the cache's geometry places it.
+        _, segments = token_layout(fields)
+        encoder_kwargs = {name: value for name, value in prepared.kwargs().items()
+                          if name != COORDINATES_FIELD}
+        encoder_kwargs[COORDINATES_FIELD] = coordinates(tokens.shape[:2], segments=segments, valid=full_valid,
+                                                        positions=positions)
         encoder_states, mutated = model.apply(
             {**params, "cache": cache}, tokens, **encoder_kwargs,
             attention_pairwise_mask=encoder_mask, attention_key_positions=encoder_keys,

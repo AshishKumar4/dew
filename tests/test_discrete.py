@@ -426,9 +426,10 @@ class FieldReader(nn.Module):
     def __call__(self, tokens, **fields):
         return self.logits(tokens, **fields)
 
-    def logits(self, tokens, *, train=False, positions=None, image_indices=None, conditioning=None,
+    def logits(self, tokens, *, train=False, coordinates=None, image_indices=None, conditioning=None,
                **fields):
-        text = (positions + (conditioning is not None)) % 14
+        # The rows' places, as their layout's coordinates give them (`ModelInputs.kwargs`).
+        text = (coordinates.positions + (conditioning is not None)) % 14
         target = text if image_indices is None else jnp.where(image_indices < 0, text, 14)
         return self.scale * jax.nn.one_hot(target, self.vocab_size)
 
