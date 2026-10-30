@@ -26,7 +26,7 @@ from dew.interop.unread import Stored
 from dew.interop.weights import Tree, check_shapes, native_shape, placed
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
-from dew.nn.precision import accumulated, capped_logits, float32_dot_general, float32_products, products_dtype
+from dew.nn.precision import accumulated, capped_logits, float32_dot_general
 from dew.nn.rope import sinusoid_frequencies, sinusoids
 from dew.registry import from_record
 
@@ -68,6 +68,9 @@ class Gemma3nAudio(TowerBase):
     sscp_conv_kernel_size: tuple[tuple[int, int], tuple[int, int]] = ((3, 3), (3, 3))
     sscp_conv_stride_size: tuple[tuple[int, int], tuple[int, int]] = ((2, 2), (2, 2))
     initializer_range: float = 0.02
+    """The normal std its projections draw from: the published audio configs' `initializer_range`
+    (Gemma 3n's and Gemma 4's, transformers' `Gemma3nAudioConfig`), which their training drew from,
+    in place of Flax's lecun normal."""
 
     def build(self) -> nn.Module:
         return Gemma3nAudioEncoder(self)
@@ -95,6 +98,8 @@ class Gemma4Audio(TowerBase):
     gradient_clipping: float = 1e10
     output_proj_dims: int = 1536
     initializer_range: float = 0.02
+    """The normal std its projections draw from: Gemma 4's published audio config's
+    `initializer_range`, as Gemma 3n's (`Gemma3nAudio.initializer_range`)."""
 
     def build(self) -> nn.Module:
         return Gemma4AudioEncoder(self)
@@ -200,6 +205,7 @@ class AudioSubsampleLayer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     initializer_range: float = 0.02
+    """The normal std its projections draw from, its tower's (`Gemma3nAudio.initializer_range`)."""
 
     @nn.compact
     def __call__(self, x, mask):
@@ -274,8 +280,7 @@ def _relative_logits(query, key, positional, precision: PrecisionLike = None):
     batch, blocks, chunk, heads, dim = query.shape
     context = key.shape[2]
     q = query.transpose(0, 3, 1, 2, 4)
-    products = float32_products(products_dtype(q, key, positional), precision)
-    matmul = functools.partial(accumulated, functools.partial(jnp.matmul, precision=products))
+    matmul = functools.partial(accumulated, functools.partial(jnp.matmul, precision=precision))
     content = matmul(q, key.transpose(0, 3, 1, 4, 2))
     positions = positional.reshape(-1, heads, dim).transpose(1, 2, 0)
     relative = matmul(q.reshape(batch, heads, blocks * chunk, dim), positions)
@@ -309,7 +314,7 @@ def _chunked_attention(query, key, value, positional, valid, chunk: int, left: i
     allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :] & window(distance)
     logits = jnp.where(allowed, logits, fill)
     probabilities = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(value.dtype)
-    out = accumulated(functools.partial(jnp.matmul, precision=float32_products(value.dtype, precision)),
+    out = accumulated(functools.partial(jnp.matmul, precision=precision),
                       probabilities, value.transpose(0, 3, 1, 2, 4))
     return out.transpose(0, 2, 3, 1, 4).reshape(batch, -1, heads * dim)[:, :length]
 
@@ -419,6 +424,7 @@ class AudioLightConv(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     initializer_range: float = 0.02
+    """The normal std its projections draw from, its tower's (`Gemma3nAudio.initializer_range`)."""
 
     @nn.compact
     def __call__(self, x):

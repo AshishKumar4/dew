@@ -93,6 +93,14 @@ def projection_groups(model: nn.Module, variables: Variables) -> tuple[Projectio
     return _projection_groups(model, unfreeze(dict(variables)))
 
 
+def declared_groups(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
+    """The groups `model` reads packed (`Serving`) for a tree of `variables`' structure, its leaves
+    concrete or abstract (`jax.ShapeDtypeStruct`): what a tree of its shape may hold packed, whatever
+    it holds now (`projection_groups` asks which its arrays serve). A model that names none, or is
+    adapted, declares none."""
+    return _declared(model, unfreeze(dict(variables))) if _declares(model) else ()
+
+
 def _declares(model: nn.Module) -> TypeGuard[Serving]:
     """Whether `model` names groups for a tree of its own: it serves them (`Serving`) and no adapter
     wraps it. An adapter's LoRA branches bind the members' own paths, so an adapted model's tree

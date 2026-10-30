@@ -218,8 +218,9 @@ class Decide(SavedRunTask, InItsForm):
     """Answers typed questions about a state, with one forward pass per batch.
 
     `decide(state, questions)` returns one answer per question, with its
-    probabilities over exactly the question's options. `batch` answers many
-    requests together within the `budget`, `tournament` splits a choice too large
+    probabilities over exactly the question's options, and `decide(requests)`
+    each of many requests' answers, scored together within the `budget` in a
+    scoring server's passes (`RowScoring`), `tournament` splits a choice too large
     for one pass into rounds, `calibrated` fits the calibration to held-out
     examples, and `systemone` takes and returns TypeSafe Jev's wire format. The
     logits are divided by `calibration`'s temperatures, and each answer reports
@@ -272,10 +273,17 @@ class Decide(SavedRunTask, InItsForm):
     def _of(cls, bundle: "PretrainedDecision", *, name: str | None, owned: bool) -> Self:
         """`of`, the bundle's weights packed as a task serves them (`_served`): in place where the
         caller gives them up (`owned`), else into a tree of the task's own."""
+        task = cls.released(bundle, name=name)
+        return replace(task, variables=_served(task.model, task.variables, owned=owned))
+
+    @classmethod
+    def released(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
+        """The declared decision task over the bundle's own tree, its projections as the model holds
+        them: what a run trains from a release (`DecisionObjective`), where `of` packs them to serve."""
         model = DecisionModel(bundle.model, bundle.head)
         variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
-        return cls(model, _served(model, variables, owned=owned), bundle.layout, bundle.decision_tokenizer,
-                   bundle.specials, bundle.calibration, name=name or str(bundle.origin or bundle.source),
+        return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
+                   bundle.calibration, name=name or str(bundle.origin or bundle.source),
                    processor=bundle.processor)
 
     @classmethod
@@ -391,10 +399,17 @@ class Decide(SavedRunTask, InItsForm):
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
+        # One task's numerics, which every run trained under (`SavedRun.precision`), carried onto the
+        # average (`SavedRun.formed`).
+        for run in pinned[1:]:
+            if run.precision != pinned[0].precision:
+                raise ValueError(f"the run in {run.directory} trained under other numerics than {runs[0]} "
+                                 f"({run.precision} against {pinned[0].precision}), so their weights are "
+                                 f"not one task's to average")
         average = averaged_pinned(pinned, ema=ema)
         task = cls._recorded(runs[0], recorded[0], average.model.build(), average.variables,
                              Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
-        task = replace(task, variables=_served(task.model, task.variables))
+        task = pinned[0].formed(replace(task, variables=_served(task.model, task.variables)))
         # A pass's question slots are its windows' (`pass_shapes`); the runs' widest options pad its
         # questions.
         widest = max((own.options for own in settings if own.options is not None), default=None)
@@ -492,42 +507,47 @@ class Decide(SavedRunTask, InItsForm):
                                opt_state=optax.EmptyState(), ema=None,
                                key=jax.device_put(jax.random.key(0), replicated), scale=None,
                                window_size=jax.device_put(jnp.asarray(1, jnp.int32), replicated))
-            checkpoints.save(self.weights.step, state, artifact=DecisionObjective(self).inference_record())
+            # The record names the numerics the average answers under (`traced`).
+            with self.traced():
+                record = DecisionObjective(self).inference_record()
+            checkpoints.save(self.weights.step, state, artifact=record)
             checkpoints.wait()
 
     @traced_in_its_form
+    @overload
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
-                 images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
-        """Return one answer per question in `questions`, about `state` and any `images`.
+                 images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]: ...
 
-        Images need a layout with a place for them (`Layout.images`) and the
-        backbone's processor, as a joint-head release brings. `context` is a
-        sequence the decision reads beside the state through the backbone's
-        cross-attention (`Example.context`).
+    @overload
+    def __call__(self, state: Sequence[tuple[JSON, Mapping[str, Question]]], questions: None = None, *,
+                 contexts: Sequence[JSON | None] | None = None) -> list[dict[str, Answer]]: ...
+
+    def __call__(self, state, questions=None, *, images=(), context=None, contexts=None):
+        """Return one answer per question in `questions`, about `state` and any `images`; or, given a
+        sequence of `(state, questions)` requests and no `questions`, each request's answers in order.
+
+        A call's rows are scored together within the budget, shortest first, in the passes a scoring
+        server runs and over its programs (`logits`), one path for a call and a server alike. Images
+        need a layout with a place for them (`Layout.images`) and the backbone's processor, as a
+        joint-head release brings. `context` is a sequence the decision reads beside the state through
+        the backbone's cross-attention (`Example.context`), and `contexts` each request's, in order.
         """
+        if questions is None:
+            return [answers for answers, _ in self._answered(self.rows(state, contexts=contexts),
+                                                             [asked for _, asked in state])]
         if images:
             return self._seen(state, questions, images, context)[0]
-        return self.batch([(state, questions)], contexts=[context])[0][0]
+        return self._answered(self.rows([(state, questions)], contexts=[context]), [questions])[0][0]
 
     def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
              contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
-        """Each request's rows as `batch` scores them: its state and questions laid out, with its
+        """Each request's rows as a call scores them: its state and questions laid out, with its
         context (`contexts`, in order, or None for none) beside them."""
         contexts = [None] * len(requests) if contexts is None else list(contexts)
         if len(contexts) != len(requests):
             raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
         return [self._encoded(state, questions, context=context)
                 for (state, questions), context in zip(requests, contexts, strict=True)]
-
-    def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
-              contexts: Sequence[JSON | None] | None = None) -> list[tuple[dict[str, Answer], Usage]]:
-        """Return each request's answers and usage.
-
-        The rows of every request are scored together within the budget. `contexts`
-        holds each request's context, in order (`__call__`), or None for none.
-        """
-        return self._answered(self.rows(requests, contexts=contexts),
-                              [questions for _, questions in requests])
 
     def _answered(self, encoded: Sequence[Sequence[Encoded]], asked: Sequence[Mapping[str, Question]]
                 ) -> list[tuple[dict[str, Answer], Usage]]:
@@ -543,12 +563,6 @@ class Decide(SavedRunTask, InItsForm):
         answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, own[slot]))
                    for row, own in zip(rows, scores, strict=True) for slot, laid in enumerate(row.questions)}
         return {name: answers[name] for name in questions}, usage_of(rows)
-
-    def fits(self, rows: Sequence[Encoded]) -> bool:
-        """Whether `rows` are one of `logits`' passes: packed first-fit into the windows of a shape
-        (`pass_shapes`), as a run's windows pack them (`packing`)."""
-        plan = self.planned()
-        return all(plan.add(row) for row in rows)
 
     def planned(self) -> "PassPlan":
         """An empty pass, which takes rows one at a time while they fit (`PassPlan`): what a server
@@ -573,7 +587,7 @@ class Decide(SavedRunTask, InItsForm):
     def _shape(self, rows: Sequence[Encoded]) -> PassShape:
         """The shape of the pass over `rows` (`pass_shapes`): of the shortest length whose windows hold
         them all, the fewest such windows declared; else the most windows of the longest length, which
-        `fits` refuses. First-fit opens a window only where those before it have no room, so the
+        a plan refuses (`planned`). First-fit opens a window only where those before it have no room, so the
         windows it uses at a length are the same however many it may: one placement over the most a
         length declares gives the fewest that hold them."""
         plan = self.planned()
@@ -724,25 +738,19 @@ class Decide(SavedRunTask, InItsForm):
     def logits(self, rows: Sequence[Encoded]) -> list[np.ndarray]:
         """Return each row's raw `[Q, K]` logits, one row per question laid out in it, in slot order.
 
-        The rows are scored shortest first, in passes that fit the budget.
+        The rows are scored shortest first, in the passes a server of this task runs and over its
+        programs (`RowScoring`, `dew.inference.scoring.ScoringServer`), one path for a call and a
+        server alike.
         """
+        server = scoring.ScoringServer(RowScoring(replace(self, variables={})), self.variables)
         order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
-        found: dict[int, np.ndarray] = {}
-        start = 0
-        while start < len(order):
-            plan = self.planned()
-            plan.add(rows[order[start]])
-            stop = start + 1
-            while stop < len(order) and plan.add(rows[order[stop]]):
-                stop += 1
-            chosen = order[start:stop]
-            found.update(zip(chosen, self.scored([rows[index] for index in chosen]), strict=True))
-            start = stop
-        return [found[index] for index in range(len(rows))]
+        futures = {index: server.submit(rows[index]) for index in order}
+        server.run()
+        return [futures[index].result() for index in range(len(rows))]
 
     def scored(self, rows: Sequence[Encoded], variables: Variables | None = None) -> list[np.ndarray]:
-        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows, over
-        `variables` (the task's own by default)."""
+        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which a plan takes
+        (`planned`), over `variables` (the task's own by default)."""
         return self._pass(rows, self.variables if variables is None else variables)
 
     def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None,
@@ -763,8 +771,8 @@ class Decide(SavedRunTask, InItsForm):
         windows = first_fit_windows([model_row(row, options, self.context_length) for row in rows], pack)
         if len(windows) > shape.rows:
             raise ValueError(f"{len(rows)} rows pack into {len(windows)} windows of {shape.length} "
-                             f"tokens, more than the {shape.rows} the pass holds; `fits` says which rows "
-                             "a pass holds")
+                             f"tokens, more than the {shape.rows} the pass holds; a plan says which rows "
+                             "a pass holds (`planned`)")
         bounds = self._bounds[shape.length]
         in_context = self.layout.spans_in_context
         # A joint layout's windows hold their real options in as many slots as its bounds allow, as a
@@ -862,8 +870,10 @@ class Decide(SavedRunTask, InItsForm):
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or default_metrics()
-        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
-                                    key=0, metrics=chosen, mesh=self._mesh)
+        # Scored under the numerics the task answers under (`traced`), as its calls are.
+        with self.traced():
+            evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
+                                        key=0, metrics=chosen, mesh=self._mesh)
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
     @property
@@ -978,7 +988,7 @@ class Decide(SavedRunTask, InItsForm):
         `dew.inference.scoring.ScoringServer`): each body admitted on its own, so a refusal is its
         body's alone, and the admitted ones' rows scored together, a pass at a time."""
         # A call's server compiles the passes it runs as it runs them, not every shape up front.
-        server = scoring.ScoringServer(*self.scoring(details=details, strict=strict, whole=whole), rows=64)
+        server = scoring.ScoringServer(*self.scoring(details=details, strict=strict, whole=whole))
         answered: dict[int, dict[str, JSON] | ValueError] = {}
         futures = {}
         for index, request in enumerate(requests):
@@ -1174,17 +1184,54 @@ class _WirePlan:
 
 
 @dataclass(frozen=True)
-class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndarray, dict[str, JSON]]):
+class _DecideScoring[RequestT, PayloadT, AnswerT](
+        scoring.Scoring[RequestT, _Row, PayloadT, np.ndarray, AnswerT]):
+    """A `Decide` task's passes as a scoring task's (`dew.inference.scoring.Scoring`): a pass is one
+    within the task's budget (`Decide.planned`) over text rows, or one over rows of images as long as each
+    other and of alike images (`Images.joined`), which `forward` runs over the weights it is handed;
+    `decide` holds no weights. Every scoring of the task, a call's (`RowScoring`) and a server's of Jev
+    bodies (`WireScoring`), runs these passes over the same compiled programs."""
+
+    decide: Decide
+
+    def planned(self) -> "_WirePlan":
+        return _WirePlan(self.decide)
+
+    def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
+        # The server chose these rows as one pass (`planned`), so they run as one, over the weights it
+        # hands the pass; the task's compiled forwards are kept across passes.
+        if rows[0].media is None:
+            return self.decide.scored([row.encoded for row in rows], variables)
+        return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
+                                      variables)
+
+    def compile(self, variables: Variables) -> tuple[PassShape, ...]:
+        # The text passes' programs (`Decide.pass_shapes`); a pass of images compiles on its first.
+        return self.decide.compile_scoring(variables)
+
+
+@dataclass(frozen=True)
+class RowScoring(_DecideScoring[Encoded, None, np.ndarray]):
+    """A `Decide` task's laid-out text rows as a scoring task (`dew.inference.scoring.Scoring`): each
+    request one row (`Decide._encoded`), answered by its raw `[Q, K]` logits, the passes a server of
+    Jev bodies runs (`Decide.logits`)."""
+
+    def admit(self, request: Encoded) -> scoring.Scored[_Row, None]:
+        return scoring.Scored((_Row(request),), None)
+
+    def answer(self, payload: None, outputs: Sequence[np.ndarray]) -> np.ndarray:
+        return outputs[0]
+
+
+@dataclass(frozen=True)
+class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON]]):
     """A `Decide` task as a scoring task of Jev request bodies (`dew.inference.scoring.Scoring`),
     answering each as `Decide.systemone` does under `details`, `strict` and `whole`.
 
     `admit` parses and lays out a body, refusing what Jev would refuse, a body the layout could
-    answer only by cutting it under `whole` included. A pass is `Decide.logits`' one pass within the
-    task's budget (`Decide.fits`) over text rows, or one over rows of images as long as each other and
-    of alike images (`Images.joined`); `forward` runs it over the weights it is handed, and `answer`
-    reads a body's answers off its rows' logits. `decide` holds no weights (`Decide.scoring`)."""
+    answer only by cutting it under `whole` included; `answer` reads a body's answers off its rows'
+    logits."""
 
-    decide: Decide
     details: bool = False
     strict: bool = False
     whole: bool = False
@@ -1215,21 +1262,6 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
         self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
         return scoring.Scored(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
 
-    def planned(self) -> "_WirePlan":
-        return _WirePlan(self.decide)
-
-    def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
-        # The server chose these rows as one pass (`planned`), so they run as one, over the weights it
-        # hands the pass; the task's compiled forwards are kept across passes.
-        if rows[0].media is None:
-            return self.decide.scored([row.encoded for row in rows], variables)
-        return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
-                                      variables)
-
-    def compile(self, variables: Variables) -> tuple[PassShape, ...]:
-        # The text passes' programs (`Decide.pass_shapes`); a pass of images compiles on its first.
-        return self.decide.compile_scoring(variables)
-
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
         return self.decide._wire_response(payload.questions,
                                           *self.decide._replied(payload.questions, payload.rows, outputs),
@@ -1250,6 +1282,21 @@ def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -
     pack = packed_owned if owned else inference_projections
     return joined({"backbone": pack(model.backbone, part(variables, "backbone")),
                    "head": part(variables, "head")})
+
+
+def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
+    """A task's weights as a run trains them, the model's own tree: the backbone's projections, packed
+    to serve (`_served`), split back (`unpacked`, ledger 2299), so a run trains, and its resume builds,
+    one tree wherever it runs. A trunk held frozen keeps the layout it was stored in, as `_served`
+    leaves it (ledger 2439), and a task that holds no weights (a scoring task's, `Decide.scoring`)
+    has none to split."""
+    from dew.batch import FROZEN, part
+    from dew.inference.projections import unpacked
+
+    backbone = part(variables, "backbone")
+    if "params" not in backbone or FROZEN in backbone:
+        return variables
+    return joined({"backbone": unpacked(model.backbone, backbone), "head": part(variables, "head")})
 
 
 def decoded_images(images: object) -> list[Image.Image]:
