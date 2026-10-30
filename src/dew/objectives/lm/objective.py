@@ -72,6 +72,7 @@ from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows,
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
+from dew.nn.progress import END, Progress, progressed
 from dew.nn.protocols import (
     Bounded,
     CountedLogits,
@@ -453,7 +454,8 @@ _DEFAULT_SAMPLING = Sampling()
 
 class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     """Scores a causal decoder's tokens: the machinery the LM, preference and
-    policy losses share, without a loss of its own.
+    policy losses share, without a loss of its own. Each loss passes `token_scores` the run's progress
+    (`passes_progress`).
 
     It holds the decoder (`model`, a loaded source among them, with
     `variables` and `processor` overriding its own through
@@ -473,6 +475,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
              "token_accuracy": Shown(better="higher", percent=True)}
 
     counts_tokens = True
+    passes_progress = True
 
     loss_role: Role | None = None
     """The role whose targets alone count (`LMObjective`); None counts every target."""
@@ -759,7 +762,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                      depths: bool = False, roles=None, qk_stats: bool = False,
                      indexer: bool = False, layers: Sequence[int] = (),
                      routes: tuple[jax.Array, jax.Array | None] | None = None,
-                     predict: bool | None = None, z_loss: float | None = None, logits: bool = False):
+                     predict: bool | None = None, z_loss: float | None = None, logits: bool = False,
+                     progress: Progress = END):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
@@ -802,6 +806,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         `logits` scores the losses from the whole `[B, seq_len, vocab]`
         logits and returns them (`Scores.logits`), for a caller that reads
         every column, so the head is applied once.
+
+        `progress` is the run's progress a model whose computation changes over
+        a run reads (`dew.nn.progress`), which a training loss passes
+        (`Objective.progress`); the run's end by default.
         """
         prepared = _prepared(tokens, coordinates)
         self._refuse_blocks(prepared, depths)
@@ -819,8 +827,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                        + ([INDEXER_COLLECTION] if indexer else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
-        hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
-                                               {**packing, **replay}, layers)
+        hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened, {**packing, **replay},
+                                               layers, progress)
         sown = gathered.get(ROUTER_COLLECTION, {}) if routing else None
         qk = gathered.get("qk", {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
@@ -917,7 +925,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
                        packing: dict[str, jax.Array | Mapping[str, jax.Array] | Coordinates],
-                       layers: Sequence[int] = ()):
+                       layers: Sequence[int] = (), progress: Progress = END):
         """Run the model over `inputs` and return what a loss scores (`chunked.final_read`).
 
         Beside them come whatever the open `collections` gathered, empty
@@ -927,7 +935,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         opened = [*collections, *self._layer_states().layer_collections] if layers else collections
         capture = self._layer_states().capture_layers if layers else False
         hidden = final_read(self.model, params, inputs, train=train, rngs=rngs, mutable=opened or False,
-                            capture_intermediates=capture, **packing)
+                            capture_intermediates=capture, **packing, **progressed(self.model, progress))
         if not opened:
             return hidden, {}
         return hidden
@@ -1305,7 +1313,8 @@ class LMObjective(TokenScorer):
         collections = [INDEXER_COLLECTION] + (["qk"] if step.qk_stats else [])
         _, gathered = self._hidden_states(
             thaw(params), inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
-            collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs())
+            collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs(),
+            progress=self.progress(step))
         statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
         reported = {"indexer_kl": kl}
         qk = gathered.get("qk", {}) if step.qk_stats else None
@@ -1392,6 +1401,7 @@ class LMObjective(TokenScorer):
         summed = summed and VALID_ROWS not in batch
         scores = self.token_scores(
             params, prepared, train=train, rngs=model_rngs(step.key, training=train),
+            progress=self.progress(step),
             routing=balance is not None,
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
