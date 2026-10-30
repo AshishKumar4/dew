@@ -94,6 +94,16 @@ def pytest_runtest_makereport(item, call):
         # report reads a test's properties from where only one phase fails.
         outcome.get_result().user_properties.append(found)
         item.user_properties.append(found)
+    # A GPU flow's counts (`gpu_flow.REPORTED`), the JUnit property `cells`: a flow none of whose cells ran is
+    # unqualified on the GPU it ran for, never green.
+    flow = sys.modules.get("gpu_flow")
+    if call.when == "call" and flow is not None and flow.REPORTED:
+        counted = ("cells", json.dumps({key: sum(run[key] for run in flow.REPORTED)
+                                        for key in ("passed", "failed", "skipped")}
+                                       | {"device": flow.REPORTED[-1]["device"]}))
+        flow.REPORTED.clear()
+        outcome.get_result().user_properties.append(counted)
+        item.user_properties.append(counted)
     # The gate's sites this test moved onto YNNPACK's fusions (`reference_error.SWITCHED`), the JUnit property
     # `ynn_switched`, so CI counts them where it reads a test's rows.
     if call.when == "call" and gate is not None and gate.SWITCHED:

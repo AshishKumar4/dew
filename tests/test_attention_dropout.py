@@ -473,8 +473,7 @@ def test_a_dropping_call_under_x64_on_fp32_inputs_keeps_fp32_gradients():
         assert bool(jnp.all(jnp.isfinite(array)))
 
 
-@pytest.mark.gpu(reason="runs a dropping route call on a GPU")
-def test_a_dropping_route_call_on_a_gpu_runs_finite():
+def a_dropping_route_call_on_a_gpu_runs_finite():
     """On a GPU, a direct route call that drops runs, finite, on a mainloop that draws it (the frozen Triton
     mainloop's legality rule refuses it, `attention_triton.refused`, ledger row 1521)."""
     from dew.nn.kernels.templates import attention_route

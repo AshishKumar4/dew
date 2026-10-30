@@ -13,11 +13,11 @@ long and fading memories, steep then mild decays), held as test_recurrence_stabi
   16-bit numbers are mamba_ssm's (`mainloop._prepared`), held to recorded mamba_ssm's own distance from
   float64 at the same inputs (test_mamba_ssd).
 
-Natively on a GPU of a family the mainloop claims (`NATIVE`: interpreted, one case's check 1 outran the CPU
-tier's hour); off one, the CPU interprets each form's forward on the regimes that grow its tiles most for
-finiteness, and its fast backward's decay gradient under decays near zero. A form or gradient the template
-refuses (`Mosaic.eligible`, `Mosaic.trains`) is checked refused and skipped, a refusal and not numerical
-coverage (row 1968: the suite held only the portable arms)."""
+Natively on a GPU of a family the mainloop claims, in its GPU flow (tests/test_gpu_recurrence.py: interpreted,
+one case's check 1 outran the CPU tier's hour); off one, the CPU interprets each form's forward on the regimes
+that grow its tiles most for finiteness, and its fast backward's decay gradient under decays near zero. A form
+or gradient the template refuses (`Mosaic.eligible`, `Mosaic.trains`) is checked refused and skipped, a
+refusal and not numerical coverage (row 1968: the suite held only the portable arms)."""
 
 import dataclasses
 import functools
@@ -29,7 +29,7 @@ import pytest
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
-from test_recurrence_mosaic import NATIVE, REFUSED, refuses_its_gradient, taken, template_call
+from test_recurrence_mosaic import REFUSED, refuses_its_gradient, taken, template_call
 from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cotangents, restarting, stressed
 
 from dew.nn.kernels import generation
@@ -41,8 +41,9 @@ pytestmark = pytest.mark.kernel
 HOOKS = SITES['scalar delta']
 """The template's default call: the gated delta rule, a decay a head."""
 
-CASES = [pytest.param(name, regime, product, id=f'{name}-{regime}-{product}', marks=NATIVE)
+CASES = [(name, regime, product)
          for name in SITES for regime in REGIMES for product in ('forward', 'gradient')]
+"""Every form's regimes, forward and gradient: the GPU flow's alone (tests/test_gpu_recurrence.py)."""
 
 INTERPRETED = ('aligned keys', 'decays near zero')
 """The regimes the CPU interprets each form's forward under: where the template's tiles grow most, the
@@ -115,8 +116,7 @@ def runs(fn, hooks, operands: Chunk, drawn, product: str) -> bool:
     return True
 
 
-@pytest.mark.parametrize('name, regime, product', CASES)
-def test_the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product):
+def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product):
     """Each form's 16-bit forward through the template, or its forward and gradient, finite wherever the
     float64 recurrence's are on the regime's first draws, and on par with its reference arm's from float64
     over the site's declared seeds (check 1); a form or gradient it refuses is checked refused and skipped."""

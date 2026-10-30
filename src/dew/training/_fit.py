@@ -11,7 +11,7 @@ import functools
 import math
 import time
 import types
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import grain.python as pygrain
 import jax
@@ -39,7 +39,7 @@ from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, Taken, TokenClock
+from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture
 from dew.training.runtime import PreemptionNotice
@@ -327,6 +327,8 @@ class FitRun:
     notice: PreemptionNotice | None = None
     endless: bool = False
     taken: Taken | None = None
+    writer: LogWriter = dataclasses.field(default_factory=LogWriter)
+    """Where the logs the loop takes are read and reported, off the loop (`Trainer._read_taken`)."""
     scored: frozenset[str] = frozenset()
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
     ahead: tuple[Batch | None] | None = None
@@ -411,6 +413,20 @@ class FitRun:
         """The training stream's placements held for a block of device work beside the steps
         (`DevicePrefetchIterator.held`), none to hold once the stream is closed."""
         return contextlib.nullcontext() if self.train is None else self.train.held()
+
+    def further(self, interval: Interval) -> Callable[[], Batch | None]:
+        """A read of the training stream's next batch for a rollout that draws past its step's
+        (`Rollout.draws_further`): from inside the step's hold on placements (`read_held`), agreed as a
+        step's read is, its wait counted in `interval`; None where the stream ran out on every process.
+        Its position is the stream's after it, which the step saves as any read's."""
+        def read() -> Batch | None:
+            assert self.train is not None
+            asked = time.perf_counter()
+            batch = agreed_next("rollout read", iter(self.train.read_held, None))
+            interval.waited += time.perf_counter() - asked
+            return batch
+
+        return read
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
