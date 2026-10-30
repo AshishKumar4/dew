@@ -146,10 +146,11 @@ class AheadOfTime:
     step traces with these in place of its own (`Trainer`'s `ahead`), which could spread a projection
     the step does not and lower another program, and its checkpoints record their bandwidths
     (`link_figures`)."""
-    target: GpuTarget
+    target: GpuTarget | None = None
     """The facts of the GPU its kernels' launches were derived for (`gpu_target` within `assumed`), which a
     run handed the step reproduces it under (`handed`, `derived_for`): another SKU of the generation, its
-    multiprocessors other, derives other launches, and lowers another program."""
+    multiprocessors other, derives other launches, and lowers another program. None for a step compiled
+    ahead before steps recorded it, which no run reproduces."""
     plan: JSON = None
     """The plan the run's own fit search makes on those
     GPUs (`Trainer.plan`): every program it compiled, each with the footprint derived for it beside
@@ -214,6 +215,9 @@ class AheadOfTime:
         this program (`handed`): the target it was compiled for (`target`), which the device runs where
         it is of its generation and, a GPU, holds at least the shared memory a block of its launches
         takes, both known. Refused for any other, on which the program's launches are not known to run."""
+        if self.target is None:
+            raise ValueError("this step was compiled ahead before steps recorded the GPU their launches were "
+                             "derived for, which a run reproduces it under; compile it ahead again")
         held = tpu(self.target) or (device.shared_limit is not None and self.target.shared_limit is not None
                                     and device.shared_limit >= self.target.shared_limit)
         if device.generation != self.target.generation or not held:

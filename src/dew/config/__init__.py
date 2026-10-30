@@ -1753,7 +1753,7 @@ class RunConfig:
         target = self.trainer.compile_ahead
         assert target is not None
         mesh = self.trainer.mesh.build(target.compile_only())
-        held = os.path.isdir(os.path.join(self.trainer.checkpoint_dir, name))
+        held = epath.Path(self.trainer.checkpoint_dir, name).is_dir()
         trainer = self.built(objective, mesh, rollout,
                              checkpoints=self.trainer.checkpoints(name) if held else None)
         with generation.run_precision(self.trainer.precision):
