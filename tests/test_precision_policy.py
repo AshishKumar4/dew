@@ -531,21 +531,17 @@ def test_a_bf16_head_under_a_runs_highest_precision_leaves_the_bf16_algorithm():
 
 def test_a_bf16_head_under_a_configured_dot_algorithm_keeps_the_bf16_algorithm():
     """A configured dot algorithm preset states how dots that state no precision sum (check 1's arms
-    configure F32_F32_F32), no level a run picks: a bf16 head under it multiplies at the bf16 algorithm,
-    whose sums are fp32 already, as under the default precision (`operand_precision`)."""
-    model = LAYERS["packed"](dtype=jnp.bfloat16)
-    tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
-    variables = model.init(jax.random.key(0), tokens)
+    configure F32_F32_F32), no level a run picks: a bf16 product under it takes the bf16 algorithm, whose
+    sums are fp32 already, as under the default precision; a run's "highest" level leaves it
+    (`operand_precision`, `rounds_to_bf16`)."""
+    from dew.nn.precision import rounds_to_bf16
 
-    def head_algorithms(configured):
-        def traced(variables, tokens):
-            with jax.default_matmul_precision(configured):
-                return model.apply(variables, tokens)
-        return [precision for precision, _, shapes in dot_precisions(traced, variables, tokens)
-                if any(64 in shape for shape in shapes)]
+    def rounds(configured):
+        with jax.default_matmul_precision(configured):
+            return rounds_to_bf16(jnp.bfloat16)
 
-    bf16 = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
-    assert head_algorithms("F32_F32_F32") == head_algorithms(None) and bf16 in head_algorithms(None)
+    assert rounds("F32_F32_F32") == rounds(None)
+    assert not rounds("highest")
 
 
 def test_a_layer_over_bf16_parameters_fed_float32_multiplies_at_jax_s_configured_precision():
