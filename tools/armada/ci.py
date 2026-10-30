@@ -244,7 +244,7 @@ def shared(python: str) -> str:
             digest.update(str(path).encode())
     # The names of every data file under tests/ but its fixtures, and of every package's data: an existence
     # probe a library makes at import, before the recorder starts, is no record's. A fixture is its openers',
-    # listers' and probers' alone, as a run records every probe it makes (followed.py's `PROBES`; Main,
+    # listers' and probers' alone, as a run records every probe it makes (followed.py's `PROBES`;
     # 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures). A build's output and a fetched
     # payload, which a planner's checkout lacks, are not named: they are their build's and their manifest's
     # (`built`, FETCHED, `contents`), whose names are.
@@ -287,7 +287,7 @@ def contents(name: str) -> bytes:
     it is downloaded here or not, so a planner that never fetches it keys it as a task does. An execution
     limit a run read (followed.py's `LIMITS`: "limit:cpu", "limit:memory") is the one binding this process
     (host.py's `limit`): a row green on 4 vCPUs is not reused on 8, nor on a planner, which reads its own (row
-    1998, Main 2026-10-28). A path a run probed (followed.py's `PROBED`: "probe:" and the path) is its kind
+    1998, 2026-10-28). A path a run probed (followed.py's `PROBED`: "probe:" and the path) is its kind
     where it is a directory, whose probe never reads its entries, and as read otherwise."""
     if name.startswith("limit:"):
         return hashlib.sha256(host().limit(name).encode()).digest()
