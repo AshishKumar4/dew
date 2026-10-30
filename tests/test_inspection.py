@@ -1,6 +1,7 @@
 """Live inspection (row 2317): what a run watches is summarized inside its step, from the arrays its commit
 holds, and logged one log late; a run that watches nothing compiles its step unchanged."""
 
+import collections
 import contextlib
 import json
 
@@ -367,22 +368,24 @@ def test_an_offline_view_restored_mid_window_steps_to_its_commit(tmp_path, split
 
 
 TRANSFORMED = ("mean_flow", "ladd", "rcm")
-"""Objectives whose trained forward runs inside a transform (a `jax.jvp`, a `lax.cond`), whose watched
-forward at its inputs XLA computes once with it; Flow-GRPO's, inside its scan, returns its own
+"""Objectives whose trained forward runs inside a transform (a `jax.jvp`, a `lax.cond`) or beside one, which
+returns what the watched modules sow through it; Flow-GRPO's, inside its scan, returns its own
 (`test_flow_grpo`)."""
 
 
 @pytest.mark.parametrize("name", TRANSFORMED)
 def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     """A sampled step of an objective whose trained forward runs inside a transform summarizes that very
-    forward, returned through the transform, and computes the model no more than an unsampled step does:
-    the sampled loss and gradient run the unsampled's matmuls, their work the same (`step_flops`), the
-    summaries elementwise alone (row 2512: one stop-gradient forward more, at its inputs)."""
+    forward, returned through the transform, and traces the model no more than an unsampled step does:
+    as an H100 would run it (`generation.assumed`), the sampled loss and gradient hold the unsampled's
+    products and kernel launches, so no second forward rides on a compiler merging it, which two
+    attention kernels of different forms never are (rows 2512 and 2718)."""
     from objective_cases import cases
+    from reference_error import equations
 
     from dew.nn.inspection import Watched, watching
+    from dew.nn.kernels import generation
     from dew.objectives.base import Step
-    from dew.telemetry.instrumentation import step_flops
 
     objective, batch = cases(None)[name]()
     variables = objective.init(jax.random.key(0))
@@ -391,7 +394,7 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     held = {key: value for key, value in batch.items() if key not in numeric}
     kinds = ("*Block*", "*Attention*", "*Mlp*", "*MLP*")
 
-    def work(*, watched: bool) -> tuple[float, object]:
+    def work(*, watched: bool) -> tuple[collections.Counter, object]:
         # The step's count is an argument, so a branch on it (rCM's phases) stays a branch.
         def loss(params, numeric, count):
             step = Step(step=count, key=jax.random.key(1), ema=None,
@@ -401,10 +404,12 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
             return objective.reduce_loss(stats)[0], aux.inspected
         stepped = jax.value_and_grad(loss, has_aux=True)
         count = jnp.zeros((), jnp.int32)
-        flops = step_flops(jax.jit(stepped).lower(variables["params"], numeric, count).compile())
-        assert flops is not None
-        return flops.hardware, jax.eval_shape(stepped, variables["params"], numeric, count)[0][1]
+        with generation.assumed("sm90"):
+            graph, shapes = jax.make_jaxpr(stepped, return_shape=True)(variables["params"], numeric, count)
+        names = (equation.primitive.name for equation in equations(graph, platform="cuda"))
+        launched = collections.Counter(name for name in names if name in ("dot_general", "pallas_call"))
+        return launched, shapes[0][1]
 
     plain, _ = work(watched=False)
     sampled, inspected = work(watched=True)
-    assert inspected and sampled == plain
+    assert inspected and plain["dot_general"] and sampled == plain
