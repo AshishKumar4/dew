@@ -210,8 +210,8 @@ def earlier_segments(segments: Sequence[JSON]) -> list[JSON]:
     def current(segment: JSON) -> JSON:
         if not isinstance(segment, dict) or not isinstance(segment.get("fields"), dict):
             return segment
-        name = segment.get("class")
-        if not (isinstance(name, str) and name.rsplit(":", 1)[-1].rsplit(".", 1)[-1] == "OptionLines"):
+        # Option lines are recorded by their import path (`dew.registry.to_record`).
+        if segment.get("class") != "dew.decision.layout:OptionLines":
             return segment
         fields = segment["fields"]
         assert isinstance(fields, dict)

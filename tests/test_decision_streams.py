@@ -8,8 +8,10 @@ import json
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import TINY_DECODER
 from test_decision_context import assert_packed_as_alone, windows_of
 from test_decision_letters_context import LABELS, QUESTIONS as LETTERED_QUESTIONS, STATES
 
@@ -34,6 +36,9 @@ from dew.decision.objective import DecisionObjective
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.attention_masks import visibility_mask
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.dex import DifferentialExtension
+from dew.nn.progress import END, Progress
 from dew.registry import from_record, to_record
 
 pytestmark = pytest.mark.mesh
@@ -242,3 +247,23 @@ def test_a_row_of_one_stream_reads_as_its_reads_say():
     [row] = layout.rows(TOKENIZER, SPECIALS, example.state, example.questions)
     assert row.streams == (0,) * len(row.tokens)
     assert layout.attention == (((1, 0),), 1)
+
+
+def test_a_row_in_streams_reads_its_backbone_at_the_runs_progress():
+    """A row in streams reads its backbone at the run's progress, as every row does (`progressed`): over
+    a backbone whose layers anneal with it (DEX on every layer), the same rows' option logits mid-anneal
+    differ from the run's end's, which a streams row read at the end alone would leave the same."""
+    annealed = DifferentialExtension(((0, (0, 1)), (1, (1, 3))), anneal_steps=10)
+    backbone = CausalTransformer(**{**TINY_DECODER, "vocab_size": 256, "max_seq_len": 256, "num_layers": 2,
+                                    "dtype": jnp.float32, "attention_impl": "reference", "dex": annealed})
+    width, dtype = DecisionModel.head_size(backbone)
+    objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LETTERED,
+                                  head=LabelReadout(features=width, label_ids=(), dtype=dtype, count=4))
+    variables = objective.init(jax.random.key(0))
+    example = examples(LETTERED)[0]
+    rows = LETTERED.rows(TOKENIZER, SPECIALS, example.state, example.questions)
+    inputs = DecisionInputs.collate(rows, SPECIALS.pad, attention=LETTERED.attention)
+    assert inputs.streams is not None
+    middle = objective.model.logits(variables, inputs, progress=Progress(jnp.asarray(5, jnp.int32)))
+    end = objective.model.logits(variables, inputs, progress=END)
+    assert not np.array_equal(np.asarray(middle), np.asarray(end))

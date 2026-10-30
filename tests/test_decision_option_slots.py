@@ -242,7 +242,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         raise AssertionError(f"no candidate of seed {seed} has its scorer gap above {SCORER_MARGIN}")
 
     on_grid = scored(objective, grid)
-    # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
+    # A leaf zero by algebra cancels in its sum, which the check sizes by the terms it adds (`terms`).
     assert_as_exact(scored(objective, compact), on_grid, draw, "compacted options logits and gradients",
                     seeds=OPTION_SEEDS, truth_fn=on_grid, terms=True)
 
