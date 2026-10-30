@@ -11,11 +11,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   2.8 times slower for the pin. A router's logits, a vocabulary head's (the loss's) and a recurrence's
   state products keep IEEE float32 where nothing states a precision, each for its stated reason.
 - One typed record of a run's numerics, `trainer.precision` (`dew.nn.precision.Numerics`), set once
-  and recorded with the run: its dtypes by Lightning's names ("bf16-mixed" by default, "32-true",
-  "bf16-true", "16-mixed"), its matmul precision by JAX's own levels ("default", "high", "highest", or a
-  `jax.lax.DotAlgorithmPreset`), and its ops' forms ("fast" or "accurate"). `ACCURATE` names the
-  scientific one: "32-true", "highest" and the accurate forms. It replaces `trainer.attention_form`; a
-  run saved with that field loads and resumes with it as its forms.
+  and recorded with the run: its dtypes (`Dtypes`: parameters, compute and outputs, Flax's
+  `param_dtype` and `dtype`, the usual ones by Lightning's names in `DTYPE_PRESETS`: "bf16-mixed" by
+  default, "32-true", "bf16-true", "16-mixed", whose float16 compute scales the loss), its matmul
+  precision by JAX's own levels ("default", "high", "highest", or a `jax.lax.DotAlgorithmPreset`), and
+  its ops' forms ("fast" or "accurate"). `ACCURATE` names the scientific one: "32-true", "highest" and
+  the accurate forms. It replaces `trainer.attention_form`; a run saved with that field loads and
+  resumes with it as its forms.
 - DEX (arXiv 2505.16333): a learned differential on chosen heads' attention outputs, `O'_h = O_h -
   lambda(t) O_h W_D,h`, with lambda annealed from zero over the run's first updates
   (`dew.nn.dex.DifferentialExtension`). Attach it with `Pretrained.load(..., dex=...)` or
