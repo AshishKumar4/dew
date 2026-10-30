@@ -211,7 +211,7 @@ def test_a_run_names_its_rows_streams_on_the_command_line_trains_and_serves_them
     rows = Memory([{"example": example} for example in examples(JOINT)[:8]]).read("memory").pipe(
         decisions).batch(8)
     # The backbone's text decoder, which reads a row's key runs.
-    flags = ["--pretrained", str(GEMMA), "--source.text-only", "--segments",
+    flags = ["--pretrained", str(GEMMA), "--source.text-only", "--max-len", str(JOINT.max_len), "--segments",
              json.dumps(to_record(JOINT.segments, tuple[Segment, ...])), "head:joint-shape",
              "--head.width", "16", "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
              "--head.feedforward", "32", "--trainer.name", "streams",
