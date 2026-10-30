@@ -577,14 +577,11 @@ NUMERICS_PRESETS = {"accurate": ACCURATE}
 def exact_float32(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
     """The precision a float32 product whose rounding decides what follows takes, a numerically critical
     one, a vocabulary head's (the loss's logits), a router's or a recurrence's state's, each stating its
-    reason where it calls this: the one the call states, else the one JAX's config states
-    (`jax_default_matmul_precision`, a run's "accurate" policy among them), else IEEE float32
-    (`Precision.HIGHEST`), not JAX's default, which runs TF32 on a GPU and one bf16 pass on a TPU, where
+    reason where it calls this: the one the call states, else IEEE float32 (`Precision.HIGHEST`), stated
+    over JAX's configured precision, whose default runs TF32 on a GPU and one bf16 pass on a TPU, where
     the references multiply IEEE float32 (torch's float32 matmul). Every other product follows JAX's
-    default and the run's precision policy (`dew.nn.kernels.generation.run_precision`)."""
-    if precision is not None or jax.config.jax_default_matmul_precision is not None:
-        return precision
-    return jax.lax.Precision.HIGHEST
+    configured precision and the run's numerics (`dew.nn.kernels.generation.run_precision`)."""
+    return jax.lax.Precision.HIGHEST if precision is None else precision
 
 
 def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:
