@@ -50,6 +50,12 @@ CONTRACTED = {
         "test_the_categorical_losses_hold_every_order",
     "src/dew/nn/categorical.py::_divergence":
         "test_the_categorical_losses_hold_every_order",
+    "src/dew/nn/precision.py::correctly_rounded_divide":
+        "test_the_precision_seams_hold_every_order",
+    "src/dew/nn/precision.py::_compensated_sum":
+        "test_the_precision_seams_hold_every_order",
+    "src/dew/nn/precision.py::rounded_operand":
+        "test_the_precision_seams_hold_every_order",
 }
 """Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
 it."""
@@ -78,9 +84,6 @@ PENDING = frozenset({
     "src/dew/nn/kernels/templates/layout.py::_custom.held",
     "src/dew/nn/kv_cache.py::gpu_paged.linear_tangent",
     "src/dew/nn/moe.py::_stored_primal",
-    "src/dew/nn/precision.py::correctly_rounded_divide",
-    "src/dew/nn/precision.py::_compensated_sum",
-    "src/dew/nn/precision.py::rounded_operand",
     "src/dew/nn/precision.py::at_default_precision.run",
     "src/dew/objectives/base.py::_ruled",
     "src/dew/objectives/lm/chunked.py::_bounded_head",

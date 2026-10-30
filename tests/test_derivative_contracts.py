@@ -386,6 +386,33 @@ def test_the_categorical_losses_hold_every_order(edge):
                         plain_fn=plain)
 
 
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_precision_seams_hold_every_order(edge):
+    """`precision`'s correctly rounded division, compensated sum and rounded operand (each a custom
+    derivative): every order finite wherever float64 is a normal float32 and the plain formula, the
+    division, the sum and the identity as JAX writes them, is."""
+    numerator, denominator = normal_draw(2648, (5, 4), (5, 4), scale=EDGES[edge])
+    numerator_direction, denominator_direction = normal_draw(2649, (5, 4), (5, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(2650, (5, 4))
+    # Denominators away from zero, so the quotient is a normal float32 wherever float64's is.
+    denominator = jnp.where(jnp.abs(denominator) < 0.25 * EDGES[edge], 0.25 * EDGES[edge], denominator)
+    assert_contract(precision.correctly_rounded_divide, (numerator, denominator),
+                    (numerator_direction, denominator_direction), cotangent,
+                    f"a correctly rounded division {edge}", truth_fn=jnp.divide, plain_fn=jnp.divide)
+    (summed,) = normal_draw(2651, (3, 64), scale=EDGES[edge])
+    (summed_direction,) = normal_draw(2652, summed.shape, scale=EDGES[edge])
+    (summed_cotangent,) = normal_draw(2653, (3,))
+
+    def plain_sum(values):
+        return jnp.sum(values, axis=1)
+
+    assert_contract(lambda values: precision.compensated_sum(values, (1,)), (summed,), (summed_direction,),
+                    summed_cotangent, f"a compensated sum {edge}", truth_fn=plain_sum, plain_fn=plain_sum)
+    assert_contract(lambda x: precision.rounded_operand(x, jnp.bfloat16), (numerator,),
+                    (numerator_direction,), cotangent, f"a rounded operand {edge}",
+                    plain_fn=lambda x: x.astype(jnp.bfloat16).astype(x.dtype))
+
+
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
     """The rule's validation: a formula overflowing where the plain one does not (|x| as the root of its
     square, past 2**64) is refused, at its primal and its derivatives; the plain formula against itself
