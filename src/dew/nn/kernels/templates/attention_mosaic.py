@@ -17,6 +17,7 @@ import tokamax
 
 from dew.devices import deterministic_ops_requested
 from dew.nn.kernels import generation
+from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resources
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
@@ -122,7 +123,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return self.declined(ba, target) is None
 
-    def declined(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> str | None:
+    def declined(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Refusal | None:
         """Why the launch runs no call of `ba` on `target`, or None: its family has no bundle here, the call
         is one it does not take (`refusal`, each reason with its ledger row), it is interpreted in a GPU
         process (`grouped_matmul._Mosaic.eligible`: the interpreter's callbacks are ordered effects, which a
@@ -130,13 +131,14 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         name = generation.family(target.generation)
         family = bundle(target.generation, ba.arguments["query"].dtype)
         if family is None:
-            return f"the Mosaic mainloop has no bundle for {name or target.generation} yet"
+            return Refusal('family', f"the Mosaic mainloop has no bundle for {name or target.generation} yet")
         if (reason := self.refusal(ba, family)) is not None:
             return reason
         if ba.arguments["interpret"] and jax.default_backend() != "cpu":
-            return "an interpreted Mosaic launch runs in a CPU process alone"
+            return Refusal('interpret', "an interpreted Mosaic launch runs in a CPU process alone")
         if self.derived(ba, target) is None:
-            return f"no config of the Mosaic mainloop fits {target.generation}'s block and registers"
+            return Refusal('resources',
+                           f"no config of the Mosaic mainloop fits {target.generation}'s block and registers")
         return None
 
     def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
@@ -187,7 +189,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
             raise Unfitted(type(self).__name__, None, generation.shared_budget(target), target.generation)
         return config
 
-    def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
+    def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         """Why the launch takes no call of `ba` on `family`, or None (`refused`)."""
         raise NotImplementedError
 
@@ -273,7 +275,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                   ba.arguments.get("residuals") is True)
 
 
-    def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
+    def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
         hooks = Hooks(self.score_mod, tuple(map(Param, ba.arguments["score_params"], self.score_kinds)),
                       ba.arguments["initial"], self.output_mod,
@@ -330,7 +332,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
 def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                      hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                     residuals: bool | str = False) -> str | None:
+                     residuals: bool | str = False) -> Refusal | None:
     """Why `forward` runs no call of these arrays compiled on this device, or None
     (`MosaicForward.declined`)."""
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
@@ -603,7 +605,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return held and (config.fused or dq <= self.register_budget(config))
 
 
-    def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
+    def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
         hooks = Hooks(self.score_mod, tuple(map(Param, ba.arguments["score_params"], self.score_kinds)),
                       ba.arguments["initial"], drop=ba.arguments["drop"])
@@ -631,7 +633,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 def backward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                       hooks: Hooks | None, dout: jax.Array, *,
                       residuals: tuple[jax.Array, jax.Array, jax.Array, Split], scale: float | None = None,
-                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> str | None:
+                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> Refusal | None:
     """Why `backward` runs no call of these arrays compiled on this device, or None
     (`MosaicBackward.declined`)."""
     op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,

@@ -25,7 +25,6 @@ from .attention_masks import chunk_mask, combined_attention_mask
 from .attention_parallel import query_split, split_with_queries, tensor_shards
 from .documents import with_documents
 from .inputs import sequence_blocks
-from .kernels.selection import forced
 from .kernels.templates import attention as template
 from .sharding import HEADS, KV_HEADS, explicit_spec, manual_map, rows_like, rows_spec, sequence_shards
 from .visibility import same_chunk, visible
@@ -111,10 +110,11 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     whole = functools.partial(
         scaled_dot_product_attention, query, key, value, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
-    resolved = resolve_implementation(
+    route = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
         causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments)
+    resolved = route.ran
     if resolved == 'template':
         # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
         # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with
@@ -130,7 +130,7 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     # packed documents keep cuDNN off it (they reach it only as this mask), so
     # where 'auto' chose either for the window, a masked call still goes to
     # cudnn, unless the caller chose xla (`generation.chosen`).
-    banded = resolved == 'flash' or (resolved == 'xla' and forced('attention') is None)
+    banded = resolved == 'flash' or (resolved == 'xla' and route.forced is None)
     on_cudnn = resolved == 'cudnn' or (implementation == 'auto' and banded
                                        and cudnn_takes_mask(implementation, query, softcap=softcap,
                                                             sinks=sinks is not None))
