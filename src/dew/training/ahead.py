@@ -115,6 +115,32 @@ def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = No
 
 
 @dataclasses.dataclass(frozen=True)
+class AheadProgram:
+    """A program compiled ahead beside a step (`AheadOfTime.sampled`): its executable, serialized, its trees,
+    and the program it was compiled from (`program_of`), which a run that takes it lowers too (`taken`)."""
+
+    program: str
+    executable: bytes
+    trees: tuple
+
+    @staticmethod
+    def of(program: str, compiled: jax.stages.Compiled) -> AheadProgram:
+        """`compiled`, the executable `program` (`program_of`) compiled to, as a program compiled ahead."""
+        executable, in_tree, out_tree = serialize_executable.serialize(compiled)
+        return AheadProgram(program, executable, (in_tree, out_tree))
+
+    def taken(self, lowered: jax.stages.Lowered, devices: list) -> jax.stages.Compiled:
+        """The executable, loaded onto `devices`, for a run whose program lowered as `lowered`: refused
+        where that is another program than this one."""
+        if program_of(lowered) != self.program:
+            raise ValueError("the sampled step compiled ahead is another program than the one this run "
+                             "compiles: compile it ahead from this run's config, with its inspection")
+        in_tree, out_tree = self.trees
+        return serialize_executable.deserialize_and_load(self.executable, in_tree, out_tree,
+                                                         backend=devices[0].client)
+
+
+@dataclasses.dataclass(frozen=True)
 class AheadOfTime:
     """A training step compiled for `devices` devices of `generation` (`compile_ahead`), compile-only
     GPUs of a CUDA generation or a TPU topology's of its chip ('v5e'): the executable,
@@ -160,6 +186,10 @@ class AheadOfTime:
     before its first step on those GPUs."""
     capacity: int | None = None
     """The stated bytes per target GPU, or None where no memory capacity was supplied."""
+    sampled: AheadProgram | None = None
+    """The step that also summarizes what the run inspects (`Candidate.sampled`), compiled beside the step
+    for a run that inspects, which a run handed the step takes in place of compiling it
+    (`dew.training.planning.FitSearch.measured`); None for a run that inspects nothing."""
     refusals: tuple = ()
     """The kernel launch configs its compiles found spilling and refused
     (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
@@ -399,6 +429,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     with assumed(generation), uncached() if on_tpus else contextlib.nullcontext():
         target = gpu_target()
         planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity)
+    # The sampled step as the search compiled it, its program what it lowered then.
+    sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)
@@ -412,4 +444,5 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
-        capacity=capacity, links=dict(trainer.links), target=target, refusals=report.refused_launches())
+        capacity=capacity, links=dict(trainer.links), target=target, refusals=report.refused_launches(),
+        sampled=sampled)

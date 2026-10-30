@@ -22,6 +22,7 @@ too (`ModelConfig.defaults`), so a default changed since leaves the record
 building what it built.
 """
 
+import contextvars
 import copy
 import dataclasses
 import datetime
@@ -88,6 +89,7 @@ from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_s
 from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
+from dew.training.inspection import Inspection
 from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
@@ -398,6 +400,9 @@ class SourceOptions:
     """DEX's differential on chosen heads (`dew.nn.dex`, `Pretrained.load`'s `dex`), its record as
     JSON: `--source.dex '{"layers": [[0, [1, 3]], [5, [0, 2]]], "anneal_steps": 1000}'`, its
     `trains` the paper's recipe unless "all"; None for none."""
+    scan_layers: bool = False
+    """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
+    (`Pretrained.load`'s `scan_layers`): a decode step's program grows with the period, not the depth."""
     param_dtype: str | None = None
     """The dtype the source's parameters are stored in, its checkpoint's own as 'auto'; None stores a
     source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
@@ -415,7 +420,7 @@ class SourceOptions:
         PyTorch pickles alone, whose shapes no header states, is read whole): a check that a base
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
-                "modeling_overrides": self.overrides(), "dex": self.dex}
+                "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -435,6 +440,7 @@ class SourceBuild(TypedDict, total=False):
     prediction_depths: int | None
     modeling_overrides: Mapping[str, object] | None
     dex: DifferentialExtension | None
+    scan_layers: bool
 
 
 class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
@@ -639,6 +645,10 @@ class TrainerConfig:
     program, on a host of the topology it was compiled for; another program, from another config,
     data shape, Dew or a plan recorded for another rung, is refused before the run trains.
     """
+    inspection: Annotated[Inspection, tyro.conf.subcommand("inspect")] | None = None
+    """What the run watches at its sampled steps (`dew.training.inspection.Inspection`): parameter paths by
+    glob, the trees summarized there and every how many steps, `--trainer.inspection.paths '*norm*'
+    --trainer.inspection.every 100`; unset, the step compiles unchanged."""
     links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
         default_factory=dict)
     """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
@@ -849,6 +859,19 @@ def _artifact_name(name: str) -> str:
     entry and a tracker artifact id take neither.
     """
     return re.sub(r"[^\w.-]", "-", name)
+
+
+_VIEWING: contextvars.ContextVar[bool] = contextvars.ContextVar("viewing", default=False)
+"""Set while a run is viewed offline (`RunConfig.inspected`): its `train` views one sampled update and
+ends there, training nothing (`_Viewed`)."""
+
+
+class _Viewed(Exception):
+    """What ends a run's `train` under `RunConfig.inspected`: the view it took (`RunConfig.viewed`)."""
+
+    def __init__(self, scalars: dict[str, float]):
+        super().__init__()
+        self.scalars = scalars
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1136,6 +1159,7 @@ class RunConfig:
     """
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
+                                                   "trainer.inspection": "inspect",
                                                    "trainer.cooldowns": "cooldowns",
                                                    "trainer.compile-ahead": "ahead"}
     """The optional settings `cli` turns on by their own flags, each with the
@@ -1722,8 +1746,8 @@ class RunConfig:
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
-        if trainer.compile_ahead is not None:
-            raise self.compiled_ahead(objective, dataset, steps, rollout, name)
+        if trainer.compile_ahead is not None or _VIEWING.get():
+            raise self.ended(objective, dataset, steps, rollout, name)
         tracker = checkpoints = None
         try:
             wandb_tracker = None
@@ -1809,6 +1833,49 @@ class RunConfig:
         with generation.run_precision(self.trainer.precision):
             return target.compiled(trainer, dataset, steps, self.trainer.examples if steps is None else None)
 
+    def ended[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
+                                steps: int | None, rollout: Rollout | None,
+                                name: str) -> CompiledAhead | _Viewed:
+        """What ends a run before it trains: its first step compiled ahead (`compiled_ahead`), or, viewed
+        offline, its view (`viewed`, `inspected`)."""
+        if self.trainer.compile_ahead is not None:
+            return self.compiled_ahead(objective, dataset, steps, rollout, name)
+        return _Viewed(self.viewed(objective, dataset, steps, rollout, name))
+
+    def viewed[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
+                                 steps: int | None, rollout: Rollout | None, name: str) -> dict[str, float]:
+        """The run's inspection of one sampled update over its training data's first batch
+        (`dew.training.inspected`), its trainer built as `train` builds it, from the checkpoints its
+        directory `name` holds, their latest, else its start, with no tracker: what `inspected` returns."""
+        from dew.training import inspected
+        from dew.training._fit import first_batch
+
+        held = epath.Path(self.trainer.checkpoint_dir, name).is_dir()
+        trainer = self.built(objective, self.trainer.mesh, rollout,
+                             checkpoints=self.trainer.checkpoints(name) if held else None)
+        with generation.run_precision(self.trainer.precision):
+            trainer.reading(dataset, examples=self.trainer.examples if steps is None else None, steps=steps)
+            return inspected(trainer, first_batch(dataset, trainer.device_mesh), steps=steps)
+
+    def inspected(self) -> dict[str, float]:
+        """What the run's inspection (`TrainerConfig.inspection`) logs of one sampled update over its training
+        data's first batch, from its checkpoints' latest, else its start, offline (`viewed`): the view its
+        training logs, for a saved run, which this trains and writes nothing of (`dew inspect`)."""
+        from dew.training import prepare_process
+
+        trainer = self.trainer
+        if trainer.inspection is None:
+            raise ValueError("the run names no inspection to view; name one, as --set trainer.inspection=...")
+        prepare_process(None, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
+        token = _VIEWING.set(True)
+        try:
+            self.prepare().train(trainer.name or "inspected")
+        except _Viewed as view:
+            return view.scalars
+        finally:
+            _VIEWING.reset(token)
+        raise RuntimeError(f"{type(self).__name__} trained without its RunConfig.train, which views the run")
+
     def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
         """The run's optimizer as it trains under `name`: each group it names that claims the modules its
         objective draws fresh beside a loaded base matching those that hold a parameter
@@ -1851,7 +1918,7 @@ class RunConfig:
             layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
             dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
                            else trainer.dynamic_scale), rollout=rollout,
-            tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(),
+            tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(), inspection=trainer.inspection,
             **{"links": trainer.links, **resources})
 
     def compute_dtype(self) -> str:

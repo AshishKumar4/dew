@@ -361,10 +361,11 @@ def _dream_walk(config: Mapping[str, object], generation: Mapping[str, object],
     import hashlib
 
     from dew.diffusion.discrete import Unmask
-    from dew.interop.sources import code_file
+    from dew.interop.sources import code_modules
 
-    # The modeling code imports its sampling from the file beside it (`from .generation_utils import`).
-    sampling = None if code is None else code_file(code, 'generation_utils.py')
+    # The modeling code imports its sampling from the file beside it (`from .generation_utils import`),
+    # which its modules' resolution brings, as `Pretrained.save` writes it.
+    sampling = None if code is None else code_modules(code).get('generation_utils.py')
     if sampling is None:
         return None
     digest = hashlib.sha256(sampling.read_bytes()).hexdigest()

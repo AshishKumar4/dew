@@ -222,10 +222,10 @@ def test_an_edit_reruns_the_files_whose_run_executed_what_it_changed(ci, tmp_pat
 @pytest.mark.parametrize(("seen", "edit"), [
     ("assert m.unused.__doc__ == 'Less one.'", ('"""Less one."""', '"""Less two."""')),
     ("import inspect\n    assert inspect.isgeneratorfunction(m.counted)", ("    yield x", "    return x")),
-    ("assert 1 in m.unused.__code__.co_consts", ("    return x - 1", "    return x - 2")),
+    ("assert 'one' in m.unused.__code__.co_consts", ("    return x, 'one'", "    return x, 'two'")),
     ("namespace = {}\n    exec(m.__spec__.loader.get_source('m'), namespace)\n"
-     "    assert namespace['unused'](2) == 1", ("    return x - 1", "    return x - 2")),
-    ("pass", ("    return x - 1", "    return x - 1\n    break")),
+     "    assert namespace['unused'](2) == (2, 'one')", ("    return x, 'one'", "    return x, 'two'")),
+    ("pass", ("    return x, 'one'", "    return x, 'one'\n    break")),
 ], ids=["a docstring", "a generator's kind", "a function's code", "a module's text it executed itself",
         "a body that no longer compiles"])
 def test_what_a_run_sees_of_code_it_never_entered_is_its_input(ci, tmp_path, monkeypatch, cache_worker,
@@ -233,7 +233,8 @@ def test_what_a_run_sees_of_code_it_never_entered_is_its_input(ci, tmp_path, mon
     """What a run sees of a function it never entered is its input as the code it ran is: the function
     value's docstring and kind (a generator's), its code object (`__code__`), the module's text it compiled
     itself, and whether the module still compiles, which a body left out would hide."""
-    module = ('import sys\n\n\ndef unused(x):\n    """Less one."""\n    return x - 1\n\n\n'
+    # The body's constant a string, which every Python keeps in co_consts (3.14 loads a small int inline).
+    module = ('import sys\n\n\ndef unused(x):\n    """Less one."""\n    return x, \'one\'\n\n\n'
               'def counted(x):\n    yield x\n')
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "test_seen.py": ON_SRC + f"import m\ndef test_seen():\n    {seen}\n"}, {"m.py": module})

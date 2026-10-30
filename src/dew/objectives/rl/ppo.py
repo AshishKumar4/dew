@@ -270,7 +270,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
         if critic_qk is not None:
             qk = {**(qk or {}), "critic": critic_qk}
-        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects)
+        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects,
+                                              inspected=aux.inspected)
 
     def reduce_loss(self, stats: PPOStatistics | Ratio) -> tuple[jax.Array, jax.Array]:
         """Combine the independently normalized actor and weighted critic losses, or the validation NLL."""

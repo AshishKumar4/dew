@@ -12,8 +12,6 @@ These families were asked for and are not in the tables above. Each one is track
 
 | Family | What is missing |
 |---|---|
-| Qwen4-Exp (Qwen3.8-Flash-Next) | Its QSA attention, n-gram PLE, and a reader for its config and weights. The gated delta net it uses is in Dew. |
-| MiniMax Text-01 and M1 | The lightning-attention layers and a reader. MiniMax M2 loads. |
 | MiniMax M3 | The shared expert, MTP and vision-language half, and a reader. |
 | LLaDA MoE (GSAI LLaDA-MoE-v2-30B-A3B, inclusionAI LLaDA-MoE-7B-A1B) and LLaDA 2.x | The expert layers and routers in the LLaDA reader, which reads the dense 8B model. |
 | Apple DiffuCoder | A pinned load compared with the released model. The Dream reader targets Dream-v0. |

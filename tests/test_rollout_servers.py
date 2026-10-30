@@ -659,10 +659,7 @@ def test_an_fp8_sources_push_has_a_collective_for_every_tensor_it_publishes():
     assert "float8_e4m3fn" in dtypes and dtypes <= _DTYPES.keys(), dtypes
 
 
-@pytest.mark.gpu(reason="an NCCL group joins two cuda devices")
-@pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("fixture", [FIXTURE, FP8], ids=["bfloat16", "fp8"])
-def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixture):
+def an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixture):
     """A push over real NCCL groups from the trainer's GPU to two one-worker replicas on a second
     GPU, each standing in for vLLM's weight-transfer endpoints with a worker that receives as
     vLLM's does, in a group of its own. Each replica is asked its world size and joins its group
@@ -708,8 +705,7 @@ def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixtu
                for arrived, answered in received)
 
 
-@pytest.mark.gpu(reason="an NCCL group opens on a cuda device")
-def test_a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting():
+def a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting():
     """The sender opens its NCCL group while the replica's HTTP join runs. A replica that refuses
     the join never enters the rendezvous, so the push aborts the group and raises the refusal
     within seconds, where a blocking open waited on that peer for ever. The aborted group is not

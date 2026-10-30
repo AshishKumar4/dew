@@ -12,9 +12,10 @@ draws one a masked position, reads them at the masked positions in order), which
 walk too. The mask token's logit is held out (the loop's own `generation_logits_hook_func`), as Dew's
 walk never draws the mask token. Writes tests/fixtures/hf/dream-tiny/origin.json.
 
-`--vendor` pins each release's `generation_utils.py` with its license (`fetched_fixtures.pin_release`),
-which the test reads offline: Dream-v0's (apache-2.0) into the fetched store, DiffuCoder's (apple-amlr,
-which is not re-hosted) at its own repo's commit (`AT_ORIGIN`).
+`--vendor` pins each release's own code, `generation_utils.py` and the modules its config names that
+import it (`CODE`), with its license (`fetched_fixtures.pin_release`), which the test reads offline:
+Dream-v0's sampling (apache-2.0) into the fetched store (`STORED`), every other file at its own repo's
+commit, DiffuCoder's (apple-amlr) because it is not re-hosted (`AT_ORIGIN`).
 
   PYTHONPATH=src:tools python tools/dream_walk_reference.py [--vendor]
 """
@@ -31,20 +32,23 @@ import torch
 from huggingface_hub import hf_hub_download
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-from dream_walk_support import NEW_TOKENS, PROMPTS, RELEASES, STEPS, uniforms
+from dream_walk_support import CODE, NEW_TOKENS, PROMPTS, RELEASES, STEPS, uniforms
 
 ROOT = Path(__file__).resolve().parents[1]
 
 FIXTURES = ROOT / "tests" / "fixtures" / "hf"
 AT_ORIGIN = {"diffucoder"}
-"""The releases whose sampling code is pinned at their own repo rather than re-hosted in the store
+"""The releases whose code is pinned at their own repo rather than re-hosted in the store
 (`pin_release(origin=True)`): DiffuCoder's, under the Apple Machine Learning Research License."""
+STORED = ("generation_utils.py",)
+"""The files the store re-hosts for a release outside `AT_ORIGIN`: the sampling its walk is recorded
+under. Its model's modules are pinned at its own repo's commit."""
 
 
-def sampling_code(release: str) -> Path:
-    """`release`'s own `generation_utils.py` at its pinned commit."""
+def release_code(release: str, file: str = "generation_utils.py") -> Path:
+    """`release`'s own `file` at its pinned commit."""
     _, repo, revision, _ = RELEASES[release]
-    return Path(hf_hub_download(repo, "generation_utils.py", revision=revision))
+    return Path(hf_hub_download(repo, file, revision=revision))
 
 
 class _Released:
@@ -68,7 +72,7 @@ def walked(release: str) -> list[list[int]]:
     """Each prompt's response, as `release`'s own `_sample` walks it over Dew's logits of dream-tiny."""
     from dew.interop import Pretrained
 
-    spec = importlib.util.spec_from_file_location(f"{release}_generation_utils", sampling_code(release))
+    spec = importlib.util.spec_from_file_location(f"{release}_generation_utils", release_code(release))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     source = Pretrained.load(FIXTURES / "dream-tiny", dtype="float32", attention_impl="reference")
@@ -101,14 +105,14 @@ def walked(release: str) -> list[list[int]]:
 
 
 def vendor() -> None:
-    """Each release's `generation_utils.py`, pinned into the fetched store with its license."""
+    """Each release's own code (`CODE`), pinned with its license."""
     from fetched_fixtures import pin_release
 
     for release, (fixture, repo, revision, license) in RELEASES.items():
-        print(pin_release(FIXTURES / fixture / "release" / "generation_utils.py",
-                          sampling_code(release).read_bytes(),
-                          reference=f"{repo}@{revision}/generation_utils.py", license=license,
-                          origin=release in AT_ORIGIN), flush=True)
+        for file in CODE:
+            print(pin_release(FIXTURES / fixture / "release" / file, release_code(release, file).read_bytes(),
+                              reference=f"{repo}@{revision}/{file}", license=license,
+                              origin=release in AT_ORIGIN or file not in STORED), flush=True)
 
 
 if __name__ == "__main__":
