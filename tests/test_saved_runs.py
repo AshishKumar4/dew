@@ -124,8 +124,9 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     a decision backbone, in float32 unless its model names a dtype; train 328's review of ledger 2500):
     the fit starts at that step, from that checkpoint, and trains the one step past it. Where its main
     recorded what it serialized (`evidence`), the resumed run holds its parameters in the dtypes it
-    stored them in, scales its loss as it did, counts on from the examples it consumed, and compiles its
-    step at the rung it was admitted at."""
+    stored them in, scales its loss as it did, counts on from the examples it consumed (a run on the
+    examples clock restores them at its bound, which its data's order names), and compiles its step at
+    the rung it was admitted at."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
     seen = evidence(recorded, kind)
@@ -137,11 +138,12 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     # A source the repo holds is recorded by its path in the repo (a decision run's backbone), read from
     # the checkout's root as the run that wrote it read it.
     monkeypatch.chdir(Path(__file__).resolve().parents[1])
-    # A run on the examples clock runs on to one example more than it consumed.
-    clock = ({"steps": last + 1} if seen is None or not recorded_run.trainer.examples
-             else {"steps": None, "examples": seen["consumed"] + 1})
-    trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), **clock,
-                                  resume="require", compilation_cache_dir=None, multi_host=False)
+    # A run on the examples clock, which names its bound among its data's order, resumes at that bound:
+    # its progress the examples it consumed, which it restores, and no step more to take.
+    clocked = seen is not None and recorded_run.trainer.examples is not None
+    trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"),
+                                  **({} if clocked else {"steps": last + 1}), resume="require",
+                                  compilation_cache_dir=None, multi_host=False)
     sources = {"data": here.data, "validation": here.validation}
     state = dataclasses.replace(recorded_run, trainer=trainer, **sources).prepare().train(kind)
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
@@ -149,8 +151,7 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
     scalars = (run / "tracking" / "scalars.jsonl").read_text().splitlines()
     stepped = [json.loads(line)["step"] for line in scalars]
-    # A run on the examples clock trains the steps its one example more takes.
-    assert max(stepped) == last + 1 or ("examples" in clock and max(stepped) > last)
+    assert max(stepped) == (last if clocked else last + 1)
     if seen is not None:
         stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
         assert stored == seen["params"]
@@ -158,7 +159,7 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         # The examples it consumed count on from the recorded ones, not from none.
         consumed = None if state.consumed is None else int(state.consumed)
         assert (consumed is None) == (seen["consumed"] is None)
-        assert consumed is None or consumed > seen["consumed"]
+        assert consumed is None or (consumed == seen["consumed"] if clocked else consumed > seen["consumed"])
         compiled = [row["value"] for row in records if row["type"] == "StepCompiled"][-1]
         assert compiled["remat"] == seen["remat"]
         assert {name: (compiled["plan"] or {}).get(name) for name in seen["plan"]} == seen["plan"]
