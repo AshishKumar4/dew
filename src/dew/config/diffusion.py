@@ -71,8 +71,10 @@ if TYPE_CHECKING:
 ATTENTION = {"heads": 8}
 
 # The default unet has attention everywhere but the full-resolution stage,
-# where it costs the most. Every other architecture takes its own kwargs as
-# JSON.
+# where it costs the most, and computes in bf16 over float32 parameters: half
+# the activations' memory and the convolutions on the tensor cores, as
+# mixed-precision training keeps it. Every other architecture takes its own
+# kwargs as JSON.
 DEFAULT_MODEL_CONFIG = {
     "attention_configs": [None, ATTENTION, ATTENTION, ATTENTION],
     "precision": "default",

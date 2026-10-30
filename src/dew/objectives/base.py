@@ -557,11 +557,14 @@ class EMASpec:
 
     `decay` is a schedule over steps because some objectives ramp the
     momentum; I-JEPA anneals it from 0.996 to 1.0. The step it reads is the
-    count of completed optimizer updates. `select` picks the tracked leaves
-    and defaults to all of them.
+    count of completed optimizer updates, or where `progressed` the run's
+    progress, the share of its examples bound consumed before the update, in
+    a run bounded in examples that no plan counts ahead (`TrainState.consumed`).
+    `select` picks the tracked leaves and defaults to all of them.
     """
     decay: optax.Schedule
     select: PathFilter = everything
+    progressed: bool = False
 
     @classmethod
     def constant(cls, decay: float | None) -> EMASpec | None:
@@ -958,6 +961,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         raise NotImplementedError(f"{type(self).__name__} draws no fresh tree: give it variables, "
                                   "or implement fresh_variables")
+
+    def fresh_modules(self) -> tuple[str, ...]:
+        """The modules this objective trains that are drawn fresh beside a loaded base, by their paths
+        under `params` (`backbone/layers_1/cross_attention`, `head`), which a run trains in a fresh group
+        (`dew.optim.OptimConfig.fresh_groups`): none by default, an objective declaring what it draws beside
+        the base it holds and what its source drew (`Pretrained.fresh`). One drawn with no parameter, a
+        tied readout, the group leaves out (`dew.config.trained_modules`)."""
+        return ()
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Return `tree`, held or drawn, with what the objective's own modules
@@ -1412,10 +1423,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the model and task settings that let a saved step be rebuilt.
 
         It records the objective's import path, its `recorded_model`'s record,
-        and `task_settings`, field by field. An objective that declares no task
+        `task_settings`, field by field, and the attention form the step trained in
+        (`generation.chosen(attention_form=...)`), which a loaded task's calls trace in
+        (`dew.inference.tasks.SavedRunTask.traced`). An objective that declares no task
         settings returns None; a custom research method can still restore its
         raw state.
         """
+        from dew.nn.kernels import generation
         from dew.registry import ModelConfig, import_path, record_fields, to_record
 
         settings = self.task_settings()
@@ -1423,7 +1437,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             return None
         return {'objective': import_path(type(self)),
                 'model': to_record(ModelConfig.from_model(self.recorded_model()), ModelConfig),
-                **record_fields(settings, type(settings))}
+                **record_fields(settings, type(settings)),
+                'attention_form': generation.chosen_kernel('attention_form', 'fast')}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:
