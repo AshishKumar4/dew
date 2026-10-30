@@ -5,12 +5,14 @@ interop, config and inference modules take their cache paths without
 importing the FLOP accounting.
 """
 
+import contextlib
 import dataclasses
 import functools
 import importlib.metadata
 import os
 import sys
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import jax
@@ -152,16 +154,46 @@ def enable_compilation_cache(path: str):
     # in the cache directory would name one directory for every jaxlib and write picks from a
     # process this policy keeps to reading (`jax._src.compiler.get_compile_options`).
     jax.config.update('jax_persistent_cache_enable_xla_caches', 'none')
-    # Defaults skip small/fast compilations; a training step is neither, and
-    # caching everything keeps startup predictable.
-    jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
-    jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
+    # JAX's defaults skip small and fast compilations; a run's many small programs (its schedule, its
+    # metrics, its data's transforms) each compile again on every restart without them, so every
+    # program is cached, unless the user named a threshold (JAX_PERSISTENT_CACHE_MIN_*), which is theirs.
+    if 'JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES' not in os.environ:
+        jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
+    if 'JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS' not in os.environ:
+        jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
     flags = os.environ.get('XLA_FLAGS', '')
     if '--xla_gpu_per_fusion_autotune_cache_dir' not in flags:
         picks = autotune_dir(path) if keeps_picks() else ''
         if picks:
             os.makedirs(picks, exist_ok=True)
         os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
+
+
+_UNCACHED = threading.Lock()
+
+
+@contextlib.contextmanager
+def uncached() -> Iterator[None]:
+    """Compile with JAX's persistent cache neither read nor written: an executable compiled for devices
+    this process does not have (a TPU topology's, `dew.training._lowering`) deserializes onto no client
+    here, so an entry read back for it fails, as under `jax_raise_persistent_cache_errors`, and an
+    entry written for it could never load.
+
+    JAX settles whether a process uses its cache at its first compile and keeps that; its
+    `reset_cache` forgets it, so the compiles inside settle it again with the cache turned off, and
+    the next one after with the setting as it was. Compiles on other threads meanwhile go without the
+    cache, and calls on two threads take turns, so neither restores the setting the other made."""
+    from jax.experimental.compilation_cache import compilation_cache
+
+    with _UNCACHED:
+        enabled = jax.config.jax_enable_compilation_cache
+        jax.config.update('jax_enable_compilation_cache', val=False)
+        compilation_cache.reset_cache()
+        try:
+            yield
+        finally:
+            jax.config.update('jax_enable_compilation_cache', val=enabled)
+            compilation_cache.reset_cache()
 
 
 def autotune_dir(path: str) -> str:

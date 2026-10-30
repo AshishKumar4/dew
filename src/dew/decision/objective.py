@@ -261,6 +261,12 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                     tokenizer = tokenizer or tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
+        from dew.interop.pretrained import Pretrained
+
+        # What the backbone's source drew fresh over the weights it holds, under the model's `backbone`:
+        # none where other variables replace them.
+        self._fresh_backbone = tuple(f"backbone/{module}" for module in backbone.fresh) if (
+            variables is OMITTED and isinstance(backbone, Pretrained)) else ()
         if variables is not OMITTED:
             held = variables
         if tokenizer is None:
@@ -329,6 +335,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Nothing beyond the held parts: `complete_variables` draws the part the tree lacks."""
         return held or {}
+
+    def fresh_modules(self) -> tuple[str, ...]:
+        """What the backbone's source drew fresh (`Pretrained.fresh`), and the head where it is drawn
+        beside a held backbone (`complete_variables`)."""
+        held = self.variables or {}
+        loaded = any("backbone" in collection for collection in held.values())
+        drawn = loaded and not any("head" in collection for collection in held.values())
+        return self._fresh_backbone + (("head",) if drawn else ())
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Draw whichever of the backbone and the head `tree` does not hold."""
