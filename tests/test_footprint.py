@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.training.footprint import device_bytes, residual_bytes
+from dew.training.footprint import device_bytes, gradient_peak, residual_bytes
 
 
 def test_resident_device_bytes_do_not_include_host_state():
@@ -94,9 +94,24 @@ def test_a_gpu_pullback_counts_a_transcendental_chain_as_the_product_it_is_recom
     assert scores <= gpu < 2 * scores < residual_bytes(attended, keys, (queries,), platform="cpu")
 
 
+def test_a_gradients_peak_holds_the_gradient_beside_the_cotangent_each_residual_freed_after_its_read():
+    """The most a gradient program holds at once, in its traced order: through two products, the second
+    weight's gradient and the first layer's cotangent, then the first weight's gradient beside them, each
+    residual (the first layer's output, the second's) freed after its last read, which comes before."""
+    rows = jax.ShapeDtypeStruct((8, 16), jnp.float32)
+    params = {"first": jax.ShapeDtypeStruct((16, 64), jnp.float32),
+              "second": jax.ShapeDtypeStruct((64, 16), jnp.float32)}
+
+    def loss(params, rows):
+        return jnp.sum(jnp.exp((rows @ params["first"]) @ params["second"])), ()
+
+    # Both gradients, 64 x 16 floats each, and the first layer's cotangent, 8 x 64.
+    assert gradient_peak(loss, params, (rows,), platform="gpu") == (2 * 64 * 16 + 8 * 64) * 4
+
+
 @pytest.mark.parametrize(("generation", "workspace"), [("sm80", 4 << 20), ("sm90", 32 << 20)])
 def test_a_derived_step_holds_the_gemm_workspace_xla_gives_its_gpu(generation, workspace):
-    """A derived step on a CUDA GPU holds beside its residuals and gradient the workspace XLA hands each
+    """A derived step on a CUDA GPU holds beside its gradient program's peak the workspace XLA hands each
     cuBLAS matmul (gemm_rewriter's `GemmWorkspaceRewriteVisitor`): 32 MiB from Hopper on, 4 MiB before
     (`GemmConfig::kHopperWorkspace`, `kDefaultWorkspace`); a CPU's matmuls take none."""
     from dew.training.ahead import compile_only_gpus
@@ -104,9 +119,9 @@ def test_a_derived_step_holds_the_gemm_workspace_xla_gives_its_gpu(generation, w
     from dew.training.memory import derived_headroom
 
     capacity = 1 << 30
-    step = Footprint(residuals=1 << 20, gradients=1 << 20, held=0)
+    step = Footprint(residuals=1 << 20, gradients=1 << 20, held=0, peak=2 << 20)
     (gpu,) = compile_only_gpus(generation, 1, capacity)
-    empty = Footprint(residuals=0, gradients=0, held=0)
-    # The workspace is one buffer beside every step, whatever its residuals and gradient.
+    empty = Footprint(residuals=0, gradients=0, held=0, peak=0)
+    # The workspace is one buffer beside every step, whatever its peak.
     assert derived_headroom(empty, [gpu], capacity) == capacity - workspace
     assert derived_headroom(step, [gpu], capacity) == capacity - workspace - (2 << 20)
