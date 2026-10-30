@@ -674,7 +674,8 @@ class Trainer(Generic[Loss, Effects]):
                     self.objective, abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
-        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
+        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
+                                              served=self.objective.served_groups(abstract.variables))
         refuse_unclocked(state, resume, self._examples)
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
