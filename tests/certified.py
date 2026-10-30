@@ -946,9 +946,9 @@ def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
 
 
 def _scanned(params, operands, findings, where: str) -> list:
-    """A scan run a step at a time (`reference_error.scanned_steps`, `_run` of its body), every step's
+    """A scan run a step at a time (`float64_terms.scanned_steps`, `_run` of its body), every step's
     equations held to their contracts as the program's are, each by its step's path."""
-    from reference_error import scanned_steps
+    from float64_terms import scanned_steps
 
     body = params["jaxpr"]
     walked = scanned_steps(params, [(value,) for value in operands], lambda step, inputs: [

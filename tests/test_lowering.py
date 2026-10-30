@@ -20,7 +20,6 @@ from dew.nn.kernels.generation import (
     PALLAS_CHOICES,
     TARGETS,
     GpuTarget,
-    Refusal,
     Route,
     architecture,
     assumed,
@@ -36,10 +35,24 @@ from dew.nn.kernels.generation import (
     runtime_facts,
     triton_runs,
 )
+from dew.nn.kernels.selection import Refusal
 from dew.telemetry import instrumentation
-from dew.training._lowering import custom_calls, kernel_report, triton_kernels
+from dew.training._lowering import KernelReport, custom_calls, kernel_report, triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_a_kernel_report_keeps_distinct_refusals_with_the_same_message():
+    first = Route("ssd", "xla", "pallas", Refusal("width", "unsupported", "workspace"),
+                  "xla", "sm90", "training", forced="pallas")
+    second = Route("ssd", "xla", "pallas", Refusal("dtype", "unsupported", "arithmetic"),
+                   "xla", "sm90", "training")
+    counted = {}
+    for entry in KernelReport((first, second, first), ()).record()["routes"]:
+        count = entry.pop("count")
+        entry["refusal"] = Refusal(**entry["refusal"])
+        counted[Route(**entry)] = count
+    assert counted == {first: 2, second: 1}
 
 
 def _doubled(x):

@@ -14,15 +14,9 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.core import freeze, unfreeze
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    float64_terms,
-    torch_with_gradients,
-    widened,
-    with_gradients,
-)
+from float64_terms import float64_terms
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 
 from dew.nn.attention_blocks import Stage
 from dew.nn.autoencoders.vae import FlaxEncoder, translate_vae_weights
