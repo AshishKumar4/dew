@@ -638,13 +638,13 @@ class TaskSettings:
     """What every generation run records beside its model: `seq_len`, its training row length,
     `max_new_tokens`, its task's response budget (0 for none), and its host processor's source:
     `tokenizer` names the run tokenizer (`recorded_tokenizer`) and `processor` a checkpoint's own
-    processor source (`recorded_processor`); either may be None. Each task's settings add what its
-    generation reads."""
+    processor source (`recorded_processor`), the run's source's; either may be None. Each task's settings
+    add what its generation reads."""
 
     seq_len: int
     max_new_tokens: int
     tokenizer: str | None
-    processor: SourceReference | None
+    processor: SourceReference | None = dataclasses.field(metadata={"derived": "source"})
 
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:

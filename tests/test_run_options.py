@@ -460,10 +460,10 @@ def builds(annotation, option) -> bool:
     return any(isinstance(member, type) and bare(option) in made(member) for member in members)
 
 
-def reach(run: RunConfig, objective: str, name: str, annotation) -> Reach | None:
+def reach(run: RunConfig, objective: str, name: str, annotation, argument: bool = True) -> Reach | None:
     """Where `dew train` sets a saved task's option `name` of `annotation`: a field of the run, or of a
     section it holds, declared of that type (a number or a text's of that name) or a builder of it
-    (`builds`), else its objective's argument of that name; None where it has none."""
+    (`builds`), else, with `argument`, its objective's argument of that name; None where it has none."""
     # A number's or a text's field is the option's by its name; any other type's, by its type.
     named = bare(annotation) in (int, float, str, bool)
 
@@ -478,9 +478,66 @@ def reach(run: RunConfig, objective: str, name: str, annotation) -> Reach | None
             elif dataclasses.is_dataclass(value) and type(value).__module__.startswith("dew.config"):
                 yield from paths(value, f"{prefix}{field.name}.")
     found = next(paths(run, ""), None)
-    if found is None and name in inspect.signature(objectives[objective]).parameters:
+    if found is None and argument and name in inspect.signature(objectives[objective]).parameters:
         return Reach(f"objective.{name}", annotation)
     return found
+
+
+@dataclasses.dataclass(frozen=True)
+class Option:
+    """An option a saved task is built with: its name in the settings, dotted where it is a field of one
+    of theirs (`layout.reads`), its alternatives (`witnessed`), where `dew train` sets it (`reach`), None
+    where nothing does, and the field that declares it."""
+
+    name: str
+    values: list[object]
+    found: Reach | None
+    field: dataclasses.Field
+
+
+def unwitnessed(kind: type, options) -> list[str]:
+    """The fields of `kind` of Dew's types (`dews`) that declare fewer than two alternatives, so no option
+    of `options` witnesses them, none declared derived from the run nor a record, its writer's."""
+    hints = typing.get_type_hints(kind)
+    return [field.name for field in dataclasses.fields(kind) if field.name not in options
+            and dews(hints[field.name]) and "derived" not in field.metadata and not record(hints[field.name])]
+
+
+def options_of(run: RunConfig, objective: str, kind: type, base, prefix: str = "") -> list[Option]:
+    """The options `base`, a `kind` a run saved, holds (`witnessed`), each where `dew train` sets it. A
+    field its class declares derived is the run's, set by no objective argument, which the run fills
+    (`ObjectiveConfig.build`); where its saved value is a dataclass the run builds from fields of its own
+    (a decision run's layout from its budgets, `_budgeted`), its options are that value's fields', each
+    reached as the run sets it. A field of Dew's types that no alternative witnesses fails."""
+    hints = typing.get_type_hints(kind)
+    fields = {field.name: field for field in dataclasses.fields(kind)}
+    declared = witnessed(kind, base)
+    missing = unwitnessed(kind, declared)
+    assert not missing, f"{kind.__name__}'s {', '.join(missing)} declares no alternative to witness it by"
+    found = []
+    for name, values in declared.items():
+        derived = "derived" in fields[name].metadata
+        path = reach(run, objective, name, hints[name], argument=not derived)
+        value = getattr(base, name)
+        if path is None and derived and dataclasses.is_dataclass(value) and not isinstance(value, type):
+            found += options_of(run, objective, type(value), value, f"{prefix}{name}.")
+        else:
+            found.append(Option(prefix + name, values, path, fields[name]))
+    return found
+
+
+def held_at(value, name: str):
+    """The option a dotted `name` names in `value`, a field of a field where it is dotted."""
+    for part in name.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def replaced(value, name: str, option):
+    """`value` with the option a dotted `name` names in it replaced by `option`."""
+    head, _, rest = name.partition(".")
+    inner = replaced(getattr(value, head), rest, option) if rest else option
+    return dataclasses.replace(value, **{head: inner})
 
 
 def flag(value, annotation) -> str:
@@ -579,9 +636,9 @@ def consumed(before: dict[str, object], after: dict[str, object], value) -> bool
 
 
 def accepted(saved, name: str, value) -> bool:
-    """Whether `saved` settings take `value` for `name` beside the rest they hold."""
+    """Whether `saved` settings take `value` for the option `name` names beside the rest they hold."""
     try:
-        dataclasses.replace(saved, **{name: value})
+        replaced(saved, name, value)
     except (TypeError, ValueError):
         return False
     return True
@@ -613,36 +670,34 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     a run that sets none, a run sets each alone to an alternative its settings accept other than the one
     saved (the next where a run refuses it, `reached_by`), and the task saves it and, loaded, holds it
     where the first held another (`consumed`). An option with no path is row 1061's blockwise walk,
-    unless its settings declare it derived from the run's data (`metadata={"derived": ...}`), which the
-    run fills. Every settings type an objective declares alternatives in has a run here (`TASK_RUNS`)."""
+    unless its settings declare it derived from the run (`metadata={"derived": ...}`): from its data,
+    which the run fills, or a value the run builds of fields of its own (a decision run's layout), whose
+    fields are its options (`options_of`). A field of Dew's types that declares fewer than two
+    alternatives fails, unless derived or a record (`unwitnessed`). Every settings type an objective
+    declares alternatives in has a run here (`TASK_RUNS`)."""
     assert settings.__name__ in TASK_RUNS, f"no run here trains an objective whose task reads {settings}"
     builder, objective = TASK_RUNS[settings.__name__]
-    hints = typing.get_type_hints(settings)
-    fields = {field.name: field for field in dataclasses.fields(settings)}
     run = builder(tmp_path, drawn=False)
     base, before = saved_with(run, tmp_path, "unset", settings, {})
-    options = witnessed(settings, base)
-    # A field of Dew's types declares its alternatives: one with fewer than two is witnessed by none,
-    # unless its settings declare it derived from the run's data, or it is a record, its writer's.
-    for name in (name for name, field in fields.items() if name not in options and dews(hints[name])):
-        assert "derived" in fields[name].metadata or record(hints[name]), \
-            f"{settings.__name__}.{name} declares no alternative to witness it by"
-    paths = {name: reach(run, objective, name, hints[name]) for name in options}
-    for name in (name for name in options if paths[name] is None):
-        assert "derived" in fields[name].metadata, f"{settings.__name__}.{name} has no path"
-        assert getattr(base, name) != fields[name].default, f"the run fills no {settings.__name__}.{name}"
+    options = {option.name: option for option in options_of(run, objective, settings, base)}
+    for option in (option for option in options.values() if option.found is None):
+        assert "derived" in option.field.metadata, f"{settings.__name__}.{option.name} has no path"
+        # A field of the settings' own the run fills from its data; one of a value the run builds is
+        # filled from the option its declaration names (`--head`'s labels).
+        assert "." in option.name or held_at(base, option.name) != option.field.default, \
+            f"the run fills no {settings.__name__}.{option.name}"
     # A builder's path is witnessed by its own alternatives, each the option its call makes.
-    queued = {name: [value for value in (alternatives(found.annotation) if found.builds else values)
-                     if found.makes(value) and not same(found.made(value), getattr(base, name))
+    queued = {name: [value for value in (alternatives(found.annotation) if found.builds else option.values)
+                     if found.makes(value) and not same(found.made(value), held_at(base, name))
                      and accepted(base, name, found.made(value))]
-              for name, values in options.items() if (found := paths[name]) is not None}
-    reachable = {name: found for name, found in paths.items() if found is not None}
+              for name, option in options.items() if (found := option.found) is not None}
+    reachable = {name: option.found for name, option in options.items() if option.found is not None}
     reached = reached_by(run, tmp_path, settings, lambda assigned: {
         reachable[name].path: flag(value, reachable[name].annotation) for name, value in assigned.items()},
         queued)
     for name in queued:
         assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {queued[name]}"
         saved, after, value = reached[name]
-        option = paths[name].made(value)
-        assert same(getattr(saved, name), option), (name, option)
+        option = reachable[name].made(value)
+        assert same(held_at(saved, name), option), (name, option)
         assert consumed(before, after, option), f"the task loaded holds no {settings.__name__}.{name} set"

@@ -185,10 +185,12 @@ class DecideSettings:
     head: Mapping[str, object]
     """The head's class record (`Head.record`), which `Head.from_record` builds over the backbone it reads,
     its one field the record leaves to the backbone: a record, not a value the settings build."""
-    layout: Layout
+    layout: Layout = field(metadata={"derived": "budgets"})
+    """The rows' layout, which the run builds of its budgets (`DecisionRunConfig.max_len`, ...), its
+    head's labels and its source's attention."""
     specials: Specials
     tokenizer: str | None
-    processor: SourceReference | None
+    processor: SourceReference | None = field(metadata={"derived": "source"})
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
