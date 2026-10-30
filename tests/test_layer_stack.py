@@ -19,7 +19,15 @@ import numpy as np
 import pytest
 import selection_margins
 from model_support import largest_difference
-from reference_error import FEWEST_SEEDS, GateFailure, as_given, assert_as_exact, widened, without_ynn
+from reference_error import (
+    FEWEST_SEEDS,
+    GateFailure,
+    as_given,
+    assert_as_exact,
+    equations,
+    widened,
+    without_ynn,
+)
 from sharded import assert_sharded
 from token_support import token_rows
 from whole_suite import timed
@@ -378,6 +386,69 @@ TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 4, "num_heads": 4
 
 def tiny(**overrides):
     return models.build("causal_transformer", **{**TINY, **overrides})
+
+
+PERIODIC_SEEDS = 8
+"""The periodic decode's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def hybrid(periods: int, **overrides):
+    """A stack of `periods` repeats of three windowed layers and one full one, Qwen3.5's pattern."""
+    return tiny(num_layers=4 * periods, max_seq_len=16,
+                layer_types=(("sliding_attention",) * 3 + ("full_attention",)) * periods,
+                kinds={"sliding_attention": {"window": 4}}, attention_impl="reference", **overrides)
+
+
+def decoded(model, variables, ids):
+    """Single-token steps through the cache one token's call allocates, one program a step under a
+    scan: the steps' logits, and the cache's paths."""
+    def step(cache, column):
+        logits, state = model.apply({**variables, "cache": cache}, column[:, None], decode=True,
+                                    mutable=["cache"])
+        return state["cache"], logits[:, 0]
+
+    cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+    cache, steps = jax.lax.scan(step, cache, jnp.moveaxis(jnp.asarray(ids), 1, 0))
+    return jnp.moveaxis(steps, 0, 1), paths(cache)
+
+
+def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop():
+    """Under `scan_layers` a decode step over resident weights scans a stack whose layers repeat one
+    period as one body of the period's layers (`scan_groups(periodic=True)`): the step is one scan
+    over the period's repeats, its body the same for two periods as for six, its cache in the plain
+    loop's layout, and its steps decode as exactly as the plain loop's, both from the loop's own
+    float64 steps (check 1)."""
+    ids = jax.random.randint(jax.random.key(1), (2, 10), 0, VOCAB)
+
+    def program(model, variables):
+        """The step's one scan: its length and its body's operations."""
+        cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+        graph = jax.make_jaxpr(lambda variables, cache: model.apply(
+            {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(variables, cache)
+        (scan,) = (equation for equation in graph.jaxpr.eqns if equation.primitive.name == "scan")
+        body = sorted(str(equation.primitive) for equation in equations(scan.params["jaxpr"]))
+        return scan.params["length"], body
+
+    short, deep = hybrid(2, scan_layers=True), hybrid(6, scan_layers=True)
+    (two, shallow), (six, body) = (program(model, model.init(jax.random.key(0), ids))
+                                   for model in (short, deep))
+    assert (two, six) == (2, 6) and shallow == body
+    plain = hybrid(6)
+    variables = plain.init(jax.random.key(0), ids)
+    assert decoded(deep, variables, ids)[1] == decoded(plain, variables, ids)[1]
+
+    def draw(seed):
+        return (np.random.default_rng([0x9E, seed]).integers(0, VOCAB, (2, 10)).astype(np.int32),)
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            return np.asarray(decoded(hybrid(6, dtype=jnp.float64), widened(variables), ids)[0])
+
+    def steps(model):
+        return lambda ids: decoded(model, variables, ids)[0]
+
+    assert_as_exact(steps(deep), steps(plain), draw, "periodic decode steps", seeds=PERIODIC_SEEDS,
+                    truth_fn=truth)
 
 
 def bf16(**overrides):
