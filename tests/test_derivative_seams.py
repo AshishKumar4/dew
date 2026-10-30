@@ -91,12 +91,14 @@ CONTRACTED = {
         "test_the_lm_heads_hold_their_reverse_orders",
     "src/dew/objectives/lm/chunked.py::_fused":
         "test_the_lm_heads_hold_their_reverse_orders",
+    "src/dew/objectives/lm/chunked.py::_row_terms":
+        "test_a_heads_row_terms_hold_every_order",
     "src/dew/objectives/lm/chunked.py::_whole_losses":
         "test_the_whole_logits_losses_hold_every_order",
     "src/dew/objectives/residuals.py::_pulled":
-        "test_the_residual_pullbacks_hold_their_reverse_orders",
+        "test_the_residual_pullbacks_hold_every_order",
     "src/dew/objectives/residuals.py::_stepped":
-        "test_the_residual_pullbacks_hold_their_reverse_orders",
+        "test_the_residual_pullbacks_hold_every_order",
     "src/dew/nn/kernels/norm_swiglu.py::stream_rms_norm.linear_tangent":
         "test_the_fused_norms_and_products_hold_every_order",
     "src/dew/nn/kernels/norm_swiglu.py::rms_norm.linear_tangent":
