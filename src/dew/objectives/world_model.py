@@ -140,7 +140,8 @@ class TokenizerObjective(Objective[Ratio]):
     shown: Mapping[str, Shown] = {"loss": Shown()}
 
     def __init__(self, model: CausalTokenizer, *, max_mask: float = 0.9):
-        self.model, self.max_mask = model, max_mask
+        self.model = model
+        self.max_mask = max_mask
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, *self.model.frame)))
@@ -270,7 +271,8 @@ class WorldModelObjective(Objective[Ratio]):
 
     def __init__(self, model: Dynamics, tokenizer: CausalTokenizer, tokenizer_variables: Variables, *,
                  shortcut: bool = True):
-        self.model, self.tokenizer, self.tokenizer_variables = model, tokenizer, tokenizer_variables
+        self.model = model
+        self.tokenizer, self.tokenizer_variables = tokenizer, tokenizer_variables
         self.shortcut = shortcut
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:

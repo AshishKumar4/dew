@@ -288,7 +288,8 @@ class DreamerV3Objective(Objective[Ratio]):
                  return_rate: float = 0.01, variables: Variables | None = None):
         if imagination < 1 or not 0 <= lam <= 1 or horizon <= 1:
             raise ValueError("imagination must be positive, lam in [0, 1] and the horizon past one step")
-        self.model, self.horizon, self.imagination, self.lam = model, horizon, imagination, lam
+        self.model = model
+        self.horizon, self.imagination, self.lam = horizon, imagination, lam
         self.entropy, self.free_nats, self.return_rate = entropy, free_nats, return_rate
         self.variables = variables
         self.ema = EMASpec(optax.constant_schedule(slow_decay), under("params", "value"))

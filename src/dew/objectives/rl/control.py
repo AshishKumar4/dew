@@ -108,7 +108,8 @@ class ControlPPOObjective(Objective[Ratio]):
             raise ValueError("discount and lam lie in [0, 1]")
         if not clip > 0:
             raise ValueError("clip must be positive")
-        self.model, self.observation_size = model, observation_size
+        self.model = model
+        self.observation_size = observation_size
         self.discount, self.lam, self.clip = discount, lam, clip
         self.reward_scaling, self.value_cost, self.entropy_cost = reward_scaling, value_cost, entropy_cost
         self.variables = variables
