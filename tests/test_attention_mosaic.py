@@ -173,7 +173,8 @@ def _dropping(shape) -> template.Hooks:
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
-                 natural: bool = False, seeds: int | None = None, width: int = 64):
+                 natural: bool = False, seeds: int | None = None, width: int = 64,
+                 param_rows: int | None = None):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `FORM_TILES`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
@@ -182,7 +183,9 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
     else the template site's)."""
     rows, queries, heads, _ = shape
-    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, width, rows=rows, heads=heads)
+    # A hook's parameters drawn for `param_rows` batch rows where given (one every row shares).
+    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, width,
+                                               rows=rows if param_rows is None else param_rows, heads=heads)
     output = hooks_for(HOOKS["gate" if gate else "none"], queries, width, gate_of(queries, width))
     draw_operands = _drawn(shape, dtype, width=width, keys=spans.keys)
 
@@ -263,20 +266,23 @@ grow as heads shrink. The H100 site (`_check_hooked_backward`, compiled) keeps t
 and seeds, at full resolution."""
 
 
-def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int = 64):
+def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int = 64, shared: bool = False):
     """The backward in the form `form` names (`_backward_form`) under the score hook `SCORE_HOOKS[hooks]` over
     the template core's causal packed documents under a window (`_check_hooks`' site), heads `width` wide:
     the gradients of the queries, keys, values, of the hook's parameters and of the initial state.
-    Interpreted, at the hook's own site (`INTERPRETED_HOOK_SITES`)."""
+    Interpreted, at the hook's own site (`INTERPRETED_HOOK_SITES`); with `shared` over two rows, the hook's
+    parameters one every row shares."""
     case = CASES["causal-documents-window"]
     queries, keys = core_geometry(case)
     (rows, heads, kv_heads), seeds = INTERPRETED_HOOK_SITES[hooks] if interpret else ((ROWS, 4, 2), None)
+    rows = 2 if shared else rows
     # The call's documents of its first `rows` rows.
     called = {name: value[:rows] if hasattr(value, "shape") else value
               for name, value in arguments(case).items()}
     spans = template.spans(queries, keys, rows, **called)
     _check_spans("causal-documents-window", spans, (rows, queries, heads, kv_heads), interpret=interpret,
-                 backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds, width=width)
+                 backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds, width=width,
+                 param_rows=1 if shared else None)
 
 
 def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form: str = "default"):
@@ -962,6 +968,15 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
     the interpreter: the gradients of the queries, keys and values, of each hook parameter and of the initial
     state."""
     _check_hooked_backward(hooks, form=form, interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
+def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks):
+    """A key's or a tile's parameter one for every batch row (`[1, H, ...]`, T5's shared bias): the dK/dV
+    programs read it at its shared place and add each row's gradient into its own shape in the program
+    (`shared_place`, `Family.added`, row 2577), every gradient the reference's, under the interpreter."""
+    _check_hooked_backward(hooks, form="default", interpret=True, shared=True)
 
 
 @INTERPRETS

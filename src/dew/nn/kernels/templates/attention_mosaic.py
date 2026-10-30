@@ -629,7 +629,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             launches = [(family, config, _fused_allocations(family, config, width, dtype, q_stages))]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
-                dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns))]
+                dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns,
+                tiled=Kind.TILE in self.score_kinds))]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k))))
