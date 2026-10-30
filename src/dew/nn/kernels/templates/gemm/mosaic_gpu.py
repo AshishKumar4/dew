@@ -219,6 +219,9 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], bus
                 continue
             layout, planned = found
             tile = dataclasses.replace(shaped(layout, block_m, block_n, step), stages=planned[0].stages)
+            if not candidate(tile):
+                # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
+                continue
             if tile.stages >= busy:
                 return tile, True
             fallback = fallback or tile
@@ -887,7 +890,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
               for column in range(0, mine_depth.size, atom)]
     shares += [(cotangent_stage.at[:, pl.ds((first_atom + j) * atom, atom)],
                 first_atom + j < atoms if short else None) for j in range(atoms_each)]
-    boundary = _zero_neighbours_of(family, shares, *group)
+    boundary = _zero_neighbours_of(family, shares, *group, aligned_skip=halves is None)
     family.published()
     if halves is not None:
         pl.when(boundary)(lambda: mosaic.meet(halves))
@@ -919,12 +922,20 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
     return summed
 
 
-def _zero_neighbours_of(family: mosaic.Family, refs: list, step, start, end, steps, block_k: int):
+def _zero_neighbours_of(family: mosaic.Family, refs: list, step, start, end, steps, block_k: int, *,
+                        aligned_skip: bool = False):
     """Dew: in a group's first and last row blocks, zero each of `refs` (`[block_k, columns]` stages, each
     one swizzled row wide, so one holds a thread's few registers whatever the tile's width; each with
     whether it is held, None where always) on the rows a neighbouring group holds, by selection; whether
-    `step` is either block."""
+    `step` is either block. With `aligned_skip` (a one-consumer tile), a block the group starts or ends at
+    a step's edge holds no neighbour's rows and is left as loaded: GPT-OSS-120B's 256-row groups at 64-row
+    steps zeroed two of their four (3.18 ms against 2.52, DBG2295-BAND1). Two consumers zero as before:
+    their zeroing is where they meet, and skipping it at aligned edges ran slower on DeepSeek-V3's and Kimi
+    Linear's kernel gradients (DBG2295-FACTOR1), for a reason not established."""
     first, last = step == 0, step == steps - 1
+    if aligned_skip:
+        first = first & (lax.rem(start, block_k) != 0)
+        last = last & (lax.rem(end, block_k) != 0)
 
     def zero(kept):
         for ref, held in refs:

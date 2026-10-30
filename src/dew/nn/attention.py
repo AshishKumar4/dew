@@ -52,8 +52,8 @@ from .documents import (
 )
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation
-from .kernels.generation import bf16_dot_runs, gpu_placed
-from .kernels.selection import forced, select, selected
+from .kernels.generation import Route, bf16_dot_runs, gpu_placed
+from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
 from .precision import (
     asks_default_precision,
@@ -280,11 +280,13 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     """The attention template's route (`attention_route.attend`) over the call's visibility as spans
     (`key_spans`): its causality, window, documents (`segment_ids`, or `CrossDocuments` aligned to their last
     keys), key lengths and starts, block and image groups, and key validity and counted places, with
-    probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook, a `bias` one
-    term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the keys' logical places) a key score hook added after
-    it (`template.key_biased`), and sinks are the softmax's initial state. On a mesh it runs per shard
-    (`on_attention_shards`), as the decode kernel does: the key heads repeat until the tensor axes split
-    them, the sinks split with their heads, and the ids, lengths, starts, groups, validity and places with
+    probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook, a `bias` a
+    score hook added after it (`template.biased`): one term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the
+    keys' logical places) a key parameter, a dense `[B or 1, H or 1, Q, K]` one a tile parameter, read a
+    tile at a time and its gradient the tiles' pulled cotangents; sinks are the softmax's initial state. On
+    a mesh it runs per shard (`on_attention_shards`), as the decode kernel does: the key heads repeat until
+    the tensor axes split them, the sinks split with their heads, and the ids, lengths, starts, groups,
+    validity and places with
     their rows. Its requirements (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
     """
     if sinks is not None and sinks.shape != (query.shape[2],):
@@ -306,9 +308,15 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         elif seed is not None and global_rows is not None and global_heads is not None:
             drop = template.Dropout(seed, global_rows, global_heads, dropout_rate)
         capped = None if softcap is None else functools.partial(template.capped, softcap)
+        if bias is None:
+            params = ()
+        elif bias.shape[2] == 1:
+            params = (template.Param(bias[:, :, 0], template.Kind.KEY),)
+        else:
+            params = (template.Param(bias, template.Kind.TILE),)
         hooks = template.Hooks(
-            score_mod=capped if bias is None else functools.partial(template.key_biased, capped),
-            score_params=() if bias is None else (template.Param(bias[:, :, 0], template.Kind.KEY),),
+            score_mod=capped if bias is None else functools.partial(template.biased, capped),
+            score_params=params,
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)
         return attention_route.attend(query, key, value, spans, hooks)
@@ -327,7 +335,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                       key_runs=(key_runs, ("activation_batch", None, None, None)),
                       places=(places, ("activation_batch", None)), seed=(dropout_seed, (None,)),
                       bias=(None if bias is None else jnp.broadcast_to(
-                          bias, (query.shape[0], query.shape[2], 1, key.shape[1])),
+                          bias, (query.shape[0], query.shape[2], jnp.shape(bias)[2], key.shape[1])),
                             ("activation_batch", "activation_heads", None, None)))
 
 
@@ -710,7 +718,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
         segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths,
         key_value_seq_starts=starts, block_groups=block_groups, image_groups=image_groups,
-        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None)
+        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None).ran
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
@@ -892,8 +900,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                     or key_valid is not None or key_runs is not None
                     or (places is not None and sliding_window is not None)),
         mask=mask is not None, bias=bias is not None,
-        key_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] == 1
-                  and jnp.dtype(bias.dtype).itemsize <= 4),
+        bias_hook=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] in (1, query.shape[1])
+                   and jnp.dtype(bias.dtype).itemsize <= 4),
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
@@ -913,8 +921,9 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                            sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
                            key_value_seq_lengths=None, key_value_seq_starts=None, block_groups=None,
                            image_groups=None, key_valid=None, key_runs=None, places=None,
-                           dropout: bool = False) -> str:
-    """The kernel an `AttentionImpl` names for this call on this host, as the attention selector
+                           dropout: bool = False) -> Route:
+    """The route an `AttentionImpl` takes for this call on this host (`Route.ran` its kernel,
+    `Route.forced` what forced it), as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
     fastest for the call where it takes it, else the first that does; a named kernel is forced, and
     raises where it does not take the call (xla handing what it cannot honour to the reference path).
@@ -933,11 +942,12 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                           image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
                           dropout=dropout, named=implementation)
     if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
-        return select(ATTENTION, case, None if implementation == 'auto' else implementation).ran
-    named = {'auto': None, 'cudnn': 'cudnn'}.get(implementation)
+        return select(ATTENTION, case, None if implementation == 'auto' else implementation)
     if implementation == 'xla':
-        named = 'xla' if forced(DECODE.choice) == 'xla' or DECODE.kernel('decode').failed(case) else 'decode'
-    return select(DECODE, case, named).ran
+        # An explicit xla's decode step: the decode kernel where it takes the call, else xla's lowering of
+        # it, a decode choice `chosen` names overriding both.
+        return select(DECODE, case, preference=('decode', 'xla', 'reference'))
+    return select(DECODE, case, {'auto': None, 'cudnn': 'cudnn'}[implementation])
 
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,

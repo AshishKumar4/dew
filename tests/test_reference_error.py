@@ -52,6 +52,48 @@ def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_of
             np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
 
 
+def one_key_draw(seed):
+    """bf16 queries [2, 5, 4, 32] over a single key and value of two heads."""
+    rng = np.random.default_rng([1698, 1, seed])
+    return tuple(jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
+                 for shape in ((2, 5, 4, 32), (2, 1, 2, 32), (2, 1, 2, 32)))
+
+
+def pulled_by_itself(attention):
+    """`attention`'s output and the gradients of its inputs under that output as the cotangent."""
+    def run(query, key, value):
+        out, pull = jax.vjp(attention, query, key, value)
+        return out, *pull(out)
+    return run
+
+
+def xla_attention(query, key, value):
+    """jax.nn's attention, its XLA implementation."""
+    return jax.nn.dot_product_attention(query, key, value, implementation="xla")
+
+
+def written_attention(query, key, value):
+    """The same attention written out: grouped heads, fp32 logits, a softmax in fp32 rounded to bf16."""
+    group = query.shape[2] // key.shape[2]
+    keys, values = jnp.repeat(key, group, axis=2), jnp.repeat(value, group, axis=2)
+    logits = jnp.einsum("btnh,bsnh->bnts", query, keys, preferred_element_type=jnp.float32)
+    weights = jax.nn.softmax(logits / np.sqrt(query.shape[-1]), axis=-1).astype(query.dtype)
+    return jnp.einsum("bnts,bsnh->btnh", weights, values)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them():
+    """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
+    every matmul precision (`YNN_REFUSED`); check 1 turns both arms over to the fusions there (`_Paired`),
+    the two still of one kind, and judges them."""
+    from reference_error import without_ynn
+
+    with pytest.raises(jax.errors.JaxRuntimeError):
+        without_ynn(pulled_by_itself(xla_attention))(*one_key_draw(0))
+    assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention), one_key_draw,
+                    "attention over one key", seeds=16)
+
+
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
 def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
     """A caller who asks for YNNPACK's dot fusion gets the dot the default XLA:CPU computes, bit for
@@ -234,12 +276,103 @@ def noised_draw(seed):
     return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
 
 
+def cancelling(split: bool, *, leak: bool = False, residue: float = 0.0):
+    """A leaf of rows that cancel, rows of no terms and plain rows: rows 0-7 a dot less itself (the
+    reference's the same dot twice, exactly zero; split, Dew's second dot summed in two halves, an ulp
+    or so off zero; leaked, one term dropped from it), rows 8-11 the dot of zero rows (`residue` added),
+    and the rest the plain dot, every arm alike."""
+    def halves(x, w):
+        return x[:, :32] @ w[:32] + (x[:, 33:] @ w[33:] if leak else x[:, 32:] @ w[32:])
+
+    def arm(x, w):
+        whole = x @ w
+        other = halves(x, w) if split else x @ w
+        return {"rows": jnp.concatenate([whole[:8] - other[:8], whole[8:12] + residue, whole[12:]])}
+    return arm
+
+
+def cancelling_draw(seed):
+    """A [64, 64] by [64, 4] dot's operands, rows 8-11 of the first zero."""
+    rng = np.random.default_rng([2440, seed])
+    x = rng.standard_normal((64, 64))
+    x[8:12] = 0
+    return jnp.asarray(x, jnp.float32), jnp.asarray(rng.standard_normal((64, 4)), jnp.float32)
+
+
+def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
+    """Term sizing (`assert_as_exact`'s `terms`, owner 10-29): a row whose truth cancels exactly, Dew's an
+    ulp or so off its zero where the reference's sum cancels to it, is judged at its terms' size by the
+    row rule and admitted, where without terms it fails as a row of float64 zero against the reference's
+    exact zero; and nothing else is: a dropped term in that row is refused, a residue on rows whose terms
+    are zero too (no size) is refused as a row of float64 zero, and a truth with no terms (run as given)
+    is refused at the site."""
+    reference = cancelling(split=False)
+    assert_as_exact(cancelling(split=True), reference, cancelling_draw, "a cancelling dot", seeds=16,
+                    terms=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untermed", seeds=16)
+    with pytest.raises(GateFailure):
+        assert_as_exact(cancelling(split=True, leak=True), reference, cancelling_draw, "a leaked term",
+                        seeds=16, terms=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(cancelling(split=True, residue=1e-20), reference, cancelling_draw,
+                        "a residue on rows of no terms", seeds=16, terms=True)
+    with pytest.raises(ValueError):
+        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untraceable", seeds=16,
+                        terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
+
+
+MIX = np.random.default_rng(2442).standard_normal((4, 4)).astype(np.float32)
+"""A fixed [4, 4] product past `cancelling`'s rows (`mixed`)."""
+
+
+def mixed(arm):
+    """`arm`'s rows through MIX: a row that cancels before that product sums zero terms into it, in
+    float64, however far each arm is off its zero."""
+    def run(x, w):
+        return {"rows": arm(x, w)["rows"] @ jnp.asarray(MIX)}
+    return run
+
+
+def mixed_terms(x, w):
+    """`mixed`'s terms carried through its cancellation (`float64_terms`' sizes): each dot's entry the
+    root sum of squares of its products, the cancelling rows' two sums both, then MIX's products of
+    those sizes."""
+    sizes = np.sqrt(np.square(np.asarray(x)) @ np.square(np.asarray(w)))
+    sizes[:8] *= np.sqrt(2.0)
+    return {"rows": np.sqrt(np.square(sizes) @ np.square(MIX.astype(np.float64)))}
+
+
+def test_check_1_sizes_a_row_that_cancels_behind_its_final_sum_by_the_sites_own_terms():
+    """A site's own terms program (`assert_as_exact`'s `terms`): the traced terms are a leaf's final
+    sums' alone, so rows that cancel before a further product (`mixed`, as an attention query that keeps
+    one key cancels its logit gradient before dQ sums it) have none and fail as rows of float64 zero; the
+    site's own terms, carried through the cancellation, size them, and nothing else is admitted: a
+    dropped term there is refused, a residue on rows whose terms are zero too is refused, and terms of
+    another tree are refused at the site."""
+    reference = mixed(cancelling(split=False))
+    with pytest.raises(GateFailure):
+        assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "traced terms", seeds=16,
+                        terms=True)
+    assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "the site's terms", seeds=16,
+                    terms=mixed_terms)
+    with pytest.raises(GateFailure):
+        assert_as_exact(mixed(cancelling(split=True, leak=True)), reference, cancelling_draw, "a leaked term",
+                        seeds=16, terms=mixed_terms)
+    with pytest.raises(GateFailure):
+        assert_as_exact(mixed(cancelling(split=True, residue=1e-20)), reference, cancelling_draw,
+                        "a residue on rows of no terms", seeds=16, terms=mixed_terms)
+    with pytest.raises(ValueError):
+        assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "another tree", seeds=16,
+                        terms=lambda x, w: mixed_terms(x, w)["rows"])
+
+
 def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw():
     """`also`: one Dew arm against several references on the same draws, each judged by its own check 1
     under its own label, Dew and the truth evaluated once a draw for them all. A Dew arm on par with one
     reference and three times another's error fails against that one alone; a site with every
     reference on par passes; beside a plain Dew arm, a further reference of another kind than the
-    reference's is refused, as is a site with several and no named truth."""
+    reference's is refused."""
     calls = {"dew": 0, "truth": 0}
 
     draw = noised_draw
@@ -265,10 +398,6 @@ def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw(
         assert_as_exact(arm(3.0, "mine"), arm(3.0, "theirs"), draw, "one far", seeds=16, truth_fn=truth,
                         also={"another": arm(1.0, "other")})
     assert {finding.leaf for finding in failed.value.findings} == {"one far, against another['value']"}
-    with pytest.raises(ValueError):
-        assert_as_exact(dew, arm(1.0, "theirs"), draw, "no truth", seeds=16,
-                        also={"another": arm(1.0, "other")})
-
     def plain(x, *_):
         return {"value": x}
 
@@ -1657,7 +1786,7 @@ def test_a_leaf_in_any_layout_reads_as_its_c_ordered_copy():
     truth's, as its C-ordered copy, bit for bit (`_evidence`, `leaf_summary`): every leaf lies in C order
     beside the others of its width (`_LaidTruths`), so its sums run alike whatever its layout. The leaves
     hold rows of float64 zero and leaves of every rank."""
-    from reference_error import _evidence, leaf_summary
+    from reference_error import _evidence, _prepared, leaf_summary
 
     rng = np.random.default_rng(2201)
     shapes = [(70, 129), (9, 33), (5, 4, 9), (40,), (3, 2, 1), (12, 9), ()]
@@ -1683,7 +1812,11 @@ def test_a_leaf_in_any_layout_reads_as_its_c_ordered_copy():
                    for value in tree.values() if np.ndim(value) >= 2)
     ordered = [{name: np.ascontiguousarray(value) for name, value in tree.items()}
                for tree in (dew, reference, laid)]
-    assert _bits(_evidence(dew, reference, laid, laid)) == _bits(_evidence(*ordered, ordered[2]))
+
+    def evidence(dew, reference, truth):
+        return _evidence(_prepared(dew, truth), reference, truth, shared=True)
+
+    assert _bits(evidence(dew, reference, laid)) == _bits(evidence(*ordered))
     for name in truth:
         assert _bits(leaf_summary(dew[name], laid[name])) == _bits(
             leaf_summary(ordered[0][name], ordered[2][name])), name

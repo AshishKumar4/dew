@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
+    from .selection import Refusal
+
 _log = logging.getLogger(__name__)
 
 ASSUMED: contextvars.ContextVar[str | None] = contextvars.ContextVar("assumed_generation", default=None)
@@ -119,6 +121,7 @@ class Architecture:
 
     family: str | None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    resident_threads: int = 1536
     wgmma: bool = False
     tma: bool = False
     tmem_columns: int | None = None
@@ -141,16 +144,20 @@ class Architecture:
 # IV): A100 466.3, H800 478.8, RTX 4090 541.5. L2 bytes a multiprocessor a clock, Dew's streaming probe
 # (L2PROBE, probe_l2.py) over SMs x clock: A100 5.43 TB/s -> 35.7, A10 4.74 -> 38.8, H100 SXM 13.2 -> 54.6.
 # A family no device of which was measured takes its nearest measured family's values, said so below.
-_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, load_latency=466.3,
+_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048,
+                       load_latency=466.3,
                        l2_bytes_per_clock=35.7)
 _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
                                 l2_bytes_per_clock=38.8)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8)
-_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, wgmma=True, tma=True,
+_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024, load_latency=541.5,
+                       l2_bytes_per_clock=38.8)
+_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, resident_threads=2048,
+                       wgmma=True, tma=True,
                        load_latency=478.8, l2_bytes_per_clock=54.6)
 # Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
-_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, tmem_columns=512, tma=True,
+_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, resident_threads=2048,
+                          tmem_columns=512, tma=True,
                           load_latency=478.8, l2_bytes_per_clock=54.6)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates
 # and measured values.
@@ -616,22 +623,6 @@ def chosen_kernel(choice: str, default: str) -> str:
     return dict(cache.KERNEL_CHOICES.value).get(choice, default)
 
 
-@dataclasses.dataclass(frozen=True)
-class Refusal:
-    """Why the kernel a target prefers does not take a call, from the call's own facts on that
-    target (its shapes, dtypes, mask): a stable `code`, which a kernel's `SUPPORTS` keys its declared
-    limits on, and the `detail` a log names. What the host cannot run is no refusal (`Route.ran`)."""
-
-    code: str
-    detail: str
-    row: str | None = None
-    """The roadmap or ledger row that tracks lifting the limit (`dew.nn.kernels.selection.Requirement`),
-    `INHERENT` where no implementation of the kernel lifts it, None for a refusal no requirement gives
-    (an analysis's own, which its op's requirements read)."""
-
-    def __str__(self) -> str:
-        return self.detail
-
 
 INHERENT = 'inherent'
 """The row of a limit no implementation of the kernel lifts (`Refusal.row`)."""
@@ -644,7 +635,8 @@ class Route:
     runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (`chosen`,
     or its selector's preference), `refusal` why `preferred` did not take the
     call, and `ran` what this host executed, `kernel` but where the host cannot run it (cuDNN within
-    `assumed` on a CPU). A route is generic exactly where `kernel != preferred`."""
+    `assumed` on a CPU), and `forced` the kernel the call named or `chosen` named, which forced the choice
+    (None where the selector chose). A route is generic exactly where `kernel != preferred`."""
 
     choice: str
     kernel: str
@@ -653,6 +645,7 @@ class Route:
     ran: str
     target: str
     site: str
+    forced: str | None = None
 
 
 class _Routes:
@@ -689,7 +682,7 @@ _logged: set[tuple[str, str, str]] = set()
 
 
 def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
-          ran: str | None = None) -> Route:
+          ran: str | None = None, forced: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
     decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
     `kernel`; `ran` is what this host executes, `kernel` by default. Every `routes` block open records it.
@@ -700,7 +693,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     _named((choice,))
     generation = device_generation()
     preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
-    found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site())
+    found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)
     for collected in cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail
@@ -711,7 +704,8 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
 
 
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
-                   live_cotangents: bool = False) -> Callable:
+                   live_cotangents: bool = False, primal: Callable | None = None,
+                   nested: bool = True) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
@@ -730,7 +724,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
-    cotangent is never formed."""
+    cotangent is never formed. `primal(*operands)` gives the output where no derivative is taken (a kernel
+    that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
+    it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
+    policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -771,10 +768,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     @jax.custom_jvp
     def bounded(*operands):
-        return forward(*operands)[0]
+        return forward(*operands)[0] if primal is None else primal(*operands)
 
     def bounded_jvp(primals, tangents):
-        output, saved = produced(*primals)
+        output, saved = (produced if nested else forward)(*primals)
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)

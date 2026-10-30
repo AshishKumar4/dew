@@ -21,6 +21,7 @@ import tokamax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
@@ -89,22 +90,23 @@ def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
             and ba.arguments["start"].ndim == 2)
 
 
-def refused(spans: KeySpans, hooks: Hooks | None = None) -> str | None:
+def refused(spans: KeySpans, hooks: Hooks | None = None) -> Refusal | None:
     """Why this mainloop takes no call over `spans` under `hooks`, or None: a call's runs, several key
     intervals a query (`KeySpans`), which the frozen mainloop does not walk, the Mosaic and plain-JAX
     mainloops do (ledger 956, `attention_route`); probability dropout (`Hooks.drop`), which it does not
     draw, the plain-JAX mainloop does (ledger row 1521)."""
     if spans.start.ndim == 3:
-        return ("the Triton mainloop walks one key interval a query; a call's runs take the Mosaic or the "
-                "plain-JAX mainloop")
+        return Refusal('spans', "the Triton mainloop walks one key interval a query; a call's runs take the "
+                       "Mosaic or the plain-JAX mainloop")
     if hooks is not None and hooks.drop is not None:
-        return ("the Triton mainloop is frozen and takes no probability dropout (the route runs a dropping "
-                "call on the reference path, ledger row 1521)")
+        return Refusal('dropout', "the Triton mainloop is frozen and takes no probability dropout (the route "
+                       "runs a dropping call on the reference path, ledger row 1521)", row='1521')
     return None
 
 
 def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-             *, scale: float | None = None, natural: bool = NATURAL, residuals: bool = False) -> str | None:
+             *, scale: float | None = None, natural: bool = NATURAL,
+             residuals: bool = False) -> Refusal | None:
     """Why no config of `forward`'s launch, bound as it binds this call (`_forward_call`), fits the GPU: its
     own fitting (`Template.fits`: its padding, the configs dividing it, the registers they hold and the
     shared memory they stage), or None. The route then takes another mainloop rather than a launch that
@@ -112,7 +114,8 @@ def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     if op.fits(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target()):
         return None
-    return "no config of the Triton mainloop's forward fits the GPU's block and registers"
+    return Refusal('resources',
+                   "no config of the Triton mainloop's forward fits the GPU's block and registers")
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
@@ -501,9 +504,10 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
     computed them (`how`)."""
     logits, slopes = algebra.tile_logits(score_mod, kernel_dot(query, key.T, interpret), seen, q_pos, k_pos,
                                          params, scale=scale if how.factor is None else 1.0, slopes=True)
-    exponentials, weights = algebra.normalized(logits, peak, total, how)
+    inverse_total = algebra.inverse(total)
+    exponentials, weights = algebra.normalized(logits, peak, inverse_total, how)
     cotangents = algebra.grad_scores(exponentials, kernel_dot(dout, value.T, interpret), anchor, delta, seen,
-                                     k_pos == key_index[:, None], algebra.inverse(total))
+                                     k_pos == key_index[:, None], inverse_total)
     return exponentials, weights, cotangents, slopes
 
 
@@ -948,7 +952,7 @@ def _launch(*arrays, interpret: bool, **params):
 
 def backward_unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                       hooks: Hooks | None, dout: jax.Array, *, residuals: tuple, scale: float | None = None,
-                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> str | None:
+                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> Refusal | None:
     """Why no config of `backward`'s launches, bound as `gradients` binds this call (`launch_arguments`),
     fits the GPU (`Template.fits`), or None: the route then takes another mainloop (`attention_route`)."""
     hooks = Hooks() if hooks is None else hooks
@@ -958,7 +962,8 @@ def backward_unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans:
                       initial=hooks.initial is not None)
     if op.fits(op.bind(*arrays, interpret=False), generation.gpu_target()):
         return None
-    return "no config of the Triton mainloop's backward fits the GPU's block and registers"
+    return Refusal('resources',
+                   "no config of the Triton mainloop's backward fits the GPU's block and registers")
 
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,

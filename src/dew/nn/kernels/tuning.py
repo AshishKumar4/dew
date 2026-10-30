@@ -72,6 +72,7 @@ from dew._records import JSON
 from dew.files import write_atomically
 
 from . import generation
+from .templates import report
 
 _log = logging.getLogger(__name__)
 
@@ -431,13 +432,15 @@ class KernelOp(tokamax.Op):
         elif not self.pinnable(ba, config):
             raise Unpinnable(type(self).__name__, config, self.unpinnable(ba, config))
         # The launch runs on its bound arguments, the facts its binding states from its operands (a
-        # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them.
-        if cache.KERNEL_LAUNCHES.value:
-            # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
-            # each traced array for its devices (`keyed`).
-            return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *ba.args,
-                                       **ba.kwargs)
-        return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
+        # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them; its
+        # kernels carry it in their names, so a compile's reports name it (`report.launching`).
+        with report.launching(self, ba, config):
+            if cache.KERNEL_LAUNCHES.value:
+                # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
+                # each traced array for its devices (`keyed`).
+                return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *ba.args,
+                                           **ba.kwargs)
+            return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
 
     def chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         """The config a launch of `ba` takes where it traces now: the op's own `config` where it carries
@@ -523,6 +526,24 @@ class KernelOp(tokamax.Op):
         computes (`program`, at the arguments the template traces it at), the rest of it as it is. An op
         naming `HOOKS` defines it."""
         raise NotImplementedError(f"{type(self).__name__} names hooks {self.HOOKS} but no way to trace them")
+
+    def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
+        """The launch of `ba` at `config` as a resource derivation lowers it (never run): a function of the
+        call's arrays, making this launch's kernels alone, and their abstract values; compiled, not
+        interpreted, where the launch takes `interpret`."""
+        leaves, treedef = jax.tree.flatten((ba.args, ba.kwargs))
+        held = [hasattr(leaf, "shape") and hasattr(leaf, "dtype") for leaf in leaves]
+
+        def fn(*arrays):
+            given = iter(arrays)
+            args, kwargs = jax.tree.unflatten(treedef, [next(given) if array else leaf
+                                                        for leaf, array in zip(leaves, held, strict=True)])
+            if "interpret" in kwargs:
+                kwargs = {**kwargs, "interpret": False}
+            return self._fwd(*args, config=config, **kwargs)[0]
+
+        return fn, tuple(jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+                         for leaf, array in zip(leaves, held, strict=True) if array)
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Arrays at `specs` to time the launch on: normal floats, zero integers."""

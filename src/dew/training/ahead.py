@@ -54,11 +54,6 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
-"""Resident threads a multiprocessor holds by compute capability, 1536 on the others the targets name
-(CUDA C++ Programming Guide, "Technical Specifications per Compute Capability")."""
-
-
 def target_config(generation: str, capacity: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
     (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
@@ -75,7 +70,7 @@ def target_config(generation: str, capacity: int | None = None) -> str:
   threads_per_warp: 32
   shared_memory_per_block: 49152
   shared_memory_per_core: {shared + 1024}
-  threads_per_core_limit: {THREADS_PER_MULTIPROCESSOR.get((major, minor), 1536)}
+  threads_per_core_limit: {target.architecture.resident_threads}
   core_count: {multiprocessors}
   fpus_per_core: {64 if (major, minor) == (8, 0) else 128}
   block_dim_limit_x: 2147483647
@@ -238,17 +233,18 @@ class AheadTarget:
         return None if self.capacity_gib is None else int(self.capacity_gib * 2**30)
 
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
-                                  steps: int | None) -> CompiledAhead:
+                                  steps: int | None, examples: int | None = None) -> CompiledAhead:
         """`trainer`, built over this target's devices (`compile_only_gpus`), its first step over
-        `loader`'s first batch, through the loader's device steps as `fit` reads it
-        (`Trainer.reading`), compiled ahead (`compile_ahead`) and saved, as what ends the run. A run
-        whose step reads a rollout's batches, which it makes as it trains, is refused."""
+        `loader`'s first batch, through the loader's device steps and the run's clock (its `steps`, or
+        the `examples` it is bounded to) as `fit` reads them (`Trainer.reading`), compiled ahead
+        (`compile_ahead`) and saved, as what ends the run. A run whose step reads a rollout's batches,
+        which it makes as it trains, is refused."""
         from dew.training._fit import first_batch
 
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
-        trainer.reading(loader)
+        trainer.reading(loader, examples=examples, steps=steps)
         trainer.validate(steps=steps)
         ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh), self.capacity)
         ahead.save(self.path)

@@ -141,38 +141,46 @@ def float64_weights(q, k, keep, sinks, softcap, *, anchored: bool = False):
 
 def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None):
     """Each entry's float64 terms of attention's output and its query, key and
-    value gradients under `cotangent` (`reference_error.float64_terms`'s
-    sizes), for `[B, S, H, D]` operands with key heads repeated over their
-    group and the keys `keep` `[B or 1, 1, q, k]` keeps, a sink joining each
-    head's denominator. A logit's gradient P (dP - delta) cancels: on a query
-    that keeps one key P is 1 and delta is dP, so it is zero in float64,
-    while a flash kernel forms delta as rowsum(out * dout) from its bf16
-    output. Each of those products carries the output's rounding, so delta's
-    error is of their size, sum |out dout|, however far their sum cancels: a
-    query that keeps one key beside a sink, whose output is a rounded share of
-    the value, shows it. Its terms are therefore P (|dP| + sum |out dout|),
-    and such a row is held to that rounding, not to its own zero."""
+    value gradients under `cotangent`, sized as `reference_error.float64_terms`
+    sizes them: the root sum of squares of the terms its final sum adds, for
+    `[B, S, H, D]` operands with key heads repeated over their group and the
+    keys `keep` `[B or 1, 1, q, k]` keeps, a sink joining each head's
+    denominator. A logit's gradient P (dP - delta) cancels: on a query that
+    keeps one key P is 1 and delta is dP, so it is zero in float64, while a
+    flash kernel forms delta as rowsum(out * dout) from its bf16 output. Each
+    of those products carries the output's rounding, so delta's error is of
+    their size however far their sum cancels: a query that keeps one key beside
+    a sink, whose output is a rounded share of the value, shows it. A logit's
+    gradient is therefore sized by the larger of its value and P times the
+    root sum of squares of dP's and delta's terms, carried through that
+    difference as `float64_terms` carries one, and dQ and dK sum the products
+    of those sizes: such a row is held to that rounding, not to its own zero."""
     with jax.enable_x64(new_val=True):
         q, k, v, dout = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent))
         heads, kv_heads, width = q.shape[2], k.shape[2], q.shape[3]
         group = jnp.arange(heads) // (heads // kv_heads)
         sunk = None if sinks is None else jnp.asarray(np.asarray(sinks, np.float64))
         weights, raw = float64_weights(q, k, keep, sunk, softcap)
-        products = jnp.einsum('bqhd,bkhd->bhqk', dout, v[:, :, group])
-        out = jnp.einsum('bhqk,bkhd->bqhd', weights, v[:, :, group])
-        delta = jnp.einsum('bqhd,bqhd->bhq', jnp.abs(out), jnp.abs(dout))[..., None]
-        logit_terms = weights * (jnp.abs(products) + delta) / np.sqrt(width)
+        keys, values = k[:, :, group], v[:, :, group]
+        products = jnp.einsum('bqhd,bkhd->bhqk', dout, values)
+        out = jnp.einsum('bhqk,bkhd->bqhd', weights, values)
+        delta = jnp.einsum('bqhd,bqhd->bhq', out, dout)[..., None]
+        # dP's and delta's terms' squares, summed: the difference's, carried.
+        energy = (jnp.einsum('bqhd,bkhd->bhqk', dout ** 2, values ** 2)
+                  + jnp.einsum('bqhd,bqhd->bhq', out ** 2, dout ** 2)[..., None])
+        logit_sizes = jnp.maximum(jnp.abs(weights * (products - delta)), weights * jnp.sqrt(energy))
+        logit_sizes = logit_sizes / np.sqrt(width)
         if softcap is not None:
-            logit_terms = logit_terms * jnp.abs(1 - jnp.tanh(raw / softcap) ** 2)
+            logit_sizes = logit_sizes * jnp.abs(1 - jnp.tanh(raw / softcap) ** 2)
 
         def per_key_head(x):
             return x.reshape(*x.shape[:2], kv_heads, heads // kv_heads, x.shape[-1]).sum(3)
 
-        terms = (jnp.einsum('bhqk,bkhd->bqhd', weights, jnp.abs(v[:, :, group])),
-                 jnp.einsum('bhqk,bkhd->bqhd', logit_terms, jnp.abs(k[:, :, group])),
-                 per_key_head(jnp.einsum('bhqk,bqhd->bkhd', logit_terms, jnp.abs(q))),
-                 per_key_head(jnp.einsum('bhqk,bqhd->bkhd', weights, jnp.abs(dout))))
-        return [np.asarray(x) for x in terms]
+        squares = (jnp.einsum('bhqk,bkhd->bqhd', weights ** 2, values ** 2),
+                   jnp.einsum('bhqk,bkhd->bqhd', logit_sizes ** 2, keys ** 2),
+                   per_key_head(jnp.einsum('bhqk,bqhd->bkhd', logit_sizes ** 2, q ** 2)),
+                   per_key_head(jnp.einsum('bhqk,bqhd->bkhd', weights ** 2, dout ** 2)))
+        return [np.sqrt(np.asarray(x)) for x in squares]
 
 
 def exact_attention(q, k, v, s=None, *, softcap=None, keep=None, anchored: bool = False, **structure):

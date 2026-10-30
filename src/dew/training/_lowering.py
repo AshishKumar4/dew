@@ -28,13 +28,14 @@ import json
 import logging
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 
 import jax
 from jax.extend.mlir import ir
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Route
+from dew.nn.kernels.templates import report
 from dew.telemetry.instrumentation import custom_call_kind, sizes
 
 _log = logging.getLogger(__name__)
@@ -160,7 +161,9 @@ def _kernel_name(location: ir.Location) -> str | None:
     if named is None:
         return None
     stack = named.split("/")
-    return stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
+    # Less the launch the kernel's name carries (`report.named`), so a kernel reads as itself in every call.
+    kernel = stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
+    return report.LAUNCH_SUFFIX.sub("", kernel)
 
 
 def _named(location: ir.Location) -> str | None:
@@ -206,9 +209,7 @@ class KernelReport:
         """Its JSON: each distinct route with its count, each kernel's launches, configs and stated FLOPs
         (None where any of its launches states none), and `unsized`, the launches whose work the FLOP
         count cannot size (`instrumentation.sizes`)."""
-        routes = Counter((route.choice, route.kernel, route.preferred,
-                          None if route.refusal is None else route.refusal.detail, route.site)
-                         for route in self.routes)
+        routes = Counter(self.routes)
         launches: dict[tuple[str, str], dict] = {}
         for call in self.calls:
             entry = launches.setdefault((call.kind or "", call.name), {
@@ -220,13 +221,11 @@ class KernelReport:
             entry["flops"] = entry["flops"] + call.flops if stated else None
 
         def order(counted) -> tuple:
-            (choice, kernel, _, _, site), _ = counted
-            return choice, site, kernel
+            route, _ = counted
+            return route.choice, route.site, route.kernel
 
-        return {"routes": [{"choice": choice, "kernel": kernel, "preferred": preferred, "refusal": refusal,
-                            "site": site, "count": count}
-                           for (choice, kernel, preferred, refusal, site), count in sorted(routes.items(),
-                                                                                         key=order)],
+        return {"routes": [{**asdict(route), "count": count}
+                           for route, count in sorted(routes.items(), key=order)],
                 "launches": [launches[key] for key in sorted(launches)],
                 "unsized": sum(not sizes(call.kind, call.flops) for call in self.calls)}
 

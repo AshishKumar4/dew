@@ -15,7 +15,7 @@ from typing import Literal
 from dew import _records
 from dew._records import JSON, is_share, share
 from dew.training.budget import every_step, recorded
-from dew.training.cadence import Tokens
+from dew.training.cadence import Counted
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,14 +48,17 @@ class Cooldowns:
         if self.shape not in ("1-sqrt", "linear"):
             raise ValueError(f"a cooldown decays as 1-sqrt or linear, not {self.shape!r}")
 
-    def branches(self, steps: int | None, tokens: int | None, accumulation: int) -> tuple[Branch, ...]:
-        """Each point resolved against a run of `steps` microsteps, or a budget of `tokens` alone,
-        `accumulation` microsteps an update (`every_step`); a point of steps inside an update, whose
-        branch would begin with that update's window part filled, is refused."""
+    def branches(self, steps: int | None, tokens: int | None, accumulation: int, examples: int | None = None
+                 ) -> tuple[Branch, ...]:
+        """Each point resolved against a run of `steps` microsteps, a budget of `tokens` alone, or a bound
+        of `examples` no pass counts steps ahead of, `accumulation` microsteps an update (`every_step`); a
+        point of steps inside an update, whose branch would begin with that update's window part filled,
+        is refused."""
         inside = [at for at in self.at if isinstance(at, int) and at % accumulation]
         if inside:
             raise ValueError(f"cooldowns at steps {inside} branch inside an update of {accumulation} steps")
-        points = [every_step(at, steps, tokens, accumulation, name="cooldowns.at") for at in self.at]
+        points = [every_step(at, steps, tokens, accumulation, name="cooldowns.at", examples=examples)
+                  for at in self.at]
         return tuple(Branch(point, self) for point in points if point is not None)
 
     def factor(self, update: int, updates: int) -> float:
@@ -79,9 +82,9 @@ class Cooldowns:
 @dataclasses.dataclass(frozen=True)
 class Branch:
     """One cooldown point as a run resolved it: a step, or a committed-token count whose passing step
-    branches (`Tokens`)."""
+    branches (`Counted`)."""
 
-    at: int | Tokens
+    at: int | Counted
     cooldowns: Cooldowns
 
     def pending(self, current: int, accumulation: int) -> Pending:
@@ -90,10 +93,11 @@ class Branch:
         return {"step": current, "steps": self.cooldowns.steps(current, accumulation),
                 "shape": self.cooldowns.shape}
 
-    def due(self, step: int, real: int, before: int) -> bool:
-        """Whether the step `step`, which brought the committed tokens from `before` to `real`, branches."""
-        if isinstance(self.at, Tokens):
-            return before < self.at.every <= real
+    def due(self, step: int, counts: Mapping[str, tuple[int, int]] | None = None) -> bool:
+        """Whether the step `step`, which brought each counted clock's count from the second of its
+        `counts` to the first, branches: at its step, or where it crosses its point."""
+        if isinstance(self.at, Counted):
+            return self.at.crossed(counts or {})
         return step == self.at
 
     def recorded(self) -> JSON:

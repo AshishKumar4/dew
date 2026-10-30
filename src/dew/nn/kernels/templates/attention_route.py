@@ -22,7 +22,16 @@ import jax.numpy as jnp
 
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates import attention_mosaic, attention_portable, attention_triton
-from dew.nn.kernels.templates.attention import ACCURATE, NATURAL, Gradients, Hooks, KeySpans, Split
+from dew.nn.kernels.templates.attention import (
+    ACCURATE,
+    NATURAL,
+    OUTPUT,
+    Gradients,
+    Hooks,
+    KeySpans,
+    Split,
+    takes_output_residuals,
+)
 
 PLAIN_TILE = attention_triton.BLOCK
 """The plain-JAX mainloop's tile: the query and key blocks a call walks, and the padding it takes to whole
@@ -146,18 +155,15 @@ class _Pass:
     it takes it) and why the Triton one refuses its spans (`attention_triton.refused`)."""
 
     on_gpu: bool
-    mosaic: str | None
-    triton: str | None
+    mosaic: selection.Refusal | None
+    triton: selection.Refusal | None
 
 
 _ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the call runs off a GPU",
                                        generation.INHERENT)
 MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
-    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.Requirement[_Pass](
-        'declined', lambda case: case.mosaic is None, lambda case: str(case.mosaic),
-        'roadmap: the Mosaic template takes every call'))),
-    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.Requirement[_Pass](
-        'spans', lambda case: case.triton is None, lambda case: str(case.triton), generation.INHERENT))),
+    selection.Kernel[_Pass]('mosaic', (_ON_GPU, lambda case: case.mosaic)),
+    selection.Kernel[_Pass]('triton', (_ON_GPU, lambda case: case.triton)),
     selection.Kernel[_Pass]('portable', (), generic=True),
 ), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')
 """The template's mainloops, the first that takes a pass: Mosaic GPU's, which a GPU prefers, the frozen
@@ -167,7 +173,7 @@ route, so the kernel-route audit sees a call on a GPU that leaves the Mosaic tem
 reason."""
 
 
-def _mainloop(declined: str | None, spans: KeySpans, hooks: Hooks, unfitted) -> str:
+def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks, unfitted) -> str:
     """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
     Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's) or of
     the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting)."""
@@ -178,14 +184,18 @@ def _mainloop(declined: str | None, spans: KeySpans, hooks: Hooks, unfitted) -> 
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
              config: _Config, *, residuals: bool):
-    """The forward on its mainloop (`_mainloop`)."""
+    """The forward on its mainloop (`_mainloop`): the Mosaic one's training forward keeping its output for the
+    backward's D where the call takes that (`takes_output_residuals`), whichever mainloop runs the backward
+    (the residuals are every mainloop's, `output_split`)."""
     form = {"scale": config.scale, "natural": config.natural}
-    declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=residuals,
+    kept = (OUTPUT if residuals and takes_output_residuals(hooks, query.dtype, accurate=config.accurate)
+            else residuals)
+    declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
                                                  **form) if _on_gpu() else None
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
         attention_triton.unfitted, query, key, value, spans, hooks, residuals=residuals, **form))
     if mainloop == 'mosaic':
-        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=residuals, **form)
+        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, **form)
     if mainloop == 'triton':
         return attention_triton.forward(query, key, value, spans, hooks, residuals=residuals, **form)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,

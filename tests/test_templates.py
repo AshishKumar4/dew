@@ -11,9 +11,32 @@ import jax.numpy as jnp
 import pytest
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement, select
+from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, Requirement, select
 from dew.nn.kernels.templates.base import Call, Template, Unfitted, call
 from dew.nn.kernels.tuning import Unpinnable
+
+
+def test_a_templates_refusal_reaches_the_forced_call_without_reconstruction():
+    limit = Refusal("workspace", "the call exceeds the available workspace", "resource model")
+    operation = Op("grouped_matmul", (Kernel("native", (lambda size: limit if size > 4 else None,)),
+                                       Kernel("plain", (), generic=True)))
+    select(operation, 4, named="native")
+    with pytest.raises(KernelRefused) as refused:
+        select(operation, 5, named="native")
+    assert refused.value.refusals == [limit]
+
+
+def test_a_tensor_memory_launch_refuses_an_automatic_mesh_axis():
+    from dew.nn.kernels.templates.mosaic_sm100 import TCGEN05
+
+    mesh = jax.sharding.AbstractMesh((2,), ("data",), axis_types=(jax.sharding.AxisType.Auto,))
+
+    def copy(source, output):
+        output[...] = source[...]
+
+    with jax.sharding.use_abstract_mesh(mesh), pytest.raises(ValueError):
+        TCGEN05.kernel(copy, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), grid=(1,),
+                       grid_names=("programs",), scratch=(), interpret=True)
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -189,16 +212,20 @@ def test_an_explicit_config_the_call_cannot_hold_is_refused_as_a_pin_is():
         assert jnp.array_equal(Doubling().replace(config=Block(64))(x), x * 2)
 
 
-def test_a_launch_builds_its_key_only_where_something_reads_it(monkeypatch):
+def test_a_launch_builds_its_key_only_where_something_reads_it():
     """A launch with no collector, pin or tuning read never builds its key (`KernelOp.keyed`, which traces
     its hooks; row 1866 K4); a collector reads it."""
     built = []
-    original = Doubling.keyed
-    monkeypatch.setattr(Doubling, "keyed", lambda self, ba: built.append(1) or original(self, ba))
+
+    class Counted(Doubling):
+        def keyed(self, ba):
+            built.append(1)
+            return super().keyed(ba)
+
     x = jnp.ones((64, 8), jnp.float32)
     with generation.assumed("sm80"):
-        Doubling()(x)
+        Counted()(x)
         assert built == []
         with tuning.seen():
-            Doubling()(x)
+            Counted()(x)
     assert built == [1]

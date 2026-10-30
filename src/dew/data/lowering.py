@@ -34,7 +34,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew._records import boolean, integer, integers, record, strings
-from dew.batch import Batch
+from dew.batch import EXAMPLES_CONSUMED, Batch
 from dew.data.analysis import (
     _LOCAL,
     _VIEWS,
@@ -74,6 +74,7 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import (
     Accepted,
+    Carried,
     Chunked,
     CorpusCounts,
     KeyedMix,
@@ -85,9 +86,11 @@ from dew.data.mixing import (
 )
 from dew.data.packing import FirstFitPacked
 from dew.data.pipeline import (
+    CONSUMED,
     Artifact,
     Batched,
     BatchStage,
+    Consumed,
     Expansion,
     Filter,
     FlatMap,
@@ -394,11 +397,40 @@ def _chained(
     *, counts: CorpusCounts | None = None,
 ) -> tuple[Record, ...]:
     """What adjacent record `stages` make of one row: each stage's `_outputs` over every output of
-    the one before, a marker passing through the rest."""
+    the one before, a marker passing through the rest, each row's consumed source examples carried to
+    the last output a stage makes of it (`_consumed_by`)."""
     held: tuple[Record, ...] = (value,)
     for stage in stages:
-        held = tuple(made for given in held for made in _outputs(stage, position, given, rng, counts=counts))
+        step = functools.partial(_outputs, stage, position, rng=rng, counts=counts)
+        held = tuple(made for given in held for made in _consumed_by(given, step))
     return held
+
+
+def _consumes(pipeline: Pipeline) -> bool:
+    """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
+    examples marks each where its bound is (`Consumed`), so every row after it holds a count."""
+    return any(isinstance(stage, Map) and isinstance(stage.step, Consumed) for stage in pipeline.stages)
+
+
+def _consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> tuple[Record, ...]:
+    """`step`'s outputs of `given`, the source examples `given` consumes (`CONSUMED`) kept out of the step's
+    sight and carried to its last output: a row's count beside its own, a rejected row's on its marker
+    (`Rejected.consumed`), which the corpus's next kept row carries on (`Accepted`). Every other row
+    holds none, so the rows of one read hold the same fields."""
+    if given is None or isinstance(given, (bytes, Rejected)) or CONSUMED not in given:
+        return step(given)
+    consumed = integer(given[CONSUMED], "a row's consumed examples")
+    outputs = step({name: column for name, column in given.items() if name != CONSUMED})
+    *rest, last = outputs
+    rest = [{CONSUMED: 0, **row} if isinstance(row, Mapping) else row for row in rest]
+    if isinstance(last, Rejected):
+        carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed)
+    elif isinstance(last, Mapping):
+        carried = {**last, CONSUMED: consumed + integer(last.get(CONSUMED, 0), "a row's consumed examples")}
+    else:
+        raise ValueError(f"a row of a run bounded in examples became {type(last).__name__}, which carries no "
+                         "count of the examples it consumes; a step after the bound returns records")
+    return (*rest, carried)
 
 
 def _run(
@@ -486,6 +518,29 @@ type Field = Batch | np.ndarray | np.generic | str | bytes | int | float | bool 
 """A record's field, as the steps before a batch leave it."""
 
 
+def _consumed_forward(elements: Sequence[Record]) -> list[Record]:
+    """`elements` in their order, each rejected row's consumed examples (`Rejected.consumed`) carried on
+    to the next row kept after it, as the corpus's reading carries them (`Accepted`), so a group that
+    holds its markers apart from its rows (`_Grouped`) moves none to an earlier row: only a marker no row
+    follows in the group keeps its count, which `_Ungrouped` hands on after the group's rows."""
+    carried: list[Record] = []
+    owed: list[int] = []
+    for element in elements:
+        if isinstance(element, Rejected) and element.consumed:
+            owed.append(len(carried))
+        elif owed and isinstance(element, Mapping) and CONSUMED in element:
+            pending = 0
+            for at in owed:
+                marker = carried[at]
+                assert isinstance(marker, Rejected)
+                pending += marker.consumed
+                carried[at] = dataclasses.replace(marker, consumed=0)
+            element = {**element, CONSUMED: integer(element[CONSUMED], "a row's consumed examples") + pending}
+            owed = []
+        carried.append(element)
+    return carried
+
+
 @dataclasses.dataclass
 class _Grouped:
     """A loading worker's records and the markers of those its steps dropped, a batch's count at a
@@ -499,12 +554,16 @@ class _Grouped:
         self.shared = True
 
     def __call__(self, elements: Sequence[Record]) -> Batch:
+        elements = _consumed_forward(elements)
         markers = [element for element in elements if isinstance(element, Rejected)]
         rows = [element for element in elements if not isinstance(element, Rejected)]
         records = [row for row in rows if isinstance(row, Mapping)]
         alike = (bool(rows) and len(records) == len(rows)
                  and all(row.keys() == records[0].keys() for row in records))
-        held = {name: self.column([row[name] for row in records]) for name in records[0]} if alike else rows
+        # The source examples each row consumes are the run's accounting, no batch column: they cross as
+        # the integers they are, which the reading process counts (`_Ungrouped`, `Accepted`).
+        held = ({name: [row[name] for row in records] if name == CONSUMED else
+                 self.column([row[name] for row in records]) for name in records[0]} if alike else rows)
         return {"held": held, "alike": alike, "rows": len(rows), "markers": markers}
 
     def column(self, values: list[Field]) -> np.ndarray | list[Field]:
@@ -530,10 +589,12 @@ class _Ungrouped:
     max_fan_out: int
 
     def flat_map(self, group: Batch) -> Sequence[Record]:
-        markers = list(group["markers"])
+        markers = [marker for marker in group["markers"] if not marker.consumed]
+        # A marker of the examples the group's last rows were the last of follows its rows.
+        trailing = [marker for marker in group["markers"] if marker.consumed]
         held, count = group["held"], integer(group["rows"], "grouped rows")
         if not group["alike"]:
-            return [*markers, *held]
+            return [*markers, *held, *trailing]
         columns: dict[str, np.ndarray | list] = {}
         for name, column in record(held, "grouped records").items():
             # A batch's column: an array, or a list of a field's values that don't stack.
@@ -541,7 +602,7 @@ class _Ungrouped:
                 raise TypeError(f"a grouped column {name!r} is a {type(column).__name__}, not a batch column")
             columns[name] = column
         rows = ({name: column[index] for name, column in columns.items()} for index in range(count))
-        return [*markers, *rows]
+        return [*markers, *rows, *trailing]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -553,6 +614,11 @@ class _Groups:
 
     def flat_map(self, group: list[Record]) -> Sequence[Record]:
         rows = [record(value, "batched input") for value in group]
+        # The source examples the group's rows consume are the run's accounting, out of the step's sight:
+        # a step that keeps its rows keeps each row's, and one that makes others gives their sum to its
+        # last row, as a record step's expansion does (`_consumed_by`).
+        consumed = [integer(row[CONSUMED], "a row's consumed examples") for row in rows if CONSUMED in row]
+        rows = [{name: value for name, value in row.items() if name != CONSUMED} for row in rows]
         columns = {name: [row[name] for row in rows] for name in rows[0]}
         made = dict(self.stage.step(columns))
         counts = {len(values) for values in made.values()}
@@ -563,9 +629,18 @@ class _Groups:
             if count != len(rows):
                 raise ValueError(f"map(batched=True) keeps the {len(rows)} rows it reads, and its step "
                                  f"returned {count}; flat_map(batched=True) changes the count")
-            return [{**row, **{name: values[index] for name, values in made.items()}}
+            kept = [{**row, **{name: values[index] for name, values in made.items()}}
                     for index, row in enumerate(rows)]
-        return [{name: values[index] for name, values in made.items()} for index in range(count)]
+            return kept if not consumed else [{**row, CONSUMED: held}
+                                              for row, held in zip(kept, consumed, strict=True)]
+        outputs = [{name: values[index] for name, values in made.items()} for index in range(count)]
+        if not consumed:
+            return outputs
+        if not outputs:
+            # A group it makes no rows of leaves its examples on a marker, which the next row carries on
+            # (`Carried`).
+            return [Rejected("empty_expansion", consumed=sum(consumed))] if sum(consumed) else []
+        return [*({**row, CONSUMED: 0} for row in outputs[:-1]), {**outputs[-1], CONSUMED: sum(consumed)}]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -839,29 +914,54 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
 class _Ruled(pygrain.IterDataset):
     """The windows a pack or windows stage makes of `documents`, each counted by the one rule its
     documents' targets were counted by (`counted_window`), as a memory read counts them
-    (`materialize._targeted`): a document's count describes no window."""
+    (`materialize._targeted`): a document's count describes no window. Where the documents carry
+    the source examples they consume (`consumed`, `CONSUMED`), each document's count stands at its
+    last token, a field the stage lays out beside its tokens, and a window's is what it holds of them
+    (`_ConsumedAt`)."""
 
-    def __init__(self, documents: pygrain.IterDataset, stage: Pack | Windows):
+    def __init__(self, documents: pygrain.IterDataset, stage: Pack | Windows, consumed: bool = False):
         super().__init__(documents)
-        self._documents, self._stage = documents, stage
+        self._documents, self._stage, self._consumed = documents, stage, consumed
 
     def __iter__(self) -> pygrain.DatasetIterator:
         from dew.data.steps.windows import CausalWindows
 
         seen = LayoutRule()
-        documents = self._documents.map(seen)
-        windows = (_packed(documents.map(self._stage.document), self._stage)
-                   if isinstance(self._stage, Pack) else CausalWindows(documents, self._stage))
-        return _RuledIterator(iter(windows), seen, self._stage.fields[0])
+        documents, stage = self._documents.map(seen), self._stage
+        if self._consumed:
+            documents = documents.map(_ConsumedAt(stage.fields[0]))
+            stage = dataclasses.replace(stage, fields=(*stage.fields, CONSUMED))
+        windows = (_packed(documents.map(stage.document), stage)
+                   if isinstance(stage, Pack) else CausalWindows(documents, stage))
+        return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ConsumedAt:
+    """A document's consumed source examples (`CONSUMED`) as a field beside its `field`'s tokens: its
+    count at its last token, none at the rest, so the window that holds that token holds it."""
+
+    field: str
+
+    def __call__(self, document: Batch) -> Batch:
+        held = np.zeros(len(document[self.field]), np.int32)
+        if len(held):
+            held[-1] = integer(document.get(CONSUMED, 0), "a row's consumed examples")
+        return {**document, CONSUMED: held}
 
 
 class _RuledIterator(pygrain.DatasetIterator):
-    def __init__(self, windows: pygrain.DatasetIterator, seen: LayoutRule, field: str):
+    def __init__(self, windows: pygrain.DatasetIterator, seen: LayoutRule, field: str, *,
+                 consumed: bool = False):
         super().__init__(windows)
-        self._windows, self._seen, self._field = windows, seen, field
+        self._windows, self._seen, self._field, self._consumed = windows, seen, field, consumed
 
     def __next__(self) -> Batch:
-        return counted_window(next(self._windows), self._seen.rule, self._field)
+        window = counted_window(next(self._windows), self._seen.rule, self._field)
+        if not self._consumed:
+            return window
+        # The window consumes the source examples its documents' last tokens hold.
+        return {**window, CONSUMED: int(np.sum(window[CONSUMED]))}
 
     def get_state(self) -> Mapping[str, object]:
         return {"windows": self._windows.get_state(), "rule": self._seen.state()}
@@ -1650,6 +1750,8 @@ class _Build:
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, _Groups(stage))
+            if _consumes(pipeline):
+                rows = Carried(rows)
         else:
             return self.layout_stage(rows, stage, pipeline)
         return rows
@@ -1660,7 +1762,8 @@ class _Build:
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             rows = _TokenSplit(rows, stage)
         elif isinstance(stage, (Pack, Windows)):
-            rows = self.targeted(_Ruled(_as_iter(rows, self.loading), stage), stage.fields[0], pipeline)
+            rows = self.targeted(_Ruled(_as_iter(rows, self.loading), stage, consumed=_consumes(pipeline)),
+                                 stage.fields[0], pipeline)
         elif isinstance(stage, Artifact):
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
@@ -2104,10 +2207,14 @@ def _workers(pipeline: Pipeline, loading: Loading) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class _Payload:
-    """A row without the private fields Dew's own steps carry to the batch."""
+    """A row without the private fields Dew's own steps carry to the batch, the source examples it
+    consumes (`CONSUMED`) its batch's column of them (`EXAMPLES_CONSUMED`)."""
 
     def __call__(self, row: Batch) -> Batch:
-        return {name: value for name, value in row.items() if not name.startswith("_dew_")}
+        payload = {name: value for name, value in row.items() if not name.startswith("_dew_")}
+        if CONSUMED in row:
+            payload[EXAMPLES_CONSUMED] = np.int32(integer(row[CONSUMED], "a row's consumed examples"))
+        return payload
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2164,6 +2271,9 @@ class _Batched:
                 "every record, or be read with read='memory', which leaves missing records out"
             )
         payload = [_Payload()(row) for row in rows]
+        if any(EXAMPLES_CONSUMED in row for row in payload):
+            # A row a run bounded in examples reads without a count of its own consumes none.
+            payload = [{EXAMPLES_CONSUMED: np.int32(0), **row} for row in payload]
         if self.batch_fn is not None:
             return stacked(payload, self.batch_fn)
         return stacked(payload, functools.partial(record_batch, shared=self.shared))

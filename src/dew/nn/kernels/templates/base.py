@@ -15,7 +15,7 @@ from typing import ClassVar, TypeGuard
 import tokamax
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import cost
+from dew.nn.kernels.templates import cost, report
 
 
 class Template[Config: Hashable](tuning.KernelOp):
@@ -74,9 +74,10 @@ class Template[Config: Hashable](tuning.KernelOp):
     def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
         """Whether a program of the launch of `ba` at `config` fits a block of `target`
         (`generation.shared_budget`) and its threads hold their registers (`registers`,
-        `register_budget`): a generated kernel spills nothing."""
-        return self.staged_bytes(ba, config, target) <= self.program_shared(config, target) and self._held(
-            ba, config)
+        `register_budget`), a compile of this process having found it spill nothing (`report.refused`):
+        a generated kernel spills nothing."""
+        return (self.staged_bytes(ba, config, target) <= self.program_shared(config, target)
+                and self._held(ba, config) and not report.refused(self, ba, config))
 
     def program_shared(self, config: Config, target: generation.GpuTarget) -> int:
         """The shared memory a program of the launch at `config` may stage on `target`: a block's
@@ -173,7 +174,7 @@ def dividing[C](configs: Sequence[C], extents: tuple[int, ...],
                  if all(extent % block == 0 for extent, block in zip(extents, blocks(config), strict=True)))
 
 
-class Unfitted(ValueError):
+class Unfitted(report.Exhausted):
     """A call no config of a launch holds: its programs stage at least `least` bytes of shared memory,
     past the `budget` a block of `generation` holds, or (`least` None) no config's threads hold their
     registers (`Template.register_budget`), or the launch declares none."""
