@@ -14,7 +14,8 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
   gradient on par from float64 with the portable rule's; their training step the same bit for bit each
   run, on the port and on the template; a gated delta net's decode tokens on its decode kernels (the fused
   step and the step alone), its state held in fp32 and in bf16, on par with the portable step's; and the
-  port on par with fla's own in fp32 and mixed dtypes (test_fla_gdn).
+  port on par with fla's own in fp32 and mixed dtypes (test_fla_gdn), fla run in the reference interpreter
+  DEW_FLA_PYTHON names, which a GPU job provides to a file naming it.
 """
 
 import functools
