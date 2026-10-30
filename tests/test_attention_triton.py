@@ -64,7 +64,7 @@ def geometry(case: dict) -> tuple[int, int]:
 PINNED = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
           attention_triton.Tiles(32, 64, 8, 3), attention_triton.Tiles(128, 128, 8, 2))
 """The configs each case runs at on the CPU, where interpreting all of `SPACE` would take hours; a GPU
-runs every config (`test_every_config_on_a_gpu`)."""
+runs every config (`every_config_on_a_gpu`, a cell of tests/test_gpu_attention.py)."""
 
 
 def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 32):
@@ -218,10 +218,7 @@ def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, val
     check(CASES["causal"], HOOKS["none"], jnp.bfloat16, PINNED[0], width=width, value_width=value_width)
 
 
-@pytest.mark.gpu(reason="every config compiles for the GPU")
-@pytest.mark.parametrize("case", ["causal-documents-window", *IRREGULAR])
-@pytest.mark.parametrize("config", attention_triton.SPACE, ids=str)
-def test_every_config_on_a_gpu(config, case):
+def every_config_on_a_gpu(config, case):
     """Every config of the space, bf16, every hook: over causal documents under a window, and over the
     irregular full and causal calls (`IRREGULAR`)."""
     check({**CASES, **IRREGULAR}[case], HOOKS["all"], jnp.bfloat16, config, residuals=True)
@@ -666,10 +663,7 @@ def test_the_backward_walks_many_key_tiles(case):
     check_backward(IRREGULAR[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.float32, PINNED[0])
 
 
-@pytest.mark.gpu(reason="every config compiles for the GPU")
-@pytest.mark.parametrize("case", ["causal-documents-window", *IRREGULAR])
-@pytest.mark.parametrize("config", attention_triton.BACKWARD_SPACE, ids=str)
-def test_every_backward_config_on_a_gpu(config, case):
+def every_backward_config_on_a_gpu(config, case):
     """Every config of the backward's space, bf16, a softcap, sinks and ALiBi, over causal documents
     under a window and over the irregular full and causal calls (`IRREGULAR`): each config the launch takes
     at the call (`TritonBackward.fitting`: its threads within their registers, its programs within a block's

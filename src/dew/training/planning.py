@@ -18,7 +18,7 @@ import tempfile
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -35,13 +35,15 @@ from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kernels.templates import report
+from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.profile import active_profile, capture_options
-from dew.training.ahead import handed
+from dew.training.ahead import handed, program_of
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
 from dew.training.memory import (
+    climbed,
     compiled_if_it_fits,
     derived_headroom,
     head_fused_of,
@@ -50,6 +52,7 @@ from dew.training.memory import (
     recompute_more,
     recompute_record,
     remat_half,
+    remat_more,
     rung_record,
     step_fits,
     temporaries_factor,
@@ -131,6 +134,9 @@ class Candidate:
     kernels: KernelReport
     footprint: Footprint | None
     """Its derived device footprint; None for a custom step not differentiating the objective."""
+    sampled: Callable[[], jax.stages.Lowered] | None = None
+    """The same step summarizing what the run inspects at its commit, lowered on call
+    (`dew.training.inspection`); None in a run that inspects nothing."""
 
     @property
     def lowered(self) -> jax.stages.Lowered:
@@ -155,6 +161,14 @@ class Relowered:
         """The candidate the executable compiled from: `compiled`, the one first lowered, where the
         compile lowered none afresh."""
         return compiled if self.last is None else self.last
+
+
+class SampledStep(NamedTuple):
+    """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
+    from (`dew.training.ahead.program_of`) and its executable."""
+
+    program: str
+    executable: jax.stages.Compiled
 
 
 @jax.jit
@@ -312,6 +326,9 @@ class Planned:
     tile: tuple[int, int] | None
     fused: bool
     profiled: tuple[int, int] | None = None
+    sampled: SampledStep | None = None
+    """The step that also summarizes what the run inspects (`Candidate.sampled`), compiled under the
+    plan's options and admitted with it (`FitSearch.measured`); None in a run that inspects nothing."""
 
     def record(self) -> dict[str, JSON]:
         record: dict[str, JSON] = {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
@@ -536,6 +553,10 @@ class FitSearch[LossT, EffectsT]:
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
+    sampled: SampledStep | None = None
+    """The last measured candidate's sampled step (`measured`)."""
+    fitted_sampled: SampledStep | None = None
+    """The fitted plan's sampled step, which summarizes what the run inspects (`Candidate.sampled`)."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
@@ -587,15 +608,34 @@ class FitSearch[LossT, EffectsT]:
         compiles, so the search's first compile confirms it and a miss climbs on as a correction; the
         rungs read are `derived`. A rung the derivation cannot judge ('unknown': residuals over several
         devices, devices stating no memory) ends the walk where it started, at the base rung, as does a
-        ladder no rung of which fits; so does a run that sets its remat, which compiles at it alone.
-        The derivation names no XLA workspace, so a 'fits' is a first guess and the compile the
-        decision."""
-        if self.derive is None or self.resumed is not None or self.remat_set:
+        ladder no rung of which fits. A run that sets its remat compiles at it alone, told first where
+        the derivation fits a lighter rung (`advise`). The derivation names no XLA workspace, so a
+        'fits' is a first guess and the compile the decision."""
+        if self.derive is None or self.resumed is not None:
+            return
+        if self.remat_set:
+            self.advise(split)
             return
         base = (tuple(entry.module for entry in self.objective.program_key()), head_tile_of(self.objective),
                 head_fused_of(self.objective))
-        narrow = self.narrow
-        while True:
+        label, narrow = self.walked(split)
+        if label != "fits":
+            self.objective.substitute(list(base[0]))
+            self.objective.restore_head(base[1], fused=base[2])
+            narrow = self.narrow
+        elif self.remat_rung() != self.started:
+            _log.info("the derivation says the step fits from remat %s; compiling there first",
+                      self.remat_rung())
+        self.narrow = narrow
+
+    def walked(self, split: int, until: str | None = None) -> tuple[str, bool]:
+        """Climb the objective from its rung to the least-recompute one whose derived footprint at `split`
+        fits the devices, each rung read appended to `derived`: the label the walk ends on, and whether
+        the rung keeps the narrow copies. It ends where a rung fits, where the derivation cannot judge one,
+        where the ladder ends, and, with `until`, at that remat (`remat_rung`), which it does not read."""
+        assert self.derive is not None
+        narrow, label = self.narrow, "refuses"
+        while until is None or self.remat_rung() != until:
             candidate = self.derive(split, narrow)
             footprint = candidate.footprint
             headroom = None if footprint is None else derived_headroom(
@@ -612,14 +652,40 @@ class FitSearch[LossT, EffectsT]:
             narrow = False
             if not self.onward(lambda: recompute_more(self.objective, self.base)):
                 break
-        if label != "fits":
-            self.objective.substitute(list(base[0]))
-            self.objective.restore_head(base[1], fused=base[2])
-            narrow = self.narrow
-        elif self.remat_rung() != self.started:
-            _log.info("the derivation says the step fits from remat %s; compiling there first",
-                      self.remat_rung())
-        self.narrow = narrow
+        return label, narrow
+
+    def advise(self, split: int) -> None:
+        """Tell a run that sets its remat, before it compiles there alone (row 2111), the least-recompute
+        rung its derivation finds fits where that recomputes less (row 2536): each trained module that
+        chooses its remat (`RematChoosing`) is read from no remat up to the run's own, which the walk
+        never reads, and the run's own modules and head are put back. A run whose remat the ladder's climb
+        from none never reaches (a policy off `DECODER_REMAT`, or a rung the climb passes over) is told
+        nothing, and traces nothing for it: no rung below its own is known."""
+        entries = self.objective.program_key()
+        if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
+            return
+        held, own = [entry.module for entry in entries], self.remat_rung()
+        tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
+        lightest = [entry.module.with_remat(None) if entry.trained and isinstance(entry.module, RematChoosing)
+                    else entry.module for entry in entries]
+        label = found = None
+        try:
+            # The rungs the climb takes, read off the modules alone, which trace nothing.
+            self.objective.substitute(lightest)
+            climbed = [self.remat_rung()]
+            while remat_more(self.objective):
+                climbed.append(self.remat_rung())
+            if own in climbed:
+                self.objective.substitute(lightest)
+                label, _ = self.walked(split, until=own)
+                found = self.remat_rung()
+        finally:
+            self.objective.substitute(held)
+            self.objective.restore_head(tile, fused=fused)
+        if label == "fits" and found != own:
+            _log.warning("the run sets remat %s, and the derivation says the step fits from remat %s, which "
+                         "recomputes less: leave the remat unset and the run compiles there first", own,
+                         found)
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
@@ -656,18 +722,40 @@ class FitSearch[LossT, EffectsT]:
         where it fits the devices, or for the search's first compile the step compiled ahead
         (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
         (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
-        else untouched."""
+        else untouched. A run that inspects compiles the candidate's sampled step too
+        (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
+        must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
+        measure."""
         options = self.required if self.xla_defaults else self.options(candidate)
-        taken = self.ahead is not None
+        taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
-        if self.ahead is not None:
-            executable, self.ahead = self.ahead.taken(candidate.lowered), None
+        if ahead is not None:
+            executable, self.ahead = ahead.taken(candidate.lowered), None
         else:
             relowered = Relowered(lambda: self.lower(split, self.narrow))
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
             candidate = relowered.candidate(candidate)
-        seconds = time.perf_counter() - began
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
+        self.sampled = None
+        if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
+            # The sampled step compiled ahead with the step, lowered as its compile lowered it (`handed`),
+            # which its target compiles none of.
+            with handed(ahead):
+                sampled = candidate.sampled()
+            self.sampled = SampledStep(ahead.sampled.program, ahead.sampled.taken(sampled, jax.devices()))
+        elif fit and candidate.sampled is not None:
+            lowered = [candidate.sampled()]
+
+            def resampled() -> jax.stages.Lowered:
+                """The sampled step lowered afresh, its launches derived past a spilled one's config."""
+                again = self.lower(split, self.narrow).sampled
+                assert again is not None
+                lowered.append(again())
+                return lowered[-1]
+            compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled)
+            self.sampled = None if compiled is None else SampledStep(program_of(lowered[-1]), compiled)
+            fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
+        seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
         return options, candidate, executable, probe
@@ -686,7 +774,7 @@ class FitSearch[LossT, EffectsT]:
         self.forecast.read(self.rung(), split, executable, headroom, self.factor)
         if fit:
             assert executable is not None
-            self.fitted = candidate, executable, self.chosen
+            self.fitted, self.fitted_sampled = (candidate, executable, self.chosen), self.sampled
             return True
         if self.resumed is not None:
             _log.warning("the step does not fit the devices at the rung its checkpoint trained on (%s); from "
@@ -700,7 +788,7 @@ class FitSearch[LossT, EffectsT]:
         own rung alone (row 2111), and planning it ahead at each policy, with each GPU's memory stated
         (`--trainer.compile-ahead.capacity-gib`), compiles the others offline."""
         remat = admitted.rung["remat"]
-        if remat is not None and json.dumps(remat, sort_keys=True) == self.started:
+        if self.remat_set and json.dumps(remat, sort_keys=True) == self.started:
             _log.info("the run sets remat %r and compiles at it alone; --trainer.compile-ahead with "
                       "--trainer.compile-ahead.capacity-gib plans it on its GPUs offline, at each remat "
                       "policy asked, to tell what else fits", remat)
@@ -718,10 +806,19 @@ class FitSearch[LossT, EffectsT]:
             return True
         self.xla_defaults = False
         self.lowered.clear()
-        return self.onward(lambda: recompute_more(self.objective, self.base))
+        return self.onward(self.compiled_again)
+
+    def compiled_again(self) -> bool:
+        """Climb the objective one rung, as `recompute_more` does, saying it compiles the step again
+        there."""
+        moved = climbed(self.objective, self.base)
+        if moved is not None:
+            _log.warning("the step does not fit the devices %s", moved)
+        return moved is not None
 
     def found(self, split: int) -> Planned:
         assert self.fitted is not None
         modules = tuple(entry.module for entry in self.objective.program_key())
         return Planned(split, *self.fitted, self.xla_defaults, self.narrow, self.current(), modules,
-                       head_tile_of(self.objective), head_fused_of(self.objective))
+                       head_tile_of(self.objective), head_fused_of(self.objective),
+                       sampled=self.fitted_sampled)

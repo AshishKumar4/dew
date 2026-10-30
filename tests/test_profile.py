@@ -293,8 +293,7 @@ def test_a_capture_that_holds_less_than_its_run_says_why():
     assert held_back(Path("absent"), {"backend": "cpu", "device_kinds": ["cpu"]}) == []
 
 
-@pytest.mark.gpu(reason="CUPTI's activity cap, which a GPU capture alone has")
-def test_a_gpu_window_past_cuptis_cap_reports_no_device_figure_its_kernels_cannot_establish(tmp_path):
+def a_gpu_window_past_cuptis_cap_reports_no_device_figure_its_kernels_cannot_establish(tmp_path):
     """A window whose kernels pass CUPTI's activity cap keeps only the events before it: its capture is
     partial, the cap its reason, and the report gives no device figure the surviving kernels cannot
     establish, its host figures kept; with no cap (-1) the capture is whole and its device figures measured

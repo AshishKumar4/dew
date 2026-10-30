@@ -789,8 +789,7 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
 
 
-@pytest.mark.gpu(reason="reads a CUDA device's attributes")
-def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
+def a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
     """The default device's shared memory a block and multiprocessors come from JAX's device: a bare
     target of its generation, holding none of the table's resources, takes the same ones the
     default device's target reports, and the row's own where the table records them."""
@@ -805,8 +804,7 @@ def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_
         assert named.shared_limit == row.shared_limit
 
 
-@pytest.mark.gpu(reason="reads a CUDA device's clocks from its driver")
-def test_a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
+def a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
     """The default device's multiprocessor clock and memory bandwidth, which JAX's device does not
     carry, come from the CUDA driver at the device's own ordinal (`local_hardware_id`, which a process
     seeing a subset of the GPUs numbers from zero): positive, and a GPU's bandwidth between that of the
@@ -817,9 +815,7 @@ def test_a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
     assert min(rows) / 2 < target.memory_bandwidth < 2 * max(rows)
 
 
-@pytest.mark.gpu(reason="two processes, each seeing one of two GPUs")
-@pytest.mark.skipif(jax.default_backend() != "gpu" or len(jax.devices()) < 2, reason="needs two GPUs")
-def test_each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
+def each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
     """Two processes, each seeing one GPU (`CUDA_VISIBLE_DEVICES`): the second's device is global id 1
     and its own ordinal 0, and each process's kernel target holds the CUDA driver's clock, bandwidth and
     multiprocessors for that GPU, the same in both, as GPUs of one kind give."""

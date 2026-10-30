@@ -246,11 +246,7 @@
    "lane": "Training"
   },
   "tests/test_fla_gdn.py": {
-   "comparisons": 22,
-   "lane": "Recurrence & Dory"
-  },
-  "tests/test_fla_kda.py": {
-   "comparisons": 2,
+   "comparisons": 19,
    "lane": "Recurrence & Dory"
   },
   "tests/test_flaxdiff.py": {
@@ -410,7 +406,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_linear_attention.py": {
-   "comparisons": 33,
+   "comparisons": 31,
    "lane": "Kernels"
   },
   "tests/test_llama4.py": {
