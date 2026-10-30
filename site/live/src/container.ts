@@ -3,14 +3,46 @@
 
 /**
  * Start `container` from `snapshot` without internet. A container stops only when destroyed or
- * when it fails: the log says which, and after how long, of `what`.
+ * when it fails: the log says which, and after how long, of `what`. How it ends (`ending`).
  */
 export function restore(container: Container, snapshot: ContainerSnapshot, what: string,
-	options: { entrypoint: string[]; env?: Record<string, string> }): void {
+	options: { entrypoint: string[]; env?: Record<string, string> }): Promise<string> {
 	container.start({ containerSnapshot: snapshot, instance: 'standard-4', enableInternet: false, ...options });
+	return ending(container, what, snapshot.id);
+}
+
+/**
+ * How `container`, just started, ends, in words, logged as it ends: "it exited", or why the runtime stopped it,
+ * a start it refused included (`monitor()`), of `what` and `id`.
+ */
+export function ending(container: Container, what: string, id: string): Promise<string> {
 	const started = Date.now();
-	container.monitor().then(() => console.log(`${what} container exited`, snapshot.id, Date.now() - started))
-		.catch((error) => console.error(`${what} container stopped`, snapshot.id, Date.now() - started, String(error)));
+	return container.monitor().then(() => {
+		console.log(`${what} container exited`, id, Date.now() - started);
+		return 'it exited';
+	}, (error) => {
+		console.error(`${what} container stopped`, id, Date.now() - started, String(error));
+		return String(error);
+	});
+}
+
+/** How long a refused start has to say why, once the container's first call found it not started. */
+const REFUSAL_MS = 10_000;
+
+/**
+ * `container`, just started, kept `idleMs` past its last request: its first call. A start the runtime refused
+ * leaves the container unstarted, which that call answers only as "The container has not been started", so
+ * the start's own refusal (`ended`, from `ending`) is said instead, within `REFUSAL_MS`: the runtime's "Account
+ * resource limit exceeded" where the account's containers are at its limits, as armada's fleet held them when
+ * the preview's trials ran (2026-10-30).
+ */
+export async function kept(container: Container, idleMs: number, ended: Promise<string>, what: string): Promise<void> {
+	try {
+		await container.setInactivityTimeout(idleMs);
+	} catch (error) {
+		const why = await Promise.race([ended, scheduler.wait(REFUSAL_MS).then(() => String(error))]);
+		throw new Error(`the ${what} container did not start: ${why}`);
+	}
 }
 
 /**

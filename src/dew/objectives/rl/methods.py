@@ -22,10 +22,8 @@ import math
 from collections.abc import Mapping
 from typing import TypedDict
 
-from .grpo import GRPOObjective
 
-
-class Rollout(TypedDict, total=False):
+class RolloutSettings(TypedDict, total=False):
     """A method's scheduler settings (`RolloutScheduler`): its estimator, DAPO's dynamic sampling, and
     its overlong punishment's budget and cache where it has one."""
 
@@ -56,25 +54,14 @@ class Method:
             settings["aggregation_tokens"] = max_new_tokens
         return settings
 
-    def rollout(self, max_new_tokens: int, overlong_cache: int | None = None) -> Rollout:
+    def rollout(self, max_new_tokens: int, overlong_cache: int | None = None) -> RolloutSettings:
         """The scheduler's settings for a response budget of `max_new_tokens`: the estimator, DAPO's
         dynamic sampling, and its overlong punishment over the last `overlong_cache` tokens of the
         budget (a quarter of it by default)."""
-        settings = Rollout(estimator=self.estimator, varied=self.varied)
+        settings = RolloutSettings(estimator=self.estimator, varied=self.varied)
         if self.overlong:
             settings["overlong"] = (max_new_tokens, overlong_cache or max(1, max_new_tokens // 4))
         return settings
-
-    def build(self, model, seq_len: int, *, max_new_tokens: int, overlong_cache: int | None = None,
-              **options) -> tuple[GRPOObjective, Rollout]:
-        """The method's objective over `model` and its rollout's settings (`rollout`); `options` set what
-        the method leaves free, and one it fixes is refused."""
-        settings = self.settings(max_new_tokens)
-        fixed = sorted(set(settings) & set(options))
-        if fixed:
-            raise ValueError(f"the method fixes {fixed}")
-        return (GRPOObjective(model, seq_len, **settings, **options),
-                self.rollout(max_new_tokens, overlong_cache))
 
 
 METHODS: dict[str, Method] = {

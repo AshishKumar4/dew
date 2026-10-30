@@ -403,11 +403,39 @@ def test_a_bf16_attention_with_a_side_of_one_is_on_par_with_float64(sides):
                     f"bf16 attention of {queries} queries over {keys} keys", seeds=SIDE_OF_ONE_SEEDS)
 
 
+DENSE_BIAS_SEEDS = 8
+"""Check 1's declared seeds for a dense bias named onto the template."""
+
+
+@pytest.mark.parametrize("rows", [2, 1], ids=["a bias a row", "one bias every row"])
+def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows):
+    """A causal bf16 call whose bias varies by query, `[B or 1, H, Q, K]` (a learned relative position's),
+    named onto the template: its score hook reads the bias a tile at a time (`template.biased`, a
+    `Kind.TILE` parameter), on par (check 1) with the reference path's dense bias from float64, its output
+    and the query's, key's, value's and bias's gradients (row 2081)."""
+    queries = 40
+
+    def drawn(seed):
+        rng = np.random.default_rng(seed)
+        query, key, value, cotangent = (
+            jnp.asarray(rng.standard_normal(shape), jnp.bfloat16) for shape in (
+                (2, queries, HEADS, WIDTH), (2, queries, KV_HEADS, WIDTH), (2, queries, KV_HEADS, WIDTH),
+                (2, queries, HEADS, WIDTH)))
+        bias = jnp.asarray(0.5 * rng.standard_normal((rows, HEADS, queries, queries)), jnp.float32)
+        return query, key, value, bias, cotangent
+
+    def attended(implementation):
+        return with_gradients(lambda query, key, value, bias: scaled_dot_product_attention(
+            query, key, value, bias=bias, causal=True, implementation=implementation))
+
+    assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), drawn,
+                    f"a dense bias of {rows} rows on the template", seeds=DENSE_BIAS_SEEDS)
+
+
 @pytest.mark.skipif(generation.device_generation() != "sm90",
                     reason="composes the route's mainloops, on an H100")
-@pytest.mark.gpu(reason="composes the route's Mosaic forward and Triton backward, on an H100")
 @pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
-def test_an_fp16_call_on_an_h100_is_on_par(case):
+def an_fp16_call_on_an_h100_is_on_par(case):
     """fp16 on an H100, whose Mosaic backward takes bf16 alone (`attention_mosaic.refused`), so its forward
     and backward compose two mainloops: on par with the reference path (check 1) whatever they run."""
     queries, keys = geometry(CASES[case])
@@ -417,10 +445,9 @@ def test_an_fp16_call_on_an_h100_is_on_par(case):
                     f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS)
 
 
-@pytest.mark.gpu(reason="walks a sequence of thousands of keys, on a GPU")
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
 @pytest.mark.parametrize("length", [4096, 8192])
-def test_a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
+def a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
     """A causal call of `length` tokens, two query heads over one key head (`WIDTH` wide), through the
     template on whichever mainloop the GPU runs it, on par with the reference path (check 1): D, the
     refinement and the denominator are sums the mainloops run in sequence over its key tiles where the

@@ -7,6 +7,7 @@
   (test_sequence_parallel), and sharded across processes compiles once (tests/sharded_attention_cells.py).
 - An NCCL push delivers every tensor to each replica on another GPU, bf16 and FP8 (test_rollout_servers).
 - Each process reads the facts of the GPU it sees (test_lowering).
+- Flash keeps the kernel contract on a mesh, over data and tensor axes (test_kernels).
 """
 
 import functools
@@ -15,10 +16,11 @@ import jax
 import pytest
 import sharded_attention_cells
 import test_distribution as distribution
+import test_kernels as kernels
 import test_lowering as lowering
 import test_rollout_servers as rollout
 import test_sequence_parallel as sequence_parallel
-from gpu_flow import Cell, run_cells
+from gpu_flow import Cell, cells_of, run_cells
 
 pytestmark = [pytest.mark.gpu(reason="two CUDA devices: NCCL, a cluster's device pins, sharded cuDNN"),
               pytest.mark.mesh(devices=2)]
@@ -60,6 +62,9 @@ def test_two_gpus_shard_cudnn_attention(tmp_path_factory, without_deterministic_
                on_two(functools.partial(sequence_parallel.cudnn_runs_inside_either_exchange, exchange, causal,
                                         without_deterministic_ops)))
           for exchange in sorted(sequence_parallel.EXCHANGES) for causal in (False, True)),
+        *(Cell(cell.label, on_two(cell.run))
+          for cell in cells_of(kernels.flash_keeps_the_kernel_contract_on_a_mesh,
+                               without_deterministic_ops=without_deterministic_ops)),
         Cell("a sharded cuDNN attention compiles once across processes",
              on_two(lambda: sharded_attention_cells.a_sharded_cudnn_attention_compiles_once_across_processes(
                  tmp_path_factory.mktemp("sharded"), without_deterministic_ops))),

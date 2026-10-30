@@ -33,7 +33,7 @@ from dew.nn.kernels.generation import triton_runs
 
 pytestmark = pytest.mark.gpu(reason="a GPU's own numerics, its kernels' configs and its driver's facts")
 
-DTYPES = (jnp.float32, jnp.bfloat16)
+DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 
 
 def when(holds: bool, reason: str, check):

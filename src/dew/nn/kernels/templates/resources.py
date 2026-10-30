@@ -20,6 +20,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import cost
 
 if TYPE_CHECKING:
+    from dew.nn.kernels.generation import GpuTarget
+    from dew.nn.kernels.templates.liveness import Compiler
     from dew.nn.kernels.templates.mosaic import Family
 
 
@@ -31,7 +33,13 @@ cap): a plain mainloop the accumulator and 32 (its step's descriptors too), exac
 16, an epilogue with a column vector the accumulator, the vector and 16."""
 
 PRODUCER_REGISTERS = 40
-"""The registers a thread of a cooperative block's producer warpgroup holds: it only issues loads."""
+"""The registers a thread of a cooperative block's producer warpgroup lowers to (`set_max_registers`): a
+measured bound, not yet the rule. A producer's rule is the least of setmaxnreg's steps of 8 (its floor 24,
+PTX ISA) holding its own issue code's live set, computed per launch once a liveness model prices the
+producer's branch, beside `Family.held_registers` and `CONTROL_REGISTERS`. The live sets vary (PRODFLOOR3,
+whole-program ptxas 12.9 and 13.4 with the raises honored): 24 holds the recurrence's training kernels' and
+the attention forward's and backward's producers at D64 and D128 but the natural training forward's at D128
+under 13.4, whose spill grows from 52 to 60 bytes below 40."""
 
 
 THREADS = 128
@@ -64,6 +72,27 @@ def allocated(*sizes: int) -> int:
     return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
 
 
+@dataclasses.dataclass(frozen=True)
+class RegisterAccount:
+    """A consumer's held workspace, charged once alongside its tile registers. Capacity derivations use
+    the inverse charge, and a separate phase contributes only its excess over that workspace."""
+    held: int
+
+    def total(self, live: int) -> int:
+        return self.held + live
+
+    def available(self, budget: int) -> int:
+        return budget - self.held
+
+    def extra(self, phase: int) -> int:
+        return max(0, self.available(phase))
+
+
+def register_account(family: "Family") -> RegisterAccount:
+    """The accounting for this family's held set; its current estimate has one reader here."""
+    return RegisterAccount(family.held_registers)
+
+
 def live_registers(family: "Family", carried, *phases) -> int:
     """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
     walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
@@ -75,7 +104,7 @@ def live_registers(family: "Family", carried, *phases) -> int:
         return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
 
     phase = max((words(tiles) for tiles in phases), default=0.0)
-    return int(-(-(words(carried) + phase) // THREADS)) + family.held_registers
+    return register_account(family).total(int(-(-(words(carried) + phase) // THREADS)))
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
@@ -124,7 +153,7 @@ def program_shared(block: int, programs: int) -> int:
 def held_area(family: "Family", consumers: int) -> int:
     """The fp32 accumulator elements `consumers` consumers of `family` hold beside what they hold besides
     (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns)."""
-    return (family.registers(consumers) - family.held_registers) * THREADS * consumers
+    return register_account(family).available(family.registers(consumers)) * THREADS * consumers
 
 
 def held_rows(family: "Family", consumers: int, columns: int) -> int:
@@ -173,7 +202,7 @@ at 168 registers where a whole-program compile holds its 232."""
 def entry_registers(warpgroups: int) -> int:
     """The registers a thread of a program of `warpgroups` warpgroups launches with: its threads' share of
     the multiprocessor's 64K in the allocator's steps of 8, at most 255 (168 at three warpgroups)."""
-    return min(255, 64 * 1024 // (warpgroups * THREADS) // 8 * 8)
+    return min(255, cost.REGISTERS // (warpgroups * THREADS) // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
 def raised_registers(consumers: int) -> int:
@@ -185,7 +214,8 @@ def raised_registers(consumers: int) -> int:
     CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a thread, so they hold 104,
     where the multiprocessor's share would ask 112 and wait for registers no warp gives back."""
     pool = entry_registers(consumers + 1) * (consumers + 1) * THREADS
-    return min(256, (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS) // 8 * 8)
+    share = (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS)
+    return min(256, share // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
 def consumer_registers(consumers: int) -> int:
@@ -297,6 +327,48 @@ class RegisterModel:
     step: int
     producer: int
     shared: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class LoweredRegisters:
+    """One launch's live register set, before the assembler schedules and allocates it."""
+    name: str
+    registers: int
+    fragments: int
+    scalars: int
+    threads: int
+    producer: int
+    raised: int
+    where: str
+
+    def model(self, target: "GpuTarget", compiler: "Compiler", *, shared: int, tmem: int) -> RegisterModel:
+        """Its launch budget and residency, from this launch's geometry and resource allocations."""
+        groups = self.threads // THREADS
+        consumers = groups - bool(self.producer)
+        budget = (self.raised if self.raised and not compiler.relocatable else entry_registers(groups))
+        most = target.architecture.resident_threads // self.threads
+        if target.shared_limit is not None:
+            most = min(most, (target.shared_limit + cost.RESERVED_SHARED) // (shared + cost.RESERVED_SHARED))
+        if tmem:
+            most = min(most, (target.tmem_columns or 0) // tmem)
+        producer = (self.producer if not compiler.relocatable else budget) if self.producer else 0
+        return RegisterModel(self.registers, budget, consumers, most, cost.REGISTER_STEP, producer, shared)
+
+
+def lowered_registers(module: bytes, compiler: "Compiler") -> list[LoweredRegisters]:
+    """Analyze the module an existing Mosaic custom call carries, without tracing or compiling it again.
+    The compiler version and assembly mode are inputs, never read from a process-global installation."""
+    from dew.nn.kernels.templates.liveness import kernel_peaks
+
+    found = []
+    for name, peak, _ in kernel_peaks(module, compiler):
+        if peak.threads is None:
+            continue
+        if peak.threads % THREADS or peak.threads < THREADS:
+            raise ValueError(f"Mosaic launch has {peak.threads} threads, not whole warpgroups")
+        found.append(LoweredRegisters(name, peak.total, peak.fragments, peak.scalars, peak.threads,
+                                       peak.producer, peak.raised, peak.where))
+    return found
 
 
 def register_model(family: "Family", consumers: int, registers: int | None, *,
