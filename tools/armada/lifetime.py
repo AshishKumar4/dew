@@ -44,6 +44,8 @@ seen: set[str] = set()
 """The checkout's files the log names: after it closes, no other may be imported (`closing`)."""
 logged: set[tuple[str, str]] = set()
 log = None
+importer = None
+"""The recorder's import finder (followed.py's `imports`), first in the import system (`leading`)."""
 children = ""
 """Where this process's followed children log (`gathered`), beside the log; named in their environment once
 the site is made, so the `.pth` that starts `follow` in a child (followed.py) never starts it here."""
@@ -55,11 +57,12 @@ def owner() -> str:
 
 
 def write(name: str, item: str) -> None:
-    """Event `item` owed to `name`, once each, as it happens: a line of its own, so a process killed mid-run
-    leaves every line it wrote before."""
+    """Event `item` owed to `name`, as it happens: a line of its own, so a process killed mid-run leaves
+    every line it wrote before; once each, but a process start, each of which owes its own record."""
     if (name, item) in logged:
         return
-    logged.add((name, item))
+    if not item.startswith(STARTED):
+        logged.add((name, item))
     if not item.startswith(EVIDENCE) and checkout_file(item):
         seen.add(item)
     log.write(f"{name}\t{item}\n")
@@ -153,6 +156,13 @@ def peaked() -> None:
     write(SHARED, f"{UNOPENED}{memory}" if isinstance(memory, str) else f"{PEAK}{memory[1]}")
 
 
+def leading() -> None:
+    """The recorder's import finder put first again, ahead of one a later import system user put first
+    (pytest's assertion rewriter, which finds a module it rewrites itself), so it still sees every import."""
+    sys.meta_path.remove(importer)
+    sys.meta_path.insert(0, importer)
+
+
 def closing() -> None:
     """The log's last line, as the last atexit runs; past it, no checkout module it does not name imports."""
     write(SHARED, CLOSED)
@@ -164,7 +174,7 @@ def boot() -> None:
     arguments: the log opened and its closing registered before anything else registers an atexit, monitoring
     and the audit hook in place before the interpreter's site, the environment's `.pth` files and pytest run,
     and the modules already loaded the shared run's."""
-    global log, children
+    global log, children, importer
     if LOG not in os.environ:
         # A targeted run (ci.py's `targeted`) records nothing: the site, then the module, as `-m` would.
         run()
@@ -179,7 +189,8 @@ def boot() -> None:
         write(SHARED, f"{followed.IMPORTED}{name.partition('.')[0]}")
         if followed.checkout(file := getattr(module, "__file__", None) or "", root):
             write(SHARED, file[len(root):])
-    sys.meta_path.insert(0, followed.imports(lambda item: write(owner(), item)))
+    importer = followed.imports(lambda item: write(owner(), item))
+    sys.meta_path.insert(0, importer)
     followed.opening(kept, root)
     sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
     sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)

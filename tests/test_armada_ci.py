@@ -499,13 +499,17 @@ def test_what_runs_after_the_last_test_is_every_files_input(ci, tmp_path, monkey
     assert reused() == [False, False]
 
 
+@pytest.mark.parametrize("rewritten", [False, True], ids=["plain", "under pytest's assertion rewriting"])
 def test_a_module_imported_by_name_is_its_files_input_and_no_earlier_files(ci, tmp_path, monkeypatch,
-                                                                             cache_worker):
+                                                                             cache_worker, rewritten):
     """A module a test imports by name at run time (importlib.import_module) is its file's input as an
-    import statement's is: a helper of that name added under tests/, which leads sys.path, reruns the
-    file, and no file the process ran before it, which never saw that module."""
+    import statement's is, whichever finder pytest put first (its assertion rewriter, for a name a conftest
+    registered): a helper of that name added under tests/, which leads sys.path, reruns the file, and no
+    file the process ran before it, which never saw that module."""
+    registered = "import pytest\npytest.register_assert_rewrite('tabnanny')\n"
+    conftest = {"conftest.py": registered} if rewritten else {}
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "test_b.py": PASSING["test_b.py"],
+        **conftest, "test_b.py": PASSING["test_b.py"],
         "test_named.py": "import importlib\ndef test_named():\n"
                          "    assert importlib.import_module('tabnanny')\n"}, {})
     assert reused() == [True, True]
@@ -529,6 +533,18 @@ def test_a_file_a_session_parameter_revisits_takes_what_ran_between_its_visits(c
     assert reused() == [True, True]
     (tmp_path / "src/m.py").write_text("VALUE = 2\n")
     assert reused() == [False, False]
+
+
+def test_each_start_needs_its_own_record_though_two_start_alike(ci, tmp_path, monkeypatch, cache_worker):
+    """Two children a file starts alike are two starts, each owing a record: one that records itself and
+    one that starts with no site (-S), which no recorder sees, leave the file without a key, so an edit to
+    what the second ran cannot reuse its row."""
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_twice.py": "import subprocess, sys\ndef test_twice():\n"
+                         "    subprocess.run([sys.executable, '-c', 'pass'], check=True)\n"
+                         "    subprocess.run([sys.executable, '-S', 'src/other.py'], check=True)\n",
+        "test_b.py": PASSING["test_b.py"]}, {"other.py": "print('other')\n"})
+    assert reused() == [False, True]
 
 
 def test_a_process_ending_1_after_its_tests_passed_is_red(ci, tmp_path, monkeypatch):

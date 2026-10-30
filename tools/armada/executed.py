@@ -58,6 +58,8 @@ def finished(finish):
 
 
 pytest.FixtureDef.finish = finished(pytest.FixtureDef.finish)
+# pytest put its assertion rewriter first before it loaded this plugin.
+lifetime.leading()
 
 
 @pytest.hookimpl(hookwrapper=True)

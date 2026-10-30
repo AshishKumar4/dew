@@ -20,7 +20,6 @@ import os
 import pathlib
 import subprocess
 import sys
-import sysconfig
 import threading
 import time
 import types
@@ -283,6 +282,9 @@ def installed() -> None:
     """The `.pth` that starts `follow` in every Python of this environment launched with
     DEW_EXECUTED_CHILDREN set, and in no other: written once, the same for every checkout, as the
     environment's checkouts share it."""
+    # Imported here, once the site has made the environment's paths (lifetime.py boots without it).
+    import sysconfig
+
     line = (f"import os; os.environ.get({CHILDREN!r}) and __import__('runpy').run_path("
             f"os.environ['DEW_EXECUTED_FOLLOWER'], run_name='dew_followed')\n")
     path = Path(sysconfig.get_paths()["purelib"]) / PTH
@@ -513,13 +515,14 @@ def recorded(path: Path) -> dict[str, dict]:
         whole = closed and not unfollowed and child["followed"] and shared_child["followed"]
         inputs = {item for _, item in before if not item.startswith(EVIDENCE)} | {
             item for item in shared if not item.startswith(EVIDENCE)}
-        held = [each for each in (*peaks, child["peak"]) if each is not None]
+        held = [each for each in (*peaks, child["peak"], shared_child["peak"]) if each is not None]
         out[file] = {
             "depends": sorted(inputs | child["files"] | shared_child["files"]) if whole else None,
             "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
             "peak": max(held) if len(files) == 1 and whole and held else None,
-            "shares": child["shares"], "pools": child["pools"]}
+            # The shared children may run beside the file's own: their counts together bound both.
+            "shares": child["shares"] + shared_child["shares"], "pools": child["pools"] + shared_child["pools"]}
     return out
 
 
