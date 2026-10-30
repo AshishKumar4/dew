@@ -138,13 +138,13 @@ class MixerContext:
     rotated query and key head, scales the query by its learned gain, scales the output gate's
     logits by theirs and unit-norms its gated output; None for none."""
     output_gate: bool = False
-    dex: LayerDex | None = None
-    """The layer's differential extension on its chosen heads' outputs (`dew.nn.dex`), or None."""
     """The attention's output gate (Qwen3.5's attn_output_gate), where the
     kind's projection doubles its query and a sigmoid of the second half
     gates the branch. The delta net's own gate activation is a field of its
     kind (qwen4_exp's output_gate_type), which is the only gate a reference
     varies."""
+    dex: LayerDex | None = None
+    """The layer's differential extension on its chosen heads' outputs (`dew.nn.dex`), or None."""
     init_std: float | None = None
     """The normal std the mixer's projections draw from; None keeps each
     module's own initializer (`CausalTransformer.initializer_range`)."""

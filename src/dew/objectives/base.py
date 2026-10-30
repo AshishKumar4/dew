@@ -1149,8 +1149,12 @@ class Objective(ABC, Generic[Loss, Effects]):
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         witness = Witness() if step.record and not validation else None
         step = step if witness is None else replace(step, witness=witness)
-        with stepping(Progress(step.committed)):
-            loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
+        if validation:
+            # A validation scores the model the run would hand on, its schedules ended (`dew.nn.progress`).
+            loss = self.validation_loss(variables, batch, step)
+        else:
+            with stepping(Progress(step.committed)):
+                loss = self.loss(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
         else:
@@ -1342,15 +1346,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         weights = self.evaluation_variables(variables, step)
         if loss and evaluate and self._validation_scores is not None:
-            scores = self._validation_scores
-
-            def progressed(weights: Variables, batch: Batch, step: Step):
-                # The loss reads the run's progress as `_loss`'s does, so a metric scored beside it
-                # leaves it as it is.
-                with stepping(Progress(step.committed)):
-                    return scores(weights, batch, step)
-
-            report = self.program('report', progressed)
+            report = self.program('report', self._validation_scores)
             return report(weights, batch, replace(step, training=False))
         statistics = self._validation_loss(weights, batch, step) if loss else None
         return statistics, self.evaluate(variables, batch, step) if evaluate else None
