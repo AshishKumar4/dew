@@ -34,7 +34,7 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 
 import functools
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import NamedTuple, Protocol
 
 import jax
@@ -769,7 +769,7 @@ def factored_range(floor: float, sub: int = SUB) -> bool:
 
 def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
                       gates: Callable[[int], tuple],
-                      reference: Callable[[int, int], tuple], summed: Callable[[Iterable], jax.Array], *,
+                      reference: Callable[[int, int], tuple], summed: Callable[..., jax.Array], *,
                       chunk: int, strict: bool, sub: int = SUB):
     """A chunk's pairs' products under a decay a key dimension `[C, C]` fp32, `sum_k r_ik k_jk exp2(g_ik -
     g_jk)` for `j <= i` (`j < i` where `strict`), zero elsewhere: the rows `rows(c)` (the queries, or the
