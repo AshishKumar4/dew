@@ -909,7 +909,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         mask=mask is not None, bias=bias is not None,
         bias_hook=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] in (1, query.shape[1])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
-        dense_bias=bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1,
+        row_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1
+                  and jnp.shape(bias)[0] > 1),
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
