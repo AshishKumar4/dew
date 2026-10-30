@@ -188,7 +188,7 @@ def preallocate_gpu_pool() -> None:
     8 x 3072 found 59.2 GiB left to grow, with 16 GiB held, against 63.4 GiB
     of temporaries, and recomputed under 'minimal'; with 95% preallocated it
     ran without, 351 ms a step against 403 (an A100-40 at 4 x 3072, 389
-    against 444 ms; gdn-one-path e3c90a968, runs/SwiftHeron/parity-*-gdn).
+    against 444 ms; gdn-one-path e3c90a968, runs/parity-*-gdn).
     JAX's default 75% holds less than that step's 71.8 GiB peak.
 
     It is a training process's (`dew.training.prepare_process`, `dew train`), which owns its GPUs; a

@@ -15,7 +15,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from whole_suite import timed
+
+from dew.nn.precision import WIDE_CPU_ARITHMETIC
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
@@ -36,14 +37,8 @@ PAGES = [page.relative_to(DOCS).as_posix() for page in sorted(DOCS.rglob("*.md")
              "from-flaxdiff.md", "guides/decision-models.md", "guides/multi-node.md", "recipes.md"}]
 
 
-PAST_TARGET = {"page": {"concepts/language_models.md": 252}}
-"""The pages past a group's 120 s (`timed`), each its seconds in train 270's CI (main f58abb8a3, ledger 2124):
-concepts/language_models.md's two trainings, a masked-diffusion training and two exports, which share one
-interpreter and cannot split (138 s alone on armada)."""
-
-
 @pytest.mark.mesh(devices=0)
-@pytest.mark.parametrize("page", timed(PAST_TARGET, "page", PAGES))
+@pytest.mark.parametrize("page", PAGES)
 def test_a_page_s_python_blocks_run_in_order(page, tmp_path):
     path = DOCS / page
     # Each block is compiled at its own lines of the page, so a traceback
@@ -51,9 +46,13 @@ def test_a_page_s_python_blocks_run_in_order(page, tmp_path):
     script = "\n".join(
         f"exec(compile({chr(10) * (line - 1) + code!r}, {str(path)!r}, 'exec'), scope)"
         for line, code, reason in blocks(path) if reason is None)
-    # One CPU device, as a reader's machine has: the suite's device count
-    # (XLA_FLAGS) would replicate each block's model across eight.
-    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
+    # One CPU device and the library's own arithmetic, as a reader's machine
+    # has: the suite's device count (XLA_FLAGS) would replicate each block's
+    # model across eight, and its numerics (tests/lane_environment.py's
+    # matmul precision and wide CPU arithmetic) are Dew's tests' alone, which
+    # took the language-models page past a group's 120 s (ledger 2510).
+    suite = {"XLA_FLAGS", "JAX_DEFAULT_MATMUL_PRECISION", WIDE_CPU_ARITHMETIC}
+    env = {**{name: value for name, value in os.environ.items() if name not in suite},
            "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"), "WANDB_MODE": "disabled"}
     done = subprocess.run([sys.executable, "-c", f"scope = {{'__name__': '__main__'}}\n{script}"],
                           cwd=tmp_path, env=env, capture_output=True, text=True, timeout=1500)

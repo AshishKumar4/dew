@@ -1,7 +1,10 @@
 {
  "step": 2,
  "compute": "float16",
- "task_compute": "float16",
+ "products": {
+  "float16": 12,
+  "float64": 2
+ },
  "params": [
   "float32"
  ],
