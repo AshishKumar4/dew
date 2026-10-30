@@ -358,7 +358,8 @@ def _halved(summed: Callable[[slice], jax.Array], depth: int) -> jax.Array:
     (`compensated_add`, `paired`)."""
     half = depth // 2
     first, second = summed(slice(None, half)), summed(slice(half, None))
-    return sum(compensated_add((first, jnp.zeros_like(first)), (second, jnp.zeros_like(second))))
+    total, error = compensated_add((first, jnp.zeros_like(first)), (second, jnp.zeros_like(second)))
+    return total + error
 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(0, 1))
