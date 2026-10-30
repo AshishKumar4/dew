@@ -1753,6 +1753,19 @@ def test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput(
         assert scalars["train/samples_per_sec"] > 0
 
 
+def test_an_interval_read_no_later_than_the_last_reports_its_counts_and_no_rates():
+    """A log the writer reads no later than the one before it was done (`Taken.read`), an interval of
+    no seconds, still reports the tokens, work, compile and waits its steps counted, which a run's
+    committed tokens are summed from; only its rates, which need seconds, are left out."""
+    from dew.training.interval import throughput
+
+    counted = {"train/tokens": 15.0, "train/flops": 30.0, "train/compile_s": 0.5, "train/data_wait_ms": 2.0}
+    interval = {"waited": 0.004, "compiling": 0.5, "training_flops": 60.0, "tokens": 30}
+    assert throughput(0.5, 2, 16, None, 1, **interval) == counted
+    timed = throughput(1.5, 2, 16, None, 1, **interval)
+    assert timed.items() >= counted.items() and timed["train/tokens_per_s"] == 30.0
+
+
 # --------------------------------------------------------------------------
 # Divergence
 # --------------------------------------------------------------------------
