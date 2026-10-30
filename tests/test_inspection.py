@@ -11,7 +11,7 @@ import optax
 import pytest
 import test_run_budgets
 from reference_error import assert_as_exact_as_the_reference
-from test_run_options import lm, scalars
+from test_run_options import KINDS, lm, scalars
 
 from dew.cli.main import main
 from dew.data.dataset import Loader
@@ -266,3 +266,26 @@ def test_watching_a_kind_no_module_is_refused():
     with pytest.raises(ValueError):
         unmatched = Inspection(modules=("*Attention",), targets=("params",))
         inspected(watched_run(Stacked(scanned=False), unmatched), {"x": ROWS})
+
+
+@pytest.mark.parametrize("kind", list(KINDS))
+def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp_path):
+    """A run of every kind watching module kinds on its command line (`trainer.inspection.modules`)
+    logs a summary of each watched module's output at its sampled step, its mean, standard deviation,
+    largest magnitude and non-finite share, and none at a step it does not sample."""
+    record, runs = tmp_path / "record", tmp_path / "runs"
+    (tmp_path / "data").mkdir()
+    KINDS[kind](tmp_path / "data", drawn=False).save(str(record))
+    inspection = {"class": "dew.training.inspection:Inspection",
+                  "fields": {"modules": ["*Attention*", "*Block*", "*Mlp*", "*MLP*"], "every": 2,
+                             "targets": ["params"]}}
+    settings = {"trainer.name": "watched", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
+                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
+                "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
+                "trainer.compilation_cache_dir": "None"}
+    assert main(["train", str(record / "run.json"),
+                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
+    logged = scalars(runs / "watched")
+    watched = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/activations/")}
+    assert {"mean", "std", "abs_max", "non_finite"} <= watched
+    assert not any(name.startswith("inspect/activations/") for name in logged[1])
