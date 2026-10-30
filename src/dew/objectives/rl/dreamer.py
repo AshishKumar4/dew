@@ -377,7 +377,7 @@ class DreamerV3Objective(Objective[Ratio]):
         env = LatentEnv(self.model, jax.lax.stop_gradient(variables), self.bins)
         starts = jax.tree.map(lambda x: jax.lax.stop_gradient(x.reshape(rows * length, *x.shape[2:])),
                               (deter, stoch))
-        latent_key, act_key = jax.random.split(imagine_key)
+        latent_key, act_key, last_key = jax.random.split(imagine_key, 3)
         state, begin = env.at(*starts, latent_key)
 
         def policy(params, feature, key, memory):
@@ -389,7 +389,7 @@ class DreamerV3Objective(Objective[Ratio]):
                                   reset=False)
         # The start's feature then each imagined one, and the action taken at each [B*T, H + 1].
         features = jnp.concatenate([begin[:, None], jnp.swapaxes(imagined.following.observation, 0, 1)], 1)
-        last_action, _, _ = policy(held, features[:, -1], jax.random.fold_in(act_key, -1), None)
+        last_action, _, _ = policy(held, features[:, -1], last_key, None)
         actions = jnp.concatenate([jnp.swapaxes(imagined.action, 0, 1), last_action[:, None]], 1)
         rewards = twohot_mean(self.model.apply(held, features, method=WorldModel.reward), self.bins)
         cont = jax.nn.sigmoid(self.model.apply(held, features, method=WorldModel.continue_))

@@ -14,6 +14,8 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import at_least_fp32
+
 
 def symlog(x: jax.Array) -> jax.Array:
     """sign(x) log(1 + |x|)."""
@@ -38,7 +40,8 @@ def twohot_bins(count: int = 255, limit: float = 20.0) -> jax.Array:
 def twohot_mean(logits: jax.Array, bins: jax.Array) -> jax.Array:
     """The expectation of `bins` under softmax(`logits`), summed outward-in from both ends to the
     middle bin, so symmetric bins under uniform probabilities give exactly zero (outs.py:285-309)."""
-    probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+    probs = jax.nn.softmax(logits.astype(at_least_fp32(logits.dtype)), axis=-1)
+    bins = bins.astype(probs.dtype)
     count = bins.shape[-1]
     middle = count // 2
     if count % 2 == 1:
@@ -51,7 +54,8 @@ def twohot_loss(logits: jax.Array, target: jax.Array, bins: jax.Array) -> jax.Ar
     """The cross-entropy of softmax(`logits`) against `target`'s two-hot encoding over `bins`: its
     weight on the bins either side of it, each the other's share of the distance between them, all
     of it on the first or last bin past the range (outs.py:311-323)."""
-    target = jax.lax.stop_gradient(target.astype(jnp.float32))
+    wide = at_least_fp32(jnp.result_type(logits, target))
+    target, bins = jax.lax.stop_gradient(target.astype(wide)), bins.astype(wide)
     below = jnp.sum(bins <= target[..., None], axis=-1).astype(jnp.int32) - 1
     above = bins.shape[-1] - jnp.sum(bins > target[..., None], axis=-1).astype(jnp.int32)
     below = jnp.clip(below, 0, bins.shape[-1] - 1)
@@ -62,12 +66,12 @@ def twohot_loss(logits: jax.Array, target: jax.Array, bins: jax.Array) -> jax.Ar
     total = to_below + to_above
     encoded = (jax.nn.one_hot(below, bins.shape[-1]) * (to_above / total)[..., None]
                + jax.nn.one_hot(above, bins.shape[-1]) * (to_below / total)[..., None])
-    return -jnp.sum(encoded * jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1), axis=-1)
+    return -jnp.sum(encoded * jax.nn.log_softmax(logits.astype(wide), axis=-1), axis=-1)
 
 
 def unimix_log_probs(logits: jax.Array, unimix: float = 0.01) -> jax.Array:
     """A categorical's log-probabilities, its softmax mixed with `unimix` of the uniform."""
-    probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+    probs = jax.nn.softmax(logits.astype(at_least_fp32(logits.dtype)), axis=-1)
     if unimix:
         probs = (1 - unimix) * probs + unimix / logits.shape[-1]
     return jnp.log(probs)
