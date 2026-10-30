@@ -34,13 +34,12 @@ MiniMax masks its softmax layers (modeling_minimax.py:660-690). The config class
 
 import json
 import math
-import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
+from hf_reference import write_released_config
 from reference_source import hub_modules, padded_probe
 from torch_precision import float64_twin
 
@@ -177,10 +176,7 @@ def write_recording(configuration, modeling) -> None:
 
 def write_released() -> None:
     for name, (repo, revision) in RELEASES.items():
-        directory = FIXTURES / name
-        directory.mkdir(parents=True, exist_ok=True)
-        shutil.copy(hf_hub_download(repo, 'config.json', revision=revision), directory / 'config.json')
-        (directory / 'source.json').write_text(f'{{"repo": "{repo}", "revision": "{revision}"}}\n')
+        write_released_config(name, repo, revision)
 
 
 if __name__ == '__main__':

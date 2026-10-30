@@ -26,13 +26,12 @@ them, which a hash stops at.
 """
 
 import json
-import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
+from hf_reference import write_released_config
 from reference_source import padded_probe
 from transformers.models.qwen4_exp import modeling_qwen4_exp
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
@@ -129,10 +128,7 @@ def release_ple_ids(config: dict) -> dict[str, np.ndarray]:
 
 def write_release() -> None:
     directory = FIXTURES / 'qwen3.8-flash-next'
-    directory.mkdir(parents=True, exist_ok=True)
-    repo, revision = RELEASE
-    shutil.copy(hf_hub_download(repo, 'config.json', revision=revision), directory / 'config.json')
-    (directory / 'source.json').write_text(json.dumps({'repo': repo, 'revision': revision}) + '\n')
+    write_released_config(directory.name, *RELEASE)
     config = json.loads((directory / 'config.json').read_text())
     np.savez(directory / 'release_ple_ids.npz', **release_ple_ids(config))
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")

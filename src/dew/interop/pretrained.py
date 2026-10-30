@@ -78,7 +78,6 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.diffusion.discrete import Confident, Unmask
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
@@ -777,8 +776,9 @@ class PretrainedMaskedDecoder(Pretrained):
     """A masked-diffusion decoder (LLaDA, Dream).
 
     It is a non-causal decoder with a mask id that generates by unmasking a whole
-    response, or, where its family declares its release's walk (LLaDA2.0's), a
-    block at a time as the release does (`masked_recipe`).
+    response, or, where its family declares its release's walk (LLaDA2.0's
+    blocks, Dream's grid), as the release does (`masked_walk`), which its task
+    and an objective over it (`MaskedDiffusionObjective`) take alike.
     """
 
     model: CausalTransformer
@@ -796,19 +796,12 @@ class PretrainedMaskedDecoder(Pretrained):
             return None
         return family.masked_walk(self.config, self.generation_config, self.code)
 
-    @property
-    def masked_recipe(self) -> tuple[Unmask | Confident, int, int | None] | None:
-        """The release's own walk's solver, steps and block (`masked_walk`), or None. Its task
-        (`text_generation`) and an objective over it (`MaskedDiffusionObjective`) take it alike."""
-        walk = self.masked_walk
-        return None if walk is None else (walk.solver, walk.steps, walk.block)
-
     def pipeline(self):
         return self.packed().text_generation()
 
     def text_generation(self) -> MaskedGeneration:
         """Build the masked generation task this source describes, walking as its release does where
-        its family declares the walk (`masked_recipe`), else refining a whole response with Dew's MDLM
+        its family declares the walk (`masked_walk`), else refining a whole response with Dew's MDLM
         sampler (`Unmask`), not its family's own recipe.
         """
         from dew.diffusion.discrete import MDLM
