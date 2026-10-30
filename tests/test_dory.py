@@ -637,8 +637,9 @@ EXAMPLES = [Example(state, {'team': INTENT}, {'team': label})
 
 def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
     """The joint schema head's lexical prior gathers the output table's rows, which contracted with the
-    final states give Dory's logits (the looped stack's check). Over the release's own tokenizer it trains a step that moves the head and the backbone, and
-    the saved run answers as the live one does."""
+    final states give Dory's logits (the looped stack's check). Over the release's own tokenizer it
+    trains a step that moves the head and the backbone, and the saved run answers as the live one
+    does."""
     loaded = load(max_seq_len=1024)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
