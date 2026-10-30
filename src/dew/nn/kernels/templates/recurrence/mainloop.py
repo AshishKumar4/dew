@@ -884,7 +884,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                        keys=call.given.views(k_ref, row, CHUNK, keyed, width),
                        gates=gates.views(hi_ref, row, CHUNK, h * width, width),
                        lows=gates.views(lo_ref, row, CHUNK, h * width, width))
-        pairing, *merges = staging
+        pairing, referenced, *merges = staging
 
         def step(index, slots, carry, accumulators):
             del index
@@ -892,6 +892,13 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             # acquired in a loop's body kept that body's slot index past it (`Slots`' cache), a scalar the
             # kernel then took as an input.
             slots.held()
+            # The sub-chunks' first tokens' prefix halves read once a step into a plain tile, a row each:
+            # read from global memory in each rolled turn, their latency bound an H100's launch (ncu: 59% of
+            # its stalls on L1TEX scoreboards, JS-kdakept-h100-797377e5d).
+            for half, ref in enumerate((hi_ref, lo_ref)):
+                for sub in range(CHUNK // algebra.SUB):
+                    referenced[half, sub, :] = family.columns_of(
+                        ref.at[row + sub * algebra.SUB, pl.ds(h * width, width)])
 
             def block(name, operand, c):
                 return _tile(slots, name, operand, columns=pl.ds(c * INTRA_KEYS, INTRA_KEYS)).value()
@@ -900,12 +907,11 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                 return lambda c: block(name, call.given, c).astype(jnp.float32)
 
             def reference(sub, c):
-                """The sub-chunk's first token's prefix halves on key block `c`, a column's vectors, from
-                global memory (a step's tiles carry their bundle's transforms, which a traced row does not
-                commute through)."""
-                columns = pl.ds(h * width + c * INTRA_KEYS, INTRA_KEYS)
-                return tuple(family.columns_of(ref.at[row + sub * algebra.SUB, columns])
-                             for ref in (hi_ref, lo_ref))
+                """The sub-chunk's first token's prefix halves on key block `c`, a column's vectors, from the
+                step's plain tile of them (a stream's tiles carry their bundle's transforms, which a traced
+                row does not commute through)."""
+                columns = pl.ds(c * INTRA_KEYS, INTRA_KEYS)
+                return tuple(family.columns_of(referenced.at[half, sub, columns]) for half in (0, 1))
 
             def gated(c):
                 return block("gates", gates, c), block("lows", gates, c)
@@ -941,7 +947,8 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
         + _fragments(call, (_pairing_operand(call), CHUNK, INTRA_KEYS), (_pairing_operand(call), CHUNK,
                                                                               INTRA_KEYS)),
         [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
-    staging = (_pairing(call), *(_merges(call) if call.delta else ()))
+    staging = (_pairing(call), plgpu.SMEM((2, CHUNK // algebra.SUB, width), jnp.float32),
+               *(_merges(call) if call.delta else ()))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
                    held=held_tiles, staging=staging, landing={"square": held.landing(CHUNK, CHUNK)},
