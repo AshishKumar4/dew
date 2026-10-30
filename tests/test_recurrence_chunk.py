@@ -70,8 +70,8 @@ PACKED = (False, True)
 
 
 def chunk_on(kernel: str, hooks, *args, **kwargs):
-    """`chunk` on `kernel`, which `generation.chosen` names for the delta rule's selector where it runs it, and
-    for the rated scan's where that runs it: the portable math ('xla') and the recurrence template
+    """`chunk` on `kernel`, which `generation.chosen` names for the delta rule's selector where it runs it,
+    and for the rated scan's where that runs it: the portable math ('xla') and the recurrence template
     ('mosaic_gpu') both, the port of mamba_ssm's kernels ('pallas') the scan's alone."""
     named = {**({} if kernel == 'pallas' else {'gated_delta_rule': kernel}),
              **({'ssd': kernel} if kernel in ('xla', 'mosaic_gpu', 'pallas') else {})}
