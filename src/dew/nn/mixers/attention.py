@@ -71,6 +71,7 @@ from dew.nn.progress import progress
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
+from dew.nn.value_experts import RoutedValues
 from dew.nn.visibility import windowed
 
 
@@ -257,6 +258,15 @@ CONTEXT_LOGITS = "context_max_logits"
 (`CausalSelfAttention.attend_context`), which the layer's own maxima take in."""
 
 
+
+GATE_ACTIVATIONS = {
+    'sigmoid': jax.nn.sigmoid,
+    'silu': jax.nn.silu,
+    # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
+    'softplus2': lambda gate: jax.nn.softplus(gate * math.log(2)) / math.log(2),
+}
+"""The output gate's activations (`MixerContext.output_gate_activation`)."""
+
 @logical_axes({
     ("q_proj",): ("embed", "heads"),
     ("k_proj",): ("embed", "kv"),
@@ -373,7 +383,13 @@ class CausalSelfAttention(nn.Module):
         # (modeling_gemma4.py, Gemma4TextAttention.__init__).
         if not self.ctx.kv_shared and not self._packed():
             self.k_proj = dense(projections['k_proj'][1], name='k_proj')
-            if not self.ctx.k_eq_v:
+            if self.ctx.value_experts is not None:
+                # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`).
+                self.experts = RoutedValues(
+                    self.ctx.value_experts, self.ctx.emb_features, self.ctx.num_kv_heads * self.value_dim,
+                    init_std=self.ctx.init_std, dtype=self.ctx.dtype, precision=self.ctx.precision,
+                    name='experts')
+            elif not self.ctx.k_eq_v:
                 self.v_proj = dense(projections['v_proj'][1], name='v_proj')
         if 'gate_proj' in projections:
             self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj', use_bias=False)
@@ -458,7 +474,7 @@ class CausalSelfAttention(nn.Module):
         """Query/output maps, unshared K/V maps and DEX's maps of its chosen heads, plus QK and AV."""
         window = self.ctx.sliding_window if self.ctx.causal or self.ctx.bidirectional_window else None
         return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
-                + self._dex_flops(lengths)
+                + self._dex_flops(lengths) + self._value_expert_flops(lengths)
                 + attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
                                   causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk))
 
@@ -484,9 +500,20 @@ class CausalSelfAttention(nn.Module):
         return projection_flops(lengths, len(self.ctx.dex.heads) * self.value_dim, self.value_dim)
 
     @nn.nowrap
+    def _value_expert_flops(self, lengths) -> float:
+        """Routed values' maps (`RoutedValues`): the router's and each token's `top_k` experts'."""
+        spec = self.ctx.value_experts
+        if spec is None or self.ctx.kv_shared:
+            return 0.0
+        return (projection_flops(lengths, self.ctx.emb_features, spec.experts)
+                + spec.top_k * projection_flops(lengths, self.ctx.emb_features,
+                                                self.ctx.num_kv_heads * self.value_dim))
+
+    @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
         """The attention's maps as `{name: (inputs, outputs)}`, keys and
-        values absent where the layer shares them or the keys are the values:
+        values absent where the layer shares them or the keys are the values, and values where routed
+        experts give them (`_value_expert_flops`):
         what setup builds, the count reads and the packed group
         (`_group`) concatenates."""
         # The gate doubles the query projection: the reference chunks its
@@ -501,14 +528,14 @@ class CausalSelfAttention(nn.Module):
             sites['gate_proj'] = (self.ctx.emb_features, self.ctx.num_heads * per_head)
         if not self.ctx.kv_shared:
             sites['k_proj'] = (self.ctx.emb_features, self.ctx.num_kv_heads * self.ctx.head_dim)
-            if not self.ctx.k_eq_v:
+            if not self.ctx.k_eq_v and self.ctx.value_experts is None:
                 sites['v_proj'] = (self.ctx.emb_features, self.ctx.num_kv_heads * self.value_dim)
         return sites
 
     def _group(self) -> ProjectionGroup | None:
         """Its query, key and value projections of the layer's input, packed
         as `qkv_proj`, where it projects keys and values of its own."""
-        if self.ctx.kv_shared or self.ctx.k_eq_v:
+        if self.ctx.kv_shared or self.ctx.k_eq_v or self.ctx.value_experts is not None:
             return None
         return ProjectionGroup.of(tuple(self.path), 'qkv_proj', ('q_proj', 'k_proj', 'v_proj'),
                                   self.projections())
@@ -570,8 +597,9 @@ class CausalSelfAttention(nn.Module):
         if projected is None:
             key = self.k_proj(x)
             # Gemma 4's global layers use the raw key projection as the
-            # values before its norm (modeling_gemma4.py).
-            value = key if self.ctx.k_eq_v else self.v_proj(x)
+            # values before its norm (modeling_gemma4.py); MoVA's are routed experts'.
+            value = (key if self.ctx.k_eq_v else self.experts(x) if self.ctx.value_experts is not None
+                     else self.v_proj(x))
         else:
             key, value = projected
         key = checkpoint_name(key, 'k_proj')
@@ -1367,9 +1395,11 @@ class CausalSelfAttention(nn.Module):
             logits = gate.astype(wide) * jnp.square(scale).reshape(self.ctx.num_heads, self.ctx.head_dim)
             attention = (attention.astype(wide) * jax.nn.sigmoid(logits)).astype(attention.dtype)
         elif gate is not None:
-            # The branch multiplies by the sigmoid of its gate, then projects
-            # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
-            attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
+            # The branch multiplies by the sigmoid of its gate, then projects (modeling_qwen3_5.py:701,
+            # modeling_qwen4_exp.py:836 the same), or by K2 Horizon's SiLU or softplus at beta log 2
+            # (modeling_k2_horizon.py:500-506 at cca48b66).
+            attention = attention * GATE_ACTIVATIONS[self.ctx.output_gate_activation](gate).astype(
+                attention.dtype)
         attention = constrain(attention, HEADS)
         joined = attention.reshape(batch, length, self.ctx.num_heads * self.value_dim)
         if self.ctx.ngpt is not None:

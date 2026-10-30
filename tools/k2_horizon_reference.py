@@ -17,7 +17,13 @@ k2-horizon-tiny's config with its pad id stated, left out and null
 records instead k2-horizon-tiny's unpadded and left-padded logits over check
 1's seeds (`recorded_references.record_logits`), as recorded_logits.npz there,
 which tests/test_hf_reference_decoders.py reads where the remote code cannot
-run.
+run. `--mova` writes instead k2-horizon-mova-tiny/ from the MoVA release's own
+remote code (IFM/K2-Horizon-MoVA-36B-A4B at cca48b66): three layers, the first
+dense and the other two routing their MLP to four experts and a shared one and
+their values to four value experts, two of each per token, under a biased
+sigmoid router scaled by 2.5, every attention output gated by a softplus at
+beta log 2, with the same ids, padded rows and greedy continuation, and its
+logits over check 1's seeds (recorded_logits.npz).
 """
 
 import json
@@ -34,14 +40,15 @@ from torch_precision import float64_twin
 from dew.interop.verify import probe_ids, scatter_weights
 
 REPO, REVISION = 'IFM/K2-Horizon-0.9B', '383cb66347be'
+MOVA_REPO, MOVA_REVISION = 'IFM/K2-Horizon-MoVA-36B-A4B', 'cca48b6631d03c338a0e1d8beb0c392af8becbd3'
 RELEASES = {'0.9b': ('IFM/K2-Horizon-0.9B', '383cb66347be'), '3.7b': ('IFM/K2-Horizon-3.7B', 'd6e5432c5963'),
             '7b': ('IFM/K2-Horizon-7B', '3b6ae394c1b8')}
 FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
 
 
-def remote():
-    """K2 Horizon's modeling module, imported from the pinned remote code as a package."""
-    _, modeling = hub_modules('k2_horizon_remote', REPO, REVISION,
+def remote(repo: str = REPO, revision: str = REVISION):
+    """K2 Horizon's modeling module, imported from the pinned remote code of `repo` as a package."""
+    _, modeling = hub_modules(f"k2_horizon_remote_{revision}", repo, revision,
                               ('configuration_k2_horizon.py', 'modeling_k2_horizon.py'))
     return modeling
 
@@ -54,18 +61,27 @@ def logits(model, ids, mask=None, positions=None):
         return model(**inputs).logits.numpy()
 
 
-def write_tiny(modeling) -> None:
-    directory = FIXTURES / 'k2-horizon-tiny'
+MOVA = {'num_hidden_layers': 3, 'num_experts': 4, 'num_experts_per_tok': 2, 'moe_intermediate_size': 8,
+        'num_shared_experts': 1, 'moe_gate_bias': True, 'router_score_func': 'sigmoid',
+        'router_scaling_factor': 2.5, 'norm_topk_prob': True, 'mlp_only_layers': [0],
+        'decoder_sparse_step': 1, 'mova_num_experts': 4, 'mova_num_experts_per_tok': 2,
+        'attention_gate_func': 'softplus', 'rope_parameters': {'rope_type': 'default', 'rope_theta': 10000.0}}
+"""The MoVA fixture's fields over the dense tiny's (`write_tiny`)."""
+
+
+def write_tiny(modeling, name: str = 'k2-horizon-tiny', fields=None) -> None:
+    directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
-    config = modeling.K2HorizonConfig(
-        vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=2, num_attention_heads=4,
-        num_key_value_heads=2, head_dim=8, rope_head_dim=8, max_position_embeddings=64, rms_norm_eps=1e-6,
-        layernorm_num_groups=2, num_experts=0, mlp_only_layers=[0, 1], query_key_norm=False,
-        use_sliding_window=False, sliding_window=None, tie_word_embeddings=False, bos_token_id=1,
-        eos_token_id=None, pad_token_id=0,
-        rope_parameters={'rope_type': 'yarn', 'rope_theta': 10000.0, 'factor': 4.0, 'beta_fast': 128.0,
-                         'beta_slow': 4.0, 'original_max_position_embeddings': 16, 'truncate': True,
-                         'attention_factor': 1.1386294361119891})
+    config = modeling.K2HorizonConfig(**{
+        'vocab_size': 64, 'hidden_size': 16, 'intermediate_size': 32, 'num_hidden_layers': 2,
+        'num_attention_heads': 4, 'num_key_value_heads': 2, 'head_dim': 8, 'rope_head_dim': 8,
+        'max_position_embeddings': 64, 'rms_norm_eps': 1e-6, 'layernorm_num_groups': 2, 'num_experts': 0,
+        'mlp_only_layers': [0, 1], 'query_key_norm': False, 'use_sliding_window': False,
+        'sliding_window': None, 'tie_word_embeddings': False, 'bos_token_id': 1, 'eos_token_id': None,
+        'pad_token_id': 0,
+        'rope_parameters': {'rope_type': 'yarn', 'rope_theta': 10000.0, 'factor': 4.0, 'beta_fast': 128.0,
+                            'beta_slow': 4.0, 'original_max_position_embeddings': 16, 'truncate': True,
+                            'attention_factor': 1.1386294361119891}, **(fields or {})})
     config._attn_implementation = 'eager'
     torch.manual_seed(0)
     model = modeling.K2HorizonForCausalLM(config).float().eval()
@@ -83,20 +99,21 @@ def write_tiny(modeling) -> None:
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
 
 
-def write_recording(modeling) -> None:
-    """k2-horizon-tiny's committed weights in the remote code's class, fp32 on eager attention, and their
-    float64 twin, recorded over check 1's seeds with the rows `write_tiny` padded."""
+def write_recording(modeling, name: str = 'k2-horizon-tiny', flag: str = '--recording',
+                    revision: str = f'{REPO}@{REVISION}') -> None:
+    """`name`'s committed weights in the remote code's class, fp32 on eager attention, and their float64
+    twin, recorded over check 1's seeds with the rows `write_tiny` padded."""
     import transformers
     from recorded_references import record_logits
 
-    directory = FIXTURES / 'k2-horizon-tiny'
+    directory = FIXTURES / name
     model = modeling.K2HorizonForCausalLM.from_pretrained(directory, dtype=torch.float32,
                                                           attn_implementation='eager').eval()
     truth = float64_twin(model, lambda: modeling.K2HorizonForCausalLM(model.config))
     mask = np.load(directory / 'attention_mask.npy')
     record_logits(directory, model, truth,
-                  'PYTHONPATH=src:tools .venv-3.12/bin/python tools/k2_horizon_reference.py --recording',
-                  reference='K2HorizonForCausalLM (remote code)', revision=f'{REPO}@{REVISION}',
+                  f'PYTHONPATH=src:tools .venv-3.12/bin/python tools/k2_horizon_reference.py {flag}',
+                  reference='K2HorizonForCausalLM (remote code)', revision=revision,
                   license='Apache-2.0', transformers=transformers.__version__,
                   padded={'attention_mask': mask, 'position_ids': np.maximum(np.cumsum(mask, -1) - 1, 0)})
 
@@ -118,6 +135,10 @@ if __name__ == '__main__':
                        FIXTURES / 'k2-horizon-tiny')
     elif sys.argv[1:] == ['--recording']:
         write_recording(remote())
+    elif sys.argv[1:] == ['--mova']:
+        modeling = remote(MOVA_REPO, MOVA_REVISION)
+        write_tiny(modeling, 'k2-horizon-mova-tiny', MOVA)
+        write_recording(modeling, 'k2-horizon-mova-tiny', '--mova', f'{MOVA_REPO}@{MOVA_REVISION}')
     else:
         write_tiny(remote())
         write_released()
