@@ -125,6 +125,9 @@ class FitStarted:
     seed: int | None = None
     """None: no integer seed recorded (a JAX key was supplied, or the record predates the field)."""
     tokens: int | None = None
+    examples: int | None = None
+    """The source examples a run on the examples clock is bounded to, its length where it counts no
+    steps ahead (`target_steps` None); None for a run counted otherwise."""
     cadences: Mapping[str, JSON] = dataclasses.field(default_factory=dict)
     """The run's cadences and schedule warmups as it resolved them, a share of the run among them
     (`dew.training.budget.every_step`, `dew.optim.OptimConfig.warmups`): steps, committed tokens or a

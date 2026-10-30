@@ -800,8 +800,8 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
             f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
             "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
             "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
-    from dew.state import CHECKPOINTED
-    missing = set(CHECKPOINTED).difference(stored)
+    from dew.state import CHECKPOINTED, OPTIONAL
+    missing = set(CHECKPOINTED).difference(stored, OPTIONAL)
     if missing:
         raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
     if (metadata["scale"] is None) != (template.scale is None):
@@ -865,11 +865,13 @@ def _filled(template, restored: dict, step: int):
     if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
             and int(restored["window_size"]) != int(template.window_size)):
         raise ValueError("checkpoint accumulation window_size differs from this run")
-    from dew.state import CHECKPOINTED
+    from dew.state import CHECKPOINTED, OPTIONAL
     # A field no checkpoint holds (the narrow copies) starts over: the
-    # template's are of its own parameters, not the restored ones.
+    # template's are of its own parameters, not the restored ones. An optional one the checkpoint
+    # holds none of is None (`OPTIONAL`).
     return template.replace(**restored, **{field.name: field.default for field in dataclasses.fields(template)
-                                           if field.name not in CHECKPOINTED})
+                                           if field.name not in CHECKPOINTED},
+                            **{name: None for name in OPTIONAL if name not in restored})
 
 
 def _split_axes(spec: jax.sharding.PartitionSpec) -> list[str]:
@@ -2001,9 +2003,9 @@ class Checkpoints:
 
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
-        from dew.state import CHECKPOINTED, Accumulation
+        from dew.state import CHECKPOINTED, OPTIONAL, Accumulation
         metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
-        missing = set(CHECKPOINTED).difference(metadata.keys())
+        missing = set(CHECKPOINTED).difference(metadata.keys(), OPTIONAL)
         if missing:
             raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
         pending = metadata["accumulation"]
@@ -2098,8 +2100,9 @@ class Checkpoints:
         elif from_local and self._lost(step):
             restored, held = self._lost_shards(step, template, frozen, snapshot, metadata, where)
         else:
-            from dew.state import CHECKPOINTED
-            state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
+            from dew.state import CHECKPOINTED, OPTIONAL
+            state_tree = {name: getattr(template, name) for name in CHECKPOINTED
+                          if name in stored or name not in OPTIONAL} \
                 if not isinstance(template, Mapping) else dict(template)
             held = _held_apart(state_tree, frozen)
             if from_local:
@@ -2221,8 +2224,9 @@ class Checkpoints:
         """What a process that lost its copy of local `step` restores before its replicas give it
         their shards (`_recovered`): zeros where its template places each leaf, the template checked
         against what the processes holding the step wrote; and the frozen trees held apart."""
-        from dew.state import CHECKPOINTED
-        state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
+        from dew.state import CHECKPOINTED, OPTIONAL
+        state_tree = {name: getattr(template, name) for name in CHECKPOINTED
+                      if name in metadata or name not in OPTIONAL} \
             if not isinstance(template, Mapping) else dict(template)
         held = _held_apart(state_tree, frozen)
         self._check_recovered(step, state_tree)
