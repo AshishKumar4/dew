@@ -164,9 +164,9 @@ def test_the_state_reads_the_other_stream_after_it_and_that_stream_reads_no_stat
     assert not np.array_equal(first[:before], moved[:before])
 
 
-STREAM_SEEDS = {"joint": 8, "lettered": 8}
-"""Check 1's declared seeds for packed rows in two streams against each row alone, as the packed contexts'
-(`test_decision_context.PACKED_CONTEXT_SEEDS`)."""
+STREAM_SEEDS = {"joint": 16, "lettered": 8}
+"""Check 1's declared seeds for packed rows in two streams against each row alone, sized by `seeds_for`
+with the packed windows as `dew_fn` (16 and 8, 2026-10-30)."""
 
 
 @pytest.mark.parametrize("layout", [JOINT, LETTERED], ids=["joint", "lettered"])

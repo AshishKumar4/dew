@@ -205,8 +205,8 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
     config = DecisionRunConfig.cli(
         ["--pretrained", str(LLAMA.parent / "qwen38-dense-tiny"), "--segments",
          json.dumps(to_record(SEGMENTS, tuple[Segment, ...])), "--context-layers", "0", "head:letters",
-         "--head.count", "4", "--head.labels", json.dumps(to_record(LABELS, Labels)),
-         "--trainer.name", "letters",
+         "--head.count", "4", "--head.labels.names", *(LABELS.names or ()),
+         "--head.labels.variants", *LABELS.variants, "--head.labels.cue", LABELS.cue, "--trainer.name", "letters",
          "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "1",
          "--trainer.checkpoint-every", "1", "--trainer.multi-host", "False",
          "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],

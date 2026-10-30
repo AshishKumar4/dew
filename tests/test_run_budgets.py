@@ -595,8 +595,11 @@ def test_a_clocked_runs_cooldown_and_its_step_compiled_ahead_take_its_batches_as
     (x,) = clocked_records(0)
     optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
     signed, tracker = Signed(), RecordingTracker()
+    # A cooldown branch is scored by the run's validation, which reads the corpus's first batch.
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
     Trainer(signed, optim, key=0, tracker=tracker).fit(
-        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, cooldowns=Cooldowns(at=("50%",), length=1))
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held,
+        cooldowns=Cooldowns(at=("50%",), length=1))
     assert len(signed.signed) > 1 and all(signature == signed.signed[0] for signature in signed.signed)
     logged = [scalars["train/compiles"] for _, scalars in tracker.scalars if "train/compiles" in scalars]
     assert logged and logged[0] == logged[-1]
