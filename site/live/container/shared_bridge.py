@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
-from guests import GUEST_UIDS, MAX_CONTEXTS
+from guests import GUEST_UIDS, MAX_CONTEXTS, idle_seconds
 from kernel_outputs import outputs_of
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
@@ -246,7 +246,7 @@ class Gateway:
         self.training = False
         self.waiting = []
         self.started = time.monotonic()
-        self.idle = int(os.environ.get("DEW_LIVE_IDLE_SECONDS", "300"))
+        self.idle = idle_seconds()
         # Cleanups running to their end after what they clean up for was cancelled (`settle`).
         self.cleanups = set()
 
