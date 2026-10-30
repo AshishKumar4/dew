@@ -44,7 +44,9 @@ LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
 `LIMITS`, which this module cannot import (it runs inside every test process, before the checkout's tools)."""
 """Audit events of a read: a file opened, a directory listed."""
 IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
-"""The import system's frozen modules, which list the directories it imports from."""
+"""The import system's frozen modules, which list the directories it imports from and read the modules it
+executes: what a run executed of a module is its record's (`code_unit`), the code it entered, not the text
+the loader read to compile it."""
 CHILDREN = "DEW_EXECUTED_CHILDREN"
 """Where a followed child writes its record and its start mark, and what makes it one."""
 FOLLOWER_TOOL = 4
@@ -90,6 +92,39 @@ def checkout(name: str, root: str) -> bool:
     return name.startswith(root) and name.endswith(".py") and "site-packages" not in name
 
 
+def code_unit(code: types.CodeType, root: str) -> str:
+    """How a record names code object `code` of a checkout file run under `root`: a test file or conftest
+    whole, as its text is the run's; else the file, CODE, and the unit holding the code (ci.py's `units`): the
+    outermost function it lies in, by its qualified name, whose text holds every function and class nested in
+    it, or `TOP`, a module's or a class's body, or a lambda or a generator expression outside any function,
+    whose text the module's top level holds."""
+    name = code.co_filename[len(root):]
+    if Path(name).name.startswith("test_") or Path(name).name == "conftest.py":
+        return name
+    unit = code.co_qualname.split(".<locals>", 1)[0]
+    body = not code.co_flags & OPTIMIZED
+    return f"{name}{CODE}{TOP if body or unit.split('.')[-1].startswith('<') else unit}"
+
+
+def coded(event: str, args: tuple, root: str) -> str | None:
+    """The unit (`code_unit`) of the checkout function whose code a run took (`object.__getattr__`'s audit of
+    `__code__`): its body is then the run's input though it never ran (its constants, its bytecode)."""
+    if event != "object.__getattr__" or args[1] != "__code__" or getattr(taking, "code", False):
+        return None
+    taking.code = True
+    try:
+        code = getattr(args[0], "__code__", None)
+    finally:
+        taking.code = False
+    if isinstance(code, types.CodeType) and checkout(code.co_filename, root):
+        return code_unit(code, root)
+    return None
+
+
+taking = threading.local()
+"""Whether `coded` itself takes a function's code, which audits again."""
+
+
 def reads_backend(code: types.CodeType) -> bool:
     """Whether `code` calls `default_backend` (jax's), by any name table, or reads a device's
     `platform`: an attribute of anything but the `sys` and `platform` modules."""
@@ -108,8 +143,9 @@ def read(event: str, args: tuple, root: str) -> str | None:
     """The checkout's file or directory, relative to `root`, that a read event names, or None: a file
     opened only to read (`open`'s mode, or its flags for `os.open`), or a directory listed but by a
     listing tool (`listing_tool`), the code that listed it two frames up, beneath the audit hook that
-    calls this. An open relative to a directory descriptor is `opening`'s to place. An open has no
-    caller to ask about: the interpreter audits the main script's from no frame at all."""
+    calls this; nor a module's source or bytecode the import system's loader reads to execute it, whose
+    record is the code it ran (`code_unit`). An open relative to a directory descriptor is `opening`'s to
+    place. The interpreter audits the main script's open from no frame at all."""
     path = args[0]
     if isinstance(path, int):
         return None
@@ -118,6 +154,15 @@ def read(event: str, args: tuple, root: str) -> str | None:
         written = any(letter in mode for letter in "wax+") if mode is not None else (
             flags & os.O_ACCMODE != os.O_RDONLY)
         if written or (mode is None and getattr(placing, "relative", False)):
+            return None
+        # The source loader's read of the module's text on its way to compiling it (its get_code beneath
+        # get_data), not a caller's get_source or get_data, nor a sourceless loader's bytecode, nor
+        # zipimport's archive, which are the module's only text.
+        loader = sys._getframe(1).f_back
+        compiling = loader is not None and loader.f_back is not None and \
+            loader.f_back.f_code.co_name == "get_code" and \
+            isinstance(loader.f_back.f_locals.get("self"), importlib.machinery.SourceFileLoader)
+        if compiling and loader.f_code.co_filename == "<frozen importlib._bootstrap_external>":
             return None
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
@@ -156,6 +201,14 @@ PROBED = "probe:"
 """What a probed path's name is recorded under: a probe's answer is whether the path is there and of
 what kind, and a file's size, so ci.py's `contents` keys a probed directory by its kind, not by the
 entries a listing of it reads."""
+CODE = "::"
+"""How a record names the code a run executed in a checkout module (`code_unit`): the file, CODE, and the unit
+the key hashes (ci.py's `contents`), a function its run entered, or the module's top level."""
+OPTIMIZED = 0x1
+"""A code object's flag that marks a function's body (inspect.CO_OPTIMIZED), which a module's or a class's
+body lacks: the child imports no more of the standard library than it must."""
+TOP = "<module>"
+"""The unit of a module's top level: all its text but its functions' bodies (ci.py's `units`)."""
 IMPORTED = "import:"
 """What a top-level module a run imported is recorded under (executed.py): a helper of that name under
 tests/, which leads sys.path, would shadow it, so ci.py's `contents` keys whether tests/ holds one."""
@@ -345,8 +398,9 @@ def follow() -> None:
             log.write(line + "\n")
 
     def recorded(name: str) -> None:
-        if checkout(os.path.join(root, name), root):
-            seen.add(name)
+        path = name.partition(CODE)[0]
+        if checkout(os.path.join(root, path), root):
+            seen.add(path)
         write("file", name)
 
     # A child given its parent's fraction holds one more of the parent's shares where it opens the GPU.
@@ -364,7 +418,7 @@ def follow() -> None:
             return None
         name = code.co_filename
         if checkout(name, root):
-            recorded(name[len(root):])
+            recorded(code_unit(code, root))
             if reads_backend(code):
                 write("read", f"{name[len(root):]}:{code.co_qualname}")
         return sys.monitoring.DISABLE
@@ -382,6 +436,9 @@ def follow() -> None:
             name = read(event, args, root)
             if name is not None:
                 write("file", name)
+            return
+        if (taken := coded(event, args, root)) is not None:
+            recorded(taken)
             return
         kind = start(event, args, str(directory))
         if kind == "followed":

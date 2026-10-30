@@ -859,11 +859,29 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     return solved if keeps else (None, *solved)
 
 
-INTRA_KEYS = 16
-"""The key block the intra launch's factored pairs take (`algebra.key_decayed_pairs`): each sub-chunk's and
-block's prefix halves, gated rows and keys `[C, 16]` fp32. At the mainloop's 64 columns its lowered peak was
-519 registers on an H100 and 1170 on an A100 (Kimi Linear, Tiles(32, 1)); at 16, 196 and 270, every forward
-launch spill-free under ptxas on both."""
+def _key_block(call: _Call, held: Callable[[int], _Held], consumers: int = 1) -> int:
+    """A launch's key block under a decay a key dimension, whose prefix halves, decays and gated keys it
+    holds a block at a time in fp32: the widest of the family's depths for 16-bit operands
+    (`Family.depths`), halved down to the narrowest columns a staged operand takes
+    (`Family.narrowest_columns`), at which its register model (`held(block)`, `_Held`) fits a consumer
+    thread's registers (`Family.registers`); the narrowest where none does, which the launch then refuses."""
+    family = call.family
+    block, narrowest = family.depths(jnp.bfloat16)[0], family.narrowest_columns(jnp.bfloat16)
+    while block > narrowest and held(block).registers(family) > family.registers(consumers):
+        block //= 2
+    return block
+
+
+def _intra_held(call: _Call, block: int) -> _Held:
+    """`_intra`'s consumer thread at key block `block`: the sum of the pairs carried across the sub-chunks and
+    a sub-chunk's own, beside a key block's tiles: its prefix halves, a pair's decay's two terms (`between`:
+    the exp2 of the fractions' difference and the scale of the wholes'), the rows or keys it gates and the
+    gated product, their masks, and the product's operands; then the doubling's, as the solve's."""
+    pairing = _pairing_operand(call)
+    return _Held(phases=(
+        [_f32(CHUNK, CHUNK)] * 2 + [_f32(CHUNK, block)] * 6 + _masks(CHUNK, block) * 2
+        + _fragments(call, (pairing, CHUNK, block), (pairing, CHUNK, block)),
+        [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
 
 
 @_lowered_once
@@ -875,6 +893,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     Without the delta rule, `(Aqk,)` alone."""
     width, held, gates = call.width, dataclasses.replace(call.held, rows=call.rows), call.gates
     family = call.family
+    keys = _key_block(call, functools.partial(_intra_held, call))
 
     def program(q_ref, k_ref, hi_ref, lo_ref, beta_ref, taken_ref, *outs, streams, staging, landing):
         n, h = _axis("chunks"), _axis("heads")
@@ -894,7 +913,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             slots.held()
 
             def block(name, operand, c):
-                return _tile(slots, name, operand, columns=pl.ds(c * INTRA_KEYS, INTRA_KEYS)).value()
+                return _tile(slots, name, operand, columns=pl.ds(c * keys, keys)).value()
 
             def operand(name):
                 return lambda c: block(name, call.given, c).astype(jnp.float32)
@@ -903,14 +922,14 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                 """The sub-chunk's first token's prefix halves on key block `c`, a column's vectors, from
                 global memory (a step's tiles carry their bundle's transforms, which a traced row does not
                 commute through)."""
-                columns = pl.ds(h * width + c * INTRA_KEYS, INTRA_KEYS)
+                columns = pl.ds(h * width + c * keys, keys)
                 return tuple(family.columns_of(ref.at[row + sub * algebra.SUB, columns])
                              for ref in (hi_ref, lo_ref))
 
             def gated(c):
                 return block("gates", gates, c), block("lows", gates, c)
 
-            pairs = functools.partial(algebra.key_decayed_pairs, columns=width // INTRA_KEYS, gates=gated,
+            pairs = functools.partial(algebra.key_decayed_pairs, columns=width // keys, gates=gated,
                                       reference=reference, summed=Issuer(call, {"pairs": pairing}).summed,
                                       chunk=CHUNK)
             scores = pairs(operand("queries"), operand("keys"), strict=False) * scale
@@ -934,20 +953,13 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     pairs = (CHUNK // algebra.SUB) * (1 + call.delta)
     work = Work(pairs * 2 * CHUNK * CHUNK * width + (_inverse_flops() if call.delta else 0),
                 exponentials=pairs * 2 * CHUNK * width)
-    # The sum of the pairs carried across the sub-chunks and a sub-chunk's own, beside a sub-chunk's and key
-    # block's prefix halves, exponent, gated rows and keys; then the doubling's, as the solve's.
-    held_tiles = _Held(phases=(
-        [_f32(CHUNK, CHUNK)] * 2 + [_f32(CHUNK, INTRA_KEYS)] * 4 + _masks(CHUNK, INTRA_KEYS) * 2
-        + _fragments(call, (_pairing_operand(call), CHUNK, INTRA_KEYS), (_pairing_operand(call), CHUNK,
-                                                                              INTRA_KEYS)),
-        [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
-    staging = (_pairing(call), *(_merges(call) if call.delta else ()))
+    staging = (_pairing(call, keys), *(_merges(call) if call.delta else ()))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
-                   held=held_tiles, staging=staging, landing={"square": held.landing(CHUNK, CHUNK)},
-                   persistent=True,
+                   held=_intra_held(call, keys), staging=staging,
+                   landing={"square": held.landing(CHUNK, CHUNK)}, persistent=True,
                    # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
-                   swizzles={name: INTRA_KEYS * jnp.dtype(dtype).itemsize
+                   swizzles={name: min(keys * jnp.dtype(dtype).itemsize, mosaic.SWIZZLE_BYTES)
                              for name, (_, dtype) in blocks.items()})(
         q, k, hi, lo, beta, taken)
 
@@ -962,16 +974,21 @@ def _pairing_operand(call: _Call) -> _Operand:
     return _Operand(call.rows, 1 if call.family.takes_tf32 else 2, jnp.dtype(jnp.float32))
 
 
-def _pairing(call: _Call) -> list:
+def _pairing(call: _Call, block: int) -> list:
     """The factored pairs' staging (`Issuer`'s 'pairs'): two sets, the gated rows' and the gated keys',
     each a `[C, block]` tile a part (`_pairing_operand`)."""
-    return [_staging(_pairing_operand(call), (CHUNK, INTRA_KEYS))[0] for _ in range(2)]
+    return [_staging(_pairing_operand(call), (CHUNK, block))[0] for _ in range(2)]
 
 
-WEIGHTED_KEYS = 32
-"""The key block the weighted launch takes under a decay a key dimension: its prefix halves, decays and
-written keys `[C, 32]` fp32 a block. At 64 columns its lowered peak was 344 registers on an H100 and an A100
-(Kimi Linear, Tiles(32, 1)); at 32, 248 and 175."""
+def _weighted_held(call: _Call, block: int) -> _Held:
+    """`_weighted`'s consumer thread at key block `block`: the inverse beside a value block's product, its
+    decay and its keys or values; under a decay a key dimension the key block's prefix halves, its range
+    decay's two terms (`algebra.range_decay`, as `between`'s) and its decayed write too."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    return _Held(phases=(
+        _held(held, CHUNK, CHUNK) + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
+        + [_f32(CHUNK, block)] * 5 * call.per_key
+        + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block)),))
 
 
 @_lowered_once
@@ -982,9 +999,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     and those alone without the delta rule (`a` None)."""
     width, value_width, gates, family = call.width, call.value_width, call.gates, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
-    # Under a decay a key dimension, a key block of its own: its prefix halves, decays and written keys
-    # held a block at a time.
-    keyed = WEIGHTED_KEYS if call.per_key else call.block
+    keyed = _key_block(call, functools.partial(_weighted_held, call)) if call.per_key else call.block
 
     def program(k_ref, v_ref, a_ref, hi_ref, lo_ref, beta_ref, taken_ref, *outs, streams, staging, landing):
         n, h = _axis("chunks"), _axis("heads")
@@ -1049,7 +1064,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                     inverse, betas, issue = applied
                     w = algebra.weighted("apply_w", inverse, tile.astype(held.dtype), betas, issue, decay)
                     held.store(outs[0], w, row, CHUNK, h * width + c * keyed, keyed, family=family,
-                               smem=landing["keyed"])
+                               smem=landing["keyed" if call.per_key else "block"])
             return carry, accumulators
 
         _walk(streams, views, step, call, prologue=None if streamed else lambda: read(None))
@@ -1064,24 +1079,22 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     # Without the delta rule the inverse's place takes the keys, an operand no step reads.
     work = Work(2 * CHUNK * CHUNK * (width + value_width) if call.delta else 0,
                 exponentials=CHUNK * width if call.per_key else 0)
-    # The inverse beside a block's product, its decay and its keys or values; under a decay a key dimension
-    # the block's prefix halves and its decayed write too.
-    held_tiles = _Held(phases=(
-        _held(held, CHUNK, CHUNK) + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
-        + [_f32(CHUNK, keyed)] * 3 * call.per_key
-        + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block)),))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"),
                    blocks=_streamed(**given) | _vector_blocks(call, *(("write",) if call.delta else ()),
                                                               *(() if call.per_key else ("gate", "low"))),
                    stages=1, live=_taken(6),
-                   work=work, held=held_tiles,
+                   work=work, held=_weighted_held(call, keyed),
                    staging=_staging(held, *dict.fromkeys(((CHUNK, call.block), (CHUNK, keyed)))) if call.delta
                    else (),
-                   landing={"block": held.landing(CHUNK, call.block), "keyed": held.landing(CHUNK, keyed)},
+                   # A key block's own landing only where it is one: a decay a head's would be the value
+                   # block's twice.
+                   landing={"block": held.landing(CHUNK, call.block),
+                            **({"keyed": held.landing(CHUNK, keyed)} if call.per_key else {})},
                    persistent=True,
                    # A key block's streams staged at its row: a tile slices only whole swizzle rows.
-                   swizzles={f"{name}{p}": keyed * jnp.dtype(operand.stored).itemsize
+                   swizzles={f"{name}{p}": min(keyed * jnp.dtype(operand.stored).itemsize,
+                                                mosaic.SWIZZLE_BYTES)
                              for name, (_, operand) in given.items() if name in ("keys", "gates", "lows")
                              for p in range(operand.parts)})(
         k, v, k if a is None else a, hi, lo, beta, taken)
