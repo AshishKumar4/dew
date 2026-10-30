@@ -496,6 +496,8 @@ def _export(capture: Path, converter: _Converter, metadata: dict[str, JSON],
     """Export a stopped `capture`: its status from what it holds (`held_back`), its native reports and its
     manifest (`_reports`), raising every failure of the stop (`failures`) and of the export together."""
     reasons = [] if failures else held_back(capture, metadata)
+    # The process that made the reports: the stopping one's own, or one beside it (`Profiler.stop`).
+    metadata["exported_by"] = os.getpid()
     metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
     metadata["capture_errors"] = [str(error) for error in failures]
     metadata["capture_reasons"] = [*reasons]

@@ -67,8 +67,9 @@ def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | No
     if epochs is None:
         return sum(taken for place, _, taken in _reached(root, examples) if place % partition.count
                    == partition.index)
-    mine = sum(root[place].rows for place in range(partition.index, len(root), partition.count))
-    passes, rest = divmod(examples, sum(root[place].rows for place in range(len(root))))
+    rows = [_rows(root[place]) for place in range(len(root))]
+    mine = sum(rows[partition.index::partition.count])
+    passes, rest = divmod(examples, sum(rows))
     return passes * mine + sum(taken for place, _, taken in _reached(root, rest)
                                if place % partition.count == partition.index)
 
@@ -93,11 +94,17 @@ def _reached(root: grain.MapDataset, examples: int) -> Iterator[tuple[int, Shard
     of it they hold. Some shard of `root` holds a row."""
     place = 0
     while examples > 0:
-        shard = root[place]
-        assert shard.rows is not None, "every shard a bound walks states its rows"
-        yield place, shard, min(shard.rows, examples)
-        examples -= shard.rows
+        shard: Shard = root[place]
+        rows = _rows(shard)
+        yield place, shard, min(rows, examples)
+        examples -= rows
         place += 1
+
+
+def _rows(shard: Shard) -> int:
+    """The rows `shard` states, which every shard a bound walks does (`bounded`)."""
+    assert shard.rows is not None, "every shard a bound walks states its rows"
+    return shard.rows
 
 
 def _shards(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) -> tuple[Shard, ...]:
@@ -128,8 +135,11 @@ def _dealt(shards: tuple[Shard, ...], *, seed: int | None, epochs: int | None) -
     return root
 
 
-class _ShardPass(grain.IterDataset):
-    def __init__(self, root: grain.MapDataset, reader: Callable[[Shard], grain.IterDataset], cycle: int,
+class _ShardPass[Place](grain.IterDataset):
+    """A share's places of a stream (its shards, or `(shard, rows)` of a bound's, `bounded_places`), each
+    read by `reader`, interleaved `cycle` at a time."""
+
+    def __init__(self, root: grain.MapDataset, reader: Callable[[Place], grain.IterDataset], cycle: int,
                  loading: Loading, name: str):
         super().__init__(root)
         self.root, self.reader = root, reader
@@ -177,14 +187,14 @@ class _Taken:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Reader:
-    """A shard's reader, its rows watched for a run of empty shards (`_EmptyRun`)."""
+class _Reader[Place]:
+    """A place's reader (a shard's), its rows watched for a run of empty shards (`_EmptyRun`)."""
 
-    reader: Callable[[Shard], grain.IterDataset]
+    reader: Callable[[Place], grain.IterDataset]
     empty: _EmptyRun
 
-    def __call__(self, shard: Shard) -> grain.IterDataset:
-        return _Watched(self.reader(shard), self.empty)
+    def __call__(self, place: Place) -> grain.IterDataset:
+        return _Watched(self.reader(place), self.empty)
 
 
 class _Watched(grain.IterDataset):

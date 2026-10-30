@@ -422,6 +422,13 @@ def _bounds(stages: Sequence[Stage], at: int) -> bool:
             and isinstance(marks.step, MarkConsumed))
 
 
+def _bound(pipeline: Pipeline, at: int) -> int:
+    """The examples of the bound at `at` (`_bounds`)."""
+    stage = pipeline.stages[at]
+    assert isinstance(stage, Limit), "a bound in examples is a limit"
+    return stage.count
+
+
 type Share = Callable[[int], int | None] | None
 """A per-share read's part of the pool's first examples, as its root deals its source to the shares
 (`DataPartition.bounded`, `dew.data.shards.bounded`); None, or a part of None, where the root deals no
@@ -1658,7 +1665,7 @@ class _Build:
         if at is None or any(_drops(stage) for stage in pipeline.stages[consumed:at]) or any(
                 isinstance(stage, (Slice, Limit)) for stage in pipeline.stages[:at]):
             return None
-        return pipeline.stages[at].count
+        return _bound(pipeline, at)
 
     def shared(
         self, rows: pygrain.MapDataset, pipeline: Pipeline, partition: DataPartition
@@ -1717,7 +1724,7 @@ class _Build:
         # none, and its pool steps it emptied (`dew.training._fit.pooled_read`).
         at, quota = self.bound_at(pipeline, partition), None
         if at is not None:
-            examples = pipeline.stages[at].count
+            examples = _bound(pipeline, at)
             dealt = share if self.dealt_examples(pipeline, partition, consumed) is not None else None
             held = None if dealt is None else dealt(examples)
             quota = partition.bounded(examples) if held is None else held

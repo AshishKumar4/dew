@@ -497,11 +497,13 @@ def credited(column: jax.Array | np.ndarray, examples: int) -> jax.Array | np.nd
         return column + owed
 
     def credit(shard: jax.Shard) -> jax.Array:
+        data = shard.data
+        assert isinstance(data, jax.Array), "an addressable shard holds its data"
         if shard.index and (shard.index[0].start or 0):
-            return shard.data
-        owed = np.zeros(shard.data.shape, np.int32)
+            return data
+        owed = np.zeros(data.shape, np.int32)
         owed[0] = examples
-        return shard.data + jax.device_put(owed, shard.device)
+        return data + jax.device_put(owed, shard.device)
 
     return jax.make_array_from_single_device_arrays(column.shape, column.sharding,
                                                     [credit(shard) for shard in column.addressable_shards])
@@ -601,7 +603,7 @@ def pooled_read(run: FitRun, stream: Iterator[Batch], *, phase: str = "training 
     partition, empty = run.partition, run.emptied
     assert partition is not None and empty is not None
 
-    def said(batch: Batch) -> list[int]:
+    def said(batch: Batch) -> JSON:
         # Its share's rows: a placed batch's are the step's, every share holding as many of them.
         rows = rows_of(batch) if peek else rows_of(batch) // partition.count
         return [counted(batch).examples if partition.reader == 0 else 0, rows]

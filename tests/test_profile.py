@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -82,24 +83,24 @@ def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, nativ
     assert result.is_ready()
 
 
-def test_a_stop_that_does_not_wait_exports_its_capture_in_a_process_of_its_own(tmp_path, native_reports,
-                                                                             monkeypatch):
+def test_a_stop_that_does_not_wait_exports_its_capture_in_a_process_of_its_own(tmp_path, native_reports):
     """A capture stopped without waiting (`Profiler.stop(wait=False)`, a training window's) is stopped at
     once and its reports and manifest made in a process of their own, never by the caller's, whole once
-    `exported` returns (row 2017)."""
-    def unconverted(*arguments):
-        raise AssertionError("the caller converted its capture itself")
-
-    monkeypatch.setattr(profile, "_reports", unconverted)
-    profiler = dew.Profiler(tmp_path).start()
+    `exported` returns (row 2017); one that waits makes them itself."""
+    profiler = dew.Profiler(tmp_path / "beside").start()
     work().block_until_ready()
     profiler.stop(wait=False)
     assert not profiler.running and active_profile() is None
-    profile.exported(tmp_path)
-    (capture,) = captures(tmp_path)
+    profile.exported(tmp_path / "beside")
+    (capture,) = captures(tmp_path / "beside")
     record = manifest(capture)
+    assert record["exported_by"] != os.getpid()
     assert record["capture_status"] == record["export_status"] == "completed"
     assert any(report["status"] == "completed" for report in record["reports"])
+    waited = dew.Profiler(tmp_path / "waited").start()
+    work().block_until_ready()
+    waited.stop()
+    assert manifest(*captures(tmp_path / "waited"))["exported_by"] == os.getpid()
 
 
 def test_body_failure_keeps_trace_and_releases_for_next_capture(tmp_path, native_reports):

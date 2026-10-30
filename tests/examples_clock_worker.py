@@ -46,10 +46,12 @@ def examples_clock(args) -> dict:
     expands = args.deal != "order"
 
     class Questioned:
-        """Each record made `id % 3 + 1` rows, as a decision layout makes a row of each question."""
+        """Each record made `id % 3 + 1` rows, as a decision layout makes a row of each question, the
+        question it asks on each."""
 
         def flat_map(self, element):
-            return tuple({"id": element["id"]} for _ in range(int(element["id"]) % 3 + 1))
+            return tuple({"id": element["id"], "question": np.int32(question)}
+                         for question in range(int(element["id"]) % 3 + 1))
 
     class Pulled(Objective):
         """A weight pulled toward each real row's id, counting each id's examples among the rows it trains."""
