@@ -1742,11 +1742,13 @@ def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_gr
                                        shutil.which("python3") or "")
                  if Path(python).is_file() and version(python) != version(sys.executable))
     verdict = tmp_path / ".verdict/verdict.json"
-    subprocess.run([sys.executable, script, "task", "--python=3.12", "--tests=tests/test_a.py tests/test_b.py",
-                    f"--out={verdict}", "--cache=on"], cwd=tmp_path, env=env, check=True)
+    tests = "--tests=tests/test_a.py tests/test_b.py"
+    subprocess.run([sys.executable, script, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
+                   cwd=tmp_path, env=env, check=True)
     assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0, 0]
-    planned = subprocess.run([other, script, "plan", "--target=300", f"--timings={tmp_path / 'timings.json'}"],
-                             cwd=tmp_path, env=env, capture_output=True, text=True, check=True).stdout
+    timings = tmp_path / "timings.json"
+    planned = subprocess.run([other, script, "plan", "--target=300", f"--timings={timings}"], cwd=tmp_path,
+                             env=env, capture_output=True, text=True, check=True).stdout
     entries = [entry for entry in json.loads(planned)["include"] if entry["python"] == "3.12"]
     assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [
         ["tests/test_a.py", "tests/test_b.py"]]
