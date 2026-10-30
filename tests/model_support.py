@@ -302,3 +302,10 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
             return {"row0": logits[0], "row1": logits[1, PADDED:]}
         return jax.jit(biased)
     return jax.jit(lambda inputs: {"logits": model.apply(variables, inputs["ids"])})
+
+
+def prediction_logits(model, variables, tokens):
+    """A causal transformer's multi-token prediction logits for `tokens`: its prediction depth's first, read
+    from its hidden states (`CausalTransformer.mtp_logits`)."""
+    hidden = model.apply(variables, tokens, method=CausalTransformer.hidden_states)
+    return model.apply(variables, hidden, tokens, method=CausalTransformer.mtp_logits)[0]

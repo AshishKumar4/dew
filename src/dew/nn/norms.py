@@ -45,28 +45,29 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
     on the result before its last cast to `dtype`, as `GroupNorm`'s does.
     """
     activated = (lambda y: y) if activation is None else activation
+    # A pure normalization has no learned weight, as Gemma 4 norms its values
+    # (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
+    weight = None if scale is None else (1.0 + scale) if scale_offset else scale
     if fp32_statistics:
-        y = x.astype(at_least_fp32(x.dtype))
-        y = y * rms_statistics(y, epsilon)[1]
+        x = x.astype(at_least_fp32(x.dtype))
+        inverse, normalized = rms_statistics(x, epsilon)[1], None
     else:
         # The reference rounds every step to the input dtype. XLA fuses the
         # chain and carries fp32 between the ops, so each rounding is explicit.
-        y = rounded_to(x * rounded_to(jax.lax.rsqrt(rounded_to(
+        inverse = rounded_to(jax.lax.rsqrt(rounded_to(
             rounded_to(jnp.mean(rounded_to(jnp.square(x), x.dtype), axis=-1, keepdims=True), x.dtype)
-            + epsilon, x.dtype)), x.dtype), x.dtype)
-    if scale is None:
-        # A pure normalization with no learned weight, as Gemma 4 norms
-        # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
-        return activated(y).astype(dtype)
-    weight = (1.0 + scale) if scale_offset else scale
-    if scale_after_cast:
-        # The reference casts the activations, then multiplies by its weight:
-        # a bf16 product for a bf16 weight, an fp32 one for an fp32 master
-        # that the next layer rounds. Rounding in place keeps both roundings
-        # under jit, where XLA drops a narrowing cast that a widening one
-        # follows, and keeps the weight's product and gradient in fp32.
-        return rounded_to(activated(rounded_to(y, dtype) * weight), dtype).astype(dtype)
-    return activated(y * weight).astype(dtype)
+            + epsilon, x.dtype)), x.dtype)
+        normalized = functools.partial(rounded_to, dtype=x.dtype)
+    after_cast = weight is not None and scale_after_cast
+    # The reference casts the activations, then multiplies by its weight: a
+    # bf16 product for a bf16 weight, an fp32 one for an fp32 master that the
+    # next layer rounds. Rounding in place keeps both roundings under jit,
+    # where XLA drops a narrowing cast that a widening one follows, and keeps
+    # the weight's product and gradient in fp32.
+    rounded = normalized if not after_cast else (
+        lambda y: rounded_to(y if normalized is None else normalized(y), dtype))
+    y = activated(rms_weighted(x, inverse, weight=weight, rounded=rounded))
+    return (rounded_to(y, dtype) if after_cast else y).astype(dtype)
 
 
 def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,

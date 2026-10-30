@@ -278,11 +278,13 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     """The attention template's route (`attention_route.attend`) over the call's visibility as spans
     (`key_spans`): its causality, window, documents (`segment_ids`, or `CrossDocuments` aligned to their last
     keys), key lengths and starts, block and image groups, and key validity and counted places, with
-    probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook, a `bias` one
-    term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the keys' logical places) a key score hook added after
-    it (`template.key_biased`), and sinks are the softmax's initial state. On a mesh it runs per shard
-    (`on_attention_shards`), as the decode kernel does: the key heads repeat until the tensor axes split
-    them, the sinks split with their heads, and the ids, lengths, starts, groups, validity and places with
+    probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook, a `bias` a
+    score hook added after it (`template.biased`): one term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the
+    keys' logical places) a key parameter, a dense `[B or 1, H or 1, Q, K]` one a tile parameter, read a
+    tile at a time and its gradient the tiles' pulled cotangents; sinks are the softmax's initial state. On
+    a mesh it runs per shard (`on_attention_shards`), as the decode kernel does: the key heads repeat until
+    the tensor axes split them, the sinks split with their heads, and the ids, lengths, starts, groups,
+    validity and places with
     their rows. Its requirements (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
     """
     if sinks is not None and sinks.shape != (query.shape[2],):
@@ -304,9 +306,15 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         elif seed is not None and global_rows is not None and global_heads is not None:
             drop = template.Dropout(seed, global_rows, global_heads, dropout_rate)
         capped = None if softcap is None else functools.partial(template.capped, softcap)
+        if bias is None:
+            params = ()
+        elif bias.shape[2] == 1:
+            params = (template.Param(bias[:, :, 0], template.Kind.KEY),)
+        else:
+            params = (template.Param(bias, template.Kind.TILE),)
         hooks = template.Hooks(
-            score_mod=capped if bias is None else functools.partial(template.key_biased, capped),
-            score_params=() if bias is None else (template.Param(bias[:, :, 0], template.Kind.KEY),),
+            score_mod=capped if bias is None else functools.partial(template.biased, capped),
+            score_params=params,
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)
         return attention_route.attend(query, key, value, spans, hooks)
@@ -325,7 +333,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                       key_runs=(key_runs, ("activation_batch", None, None, None)),
                       places=(places, ("activation_batch", None)), seed=(dropout_seed, (None,)),
                       bias=(None if bias is None else jnp.broadcast_to(
-                          bias, (query.shape[0], query.shape[2], 1, key.shape[1])),
+                          bias, (query.shape[0], query.shape[2], jnp.shape(bias)[2], key.shape[1])),
                             ("activation_batch", "activation_heads", None, None)))
 
 
@@ -890,8 +898,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                     or key_valid is not None or key_runs is not None
                     or (places is not None and sliding_window is not None)),
         mask=mask is not None, bias=bias is not None,
-        key_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] == 1
-                  and jnp.dtype(bias.dtype).itemsize <= 4),
+        bias_hook=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] in (1, query.shape[1])
+                   and jnp.dtype(bias.dtype).itemsize <= 4),
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),

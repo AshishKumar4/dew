@@ -26,7 +26,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
-from reference_error import as_given, assert_as_exact, widened, with_gradients, without_ynn
+from reference_error import as_given, assert_as_exact, widened, with_gradients
 
 from dew.batch import FROZEN
 from dew.data.dataset import Loader
@@ -216,16 +216,12 @@ def tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
                    (direction,))
 
 
-# Both arms of the forward-mode check are Dew programs, compiled alike (docs/design/testing.md).
-fp8_tangents = without_ynn(tangents)
-
-
-@as_given
 def default_precision_tangents(*inputs):
-    """`fp8_tangents` compiled under JAX's default matmul precision, not the suite's highest
-    (`lane_environment`): the products state their own."""
+    """`tangents` traced under JAX's default matmul precision, not the suite's highest
+    (`lane_environment`): the products state their own. A plain arm, which check 1 compiles alike with
+    the reference's (`_arms`, docs/design/testing.md)."""
     with jax.default_matmul_precision("default"):
-        return fp8_tangents(*inputs)
+        return tangents(*inputs)
 
 
 def decoded_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):

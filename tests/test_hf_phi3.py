@@ -1,6 +1,5 @@
 """Phi-3's fused GQA and LongRoPE against transformers 5.17.0."""
 
-import contextlib
 import dataclasses
 import json
 from pathlib import Path
@@ -9,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_ids, transformers_arms, transformers_model
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import assert_as_exact, widened
 
 from dew.interop import Pretrained
 from dew.interop.sources import load_shards
@@ -137,42 +136,29 @@ MIXED_SEEDS = 32
 
 def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule():
     import torch
-    from transformers import AutoModelForCausalLM
-
-    from tools.torch_precision import float64
 
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
     shape = np.load(DIRECTORY / 'input_ids.npy')[:, :4].shape
     positions = np.stack((np.arange(12, 16), np.arange(4)))
-    reference = AutoModelForCausalLM.from_pretrained(DIRECTORY, attn_implementation='eager').float().eval()
-    with float64():
-        truth_model = AutoModelForCausalLM.from_config(
-            reference.config, dtype=torch.float64, attn_implementation='eager').eval()
-    truth_model.load_state_dict(reference.state_dict())
     vocabulary = json.loads((DIRECTORY / 'config.json').read_text())['vocab_size']
 
     def draw(seed):
         return (np.random.default_rng(seed).integers(0, vocabulary, shape).astype(np.int32),)
 
-    def rows(model, precision):
+    def rows(model, ids):
         """Each row's logits at batch one, the reference's own table per row."""
-        def run(ids):
-            ids = np.asarray(ids)
-            with torch.no_grad(), precision():
-                return {f'row {row}': model(torch.from_numpy(ids[row:row + 1]).long(),
-                                            position_ids=torch.from_numpy(positions[row:row + 1]).long(),
-                                            use_cache=False).logits.double().numpy()[0] for row in range(2)}
-        return as_given(run)
+        return {f'row {row}': model(ids[row:row + 1], position_ids=torch.from_numpy(positions[row:row + 1]),
+                                    use_cache=False).logits[0] for row in range(2)}
 
     def ours(ids):
         logits = loaded.model.apply(loaded.variables, ids, positions=positions)
         return {f'row {row}': logits[row] for row in range(2)}
 
-    assert_as_exact(ours, rows(reference, contextlib.nullcontext), draw, 'Phi-3 mixed rows',
-                    seeds=MIXED_SEEDS, truth_fn=rows(truth_model, float64))
+    reference, truth = transformers_arms(transformers_model(DIRECTORY), rows)
+    assert_as_exact(ours, reference, draw, 'Phi-3 mixed rows', seeds=MIXED_SEEDS, truth_fn=truth)
     (ids,) = draw(0)
     actual = np.asarray(loaded.model.apply(loaded.variables, ids, positions=positions))
-    expected = np.stack([rows(reference, contextlib.nullcontext)(ids)[f'row {row}'] for row in range(2)])
+    expected = np.stack([reference(ids)[f'row {row}'] for row in range(2)])
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
 
     uniform = loaded.model.apply(loaded.variables, ids, positions=np.stack((np.arange(4), np.arange(4))))

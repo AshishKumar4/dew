@@ -54,11 +54,6 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
-"""Resident threads a multiprocessor holds by compute capability, 1536 on the others the targets name
-(CUDA C++ Programming Guide, "Technical Specifications per Compute Capability")."""
-
-
 def target_config(generation: str, capacity: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
     (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
@@ -75,7 +70,7 @@ def target_config(generation: str, capacity: int | None = None) -> str:
   threads_per_warp: 32
   shared_memory_per_block: 49152
   shared_memory_per_core: {shared + 1024}
-  threads_per_core_limit: {THREADS_PER_MULTIPROCESSOR.get((major, minor), 1536)}
+  threads_per_core_limit: {target.architecture.resident_threads}
   core_count: {multiprocessors}
   fpus_per_core: {64 if (major, minor) == (8, 0) else 128}
   block_dim_limit_x: 2147483647

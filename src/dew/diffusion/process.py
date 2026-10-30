@@ -131,9 +131,11 @@ class Process:
 
         By default the prior's standard deviation is that of the marginal at
         T for unit-variance data. A schedule may declare a different scale
-        through `prior_scale`.
+        through `prior_scale`. The draw is float32's whatever the default
+        dtype, as the samplers' innovations are, so a float64 walk from a key
+        starts from the float32 walk's numbers.
         """
-        return jax.random.normal(key, shape) * self.sampler_schedule.prior_scale()
+        return jax.random.normal(key, shape, jnp.float32) * self.sampler_schedule.prior_scale()
 
     def denoiser(self, model, params, conditions: Mapping[str, Conditioning],
                  unconditional: Mapping[str, Conditioning] | None = None, *,

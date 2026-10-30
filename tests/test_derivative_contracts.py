@@ -107,14 +107,21 @@ EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.
 pairs) reach float32's largest or its least normal."""
 
 
+DELTA_RULE_EDGES = [edge for edge in EDGES if edge != "near the largest"]
+"""The chunked delta rule's edges: near float32's largest its derivative gives inf where float64 is a
+normal float32, ledger 2470's, whose red test rides its fix."""
+
+
+@pytest.mark.parametrize("edge", DELTA_RULE_EDGES)
 @pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
-def test_the_chunked_delta_rule_holds_every_order(packed):
+def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     """`recurrence_chunk.chunk_delta_rule` (the portable rule's custom derivative through
     `generation.linear_tangent`, rows 1861 and 1862): every order runs, its boolean document starts a
-    residual with no tangent space, and each is finite wherever float64 is a normal float32."""
+    residual with no tangent space, and each is finite wherever float64 is a normal float32, at queries,
+    keys and values whose products near float32's ends; the decays and gates as drawn."""
     keys = jax.random.split(jax.random.key(1861), 8)
     rows, length, heads, width = 1, 37, 2, 8
-    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
+    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) * EDGES[edge] for k in keys[:3])
     g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
     starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
@@ -123,9 +130,10 @@ def test_the_chunked_delta_rule_holds_every_order(packed):
         return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=16, starts=starts)[0]
 
     primals = (query, key, value, g, beta)
-    direction = tuple(jax.random.normal(keys[6], x.shape) for x in primals)
+    direction = tuple(jax.random.normal(keys[6], x.shape) * (EDGES[edge] if at < 3 else 1.0)
+                      for at, x in enumerate(primals))
     cotangent = jax.random.normal(keys[7], query.shape)
-    assert_contract(rule, primals, direction, cotangent, "the chunked delta rule")
+    assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}")
 
 
 def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
@@ -172,30 +180,37 @@ def test_a_bf16_dot_holds_every_order(edge):
                     plain_fn=plain)
 
 
-def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch):
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch, edge):
     """`precision.accumulated` in a process running wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, its own
     custom derivative of the float64-summed product): every order runs, finite wherever float64 is a
-    normal float32."""
+    normal float32 and wherever XLA's plain product is, at values whose products near float32's ends."""
     monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "1")
-    primals = normal_draw(343, (4, 16), (16, 5))
-    direction = normal_draw(344, (4, 16), (16, 5))
+    primals = normal_draw(343, (4, 16), (16, 5), scale=EDGES[edge])
+    direction = normal_draw(344, (4, 16), (16, 5), scale=EDGES[edge])
     (cotangent,) = normal_draw(345, (4, 5))
     assert_contract(lambda lhs, rhs: precision.accumulated(jnp.matmul, lhs, rhs), primals, direction,
-                    cotangent, "a wide CPU sum of products")
+                    cotangent, f"a wide CPU sum of products {edge}", plain_fn=jnp.matmul)
 
 
-def test_a_grouped_gemm_holds_every_order():
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_grouped_gemm_holds_every_order(edge):
     """The GEMM template's grouped product (`template.gemm`, its custom derivative through
     `generation.linear_tangent`): every order runs in the rows and the matrices, the group sizes not
-    differentiable, finite wherever float64 is a normal float32."""
+    differentiable, finite wherever float64 is a normal float32 and wherever XLA's ragged product is, at
+    values whose products near float32's ends."""
     sizes = jnp.asarray([3, 0, 5], jnp.int32)
-    primals = normal_draw(146, (8, 16), (3, 16, 4))
-    direction = normal_draw(147, (8, 16), (3, 16, 4))
+    primals = normal_draw(146, (8, 16), (3, 16, 4), scale=EDGES[edge])
+    direction = normal_draw(147, (8, 16), (3, 16, 4), scale=EDGES[edge])
     (cotangent,) = normal_draw(148, (8, 4))
+
     def grouped(rows, matrices):
         return template.gemm(rows, matrices, sizes, out_dtype=rows.dtype)
 
-    assert_contract(grouped, primals, direction, cotangent, "a grouped GEMM")
+    def plain(rows, matrices):
+        return jax.lax.ragged_dot(rows, matrices, sizes)
+
+    assert_contract(grouped, primals, direction, cotangent, f"a grouped GEMM {edge}", plain_fn=plain)
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():

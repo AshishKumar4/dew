@@ -48,6 +48,7 @@ from jax.extend.mlir import ir
 from dew.cache import uncached
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Route
+from dew.nn.kernels.templates import report
 from dew.telemetry.instrumentation import custom_call_kind, sizes
 
 _log = logging.getLogger(__name__)
@@ -173,7 +174,9 @@ def _kernel_name(location: ir.Location) -> str | None:
     if named is None:
         return None
     stack = named.split("/")
-    return stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
+    # Less the launch the kernel's name carries (`report.named`), so a kernel reads as itself in every call.
+    kernel = stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
+    return report.LAUNCH_SUFFIX.sub("", kernel)
 
 
 def _named(location: ir.Location) -> str | None:

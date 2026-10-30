@@ -9,9 +9,9 @@ import fractions
 import functools
 import math
 
-import ml_dtypes
 import numpy as np
 from op_certificates import (
+    DTYPES,
     EXP_RANGE,
     FORMATS,
     Format,
@@ -21,13 +21,13 @@ from op_certificates import (
     interval_precision,
     magnitude_sum,
     rounded,
+    stepped as oc_stepped,
     two_sum,
 )
 
 STORAGE = {"float32": np.uint32, "bfloat16": np.uint16}
 """Each format's storage bits, which a move of data is compared by."""
 
-VALUES = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16}
 """Each format's NumPy type."""
 
 UNREACHED = np.iinfo(np.int64).max
@@ -59,7 +59,7 @@ def _grid_index(value, fmt: Format, flushes: bool) -> np.ndarray:
     from zero, negative below it: its storage bits' magnitude, less the subnormals the grid skips where
     the lane flushes, so that the least normal is one step from zero there."""
     value = np.asarray(value, np.float64)
-    magnitude = np.abs(value).astype(VALUES[fmt.name]).view(STORAGE[fmt.name]).astype(np.int64)
+    magnitude = np.abs(value).astype(DTYPES[fmt.name]).view(STORAGE[fmt.name]).astype(np.int64)
     if flushes:
         magnitude = np.where(magnitude > 0, magnitude - (2 ** (fmt.precision - 1) - 1), 0)
     return np.where(np.signbit(value), -magnitude, magnitude)
@@ -140,9 +140,8 @@ def _step(value, fmt: Format, direction: float, flushes: bool) -> np.ndarray:
     """The next value of `fmt` after each `value` (a value of `fmt`, as float64) toward `direction`,
     on the lane's grid: where it `flushes` its outputs hold no subnormal, so the next value past zero is
     the least normal and the next below the least normal is zero."""
-    dtype = VALUES[fmt.name]
     value = np.asarray(value, np.float64)
-    stepped = np.nextafter(value.astype(dtype), np.full(value.shape, direction, dtype)).astype(np.float64)
+    stepped = oc_stepped(value, fmt, direction)
     if flushes:
         least = 2.0 ** fmt.emin
         tiny = np.abs(stepped) < least
@@ -327,8 +326,11 @@ def allowance(magnitude, count: int, fmt: Format, underflow: float):
     """How far any order's sum of `count` terms of total magnitude `magnitude` lies from their exact sum in
     `fmt`: γ_n of it (Higham, §3.1), with 2^-52 for the exact sum's own float64 rounding (`exact_sum`), and
     `underflow` lost at each rounding below the normal range. Check 2's sums (`_terms_hold`) and a native
-    GEMM's (`native_certificates.native_dot_ends`) are held within it."""
-    return (gamma(count, fmt) + 2.0 ** -52) * magnitude + count * underflow
+    GEMM's (`native_certificates.native_dot_ends`) are held within it; `count` an int or each element's
+    count, an array (an add of an exact zero rounding nothing)."""
+    gammas = (np.vectorize(lambda n: gamma(int(n), fmt), otypes=[np.float64])(count) if np.ndim(count)
+              else gamma(count, fmt))
+    return (gammas + 2.0 ** -52) * magnitude + count * underflow
 
 
 def _floats(operands, flushes: bool):
@@ -784,7 +786,7 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         value[:quarter] = rng.choice([-1.0, 1.0], quarter) * poles
         value[0] = 0.0
         drawn = [value]
-    return [value.astype(VALUES[fmt.name]) for value in drawn]
+    return [value.astype(DTYPES[fmt.name]) for value in drawn]
 
 
 @functools.cache
@@ -912,8 +914,8 @@ def certified(fn, *arguments) -> tuple:
 
 
 def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
+    from float64_terms import _body
     from jax.extend import core
-    from reference_error import _body
 
     env = {}
 

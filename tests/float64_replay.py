@@ -5,7 +5,8 @@ draws, whose float32 bits a float64 run would draw otherwise)."""
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import _floating, as_given, equations, scan_groups
+from float64_terms import scan_groups
+from reference_error import _floating, as_given, equations
 
 REPLAYED = frozenset({
     "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "square", "exp", "expm1", "log", "erf",
