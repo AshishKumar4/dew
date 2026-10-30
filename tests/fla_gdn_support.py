@@ -57,6 +57,8 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     gated = jax.ShapeDtypeStruct((batch, length, value_heads), jnp.float32)
     beta = jax.ShapeDtypeStruct(gated.shape, narrow)
     inverse = jax.ShapeDtypeStruct((batch, length, value_heads, chunk), narrow)
+    # The query side's pair terms, fp32 as the rule passes them (`chunk_bwd_dqkwg`'s, summed over key blocks).
+    pairs = jax.ShapeDtypeStruct(inverse.shape, jnp.float32)
     entered = jax.ShapeDtypeStruct((batch * (length // chunk), value_heads, width, columns), narrow)
     state = jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)
     operands = {
@@ -68,7 +70,7 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
         "chunk_bwd_dv_local": (keyed, keyed, gated, valued),
         "chunk_bwd_dhu": (keyed, keyed, weighted, gated, state, valued, valued),
         "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, entered, valued, valued, entered),
-        "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed, inverse, gated),
+        "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed, pairs, gated),
     }
     kwargs = {"chunk": chunk, "interpret": False}
     if kernel == "cumulated":

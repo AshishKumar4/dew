@@ -119,6 +119,7 @@ class Architecture:
 
     family: str | None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    resident_threads: int = 1536
     wgmma: bool = False
     tma: bool = False
     tmem_columns: int | None = None
@@ -141,16 +142,20 @@ class Architecture:
 # IV): A100 466.3, H800 478.8, RTX 4090 541.5. L2 bytes a multiprocessor a clock, Dew's streaming probe
 # (L2PROBE, probe_l2.py) over SMs x clock: A100 5.43 TB/s -> 35.7, A10 4.74 -> 38.8, H100 SXM 13.2 -> 54.6.
 # A family no device of which was measured takes its nearest measured family's values, said so below.
-_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, load_latency=466.3,
+_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048,
+                       load_latency=466.3,
                        l2_bytes_per_clock=35.7)
 _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
                                 l2_bytes_per_clock=38.8)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8)
-_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, wgmma=True, tma=True,
+_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024, load_latency=541.5,
+                       l2_bytes_per_clock=38.8)
+_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, resident_threads=2048,
+                       wgmma=True, tma=True,
                        load_latency=478.8, l2_bytes_per_clock=54.6)
 # Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
-_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, tmem_columns=512, tma=True,
+_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, resident_threads=2048,
+                          tmem_columns=512, tma=True,
                           load_latency=478.8, l2_bytes_per_clock=54.6)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates
 # and measured values.
@@ -711,7 +716,8 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
 
 
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
-                   live_cotangents: bool = False) -> Callable:
+                   live_cotangents: bool = False, primal: Callable | None = None,
+                   nested: bool = True) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
@@ -730,7 +736,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
-    cotangent is never formed."""
+    cotangent is never formed. `primal(*operands)` gives the output where no derivative is taken (a kernel
+    that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
+    it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
+    policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -771,10 +780,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     @jax.custom_jvp
     def bounded(*operands):
-        return forward(*operands)[0]
+        return forward(*operands)[0] if primal is None else primal(*operands)
 
     def bounded_jvp(primals, tangents):
-        output, saved = produced(*primals)
+        output, saved = (produced if nested else forward)(*primals)
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)

@@ -38,7 +38,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from interop_support import fixture_ids, transformers_arms, transformers_model
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
@@ -49,50 +50,82 @@ DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek
             "mamba2-tiny")
 
 
+DECODER_SEEDS = {"float32": {"mixtral-tiny": 16}, "bfloat16": {"mixtral-tiny": 512}}
+"""Each decoder's declared draws of ids against transformers' forward in the same precision (check 1),
+sized by `seeds_for` paired with Dew's logits on the CPU: 8 where a decoder is not named."""
+ONE_DRAW = {("deepseek-v3-tiny", "bfloat16")}
+"""The decoders whose check 1 does not resolve within the 512-seed cap, paired (G02's open row): held on
+their recorded draw by the one-draw rule, as before, until it does."""
+
+
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("name", DECODERS)
 def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
+    """Dew's logits in `dtype` (bfloat16 over float32 masters, as training runs) are on par with
+    transformers' own forward in `dtype` (its weights cast to it, as `from_pretrained` casts them), both
+    from the float64 twin of the stored weights, over drawn ids (check 1)."""
     directory = FIXTURES / name
     pretrained = Pretrained.load(str(directory), dtype=dtype, attention_impl="reference")
-    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
-    logits = np.asarray(pretrained.model.apply(pretrained.variables, ids), np.float32)
-    with np.load(directory / "numerics.npz") as exact:
-        reference = np.load(directory / "logits.npy") if dtype == "float32" else exact["bf16"]
-        assert_as_exact_as_the_reference(logits, reference, exact["f64"], f"{name} {dtype}")
+    if (name, dtype) in ONE_DRAW:
+        ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+        logits = np.asarray(pretrained.model.apply(pretrained.variables, ids), np.float32)
+        with np.load(directory / "numerics.npz") as exact:
+            assert_as_exact_as_the_reference(logits, exact["bf16"], exact["f64"], f"{name} {dtype}")
+        return
+    source = transformers_model(directory)
+    narrow = source if dtype == "float32" else transformers_model(directory, dtype=dtype)
+    reference, truth = transformers_arms(narrow, lambda model, ids: model(ids, use_cache=False).logits,
+                                         source=source)
+    assert_as_exact(lambda ids: pretrained.model.apply(pretrained.variables, ids).astype(jnp.float32),
+                    reference, fixture_ids(directory), f"{name} {dtype}",
+                    seeds=DECODER_SEEDS[dtype].get(name, 8), truth_fn=truth)
+
+
+BIAS_SEEDS = {"qwen2-tiny": 64, "llama-tiny": 32}
+"""The projection biases' declared draws of batches against transformers' bfloat16 gradients (check 1),
+sized by `seeds_for` paired with Dew's gradients on the CPU."""
 
 
 @pytest.mark.parametrize("name", ["qwen2-tiny", "llama-tiny"])
 def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does(name):
-    """A bfloat16 model's projection biases sum their gradients over every token of the batch.
-    Over four batches of 8192 tokens Dew's land as near float64 as transformers' own bfloat16
-    gradients, which accumulate those sums at float32; a bfloat16 sum, which JAX gives a
-    broadcast's transpose (jax-ml/jax#30310), lands several times further. Each leaf is held
-    to the reference over the four batches at once, every bias leaf of the model: one batch's
-    key bias, whose gradient nearly cancels by the softmax's shift invariance, is a draw of a
-    few dozen rounded terms: over 24 seeds one batch put Dew's at 0.4 to 3.2 times torch's
-    distance, and four drawn from them pooled past twice in under one draw in a thousand."""
+    """A bfloat16 model's projection biases sum their gradients over every token of the batch. Over
+    drawn batches of 8192 tokens Dew's are on par with transformers' own bfloat16 gradients, which
+    accumulate those sums at float32, from the float64 twin's of the same bfloat16 weights (check 1),
+    every bias leaf of the model; a bfloat16 sum, which JAX gives a broadcast's transpose
+    (jax-ml/jax#30310), lands several times further. One batch's key bias, whose gradient nearly
+    cancels by the softmax's shift invariance, is a draw of a few dozen rounded terms (over 24 seeds
+    one batch put Dew's at 0.4 to 3.2 times torch's distance), which the pooled seeds resolve."""
     import torch
     from transformers import AutoModelForCausalLM
 
-    from tools.torch_precision import float64
+    from tools.torch_precision import float64, float64_twin
 
     directory = FIXTURES / name
-    batches = np.random.default_rng(0).integers(0, 256, (4, 64, 128))
-
-    def torch_gradients(ids, widen=False):
-        # Loaded in bfloat16 as transformers loads it, its rotary frequencies kept in float32;
-        # `.bfloat16()` would round that buffer too, and the float64 truth would rotate by them.
-        # The truth widens those parameters and every float32 pin of the model (`float64`).
-        with float64() if widen else contextlib.nullcontext():
-            model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.bfloat16)
-            model = model.to(torch.float64) if widen else model
-            tokens = torch.from_numpy(ids)
-            model(tokens, labels=tokens).loss.backward()
-        return {name: parameter.grad.double().numpy() for name, parameter in model.named_parameters()
-                if parameter.grad is not None}
-
+    vocabulary = json.loads((directory / "config.json").read_text())["vocab_size"]
+    # Loaded in bfloat16 as transformers loads it, its rotary frequencies kept in float32;
+    # `.bfloat16()` would round that buffer too, and the float64 truth would rotate by them.
+    # The truth widens those parameters and every float32 pin of the model (`float64`).
+    narrow = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.bfloat16)
+    wide = float64_twin(narrow)
     loaded = Pretrained.load(str(directory), dtype="bfloat16", param_dtype="bfloat16",
                              attention_impl="reference", max_seq_len=128)
+    biases = [layout for layout in loaded.weight_layouts if layout.name.endswith(".bias")]
+    assert biases
+    shapes = {name: tuple(parameter.shape) for name, parameter in narrow.named_parameters()}
+
+    def draw(seed):
+        return (np.random.default_rng(seed).integers(0, vocabulary, (64, 128)).astype(np.int32),)
+
+    def torch_gradients(model, precision):
+        @as_given
+        def run(ids):
+            model.zero_grad(set_to_none=True)
+            tokens = torch.from_numpy(np.asarray(ids, np.int64))
+            with precision():
+                model(tokens, labels=tokens).loss.backward()
+                parameters = dict(model.named_parameters())
+                return {layout.name: parameters[layout.name].grad.float().numpy() for layout in biases}
+        return run
 
     def loss(variables, ids):
         logits = jnp.asarray(loaded.model.apply(variables, ids), jnp.float32)
@@ -101,25 +134,15 @@ def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torc
         return -jnp.mean(chosen)
 
     gradient = jax.jit(jax.grad(loss))
-    biases = [layout for layout in loaded.weight_layouts if layout.name.endswith(".bias")]
-    assert biases
-    truth, reference, dew = ({layout.name: [] for layout in biases} for _ in range(3))
-    for ids in batches:
-        exact, rounded = torch_gradients(ids, widen=True), torch_gradients(ids)
-        ours = gradient(loaded.variables, jnp.asarray(ids, jnp.int32))
-        for layout in biases:
-            shape = exact[layout.name].shape
-            truth[layout.name].append(exact[layout.name])
-            reference[layout.name].append(rounded[layout.name])
-            dew[layout.name].append(np.asarray(layout.export(ours), np.float64).reshape(shape))
-    over = []
-    for layout in biases:
-        try:
-            assert_as_exact_as_the_reference(np.stack(dew[layout.name]), np.stack(reference[layout.name]),
-                                             np.stack(truth[layout.name]), f"{name} {layout.name}")
-        except AssertionError as failure:
-            over.append(str(failure))
-    assert not over, "\n".join(over)
+
+    @as_given
+    def ours(ids):
+        grads = gradient(loaded.variables, jnp.asarray(ids, jnp.int32))
+        return {layout.name: np.asarray(layout.export(grads), np.float32).reshape(shapes[layout.name])
+                for layout in biases}
+
+    assert_as_exact(ours, torch_gradients(narrow, contextlib.nullcontext), draw, f"{name} bias gradients",
+                    seeds=BIAS_SEEDS[name], truth_fn=torch_gradients(wide, float64))
 
 
 def denoise(model, variables, prompt, canvas, **conditioning):
@@ -131,7 +154,7 @@ def denoise(model, variables, prompt, canvas, **conditioning):
     cache = model.apply({**variables, "cache": cache}, inputs,
                         method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
                         mutable=["cache"])[1]["cache"]
-    return np.asarray(model.apply({**variables, "cache": cache}, canvas, **conditioning), np.float32)
+    return model.apply({**variables, "cache": cache}, canvas, **conditioning).astype(jnp.float32)
 
 
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():

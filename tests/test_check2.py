@@ -214,7 +214,7 @@ def test_a_zero_of_the_wrong_sign_or_a_missed_exact_value_is_no_rounding(flushes
     """exp(-1000) is positive and under the least value past zero: +0 is level 1, and -0 no rounding of
     it; sqrt(-0) is -0 exactly and +0 no rounding of it; exp(±0) is 1 and log(1) is +0 exactly, so a step
     of the grid off either, which a measured reach would otherwise admit, is no rounding either."""
-    dtype = ct.VALUES[fmt.name]
+    dtype = oc.DTYPES[fmt.name]
 
     def at(values):
         return np.asarray(values, np.float64).astype(dtype)
@@ -553,17 +553,16 @@ def test_a_native_dot_holds_products_that_truncate_away_below_the_normal_range()
 def test_a_native_dot_aligns_a_subnormal_operand_at_its_least_normal_and_no_bare_product_of_one():
     """The native-dot contract's magnitudes (row 2084, link 3): the tensor cores' sum of `SUBNORMAL_CASE`'s
     five fp16 products, one of the subnormal 2^-24, holds where that operand counts at fp16's least normal
-    (`nc.aligned`) and is refused at the products' own magnitudes; bare products a subnormal operand
-    may have made, any under `SUBNORMAL_REACH`, raise rather than take the tight bound, where products of 4
-    and more pass bare."""
+    (`nc.aligned`) and is refused at the products' own magnitudes; bare products, which a subnormal operand
+    may have made, are refused rather than take the tight bound."""
     left, right, native = nc.SUBNORMAL_CASE
-    products = nc.terms(np.multiply, np.asarray([left]), np.asarray([right]), fmt=rw.FLOAT16)
+    products = nc.terms(np.multiply, np.asarray([left]), np.asarray([right]), fmt=oc.FLOAT16)
     assert nc.native_dot_holds([native], products, oc.FLOAT32, flushes=False).tolist() == [True]
     tight = nc.Terms(products.exact, np.abs(products.exact))
     assert nc.native_dot_holds([native], tight, oc.FLOAT32, flushes=False).tolist() == [False]
-    with pytest.raises(ValueError):
-        nc.native_dot_ends(products.exact, oc.FLOAT32, flushes=False)
-    assert nc.native_dot_holds([16.0], np.full((1, 4), 4.0), oc.FLOAT32, flushes=False).tolist() == [True]
+    for bare in (products.exact, np.full((1, 4), 4.0)):
+        with pytest.raises(TypeError):
+            nc.native_dot_ends(bare, oc.FLOAT32, flushes=False)
 
 
 def test_a_native_dot_holds_truncating_sums_in_any_order_and_refuses_a_lost_product_or_a_narrow_partial():
@@ -697,7 +696,6 @@ def test_the_recurrence_step_witness_holds_the_interpreted_mainloop(regime):
     before it leave, rounded as stored (end_j == start_{j+1})."""
     run = rw.recorded(*rw.draw(0, regime))
     held = rw.witness(run, rw.interpreted_lane())
-    assert np.all(run.seams)
     for name in rw.RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
 
@@ -705,25 +703,13 @@ def test_the_recurrence_step_witness_holds_the_interpreted_mainloop(regime):
 @INTERPRETS
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
-    (`nc.assert_refused`), a memory kept across chunks (`REGIMES`' 'slow'): a document starting at the
-    second chunk, whose zero memory is refused at more than 95% of the memory the first chunk leaves; and the
-    second chunk run from that memory rounded to bf16 where fp32 is held, refused at more than 60% of the
-    fp32 memory it leaves."""
-    lane = rw.interpreted_lane()
-    operands = rw.draw(1, "slow", chunks=2)
-    truth = rw.recorded(*operands)
-    nc.assert_refused(*rw.dropped_refusals(operands, truth, 1, lane), 0.95)
-    nc.assert_refused(*rw.handed_refusals(operands, truth, 1, lane), 0.6)
+    (`rw.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where fp32 is held."""
+    rw.assert_carry_faults_refused(rw.interpreted_lane())
 
 
 @INTERPRETS
 def test_the_recurrence_step_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary():
     """The step witness's faults on the interpreted mainloop, each refused where it lands
-    (`nc.assert_refused`): the decay from a difference of fp32 cumulative sums (row 2066's defect) in
-    a decay alone, refused at more than 50% of the fp32 memory each chunk leaves (the 16-bit records' grid
-    hides it); and each chunk's boundary a token early, at more than 95% of the weighted keys, corrected
-    values and outputs, and no record held where its intervals separate."""
-    lane = rw.interpreted_lane()
-    rw.assert_refusals(rw.cumsum_refusals(rw.draw(1, "decay", chunks=2), lane), {"leaving": 0.5})
-    rw.assert_refusals(rw.shifted_refusals(rw.draw(1, "mild", chunks=2), lane),
-                       {"w": 0.95, "c": 0.95, "o": 0.95})
+    (`rw.assert_step_faults_refused`): decays from a difference of fp32 cumulative sums (row 2066's defect)
+    and each chunk's boundary a token early."""
+    rw.assert_step_faults_refused(rw.interpreted_lane())

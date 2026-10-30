@@ -212,6 +212,33 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert not runs.exists()
 
 
+def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progress(tmp_path):
+    """A decision run bounded in examples, which its objective expands after its bound so no pass counts
+    its steps, keeps its progress on the examples clock: compiled ahead for a GPU it lacks, its step reads
+    that progress as fit's does (`Trainer.reading`), under a schedule over the run (`Linear`), and the run
+    ends with the step saved, where it was compiled over no clock and refused the schedule (row 2434)."""
+    from test_run_options import decision
+
+    from dew.decision.config import DecisionRunConfig
+    from dew.training.ahead import AheadOfTime, CompiledAhead
+
+    runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
+    default = decision(tmp_path, drawn=False)
+    assert isinstance(default, DecisionRunConfig)
+    run = DecisionRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
+                                 "--trainer.examples", "16", "--optim.learning-rate",
+                                 '{"class": "linear", "fields": {"peak_value": 0.001}}',
+                                 "--trainer.compile-ahead.generation", "sm80",
+                                 "--trainer.compile-ahead.devices", "1",
+                                 "--trainer.compile-ahead.path", str(path),
+                                 "--trainer.compile-ahead.capacity-gib", "4"],
+                                default=default)
+    with pytest.raises(CompiledAhead) as ended:
+        run.run()
+    assert ended.value.code == 0
+    assert AheadOfTime.load(path).peak_bytes > 0
+
+
 ACCUMULATION_CELLS = [("sm80", "bfloat16"), ("sm90", "float32")]
 """Each generation and each compute dtype once (testing.md's pairwise settings): a bfloat16 step reads
 its parameters through narrow copies on a GPU (`dew.training.narrow`), a float32 step reads them whole."""

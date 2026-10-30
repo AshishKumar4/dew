@@ -1230,16 +1230,18 @@ SXM at batch 2 (Mistral 1), the RTX 4080 at batch 1, jax 0.11.2, median of 20:
 | Gemma 3: 4096 tokens, 8 over 4 of 256, 1024 keys | xla | 9.17 | 2.63 | 4.16 | 0.84 | | |
 | ModernBERT local layer: 8192 tokens, 12 heads of 64, 64 keys either side | xla | 46.96 | 1.12 | 26.61 | 0.40 | 47.23 | 0.59 |
 
-The 4080's backward takes no head over 192, so Gemma 3 stays off flash there. Flash's output and
-its query, key, value and sink gradients lie within tests/reference_error.py's rule of the xla
-kernel's from float64, batched and packed (tests/test_kernels.py), on all three GPUs. So flash takes
-windows and sinks wherever its declared cell names it and it takes the call (`FLASH_SUPPORTS`); the
-template takes every other GPU call it takes. A packed or key-masked
-windowed call keeps its band on cuDNN, which takes the band's mask as a bias. Each row reproduces
-with `tools/benchmark_attention.py`, for example the MiMo row with `PYTHONPATH=src python
-tools/benchmark_attention.py --implementations xla flash --sequence-lengths 4096 --head-dims 192
---value-dim 128 --batch-size 2 --heads 128 --kv-groups 16 --causal True --sliding-window 128
---sinks`.
+The 4080's backward takes no head over 192, so Gemma 3 stays off flash there. The sink rows are
+historical: flash no longer takes sinks (ledger 2410, 2026-10-29), its backward's D, `rowsum(dO O)` of
+the rounded output, misreading a row a sink dominates (32 to 512 times the reference's error from
+float64 on an H100, packed with a window). 'auto' runs a whole-sequence call with sinks on the
+template where the template takes it, and on the generic path otherwise. Flash takes windows wherever its declared cell names it and it takes the call
+(`FLASH_SUPPORTS`), its output and gradients within tests/reference_error.py's rule of the xla
+kernel's from float64, batched and packed (tests/test_kernels.py); the template takes every other GPU
+call it takes. A packed or key-masked windowed call keeps its band on cuDNN, which takes the band's
+mask as a bias. Each row reproduces with `tools/benchmark_attention.py`, for example the MiMo row
+without its sinks with `PYTHONPATH=src python tools/benchmark_attention.py --implementations xla flash
+--sequence-lengths 4096 --head-dims 192 --value-dim 128 --batch-size 2 --heads 128 --kv-groups 16
+--causal True --sliding-window 128`.
 
 ### Packed rows on FlashAttention's varlen kernel, 2026-10-13
 

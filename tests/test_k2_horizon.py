@@ -10,8 +10,8 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
-from interop_support import assert_reloads, assert_same_stored_tensors
-from reference_error import as_given, assert_as_exact
+from interop_support import assert_reloads, assert_same_stored_tensors, reference_read
+from reference_error import assert_as_exact
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config
@@ -60,7 +60,7 @@ def test_a_single_group_exports_as_llama_with_its_yarn(tmp_path):
     is the same product in fp32 and whose rotary builds the same YaRN:
     transformers' LlamaForCausalLM reads it back on par with its fp32 forward
     from its float64 one over drawn ids (check 1)."""
-    from tools.decoder_export_reference import Case, reference_logits
+    from tools.decoder_export_reference import Case
 
     loaded = load()
     single = loaded.model.clone(norms=None)
@@ -74,7 +74,7 @@ def test_a_single_group_exports_as_llama_with_its_yarn(tmp_path):
         return (np.random.default_rng(seed).integers(0, config['vocab_size'], shape).astype(np.int32),)
 
     def read(wide):
-        return as_given(lambda ids: reference_logits(case, tmp_path, np.asarray(ids), wide=wide))
+        return reference_read(case, tmp_path, wide=wide)
 
     assert_as_exact(lambda ids: single.apply(loaded.variables, ids), read(wide=False), draw,
                     'Llama YaRN export', seeds=YARN_EXPORT_SEEDS, truth_fn=read(wide=True))

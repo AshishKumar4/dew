@@ -126,9 +126,10 @@ class AttentionCase:
     spans_only: bool
     mask: bool
     bias: bool
-    key_bias: bool
-    """Whether the call's bias is one term a key, `[B or 1, H or 1, 1, K]` (ALiBi's), of at most fp32's width,
-    which the template reads as a key score hook in fp32 (`attention.template_attention`)."""
+    bias_hook: bool
+    """Whether the call's bias is one the template reads as a score hook in fp32 (`attention.
+    template_attention`): 4-D, one term a key `[B or 1, H or 1, 1, K]` (ALiBi's) or dense `[B or 1, H or 1,
+    Q, K]`, of at most fp32's width."""
     sinks: bool
     softcap: float | None
     arithmetic: bool
@@ -219,6 +220,13 @@ FLASH_SUPPORTS = (
     _Need('dropout', lambda case: not case.dropout,
           "the call drops attention weights, which FlashAttention's path here does not take",
           row='roadmap: attention dropout in FlashAttention'),
+    # Its backward's D is rowsum(dO·O) of the rounded output, so a row whose sink holds most of its
+    # softmax, dP - D the sink's share of dP, takes O's rounding at 2^-8 over that share (512 times the
+    # reference's error at packed rows with a window, gate-g02-judged-h100, row 2410); the template's D
+    # cancels.
+    _Need('sinks', lambda case: not case.sinks,
+          "the call has attention sinks, whose rows FlashAttention's backward misreads where a sink holds "
+          "most of the softmax", row=INHERENT),
     _ARITHMETIC,
     _Need('not_installed', _flash_installed, "dew_flash_attn is not installed", row=INHERENT),
     _Need('binary_arch', _flash_built,
@@ -227,8 +235,8 @@ FLASH_SUPPORTS = (
 )
 """FlashAttention's requirements (`flash_attention`): a GPU, bf16 or fp16 heads a multiple of 8 up to the
 width its backward takes, a causal or windowed call square or over another sequence's documents (which it
-aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias or softcap, no
-deterministic ops, and a wheel holding code for the target."""
+aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias, softcap or sinks,
+no deterministic ops, and a wheel holding code for the target."""
 
 CUDNN_SUPPORTS = (
     _ON_GPU,
@@ -382,9 +390,9 @@ TEMPLATE_SUPPORTS = (
     _Need('mask', lambda case: not case.mask,
           "the call has an arbitrary mask, which the template reads as spans and never as a mask",
           row=INHERENT),
-    _Need('bias', lambda case: not case.bias or case.key_bias,
-          "the call's bias varies by query, a dense term beside the spans that carry the template's "
-          "validity; a bias one term a key (ALiBi's) is its key score hook", row=INHERENT),
+    _Need('bias', lambda case: not case.bias or case.bias_hook,
+          "the call's bias is not 4-D one term a key or a query's every key, or is wider than fp32, which "
+          "the template's score hook reads it in", row=INHERENT),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),

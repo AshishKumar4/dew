@@ -79,7 +79,6 @@ from flax.core import lift
 from flax.linen.transforms import lift_direct_transform
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
-from jax.interpreters.ad import JVPTracer
 
 from dew.batch import prefix_sum, valid_order
 from dew.nn import linear
@@ -92,7 +91,6 @@ from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
 from dew.quantization import decoded_frozen_fp8, decoded_stored, moving_weights, quantized_products
 
-from .attention import FORWARD_MODE
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks
 from .mlp import GatedMLP
 from .norms import LayerNorm
@@ -525,7 +523,7 @@ class InContextMemory(nn.Module):
             # step in the memory's own precision.
             out, state = linear.decode_step(
                 hooks, held, steps.query[:, 0], steps.key[:, 0], value[:, 0], log_decay[:, 0], beta[:, 0],
-                real[:, 0], tangent=FORWARD_MODE.get() or isinstance(steps.query, JVPTracer))
+                real[:, 0])
             out = out[:, None]
         else:
             out, state = recurrence_chunk.chunk(hooks, recurrence_chunk.Chunk(

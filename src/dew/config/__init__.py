@@ -1599,7 +1599,9 @@ class RunConfig:
             with generation.chosen(attention_form=trainer.attention_form):
                 state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
                                    profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
+                    # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
                     dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
+                    examples=trainer.examples if steps is None else None,
                     eval_every=trainer.eval_interval(dataset),
                     checkpoint_every=trainer.checkpoint_interval(dataset),
                     checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
@@ -1633,7 +1635,8 @@ class RunConfig:
         assert target is not None
         mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
         with generation.chosen(attention_form=self.trainer.attention_form):
-            return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps)
+            return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps,
+                                   self.trainer.examples if steps is None else None)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,

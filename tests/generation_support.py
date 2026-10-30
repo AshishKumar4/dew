@@ -21,6 +21,11 @@ from dew.nn.precision import float32_products
 
 INTERPRETS = pytest.mark.skipif(jax.default_backend() != "cpu",
                                 reason="interprets the Mosaic GPU kernels, which a CPU process alone does")
+COMPILES_ON_CPU = pytest.mark.skipif(
+    jax.default_backend() != "cpu",
+    reason="reads ptxas's reports of kernels a CPU process compiles for a compile-only device; a GPU "
+           "process's read 0 registers (ET-A05A08-TEST6-h100)")
+"""A mark skipping a resource gate (`kernel_compile.mosaic_failures`) where the process has its own GPU."""
 SUMS_IN_IEEE = pytest.mark.skipif(
     jax.default_backend() != "cpu",
     reason="compares sums bit for bit as a CPU's IEEE fp32 dots give them, which a GPU's tensor cores, "

@@ -30,6 +30,7 @@ import numpy as np
 from jax.sharding import Mesh
 from jaxlib.xla_client import LoadedExecutable
 
+from dew import cache
 from dew._records import JSON, json_value, record
 from dew.files import write_atomically
 from dew.nn.kernels.generation import gpu_target
@@ -46,10 +47,7 @@ if TYPE_CHECKING:
 def rung_records() -> Path | None:
     """Where a step's rung is recorded: DEW_RUNG_RECORDS when set, else beside
     the persistent compilation cache, or nowhere when the process keeps none."""
-    if directory := os.environ.get('DEW_RUNG_RECORDS'):
-        return Path(directory)
-    cache = jax.config.jax_compilation_cache_dir
-    return None if not cache else Path(cache) / 'dew-rungs'
+    return cache.beside_compilation_cache('DEW_RUNG_RECORDS', 'dew-rungs')
 
 
 RECORD_VERSION = 2
