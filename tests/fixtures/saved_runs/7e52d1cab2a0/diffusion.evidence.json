@@ -1,0 +1,19 @@
+{
+ "step": 2,
+ "compute": "bfloat16",
+ "params": [
+  "float32"
+ ],
+ "scale": null,
+ "consumed": null,
+ "remat": false,
+ "plan": {
+  "split": 1,
+  "rows": 8,
+  "head_tile": null,
+  "head_fused": false,
+  "remat": false,
+  "xla_defaults": false,
+  "narrow": true
+ }
+}
