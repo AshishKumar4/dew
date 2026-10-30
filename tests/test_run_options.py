@@ -676,8 +676,8 @@ def held(task) -> dict[str, object]:
 
 def requested(task) -> object:
     """One request of a loaded task, as its kind's users make it, at the task's own defaults but a
-    generation's budget of two tokens, its answers: a decision's with a context beside its state, which
-    a backbone reading none leaves unread."""
+    generation's budget of two tokens, its answers: a decision's with a context beside its state where its
+    backbone reads one."""
     from dew.decision import Choice
     from dew.decision.task import Decide
     from dew.inference.images import TextToImage
@@ -690,7 +690,9 @@ def requested(task) -> object:
         return task([[5, 17, 33, 2]], max_new_tokens=2, key=0)
     if isinstance(task, Decide):
         question = {"team": Choice("which team", ["billing", "technical", "sales"])}
-        return task([({"text": "the site is down"}, question)], contexts=[{"plan": "enterprise"}])
+        # A context beside the state where the backbone's cross-attention reads one (`context_length`).
+        context = None if task.context_length is None else {"plan": "enterprise"}
+        return task([({"text": "the site is down"}, question)], contexts=[context])
     if isinstance(task, TextToImage):
         return task(["a cat"], key=0)
     raise AssertionError(f"no request is written for a loaded {type(task).__name__}")
