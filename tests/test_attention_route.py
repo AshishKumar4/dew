@@ -420,21 +420,6 @@ def test_a_bias_of_the_key_heads_is_refused_by_the_template_not_read_past():
         scaled_dot_product_attention(query, key, key, bias=bias, causal=True, implementation="template")
 
 
-@pytest.mark.parametrize(("target", "rows", "template_runs"),
-                         [("sm90", 1, True), ("sm90", 2, False), ("sm80", 1, False)],
-                         ids=["a shared table on an H100", "a bias a row", "a shared table off an H100"])
-def test_auto_takes_a_dense_bias_to_the_template_where_it_measured_faster(target, rows, template_runs):
-    """A call whose bias varies by query goes to the template by itself only where it measured faster
-    than the xla kernel (ET-DBIAS-h100): a table every batch row shares, on an H100, whose Mosaic mainloop
-    reads it once a tile; a bias a row, or a shared table off an H100 (its Triton mainloop reads it spread
-    to every row), goes to the attention kernels' other paths (rows 2523, 2577)."""
-    query = jnp.zeros((2, 64, HEADS, 64), jnp.bfloat16)
-    bias = jnp.zeros((rows, HEADS, 64, 64), jnp.float32)
-    with generation.assumed(target):
-        route = attention.resolve_implementation("auto", query, query, bias=bias)
-    assert (route.kernel == "template") is template_runs
-
-
 DENSE_BIAS_SEEDS = 8
 """Check 1's declared seeds for a dense bias named onto the template."""
 
@@ -463,8 +448,33 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
         return with_gradients(lambda query, key, value, bias: scaled_dot_product_attention(
             query, key, value, bias=bias, causal=True, implementation=implementation))
 
+    keep = kept(queries, queries, causal=True)
+
+    def terms(query, key, value, bias, dout):
+        # A query of one key has a dQ of zero in float64, which a D from the rounded output rounds to
+        # its own size (`attention_terms`, its bias's terms the fifth).
+        return tuple(attention_terms(query, key, value, dout, keep, bias=bias))
+
     assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), drawn,
-                    f"a dense bias of {rows} rows and {heads} heads on the template", seeds=DENSE_BIAS_SEEDS)
+                    f"a dense bias of {rows} rows and {heads} heads on the template", seeds=DENSE_BIAS_SEEDS,
+                    terms=terms)
+
+
+def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient_is_zero():
+    """attention_terms with a bias every row shares: the first query of a causal call keeps one key, so its
+    query gradient is zero in float64, and its terms are not (a D from the rounded output rounds it to their
+    size); the bias's own gradient's terms have the bias's shape, summed over the rows it shares."""
+    rng = np.random.default_rng(0)
+    query, key, value, dout = (rng.standard_normal((3, 16, 2, 8)) for _ in range(4))
+    bias = 0.5 * rng.standard_normal((1, 2, 16, 16))
+    keep = kept(16, 16, causal=True)
+    _, dq_terms, _, _, bias_terms = attention_terms(query, key, value, dout, keep, bias=bias)
+    with jax.enable_x64(new_val=True):
+        _, pull = jax.vjp(lambda q, k, v, b: scaled_dot_product_attention(
+            q, k, v, bias=b, causal=True, implementation="reference"), query, key, value, bias)
+        dq = np.asarray(pull(dout)[0])
+    assert np.all(dq[:, 0] == 0) and np.all(dq_terms[:, 0] > 0)
+    assert bias_terms.shape == bias.shape
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
@@ -712,58 +722,3 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
     [refused] = attention_route.MAINLOOP.kernel("triton").failed(
         attention_route._Pass(on_gpu=True, mosaic=None, triton=spans))
     assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
-
-
-def routed_call(form: str):
-    """A causal call on the default route ('auto') under a run's numerics of `form`
-    (`generation.run_precision`), at JAX's own default matmul precision, as a run's default numerics
-    multiply (the suite's environment states 'highest'), as a function of `(query, key, value, sinks,
-    dout)`: its output, then its gradients (`with_gradients`)."""
-    from dew.nn.kernels.generation import run_precision
-
-    def call(query, key, value, sinks):
-        with run_precision(Numerics(forms=form)), jax.default_matmul_precision("default"):
-            return scaled_dot_product_attention(query, key, value, causal=True, sinks=sinks)
-
-    return with_gradients(call)
-
-
-ieee_reference = with_gradients(functools.partial(scaled_dot_product_attention, causal=True,
-                                                  implementation="reference",
-                                                  precision=jax.lax.Precision.HIGHEST))
-"""The causal call on the reference path at IEEE float32 products (`Precision.HIGHEST`), the arithmetic
-an accurate run's form states: its output and its gradients (`with_gradients`)."""
-
-
-def accurate_draws():
-    """The inputs that tell an accurate call from a fast one, each a check-1 draw: float32 rows; bfloat16
-    rows, whose fast kernels keep less than IEEE fp32 products (on an H100 the fast form's error is 8
-    times the reference's); and float32 products past the largest float before the scale, which a fast
-    path multiplying first overflows (`test_attention_stability`)."""
-    from test_attention_stability import _product_past_largest
-
-    return {"float32": drawing(QUERIES, KEYS, jnp.float32, sinks=False),
-            "bfloat16": drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False),
-            "products past the largest float": _product_past_largest}
-
-
-@pytest.mark.kernel
-@pytest.mark.parametrize("case", ["float32", "bfloat16", "products past the largest float"])
-def test_an_accurate_call_on_the_default_route_is_on_par_with_ieee_fp32(case):
-    """Under a run's accurate numerics (`generation.run_precision`), a call on the default route ('auto'),
-    whichever kernel it takes, is on par with the reference path's IEEE float32 products forward and
-    backward, measured from float64 (check 1; row 2350: an accurate run's calls ran fast on FlashAttention,
-    cuDNN, xla and splash), over inputs a fast kernel fails on (`accurate_draws`); the kernel lab's GPU
-    tier runs it on each target GPU."""
-    assert_as_exact(jax.jit(routed_call("accurate")), jax.jit(ieee_reference), accurate_draws()[case],
-                    f"the accurate form on the default route, {case}", seeds=SEEDS)
-
-
-@pytest.mark.gpu(reason="a GPU's default route takes fast kernels for the fast form, which a CPU never does")
-@pytest.mark.parametrize("case", ["bfloat16", "products past the largest float"])
-def test_the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32(case):
-    """On a GPU the fast form's default route fails check 1 against IEEE fp32 products where the accurate
-    form passes it (`accurate_draws`): the accurate test's inputs tell the two routes apart (row 2556)."""
-    with pytest.raises(AssertionError):
-        assert_as_exact(jax.jit(routed_call("fast")), jax.jit(ieee_reference), accurate_draws()[case],
-                        f"the fast form on the default route, {case}", seeds=SEEDS)

@@ -31,12 +31,12 @@ from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
-from dew.nn.progress import training
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
     EXAMPLE_STREAM,
     Aux,
     Evaluated,
+    Objective,
     Ratio,
     Recorded,
     Step,
@@ -50,6 +50,21 @@ from dew.training.narrow import forward_variables, narrowed
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
+
+
+@dataclasses.dataclass(frozen=True)
+class PassesProgress[L, E]:
+    """A custom training step (`Trainer(step=)`) that passes the run's progress to a model that reads
+    it (`dew.nn.progress`, `Progress(state.updates)`), as the objective's own loss does: `make`, its
+    factory, wrapped. A custom step not so declared refuses such a model, which it would otherwise
+    train at the run's end."""
+
+    make: Callable[[Objective[L, E], optax.GradientTransformation],
+                   Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]]
+
+    def __call__(self, objective: Objective[L, E], optimizer: optax.GradientTransformation
+                 ) -> Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]:
+        return self.make(objective, optimizer)
 
 
 @struct.dataclass
@@ -802,4 +817,4 @@ class Transaction:
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
                                                     tokens)
             return together(advanced, held), loss, aux, committed
-        return training(run)
+        return run

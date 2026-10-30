@@ -125,6 +125,12 @@ class AttentionCase:
     blocks: bool
     spans_only: bool
     mask: bool
+    mask_as_bias: bool
+    """Whether cuDNN's dense-bias form of the call's mask was measured cheaper than the xla kernel's mask:
+    a window's band `[S, 2W]` (local attention: 16384 packed tokens at window 4096 in 0.60 GiB of
+    temporaries on an L4, where xla asked for 10.0 GiB at 8192) or a forward-only cache call over several
+    queries (8 prompts of 256 at Qwen3-0.6B's widths, 4.0 against xla's 6.2 ms on an RTX 4080;
+    docs/performance.md); set where a caller builds such a mask (`attention.mask_kernel`)."""
     bias: bool
     bias_hook: bool
     """Whether the call's bias is one the template reads as a score hook in fp32 (`attention.
@@ -272,9 +278,9 @@ CUDNN_SUPPORTS = (
                 "cuDNN takes no segment ids, a call's packed documents only as their mask, a dense bias "
                 "that costs more than the xla kernel's mask (`_attention_kernel` builds it where cuDNN is "
                 "named)", row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
-    _Need('mask', lambda case: not case.mask,
+    _Need('mask', lambda case: not case.mask or case.mask_as_bias,
                 "cuDNN takes an arbitrary mask as a dense bias, which costs more than the xla kernel's "
-                "mask but in a forward-only cache call (`kernel_for_materialized_mask`)",
+                "mask but for a window's band or a forward-only cache call (`AttentionCase.mask_as_bias`)",
                 row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('spans_only', lambda case: not case.spans_only,
                 "cuDNN takes block groups, key validity or counted places only as the mask the call's spans "
@@ -419,7 +425,7 @@ TEMPLATE_SUPPORTS = (
           "H100, or a table every row shares on a GPU without warpgroup MMA, where the template's frozen "
           "Triton mainloop reads it spread to every row, unmeasured; a shared table the warpgroup-MMA "
           "Mosaic mainloop runs a third faster in half the memory (ET-DBIAS-h100; named, it runs)",
-          row='2577', kind='measured'),
+          row='2625', kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
