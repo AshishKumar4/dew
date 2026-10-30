@@ -76,11 +76,11 @@ def dit_params():
     return model.init(jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)))
 
 
-def muon_solver(ns_precision: str = "float32", **kwargs):
-    """Dew's Muon over the run's own build, its Newton-Schulz at `ns_precision`: float32 where it is held
-    to optax's Muon, which iterates in its momentum's float32."""
+def muon_solver(ns_precision: str = "float32", optimizer: str = "muon", **kwargs):
+    """Dew's Muon, or `optimizer` its MuonClip, over the run's own build, its Newton-Schulz at
+    `ns_precision`: float32 where it is held to optax's Muon, which iterates in its momentum's float32."""
     opts = {"ns_precision": ns_precision, **kwargs.pop("optimizer_opts", {})}
-    return OptimConfig(optimizer='muon', learning_rate=LR, optimizer_opts=opts, **kwargs).build(10)
+    return OptimConfig(optimizer=optimizer, learning_rate=LR, optimizer_opts=opts, **kwargs).build(10)
 
 
 def fixed_gradients(params):
@@ -546,12 +546,6 @@ QK_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "muonclip" / "maxtex
 MEGATRON = np.load(QK_FIXTURE.parent / "megatron.npz")
 
 
-def muonclip_solver(ns_precision: str = "float32", **kwargs):
-    """Dew's MuonClip over the run's own build, its Newton-Schulz at `ns_precision` as `muon_solver`'s."""
-    opts = {"ns_precision": ns_precision, **kwargs.pop("optimizer_opts", {})}
-    return OptimConfig(optimizer='muonclip', learning_rate=LR, optimizer_opts=opts, **kwargs).build(10)
-
-
 def qk_tree(layers=1, heads=4, kv_heads=4, dim=8, seed=0):
     """A trainable tree of query/key kernels and its fixed gradients."""
     rng = np.random.default_rng(seed)
@@ -597,7 +591,7 @@ def test_muonclip_without_stats_steps_like_muon():
     Muon's does not."""
     params, grads = qk_tree()
     muon = muon_solver()
-    clipped = muonclip_solver()
+    clipped = muon_solver(optimizer="muonclip")
     expected, _ = muon.update(grads, muon.init(params), params)
     initial = clipped.init(params)
     updates, state = clipped.update(grads, initial, params)
@@ -610,7 +604,7 @@ def test_a_quiet_clip_steps_like_muon():
     """Maxima below the threshold rescale nothing: bitwise the Muon step."""
     params, grads = qk_tree()
     muon = muon_solver()
-    clipped = muonclip_solver()
+    clipped = muon_solver(optimizer="muonclip")
     expected, _ = muon.update(grads, muon.init(params), params)
     initial = clipped.init(params)
     updates, state = clipped.update(
@@ -637,7 +631,7 @@ def test_a_clip_rescales_the_weights_only_after_the_updates_it_takes_part_in():
     move them by the zero update, bit for bit."""
     params, grads = qk_tree()
     stats = qk_stats(values=[[200.0] * 4] * 3)
-    solver = optax.MultiSteps(muonclip_solver(), every_k_schedule=2)
+    solver = optax.MultiSteps(muon_solver(optimizer="muonclip"), every_k_schedule=2)
     state = solver.init(params)
     for update in range(3):
         updates, after = solver.update(grads, state, params, qk_stats=stats)
@@ -883,13 +877,13 @@ def test_the_threshold_rides_optimizer_opts():
     (check 1), the clip rounding `gamma * (W + update)` once."""
     stats = qk_stats(values=[[50.0] * 4] * 3)
     params, grads = qk_tree()
-    default, muon = muonclip_solver(), muon_solver()
+    default, muon = muon_solver(optimizer="muonclip"), muon_solver()
     plain, _ = muon.update(grads, muon.init(params), params)
     initial = default.init(params)
     updates, state = default.update(grads, initial, params, qk_stats=stats)
     moved = stepped(params, updates, initial, state)
     assert largest_difference(moved, optax.apply_updates(params, plain)) == 0.0
-    clipped = clip_step(muonclip_solver(optimizer_opts={'qk_clip_threshold': 5.0}), stats)
+    clipped = clip_step(muon_solver(optimizer="muonclip", optimizer_opts={'qk_clip_threshold': 5.0}), stats)
 
     def paper(solver):
         def rescaled(params, grads):
