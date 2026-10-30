@@ -1329,10 +1329,11 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     single = run_worker("mixed_validity", tmp_path / "single.json", fsdp_size=2,
                         explicit=True)
 
-    # The producers really did disagree, and the seams really did agree.
+    # The producers really did disagree, and the seams really did agree, on one layout: each rank's
+    # validity laid out as its rows' coordinates (ledger 1122).
     assert reports[0]["local_fields"] == [] and reports[1]["local_fields"] == ["attention_mask"]
-    assert [report["agreed_fields"] for report in reports] == [["attention_mask"]] * 2
-    assert [report["placed_fields"] for report in reports] == [["attention_mask"]] * 2
+    assert [report["agreed_fields"] for report in reports] == [["coordinates"]] * 2
+    assert [report["placed_fields"] for report in reports] == [["coordinates"]] * 2
     assert reports[0]["agreed_all_true"] is True and reports[1]["agreed_all_true"] is False
     assert reports[0]["batch_sharding"]["fully_addressable"] == [False]
 

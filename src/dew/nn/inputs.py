@@ -841,11 +841,13 @@ def assembly_signature(tree: InputTree, controls: tuple = ()) -> np.ndarray:
 
 
 def filled_validity[TreeT](tree: TreeT, wanted: bool | Sequence[bool] = True) -> TreeT:
-    """All-true validity at the sites that want it and do not carry it.
+    """All-true validity at the sites that want it and do not carry it, each wanted site's layout one
+    `Coordinates` (`with_validity`) whether it carried coordinates or flat fields, so every process
+    hands the same tree.
 
     `wanted` is one flag per site of `validity_sites`, or one flag for all of
-    them. Nothing is read from a resident array and no site that carries
-    validity is touched, so this is a schema operation and not a mask.
+    them. Nothing is read from a resident array and no site's validity is
+    changed, so this is a schema operation and not a mask.
     """
     sites = itertools.count()
 
@@ -854,12 +856,13 @@ def filled_validity[TreeT](tree: TreeT, wanted: bool | Sequence[bool] = True) ->
             return node
         index = next(sites)
         needed = wanted if isinstance(wanted, bool) else bool(wanted[index])
-        if not needed or token_validity(node.token_fields) is not None:
+        if not needed:
             return node
-        shape = np.shape(node.tokens)
-        ones = (np.ones(shape, bool) if isinstance(node.tokens, np.ndarray)
-                else jnp.ones(shape, bool))
-        return replace(node, token_fields=with_validity(node.token_fields, ones))
+        valid = token_validity(node.token_fields)
+        if valid is None:
+            shape = np.shape(node.tokens)
+            valid = np.ones(shape, bool) if isinstance(node.tokens, np.ndarray) else jnp.ones(shape, bool)
+        return replace(node, token_fields=with_validity(node.token_fields, valid))
 
     return jax.tree.map(fill, tree, is_leaf=lambda node: isinstance(node, ModelInputs))
 
