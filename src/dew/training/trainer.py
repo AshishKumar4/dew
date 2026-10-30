@@ -1490,7 +1490,7 @@ class Trainer(Generic[Loss, Effects]):
                 with region("train.step"):
                     state, loss, aux, finite, accepted, committed = train_step(
                         state, device, sampled=self.inspection is not None and self.inspection.samples(
-                            run.current + 1))
+                            run.current + 1, self.accumulation))
                 # Written off the loop, which never waits on it (row 2313).
                 self._read_taken(run, wait=False)
                 if self._unproven:
