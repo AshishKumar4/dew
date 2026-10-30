@@ -3,6 +3,7 @@ holds, and logged one log late; a run that watches nothing compiles its step unc
 
 import collections
 import contextlib
+import itertools
 import json
 
 import flax.linen as nn
@@ -382,6 +383,31 @@ def test_an_examples_runs_short_last_window_samples_its_commit():
         chain, examples=5 * BATCH, log_every=1, eval_every=None, checkpoint_every=None)
     sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
     assert sampled == [5]
+
+
+def test_a_rejected_step_skips_one_sample_and_the_run_samples_on():
+    """A step whose loss is not finite under a dynamic loss scale is rejected and drops its window,
+    shifting the windows after it;
+    the sampled window it shifted holds no commit, so that sample is skipped, and the next sampled window's
+    commit is sampled: with three steps an update and every second window sampled, a rejection at the
+    fourth step moves the updates to the seventh and tenth steps, and the tenth's log carries the sample
+    (row 2720)."""
+    poisoned = ROWS.copy()
+    poisoned[0, 0] = np.inf
+
+    def rows(partition):
+        for step in itertools.count(1):
+            yield {"x": poisoned if step == 4 else ROWS}
+
+    from flax.training.dynamic_scale import DynamicScale
+
+    tracker = Kept()
+    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, accumulation=3,
+            dynamic_scale=DynamicScale(), inspection=Inspection(paths=("w",), targets=("params",), every=2)
+            ).fit(Loader(rows, None, batch=BATCH, records=None), steps=12, log_every=1, eval_every=None,
+                  checkpoint_every=None)
+    sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
+    assert sampled[0] == 10
 
 
 def test_an_accumulating_trainers_offline_view_steps_its_whole_window():

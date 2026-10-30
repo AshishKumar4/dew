@@ -690,6 +690,23 @@ def test_a_clocked_run_resumed_with_a_larger_bound_trains_on_to_it(tmp_path):
         clocked_fit(x, 1, directory=tmp_path, examples=CLOCKED_RECORDS // 2)
 
 
+def test_a_resume_refuses_a_limit_grown_before_a_repeat(tmp_path):
+    """A limit a repeat reads after (`take(5).repeat()`), grown on resume, reads other records past the
+    saved position (its second pass the larger limit's next records, not the first five again), so the
+    resume is refused: only a bound with nothing but a batch after it reads on (row 2649)."""
+    (x,) = clocked_records(0)
+
+    def fit(count: int, steps: int):
+        chain = Pipeline(Memory({"x": x})).read("streamed").take(count).repeat().batch(BATCH)
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+                          checkpoints=Checkpoints(str(tmp_path)))
+        return trainer.fit(chain, steps=steps, log_every=1)
+
+    fit(5, 2)
+    with pytest.raises(ValueError):
+        fit(10, 4)
+
+
 def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
     """A run paused halfway through its budget and resumed without the pause lands where the whole
     run does, step for step and in its weight (check 1): the budget, not the pause, sized its
