@@ -208,12 +208,15 @@ def test_a_language_models_estimate_is_its_configured_objectives():
     assert rejected(estimates["Dense_1"]["bias"], without["Dense_1"]["bias"]) < 1e-9
 
 
-def tied(wrapped: bool):
-    """A one-layer tied decoder, or that decoder under a multimodal wrapper whose head read delegates to
-    the decoder's (`MultimodalTransformer.output_table`), and the path of its embedding's parameters."""
+def tied(kind: str):
+    """A one-layer tied decoder, that decoder with an embedding of its own width (`embedding_features`),
+    whose states reach the table through `project_out` (`Projection`), or under a multimodal wrapper
+    whose head read delegates to the decoder's (`MultimodalTransformer.output_table`), and the path of
+    its embedding's parameters."""
     decoder = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                mlp_features=32, max_seq_len=8, dtype="float32")
-    if not wrapped:
+                                mlp_features=32, max_seq_len=8, dtype="float32",
+                                embedding_features=8 if kind == "projected" else None)
+    if kind != "wrapped":
         return decoder, ("embed_tokens", "embedding")
     return (MultimodalTransformer(decoder, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1,
                                                         num_heads=2, image_size=8, patch_size=4),
@@ -222,21 +225,25 @@ def tied(wrapped: bool):
             ("language_model", "embed_tokens", "embedding"))
 
 
-@pytest.mark.parametrize("wrapped", [False, True], ids=["decoder", "wrapped"])
-def test_a_tied_heads_rows_the_batch_only_predicts_are_estimated_once(wrapped):
+@pytest.mark.parametrize("kind", ["decoder", "projected", "wrapped"])
+def test_a_tied_heads_rows_the_batch_only_predicts_are_estimated_once(kind):
     """A decoder whose head is its embedding, tied, read as a matrix its loss contracts, over rows of the
-    ids 2 to 6 alone, bare or under a wrapper whose read delegates to the decoder's: the rows of the ids
-    7 to 12, which no input looks up and every prediction's normalizer reads, take their estimate from
-    the outermost read alone, its matrix jittered there once and added to the lookup's estimate: over
-    256 steps' keys it is the analytic gradient of those rows in expectation (the t-test rejects in no
-    coordinate), where the lookup's alone would leave them at zero and a read counted at each nesting
-    twice the gradient."""
-    model, embedding = tied(wrapped)
+    ids 2 to 6 alone, bare, projected out of its stream (`embedding_features`) or under a wrapper whose
+    read delegates to the decoder's: the rows of the ids 7 to 12, which no input looks up and every
+    prediction's normalizer reads, take their estimate from the outermost read alone, its matrix
+    jittered there once and added to the lookup's estimate: over 256 steps' keys it is the analytic
+    gradient of those rows in expectation (the t-test rejects in no coordinate), where the lookup's
+    alone would leave them at zero and a read counted at each nesting twice the gradient. A projected
+    head's `project_out`, which the read applies and no layer call makes, is its gradient in
+    expectation too."""
+    model, embedding = tied(kind)
     objective = ForwardLM(model, seq_len=6, draws=4, weight_draws=64, weight_sigma=0.01)
     variables = objective.init(jax.random.key(0))
     batch = {"text": jnp.asarray(np.random.default_rng(3).integers(2, 7, (8, 7)), jnp.int32)}
     estimates = estimated(objective, variables, batch)
     truth = gradient(LMObjective(model, seq_len=6), variables, batch, jax.random.key(0))
+    if kind == "projected":
+        assert rejected(estimates["project_out"]["kernel"], truth["project_out"]["kernel"]) > 1e-9
     for key in embedding:
         estimates, truth = estimates[key], truth[key]
     predicted = truth[7:]

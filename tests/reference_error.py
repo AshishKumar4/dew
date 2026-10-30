@@ -73,6 +73,14 @@ from collections.abc import Callable, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from float64_terms import (  # re-exported: the gate's names
+    CALLS as CALLS,
+    CARRIES as CARRIES,
+    SUMS as SUMS,
+    float64_forward as float64_forward,
+    float64_terms as float64_terms,
+    scanned_steps as scanned_steps,
+)
 
 from dew.accuracy import distance, reduction_bound, within
 
@@ -284,17 +292,70 @@ def _refuse_numpy_arms(draw, *arms) -> None:
                             f"values unconverted")
 
 
-def _compiled(fn, compile):
+def _compiled(fn, compile, pairing=None):
     """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program
     already (another jit around it would nest its compiler options), or compiled by `compile`, a
-    window loop's arm within it (`over_windows`)."""
+    window loop's arm within it (`over_windows`); compiled without YNNPACK's fusions, paired with its
+    check's other arms by `pairing` (`_Paired`)."""
     if _given(fn) or getattr(fn, "without_ynn", False):
         return fn
     if getattr(fn, "dew_programs", False):
-        return fn if compile is jax.jit else _with_ynn_off(fn)
+        return fn if compile is jax.jit else _Paired(pairing, _with_ynn_off(fn), fn)
     if isinstance(fn, _Windowed):
-        return _Windowed(_compiled(fn.fn, compile))
-    return compile(fn)
+        return _Windowed(_compiled(fn.fn, compile, pairing))
+    return compile(fn) if compile is jax.jit else _Paired(pairing, compile(fn), jax.jit(fn))
+
+
+YNN_REFUSED = "Dot with multiple contracting dimensions is not implemented"
+"""XLA:CPU's refusal, without YNNPACK's fusions, of a dot of other than one contracting dimension: its
+algebraic simplifier forms one with none from a contraction of length one (attention's XLA backward
+over a single key), which only YNNPACK's fusion runs (`_Paired`)."""
+
+
+@dataclasses.dataclass(eq=False)
+class _Pairing:
+    """Whether a check's paired arms (`_Paired`) run with YNNPACK's fusions: not until XLA:CPU refuses to
+    compile one of them without (`_turned_over`)."""
+
+    with_ynn: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _Paired:
+    """An arm of a check between two Dew paths (`_arms`): `without`, the arm without YNNPACK's fusions,
+    until its `pairing` turns over, then `plain`, the arm as Dew's users compile it. Where XLA:CPU
+    cannot compile an arm of the check without the fusions (`YNN_REFUSED`), every arm of it turns over
+    at once (`_turned_over`), so the two still run the same kind of code, here the kind whose
+    microkernels the host picks."""
+
+    pairing: _Pairing
+    without: Callable
+    plain: Callable
+
+    @property
+    def without_ynn(self) -> bool:
+        """Whether the arm runs without YNNPACK's fusions (`without_ynn`'s mark): until it turns over."""
+        return not self.pairing.with_ynn
+
+    def __call__(self, *inputs, **options):
+        return (self.plain if self.pairing.with_ynn else self.without)(*inputs, **options)
+
+
+def _turned_over(arms, run):
+    """`run()`, one draw of a check over `arms`; where XLA:CPU refuses to compile one of them without
+    YNNPACK's fusions (`YNN_REFUSED`), every paired arm among them turned over to the fusions
+    (`_Paired`) and the draw run again from its start, so no arm's value of it comes from the other
+    kind of code."""
+    try:
+        return run()
+    except jax.errors.JaxRuntimeError as error:
+        pairings = {arm.pairing for arm in (arm.fn if isinstance(arm, _Windowed) else arm for arm in arms)
+                    if isinstance(arm, _Paired)}
+        if YNN_REFUSED not in str(error) or all(pairing.with_ynn for pairing in pairings):
+            raise
+        for pairing in pairings:
+            pairing.with_ynn = True
+        return run()
 
 
 class _Truth:
@@ -351,11 +412,12 @@ def _arms(dew_fn, reference_fn):
     them compiled so through Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a
     recording, a host loop over programs of its own), the other as Dew's users run it, with the
     fusions (`jax.jit`). A site passes plain functions; the gate compiles them, so no site can compile
-    one arm otherwise than its other. One function as both arms compiles once."""
-    compile = jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn
+    one arm otherwise than its other. One function as both arms compiles once. A program XLA:CPU cannot
+    compile without the fusions (`YNN_REFUSED`) turns both arms over to them (`_Paired`)."""
+    compile, pairing = (jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn), _Pairing()
     _refuse_owned_policies(compile, dew_fn, reference_fn)
-    reference = _compiled(reference_fn, compile)
-    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile)), reference
+    reference = _compiled(reference_fn, compile, pairing)
+    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile, pairing)), reference
 
 
 def _refuse_owned_policies(compile, *arms) -> None:
@@ -911,6 +973,24 @@ def leaf_summaries(references, truths) -> list[RecordedLeaf]:
     return _summaries(references, _LaidTruths.of(truths))
 
 
+def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = None) -> RecordedLeaf:
+    """`leaf_summary` of a leaf from each row's RMS distance from its float64 truth `rows` alone, where the
+    reference ran apart and kept those (a recorder whose outputs are too large to keep, its rows its
+    leaf's every axis but the last, in C order): its mean squared error the rows' mean square, every row
+    one width, unless `mse` gives it; `finite` whether the reference's leaf was, and `dtype` its dtype.
+    The truth's rows are read as `_summaries` reads them (`_LaidTruths`), and an empty leaf is exact,
+    as `leaf_summary` reads one."""
+    if not np.size(truth):
+        return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=finite, dtype=dtype)
+    held, rows = _LaidTruths.of([truth]), np.asarray(rows, np.float64)
+    sized = held.sizes > 0
+    logged = float(np.max(_log_over(rows[sized], held.sizes[sized]))) if sized.any() else LOG_ZERO
+    return RecordedLeaf(float(np.mean(np.square(rows))) if mse is None else mse,
+                        float(np.max(_over(rows[sized], held.sizes[sized]))) if sized.any() else 0.0,
+                        np.flatnonzero(~sized), rows[~sized], finite=finite and bool(held.finite.all()),
+                        dtype=dtype, zero_sizes=held.own[~sized], worst_log=logged)
+
+
 @dataclasses.dataclass(frozen=True)
 class _LaidTruths:
     """A draw's truth leaves read at once for both arms (`_summaries`). Every leaf that is not empty lies
@@ -1081,7 +1161,9 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with jax.enable_x64(new_val=True):
             return float64_terms(terms_fn, *widened(inputs))
 
-    for at, seed in enumerate(seeds):
+    def rows_at(at, seed):
+        """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
+        nonlocal names, widths
         inputs = draw(seed)
         truth, terms = truth_and_terms(inputs)
         if reference_seeds is None:
@@ -1116,6 +1198,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                     (first[0], first[1], float(np.fmax(first[2], later[2])),
                      float(np.fmax(first[3], later[3])), first[4], first[5] and later[5])
                     for first, later in zip(rows[at_arm], evidence, strict=True)]
+        return rows
+
+    for at, seed in enumerate(seeds):
+        rows = _turned_over([dew_fn, *arms], functools.partial(rows_at, at, seed))
         mine.append([entry[0] for entry in rows[0]])
         for at_arm, row in enumerate(rows):
             theirs[at_arm].append([entry[1] for entry in row])
@@ -2048,285 +2134,6 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     return draw, reference, truth
 
 
-SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
-                  "scatter-add"})
-"""The operations that sum terms: a leaf's terms are those its own sums add,
-taken at their float64 values (`float64_terms`). A ragged dot, an expert
-layer's grouped matmul, sums as a dot does within each group, and its
-transpose, which the kernel's gradient runs, is one too."""
-
-CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
-                     "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
-                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier",
-                     "name", "psum", "psum_invariant", "reduce_scatter", "all_gather", "all_gather_invariant",
-                     "all_to_all", "ppermute", "pvary"})
-"""The operations that carry the terms of sums into a leaf without making
-new ones: sums combined (tied weights, accumulated microbatches, an update
-added to a parameter, devices' partials) and moved, by a remat name
-(`checkpoint_name`) or a collective too.
-A product or quotient of a sum by a value that is none carries them too,
-scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
-`s_i x_ik`; a product of two sums ends them."""
-
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
-                   "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
-"""The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal. A
-shard_map's per-device program is too, on each device's blocks (`_mapped`).
-A body that runs elsewhere, a Pallas kernel, is one operation, its outputs
-their own size."""
-
-
-def float64_forward(module, variables, *args, **kwargs):
-    """`module`'s own forward of `args` in float64, and each output's terms
-    (`float64_terms`): the module computing in float64 over its variables
-    widened, integer inputs as they are, `kwargs` given as they are. A
-    reference's float64 truth written elsewhere (a fixture's) is sized by
-    these terms, what Dew's own float64 sums add.
-
-    Only `module`'s own `dtype` is widened: a module holding another (a
-    multimodal wrapper's language model) that keeps its own dtype computes
-    that part in it, so an output that is not float64 is refused, and such a
-    model is passed widened whole (`ModelConfig.with_dtype`)."""
-    with jax.enable_x64(new_val=True):
-        wide = module.clone(dtype=jnp.float64)
-        outputs, terms = float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
-                                       *widened((variables, *args)))
-    narrow = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(outputs)
-                     if jnp.issubdtype(leaf.dtype, jnp.floating) and leaf.dtype != jnp.float64})
-    if narrow:
-        raise ValueError(f"{type(module).__name__} widened to float64 still gives {', '.join(narrow)} "
-                         "outputs: a module it holds keeps its own dtype; widen the whole model")
-    return outputs, terms
-
-
-def float64_terms(fn, *args):
-    """`fn(*args)` evaluated op by op, as float64 as `args` are, and the tree of
-    each output leaf's terms, alike: the root sum of squares of the terms its
-    final sums add (`SUMS`), at their operands' values, carried into the leaf
-    (`CARRIES`). That is the size of the sum's partial sums, which its
-    rounding scales with in any order: about the leaf's own size where the
-    terms' signs are independent, far above it where they cancel by design
-    (a softmax's shift invariance). A leaf made by any other operation is
-    its own size, and an input carries no terms, so a parameter's terms
-    after an update are the update's. Nothing propagates through the layers
-    behind a sum, which would bound the whole computation."""
-    closed = jax.make_jaxpr(fn)(*args)
-    values, energies = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
-    tree = jax.tree.structure(jax.eval_shape(fn, *args))
-    return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
-                                                   for energy, value in zip(energies, values, strict=True)])
-
-
-def _evaluated(jaxpr, consts, args, given=None):
-    """`jaxpr`'s outputs and their terms' energies, the sums of their squares
-    (`float64_terms`), from `args` and the energies `given` for them (none for
-    a computation's own inputs). A value no sum made has none."""
-    from jax.extend.core import Literal
-
-    wanted = _carrying(jaxpr)
-    values, energies = {}, {}
-    for var, value, energy in zip(jaxpr.constvars + jaxpr.invars, [*consts, *args],
-                                  [None] * len(consts) + list(given or [None] * len(args)), strict=True):
-        values[var], energies[var] = value, energy
-
-    def read(var):
-        return var.val if isinstance(var, Literal) else values[var]
-
-    def energy(var):
-        return None if isinstance(var, Literal) else energies.get(var)
-
-    # Each value and energy goes once its last reader has run, as an execution
-    # frees it: a chunked scan's float64 intermediates would otherwise all stay.
-    last = {var: index for index, equation in enumerate(jaxpr.eqns)
-            for var in equation.invars if not isinstance(var, Literal)}
-    for var in jaxpr.outvars:
-        if not isinstance(var, Literal):
-            last.pop(var, None)
-    for index, equation in enumerate(jaxpr.eqns):
-        inputs = [read(var) for var in equation.invars]
-        with equation.ctx.manager:
-            outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
-                                     any(var in wanted for var in equation.outvars))
-        for var in equation.invars:
-            if not isinstance(var, Literal) and last.get(var) == index:
-                values.pop(var, None)
-                energies.pop(var, None)
-        for var, value, made_energy in zip(equation.outvars, outputs, made, strict=True):
-            values[var], energies[var] = value, made_energy
-    return [read(var) for var in jaxpr.outvars], [energy(var) for var in jaxpr.outvars]
-
-
-def _carrying(jaxpr) -> set:
-    """The variables whose terms reach an output of `jaxpr`."""
-    from jax.extend.core import Var
-
-    wanted = {var for var in jaxpr.outvars if isinstance(var, Var)}
-    for equation in reversed(jaxpr.eqns):
-        if any(var in wanted for var in equation.outvars):
-            wanted.update(equation.invars[index] for index in _carried(equation)
-                          if isinstance(equation.invars[index], Var))
-    return wanted
-
-
-def _real(var) -> bool:
-    return jnp.issubdtype(var.aval.dtype, jnp.floating)
-
-
-def _carried(equation) -> list[int]:
-    """The operands whose terms `equation` carries to its outputs: real floats
-    alone, as a complex value's terms have no order to sum in."""
-    name, operands = equation.primitive.name, equation.invars
-    if not all(_real(var) or not jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.outvars):
-        return []
-    floats = [index for index, var in enumerate(operands) if _real(var)]
-    if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond", "shard_map"):
-        return floats
-    if name == "reduce_sum":
-        # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
-        return floats if all(operands[0].aval.shape[axis] == 1 for axis in equation.params["axes"]) else []
-    if name in ("mul", "div"):
-        return floats
-    return []
-
-
-def _body(equation):
-    """The jaxpr and constants a call runs (`CALLS`), or None."""
-    if equation.primitive.name not in CALLS:
-        return None
-    for name in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
-        body = equation.params.get(name)
-        if body is not None:
-            return (body.jaxpr, body.consts) if hasattr(body, "consts") else (body, [])
-    return None
-
-
-def _squared(value):
-    return jnp.square(jnp.abs(value)) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
-
-
-def _applied(equation, inputs, given, wanted: bool):
-    """`equation`'s outputs from `inputs`, and their energies where `wanted`."""
-    name, params = equation.primitive.name, equation.params
-    body = _body(equation)
-    if wanted and body is not None:
-        return _evaluated(*body, inputs, given)
-    if wanted and name == "scan":
-        return _scanned(params, inputs, given)
-    if wanted and name == "while":
-        return _looped(params, inputs, given)
-    if wanted and name == "shard_map":
-        return _mapped(params, inputs, given)
-    if wanted and name == "cond":
-        branch = params["branches"][int(inputs[0])]
-        return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:])
-    outputs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(params))
-    outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
-    if not wanted:
-        return outputs, [None] * len(outputs)
-    carried = _carried(equation)
-    if name in SUMS and not carried and all(_real(var) for var in equation.outvars):
-        squares = [_squared(value) if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating)
-                   else value for var, value in zip(equation.invars, inputs, strict=True)]
-        return outputs, [equation.primitive.bind(*squares, **equation.primitive.get_bind_params(params))]
-    if not carried:
-        return outputs, [None] * len(outputs)
-    if name in ("mul", "div"):
-        summed = [index for index in carried if given[index] is not None]
-        if len(summed) != 1 or (name == "div" and summed != [0]):
-            return outputs, [None] * len(outputs)
-        (index,) = summed
-        scale = jnp.square(jnp.abs(inputs[1 - index]))
-        return outputs, [given[index] * scale if name == "mul" else given[index] / scale]
-    if all(given[index] is None for index in carried):
-        return outputs, [None] * len(outputs)
-    operands = [_or_zero(given[index], value) if index in carried else value
-                for index, value in enumerate(inputs)]
-    primitive = jax.lax.add_p if name == "sub" else equation.primitive
-    made = (primitive.bind(*operands) if name == "sub" else
-            operands[0] if name == "neg" else
-            primitive.bind(*operands, **primitive.get_bind_params(params)))
-    made = list(made) if primitive.multiple_results else [made]
-    return outputs, [energy if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
-                     for energy, value in zip(made, outputs, strict=True)]
-
-
-def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
-    """A scan (lax.scan's equation `params`) over `inputs` a step at a time, as the gate's evaluators
-    walk one (`float64_terms`, check 2's `certified`): each input a tuple of lanes, a value and what an
-    evaluator carries beside it, sliced at each step lane by lane (a lane of None stays None), and
-    `body(step, step_inputs)` the body's outputs for one step, carries first, tuples alike. The carries
-    thread from step to step and each further output stacks over the steps in scan order, a lane where
-    every step has one (else None); an empty scan's from its outvars' avals, its `lanes` - 1 others None."""
-    jaxpr = params["jaxpr"].jaxpr
-    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
-    consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
-                         inputs[constants + carries:])
-    ys = []
-    steps = range(params["length"])
-    for step in reversed(steps) if params["reverse"] else steps:
-        sliced = [tuple(None if lane is None else lane[step] for lane in x) for x in xs]
-        outputs = body(step, [*consts, *carry, *sliced])
-        carry = outputs[:carries]
-        ys.append(outputs[carries:])
-    if params["reverse"]:
-        ys.reverse()
-    if not ys:
-        return [*carry, *((jnp.zeros((0, *var.aval.shape), var.aval.dtype), *(None,) * (lanes - 1))
-                          for var in jaxpr.outvars[carries:])]
-    return [*carry, *(tuple(None if any(entry is None for entry in lane) else jnp.stack(lane)
-                            for lane in zip(*column, strict=True))
-                      for column in zip(*ys, strict=True))]
-
-
-def _scanned(params, inputs, given):
-    """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time."""
-    body = params["jaxpr"]
-
-    def step(_, pairs):
-        outputs, made = _evaluated(body.jaxpr, body.consts, [value for value, _ in pairs],
-                                   [energy for _, energy in pairs])
-        return list(zip(outputs, made, strict=True))
-
-    walked = scanned_steps(params, list(zip(inputs, given, strict=True)), step, lanes=2)
-    return [value for value, _ in walked], [energy for _, energy in walked]
-
-
-def _looped(params, inputs, given):
-    """A while loop's carries and energies (`float64_terms`), its body evaluated a step at a time."""
-    condition, body = params["cond_jaxpr"], params["body_jaxpr"]
-    tested, run = params["cond_nconsts"], params["body_nconsts"]
-    condition_consts, body_consts, carry = inputs[:tested], inputs[tested:tested + run], inputs[tested + run:]
-    body_terms, carry_terms = given[tested:tested + run], given[tested + run:]
-    while bool(_evaluated(condition.jaxpr, condition.consts, [*condition_consts, *carry])[0][0]):
-        carry, carry_terms = _evaluated(body.jaxpr, body.consts, [*body_consts, *carry],
-                                        [*body_terms, *carry_terms])
-    return carry, carry_terms
-
-
-def _mapped(params, inputs, given):
-    """A shard_map's outputs and energies (`float64_terms`), its program evaluated
-    op by op on each device's blocks, as the map runs it: an expert layer's
-    dispatch (`dew.nn.moe`), whose grouped matmul and its transpose sum."""
-    body, specs, out_specs = params["jaxpr"], tuple(params["in_specs"]), tuple(params["out_specs"])
-
-    def program(values, energies):
-        return tuple(map(tuple, _evaluated(body.jaxpr, body.consts, values, energies)))
-
-    return jax.shard_map(program, mesh=params["mesh"], in_specs=(specs, specs),
-                         out_specs=(out_specs, out_specs), axis_names=params["newly_manual_axes"],
-                         check_vma=params["check_vma"])(tuple(inputs), tuple(given))
-
-
-def _or_zero(energy, value):
-    return jnp.zeros_like(value) if energy is None else energy
-
-
-def _or_size(energy, value):
-    """An output's energy: the one its sums carried, else its own size's square."""
-    if not jnp.issubdtype(jnp.result_type(value), jnp.inexact):
-        return np.zeros(np.shape(value))
-    return _squared(value) if energy is None else energy
 
 
 FALSE_FAILURE = 1e-6
