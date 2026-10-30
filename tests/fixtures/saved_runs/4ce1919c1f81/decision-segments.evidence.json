@@ -2,7 +2,99 @@
  "step": 2,
  "compute": "float32",
  "products": {
-  "float64": 50
+  "DecisionHead/layers_0/mlp/down_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_0/mlp/up_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_0/self_attn": [
+   "float64"
+  ],
+  "DecisionHead/layers_0/self_attn/k_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_0/self_attn/o_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_0/self_attn/q_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_0/self_attn/v_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_1/mlp/down_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_1/mlp/up_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_1/self_attn": [
+   "float64"
+  ],
+  "DecisionHead/layers_1/self_attn/k_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_1/self_attn/o_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_1/self_attn/q_proj": [
+   "float64"
+  ],
+  "DecisionHead/layers_1/self_attn/v_proj": [
+   "float64"
+  ],
+  "DecisionHead/scorer_hidden": [
+   "float64"
+  ],
+  "DecisionHead/scorer_out": [
+   "float64"
+  ],
+  "layers_0/mlp/down_proj": [
+   "float64"
+  ],
+  "layers_0/mlp/gate_up_proj": [
+   "float64"
+  ],
+  "layers_0/self_attn": [
+   "float64"
+  ],
+  "layers_0/self_attn/o_proj": [
+   "float64"
+  ],
+  "layers_0/self_attn/qkv_proj": [
+   "float64"
+  ],
+  "layers_1/mlp/down_proj": [
+   "float64"
+  ],
+  "layers_1/mlp/gate_up_proj": [
+   "float64"
+  ],
+  "layers_1/self_attn": [
+   "float64"
+  ],
+  "layers_1/self_attn/o_proj": [
+   "float64"
+  ],
+  "layers_1/self_attn/qkv_proj": [
+   "float64"
+  ],
+  "layers_2/mlp/down_proj": [
+   "float64"
+  ],
+  "layers_2/mlp/gate_up_proj": [
+   "float64"
+  ],
+  "layers_2/self_attn": [
+   "float64"
+  ],
+  "layers_2/self_attn/o_proj": [
+   "float64"
+  ],
+  "layers_2/self_attn/qkv_proj": [
+   "float64"
+  ]
  },
  "params": [
   "float32"

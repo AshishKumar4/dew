@@ -39,13 +39,21 @@ ABSOLUTE = re.compile(rb"/(?:home|Users|root|tmp|mnt|private|var)/")
 """An absolute place of the machine that wrote a file: a home, a scratch or a mounted directory."""
 
 
+PRODUCTS = 2
+"""The evidence version from which a generation records the dtypes one request of each run's task
+multiplies in, by module path (`saved_run_kinds.computed`); an earlier one's are not compared."""
+
+
 def evidence(recorded: str, kind: str) -> dict | None:
-    """What `kind`'s run the main `recorded` saved serialized (`saved_runs_reference.evidence`), None where
-    that main's generation records none: one recorded before its version (`source.json`'s `evidence`).
-    A generation that states one holds every kind's."""
-    if "evidence" not in json.loads((CORPUS / recorded / "source.json").read_text()):
+    """What `kind`'s run the main `recorded` saved serialized (`saved_runs_reference.evidence`), beside
+    the version its generation states (`version`), None where that main's generation records none: one
+    recorded before its version (`source.json`'s `evidence`). A generation that states one holds every
+    kind's."""
+    source = json.loads((CORPUS / recorded / "source.json").read_text())
+    if "evidence" not in source:
         return None
-    return json.loads((CORPUS / recorded / f"{kind}.evidence.json").read_text())
+    seen = json.loads((CORPUS / recorded / f"{kind}.evidence.json").read_text())
+    return {**seen, "version": source["evidence"]}
 
 
 def archived(recorded: str, kind: str) -> tarfile.TarFile:
@@ -88,10 +96,10 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
     task = objectives[recorded_run.objective.name].saved_task
     if seen is not None:
         assert recorded_run.compute_dtype() == seen["compute"]
-        if task is not None:
-            # The task loaded multiplies as the one the run saved did: one request's products in the
-            # dtypes they multiplied in then.
-            assert computed(task.from_run(str(run))) == seen["products"]
+        if task is not None and seen["version"] >= PRODUCTS:
+            # The task loaded multiplies as the one the run saved did: one request's products, module by
+            # module, in the dtypes they multiplied in then.
+            assert computed(run) == seen["products"]
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
         declared = checkpoints.artifact(last) is not None
@@ -152,8 +160,8 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         assert not clocked or consumed == recorded_run.trainer.examples
         # The model the resumed fit trained computes as the saved one did: the task its new step saves.
         task = objectives[recorded_run.objective.name].saved_task
-        if task is not None:
-            assert computed(task.from_run(str(run), step=int(state.step))) == seen["products"]
+        if task is not None and seen["version"] >= PRODUCTS:
+            assert computed(run, int(state.step)) == seen["products"]
         # The step the resumed fit compiled, at the rung it was admitted at.
         compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
         assert compiled["remat"] == seen["remat"]

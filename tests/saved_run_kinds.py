@@ -4,13 +4,13 @@ and each variant a run serializes apart (row 2640): a decision row of its own se
 a lettered one, a block-diffusion run over a nested decoder, a run on the examples clock, fresh runs in
 bfloat16 and in float16 (whose loss a dynamic scale scales), and a run over a source stored as it states."""
 
-import collections
 import dataclasses
-import re
-import tempfile
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
-import jax
 import numpy as np
 import test_run_options as run_options
 from test_lm_recipe import SEQ, write_token_files
@@ -24,7 +24,6 @@ from dew.decision.layout import built_in
 from dew.decision.task import Decide
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, TextGeneration
-from dew.nn.kernels import options
 from dew.nn.precision import numerics_of
 from dew.registry import ModelConfig
 from dew.training.budget import Pause
@@ -109,38 +108,26 @@ def stored(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(over(QWEN, root, drawn), source=SourceOptions(param_dtype="bfloat16"))
 
 
-def computed(task) -> dict[str, int]:
-    """How many matrix products a loaded task multiplies in each dtype, its operands' dtypes joined by a
-    comma where they differ: the products of the programs one request of it lowers (`answered`), read
-    from the StableHLO JAX writes as it lowers them (`jax_dump_ir_to`). A model whose outer module states
-    bfloat16 while one projection of its decoder computes in float32 multiplies one product fewer in
-    bfloat16. JAX's caches and Dew's outer programs (`dew.nn.kernels.options.program`, which an equal
-    model's earlier task compiled) are cleared first, so every program lowers anew. The products are the
-    suite's CPU's, as the corpus's writer counts them under the suite's environment, whose wide
-    arithmetic multiplies a product summed in float32 in float64 (`dew.nn.precision.accumulated`); an
-    accelerator lowers its own (bible §7 runs these files on the CPU)."""
-    assert jax.default_backend() == "cpu", "a saved run's products are counted on the suite's CPU"
-    jax.clear_caches()
-    options._program.cache_clear()
-    before = jax.config.values["jax_dump_ir_to"]
-    with tempfile.TemporaryDirectory() as dump:
-        jax.config.update("jax_dump_ir_to", dump)
-        try:
-            answered(task)
-        finally:
-            jax.config.update("jax_dump_ir_to", before)
-        lowered = "".join(path.read_text() for path in Path(dump).glob("*.mlir"))
-    products = collections.Counter(",".join(sorted({DTYPES[operand.rsplit("x", 1)[-1]] for operand in pair}))
-                                   for pair in PRODUCT.findall(lowered))
-    assert products, "the request lowered no matrix product"
-    return dict(sorted(products.items()))
-
-
-PRODUCT = re.compile(r"stablehlo\.dot_general [^\n]*: \(tensor<([^>]*)>, tensor<([^>]*)>\)")
-"""A matrix product of a lowered program and its operands' tensor types, shape and element type."""
-
-DTYPES = {"bf16": "bfloat16", "f16": "float16", "f32": "float32", "f64": "float64"}
-"""The dtype StableHLO's element type names."""
+def computed(directory: Path | str, step: int | None = None) -> dict[str, list[str]]:
+    """Each module path's dtypes that one request of the task a saved run at `directory` loads, at `step`
+    or else its default, multiplies in: its products' operands' (`saved_run_products`), read in a fresh
+    interpreter, where every program the request runs lowers, as the corpus's writer reads them. A model
+    whose outer module states bfloat16 while one projection of its decoder computes in float32 states
+    float32 at that projection's path. The products are the suite's CPU's, in the suite's environment,
+    whose wide arithmetic multiplies a product summed in float32 in float64
+    (`dew.nn.precision.accumulated`); an accelerator lowers its own (bible §7 runs these files on the
+    CPU)."""
+    root = Path(__file__).resolve().parents[1]
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(
+        [str(root / "src"), *filter(None, [os.environ.get("PYTHONPATH")])])}
+    # A record names the repo's sources by their path in it, read from the checkout's root.
+    done = subprocess.run([sys.executable, str(Path(__file__).with_name("saved_run_products.py")),
+                           str(directory), *([] if step is None else [str(step)])], cwd=root,
+                          env=environment, capture_output=True, text=True, timeout=600, check=False)
+    assert done.returncode == 0, done.stderr[-3000:]
+    found = json.loads(done.stdout.splitlines()[-1])
+    assert found, "the request lowered no matrix product"
+    return found
 
 
 def answered(task) -> None:
