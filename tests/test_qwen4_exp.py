@@ -8,7 +8,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
-from interop_support import assert_reloads, fixture_ids, token_draw, transformers_arms, transformers_model
+from interop_support import assert_reloads, fixture_ids, token_draw, transformers_arms
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -18,6 +18,7 @@ from dew.nn.engram import Engram, EngramHashes
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 RELEASE = ROOT / 'qwen3.8-flash-next'
 TINY = ROOT / 'qwen4-exp-tiny'
+NATIVE = ROOT / 'qwen4-exp-native-tiny'
 
 
 def test_the_releases_ngram_lookups_hash_its_ids_as_transformers_does():
@@ -66,10 +67,6 @@ def test_an_export_opens_in_transformers_as_the_model_it_was(tmp_path):
     assert_reloads(loaded, tmp_path, np.load(TINY / 'input_ids.npy'))
 
 
-WRAPPER_SEEDS = 8
-"""The wrapper's declared draws of ids against transformers' (check 1), sized as `EXPORT_SEEDS`."""
-
-
 MTP = {'mtp.fc_embedding.weight': (8, 16), 'mtp.layers.0.self_attn.q_proj.weight': (16, 8)}
 """Two of the root names the release stores its prediction layer under (its
 model.safetensors.index.json), which transformers' class leaves out, at shapes of no consequence."""
@@ -85,35 +82,18 @@ def with_mtp(directory: Path) -> None:
     save_file({**stored, **drawn}, directory / 'model.safetensors', metadata={'format': 'pt'})
 
 
-def test_the_release_wrapper_loads_whole_and_text_only_as_its_language_model(tmp_path):
-    """Qwen3.8-Flash-Next's wrapper (Qwen4ExpForConditionalGeneration at the release's config, its text half
-    qwen4-exp-tiny's config and its tower one block of Qwen 3.5's, transformers' own draw, the release's
-    root prediction-layer names beside it) loads whole, its tower Qwen 3.5's, and computes transformers'
-    text logits on par from its float64 twin (check 1); its language model alone (`text_only`) computes
-    them bit for bit as the whole does; and the whole writes back and reloads as itself."""
-    import torch
-    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
+def test_the_wrapper_loads_whole_and_text_only_and_writes_back_as_stored(tmp_path):
+    """qwen4-exp-native-tiny, transformers' own Qwen4ExpForConditionalGeneration save, with the release's
+    root prediction-layer names beside it, loads whole, its tower Qwen 3.5's, and as its language model
+    alone (`text_only`), which computes the whole's text logits bit for bit; and the whole writes back
+    and reloads as itself. Its logits are transformers' as the media test holds them."""
+    import shutil
 
-    release = json.loads((RELEASE / 'config.json').read_text())
-    text = {key: value for key, value in json.loads((TINY / 'config.json').read_text()).items()
-            if key not in ('architectures', 'transformers_version')}
-    vision = {**release['vision_config'], 'depth': 1, 'hidden_size': 32, 'intermediate_size': 64,
-              'num_heads': 2, 'out_hidden_size': text['hidden_size'], 'num_position_embeddings': 16}
-    special = {'image_token_id': 250, 'video_token_id': 251, 'vision_start_token_id': 252,
-               'vision_end_token_id': 253}
-    torch.manual_seed(0)
-    Qwen4ExpForConditionalGeneration(Qwen4ExpConfig(text_config=text, vision_config=vision, **special)).to(
-        torch.float32).save_pretrained(tmp_path)
-    reference, truth = transformers_arms(
-        transformers_model(tmp_path), lambda model, ids: model(input_ids=ids, use_cache=False).logits)
-    with_mtp(tmp_path)
-    whole = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    alone = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference', text_only=True)
-    draw = token_draw(0x4E, 240, (2, 12))
-    assert_as_exact(lambda ids: whole.model.apply(whole.variables, ids), reference, draw,
-                    'Qwen4-Exp wrapper logits', seeds=WRAPPER_SEEDS, truth_fn=truth)
-    (ids,) = draw(0)
+    source = Path(shutil.copytree(NATIVE, tmp_path / 'source'))
+    with_mtp(source)
+    whole = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    alone = Pretrained.load(source, dtype='float32', attention_impl='reference', text_only=True)
+    (ids,) = token_draw(0x4E, 200, (2, 12))(0)
     np.testing.assert_array_equal(alone.model.apply(alone.variables, ids),
                                   whole.model.apply(whole.variables, ids))
     whole.save(tmp_path / 'saved')
@@ -138,7 +118,6 @@ def test_a_loaded_checkpoint_of_a_sharded_table_writes_back_and_reloads(tmp_path
     assert_reloads(loaded, tmp_path / 'saved', ids)
 
 
-NATIVE = ROOT / 'qwen4-exp-native-tiny'
 
 MEDIA_SEEDS = 32
 """The media's declared draws (check 1), sized by `seeds_for` paired with Dew's logits on armada."""
@@ -159,10 +138,14 @@ def test_images_and_a_video_read_through_the_processor_as_transformers_reads_the
     processor = transformers.AutoProcessor.from_pretrained(NATIVE, local_files_only=True)
     metadata = [prompts['video_metadata']]
 
+    # One program for every draw: the processor's arrays keep their shapes.
+    apply = jax.jit(lambda variables, tokens, fields: loaded.model.apply(variables, tokens, **fields))
+
     def dew(image, video):
-        pictured = loaded.processor([prompts['image']], images=[[np.asarray(image)]])
-        clip = loaded.processor([prompts['video']], videos=[np.asarray(video)], video_metadata=metadata)
-        return {name: loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
+        pictured = loaded.processor([prompts['image']], images=[[np.asarray(image, np.uint8)]])
+        clip = loaded.processor([prompts['video']], videos=[np.asarray(video, np.uint8)],
+                                video_metadata=metadata)
+        return {name: apply(loaded.variables, inputs.tokens, inputs.kwargs())
                 for name, inputs in (('image', pictured), ('video', clip))}
 
     def run(network, image, video):
