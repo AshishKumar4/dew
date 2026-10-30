@@ -934,7 +934,7 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
     its launches on the global batch, layer 0's solve over 4 rows for its 2, beside 40 GB of gathers a
     microbatch (row 1897). `options` are the op's (`max_segments`, `scale`, `delta`, `wide`, `floor`,
-    `bound`)."""
+    `bound`, `rounded`)."""
     from .templates.recurrence import template
 
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
@@ -953,7 +953,7 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
                 wide: bool = False, family=None, floor: float | None = None, bound: float | None = None,
-                firsts=None):
+                firsts=None, rounded: bool = False):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
     (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their
@@ -969,7 +969,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     it issues by, interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's
     declared `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit
     delta rule the chunk inverse's `bound` its form proves, which its solve's range needs
-    (`template.inverse_refusal`)."""
+    (`template.inverse_refusal`); a `rounded` call without it (the SSD's) takes mamba_ssm's 16-bit numbers
+    under the run's fast forms (`mainloop.forward`)."""
     from .templates.recurrence import mainloop, template
 
     dtype = jnp.result_type(query, key, value)
@@ -1001,7 +1002,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
         alone = {**run, "tiles": tiles.forward or tiles}
         return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
-                                max_segments=max_segments, scale=scale, delta=delta, wide=wide, **alone)
+                                max_segments=max_segments, scale=scale, delta=delta, wide=wide,
+                                rounded=rounded, **alone)
 
     def forward(*operands):
         if not fast:
@@ -1012,7 +1014,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # keeps them rather than replaying the forward's launches for them (`mixer_base.DELTA_RESIDUALS`).
         out, final, (inverse, kept) = mainloop.kept_forward(*operands[:6], starts=operands[6],
                                                             firsts=operands[7], max_segments=max_segments,
-                                                            scale=scale, delta=delta, wide=wide, **run)
+                                                            scale=scale, delta=delta, wide=wide,
+                                                            rounded=rounded, **run)
         kept = None if "delta_memory" in RECOMPUTED.get() else checkpoint_name(kept, 'delta_memory')
         return (out, final), (operands, (checkpoint_name(inverse, 'delta_inverse'), kept))
 
@@ -1159,7 +1162,8 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
         if kernel == 'mosaic_gpu':
             out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
-                                       max_segments=max_segments, scale=1.0, delta=False, wide=True)
+                                       max_segments=max_segments, scale=1.0, delta=False, wide=True,
+                                       rounded=True)
             return recurrence.skipped(hooks, out, value, {'skip': skip}, work), final
         operand = jnp.result_type(query, key, value)
         x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
@@ -1319,27 +1323,26 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=1.0, delta=False, wide=True)
+                     max_segments=max_segments, scale=1.0, delta=False, wide=True, rounded=True)
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
     return select(SCAN, case).kernel if report else selected(SCAN, case).name
 
 
 SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('wgmma', 'forward'): (
-        'pallas', "on an H100 PCIe, the port's forward 0.840 ms against the template's 0.954 on "
-                  "Nemotron-H 4B's SSD (chunk 256) and 0.329 against 0.377 on Nemotron-H 30B's (chunk 128), "
-                  "each the same `chunk(SSD, ...)` call (SE-1964-h100-5e6e356e0)"),
-    ('mma.sync', 'forward'): (
-        'pallas', "on an A100 SXM4 40GB, the port's forward 1.486 ms against the template's 1.821 on "
-                  "Nemotron-H 4B's SSD and 0.529 against 0.769 on 30B's, each the same `chunk(SSD, ...)` "
-                  "call (SE-1964-a100-5e6e356e0)"),
+        'pallas', "on an H100 80GB HBM3, the port's forward 0.228 ms against the template's 0.248 on "
+                  "Nemotron-H 30B's SSD (chunk 128), the template's launches 0.167 against the port's 0.194 "
+                  "and its fp32 output's skip and cast 0.045 past them; on Nemotron-H 4B's (chunk 256) the "
+                  "template's 0.575 against 0.606, each the same `chunk(SSD, ...)` call under the fast forms "
+                  "(ssd-rounded-h100-fdab2424c)"),
 }
 """The cells, each an instruction family and a product (`ScanCase.cell`), where a receipt timing the same
 product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows the port of
 mamba_ssm's kernels faster than the recurrence template, each its old route's kernel and that receipt: the
 scan's selector runs the port on them where it takes the call (`Op.declared`); the list shrinks as the
-template wins its cells. Training is the port's by the template's refusal (it trains no rated scan, row
-1926), not a cell."""
+template wins its cells. An A100's forward is the template's: 1.418 ms against the port's 1.506 on
+Nemotron-H 4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c). Training is the port's by
+the template's refusal (it trains no rated scan), not a cell."""
 
 SCAN: Op[ScanCase] = Op('ssd', (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
                                Kernel('pallas', SSD_SUPPORTS), Kernel('tpu', TPU_SCAN_SUPPORTS),
