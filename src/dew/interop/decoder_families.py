@@ -96,6 +96,8 @@ ENTRIES = (
     KIMI_K3,
     DEEPSEEK_V3,
     MUSE_GLIMMER_TEXT,
+    # Its grouped norms and value experts are its own; its gated, routed layers would read as Qwen3.5's.
+    K2_HORIZON,
     QWEN3_NEXT,
     QWEN3_5_MOE_TEXT,
     QWEN3_5_TEXT,
@@ -126,7 +128,6 @@ ENTRIES = (
         preserve_source_layout=True,
         tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
     ),
-    K2_HORIZON,
     DecoderFamily(
         ("ministral",),
         ministral_config,
