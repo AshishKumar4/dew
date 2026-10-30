@@ -149,6 +149,25 @@ def test_a_masked_step_passes_its_model_the_run_s_progress():
     assert loss(objective(), trained) != loss(objective(), validated)
 
 
+def test_an_evaluation_reads_the_run_s_end_whatever_it_reports():
+    """An evaluation's step is no training step (`Evaluation.run`), so a model that reads the run's
+    progress reads its end in every pass, a metrics-only one as one beside the loss (review of ledger
+    2537): the masked objective's perplexity after five updates is its perplexity before any, both the
+    run's end, where a metrics-only pass read the updates the run had committed."""
+    from dew.objectives.lm import Perplexity
+    from dew.training.evaluation import Evaluation
+
+    objective = MaskedDiffusionObjective(_Annealed(), MDLM(mask_id=31)(), seq_len=8, ema_decay=None)
+    variables = objective.init(jax.random.key(0))
+    rows = {"text": np.tile(np.arange(1, 9, dtype=np.int32), (8, 1))}
+
+    def perplexity(updates: int) -> float:
+        return Evaluation.run(objective, variables, lambda partition: iter((rows,)), key=0,
+                              metrics=(Perplexity(),), updates=updates).scores["val/perplexity"]
+
+    assert perplexity(5) == perplexity(0)
+
+
 @pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
 def test_padding_that_holds_the_mask_token_scores_nothing(given):
     """A padded row whose padding slots hold the mask token, as a tokenizer padding with it writes
