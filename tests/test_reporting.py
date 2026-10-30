@@ -375,6 +375,27 @@ def test_the_panel_shows_the_metrics_its_last_interval_reported():
         ("loss", [2.0, 1.5, 1.0]), ("source/a/reward", [1.0, 0.5])]
 
 
+def test_a_run_on_the_examples_clock_shows_its_progress_in_examples_and_estimates_its_steps():
+    """A run bounded in examples that counts no steps ahead shows none until it has consumed some, then
+    the steps its examples so far took, carried over its bound (`≈`), an estimate the run never reads;
+    its bar is the examples it consumed of its bound, exactly. A run counted ahead shows its own."""
+    from rich.console import Console
+
+    from dew.training.display import TrainingDisplay
+
+    display = TrainingDisplay(total=None, examples=1000)
+    assert display.steps_total() == (None, "")
+    display.current = 10
+    display.interval(10, {"train/loss": 1.0, "train/examples_consumed": 250.0})
+    assert display.steps_total() == (40, "≈40")
+    console = Console(width=100, record=True, force_terminal=False)
+    console.print(display)
+    shown = console.export_text()
+    assert "10/≈40" in shown and "25%" in shown
+    counted = TrainingDisplay(total=40)
+    assert counted.steps_total() == (40, "40")
+
+
 def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_within_its_name_column():
     """A step some of whose launches' work XLA's cost analysis cannot count reports its utilizations
     as lower bounds beside how many launches went uncounted: the panel shows them as `hfu ≥` and
