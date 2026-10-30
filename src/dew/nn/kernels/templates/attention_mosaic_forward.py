@@ -599,7 +599,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
     launch = _Launch(tuple((array.shape, jnp.dtype(array.dtype)) for array in (query, key, value)), treedef,
-                     jax.tree.structure(hooks), spec, tiles, family, training, interpret, peaks,
+                     _described(hooks), spec, tiles, family, training, interpret, peaks,
                      None if out_dtype is None else jnp.dtype(out_dtype), counted, finishes,
                      generation.gpu_target(), name, report.named(name))
     return _kernel_of(launch)(query, key, value, *leaves)
@@ -608,8 +608,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
 @dataclasses.dataclass(frozen=True)
 class _Launch:
     """A forward launch's static facts, all its kernel is built from (`_kernel_of`): its operands' shapes
-    and dtypes, the structure of the arrays its programs read beside them (`treedef`) and of its hooks
-    (their functions and parameters' kinds, no array), its form, tiles and family, what it gives, the target
+    and dtypes, the structure of the arrays its programs read beside them (`treedef`), its hooks with their
+    arrays' shapes and dtypes in place of the arrays (`_described`), its form, tiles and family, what it gives, the target
     it is derived for, and its name (its form, guard and value columns) as the launch tracing it resolves
     it (`report.named`)."""
 
@@ -630,14 +630,20 @@ class _Launch:
     kernel_name: str | None
 
 
+def _described(hooks: Hooks) -> Hooks:
+    """`hooks` with each array's shape and dtype in its place (`jax.ShapeDtypeStruct`): what a kernel built
+    for many calls reads of them, no array held."""
+    return jax.tree.map(lambda array: jax.ShapeDtypeStruct(jnp.shape(array), jnp.result_type(array)), hooks)
+
+
 @functools.lru_cache(maxsize=256)
 def _kernel_of(launch: _Launch) -> Callable:
     """`_launch`'s kernel for its static facts `launch`, built once for every call of them and reading no
-    array: its hooks' structure alone (`launch.hooks`, their parameters' kinds, their arrays the programs'
-    refs), its operands their shapes and dtypes. A bound of 256 kernels keeps a process's memory bounded
+    array: its hooks' functions and their arrays' shapes and dtypes (`_described`; the arrays the programs'
+    refs), its operands' alike. A bound of 256 kernels keeps a process's memory bounded
     (the hook programs' own cache's, `hook_program`)."""
     query, key, value = (jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in launch.operands)
-    hooks = jax.tree.unflatten(launch.hooks, [None] * launch.hooks.num_leaves)
+    hooks = launch.hooks
     spec, tiles, family, training, interpret = (launch.spec, launch.tiles, launch.family, launch.training,
                                                 launch.interpret)
     peaks, out_dtype, counted, finishes, treedef = (launch.peaks, launch.out_dtype, launch.counted,
