@@ -217,6 +217,34 @@ def agreed_next[T](phase: str, stream: Iterator[T]) -> T | None:
     return read
 
 
+def agreed_shares[T](phase: str, stream: Iterator[T],
+                     counted: Callable[[T], int]) -> tuple[T | None, int, int]:
+    """`stream`'s next item on this rank, or None where it has run out, with how many ranks' streams have
+    run out and the sum of `counted` over what the others read, learned in one round: a pool's shares
+    that end apart, each reading on until every one has (a run on the examples clock). A rank that
+    fails stops every rank, as `agreed` does."""
+    held: tuple[T | None] | None = None
+    error: BaseException | None = None
+    try:
+        held = (next(stream, None),)
+    except BaseException as failure:
+        error = failure
+    word = "-" if held is None or held[0] is None else str(counted(held[0]))
+    if jax.process_count() == 1:
+        if error is not None:
+            raise error
+        words = [word]
+    else:
+        try:
+            words = _agree(phase, error, word)
+        except BaseException as failure:
+            if error is None:
+                raise PeerFailure(str(failure)) from failure
+            raise
+    assert held is not None
+    return held[0], words.count("-"), sum(int(said) for said in words if said != "-")
+
+
 def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:
     """`agreed`, with how many ranks' outcomes `counted` holds for, learned in the same round."""
     held: tuple[T] | None = None

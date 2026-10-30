@@ -133,6 +133,7 @@ from dew.training._fit import (
     first_batch,
     fit_policies,
     handed_splits,
+    pooled,
     refuse_unclocked,
     stage_reached,
     unrecorded_parts,
@@ -448,8 +449,7 @@ class Trainer(Generic[Loss, Effects]):
         return self._key
 
     def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
-        """Take `loader`'s device steps, the batches to prefetch and the run's clock (`clocked`), as `fit`
-        does before it compiles, and a step compiled ahead (`dew.training.ahead`)."""
+        """Take `loader`'s device steps, prefetch and clock (`clocked`), as fit and compile-ahead do."""
         self._device, self._prefetch = loader.device, prefetch
         self._examples = clocked(examples, steps, custom=self.step is not None,
                                  rollout=self.rollout is not None, bound_ends=loader.bound_ends)
@@ -1742,7 +1742,7 @@ class Trainer(Generic[Loss, Effects]):
             # corpus, and none reads a record before all agree it is one.
             agreed_same("training data", lambda: (
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
-        run.endless = stream_endless(source)
+        run.endless, run.pooled = stream_endless(source), pooled(self._examples)
         self._marked = marked(run.partition, self._counted_batch)
         prepare = self._marked if self.rollout is None else None
         return DevicePrefetchIterator(source, self.device_mesh, self._prefetch, source_state=position,

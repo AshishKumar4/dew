@@ -21,9 +21,9 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import position
-from dew._coordination import agreed_next
+from dew._coordination import agreed_next, agreed_shares
 from dew._records import JSON
-from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, Batch, ConsumedCount
+from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
 from dew.data.compile import Handed, native
 from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
@@ -331,6 +331,13 @@ class FitRun:
     ahead: tuple[Batch | None] | None = None
     """The next batch, or None for the stream's end, read before the step that takes it, where a
     save had to know whether the run ends there (`ends_here`)."""
+    pooled: bool = False
+    """Whether the run is on the examples clock in a pool, whose shares end apart: each reads on, a
+    share that ran out with its last batch emptied (`emptied`), until every one has, the examples
+    each step consumed counted over the pool (`agreed_shares`)."""
+    last: Batch | None = None
+    """The latest batch the share read, which it steps with emptied once its stream has run out and
+    others' read on (`pooled`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
@@ -500,8 +507,8 @@ def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool)
 def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
     """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
     prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
-    its start. A run on another clock, one bounded in examples whose plan counts its steps ahead, keeps
-    no count: none rides to its step."""
+    its start, and in a pool each marks its real rows (`VALID_ROWS`). A run on another clock, one
+    bounded in examples whose plan counts its steps ahead, keeps no count: none rides to its step."""
     if not clocked:
         return batch if EXAMPLES_CONSUMED not in batch else {
             name: value for name, value in batch.items() if name != EXAMPLES_CONSUMED}
@@ -509,7 +516,12 @@ def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
         raise ValueError("a step after the examples bound dropped the batch's count of the examples it "
                          f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "
                          "step that rebuilds its records keeps no count")
-    return {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
+    counted_batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
+    if jax.process_count() > 1 and VALID_ROWS not in batch:
+        # A pool's share steps on with its last batch emptied once its stream runs out (`emptied`), so
+        # each of its batches marks its real rows, and every one is the same tree, one program.
+        counted_batch[VALID_ROWS] = np.ones(len(np.asarray(batch[EXAMPLES_CONSUMED])), bool)
+    return counted_batch
 
 
 def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = False) -> Batch | None:
@@ -528,11 +540,51 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     stream = iter(run.train.peek, None) if peek else run.train
     with region("input.wait"):
         asked = time.perf_counter()
-        batch = agreed_next("training read", stream) if agree or peek else run.read()
+        batch = (pooled_read(run, stream) if run.pooled and not peek
+                 else agreed_next("training read", stream) if agree or peek else run.read())
         interval.waited += time.perf_counter() - asked
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
     return batch
+
+
+def pooled(examples: int | None) -> bool:
+    """Whether a run on the examples clock (bounded to `examples`) is a pool's, whose shares end apart
+    (`FitRun.pooled`)."""
+    return examples is not None and jax.process_count() > 1
+
+
+def pooled_read(run: FitRun, stream: Iterator[Batch]) -> Batch | None:
+    """A pooled run's next batch (`FitRun.pooled`): this share's, or its last emptied where its stream has
+    run out and another share's reads on, each counting the examples the whole pool's batches consume,
+    so every share's clock is the pool's; None once every share's stream has run out."""
+    read, ended, consumed = agreed_shares("training read", stream, lambda batch: counted(batch).examples)
+    if ended == jax.process_count():
+        return None
+    if read is None:
+        assert run.last is not None, "a share that ran out stepped with the pool before"
+        read = emptied(run.last)
+    run.last = read
+    return {**read, CONSUMED_COUNT: ConsumedCount(consumed)}
+
+
+def counted(batch: Batch) -> ConsumedCount:
+    """The examples a clocked run's `batch` consumes (`consumption_counted`)."""
+    held = batch[CONSUMED_COUNT]
+    assert isinstance(held, ConsumedCount), "a clocked run's batch is counted (`consumption_counted`)"
+    return held
+
+
+def emptied(batch: Batch) -> Batch:
+    """A share's `batch`, its last, with no row real and none consuming an example: what it steps with
+    once its stream has run out and another share's reads on, so it trains nothing and its pool's
+    programs and collectives stay one. Its rows' other fields stand as they were, masked."""
+    def zeroed(leaf: jax.Array) -> jax.Array:
+        return jax.make_array_from_single_device_arrays(
+            leaf.shape, leaf.sharding, [jnp.zeros_like(shard.data) for shard in leaf.addressable_shards])
+
+    return {**batch, VALID_ROWS: zeroed(batch[VALID_ROWS]),
+            EXAMPLES_CONSUMED: zeroed(batch[EXAMPLES_CONSUMED]), CONSUMED_COUNT: ConsumedCount(0)}
 
 
 def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, stop, scored,
