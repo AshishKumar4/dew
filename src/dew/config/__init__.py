@@ -524,7 +524,7 @@ class TrainerConfig:
     Scalars, records and objective previews are tracked; checkpoints are not uploaded.
     """
     publish: bool = False
-    """Publish the final checkpoint to W&B; requires `wandb` and `checkpoint_final`."""
+    """Publish the final checkpoint to W&B; requires `wandb`, online, and `checkpoint_final`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
@@ -612,6 +612,9 @@ class TrainerConfig:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
+        if self.publish and self.wandb is not None and self.wandb.offline:
+            raise ValueError("trainer.publish links the final checkpoint into W&B's registry, which an "
+                             "offline W&B run cannot reach; track online to publish")
         if self.attention_form not in attention_route.FORMS:
             raise ValueError(f"--trainer.attention-form is one of the template's forms "
                              f"{attention_route.FORMS}, not {self.attention_form!r}")
@@ -626,9 +629,6 @@ class TrainerConfig:
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
             object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
-        if isinstance(self.stop, Mapping) and "class" not in self.stop:
-            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
-            object.__setattr__(self, 'stop', from_record(Pause, self.stop, dtypes=False))
         if isinstance(self.keep, Keep) and self.keep.where is not None:
             raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
         if self.best is not None:
@@ -1105,6 +1105,14 @@ class RunConfig:
         recorded as unrecorded, or a recipe's record written before runs
         recorded chains, is refused by name."""
         rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        trainer = rest.get("trainer")
+        fields = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else {}
+        stop = fields.get("stop")
+        if isinstance(trainer, Mapping) and isinstance(stop, Mapping) and "class" not in stop:
+            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
+            # Carried until 1.0 (ledger 1552).
+            fields = {**fields, "stop": {"class": f"{Pause.__module__}:Pause", "fields": stop}}
+            rest = {**rest, "trainer": {**trainer, "fields": fields} if "class" in trainer else fields}
         chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 

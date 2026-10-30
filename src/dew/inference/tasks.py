@@ -13,11 +13,12 @@ delete those buffers while the task is using them.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +38,8 @@ from dew.inference.projections import packed_owned
 from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import attention_route
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
 from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
@@ -288,6 +291,22 @@ class SavedRun:
     record: Mapping[str, object]
     step: int
 
+    @property
+    def attention_form(self) -> str | None:
+        """The attention form the run's step trained in (`Objective.inference_record`); None for a record
+        written before it named one."""
+        form = self.record.get("attention_form")
+        if form is not None and form not in attention_route.FORMS:
+            raise ValueError(f"this run records attention_form={form!r}, none of {attention_route.FORMS}")
+        return form
+
+    def formed[TaskT](self, task: TaskT) -> TaskT:
+        """`task`, built from this run (`from_saved`), in the attention form its step trained in where it
+        traces in one (`InItsForm`); a task of another class reads `attention_form` itself."""
+        if not isinstance(task, InItsForm) or task.attention_form == self.attention_form:
+            return task
+        return replace(task, attention_form=self.attention_form)
+
     @classmethod
     def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
         """The selected checkpoint of the run in `directory`, its latest or `step`. A task loaded
@@ -308,7 +327,7 @@ class SavedRun:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
         objective = objectives[named(record['objective'], 'objective')]
         declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-        stray = set(record) - {'objective', 'model', UNREAD, *declared}
+        stray = set(record) - {'objective', 'model', 'attention_form', UNREAD, *declared}
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
@@ -344,10 +363,41 @@ class SavedRun:
         return objective.model_tree(variables)
 
 
+@dataclass(frozen=True, kw_only=True)
+class InItsForm:
+    """A task whose calls trace in the attention form its run trained in (`attention_form`, `traced`),
+    as Dew's saved tasks do: a task built from a run (`SavedRun.formed`) takes the form the run's record
+    names, and a task built otherwise, a preview's during its run's fit, traces in the form chosen
+    around it."""
+
+    attention_form: str | None = None
+    """The form the template's attention computes in (`attention_route.FORMS`), as the loaded step was
+    trained in it (`Objective.inference_record`); None traces in the form chosen around the call."""
+
+    def traced(self) -> contextlib.AbstractContextManager[None]:
+        """The block a call of this task traces in: its run's attention form (`generation.chosen`), which
+        JAX keys its trace and compile caches on, so another form's task traces its own programs."""
+        if self.attention_form is None:
+            return contextlib.nullcontext()
+        return generation.chosen(attention_form=self.attention_form)
+
+
+def traced_in_its_form[TaskT: InItsForm, **P, R](
+        call: Callable[Concatenate[TaskT, P], R]) -> Callable[Concatenate[TaskT, P], R]:
+    """`call`, a method of a task or its helper, traced in its run's attention form (`InItsForm.traced`),
+    on whichever thread runs it."""
+    @functools.wraps(call)
+    def traced(task: TaskT, *arguments: P.args, **keywords: P.kwargs) -> R:
+        with task.traced():
+            return call(task, *arguments, **keywords)
+    return traced
+
+
 class SavedRunTask:
     """A task a saved run loads as (`dew.objectives.base.SavedTask`): `from_run` pins the run's checkpoint
     once (`SavedRun.pinned`) and builds the task from it with the class's `from_saved`, which
-    `dew.pipeline` and `dew export` call on the run they pinned themselves."""
+    `dew.pipeline` and `dew export` call on the run they pinned themselves, in the attention form its run
+    trained in where the task traces in one (`InItsForm`, `SavedRun.formed`)."""
 
     if TYPE_CHECKING:
         @classmethod
@@ -356,15 +406,25 @@ class SavedRunTask:
                        param_dtype: DTypeLike | None = None) -> Self: ...
 
     @classmethod
+    def default_step(cls, directory: str) -> int | None:
+        """The step this task loads of the run in `directory` where none is asked: its latest (None),
+        unless the task names one it was fitted on (`Decide`'s calibration, of a run that ended on its
+        best step)."""
+        del directory
+        return None
+
+    @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> Self:
-        """Load the run in `directory` as this task (`from_saved`), at its latest checkpoint or at
-        `step`. `trust` names the packages outside Dew the run's record may import, as
-        `trust_remote_code` does in transformers."""
-        return cls.from_saved(SavedRun.pinned(directory, step, trust), ema=ema, mesh=mesh, layout=layout,
-                              dtype=dtype, param_dtype=param_dtype)
+        """Load the run in `directory` as this task (`from_saved`), at the step it loads by default
+        (`default_step`) or at `step`. `trust` names the packages outside Dew the run's record may
+        import, as `trust_remote_code` does in transformers."""
+        step = cls.default_step(directory) if step is None else step
+        run = SavedRun.pinned(directory, step, trust)
+        return run.formed(cls.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
+                                         param_dtype=param_dtype))
 
 
 _EARLIER_AUTOENCODERS = {
@@ -666,7 +726,7 @@ def held(variables: Variables) -> Variables:
                          if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=False)
 
 
-class _NativeTextTask(SavedRunTask):
+class _NativeTextTask(SavedRunTask, InItsForm):
     """The lifecycle Dew's three text tasks share, over their own `model`,
     `variables` and `processor`: frozen weights, rebinding, loading a run
     (`SavedRunTask`), and the row decoder their generations carry. Each task
@@ -861,6 +921,7 @@ class TextGeneration(_NativeTextTask):
         return cls(model, variables, processor, sampling=settings.sampling,
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
+    @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array, n: int | None = None,
                  sampling: Sampling | None = None, images: Media | None = None,
@@ -945,6 +1006,7 @@ class BlockGeneration(_NativeTextTask):
 
 
 
+    @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array, n: int | None = None,
                  process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
@@ -1035,6 +1097,7 @@ class MaskedGeneration(_NativeTextTask):
 
 
 
+    @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array, n: int | None = None,
                  steps: int | None = None, images: Media | None = None) -> CanvasGeneration:
