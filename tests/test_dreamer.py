@@ -9,7 +9,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import struct
-from recording import RecordingTracker
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
@@ -136,23 +135,31 @@ def test_imagination_is_the_world_models_prior_stepped_in_an_env_rollout():
 
 
 def test_an_agent_learns_its_world_and_its_return_rises():
-    """A small DreamerV3 agent acting in batched target walks, trained from its replay at the code's
-    ratio, lowers its world model's prediction losses and raises its episodes' return over its
-    first collections."""
+    """A small DreamerV3 agent acting in batched target walks and trained from its replay at a fixed
+    ratio predicts the replay's observations and rewards better than it did at the start, on the same
+    replayed windows, and its episodes from the same starts and draws earn more."""
     from dew.data.dataset import Loader
+    from dew.objectives.base import Step
+    from dew.objectives.rl.dreamer import episodes_return
     from dew.training import Trainer
 
     env = Batched(TimeLimit(Target(), episode_length=20), 8)
     objective = DreamerV3Objective(tiny())
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
-    tracker = RecordingTracker()
-    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout, tracker=tracker)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
+    initial = jax.device_get(trainer.place()[0])
     data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
                   records=8, batch=8)
-    trainer.fit(data, steps=150, log_every=1)
-    seen = [scalars for _, scalars in tracker.scalars if "loss_decoder" in scalars]
-    early, late = seen[:20], seen[-20:]
+    final = trainer.fit(data, steps=150, log_every=150)
+    windows = rollout.sample(jax.random.key(8))
+
+    def losses(state):
+        step = Step(state.microstep, jax.random.key(9), state.ema)
+        _, aux = objective.loss(state.variables, windows, step)
+        return {name: float(value) for name, value in aux.metrics.items()}
+
+    before, after = losses(initial), losses(final)
     for name in ("loss_decoder", "loss_reward"):
-        assert np.mean([m[name] for m in late]) < np.mean([m[name] for m in early]), name
-    returns = [m["episode_return"] for m in seen if np.isfinite(m.get("episode_return", np.nan))]
-    assert np.mean(returns[-5:]) > np.mean(returns[:5]), returns
+        assert after[name] < before[name], (name, before[name], after[name])
+    assert (episodes_return(objective, env, final.variables, jax.random.key(10), 21)
+            > episodes_return(objective, env, initial.variables, jax.random.key(10), 21))

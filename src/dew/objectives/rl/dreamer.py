@@ -507,8 +507,11 @@ class DreamerRollout:
         due = max(owed - (self._taken - self.prefill * envs), 0)
         if due:
             self._advance(variables, -(-due // envs), random=False)
-        windows = self._sample(self._replay, sample_key)
-        return jax.device_get(windows)
+        return self.sample(sample_key)
+
+    def sample(self, key: jax.Array) -> Batch:
+        """`batch` windows of `length` steps drawn from the replay as an update draws them."""
+        return jax.device_get(self._sample(self._replay, key))
 
     def _advance(self, variables: Variables, steps: int, *, random: bool) -> None:
         self._carry, self._replay, self._returns, total, count = self._acted(
