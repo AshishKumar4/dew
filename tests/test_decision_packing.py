@@ -7,12 +7,15 @@ import itertools
 from dataclasses import replace
 from pathlib import Path
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from attention_oracle import attention_terms
 from decision_support import decision_rows
+from float64_terms import float64_terms
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 
@@ -35,6 +38,7 @@ from dew.decision.layout import OPTION_TILE, QUESTION_FIELDS, DecisionInputs, La
 from dew.decision.rows import TRAINING_FIELDS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
+from dew.nn.attention_blocks import NormalAttention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step
 from dew.training.trainer import Trainer
@@ -216,6 +220,104 @@ def gradient(objective, variables, batch):
     return jax.grad(total)(variables)
 
 
+def located(tree, path: tuple[str, ...]):
+    """The node of a variables tree at a module's scope `path`, whose model applies it at the tree's root
+    or under one of its top-level modules: the one node there is."""
+    found = []
+    for root in (tree, *(node for node in tree.values() if isinstance(node, dict))):
+        node = root
+        for name in path:
+            node = node.get(name) if isinstance(node, dict) else None
+        if node is not None:
+            found.append(node)
+    assert len(found) == 1, f"{path} is at {len(found)} places of the variables"
+    return found[0]
+
+
+READ = ("_heads", "__call__")
+"""The methods of an attention `AttentionTerms` reads: each projection to heads, and the call."""
+
+
+class AttentionTerms:
+    """Each attention's projections' gradients' float64 terms in `objective`'s float64 model at `batch`
+    (`NormalAttention`): its queries', keys' and values' terms (`attention_terms`, a logit's gradient
+    P (dP - delta) sized by its terms' rounding), carried through the projection that made them to its
+    bias, their root sum of squares over the batch's tokens, and to its kernel, the tokens' input times
+    them. A key's bias moves every logit of its query alike, so its gradient cancels to zero in float64
+    (softmax's shift invariance); its rounding is of those terms, behind the sums that cancel, where
+    `float64_terms` sizes a leaf by its final sum's terms alone. The attentions' inputs and outputs are
+    read through Flax's method interception, the outputs' cotangents as the gradient of a zero added to
+    each, in one program traced once."""
+
+    def __init__(self, objective, batch):
+        self.names: dict = {}
+        step = Step(jnp.asarray(0), jax.random.key(0), None, training=False)
+
+        def total(variables, added):
+            held: dict = {}
+
+            def read(call, args, kwargs, context):
+                module = context.module
+                if not isinstance(module, NormalAttention) or context.method_name not in READ:
+                    return call(*args, **kwargs)
+                path = module.scope.path
+                self.names[path] = module.names
+                record = held.setdefault(path, {})
+                out = call(*args, **kwargs)
+                if context.method_name == "_heads":
+                    record[args[0]] = (args[1], out)
+                    return out
+                record["documents"] = (kwargs["segment_ids"], kwargs.get("key_segment_ids"))
+                record["out"] = out
+                return out + added[path] if path in added else out
+
+            with nn.intercept_methods(read):
+                loss, _ = objective.loss(variables, batch, step)
+            return loss.total, held
+
+        self.total = total
+        self.read = jax.jit(jax.grad(total, argnums=1, has_aux=True))
+
+    def __call__(self, variables) -> dict:
+        """The terms carried to each attention's projections, by its module path: each projection's
+        input and its heads' terms."""
+        _, shapes = jax.eval_shape(self.total, variables, {})
+        added = {path: jnp.zeros(record["out"].shape, record["out"].dtype) for path, record in shapes.items()}
+        cotangents, held = self.read(variables, added)
+        carried = {}
+        for path, record in held.items():
+            query_name, key_name, value_name, out_name = self.names[path]
+            (into_queries, queries), (into_keys, keys), (_, values) = (
+                record[name] for name in (query_name, key_name, value_name))
+            query_ids, key_ids = record["documents"]
+            key_ids = query_ids if key_ids is None else key_ids
+            queried = query_ids[:, None, :, None]
+            keep = (queried == key_ids[:, None, None, :]) & (queried != 0)
+            kernel = located(variables["params"], path)[out_name]["kernel"]
+            heads, width = queries.shape[2:]
+            dout = jnp.einsum("bsf,hdf->bshd", cotangents[path], kernel.reshape(heads, width, -1))
+            _, query_terms, key_terms, value_terms = attention_terms(queries, keys, values, dout, keep)
+            carried[path] = {name: (np.asarray(into, np.float64), terms) for name, into, terms in (
+                (query_name, into_queries, query_terms), (key_name, into_keys, key_terms),
+                (value_name, into_keys, value_terms))}
+        return carried
+
+
+def with_attention_terms(sized, carried: dict):
+    """`sized`, a gradient's float64 terms (`float64_terms`), each attention projection's bias and kernel
+    sized by at least the attention's terms carried to it (`AttentionTerms`)."""
+    sized = jax.tree.map(np.array, sized)
+    for path, projections in carried.items():
+        node = located(sized["params"], path)
+        for name, (into, terms) in projections.items():
+            leaf = node[name]
+            squares = np.asarray(terms, np.float64) ** 2
+            leaf["bias"] = np.maximum(leaf["bias"], np.sqrt(squares.sum((0, 1))).reshape(leaf["bias"].shape))
+            leaf["kernel"] = np.maximum(leaf["kernel"], np.sqrt(np.einsum(
+                "bse,bshd->ehd", into ** 2, squares)).reshape(leaf["kernel"].shape))
+    return sized
+
+
 def decided(objective, variables, batch, segments: int):
     """The batch's logits and the gradient of its summed loss."""
     return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
@@ -362,13 +464,21 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
         logits, grads = apart_in_float64(variables)
         return jnp.asarray(logits)[rows["options"]], grads
 
+    carried = AttentionTerms(wide, rows)
+
+    def terms(variables):
+        # Each leaf's terms as its sums add them (`float64_terms`), an attention's projections' at least
+        # the attention's own carried to them, where a key's bias cancels behind its final sum.
+        _, (logits, grads) = float64_terms(truth, variables)
+        return logits, with_attention_terms(grads, carried(variables))
+
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
     initialized = jax.jit(objective.init)
     # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
     # (`terms`), so each arm's rounding of them is on par, on every backend.
     assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),), "packed window",
-                    seeds=seeds, truth_fn=truth, terms=True)
+                    seeds=seeds, truth_fn=truth, terms=terms)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():
