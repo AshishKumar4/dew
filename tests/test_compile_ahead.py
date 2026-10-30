@@ -239,9 +239,9 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
     assert AheadOfTime.load(path).peak_bytes > 0
 
 
-@pytest.mark.gpu(reason="trains a clocked run from the step it compiled ahead on this host's own GPU")
-def test_a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other(tmp_path):
-    """A decision run on the examples clock under a schedule over the run, with a cooldown, compiled
+def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py; it trains from a step compiled ahead on this host's own
+    GPU): a decision run on the examples clock under a schedule over the run, with a cooldown, compiled
     ahead through its command line for this GPU's generation (`--trainer.compile-ahead`) and then handed
     the step it saved (`--trainer.ahead`), trains from that step through its cooldown's branch, its last
     window's too, and compiles no step program of its own: each batch it steps closes its window as the

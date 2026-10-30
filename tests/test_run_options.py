@@ -899,13 +899,12 @@ def test_a_decision_run_over_a_release_saves_and_reads_the_task_the_release_decl
     assert read_where_held(task, options) == []
 
 
-@pytest.mark.gpu(reason="a GPU's fast form multiplies float32 in TF32, which a CPU's never does")
-def test_the_attention_forms_a_run_names_reach_its_step(tmp_path):
-    """The attention forms a run's numerics name on the command line (`--set trainer.precision`,
-    `Numerics.forms`) reach its step through the default route: a step in the accurate forms (IEEE fp32
-    products) and one in the fast (a GPU's TF32), the model's compute float32 in both, score its batch
-    apart, so the route reads the run's forms, not its record alone (ledger 2350). A CPU multiplies fp32
-    one way in both, so only a GPU tells them apart."""
+def the_attention_forms_a_run_names_reach_its_step(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py): the attention forms a run's numerics name on the
+    command line (`--set trainer.precision`, `Numerics.forms`) reach its step through the default route: a
+    step in the accurate forms (IEEE fp32 products) and one in the fast (a GPU's TF32), the model's
+    compute float32 in both, score its batch apart, so the route reads the run's forms, not its record
+    alone (ledger 2350). A CPU multiplies fp32 one way in both, so only a GPU tells them apart."""
     from process_support import logged_losses
 
     from dew.nn.precision import Numerics
