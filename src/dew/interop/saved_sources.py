@@ -13,37 +13,57 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from dataclasses import Field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 from etils import epath
 from jax.sharding import Mesh
 
-from dew._coordination import agreed_same, from_every_process
+from dew._coordination import agreed_same, collective_host, from_every_process
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE
 from dew.files import staged
 
 if TYPE_CHECKING:
+    from dew.batch import Variables
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
+
+
+@runtime_checkable
+class _Weighted(Protocol):
+    """A released task as an export writes it: a dataclass of its weights (`variables`)."""
+
+    __dataclass_fields__: ClassVar[dict[str, Field[object]]]
+    variables: Variables
+
+    def save_pretrained(self, directory: str) -> None: ...
 
 
 def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release, its EMA
-    weights where `ema`, restored where `mesh` and `layout` place them: a task's own released layout
-    (`ReleasedTask`), or the model in its family's source layout (`Pretrained.from_saved`). A task
-    that releases no layout of its own and whose model no family writes (a diffusion pipeline) is
-    refused, naming its own loader."""
+    weights where `ema`: a task's own released layout (`ReleasedTask`), or the model in its family's
+    source layout (`Pretrained.from_saved`). Its weights restore where `mesh` and `layout` place them,
+    so no device holds more of them than a load does, and every process of a pool, each writing a
+    release of its own, reads them home together (`collective_host`) for the writer, which writes
+    whole host tensors."""
     from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
 
     task = run.objective.saved_task
     if task is not None and issubclass(task, ReleasedTask):
-        task.from_saved(run, ema=ema).save_pretrained(str(destination))
+        released = task.from_saved(run, ema=ema, mesh=mesh, layout=layout)
+        if not isinstance(released, _Weighted):
+            raise TypeError(f"{task.__name__} releases no dataclass of its weights (variables), which an "
+                            "export reads home before it writes them")
+        hosted = collective_host(released.variables, phase="saved run export")
+        replace(released, variables=hosted).save_pretrained(str(destination))
     else:
-        Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout).save(destination)
+        bundle = Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout)
+        hosted = collective_host(bundle.variables, phase="saved run export")
+        replace(bundle, variables=hosted).save(destination)
 
 
 def is_saved_run(name_or_dir: str | Path) -> bool:
