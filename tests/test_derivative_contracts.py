@@ -17,6 +17,7 @@ import pytest
 from reference_error import widened
 
 from dew.diffusion.schedules.flow import time_shift
+from dew.interop import torchax_fallback
 from dew.nn import categorical, precision
 from dew.nn.activations import exact_gelu
 from dew.nn.blocks import table_rows
@@ -425,3 +426,24 @@ def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
         assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a squared root",
                         plain_fn=jnp.abs)
 
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_broadcast_summing_its_gradient_wide_holds_every_order(edge):
+    """`torchax_fallback._accumulated` (a broadcast whose gradient sums in float32 and rounds once to its
+    value's dtype, as torch's autograd reduces a bf16 gradient): every order runs, finite wherever float64
+    is a normal float32, at values near float32's ends, beside the plain broadcast; but forward mode,
+    which a custom_vjp takes none of, the orders ledger 2653 adds with its fix."""
+    value, direction = normal_draw(959, (3, 1, 4), (3, 1, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(961, (3, 5, 4))
+
+    def broadcast(value):
+        return torchax_fallback._accumulated(value, (3, 5, 4), (0, 1, 2))
+
+    def plain(value):
+        return jnp.broadcast_to(value, (3, 5, 4))
+
+    # Forward mode's orders (`orders`), which ledger 2653 lists.
+    forward = ("jvp", "jvp of grad", "second jvp", "jvp of grad, remat", "second jvp, remat",
+               "jvp of grad, nested jit", "jvp of grad, scanned")
+    assert_contract(broadcast, (value,), (direction,), cotangent, f"a wide-summed broadcast {edge}",
+                    truth_fn=plain, plain_fn=plain, without=forward)

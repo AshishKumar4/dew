@@ -16,6 +16,8 @@ CUSTOM = frozenset({"custom_jvp", "custom_vjp"})
 """JAX's custom derivatives, as a decorator, a call, or within functools.partial."""
 
 CONTRACTED = {
+    "src/dew/interop/torchax_fallback.py::_accumulated":
+        "test_a_broadcast_summing_its_gradient_wide_holds_every_order",
     "src/dew/nn/kernels/generation.py::linear_tangent.produced":
         "test_an_embedding_lookup_holds_every_order",
     "src/dew/nn/kernels/generation.py::linear_tangent.pulled":
@@ -61,7 +63,6 @@ CONTRACTED = {
 it."""
 
 PENDING = frozenset({
-    "src/dew/interop/torchax_fallback.py::_accumulated",
     "src/dew/nn/attention.py::forward_differentiable.attend",
     "src/dew/nn/kernels/fla_gdn.py::chunk_gated_delta_rule",
     "src/dew/nn/kernels/fla_kda.py::chunk_kda",
