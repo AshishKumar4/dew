@@ -703,10 +703,11 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
-    passes_progress: ClassVar[bool] = False
+    passes_progress: bool = False
     """Whether its training loss passes the run's progress (`progress`) to a model that reads it
     (`dew.nn.progress.ReadsProgress`); an objective that passes none refuses such a model, which would
-    otherwise train at the run's end."""
+    otherwise train at the run's end. An objective over another's model, a distillation's over its
+    student, passes as that one does."""
     ema_is_reference: ClassVar[bool] = False
     """Whether the objective's average is the frozen reference its loss compares against (an RL
     policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""
