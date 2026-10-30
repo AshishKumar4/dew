@@ -815,9 +815,8 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
             def lifted(earlier, below):
                 # A key's lift from its own sub-chunk's first token to this one's, a vector a sub-chunk
                 # (`between` of their references, at most one: this one's is later).
-                ref = separated(*reference(earlier, c))
-                lift = between(tuple(x[None, :] for x in start), tuple(x[None, :] for x in ref))
-                return jnp.where(index >= earlier * sub, lift, below)
+                lift = between(start, separated(*reference(earlier, c)))
+                return jnp.where(index >= earlier * sub, lift[None, :], below)
 
             lift = jax.lax.fori_loop(0, s + 1, lifted, jnp.zeros(index.shape, jnp.float32))
             return total + summed([("pairs", jnp.where((index >= place) & (index < place + sub), down, 0.0),
