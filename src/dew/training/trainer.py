@@ -136,6 +136,7 @@ from dew.training._fit import (
     waited_read,
 )
 from dew.training._lowering import KernelReport, Lowered, Routed, routed
+from dew.training.ahead import AheadOfTime, handed
 from dew.training.budget import Pause, Plateau
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -214,7 +215,6 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
-    from dew.training.ahead import AheadOfTime
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
@@ -687,8 +687,7 @@ class Trainer(Generic[Loss, Effects]):
         """The fit ladder's rung this trainer's step compiles at: the
         objective's head tile, its trained modules' remat (`recompute_record`) and whether
         the step keeps XLA's default options, the half rung `compile` climbs
-        to before the next. A checkpoint records it, since each decides the
-        program a step runs."""
+        to before the next. A checkpoint records it, since each decides the program a step runs."""
         return rung_record(self.objective, self._xla_defaults, narrow=self._narrow)
 
     def _checkpoint_rung(self) -> JSON:
@@ -1055,20 +1054,21 @@ class Trainer(Generic[Loss, Effects]):
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
             derive=None if recorded is not None else functools.partial(lower, lowering=False))
-        planned, probes = search.admitted(
-            candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
+        with handed(self._ahead):
+            planned, probes = search.admitted(
+                candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
         self._ahead = search.ahead
-        if runs := pgle_runs():
-            trials = Trials(state, batch, owned=False) if trials is None else trials
-            planned = planned.guided(trials.profiled(self._runner(planned, mesh), planned, mesh, runs), runs,
-                                     mesh)
-        # The state the chosen plan holds between steps, its accumulator and copies included; the
-        # plan's fit check counted them before any is built (`Candidate.held`).
-        self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
         self._xla_defaults, self._narrow = planned.xla_defaults, planned.narrow
+        if runs := pgle_runs():
+            trials = Trials(state, batch, owned=False) if trials is None else trials
+            planned = planned.guided(trials.profiled(self._runner(planned, mesh), planned, mesh, runs), runs,
+                                     mesh, functools.partial(lower, planned.split, planned.narrow))
+        # The state the chosen plan holds between steps, its accumulator and copies included; the
+        # plan's fit check counted them before any is built (`Candidate.held`).
+        self.validation = self._validation(planned.candidate.prepared)
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
