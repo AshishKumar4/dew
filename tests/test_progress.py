@@ -1,7 +1,7 @@
-"""The training step's position, which a module whose computation changes over a run reads
-(`dew.nn.progress`, ledgers 2455 and 2479): a run's training loss supplies it; outside the training
-step, a validation's among them, it is the run's end; a training step that supplies none refuses a
-module that reads it."""
+"""The training step's position, a declared input a module whose computation changes over a run reads
+(`dew.nn.progress`, ledgers 2455, 2479 and 2537): a run's training loss passes it to a model that reads
+it; a call that passes none, a validation's among them, reads the run's end; a compiled forward keys on
+it as on any argument; an objective that passes none refuses a model that reads it."""
 
 import flax.linen as nn
 import jax
@@ -14,7 +14,7 @@ from recording import RecordingTracker
 
 from dew.data.dataset import Loader
 from dew.inputs import Field, InputSpec
-from dew.nn.progress import progress
+from dew.nn.progress import END, Progress
 from dew.objectives.base import Aux
 from dew.objectives.supervised import Supervised
 from dew.training import Trainer
@@ -22,13 +22,16 @@ from dew.training import Trainer
 
 class Annealed(nn.Module):
     """A map whose output is offset by the updates its run committed before the step, or by -1 past
-    the run's training: an anneal's schedule, as a module reads it."""
+    the run's training: an anneal's schedule, as a module reads it from its call's `progress`."""
+
+    @nn.nowrap
+    def reads_progress(self) -> bool:
+        return True
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, progress: Progress = END):
         weight = self.param("weight", nn.initializers.zeros, (x.shape[-1], 1))
-        updates = progress().updates
-        offset = -1.0 if updates is None else updates.astype(jnp.float32)
+        offset = -1.0 if progress.updates is None else progress.updates.astype(jnp.float32)
         return x @ weight + offset
 
 
@@ -69,21 +72,39 @@ def test_a_run_s_validation_scores_the_model_at_the_run_s_end():
     np.testing.assert_array_equal(losses, [0.0, 1.0, 2.0, 3.0])
 
 
-def test_a_custom_training_step_refuses_a_module_that_reads_the_progress_it_does_not_supply():
-    """A training step the trainer traces that does not run an objective's loss (a custom step) supplies
-    no progress, and a module that reads it there is refused, not handed a stand-in; the same step over
-    a module that reads none trains."""
-    def stepping(model):
-        def make_step(objective, optimizer):
-            def step(state, batch):
-                loss = jnp.mean(model.apply(state.variables, batch["x"]))
-                return state.replace(microstep=state.microstep + 1, updates=state.updates + 1), loss, Aux({})
-            return step
-        return make_step
+def test_a_compiled_forward_keys_on_the_progress_it_is_passed():
+    """The progress is the call's input, so one forward compiled once reads each value it is passed and
+    the run's end where it is passed none, in whichever order: no value it first traced with is held,
+    as a value read from ambient state outside the compile's key was (ledger 2537)."""
+    variables = Annealed().init(jax.random.key(0), jnp.zeros((1, 2)))
+    forward = jax.jit(lambda variables, x, progress=END: Annealed().apply(variables, x, progress))
+    x = jnp.zeros((1, 2))
+    np.testing.assert_array_equal(forward(variables, x), [[-1.0]])
+    np.testing.assert_array_equal(forward(variables, x, Progress(jnp.asarray(3, jnp.int32))), [[3.0]])
+    np.testing.assert_array_equal(forward(variables, x, Progress(jnp.asarray(5, jnp.int32))), [[5.0]])
+    np.testing.assert_array_equal(forward(variables, x), [[-1.0]])
+
+
+def test_an_objective_that_passes_no_progress_refuses_a_model_that_reads_it():
+    """An objective whose loss passes its model no progress (`Objective.passes_progress`) refuses a model
+    that reads it, which would otherwise train at the run's end; a custom training step passes it as any
+    other input, and the model reads what the step passes."""
+    class Unstepped(Supervised):
+        passes_progress = False
 
     with pytest.raises(ValueError):
-        Trainer(objective(), optax.sgd(0.0), key=0, step=stepping(Annealed())).fit(data(), steps=1)
-    plain = Supervised(nn.Dense(1), lambda outputs, batch: jnp.mean(outputs, axis=-1),
-                       inputs=InputSpec(Field("x", (2,))))
-    trained = Trainer(plain, optax.sgd(0.0), key=0, step=stepping(nn.Dense(1))).fit(data(), steps=1)
-    assert int(trained.step) == 1
+        Trainer(Unstepped(Annealed(), lambda outputs, batch: jnp.mean(outputs, axis=-1),
+                          inputs=InputSpec(Field("x", (2,)))), optax.sgd(0.0), key=0).fit(data(), steps=1)
+
+    def make_step(objective, optimizer):
+        def step(state, batch):
+            outputs = Annealed().apply(state.variables, batch["x"], Progress(state.updates))
+            return (state.replace(microstep=state.microstep + 1, updates=state.updates + 1),
+                    jnp.mean(outputs), Aux({}))
+        return step
+
+    tracker = RecordingTracker()
+    Trainer(objective(), optax.sgd(0.0), key=0, step=make_step, tracker=tracker).fit(data(), steps=2,
+                                                                                    log_every=1)
+    losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
+    np.testing.assert_array_equal(losses, [0.0, 1.0])

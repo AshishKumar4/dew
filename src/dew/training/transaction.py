@@ -31,7 +31,6 @@ from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
-from dew.nn.progress import training
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
     EXAMPLE_STREAM,
@@ -802,4 +801,4 @@ class Transaction:
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
                                                     tokens)
             return together(advanced, held), loss, aux, committed
-        return training(run)
+        return run

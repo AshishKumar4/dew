@@ -25,7 +25,7 @@ from dew.nn.dex import (
     diff_lambda_init,
     differential,
 )
-from dew.nn.progress import Progress, stepping
+from dew.nn.progress import END, Progress
 
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 HEADS = (1, 3)
@@ -241,7 +241,7 @@ def test_an_export_folds_the_operands_a_layer_multiplies_in():
 
 
 def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
-    """Within a run's step (`dew.nn.progress.stepping`) the layer reads lambda annealed over the run's
+    """Passed a run's step's progress (`dew.nn.progress`), the layer reads lambda annealed over the run's
     updates: at update 0 the extended decoder computes its source's logits whatever its extension holds,
     and from the anneal's end on, as outside a run, the source's forward over the folded output
     projection (`folded`), each on par from the float64 of what it is held to (check 1)."""
@@ -250,10 +250,8 @@ def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
 
     def stepped(updates: int | None):
         def run(variables, ids, _):
-            if updates is None:
-                return loaded.model.apply(variables, ids)
-            with stepping(Progress(jnp.asarray(updates, jnp.int32))):
-                return loaded.model.apply(variables, ids)
+            progress = END if updates is None else Progress(jnp.asarray(updates, jnp.int32))
+            return loaded.model.apply(variables, ids, progress=progress)
         return jax.jit(run)
 
     plain = jax.jit(lambda variables, ids, _: source.model.apply(source.variables, ids))
@@ -314,11 +312,10 @@ def every_layer(**fields) -> CausalTransformer:
 
 
 def mid_anneal(model):
-    """`model`'s logits within a run's step half way through the anneal (`dew.nn.progress`), compiled."""
+    """`model`'s logits at a run's step half way through the anneal (`dew.nn.progress`), compiled."""
     @jax.jit
     def run(variables, tokens):
-        with stepping(Progress(jnp.asarray(5, jnp.int32))):
-            return model.apply(variables, tokens)
+        return model.apply(variables, tokens, progress=Progress(jnp.asarray(5, jnp.int32)))
     return run
 
 

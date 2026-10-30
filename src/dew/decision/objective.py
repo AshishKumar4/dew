@@ -131,6 +131,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     saved_task = Decide
     settings = DecideSettings
+    passes_progress = True
     _held_parts = True
     # The record is the backbone's; the head beside it is a task setting.
     _recorded_part = "backbone"
@@ -386,8 +387,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
                           whole_blocks=whole_blocks_of(self.layout))
         logits = self.model.logits(
-            variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training)
-        )
+            variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
+            progress=self.progress(step))
         return self._charged(logits, inputs, batch)
 
     def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch

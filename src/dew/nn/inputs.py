@@ -560,6 +560,8 @@ class AttentionMetadata:
     routing blocks of `routing_block` places for a block router
     (`numbered_blocks`), which the model computes once for its layers.
     `context` is the sequence its cross-attention layers read (`CrossContext`).
+    `progress` is the updates the run committed before a training step, its declared input
+    (`dew.nn.progress`), None at the run's end; a layer whose computation changes over a run reads it.
     `pairwise_mask` `[B, S, keys]`, or `key_runs` `[B, S, R, 2]`, each query's
     key intervals whose union it reads, replaces a call's visibility, a
     windowed layer windowing it over `key_positions` `[B, keys]`.
@@ -598,6 +600,7 @@ class AttentionMetadata:
     position_bias: jax.Array | None = None
     blocks: jax.Array | None = None
     context: CrossContext | None = None
+    progress: jax.Array | None = None
     routing_block: int | None = struct.field(pytree_node=False, default=None)
     whole_blocks: bool = struct.field(pytree_node=False, default=False)
     """Whether each block of `block_groups` is its document's whole run of real tokens, as its producer

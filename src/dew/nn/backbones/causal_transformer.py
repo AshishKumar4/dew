@@ -101,6 +101,7 @@ from ..precision import (
     scaled,
     scaled_logits,
 )
+from ..progress import Progress
 from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
 from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
@@ -1202,7 +1203,7 @@ class CausalTransformer(nn.Module):
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
                  right_padded: bool = False, coordinates: Coordinates | None = None,
-                 conditioning: Mapping[str, jax.Array] | None = None):
+                 conditioning: Mapping[str, jax.Array] | None = None, progress: Progress | None = None):
         # The call's token layout, converted once (`token_coordinates`): the trunk and the
         # prediction depths read its coordinates alone.
         coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
@@ -1211,7 +1212,8 @@ class CausalTransformer(nn.Module):
             tokens, train=train, decode=decode, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
             attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
-            attention_key_runs=attention_key_runs, coordinates=coordinates, conditioning=conditioning)
+            attention_key_runs=attention_key_runs, coordinates=coordinates, conditioning=conditioning,
+            progress=progress)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1573,7 +1575,7 @@ class CausalTransformer(nn.Module):
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
                               coordinates: Coordinates | None = None,
                               conditioning: Mapping[str, jax.Array] | None = None,
-                              whole_blocks: bool = False):
+                              whole_blocks: bool = False, progress: Progress | None = None):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
@@ -1615,11 +1617,13 @@ class CausalTransformer(nn.Module):
           calls after it. A model without cross-attention takes none.
         - `whole_blocks` states that each of `block_groups`' blocks is its
           document's whole run of real tokens (`AttentionMetadata.whole_blocks`).
+        - `progress` is a training step's (`dew.nn.progress`), which its DEX
+          layers anneal over; None is the run's end, outside a training step.
         """
         attention_metadata = self._attention_metadata(
             tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
             attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
-            whole_blocks=whole_blocks)
+            whole_blocks=whole_blocks, progress=progress)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1681,7 +1685,8 @@ class CausalTransformer(nn.Module):
                             pairwise_mask, key_positions, key_runs, media_mask, admitted=None,
                             coordinates: Coordinates | None = None,
                             conditioning: Mapping[str, jax.Array] | None = None, *,
-                            whole_blocks: bool = False) -> AttentionMetadata | None:
+                            whole_blocks: bool = False, progress: Progress | None = None
+                            ) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
         carries none of it: the tokens' layout `hidden_and_mtp_inputs`
         converted (`coordinates`), the token ids a hash router selects by,
@@ -1729,14 +1734,15 @@ class CausalTransformer(nn.Module):
                 and pairwise_mask is None and key_positions is None and key_runs is None
                 and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None and blocks is None
-                and context is None):
+                and context is None and (progress is None or progress.updates is None)):
             return None
         return AttentionMetadata(
             coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
             rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
             key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
             media=media_mask,
-            admitted=admitted, blocks=blocks, context=context, routing_block=block,
+            admitted=admitted, blocks=blocks, context=context,
+            progress=None if progress is None else progress.updates, routing_block=block,
             whole_blocks=whole_blocks and block_groups is not None)
 
     def looped(self, x, **stack):
@@ -2239,6 +2245,12 @@ class CausalTransformer(nn.Module):
     def with_dex(self, extension: DifferentialExtension | None) -> Self:
         """This decoder with `extension`'s differential on its chosen heads (`dew.nn.dex`), None for none."""
         return self.clone(dex=extension)
+
+    @nn.nowrap
+    def reads_progress(self) -> bool:
+        """Whether its computation changes over a run (`dew.nn.progress.ReadsProgress`): its DEX layers'
+        lambda anneals over the run's updates."""
+        return self.dex is not None
 
     @nn.nowrap
     def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:

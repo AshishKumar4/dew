@@ -1,24 +1,22 @@
-"""The training step's position, which a module whose computation changes over a run reads (`progress`):
-an annealed coefficient, a schedule of its own.
+"""The training step's position, which a module whose computation changes over a run reads: an annealed
+coefficient, a schedule of its own.
 
-A run's training loss supplies it (`dew.objectives.base.Objective._loss`, the updates the run committed
-before the step, `Step.committed`), and so does a derivative that runs the model again (node
-perturbation's estimate); a step the trainer traces otherwise, a custom one, supplies none, and a module
-that reads it there is refused, never handed a stand-in. Outside the training step it is the run's end, no
-updates and past every anneal: a validation's loss and its evaluation alike, as the model the run would
-hand on, and evaluation, inference and serving after it.
+It is a declared input, never ambient state: a model that reads it says so (`ReadsProgress`), takes it as
+its call's `progress` keyword, and carries it to its layers in the call's `AttentionMetadata`, so a
+compiled forward keys on it as on any argument and a cached one never holds a stale value (ledger 2537).
+A run's training loss passes the updates the run committed before the step (`Step.committed`) to a model
+that reads it, and so does a derivative that runs the model again (node perturbation's estimate); a call
+that passes none reads the run's end (`END`), no updates and past every anneal: a validation's loss and
+its evaluation alike, as the model the run would hand on, and evaluation, inference and serving after it.
 """
 
 from __future__ import annotations
 
-import contextlib
-import contextvars
 import dataclasses
-import functools
-from collections.abc import Callable, Iterator
-from typing import Literal
+from typing import Protocol, TypedDict, runtime_checkable
 
 import jax
+from flax import linen as nn
 
 
 @dataclasses.dataclass(frozen=True)
@@ -33,42 +31,25 @@ class Progress:
 END = Progress(None)
 """The run's end: a module's schedules all ended, as a model is evaluated and served."""
 
-_TRAINING: Literal["training"] = "training"
-"""A step the trainer traces, whose loss has not supplied its progress."""
 
-_CURRENT: contextvars.ContextVar[Progress | Literal["training"] | None] = contextvars.ContextVar(
-    "dew_progress", default=None)
+@runtime_checkable
+class ReadsProgress(Protocol):
+    """A model whose computation changes over a run (`Progress`): it takes the step's progress as its
+    call's `progress` keyword where `reads_progress` holds, which a run's training loss passes it."""
 
-
-def progress() -> Progress:
-    """The step's progress where a run's loss supplied it (`stepping`), the run's end (`END`) outside
-    any training step; refused within a training step that supplied none (`training`), a custom
-    step's, where any value would be a guess."""
-    current = _CURRENT.get()
-    if current == _TRAINING:
-        raise ValueError("a module reads the training step's progress (dew.nn.progress), which this step "
-                         "supplies none of: train it through an objective's loss, which supplies it")
-    return END if current is None else current
+    def reads_progress(self) -> bool: ...
 
 
-@contextlib.contextmanager
-def stepping(value: Progress) -> Iterator[None]:
-    """Within the block, modules read `value` as the step's progress (`progress`)."""
-    token = _CURRENT.set(value)
-    try:
-        yield
-    finally:
-        _CURRENT.reset(token)
+class ProgressKeywords(TypedDict, total=False):
+    """The keywords a model call takes for the run's progress (`progressed`)."""
+
+    progress: Progress
 
 
-def training[**P, R](step: Callable[P, R]) -> Callable[P, R]:
-    """`step`, traced as a training step: a module reading the step's progress within it reads what its
-    loss supplies (`stepping`), and is refused where nothing supplies it."""
-    @functools.wraps(step)
-    def traced(*args: P.args, **kwargs: P.kwargs) -> R:
-        token = _CURRENT.set(_TRAINING)
-        try:
-            return step(*args, **kwargs)
-        finally:
-            _CURRENT.reset(token)
-    return traced
+def progressed(model: nn.Module, progress: Progress) -> ProgressKeywords:
+    """The keywords a call of `model` takes for `progress`: `{"progress": progress}` where the model
+    reads it (`ReadsProgress`), else none, so a model that reads none is called as it always is."""
+    return {"progress": progress} if isinstance(model, ReadsProgress) and model.reads_progress() else {}
+
+
+__all__ = ["END", "Progress", "ProgressKeywords", "ReadsProgress", "progressed"]

@@ -67,7 +67,6 @@ from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
-from dew.nn.progress import progress
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
@@ -774,6 +773,8 @@ class CausalSelfAttention(nn.Module):
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL, train: bool = False):
         decode, kv_store, attention_metadata = call.decode, call.kv_store, call.metadata
+        # The run's progress, the call's declared input (`dew.nn.progress`), None at its end.
+        progress = None if attention_metadata is None else attention_metadata.progress
         B, S, _ = x.shape
         # The tokens' places and documents: the caller's or a packed batch's, else none given
         # (`Coordinates`).
@@ -817,7 +818,7 @@ class CausalSelfAttention(nn.Module):
         query = self._tuned(query, places)
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
-            return self._output(attention, gate, B, S, own_value)
+            return self._output(attention, gate, B, S, own_value, progress)
         sinks = self.sinks
         if self._runs_local(attention_metadata, decode) and not (self.ctx.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
@@ -830,7 +831,7 @@ class CausalSelfAttention(nn.Module):
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                 implementation=self.ctx.attention_impl, sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap), 'context')
-            return self._output(attention, gate, B, S, own_value)
+            return self._output(attention, gate, B, S, own_value, progress)
         masking = self._masking(query, key, value, positions, counted, held, rotary_positions, append,
                                 prefix, kv_len, kv_store, segment_ids, attention_metadata, decode)
         bias = None
@@ -840,7 +841,7 @@ class CausalSelfAttention(nn.Module):
             position_bias = attention_metadata.position_bias
             bias = position_bias if bias is None else bias + position_bias
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
-        return self._output(attention, gate, B, S, own_value)
+        return self._output(attention, gate, B, S, own_value, progress)
 
     @property
     def _whole_norm(self) -> bool:
@@ -918,7 +919,7 @@ class CausalSelfAttention(nn.Module):
         return self._projected_kv(context, self._whole_norm, projected)
 
     def attend_context(self, query, gate, key, value, *, lengths, queries=None, segments=None,
-                       max_segments=None):
+                       max_segments=None, progress=None):
         """The layer's own attention of `query` heads (`context_query`) over a context's `key` and
         `value` heads (`context_keys`), each row's first `lengths` keys real (none for a row without
         context, whose read its block leaves out) and, where given, each
@@ -943,7 +944,7 @@ class CausalSelfAttention(nn.Module):
             key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
             max_segments=max_segments, sinks=self.sinks, softcap=self.ctx.attn_logit_softcap), 'context')
         B, S = query.shape[:2]
-        return self._output(attention, gate, B, S, None)
+        return self._output(attention, gate, B, S, None, progress)
 
     @nn.nowrap
     def context_flops(self, lengths, context_lengths) -> float:
@@ -1406,13 +1407,14 @@ class CausalSelfAttention(nn.Module):
             metadata.pairwise_mask is None and metadata.key_runs is None and metadata.position_bias is None
             and all(getattr(metadata, name) is None for name in self._group_fields()))
 
-    def _output(self, attention, gate, batch: int, length: int, own_value):
-        """Take the differential on the chosen heads where the layer carries DEX (`dew.nn.dex`), exclude
-        the own value where the layer does and the call has one (None for a read of another sequence),
-        gate the attended values where it gates, then project them."""
+    def _output(self, attention, gate, batch: int, length: int, own_value, progress):
+        """Take the differential on the chosen heads where the layer carries DEX (`dew.nn.dex`), its lambda
+        annealed over the call's `progress` (`AttentionMetadata.progress`), exclude the own value where
+        the layer does and the call has one (None for a read of another sequence), gate the attended
+        values where it gates, then project them."""
         if self.ctx.dex is not None:
             # Lambda annealed over the run's updates (`dew.nn.progress`), its learned value outside a run.
-            strength = annealed(progress().updates, self.ctx.dex, self.dex_lambda_init, self.dex_lambda)
+            strength = annealed(progress, self.ctx.dex, self.dex_lambda_init, self.dex_lambda)
             attention = differential(attention, self.dex_heads, self.dex_projection, strength,
                                      self.ctx.precision)
         if self.exclusive_self_attention and own_value is not None:

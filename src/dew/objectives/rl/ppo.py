@@ -136,6 +136,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     saved_task = TextGeneration
     settings = TextSettings
     ema_is_reference = True
+    # The actor's loss passes its policy the run's progress (`GRPOObjective.loss`); the critic reads the
+    # run's end.
+    passes_progress = True
     _model_part = "policy"
 
     def __init__(self, model, seq_len: int, *, critic: nn.Module,
