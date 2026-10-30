@@ -293,15 +293,16 @@ def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_t
 
 
 def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
-    """An LM run whose attention takes Triton's kernel, a launch of configs to measure, that measures its
-    step's launches on this GPU (`tune_kernels`) adds what it picked to the picks of this GPU's kind
-    beside the compilation cache (`dew.cache.kernel_picks_path`), where a later run reads them. Every
-    kind's trainer is built through the one `RunConfig.built`, which hands it the option; the other
-    kinds' tiny models launch nothing Triton takes (a decision backbone's sliding window, heads narrower
-    than its kernel computes). The suite's GPUs run deterministic ops, under which no process keeps
-    picks (`dew.cache.keeps_picks`); the run here does not. It runs as `dew train` in a process of its
-    own, whose compilation cache is its own (JAX_COMPILATION_CACHE_DIR): no run before it measured into
-    that cache, and no picks this process holds reach it."""
+    """An LM run whose attention takes Dew's attention template (`model.attention_impl="template"`,
+    `AttentionLaunch`), a launch of configs to measure, that measures its step's launches on this GPU
+    (`tune_kernels`) adds what it picked to the picks of this GPU's kind beside the compilation cache
+    (`dew.cache.kernel_picks_path`), where a later run reads them: the tuner measures Dew's own launches
+    (`tuning.KernelOp`), not tokamax's ops, which keep their heuristic (row 2661). Every kind's trainer is
+    built through the one `RunConfig.built`, which hands it the option. The suite's GPUs run
+    deterministic ops, under which no process keeps picks (`dew.cache.keeps_picks`); the run here does
+    not. It runs as `dew train` in a process of its own, whose compilation cache is its own
+    (JAX_COMPILATION_CACHE_DIR): no run before it measured into that cache, and no picks this process holds
+    reach it."""
     import jax
     from lane_environment import without_deterministic_ops
     from process_support import REPO_ROOT, dew_train
@@ -320,7 +321,7 @@ def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
                    "XLA_FLAGS": without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))}
     dew_train(tmp_path, environment, *train_arguments("lm", tmp_path, "tuned", **{
         "trainer.steps": 1, "trainer.tune_kernels": "True", "trainer.mesh": {},
-        "trainer.compilation_cache_dir": str(compiled), "model.attention_impl": "triton",
+        "trainer.compilation_cache_dir": str(compiled), "model.attention_impl": "template",
         "model.head_dim": 16}))
     assert json.loads(picks.read_text())["data"]
 
