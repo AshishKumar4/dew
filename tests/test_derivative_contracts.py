@@ -16,7 +16,9 @@ import numpy as np
 import pytest
 from reference_error import widened
 
-from dew.nn import precision
+from dew.diffusion.schedules.flow import time_shift
+from dew.nn import categorical, precision
+from dew.nn.activations import exact_gelu
 from dew.nn.blocks import table_rows
 from dew.nn.kernels import recurrence_chunk
 from dew.nn.kernels.templates.gemm import template
@@ -316,6 +318,72 @@ def test_a_grouped_gemm_holds_every_order(edge):
     # Its reverse over reverse does not run (ledger 2650); that row's head adds the order with its fix.
     assert_contract(grouped, primals, direction, cotangent, f"a grouped GEMM {edge}", truth_fn=plain,
                     plain_fn=plain, without=("grad of grad",))
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_exact_gelu_holds_every_order(edge):
+    """`activations.exact_gelu` (rounded once to its dtype in both directions): every order finite wherever
+    float64 is a normal float32 and the plain formula, x (1 + erf(x / sqrt 2)) / 2, is."""
+    (x,) = normal_draw(2641, (4, 7), scale=EDGES[edge])
+    (direction,) = normal_draw(2642, x.shape, scale=EDGES[edge])
+    (cotangent,) = normal_draw(2643, x.shape)
+
+    def plain(x):
+        return 0.5 * x * (1 + jax.scipy.special.erf(x / np.sqrt(2.0)))
+
+    assert_contract(exact_gelu, (x,), (direction,), cotangent, f"an exact gelu {edge}", truth_fn=plain,
+                    plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_time_shift_holds_every_order(edge):
+    """`schedules.flow.time_shift` (its derivative in the regular form): every order finite wherever float64
+    is a normal float32 and the plain shifted time, shift t / (1 + (shift - 1) t), is, over times in (0, 1]
+    scaled to the edge."""
+    rng = np.random.default_rng(2644)
+    t = jnp.asarray(rng.uniform(1e-3, 1.0, (9,)) * EDGES[edge], jnp.float32)
+    direction = jnp.asarray(rng.standard_normal(t.shape) * EDGES[edge], jnp.float32)
+    cotangent = jnp.asarray(rng.standard_normal(t.shape), jnp.float32)
+
+    def plain(t):
+        return 3.0 * t / (1 + 2.0 * t)
+
+    assert_contract(lambda t: time_shift(3.0, t), (t,), (direction,), cotangent, f"a time shift {edge}",
+                    truth_fn=plain, plain_fn=plain)
+
+
+def categorical_draw(seed: int, edge: str) -> tuple:
+    """Logits [3, 6] at `edge`'s scale, labels, soft targets and a reference distribution's logits."""
+    rng = np.random.default_rng(seed)
+    logits = jnp.asarray(rng.standard_normal((3, 6)) * EDGES[edge], jnp.float32)
+    labels = jnp.asarray(rng.integers(0, 6, (3,)), jnp.int32)
+    targets = jnp.asarray(rng.dirichlet(np.ones(6), 3), jnp.float32)
+    reference = jnp.asarray(rng.standard_normal((3, 6)), jnp.float32)
+    return logits, labels, targets, reference
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_categorical_losses_hold_every_order(edge):
+    """`categorical`'s probabilities, cross entropy, soft cross entropy and KL divergence (each a custom
+    derivative): every order in the logits finite wherever float64 is a normal float32 and the plain formula,
+    jax.nn's softmax and log-softmax as written, is."""
+    logits, labels, targets, reference = categorical_draw(2645, edge)
+    (direction,) = normal_draw(2646, logits.shape, scale=EDGES[edge])
+    rows = jnp.arange(3)
+    sites = {
+        "probabilities": (categorical.probabilities, lambda x: jax.nn.softmax(x, axis=-1), (3, 6)),
+        "cross entropy": (lambda x: categorical.cross_entropy(x, labels),
+                          lambda x: -jax.nn.log_softmax(x, axis=-1)[rows, labels], (3,)),
+        "soft cross entropy": (lambda x: categorical.soft_cross_entropy(x, targets),
+                               lambda x: -jnp.sum(targets * jax.nn.log_softmax(x, axis=-1), axis=-1), (3,)),
+        "kl divergence": (lambda x: categorical.kl_divergence(x, reference), lambda x: jnp.sum(
+            jax.nn.softmax(reference, axis=-1)
+            * (jax.nn.log_softmax(reference, axis=-1) - jax.nn.log_softmax(x, axis=-1)), axis=-1), (3,)),
+    }
+    for name, (fn, plain, shape) in sites.items():
+        (cotangent,) = normal_draw(2647, shape)
+        assert_contract(fn, (logits,), (direction,), cotangent, f"{name} {edge}", truth_fn=plain,
+                        plain_fn=plain)
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():

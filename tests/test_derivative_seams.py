@@ -38,19 +38,25 @@ CONTRACTED = {
         "test_the_chunked_delta_rule_holds_every_order",
     "src/dew/nn/kernels/recurrence_algebra.py::_decayed_product":
         "test_the_chunked_delta_rule_holds_every_order",
+    "src/dew/nn/activations.py::exact_gelu":
+        "test_an_exact_gelu_holds_every_order",
+    "src/dew/diffusion/schedules/flow.py::time_shift":
+        "test_a_time_shift_holds_every_order",
+    "src/dew/nn/categorical.py::_probabilities":
+        "test_the_categorical_losses_hold_every_order",
+    "src/dew/nn/categorical.py::_label_loss":
+        "test_the_categorical_losses_hold_every_order",
+    "src/dew/nn/categorical.py::_soft_loss":
+        "test_the_categorical_losses_hold_every_order",
+    "src/dew/nn/categorical.py::_divergence":
+        "test_the_categorical_losses_hold_every_order",
 }
 """Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
 it."""
 
 PENDING = frozenset({
-    "src/dew/diffusion/schedules/flow.py::time_shift",
     "src/dew/interop/torchax_fallback.py::_accumulated",
-    "src/dew/nn/activations.py::exact_gelu",
     "src/dew/nn/attention.py::forward_differentiable.attend",
-    "src/dew/nn/categorical.py::_probabilities",
-    "src/dew/nn/categorical.py::_label_loss",
-    "src/dew/nn/categorical.py::_soft_loss",
-    "src/dew/nn/categorical.py::_divergence",
     "src/dew/nn/kernels/fla_gdn.py::chunk_gated_delta_rule",
     "src/dew/nn/kernels/fla_kda.py::chunk_kda",
     "src/dew/nn/kernels/grouped_matmul.py::portable_projection",
