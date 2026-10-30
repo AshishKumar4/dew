@@ -1030,8 +1030,12 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
         # lane read, only once the first is written, so it is never newer.
         if written(record_key(python, row_["name"], held, common), token, body):
             written(record_key(python, row_["name"], held), token, body)
-            if key is not None:
-                written(green_key(held, key), token, body)
+            # The run of exactly these inputs, kept by their key (`green_key`): a green one, or a red one, which
+            # replaces a green row of the same inputs so no later run reuses it (a flaky red).
+            ran_on = key if key is not None else None if ran["depends"] is None else cache_key(
+                common, name, parsed_row(row_["name"])[2], ran["depends"])
+            if ran_on is not None:
+                written(green_key(held, ran_on), token, body)
 
 
 def written(key: str, token: str, body: bytes) -> bool:
