@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from model_support import TINY_DECODER
 
+from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import Admitted
@@ -69,7 +70,8 @@ def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, 
     valid = jnp.concatenate([feeding, prompt > 0, jnp.zeros(WIDTH, bool)])[None]
     picked = jnp.asarray([[0, 1, 2, 3, ROWS + WIDTH - 1, ROWS + 2 * WIDTH - 1]])
     (_, logits), mixed = model.apply(
-        {**params, "cache": cache}, tokens, picked, attention_mask=valid, decode=True, mutable=["cache"],
+        {**params, "cache": cache}, tokens, picked, coordinates=coordinates(valid.shape, valid=valid),
+        decode=True, mutable=["cache"],
         admitted=Admitted(slots=jnp.asarray([3, ROWS]), cursors=jnp.asarray([0, 0]), continuing=continuing,
                           tables=tables_of(cache, [3, 0]) if paged else None),
         method=CausalTransformer.states_and_logits_at)
@@ -115,8 +117,8 @@ def test_a_model_says_whether_its_layers_run_the_mixed_call_as_they_do(case):
     valid = jnp.zeros((1, ROWS + WIDTH), bool).at[0, :2].set(True)
 
     def mixed():
-        return model.apply({**params, "cache": cache}, tokens, jnp.asarray([[0, 1]]), attention_mask=valid,
-                           decode=True, mutable=["cache"],
+        return model.apply({**params, "cache": cache}, tokens, jnp.asarray([[0, 1]]),
+                           coordinates=coordinates(valid.shape, valid=valid), decode=True, mutable=["cache"],
                            admitted=Admitted(slots=jnp.asarray([ROWS]), cursors=jnp.asarray([0])),
                            method=CausalTransformer.states_and_logits_at)
 
@@ -138,7 +140,8 @@ def test_a_mixed_call_carrying_a_pairwise_mask_is_refused_by_name():
     tokens = jnp.zeros((1, ROWS + WIDTH), jnp.int32)
     valid = jnp.zeros((1, ROWS + WIDTH), bool).at[0, :2].set(True)
     with pytest.raises(ValueError):
-        model.apply({**params, "cache": cache}, tokens, jnp.asarray([[0, 1]]), attention_mask=valid,
+        model.apply({**params, "cache": cache}, tokens, jnp.asarray([[0, 1]]),
+                    coordinates=coordinates(valid.shape, valid=valid),
                     attention_pairwise_mask=jnp.ones((1, ROWS + WIDTH, ROWS + WIDTH), bool), decode=True,
                     mutable=["cache"], admitted=Admitted(slots=jnp.asarray([ROWS]), cursors=jnp.asarray([0])),
                     method=CausalTransformer.states_and_logits_at)

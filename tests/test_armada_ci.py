@@ -158,6 +158,8 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
     assert {name: (row["kind"], row["failed"]) for name, row in rows.items() if row["exitCode"]} == {
         "3.14:tests/test_broken.py#collect": ("collect", []),
         "3.14:tests/test_missing.py#collect": ("collect", [])}
+    # A collection runs no test, so its rows count no site moved onto YNNPACK's fusions.
+    assert all(row["ynn_switched"] == [] for row in rows.values())
 
 
 def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_override(ci, tmp_path):
@@ -1017,6 +1019,32 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     shared.write_text("")
     assert run("GenuineIntel-6-143") == 12
 
+
+
+def test_every_row_carries_the_sites_its_cases_moved_onto_ynnpacks_fusions_and_a_reused_row_keeps_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Each row a task runs carries `ynn_switched`, the sites its file's cases reported moving onto
+    YNNPACK's fusions (the JUnit property tests/conftest.py writes), green rows included and an empty list
+    where none moved; a green row a later task reuses keeps the field as it ran."""
+    sites = [{"label": "a site over one key", "refused": "Dot with multiple contracting dimensions"}]
+    written(tmp_path, {
+        "test_moved.py": "import json\n"
+                         "from pathlib import Path\n"
+                         "def test_moved(record_property):\n"
+                         "    with Path('runs').open('a') as runs: runs.write('x')\n"
+                         f"    record_property('ynn_switched', json.dumps({sites!r}))\n"
+                         "def test_still(): pass\n",
+        "test_unmoved.py": "def test_plain(): pass\n"})
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+
+    def fields() -> dict[str, list]:
+        return {row["name"]: row["ynn_switched"] for row in armada_task(ci, monkeypatch, out)}
+
+    expected = {"3.12:tests/test_moved.py": [{"node": "tests/test_moved.py::test_moved", **sites[0]}],
+                "3.12:tests/test_unmoved.py": []}
+    assert fields() == expected
+    assert fields() == expected
+    assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
 
 
 def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:

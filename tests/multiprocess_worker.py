@@ -1946,6 +1946,7 @@ def mode_mixed_validity(args) -> dict:
     """
     import jax
 
+    from dew.batch import token_validity
     from dew.nn.inputs import agreed_validity
     from dew.sampling import Sampling, generate
 
@@ -1967,7 +1968,7 @@ def mode_mixed_validity(args) -> dict:
         "local_fields": sorted(local.token_fields),
         "agreed_fields": sorted(agreed.token_fields),
         "agreed_all_true": (None if not agreed.token_fields else
-                            bool(np.all(np.asarray(agreed.token_fields["attention_mask"])))),
+                            bool(np.all(np.asarray(token_validity(agreed.token_fields))))),
         "placed_fields": trained["placed_fields"],
         "tokens": np.asarray(drawn.tokens).tolist(),
         "raw_log_probs": np.asarray(drawn.raw_log_probs, np.float64).tolist(),

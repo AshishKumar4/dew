@@ -169,6 +169,17 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
                                 floor=hooks.floor, bound=hooks.inverse_bound)
 
 
+def refuses_its_gradient(fn, *drawn) -> None:
+    """`fn`'s gradient, traced over `drawn` where the template's fast backward does not take it (an fp32 call,
+    a decay a key dimension's, launches the device does not hold): refused, by the template named to the
+    selectors as its route's 'backward' requirement (`recurrence_chunk.MOSAIC_SUPPORTS`, `KernelRefused`), by
+    the mainloop called directly (`mosaic_rule`) as not implemented."""
+    with pytest.raises((KernelRefused, NotImplementedError)) as refused:
+        jax.eval_shape(fn, *drawn)
+    if isinstance(refused.value, KernelRefused):
+        assert 'backward' in {refusal.code for refusal in refused.value.refusals}
+
+
 def taken(given: Chunk, hooks: recurrence.Hooks) -> bool:
     """Whether the template takes a call over `given`'s operands under `hooks` on the device its launches run
     for (`Mosaic.eligible`: every launch's shared memory and registers within a block's and a thread's, a
@@ -668,7 +679,9 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
 
             return fn, (*given, *([starts] if packed else []))
 
-        return KernelCase(label, call, {launch.name: _model(launch, family) for launch in plans[label]})
+        # A refused tile compiled for the model's evidence alone, which no call runs (`KernelCase.required`).
+        return KernelCase(label, call, {launch.name: _model(launch, family) for launch in plans[label]},
+                          required=not kind.startswith('refused'))
 
     return [kernel for group in (GATE_GROUPS if only is None else [only])
             for kernel in cases(group[0], group[1], training=group[2], packed=group[3], variants=group[4])]
@@ -704,22 +717,26 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
     CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
     227 KB) and tensor memory and at most its plan's shared memory (`mainloop.planned`, from which the tiles
-    are derived, `planned_failures`), no launch the template's legality holds spills a register, and each
-    launch's register model decides as ptxas's need does, admitting a tile or refusing it (row 1971,
-    `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's
-    shared memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated
-    delta rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds
-    for its own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the newer
-    targets are the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
+    are derived, `planned_failures`), no launch the template's legality holds spills a register (a refused
+    tile's compiled as the model's evidence, `KernelCase.required`), and each launch's register model decides
+    as ptxas's need does, admitting a tile or refusing it (row 1971, `kernel_compile.mosaic_failures`).
+    Lowering alone takes no device's budget: a launch past an A100's shared memory lowered and failed on the
+    GPU (the fast backward's readout's third staging tile). The gated delta rule's 16-bit call, the production
+    cell, derives tiles on every family. A GPU host's ptxas builds for its own GPU and those before it, not a
+    newer one's (an A100's refuses sm_90a), so there the newer targets are the CPU suite's alone. A test a
+    group of cases (`GATE_GROUPS`)."""
     if jax.default_backend() == 'gpu':
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
             pytest.skip(f"this host's ptxas builds for its {local} GPU and before, not {target}")
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    from kernel_compile import compile_mosaic_kernels, failures, mosaic_failures
 
     plans, refused = {}, []
-    found = compile_mosaic_kernels(compiled_cases(target, plans, refused, only=group), target)
-    failed = mosaic_failures(found) + planned_failures(found, plans)
+    cases = compiled_cases(target, plans, refused, only=group)
+    found = compile_mosaic_kernels(cases, target)
+    # Every case compiles and reports; a refused tile's spill is the model's refusal, a required one's fails.
+    failed = failures(found) + planned_failures(found, plans)
+    failed += mosaic_failures([record for case, record in zip(cases, found, strict=True) if case.required])
     failed += [f"{case}: no tiles derived" for case in refused
                if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
     assert not failed, "\n".join(failed)

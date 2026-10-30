@@ -166,8 +166,7 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
 
             # What the kernels take, whatever this GPU's row prefers.
             case = scan_case(x, B, shape.chunk)
-            refusals['hand'] = '; '.join(requirement.refusal(case).detail
-                                         for requirement in SCAN.kernel('pallas').failed(case))
+            refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').failed(case))
             cotangents = (given['dy'], given['dfinal'])
         else:
             # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.

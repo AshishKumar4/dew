@@ -30,7 +30,17 @@ from jax.typing import ArrayLike, DTypeLike
 
 from dew._coordination import agreed
 from dew._records import integer, record as named_fields, strings, text as named
-from dew.batch import PARAMETER_ROOTS, POSITIONS_FIELD, VALIDITY_FIELD, Variables, thaw
+from dew.batch import (
+    COORDINATES_FIELD,
+    PARAMETER_ROOTS,
+    POSITIONS_FIELD,
+    VALIDITY_FIELD,
+    Variables,
+    laid_coordinates,
+    thaw,
+    token_positions,
+    token_validity,
+)
 from dew.cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
@@ -216,8 +226,11 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
     """
     if ceiling is None or budget < 1:
         return inputs, budget, None
-    positions = inputs.token_fields.get(POSITIONS_FIELD)
-    if (set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD} or inputs.conditioning
+    # The rows' layout, their coordinates or their flat fields (`laid_coordinates`): one document a row.
+    laid = laid_coordinates(inputs.token_fields)
+    positions = token_positions(inputs.token_fields)
+    if (set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD, COORDINATES_FIELD} or inputs.conditioning
+            or (laid is not None and laid.segments is not None)
             or (positions is not None and positions.shape != inputs.tokens.shape)):
         return inputs, budget, None
     width = shape_bucket(inputs.tokens.shape[1], 64)
@@ -229,17 +242,19 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
 
 
 def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
-    """Return `inputs` left-padded to `width` slots, with the filler marked invalid."""
+    """Return `inputs` left-padded to `width` slots, with the filler marked invalid, laid out again
+    (`ModelInputs.laid`)."""
     extra = width - inputs.tokens.shape[1]
     if extra < 1:
         return inputs
-    valid = inputs.token_fields.get(VALIDITY_FIELD)
+    valid = token_validity(inputs.token_fields)
     if valid is None:
         valid = jnp.ones(inputs.tokens.shape, bool)
+    positions = token_positions(inputs.token_fields)
     left = ((0, 0), (extra, 0))
-    fields = {name: jnp.pad(value, left) for name, value in inputs.token_fields.items()}
-    return replace(inputs, tokens=jnp.pad(inputs.tokens, left),
-                   token_fields={**fields, VALIDITY_FIELD: jnp.pad(valid, left)})
+    fields = {VALIDITY_FIELD: jnp.pad(valid, left),
+              **({} if positions is None else {POSITIONS_FIELD: jnp.pad(positions, left)})}
+    return replace(inputs, tokens=jnp.pad(inputs.tokens, left), token_fields=fields).laid()
 
 
 @functools.cache
@@ -309,9 +324,27 @@ class SavedRun:
 
     @classmethod
     def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
-        """The selected checkpoint of the run in `directory`, its latest or `step`. A task loaded
+        """The selected checkpoint of the run in `directory`: `step`, or where none is asked the step its
+        task loads by default (`SavedRunTask.default_step`), its latest unless the task names another, so
+        every reader of a run (a task, `dew.pipeline`, `dew export`) pins the one step. A task loaded
         from it compiles into the persistent cache (`persist_compilations`). `trust` names the
         packages outside Dew whose modules the record may import (`dew.registry.imported`)."""
+        run = cls.at(directory, step, trust)
+        task = run.objective.saved_task
+        chosen = (task.default_step(directory) if step is None and task is not None
+                  and issubclass(task, SavedRunTask) else None)
+        if chosen is None:
+            return run
+        again = cls.at(directory, chosen, trust)
+        if again.objective.saved_task is not task:
+            raise ValueError(f"step {chosen} of {directory}, which its task loads by default, was written by "
+                             f"{again.objective.__name__}, whose task is another; load a step with `step`")
+        return again
+
+    @classmethod
+    def at(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+        """The checkpoint of the run in `directory` at `step`, its latest where None, whatever step its task
+        loads by default (`pinned`): the step an average of runs reads (`dew.checkpoints.averaged`)."""
         from dew.checkpoints import Checkpoints
         from dew.registry import import_trusted, objectives
         persist_compilations()
@@ -420,9 +453,8 @@ class SavedRunTask:
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> Self:
         """Load the run in `directory` as this task (`from_saved`), at the step it loads by default
-        (`default_step`) or at `step`. `trust` names the packages outside Dew the run's record may
-        import, as `trust_remote_code` does in transformers."""
-        step = cls.default_step(directory) if step is None else step
+        (`default_step`, `SavedRun.pinned`) or at `step`. `trust` names the packages outside Dew the run's
+        record may import, as `trust_remote_code` does in transformers."""
         run = SavedRun.pinned(directory, step, trust)
         return run.formed(cls.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
                                          param_dtype=param_dtype))

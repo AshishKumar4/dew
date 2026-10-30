@@ -400,17 +400,14 @@ class MultimodalTransformer(DecoderWrapper):
             decoder_tokens = jnp.where(media, tokens, decoder_tokens)
         return Fusion(decoder_tokens, embeddings, media)
 
-    def mtp_hidden_states(self, hidden, tokens, train: bool = False, positions=None,
-                          segment_ids=None, image_indices=None, conditioning=None,
-                          attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
+    def mtp_hidden_states(self, hidden, tokens, train: bool = False, image_indices=None, conditioning=None,
+                          image_groups=None, block_groups=None, rotary_positions=None,
                           audio_indices=None, coordinates: Coordinates | None = None):
         """Run the multi-token prediction layers over the same media embeddings and
-        token fields as the main decoder (`hidden_states`)."""
+        token fields as the main decoder (`hidden_states`), its tokens laid out by their
+        `coordinates`."""
         _, media = CrossContext.parted(conditioning)
         fused = self._fused(tokens, image_indices, audio_indices, media, train=train)
-        # The tokens' layout converted once (`token_coordinates`); the language model reads it alone.
-        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
-                                        positions=positions)
         return self.language_model.mtp_hidden_states(
             hidden, fused.tokens, train=train, input_embeddings=fused.embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates)
@@ -442,11 +439,10 @@ class MultimodalTransformer(DecoderWrapper):
 
 
     @nn.compact
-    def hidden_states(self, tokens, train: bool = False, decode: bool = False,
-                      positions=None, segment_ids=None, image_indices=None,
+    def hidden_states(self, tokens, train: bool = False, decode: bool = False, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
-                      attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
-                      audio_indices=None, routed_experts=None, routed=None, right_padded: bool = False,
+                      image_groups=None, block_groups=None, rotary_positions=None,
+                      audio_indices=None, routed_experts=None, routed=None,
                       coordinates: Coordinates | None = None, whole_blocks: bool = False):
         """Run the decoder over text with the media embeddings spliced in.
 
@@ -457,13 +453,10 @@ class MultimodalTransformer(DecoderWrapper):
         `routed_experts` and `routed` replay a routing record and go to the
         language model unchanged. Engines record a row for every placeholder
         position too, so the `[B, S, layers, top_k]` layout matches the text.
-        `right_padded`, `coordinates` and `whole_blocks` are the language
-        model's (`CausalTransformer.hidden_and_mtp_inputs`).
+        `coordinates` and `whole_blocks` are the language model's
+        (`CausalTransformer.hidden_and_mtp_inputs`): the tokens as the decoder reads them, so the
+        cursor counts the places the layers do.
         """
-        # The tokens as the decoder reads them (`Coordinates`), whichever fields the caller gave
-        # them in, so the cursor counts the places the layers do.
-        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
-                                        positions=positions, right_padded=right_padded)
         if decode:
             allocated = self.has_variable("cache", POSITION)
             cursor = self.variable("cache", POSITION, jnp.zeros, (tokens.shape[0],), jnp.int32)

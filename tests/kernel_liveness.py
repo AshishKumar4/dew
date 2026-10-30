@@ -19,13 +19,15 @@ from jaxlib.mlir import passmanager
 from jaxlib.mlir.dialects import gpu, llvm
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
 
+from dew.nn.kernels.generation import GpuTarget
+from dew.nn.kernels.templates import resources
+
 
 @dataclasses.dataclass(frozen=True)
 class Compiler:
-    """The assembler whose scheduling the estimate describes. Relocatable assembly ignores register
-    raises; CUDA 13 streams transcendental chains that CUDA 12 keeps as vectors."""
+    """The assembler whose scheduling the estimate describes: CUDA 13 streams transcendental chains
+    that CUDA 12 keeps as vectors."""
     version: tuple[int, int]
-    relocatable: bool
 
 
 FREE = {"arith.constant", "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison", "llvm.mlir.zero",
@@ -628,4 +630,44 @@ def kernel_peaks(module_bytes: bytes, compiler: Compiler | None = None) -> list[
                 launch.mma_words = run.mma_words
                 regions = sorted(launch.regions.items(), key=lambda kv: -kv[1][0])[:8]
                 found.append((str(name), launch, (launch.breakdown(run.atoms), regions)))
+    return found
+
+
+@dataclasses.dataclass(frozen=True)
+class LoweredRegisters:
+    """One launch's live register set, before the assembler schedules and allocates it."""
+    name: str
+    registers: int
+    fragments: int
+    scalars: int
+    threads: int
+    producer: int
+    raised: int
+    where: str
+
+    def model(self, stated: resources.RegisterModel, target: GpuTarget, *, shared: int,
+              tmem: int) -> resources.RegisterModel:
+        """Apply the launch's family rules to its observed geometry and estimated live registers."""
+        family = stated.family
+        if family is None:
+            raise ValueError("lowered register evidence needs the launch's declared family")
+        producers = family.warpgroups(stated.consumers) - stated.consumers
+        consumers = self.threads // resources.THREADS - producers
+        if consumers < 1:
+            raise ValueError("the launch geometry does not hold its family's consumer roles")
+        return resources.register_model(family, consumers, self.registers, shared=shared, target=target,
+                                        tmem=tmem)
+
+
+def lowered_registers(module: bytes, compiler: Compiler) -> list[LoweredRegisters]:
+    """Analyze the module an existing Mosaic custom call carries, without tracing or compiling it again.
+    The compiler version is an input, never read from a process-global installation."""
+    found = []
+    for name, peak, _ in kernel_peaks(module, compiler):
+        if peak.threads is None:
+            continue
+        if peak.threads % resources.THREADS or peak.threads < resources.THREADS:
+            raise ValueError(f"Mosaic launch has {peak.threads} threads, not whole warpgroups")
+        found.append(LoweredRegisters(name, peak.total, peak.fragments, peak.scalars, peak.threads,
+                                       peak.producer, peak.raised, peak.where))
     return found

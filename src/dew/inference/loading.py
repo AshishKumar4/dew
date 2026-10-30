@@ -30,6 +30,7 @@ from dew.data.text import Tokenizer
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
+from dew.nn.precision import Numerics
 from dew.objectives.base import SavedTask
 from dew.registry import dtype_name
 
@@ -51,6 +52,7 @@ def pipeline(
     revision: str | None = None,
     trust: Sequence[str] = (),
     options: SourceOptions | None = None,
+    precision: Numerics | str | None = None,
 ) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask:
     """Load the inference task for `source`, with its weights placed once.
 
@@ -75,7 +77,10 @@ def pipeline(
     what a source builds, as a run's `--source` options do (`SourceOptions`:
     a wrapper's language model alone, the prediction depths kept, each layer
     kind's attention); a run's record selects its own, so passing them for a
-    run directory raises `ValueError`.
+    run directory raises `ValueError`. `precision` gives a source's task its
+    numerics (`Pretrained.load(precision=...)`: its dtypes, and the precision and
+    forms its calls trace under); a run's record names its own, so passing it for
+    a run directory raises `ValueError`.
 
     Loading a task also points XLA at the on-disk executable cache, unless a
     cache directory is already set, so a restarted process reuses what it
@@ -107,34 +112,34 @@ def pipeline(
         if options is not None and options != SourceOptions():
             raise ValueError("source options select what a source builds; a run's record selects its own "
                              "model")
+        if precision is not None:
+            raise ValueError("precision gives a source's task its numerics; a run's record names its own")
         return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
                          param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step,
                          trust=trust)
     if step is not None:
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
+    if precision is not None and (dtype is not None or param_dtype is not None):
+        raise ValueError("precision sets a source's dtype and param_dtype; pass the numerics or the dtypes, "
+                         "not both")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
-                        revision=revision, options=SourceOptions() if options is None else options)
+                        revision=revision, options=SourceOptions() if options is None else options,
+                        precision=precision)
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
               step: int | str | None, trust: Sequence[str]) -> SavedTask:
     """The task the run's recorded objective declares (`Objective.saved_task`), built from the checkpoint
-    pinned here (`SavedTask.from_saved`), which nothing pins again."""
-    from dew.inference.tasks import SavedRun, SavedRunTask
+    pinned here (`SavedRun.pinned`, its task's default step where none is asked), which nothing pins
+    again."""
+    from dew.inference.tasks import SavedRun
 
     run = SavedRun.pinned(str(root), step, trust)
     task = run.objective.saved_task
     if task is None:
         raise TypeError(f"a run of {run.objective.__name__} loads as no task: its class declares no "
                         "`saved_task`")
-    # A Dew task may load another step than the latest where none is asked (`SavedRunTask.default_step`).
-    chosen = task.default_step(str(root)) if step is None and issubclass(task, SavedRunTask) else None
-    if chosen is not None:
-        run = SavedRun.pinned(str(root), chosen, trust)
-        if run.objective.saved_task is not task:
-            raise ValueError(f"step {chosen} of {root}, which its task loads by default, was written by "
-                             f"{run.objective.__name__}, whose task is another; load a step with `step`")
     loaded = task.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
     # A Dew task traces in the attention form its run trained in (`SavedRun.formed`).
     return run.formed(loaded)
@@ -142,15 +147,19 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
-                 revision: str | None, options: SourceOptions) -> SavedTask:
+                 revision: str | None, options: SourceOptions, precision: Numerics | str | None) -> SavedTask:
     from dew.distributed.placement import MeshSpec as DefaultMesh
     from dew.inference.projections import packed_owned
     from dew.interop import Pretrained, PretrainedPipeline
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
-    # What the source builds, as a run's source loads it (`SourceOptions.keywords`).
-    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
+    # What the source builds, as a run's source loads it (`SourceOptions.keywords`), in the numerics
+    # asked for, which set its dtypes.
+    loaded = (Pretrained.load(source, revision=revision, mesh=placement, layout=layout, precision=precision,
+                              **options.keywords())
+              if precision is not None else
+              Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
                               **options.keywords())
               if dtype is None else
               Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,

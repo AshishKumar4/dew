@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
-from dew.batch import SEGMENTS_FIELD, Variables, real_slots, thaw
+from dew.batch import SEGMENTS_FIELD, Variables, coordinates, real_slots, thaw
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
@@ -276,9 +276,11 @@ class GRPOObjective(TokenScorer):
                                  f"the shape of {IDS_KEY}, {ids.shape}")
         routes = (None if ROUTED_EXPERTS_KEY not in batch
                   else (batch[ROUTED_EXPERTS_KEY], batch.get(ROUTED_KEY)))
-        scores = self.token_scores(params, ids, segment_ids=segments,
-                                   positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32), routes=routes,
-                                   qk_stats=qk_stats, routing=routing)
+        # The rollout's packed columns laid out once (`Coordinates`), the layout the model reads.
+        laid = coordinates(ids.shape, segments=segments,
+                           positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32))
+        scores = self.token_scores(params, ids, coordinates=laid, routes=routes, qk_stats=qk_stats,
+                                   routing=routing)
         support = (None if SUPPORT_KEY not in batch
                    else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)

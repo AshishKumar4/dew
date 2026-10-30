@@ -66,6 +66,7 @@ from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, widened
 from tiny_models import build_model, tiny_inputs
 
+from dew.batch import coordinates
 from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
@@ -194,9 +195,10 @@ def test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree(name
     same(read.logits, model.text.apply(text, read.tokens))
     same(read.hidden, model.text.apply(text, read.tokens, method="hidden_states"))
     boundary, places = LENGTH // 2, jnp.arange(LENGTH)
-    packing = {"segment_ids": jnp.broadcast_to((places >= boundary).astype(jnp.int32), read.tokens.shape),
-               "positions": jnp.broadcast_to(jnp.where(places >= boundary, places - boundary, places),
-                                             read.tokens.shape)}
+    shape = read.tokens.shape
+    packing = {"coordinates": coordinates(
+        segments=jnp.broadcast_to((places >= boundary).astype(jnp.int32), shape),
+        positions=jnp.broadcast_to(jnp.where(places >= boundary, places - boundary, places), shape))}
     packed = model.apply(variables, read.tokens, method="hidden_states", **packing)
     same(packed, model.text.apply(text, read.tokens, method="hidden_states", **packing))
     assert not np.array_equal(np.asarray(packed[:, boundary:]), np.asarray(read.hidden[:, boundary:]))

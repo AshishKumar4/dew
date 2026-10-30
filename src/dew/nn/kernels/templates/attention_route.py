@@ -25,11 +25,13 @@ from dew.nn.kernels.templates import attention_mosaic, attention_portable, atten
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
-    OUTPUT,
     Gradients,
     Hooks,
+    Kept,
     KeySpans,
+    Kind,
     Split,
+    shared_sum,
     takes_output_residuals,
 )
 
@@ -45,8 +47,8 @@ Residuals = tuple[jax.Array, jax.Array, jax.Array, Split]
 FORMS = ("fast", "accurate")
 """The template's forms (kernel-templates.md §1, testing.md): the default, fast (the base-2 fold and
 FlashAttention's arithmetic, `NATURAL`, `ACCURATE`), and the accurate form one option away (natural logits and
-the accurate products), which `generation.chosen(attention_form='accurate')` names for every template call in
-its block."""
+the accurate products), which a run's numerics name for every template call in their block
+(`generation.run_precision`, `Numerics.forms`)."""
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
@@ -60,20 +62,17 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     default. An output hook is refused: a differentiated call applies `output_mod` to the output past the
     kernel, where its own derivative runs, so the caller applies it.
 
-    `natural` and `accurate` name its form, each where None the one `generation.chosen(attention_form=...)`
-    names (`FORMS`; 'accurate' takes both), else the default's. `operand_dtype`, where the key and value
-    arrive wider than the mainloops compute them (a sharding wrapper's, so its partial gradients sum wide),
-    narrows the operands to it and hands back the key's and value's gradients unrounded, in their own dtype:
-    the wrapper sums them and rounds once.
+    `natural` and `accurate` name its form, each where None the one the run's numerics name
+    (`generation.numerics().forms`, `FORMS`; 'accurate' takes both), else the default's.
+    `operand_dtype`, where the key and value arrive wider than the mainloops compute them (a sharding
+    wrapper's, so its partial gradients sum wide), narrows the operands to it and hands back the key's
+    and value's gradients unrounded, in their own dtype: the wrapper sums them and rounds once.
     """
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
-    form = generation.chosen_kernel('attention_form', 'fast')
-    if form not in FORMS:
-        raise ValueError(f"attention_form {form!r}: the template's forms are {', '.join(FORMS)}")
-    wide = form == 'accurate'
+    wide = generation.numerics().forms == 'accurate'
     config = _Config(scale, NATURAL or wide if natural is None else natural,
                      ACCURATE or wide if accurate is None else accurate,
                      None if operand_dtype is None else jnp.dtype(operand_dtype).name)
@@ -162,8 +161,10 @@ class _Pass:
 _ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the call runs off a GPU",
                                        generation.INHERENT)
 MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
-    selection.Kernel[_Pass]('mosaic', (_ON_GPU, lambda case: case.mosaic)),
-    selection.Kernel[_Pass]('triton', (_ON_GPU, lambda case: case.triton)),
+    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.analysed(
+        'declined', lambda case: case.mosaic, 'roadmap: the Mosaic template takes every call'))),
+    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.analysed(
+        'spans', lambda case: case.triton, generation.INHERENT))),
     selection.Kernel[_Pass]('portable', (), generic=True),
 ), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')
 """The template's mainloops, the first that takes a pass: Mosaic GPU's, which a GPU prefers, the frozen
@@ -188,8 +189,12 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     backward's D where the call takes that (`takes_output_residuals`), whichever mainloop runs the backward
     (the residuals are every mainloop's, `output_split`)."""
     form = {"scale": config.scale, "natural": config.natural}
-    kept = (OUTPUT if residuals and takes_output_residuals(hooks, query.dtype, accurate=config.accurate)
-            else residuals)
+    if not residuals:
+        kept = Kept.NONE
+    elif takes_output_residuals(hooks, query.dtype, accurate=config.accurate):
+        kept = Kept.OUTPUT
+    else:
+        kept = Kept.SPLIT
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
                                                  **form) if _on_gpu() else None
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
@@ -197,7 +202,8 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     if mainloop == 'mosaic':
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, **form)
     if mainloop == 'triton':
-        return attention_triton.forward(query, key, value, spans, hooks, residuals=residuals, **form)
+        return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=residuals,
+                                        **form)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, residuals=residuals, **form)
 
@@ -229,9 +235,24 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
     if mainloop == 'triton':
-        return attention_triton.backward(*call, residuals=residuals, rounded=rounded, **form)
+        grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
+                                          residuals=residuals, rounded=rounded, **form)
+        return dataclasses.replace(grads, score_params=tuple(
+            shared_sum(grad, param) for grad, param in zip(grads.score_params, hooks.score_params,
+                                                           strict=True)))
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
                                        residuals=residuals, rounded=rounded, **form)
+
+
+def _spread(hooks: Hooks, query: jax.Array) -> Hooks:
+    """`hooks` with each query, key or tile parameter spread over the batch rows and query heads it shares
+    (`template.shared_place`), as the frozen Triton mainloop indexes them; the other mainloops read them
+    shared."""
+    batch, heads = query.shape[0], query.shape[2]
+    return dataclasses.replace(hooks, score_params=tuple(
+        dataclasses.replace(param, value=jnp.broadcast_to(param.value,
+                                                          (batch, heads, *param.value.shape[2:])))
+        if param.kind in (Kind.QUERY, Kind.KEY, Kind.TILE) else param for param in hooks.score_params))
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients) -> Hooks:

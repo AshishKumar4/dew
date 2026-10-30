@@ -30,6 +30,7 @@ from dew.nn.kernels.templates.attention import (
     floating_params,
     kept_dtype,
     power_of_two,
+    shared_place,
     whole,
 )
 
@@ -76,17 +77,30 @@ class Tiles:
     """A forward launch's config: each consumer's query block (`block_q`), the key tile (`block_k`), the key
     and value tiles in flight (`stages`), the consumers a program (`consumers`: on wgmma FlashAttention-3's
     two warpgroups take turns on the tensor cores, one's softmax under the other's products) and the
-    instruction family whose bundle runs it (`family`, `bundle`)."""
+    instruction family whose bundle runs it (`family`, `bundle`). A fold's call rewalks a row past its reach
+    in the natural form at its own key tile and consumers (`relaunch_k`, `relaunch_consumers`; the config's
+    where None, `relaunch`), which divide the config's so its padded blocks hold; `natural_form` marks the
+    natural form's tiles, whose register model differs (`MosaicForward.registers`)."""
 
     block_q: int
     block_k: int
     stages: int
     consumers: int
     family: str = mosaic_sm90.WGMMA.name
+    relaunch_k: int | None = None
+    relaunch_consumers: int | None = None
+    natural_form: bool = False
 
     def __post_init__(self):
         if self.stages < 2:
             raise ValueError(f"{self}: two stages or more")
+
+    @property
+    def relaunch(self) -> "Tiles":
+        """The natural form's rewalk's tiles (`algebra.walked_launches`)."""
+        return dataclasses.replace(self, block_k=self.relaunch_k or self.block_k,
+                                   consumers=self.relaunch_consumers or self.consumers, relaunch_k=None,
+                                   relaunch_consumers=None, natural_form=True)
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -414,6 +428,8 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     (`keys_first`, `[bk, bq]`) reads a tile parameter's entries from its keys-first copy `[B, H, Kp, Qp]`."""
     queries, keys = like.shape[::-1] if keys_first else like.shape
     rows, columns = pl.ds(first, queries), pl.ds(k_first, keys)
+    if kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+        row, head = shared_place(ref.shape, row, head)
     match kind:
         case Kind.HEAD:
             return ref[head]
@@ -573,20 +589,11 @@ class _Program[T: (Tiles, BackwardTiles)]:
         whether tile `index` sees it whole (`whole(index)`): a full or causal call's from its places, from
         its diagonal and none for a block wholly past the keys; a spans call's from its block map, whole
         where the ids of both blocks agree too (`reach`)."""
-        block_q, block_k = self.tiles.block_q, self.tiles.block_k
         if spans is None:
-            # The first query tile that sees the block: every one, or those from its diagonal (a causal call
-            # of more keys than queries leaves its last keys unseen).
-            lo = jnp.minimum(lax.div(k_first, block_q), q_steps) if self.causal else jnp.int32(0)
-            lo = jnp.where(k_first >= self.keys, q_steps, lo)
-            # The tiles from which every query sees the block whole: past its diagonal, and none if it holds
-            # padding.
-            whole = jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps) if self.causal else lo
-            whole = jnp.where(k_first + block_k > self.keys, q_steps, jnp.maximum(whole, lo))
-            # A query tile holding padding rows sees no block whole (`reach`).
-            return lo, jnp.int32(q_steps), lambda index: (index >= whole) & jnp.logical_not(
-                self.padded(index * block_q))
-        block = lax.div(k_first, block_k)
+            start, end = self._whole_run(k_first, q_steps)
+            return self._first_reader(k_first, q_steps), jnp.int32(q_steps), lambda index: (
+                (index >= start) & (index < end))
+        block = lax.div(k_first, self.tiles.block_k)
 
         def seen_whole(index):
             inside = (block >= spans.full_lo[row, index]) & (block < spans.full_hi[row, index])
@@ -596,6 +603,30 @@ class _Program[T: (Tiles, BackwardTiles)]:
             return inside & (doc != 0) & (doc == spans.query_doc[row, index])
 
         return spans.q_lo[row, block], spans.q_hi[row, block], seen_whole
+
+    def whole_run(self, k_first, q_steps: int, spans: _Spans | None) -> tuple[jax.Array, jax.Array] | None:
+        """The query tiles `[a, b)` that see the key block from `k_first` whole (`readers`' `whole`), one run
+        of them: a causal call's, from its diagonal to its first tile holding padding rows; None for a spans
+        call, whose whole tiles need not run unbroken, and for a full call, whose every tile but a padded
+        edge's is whole (ET-SEGS-h100: the run its own segment, 2% slower a full launch at width 64, 7%
+        faster a causal one at Qwen3-8B's)."""
+        return None if spans is not None or not self.causal else self._whole_run(k_first, q_steps)
+
+    def _first_reader(self, k_first, q_steps: int) -> jax.Array:
+        """The first query tile that sees the key block from `k_first` in a full or causal call: every one,
+        or those from its diagonal (a causal call of more keys than queries leaves its last keys unseen)."""
+        lo = jnp.minimum(lax.div(k_first, self.tiles.block_q), q_steps) if self.causal else jnp.int32(0)
+        return jnp.where(k_first >= self.keys, q_steps, lo)
+
+    def _whole_run(self, k_first, q_steps: int) -> tuple[jax.Array, jax.Array]:
+        """`whole_run`'s of a full or causal call: from past the block's diagonal (none if the block holds
+        padding keys) to the first query tile holding padding rows, which sees no block whole (`reach`)."""
+        block_q, block_k = self.tiles.block_q, self.tiles.block_k
+        lo = self._first_reader(k_first, q_steps)
+        start = jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps) if self.causal else lo
+        start = jnp.where(k_first + block_k > self.keys, q_steps, jnp.maximum(start, lo))
+        end = jnp.int32(q_steps if self.queries is None else min(self.queries // block_q, q_steps))
+        return start, jnp.maximum(end, start)
 
 
 def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
