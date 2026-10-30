@@ -253,7 +253,6 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
     import optax
 
     from dew.data.dataset import Loader
-
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.dex import DifferentialExtension
     from dew.nn.progress import END, Progress
@@ -287,8 +286,10 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
                               dex=DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
     # A stale rollout's off-policy correction, which an asynchronous collection takes.
     objective = GRPOObjective(model, seq_len=7, behavior_importance=2.0)
-    scheduler = RolloutScheduler(Asynchronous(Scripted(), Publisher(), objective, width=8, rows=2, max_lag=1,
-                                              ahead=0), groups=2)
+    # A row a task, as many as a host's devices hold rows.
+    tasks = np.arange(1, 9, dtype=np.int32)
+    scheduler = RolloutScheduler(Asynchronous(Scripted(), Publisher(), objective, width=8, rows=len(tasks),
+                                              max_lag=1, ahead=0), groups=2)
     seen = []
 
     def rollout(state, batch, key):
@@ -299,9 +300,8 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
                      scored_rows(objective, state.variables, packed, END)))
         return packed
 
-    tasks = np.asarray([1, 2], np.int32)
     data = scheduler.tasks(Loader(train=lambda partition: itertools.repeat({"task_id": tasks}), val=None,
-                                  records=2, batch=2))
+                                  records=len(tasks), batch=len(tasks)))
     Trainer(objective, optax.sgd(0.0), key=0, rollout=rollout).fit(data, steps=6, log_every=100,
                                                                    checkpoint_every=None)
     updates, rescored, stepped, ended = seen[-1]
