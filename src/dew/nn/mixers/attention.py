@@ -19,13 +19,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.batch import Coordinates, prefix_sum
-from dew.nn.attention import (
-    AttentionImpl,
-    cudnn_takes_mask,
-    kernel_for_materialized_mask,
-    reference_only,
-    scaled_dot_product_attention,
-)
+from dew.nn.attention import AttentionImpl, mask_kernel, reference_only, scaled_dot_product_attention
 from dew.nn.attention_masks import (
     alibi_bias,
     causal_attention_mask,
@@ -1017,7 +1011,7 @@ class CausalSelfAttention(nn.Module):
         """The kernel a call that builds its mask runs: xla
         (`kernel_for_materialized_mask`), except a cache call over several
         queries (a prefill, a verified draft) where cuDNN takes the mask
-        (`cudnn_takes_mask`); an explicit 'xla' stays xla. That call runs
+        (`mask_kernel`); an explicit 'xla' stays xla. That call runs
         forward only, where cuDNN takes the mask as its additive bias with
         none of the backward's refusals: 8 prompts of 256 at Qwen3-0.6B's
         widths took 4.0 against xla's 6.2 ms over 28 layers on an RTX 4080.
@@ -1025,14 +1019,10 @@ class CausalSelfAttention(nn.Module):
         distance from an fp32 forward is 1.04 times xla's on Qwen3-0.6B and
         1.00 on 1.7B (tests/reference_error.py allows 2), and greedy rows part
         only at bf16 near-ties (docs/performance.md)."""
-        masked = kernel_for_materialized_mask(
-            self.ctx.attention_impl, query, key, dtype=self.ctx.dtype, precision=self.ctx.precision,
-            force_fp32_for_softmax=self.ctx.force_fp32_for_softmax)
-        if decode and query.shape[1] > 1 and masked == 'xla' and cudnn_takes_mask(
-                self.ctx.attention_impl, query, softcap=self.ctx.attn_logit_softcap,
-                sinks=self.ctx.attention_sinks):
-            return 'cudnn'
-        return masked
+        return mask_kernel(self.ctx.attention_impl, query, key, as_bias=decode and query.shape[1] > 1,
+                           dtype=self.ctx.dtype, precision=self.ctx.precision,
+                           force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
+                           softcap=self.ctx.attn_logit_softcap, sinks=bool(self.ctx.attention_sinks))
 
     def _masking(
         self,
