@@ -307,6 +307,23 @@ def masked(root: Path, drawn: bool) -> RunConfig:
                                max_new_tokens=0)
 
 
+def dreamed(root: Path, drawn: bool, release: str = "dream") -> RunConfig:
+    """A masked-diffusion run over a Dream `release` (dream-tiny as it ships, `test_dream_walk.snapshot`,
+    under `root / release`), its walk the release's own, its grid's endpoint among it (ledger 2563), over
+    token files in the release's tokenizer."""
+    from test_dream_walk import snapshot
+
+    source = snapshot(release, root)
+    corpus = write_token_corpus(root / "dream-tokens", np.random.RandomState(0).randint(4, 100, 400),
+                                tokenizer=str(source), vocab_size=128, eos_id=1)
+    data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        Loading(workers=0))
+    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "reference"})
+    return dataclasses.replace(lm(root, drawn), data=data, validation=None, pretrained=str(source),
+                               tokenizer=str(source), model=model, max_new_tokens=0,
+                               objective=ObjectiveConfig("masked_diffusion"))
+
+
 def members_of(annotation: type, base=None) -> list[object]:
     """The values of Dew's classes that are `annotation`s: every member of a registry kind
     (`registry.KINDS`) and every class its package exports (`dew.sampling`'s CFG, APG, ...) that derives
@@ -646,12 +663,13 @@ def blocked(root: Path, drawn: bool) -> RunConfig:
         text_only=True, attention={"full_attention": "block_bidirectional"}))
 
 
-TASK_RUNS = {"TextSettings": ((prefixed, "lm"),), "MaskedSettings": ((masked, "masked_diffusion"),),
+TASK_RUNS = {"TextSettings": ((prefixed, "lm"),),
+             "MaskedSettings": ((masked, "masked_diffusion"), (dreamed, "masked_diffusion")),
              "ImageSettings": ((diffusion, "diffusion"),), "BlockSettings": ((blockwise, "block_diffusion"),),
              "DecideSettings": ((decision, "decision"), (blocked, "decision"), (lettered, "decision"))}
 """The runs here of an objective that records each saved task's settings, and the objective's name: a
 decision release's, which exports, a fresh head's over a backbone that reads blocks, and a fresh letter
-readout's, whose labels its layout takes."""
+readout's, whose labels its layout takes; a masked run over a release, whose walk it takes."""
 
 
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:
@@ -875,7 +893,8 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
 
 
 UNHELD = ("states a layout's window, budgets and option layout alone",
-          "Laya's layout holds a ModernBERT encoder", "the source's format holds no cross-attention layers")
+          "Laya's layout holds a ModernBERT encoder", "the source's format holds no cross-attention layers",
+          "Laya's layout is a MarkerLayout over a Hugging Face tokenizer")
 """What `dew export` says refusing a run whose format holds not all it saved, rather than dropping it: a
 release's config (Laya's) its layout's window, budgets and option layout alone, its weights a ModernBERT
 encoder's, and its source's format no cross-attention layer a context reads through."""
@@ -977,28 +996,20 @@ def test_a_masked_run_over_a_release_saves_and_reads_the_walk_the_release_declar
     among it (ledger 2563), its solver, its steps and its blocks; and the walk its loaded task takes
     reads that endpoint: the same task with no endpoint answers apart (`answers`), a loaded source's
     default reaching its consumer."""
-    from test_dream_walk import snapshot
-    from token_support import write_token_corpus
-
     from dew.inference.tasks import MaskedSettings
     from dew.interop import Pretrained
 
-    source = snapshot(release, tmp_path)
-    declared = Pretrained.load(source, dtype="float32", attention_impl="reference").text_generation()
-    corpus = write_token_corpus(tmp_path / "tokens", np.random.RandomState(0).randint(4, 100, 400),
-                                tokenizer=str(source), vocab_size=128, eos_id=1)
-    data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
-        Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "reference"})
-    run = LMRunConfig(data=data, pretrained=str(source), objective=ObjectiveConfig("masked_diffusion"),
-                      tokenizer=str(source), max_new_tokens=0, model=model)
+    run = dreamed(tmp_path, drawn=False, release=release)
+    source = Pretrained.load(tmp_path / release, dtype="float32", attention_impl="reference")
+    declared = source.text_generation()
     _, task = saved_with(run, tmp_path, "over", MaskedSettings, {})
     options = {name: getattr(declared, name) for name in ("process", "solver", "steps", "block")}
     assert {name: same(getattr(task, name), option) for name, option in options.items()} == dict.fromkeys(
         options, True)
     assert task.process.endpoint is not None
-    unended = dataclasses.replace(task, process=dataclasses.replace(task.process, endpoint=None))
-    assert not answered_alike(answers(task), answers(unended))
+    drawn = drawn_afresh(task)
+    unended = dataclasses.replace(drawn, process=dataclasses.replace(drawn.process, endpoint=None))
+    assert not answered_alike(answers(drawn), answers(unended))
 
 
 def test_a_decision_run_over_a_release_saves_and_reads_the_task_the_release_declares(tmp_path):
