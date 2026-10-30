@@ -81,7 +81,7 @@ def objective(**options):
         "textcontext": Condition(CharTable.from_pretrained(tokens=3, features=4))})
     model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8, num_layers=1, num_heads=2,
                       mlp_ratio=2)
-    return DiffusionNFTObjective(model, process, inputs, steps=5, **options)
+    return DiffusionNFTObjective(model, process, inputs, steps=5, **{"kl": 0.0, **options})
 
 
 def nudged(variables, key):
@@ -139,21 +139,23 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
 
 
 def test_the_old_policy_follows_the_trained_one_at_the_released_decay():
-    """At an update the old policy keeps min(0.001 s, 0.5) of itself, s the updates before it, and
-    takes the rest from the trained weights (train_nft_sd3.py:169-188, decay_type 1): the EMA slot's
-    update at the released schedule, bit for bit."""
+    """At an update the old policy keeps min(0.001 s, 0.5) of itself, s the gradient steps taken once
+    it is made, and takes the rest from the trained weights (train_nft_sd3.py:169-189 and 1033-1038,
+    decay_type 1): the EMA slot's update at the released schedule, bit for bit, the base model's
+    velocity weighed in at the release's kl."""
     from dew.averaging import ema_update
 
-    nft = objective(variables=nudged(objective().init(jax.random.key(20)), jax.random.key(22)))
+    nft = objective(variables=nudged(objective().init(jax.random.key(20)), jax.random.key(22)), kl=1e-4)
     _, initial, final = fitted(nft, lambda images, context: images.mean(axis=(1, 2, 3)),
                                nft.inputs.tokenize(PROMPTS), groups=2, steps=5, train_steps=2)
     expected = ema_update(initial.ema, final.variables, released_old_decay(initial.updates))
     jax.tree.map(np.testing.assert_array_equal, final.ema, expected)
 
 
-@pytest.mark.parametrize("asked", ["beta", "adv_clip_max", "kl"])
+@pytest.mark.parametrize("asked", [{"beta": 0.0}, {"adv_clip_max": 0.0}, {"kl": -1.0}, {"kl": 1e-4}],
+                         ids=["beta", "clip", "kl", "kl without a base"])
 def test_a_degenerate_strength_clip_or_regularizer_is_refused(asked):
-    """A beta or a clip that is not positive, or a negative kl weight, is refused as the objective is
-    made."""
+    """A beta or a clip that is not positive, a negative kl weight, or a positive one with no starting
+    tree to read the base model from, is refused as the objective is made."""
     with pytest.raises(ValueError):
-        objective(**{asked: 0.0 if asked != "kl" else -1.0})
+        objective(**asked)

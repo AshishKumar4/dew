@@ -10,13 +10,15 @@ The loss is the released trainer's form (NVlabs/DiffusionNFT at cbb14f84, script
 :862-970), which the paper's Eq. 5 is up to a weighting: each implicit policy's clean-sample estimate,
 x0 = x_t - t v, against the sample, its squared error over the sample's coordinates divided by the
 detached mean absolute error (floored at 1e-5), the two mixed by r, divided by beta and scaled by the
-advantage clip; plus, where `kl` is positive, the mean squared difference of the live velocity from
-the base model's. An advantage is the reward less its prompt group's mean over the global standard
+advantage clip; plus `kl` (the release's train.beta, 1e-4) times the mean squared difference of the
+live velocity from the base model's (:962-967). An advantage is the reward less its prompt group's mean over the global standard
 deviation of the batch's rewards plus 1e-4 (flow_grpo/stat_tracking.py:14-30, `global_std`); r is
 that advantage clipped to the clip and mapped to [0, 1] (train_nft_sd3.py:910-929). The old policy
 is the EMA slot, which follows the trained weights at `old_decay` once an update
-(train_nft_sd3.py:169-188, the release's decay_type 1); the base model is the starting tree's
-weights, frozen under `TEACHER`.
+(train_nft_sd3.py:1033-1038, the release's decay_type 1), and samples every rollout (:640-660); the
+base model is the starting tree's weights, frozen under `TEACHER`. The release also keeps an EMA of
+the trained weights at 0.9 for its evaluations and saved checkpoints (:565-567, :220, :342); Dew's one
+EMA slot holds the old policy, so evaluation, previews and the published task use the live weights.
 """
 
 from __future__ import annotations
@@ -55,10 +57,11 @@ if TYPE_CHECKING:
 
 
 def released_old_decay(updates: jax.typing.ArrayLike) -> jax.Array:
-    """The released trainer's old-policy decay before update `updates` + 1, min(0.001 s, 0.5)
-    (train_nft_sd3.py:169-188, decay_type 1): the old policy takes the trained weights whole at the
-    first update and keeps half of itself from the 500th."""
-    return jnp.minimum(0.001 * jnp.asarray(updates, jnp.float32), 0.5)
+    """The released trainer's old-policy decay at the update after `updates` completed ones,
+    min(0.001 s, 0.5) with s the gradient steps taken once it is made (train_nft_sd3.py:169-189 and
+    1033-1038, decay_type 1, one gradient step an epoch): 0.001 at the first update, a half from the
+    500th."""
+    return jnp.minimum(0.001 * (jnp.asarray(updates, jnp.float32) + 1), 0.5)
 
 
 _WEIGHT_FLOOR = 1e-5
@@ -96,7 +99,8 @@ class DiffusionNFTObjective(DiffusionObjective):
     times each trains at, `[N, T]` (the sampler's grid); and `advantages`, `[N]`. `beta` is the
     implicit policies' strength, `adv_clip_max` the advantage clip and the loss's scale, `kl` the
     weight of the velocity's squared difference from the base model's, which a positive weight reads
-    from the starting tree (`variables`), and `old_decay` the old policy's decay over updates. The
+    from the starting tree (`variables`, a pretrained model's), and `old_decay` the old policy's decay
+    over updates. The release's single-reward defaults: beta 1, a clip of 5, kl 1e-4. The
     old policy is the EMA slot; evaluation, previews and the published task use the live weights.
     `solver` and `steps` configure evaluation; a rollout samples over its own grid (`NFTRollout`).
     """
@@ -106,7 +110,7 @@ class DiffusionNFTObjective(DiffusionObjective):
     ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
-                 beta: float = 1.0, adv_clip_max: float = 5.0, kl: float = 0.0,
+                 beta: float = 1.0, adv_clip_max: float = 5.0, kl: float = 1e-4,
                  old_decay: optax.Schedule = released_old_decay, autoencoder: AutoEncoder | None = None,
                  solver: Solver | None = None, steps: int = 41, variables: Variables | None = None,
                  grid: SourceGrid | None | Omitted = OMITTED):
@@ -200,8 +204,9 @@ class DiffusionNFTObjective(DiffusionObjective):
 @dataclass(frozen=True)
 class NFTRollout(GroupedRollout):
     """Draws `groups` clean samples of each source row with the old policy, the objective's solver
-    over `steps` time points and no guidance, and trains each at the first `train_steps` times of
-    that grid (the released 9 of 10).
+    over `steps` time points and no guidance (the release's deterministic second-order DPM-Solver at
+    guidance 1), and trains each at the first `train_steps` times of that grid (the release's
+    int(0.99 num_steps), 9 of its 10 steps' times, at 11 time points).
 
     A sample's advantage is its reward less its group's mean, over the population standard deviation
     of every reward in the batch plus 1e-4 (the module docstring); the rewards stay float64 on the
