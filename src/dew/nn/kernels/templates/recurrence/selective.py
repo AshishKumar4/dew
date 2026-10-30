@@ -61,25 +61,33 @@ def _down(i):
     return i, 0
 
 
-def forward(x, dt, rates, b, c, skip, state, resets, scan: Scan):
-    """The scan's outputs from padded operands: `x`, `dt` `[R, T, D]`, `rates` `[N, D]` fp32 (`A log2(e)`),
-    `b`, `c` `[R, T, N]`, `skip` `[D]` fp32, `state` `[R, N, D]` fp32 and `resets` `[R, T, RESET_WIDTH]` int8
-    (a token's flag in every column; ignored unless `scan.packed`). Returns `y` `[R, T, D]` in `x`'s dtype,
-    the final state `[R, N, D]` fp32 and, with `scan.entered`, each chunk's entering state `[R, chunks, N, D]`
-    fp32 (None without)."""
+PARAMETER_ROWS = 8
+"""The rows a program's parameter tile takes past its rates: the skip's, padded to the 8-row tiles a stream's
+rows come in."""
+
+
+def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
+    """The scan's outputs from padded operands: `x`, `dt` `[R, T, D]`, `b`, `c` `[R, T, N]`, `parameters`
+    `[N + PARAMETER_ROWS, D]` fp32 (the rates `A log2(e)` transposed, then the skip `D`), `state` `[R, N, D]`
+    fp32 and `resets` `[R, T, RESET_WIDTH]` int8 (a token's flag in every column; ignored unless
+    `scan.packed`). Returns `y` `[R, T, D]` in `x`'s dtype, the final state `[R, N, D]` fp32 and, with
+    `scan.entered`, each chunk's entering state `[R, chunks, N, D]` fp32 (None without)."""
     family, chunk, block, states = scan.family, scan.chunk, scan.block, scan.states
     blocks = {"x": ((chunk, block), x.dtype), "dt": ((chunk, block), dt.dtype),
               "b": ((chunk, states), b.dtype), "c": ((chunk, states), c.dtype)}
     if scan.packed:
         blocks["resets"] = ((chunk, RESET_WIDTH), jnp.int8)
-    # Each tile read a token's row at a time, at a traced row: staged plain (`mosaic.UNSWIZZLED`).
-    streams = family.streams(blocks, 2, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED))
+    once = {"parameters": ((states + PARAMETER_ROWS, block), jnp.float32),
+            "entering": ((states, block), jnp.float32)}
+    # Each tile read a row at a time, at a traced row: staged plain (`mosaic.UNSWIZZLED`).
+    streams = {"walked": family.streams(blocks, 2, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED)),
+               "once": family.streams(once, 1, 1, swizzles=dict.fromkeys(once, mosaic.UNSWIZZLED))}
     out_type = [jax.ShapeDtypeStruct(x.shape, x.dtype),
                 jax.ShapeDtypeStruct((scan.rows, states, scan.channels), jnp.float32)]
     if scan.entered:
         out_type.append(jax.ShapeDtypeStruct((scan.rows, scan.chunks, states, scan.channels), jnp.float32))
 
-    def entry(x_ref, dt_ref, rates_ref, b_ref, c_ref, skip_ref, state_ref, resets_ref, y_ref, final_ref,
+    def entry(x_ref, dt_ref, b_ref, c_ref, parameters_ref, state_ref, resets_ref, y_ref, final_ref,
               *entered_ref):
         row, part = lax.axis_index("rows"), lax.axis_index("blocks")
         columns = pl.ds(part * block, block)
@@ -89,23 +97,30 @@ def forward(x, dt, rates, b, c, skip, state, resets, scan: Scan):
                  "b": (b_ref.at[row], _down), "c": (c_ref.at[row], _down)}
         if scan.packed:
             views["resets"] = (resets_ref.at[row], _down)
+        once_views = {"parameters": (parameters_ref.at[:, columns], _down),
+                      "entering": (state_ref.at[row, :, columns], _down)}
 
         def body(staged, *, streams):
-            rates_smem, skip_smem, state_smem, out_smem, loads = staged
-            opened = family.opened(streams, views)
+            out_smem, state_smem = staged
+            walked = family.opened(streams["walked"], views)
+            given = family.opened(streams["once"], once_views)
 
             def consumer(wg):
-                # The consumer's own loads: a producer role takes none of them.
-                family.loaded([(rates_ref.at[:, columns], rates_smem, loads.at[0]),
-                               (skip_ref.at[columns], skip_smem, loads.at[1]),
-                               (state_ref.at[row, :, columns], state_smem, loads.at[2])])
-                rates = [rates_smem[n, :] for n in range(states)]
-                skip = skip_smem[...]
+                def taken(index, slots, carry, accumulators):
+                    del index, carry
+                    parameters, entering = slots["parameters"], slots["entering"]
+                    return ([parameters[n, :] for n in range(states)], parameters[states, :],
+                            [entering[n, :] for n in range(states)]), accumulators
+
+                vector = jnp.zeros((block,), jnp.float32)
+                (rates, skip, h0), _ = family.walk(family.fed(given, once_views, 0, 1, wg), ((taken, 0, 1),),
+                                                   ([vector] * states, vector, [vector] * states), (),
+                                                   scan.interpret)
 
                 def step(index, slots, h, accumulators):
                     if scan.entered:
                         family.stored(list(h), [entered_ref[0].at[row, index, n, columns]
-                                                for n in range(states)], smem=state_smem.at[0])
+                                                for n in range(states)], smem=state_smem)
                     xs, dts, bs, cs = (slots[name] for name in ("x", "dt", "b", "c"))
                     resets = slots["resets"] if scan.packed else None
 
@@ -126,25 +141,26 @@ def forward(x, dt, rates, b, c, skip, state, resets, scan: Scan):
                                   smem=out_smem)
                     return h, accumulators
 
-                h0 = [state_smem[n, :] for n in range(states)]
-                h, _ = family.walk(family.fed(opened, views, 0, scan.chunks, wg), ((step, 0, scan.chunks),),
+                h, _ = family.walk(family.fed(walked, views, 0, scan.chunks, wg), ((step, 0, scan.chunks),),
                                    h0, (), scan.interpret)
                 family.stored(list(h), [final_ref.at[row, n, columns] for n in range(states)],
-                              smem=state_smem.at[0])
+                              smem=state_smem)
                 family.store_wait(0)
 
-            family.roles(1, consumer, lambda: family.stream(opened, views, 0, scan.chunks))
+            def producer():
+                family.stream(given, once_views, 0, 1)
+                family.stream(walked, views, 0, scan.chunks)
 
-        allocations = (plgpu.SMEM((states, block), jnp.float32), plgpu.SMEM((block,), jnp.float32),
-                       plgpu.SMEM((states, block), jnp.float32), plgpu.SMEM((chunk, block), x.dtype),
-                       family.load_barriers(3))
+            family.roles(1, consumer, producer)
+
+        allocations = (plgpu.SMEM((chunk, block), x.dtype), plgpu.SMEM((block,), jnp.float32))
         family.scoped(body, allocations, streams=streams)
 
     entry.__name__ = "selective_scan"
     launched = family.kernel(entry, out_type=tuple(out_type), grid=(scan.rows, scan.blocks),
                              grid_names=("rows", "blocks"), consumers=1, interpret=scan.interpret,
                              name="selective_scan")
-    outs = launched(x, dt, rates, b, c, skip, state, resets)
+    outs = launched(x, dt, b, c, parameters, state, resets)
     return (*outs, None) if not scan.entered else tuple(outs)
 
 
@@ -166,6 +182,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     entering = (jnp.zeros((rows, states, channels), jnp.float32) if state is None
                 else jnp.swapaxes(jnp.asarray(state, jnp.float32), 1, 2))
     scan = Scan(rows, padded, channels, states, chunk, block, family, interpret, packed=starts is not None)
-    y, final, _ = forward(pad(x), pad(dt), (jnp.asarray(A, jnp.float32) * LOG2E).T, pad(B), pad(C),
-                          jnp.asarray(D, jnp.float32), entering, resets, scan)
+    parameters = jnp.concatenate([(jnp.asarray(A, jnp.float32) * LOG2E).T, jnp.asarray(D, jnp.float32)[None],
+                                  jnp.zeros((PARAMETER_ROWS - 1, channels), jnp.float32)])
+    y, final, _ = forward(pad(x), pad(dt), pad(B), pad(C), parameters, entering, resets, scan)
     return y[:, :length], jnp.swapaxes(final, 1, 2).astype(x.dtype)
