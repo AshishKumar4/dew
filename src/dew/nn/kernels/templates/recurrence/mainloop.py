@@ -907,10 +907,8 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
 
         def step(index, slots, carry, accumulators):
             del index
-            # Every slot acquired in the step's own trace: the rolled sub-chunks read them, and a slot first
-            # acquired in a loop's body kept that body's slot index past it (`Slots`' cache), a scalar the
-            # kernel then took as an input.
-            slots.held()
+            # Every slot acquired in the step's own trace: the rolled sub-chunks read them.
+            slots.acquire_all()
 
             def block(name, operand, c):
                 return _tile(slots, name, operand, columns=pl.ds(c * keys, keys)).value()
