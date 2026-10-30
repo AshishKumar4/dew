@@ -148,6 +148,9 @@ def test_a_pools_shares_on_the_examples_clock_end_apart_and_the_run_at_its_bound
     bound consumed, its clock the pool's on every step (the examples its logs read rising to the bound),
     where the pool once refused the run (row 2009)."""
     reports = run_pool("examples_clock", tmp_path / "pool", 2, script=EXAMPLES_CLOCK, records=24, timeout=300)
+    # Each share credits the examples whose last rows it holds, the pool's shares the bound once.
+    assert sum(report["credited"] for report in reports) == 24
+    assert reports[0]["rows"] != reports[1]["rows"]
     assert len({report["step"] for report in reports}) == 1
     assert [report["consumed"] for report in reports] == [24, 24]
     logged = reports[0]["logged"]

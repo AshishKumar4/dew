@@ -55,11 +55,21 @@ def examples_clock(args) -> dict:
     ids = np.arange(args.records, dtype=np.int32)
     x = np.repeat(ids[:, None].astype(np.float32), FEATURES, axis=1)
     chain = Pipeline(Memory({"x": x, "id": ids})).read("memory").batch(BATCH)
+    from dew.batch import EXAMPLES_CONSUMED
+    from dew.data.compile import fitted
+    from dew.data.dataset import DataPartition
+
+    # The examples this process's share credits and the rows it holds, read apart before the run.
+    loader, _ = fitted(chain, None, objective=Pulled().data(), examples=args.records)
+    credited = rows = 0
+    for batch in loader.train(DataPartition.of(MeshSpec().build())):
+        credited += int(np.sum(batch[EXAMPLES_CONSUMED]))
+        rows += len(batch[EXAMPLES_CONSUMED])
     tracker = Logged()
     optim = OptimConfig(optimizer="optax:sgd", learning_rate=Linear(peak_value=1e-2, end_value=0.0))
     trainer = Trainer(Pulled(), optim, key=jax.random.key(0), mesh=MeshSpec(), tracker=tracker)
     state = trainer.fit(chain, examples=args.records, log_every=1)
-    return {"step": int(state.step), "consumed": int(state.consumed),
+    return {"step": int(state.step), "consumed": int(state.consumed), "credited": credited, "rows": rows,
             "logged": [scalars["train/examples_consumed"] for scalars in tracker.scalars]}
 
 
